@@ -7,7 +7,7 @@ fn cli_happy_path_composite_fk_violation_renders() {
     let db_path = tmp.path().join("cfk-cli.db");
     let output = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         "CREATE TABLE parent (a INTEGER, b INTEGER, UNIQUE(a, b));\n\
          CREATE TABLE child (id INTEGER PRIMARY KEY, c1 INTEGER, c2 INTEGER, FOREIGN KEY (c1, c2) REFERENCES parent(a, b));\n\
          INSERT INTO child (id, c1, c2) VALUES (1, 9, 9);\n\

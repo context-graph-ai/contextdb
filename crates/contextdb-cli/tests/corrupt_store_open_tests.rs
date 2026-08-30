@@ -42,6 +42,11 @@ fn opening_a_corrupt_store_does_not_leak_an_internal_panic_backtrace() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_contextdb"))
         .arg(&db_path)
+        // What is pinned here is the OPEN path: a corrupt store must fail with
+        // a clean, actionable message rather than an internal panic. Opening
+        // for writing is what performs that open, so this drives the same
+        // invocation an operator uses when they go to fix the store.
+        .arg("--write")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -82,10 +87,10 @@ fn opening_a_corrupt_store_does_not_leak_an_internal_panic_backtrace() {
 /// Every `StoreCorrupted` raise site's message names the applicable
 /// command — today `CORRUPT_STORE_NEXT_STEP` (persistence.rs) says only
 /// "restore from a backup ... or remove the file to recreate it," with no
-/// mention of the `repair`/`reset` commands. Once those commands exist,
+/// mention of the `diagnose`/`reset` commands. Once those commands exist,
 /// opening a corrupt store must point the user at them by name.
 #[test]
-fn opening_a_corrupt_store_error_names_the_repair_and_reset_commands() {
+fn opening_a_corrupt_store_error_names_the_diagnose_and_reset_commands() {
     let dir = tempfile::Builder::new()
         .prefix("cdb-corrupt-open-names-commands-")
         .tempdir()
@@ -95,6 +100,11 @@ fn opening_a_corrupt_store_error_names_the_repair_and_reset_commands() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_contextdb"))
         .arg(&db_path)
+        // What is pinned here is the OPEN path: a corrupt store must fail with
+        // a clean, actionable message rather than an internal panic. Opening
+        // for writing is what performs that open, so this drives the same
+        // invocation an operator uses when they go to fix the store.
+        .arg("--write")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -109,8 +119,8 @@ fn opening_a_corrupt_store_error_names_the_repair_and_reset_commands() {
          stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("repair"),
-        "the corrupt-store error must name the `repair` command. stderr:\n{stderr}"
+        stderr.contains("diagnose"),
+        "the corrupt-store error must name the `diagnose` command. stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("reset"),

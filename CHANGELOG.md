@@ -4,6 +4,48 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
+- **Behavior change.** A bare `CREATE TABLE` naming a table that already exists is now refused
+  instead of silently replacing that table's schema — the old behavior dropped the values in
+  every column the new declaration omitted. `CREATE TABLE IF NOT EXISTS` is the spelling that
+  stays a no-op: the existing table is left exactly as it is and the statement answers ok. To
+  change an existing table's shape, use `ALTER TABLE`; to redefine it from scratch, `DROP TABLE`
+  first. Redefinition arriving over sync from a peer's own declaration is unaffected.
+- **Added.** `.schema` and its JSON form now carry a column's `ACL REFERENCES` declaration —
+  previously the access control clause was accepted on `CREATE TABLE` but dropped from both
+  schema surfaces, so reading a table back never showed which columns it gated. A column
+  declared with `ACL REFERENCES` now renders that clause in the printed DDL and appears as
+  `acl_references` in the JSON schema answer, on both a freshly declared table and one read
+  back out of a stored or synced schema.
+- **Breaking.** The local read-session channel protocol advances to version 2, adding the
+  visibility a session declares — its contexts, scopes, and principal — to the handshake.
+  The version is now read first, before anything else in the handshake: a peer speaking a
+  different protocol version gets the typed `LocalProtocolMismatch` refusal, not a decode
+  failure reported as damaged bytes. Two builds whose handshakes encode differently can no
+  longer share a version number.
+- **Behavior change.** `contextdb <path>` is now a bounded read session, and this reshapes the
+  everyday command line. Opening a store no longer creates it: a path that does not exist is
+  refused with `store_not_found`, and `contextdb <path> --write` is the only thing that creates
+  one. Mutation now needs that same flag — DDL, DML, transaction control, `.maintenance run`, and
+  the `.sync` write commands are refused on a bare open with `write_requires_flag` before they
+  execute, and an invocation carrying `--sync-endpoint` or `--tenant-id` without `--write` is
+  refused at argument validation (exit `2`) with nothing run at all. `:memory:` is unaffected: it
+  stays writable with no flag and accepts `--write` as a no-op. Reading is no longer exclusive —
+  several direct readers coexist on an idle store, and while a live process owns the store a read
+  session is served by that owner over its authenticated local channel, so `DatabaseLocked` is now
+  the writable-open refusal only. Machine output is frozen in namespaced, bounded shapes: an
+  ordinary `SELECT` under `--json` is `{"result":{"columns":[…],"rows":[…]}}` rather than a bare
+  row array, `.tables` and `.events status` are bounded pages under their own keys
+  (`{"tables":{"items":[…],"has_more":…,"continuation":…}}`, `events_status` likewise), and
+  `.schema` answers under `schema`. There is no `--all` flag and no row cap to disable: a result
+  publishes complete or refuses with `owner_limit_exceeded` under the declared
+  `--read-result-rows` / `--read-result-bytes` ceilings, and the refusal carries the
+  `.cursor open` command that pages it. Diagnosis and format upgrades go through the sanctioned
+  `contextdb diagnose <path>` and one-door `contextdb migrate <path>` surface; the old repair
+  guidance is gone. Every recipe in `AGENTS.md`, `skills/*/SKILL.md`, `README.md`, and `docs/`
+  has been brought onto this contract.
+- **Removed.** The `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` environment override for the same-DB
+  trigger deadlock guard is gone; no environment variable adjusts it anymore, matching the
+  environment-is-not-a-behavior-surface convention. The guard keeps its fixed 60-second default.
 - **Behavior change.** The push-refusal reason for a `SYNC CONFLICT KEEP FIRST` collision is
   now `keep_first_refused`, naming the declared policy that refused the row, not the internal
   transport-unit mechanism formerly exposed as `dependency_complete_refused`. Any consumer
@@ -195,6 +237,6 @@ Earlier versions: see git tags.
 
 - TriggerActiveSameDBProgress: same-DB cross-thread trigger contention now waits-and-proceeds inside the engine instead of surfacing retry churn to callers.
 - `CallbackActiveCrossThread { Trigger }` keeps its exact Display string, but its normal trigger scope narrows to captured callback tx-bound handles used from the wrong thread and deadlock-guard timeout paths; unrelated cross-DB writers proceed independently.
-- Added the `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` override for the bounded same-DB trigger wait guard. Default: 60 seconds; no enforced minimum.
+- Added a bounded same-DB trigger wait guard. Default: 60 seconds.
 - Deadlock-guard timeouts emit one structured `tracing::warn!` with `trigger_name`, `waited_ms`, and `surface`.
 - Class A callback-thread misuse returns `CallbackReentry`; cron same-DB callback contention remains an immediate typed callback-active error.

@@ -54,16 +54,47 @@ pub mod blob_store;
 pub mod cli_render;
 pub mod composite_store;
 pub mod database;
+#[cfg(not(feature = "test-seams"))]
+mod direct_file_reader;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod direct_file_reader;
 pub mod executor;
+#[cfg(not(feature = "test-seams"))]
+mod local_transport;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod local_transport;
 #[cfg(not(feature = "test-seams"))]
 mod memory_accounting;
 #[cfg(feature = "test-seams")]
 pub mod memory_accounting;
+mod metadata_page;
+#[cfg(not(feature = "test-seams"))]
+mod owner_read;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod owner_read;
 pub mod peer_directory;
 pub mod persistence;
 pub mod persistent_store;
 pub mod plugin;
 pub mod rank_formula;
+#[cfg(not(feature = "test-seams"))]
+#[allow(dead_code)]
+pub(crate) mod read_contract;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod read_contract;
+mod read_image;
+#[cfg(feature = "test-seams")]
+mod read_probe;
+mod read_progress;
+#[cfg(not(feature = "test-seams"))]
+mod read_session;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod read_session;
 pub mod schema_enforcer;
 pub mod sync;
 pub mod sync_types;
@@ -96,6 +127,10 @@ pub mod transport;
 
 #[cfg(feature = "iroh")]
 pub use blob_store::{BlobStore, ResolveError};
+pub use contextdb_core::read_contract::{
+    CursorPage, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus, OwnerRequestHandler,
+    OwnerServiceTimeouts, ReadClientTimeouts, ReadLimits, ReadRoute,
+};
 #[doc(hidden)]
 pub use database::CommitStageStats;
 pub use database::TriggerProgressTelemetrySnapshot;
@@ -114,8 +149,29 @@ pub use database::{
     TableSizeEstimate,
 };
 pub use database::{SearchResult, SemanticQuery};
+pub use direct_file_reader::{
+    DirectChangeState, DirectColumnReference, DirectConfigurationState, DirectEventTypeStatus,
+    DirectEventsStatus, DirectImageMetadataKind, DirectImageState, DirectIndexColumn,
+    DirectIndexDirection, DirectMaintenanceStatus, DirectMetadataBody as MetadataBody,
+    DirectMetadataRequest as MetadataRequest, DirectPropagationRule, DirectRankPolicy,
+    DirectReferencePropagation, DirectRetainPolicy, DirectRouteStatus, DirectScheduleStatus,
+    DirectSchema, DirectSchemaColumn, DirectSchemaIndex, DirectScopeLabelKind, DirectSinkStatus,
+    DirectStateMachine, DirectSyncSource, DirectSyncState, DirectTableSyncPolicy,
+    DirectVectorQuantization,
+};
 #[cfg(feature = "sync-orchestration")]
 pub use identity::FabricIdentity;
+pub use plugin::DatabasePlugin;
+pub use read_progress::{ReadPhase, ReadProgress, ReadProgressObserver};
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use read_session::OwnerReadTestHooks;
+pub use read_session::{
+    DatabaseOpenOptions, MetadataAnswer, OpenDisposition, OwnerAdmissionReport,
+    OwnerConfigurationSource, OwnerConfiguredValue, OwnerEffectiveLimits, OwnerMemoryReport,
+    OwnerReadConfig, OwnerReport, OwnerServingReport, OwnerTimeoutReport, ReadCursor, ReadSession,
+    ReadSessionOptions,
+};
 pub use sync::ChangeTracking;
 #[cfg(feature = "sync-orchestration")]
 pub use sync_client::SyncClient;

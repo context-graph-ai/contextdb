@@ -2,33 +2,33 @@
 //!
 //! This drives two real `contextdb` processes.  The child owns the database
 //! through its open stdin session; the parent invokes the installed CLI's
-//! `reset --force` command and proves the original file and PID lock remain
+//! `reset --force` command and proves the original file and binary companion remain
 //! intact before asking the child to make a second durable write.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-fn lock_path_for(path: &Path) -> std::path::PathBuf {
-    path.with_extension("lock")
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut companion = path.as_os_str().to_os_string();
+    companion.push(".lock");
+    PathBuf::from(companion)
 }
 
-fn wait_for_owner_lock(path: &Path, pid: u32) {
+fn wait_for_owner_lock(path: &Path) {
     let lock = lock_path_for(path);
     for _ in 0..100_000 {
-        if let Ok(contents) = fs::read_to_string(&lock)
-            && contents.trim() == pid.to_string()
-        {
+        if lock.is_file() {
             return;
         }
         std::thread::yield_now();
     }
     panic!(
-        "child {pid} never published its ownership lock at {}",
+        "child never published its ownership companion at {}",
         lock.display()
     );
 }
@@ -39,6 +39,9 @@ fn reset_force_refuses_a_live_owner_without_unlinking_its_store_or_lock() {
     let path = dir.path().join("owned.db");
     let mut child = Command::new(env!("CARGO_BIN_EXE_contextdb"))
         .arg(&path)
+        // The owning process creates the store and writes to it, which is what
+        // `--write` authorizes; a bare path would only read.
+        .arg("--write")
         .arg("--json")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -65,7 +68,7 @@ fn reset_force_refuses_a_live_owner_without_unlinking_its_store_or_lock() {
         r#"{"rows_affected":1}"#,
         "child wrote before reset"
     );
-    wait_for_owner_lock(&path, child_pid);
+    wait_for_owner_lock(&path);
 
     let before_db = fs::read(&path).expect("owner-created database bytes");
     let lock_path = lock_path_for(&path);
@@ -161,8 +164,15 @@ fn reset_force_refuses_a_live_owner_without_unlinking_its_store_or_lock() {
         .expect("readback SQL");
     let readback = probe.wait_with_output().expect("readback output");
     assert!(readback.status.success(), "readback failed: {readback:?}");
-    let actual: serde_json::Value =
+    let document: serde_json::Value =
         serde_json::from_slice(&readback.stdout).expect("readback must be a JSON result");
+    // A successful ordinary SELECT is one namespaced, column-carrying
+    // document; the bare row array it used to publish is gone.
+    let actual = document
+        .get("result")
+        .and_then(|result| result.get("rows"))
+        .cloned()
+        .unwrap_or_else(|| panic!("readback must publish a result document, got: {document}"));
     let expected: serde_json::Value =
         serde_json::from_str(r#"[{"id":1,"body":"before"},{"id":2,"body":"after"}]"#)
             .expect("expected readback JSON");
@@ -184,6 +194,7 @@ fn reset_force_refuses_a_live_owner_without_unlinking_its_store_or_lock() {
     );
     let fresh = Command::new(env!("CARGO_BIN_EXE_contextdb"))
         .arg(&path)
+        .arg("--write")
         .arg("--json")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

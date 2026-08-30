@@ -215,6 +215,12 @@ pub struct CreateTablePlan {
     /// for a single-column or absent primary key.
     pub primary_key_columns: Vec<String>,
     pub composite_foreign_keys: Vec<CompositeForeignKey>,
+    /// `true` when the declaration wrote `IF NOT EXISTS`. This is not part of
+    /// the table's shape -- it only decides what a collision on an existing
+    /// name does: the bare spelling is refused, this one is a no-op. The
+    /// executor needs it here for the same reason `DropIndexPlan` carries
+    /// `if_exists`.
+    pub if_not_exists: bool,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,

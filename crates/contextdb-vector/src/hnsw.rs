@@ -1,9 +1,15 @@
 use crate::quantized::{StoredVector, StoredVectorEntry, quantized_hnsw_distance};
 use anndists::dist::distances::{DistCosine, Distance};
 use contextdb_core::{Error, Result, RowId, VectorIndexRef, VectorQuantization};
-use hnsw_rs::hnsw::Hnsw;
+use hnsw_rs::hnsw::{
+    Hnsw, HnswBoundedSearchError, HnswSearchScratchContainer, HnswSearchScratchEvent,
+};
 use parking_lot::RwLock;
+#[cfg(feature = "test-seams")]
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "test-seams")]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct HnswIndex {
@@ -17,12 +23,561 @@ pub struct HnswIndex {
     ef_search: usize,
 }
 
+/// Final rows from the bounded HNSW path.  `retained_bytes` covers only the
+/// returned row vector's observable capacity; every HNSW scratch container
+/// has already emitted its matching release event.
+#[derive(Debug)]
+pub struct HnswSearchMemoryResult {
+    pub rows: Vec<(RowId, f32)>,
+    pub retained_bytes: usize,
+}
+
 static NEXT_HNSW_BUILD_SERIAL: AtomicUsize = AtomicUsize::new(1);
 const HNSW_BUILD_SEED: u64 = 0x55c8_6f2d_21a4_7bd3;
 
 enum HnswInner {
-    F32(Hnsw<'static, f32, DistCosine>),
+    F32(Hnsw<'static, f32, HnswF32Distance>),
     Quantized(Hnsw<'static, u8, DistQuantizedCosine>),
+}
+
+#[cfg(not(feature = "test-seams"))]
+type HnswF32Distance = DistCosine;
+
+#[cfg(feature = "test-seams")]
+#[derive(Debug, Clone, Copy)]
+struct HnswF32Distance;
+
+#[cfg(feature = "test-seams")]
+impl Distance<f32> for HnswF32Distance {
+    fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+        observe_hnsw_candidate_distance();
+        DistCosine.eval(va, vb)
+    }
+}
+
+fn hnsw_f32_distance() -> HnswF32Distance {
+    #[cfg(feature = "test-seams")]
+    {
+        HnswF32Distance
+    }
+    #[cfg(not(feature = "test-seams"))]
+    {
+        DistCosine
+    }
+}
+
+struct VectorSearchScratch<'a, E> {
+    acquire: &'a mut dyn FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+    release: &'a mut dyn FnMut(HnswSearchScratchEvent),
+}
+
+impl<E> VectorSearchScratch<'_, E>
+where
+    E: From<Error>,
+{
+    fn next_capacity(&self, current: usize, required: usize) -> std::result::Result<usize, E> {
+        if current == 0 {
+            return Ok(required);
+        }
+        Ok(current
+            .checked_mul(2)
+            .ok_or_else(|| E::from(Error::Other("bounded HNSW capacity overflow".to_string())))?
+            .max(required))
+    }
+
+    fn release_capacity(
+        &mut self,
+        container: HnswSearchScratchContainer,
+        capacity: usize,
+        element_bytes: usize,
+    ) {
+        if capacity != 0 && element_bytes != 0 {
+            (self.release)(HnswSearchScratchEvent::Release {
+                container,
+                capacity,
+                element_bytes,
+            });
+        }
+    }
+
+    fn allocate_vec<T>(
+        &mut self,
+        container: HnswSearchScratchContainer,
+        requested_capacity: usize,
+        operation: &str,
+    ) -> std::result::Result<Vec<T>, E> {
+        if requested_capacity == 0 || std::mem::size_of::<T>() == 0 {
+            return Ok(Vec::new());
+        }
+        let element_bytes = std::mem::size_of::<T>();
+        (self.acquire)(HnswSearchScratchEvent::Reserve {
+            container,
+            previous_capacity: 0,
+            requested_capacity,
+            element_bytes,
+        })?;
+        let mut values = Vec::new();
+        if values.try_reserve_exact(requested_capacity).is_err() {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(E::from(Error::Other(format!(
+                "bounded HNSW {operation} allocation failed"
+            ))));
+        }
+        let actual_capacity = values.capacity();
+        if actual_capacity < requested_capacity {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(E::from(Error::Other(format!(
+                "bounded HNSW {operation} capacity moved backwards"
+            ))));
+        }
+        if let Err(error) = (self.acquire)(HnswSearchScratchEvent::Reconcile {
+            container,
+            requested_capacity,
+            actual_capacity,
+            element_bytes,
+        }) {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(error);
+        }
+        Ok(values)
+    }
+
+    /// Grow a scratch vector. Each migrated element is charged through the
+    /// caller's work control first, exactly as the set migration below does,
+    /// so a doubling chain stays inside the work budget and stays cancellable.
+    fn ensure_vec_capacity<T: Copy>(
+        &mut self,
+        values: &mut Vec<T>,
+        container: HnswSearchScratchContainer,
+        required: usize,
+        operation: &str,
+        before_work: &mut impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        if required <= values.capacity() {
+            return Ok(());
+        }
+        let previous_capacity = values.capacity();
+        let requested_capacity = self.next_capacity(previous_capacity, required)?;
+        let mut replacement = self.allocate_vec(container, requested_capacity, operation)?;
+        let mut position = 0usize;
+        while position < values.len() {
+            if let Err(error) = before_work() {
+                self.release_capacity(container, replacement.capacity(), std::mem::size_of::<T>());
+                return Err(error);
+            }
+            let value = match values.get(position) {
+                Some(value) => *value,
+                None => {
+                    self.release_capacity(
+                        container,
+                        replacement.capacity(),
+                        std::mem::size_of::<T>(),
+                    );
+                    return Err(E::from(Error::Other(format!(
+                        "bounded HNSW {operation} changed during migration"
+                    ))));
+                }
+            };
+            position = match position.checked_add(1) {
+                Some(position) => position,
+                None => {
+                    self.release_capacity(
+                        container,
+                        replacement.capacity(),
+                        std::mem::size_of::<T>(),
+                    );
+                    return Err(E::from(Error::Other(format!(
+                        "bounded HNSW {operation} migration position overflow"
+                    ))));
+                }
+            };
+            replacement.push(value);
+        }
+        let old = std::mem::replace(values, replacement);
+        drop(old);
+        self.release_capacity(container, previous_capacity, std::mem::size_of::<T>());
+        Ok(())
+    }
+
+    fn allocate_set<T>(
+        &mut self,
+        container: HnswSearchScratchContainer,
+        requested_capacity: usize,
+        operation: &str,
+    ) -> std::result::Result<HashSet<T>, E>
+    where
+        T: std::hash::Hash + Eq,
+    {
+        if requested_capacity == 0 || std::mem::size_of::<T>() == 0 {
+            return Ok(HashSet::new());
+        }
+        let element_bytes = std::mem::size_of::<T>();
+        (self.acquire)(HnswSearchScratchEvent::Reserve {
+            container,
+            previous_capacity: 0,
+            requested_capacity,
+            element_bytes,
+        })?;
+        let mut values = HashSet::new();
+        if values.try_reserve(requested_capacity).is_err() {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(E::from(Error::Other(format!(
+                "bounded HNSW {operation} allocation failed"
+            ))));
+        }
+        let actual_capacity = values.capacity();
+        if actual_capacity < requested_capacity {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(E::from(Error::Other(format!(
+                "bounded HNSW {operation} capacity moved backwards"
+            ))));
+        }
+        if let Err(error) = (self.acquire)(HnswSearchScratchEvent::Reconcile {
+            container,
+            requested_capacity,
+            actual_capacity,
+            element_bytes,
+        }) {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(error);
+        }
+        Ok(values)
+    }
+
+    fn ensure_set_capacity<T>(
+        &mut self,
+        values: &mut HashSet<T>,
+        container: HnswSearchScratchContainer,
+        required: usize,
+        operation: &str,
+        before_work: &mut impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E>
+    where
+        T: std::hash::Hash + Eq + Copy,
+    {
+        if required <= values.capacity() {
+            return Ok(());
+        }
+        let previous_capacity = values.capacity();
+        let requested_capacity = self.next_capacity(previous_capacity, required)?;
+        let mut replacement = self.allocate_set(container, requested_capacity, operation)?;
+        let mut remaining = values.len();
+        let mut source = values.iter();
+        while remaining != 0 {
+            if let Err(error) = before_work() {
+                self.release_capacity(container, replacement.capacity(), std::mem::size_of::<T>());
+                return Err(error);
+            }
+            let Some(value) = source.next().copied() else {
+                self.release_capacity(container, replacement.capacity(), std::mem::size_of::<T>());
+                return Err(E::from(Error::Other(format!(
+                    "bounded HNSW {operation} changed during migration"
+                ))));
+            };
+            remaining = match remaining.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => {
+                    self.release_capacity(
+                        container,
+                        replacement.capacity(),
+                        std::mem::size_of::<T>(),
+                    );
+                    return Err(E::from(Error::Other(format!(
+                        "bounded HNSW {operation} migration underflow"
+                    ))));
+                }
+            };
+            replacement.insert(value);
+        }
+        let old = std::mem::replace(values, replacement);
+        drop(old);
+        self.release_capacity(container, previous_capacity, std::mem::size_of::<T>());
+        Ok(())
+    }
+
+    fn release_vec<T>(&mut self, values: &Vec<T>, container: HnswSearchScratchContainer) {
+        self.release_capacity(container, values.capacity(), std::mem::size_of::<T>());
+    }
+
+    fn release_set<T>(&mut self, values: &HashSet<T>, container: HnswSearchScratchContainer) {
+        self.release_capacity(container, values.capacity(), std::mem::size_of::<T>());
+    }
+}
+
+fn map_core_bounded_error<E>(error: HnswBoundedSearchError<E>) -> E
+where
+    E: From<Error>,
+{
+    match error {
+        HnswBoundedSearchError::Callback(error) => error,
+        HnswBoundedSearchError::CapacityOverflow(operation) => E::from(Error::Other(format!(
+            "bounded HNSW {operation} capacity overflow"
+        ))),
+        HnswBoundedSearchError::AllocationFailed(operation) => E::from(Error::Other(format!(
+            "bounded HNSW {operation} allocation failed"
+        ))),
+        HnswBoundedSearchError::CapacityInvariant(operation) => E::from(Error::Other(format!(
+            "bounded HNSW {operation} capacity moved backwards"
+        ))),
+        HnswBoundedSearchError::SearchInvariant(operation) => E::from(Error::Other(format!(
+            "bounded HNSW {operation} violated a search invariant"
+        ))),
+    }
+}
+
+fn quantized_query_bounds(query: &[f32]) -> (f32, f32) {
+    let Some((first, rest)) = query.split_first() else {
+        return (0.0, 0.0);
+    };
+    rest.iter()
+        .copied()
+        .fold((*first, *first), |(min, max), value| {
+            (min.min(value), max.max(value))
+        })
+}
+
+fn encode_bounded_quantized_query<E>(
+    query: &[f32],
+    quantization: VectorQuantization,
+    scratch: &mut VectorSearchScratch<'_, E>,
+) -> std::result::Result<Vec<u8>, E>
+where
+    E: From<Error>,
+{
+    let payload_len = match quantization {
+        VectorQuantization::SQ8 => query.len(),
+        VectorQuantization::SQ4 => query.len().div_ceil(2),
+        VectorQuantization::F32 => {
+            return Err(E::from(Error::Other(
+                "bounded HNSW requested a quantized query for F32 data".to_string(),
+            )));
+        }
+    };
+    let encoded_len = 12usize
+        .checked_add(payload_len)
+        .ok_or_else(|| E::from(Error::Other("bounded HNSW query size overflow".to_string())))?;
+    let mut encoded = scratch.allocate_vec(
+        HnswSearchScratchContainer::QueryBytes,
+        encoded_len,
+        "quantized query",
+    )?;
+    let (min, max) = quantized_query_bounds(query);
+    encoded.extend_from_slice(&(query.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(&min.to_le_bytes());
+    encoded.extend_from_slice(&max.to_le_bytes());
+    let range = max - min;
+    match quantization {
+        VectorQuantization::SQ8 => {
+            for value in query {
+                let quantized = if range <= f32::EPSILON {
+                    0
+                } else {
+                    (((*value - min) / range) * 255.0).round().clamp(0.0, 255.0) as u8
+                };
+                encoded.push(quantized);
+            }
+        }
+        VectorQuantization::SQ4 => {
+            let mut values = query.iter();
+            while let Some(high) = values.next() {
+                let quantize = |value: f32| {
+                    if range <= f32::EPSILON {
+                        0
+                    } else {
+                        (((value - min) / range) * 15.0).round().clamp(0.0, 15.0) as u8
+                    }
+                };
+                let high = quantize(*high) & 0x0f;
+                let low = values.next().map_or(0, |value| quantize(*value)) & 0x0f;
+                encoded.push((high << 4) | low);
+            }
+        }
+        VectorQuantization::F32 => {
+            scratch.release_vec(&encoded, HnswSearchScratchContainer::QueryBytes);
+            return Err(E::from(Error::Other(
+                "bounded HNSW reached the quantized encoder with F32 data".to_string(),
+            )));
+        }
+    }
+    Ok(encoded)
+}
+
+fn bounded_f32_exact_key<E>(
+    query: &[f32],
+    scratch: &mut VectorSearchScratch<'_, E>,
+) -> std::result::Result<Vec<u8>, E>
+where
+    E: From<Error>,
+{
+    let bytes = query
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| E::from(Error::Other("bounded HNSW exact-key overflow".to_string())))?;
+    let mut key = scratch.allocate_vec(HnswSearchScratchContainer::ExactKey, bytes, "exact key")?;
+    for value in query {
+        key.extend_from_slice(&value.to_bits().to_be_bytes());
+    }
+    Ok(key)
+}
+
+fn bounded_exact_query_score<E>(
+    query: &[f32],
+    quantization: VectorQuantization,
+    encoded: Option<&[u8]>,
+    before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
+) -> std::result::Result<Option<f32>, E>
+where
+    E: From<Error>,
+{
+    before_distance()?;
+    let (mut dot, mut query_norm, mut vector_norm) = (0.0_f32, 0.0_f32, 0.0_f32);
+    match quantization {
+        VectorQuantization::F32 => {
+            for value in query {
+                dot += *value * *value;
+                query_norm += *value * *value;
+                vector_norm += *value * *value;
+            }
+        }
+        VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
+            let Some(encoded) = encoded else {
+                return Ok(None);
+            };
+            let (min, max) = quantized_query_bounds(query);
+            let range = max - min;
+            let levels = if matches!(quantization, VectorQuantization::SQ8) {
+                255.0
+            } else {
+                15.0
+            };
+            let scale = if range <= f32::EPSILON {
+                0.0
+            } else {
+                range / levels
+            };
+            let payload = encoded.get(12..).unwrap_or_default();
+            for (index, value) in query.iter().copied().enumerate() {
+                let quantized = match quantization {
+                    VectorQuantization::SQ8 => payload.get(index).copied().unwrap_or(0),
+                    VectorQuantization::SQ4 => {
+                        let byte = payload.get(index / 2).copied().unwrap_or(0);
+                        if index.is_multiple_of(2) {
+                            byte >> 4
+                        } else {
+                            byte & 0x0f
+                        }
+                    }
+                    VectorQuantization::F32 => {
+                        return Err(E::from(Error::Other(
+                            "bounded HNSW scored a quantized query against F32 data".to_string(),
+                        )));
+                    }
+                };
+                let stored = if scale == 0.0 {
+                    min
+                } else {
+                    min + quantized as f32 * scale
+                };
+                dot += value * stored;
+                query_norm += value * value;
+                vector_norm += stored * stored;
+            }
+        }
+    }
+    let score = if query_norm == 0.0 || vector_norm == 0.0 {
+        0.0
+    } else {
+        dot / (query_norm.sqrt() * vector_norm.sqrt())
+    };
+    Ok((score.is_finite() && score > 0.0).then_some(score))
+}
+
+/// Proof-only evidence emitted from the real HNSW distance-evaluation path.
+///
+/// The private field is intentional: code above the vector source cannot
+/// manufacture an event after an eager `Hnsw::search` and pretend that it
+/// stopped before candidate work.  Only this module can construct the event,
+/// immediately before the candidate distance calculation below.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub struct HnswCandidateDistanceEvent {
+    completed_candidates: u64,
+    _source_loop_provenance: (),
+}
+
+#[cfg(feature = "test-seams")]
+impl HnswCandidateDistanceEvent {
+    pub const fn completed_candidates(&self) -> u64 {
+        self.completed_candidates
+    }
+}
+
+/// Behavior-neutral handoff for bounded-source poison and budget proofs.
+/// Production builds have no observer branch.  Under `test-seams`, installing
+/// no observer is also the ordinary path and produces byte-for-byte identical
+/// distance results.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub trait HnswCandidateObserver: Send + Sync {
+    fn before_candidate_distance(&self, event: HnswCandidateDistanceEvent);
+}
+
+#[cfg(feature = "test-seams")]
+std::thread_local! {
+    static HNSW_CANDIDATE_OBSERVER: RefCell<Option<Arc<dyn HnswCandidateObserver>>> =
+        RefCell::new(None);
+    static HNSW_COMPLETED_CANDIDATES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Install an observer only for the dynamic extent of one bounded vector
+/// source call.  Nested calls and unwinding restore the prior observer and
+/// ordinal, so a test request cannot leak state into a later ordinary search.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn with_hnsw_candidate_observer<R>(
+    observer: Arc<dyn HnswCandidateObserver>,
+    search: impl FnOnce() -> R,
+) -> R {
+    struct ObserverGuard {
+        prior_observer: Option<Arc<dyn HnswCandidateObserver>>,
+        prior_completed: u64,
+    }
+
+    impl Drop for ObserverGuard {
+        fn drop(&mut self) {
+            HNSW_CANDIDATE_OBSERVER.with(|slot| {
+                slot.replace(self.prior_observer.take());
+            });
+            HNSW_COMPLETED_CANDIDATES.with(|completed| {
+                completed.set(self.prior_completed);
+            });
+        }
+    }
+
+    let prior_observer = HNSW_CANDIDATE_OBSERVER.with(|slot| slot.replace(Some(observer)));
+    let prior_completed = HNSW_COMPLETED_CANDIDATES.with(|completed| completed.replace(0));
+    let _guard = ObserverGuard {
+        prior_observer,
+        prior_completed,
+    };
+    search()
+}
+
+#[cfg(feature = "test-seams")]
+fn observe_hnsw_candidate_distance() {
+    let observer = HNSW_CANDIDATE_OBSERVER.with(|slot| slot.borrow().as_ref().map(Arc::clone));
+    let Some(observer) = observer else {
+        return;
+    };
+    let completed_candidates = HNSW_COMPLETED_CANDIDATES.with(|completed| {
+        let current = completed.get();
+        completed.set(current.saturating_add(1));
+        current
+    });
+    observer.before_candidate_distance(HnswCandidateDistanceEvent {
+        completed_candidates,
+        _source_loop_provenance: (),
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +587,8 @@ struct DistQuantizedCosine {
 
 impl Distance<u8> for DistQuantizedCosine {
     fn eval(&self, va: &[u8], vb: &[u8]) -> f32 {
+        #[cfg(feature = "test-seams")]
+        observe_hnsw_candidate_distance();
         quantized_hnsw_distance(va, vb, self.quantization)
     }
 }
@@ -73,7 +630,7 @@ impl HnswIndex {
                     max_elements,
                     16,
                     ef_construction,
-                    DistCosine,
+                    hnsw_f32_distance(),
                     HNSW_BUILD_SEED,
                 );
                 hnsw.set_extend_candidates(true);
@@ -222,11 +779,273 @@ impl HnswIndex {
                 .copied()
                 .map(|row_id| (row_id, 1.0 - neighbor.distance))
         }));
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let mut seen = HashSet::new();
         scored.retain(|(row_id, _)| seen.insert(*row_id));
         scored.truncate(cap);
         Ok(scored)
+    }
+
+    /// Additive bounded HNSW search with transactional, exact-capacity events.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_bounded_memory<E, S, D, A, R>(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        mut before_source_entry: S,
+        mut before_distance: D,
+        mut acquire: A,
+        mut release: R,
+    ) -> std::result::Result<HnswSearchMemoryResult, E>
+    where
+        E: From<contextdb_core::Error>,
+        S: FnMut() -> std::result::Result<(), E>,
+        D: FnMut() -> std::result::Result<(), E>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
+    {
+        if k == 0 {
+            return Ok(HnswSearchMemoryResult {
+                rows: Vec::new(),
+                retained_bytes: 0,
+            });
+        }
+        if query.len() != self.dimension {
+            return Err(E::from(Error::VectorIndexDimensionMismatch {
+                index: index.clone(),
+                expected: self.dimension,
+                actual: query.len(),
+            }));
+        }
+
+        let ef = hnsw_search_ef(self.ef_search, k);
+        let mut encoded_query = None;
+        if matches!(&self.hnsw, HnswInner::Quantized(_)) {
+            let mut scratch = VectorSearchScratch {
+                acquire: &mut acquire,
+                release: &mut release,
+            };
+            encoded_query = Some(encode_bounded_quantized_query(
+                query,
+                self.quantization,
+                &mut scratch,
+            )?);
+        }
+        let searched = match &self.hnsw {
+            HnswInner::F32(hnsw) => hnsw.search_with_bounded_control(
+                query,
+                ef,
+                ef,
+                &mut before_source_entry,
+                &mut before_distance,
+                &mut acquire,
+                &mut release,
+            ),
+            HnswInner::Quantized(hnsw) => {
+                let encoded = encoded_query.as_deref().unwrap_or_default();
+                hnsw.search_with_bounded_control(
+                    encoded,
+                    ef,
+                    ef,
+                    &mut before_source_entry,
+                    &mut before_distance,
+                    &mut acquire,
+                    &mut release,
+                )
+            }
+        };
+        let raw = match searched {
+            Ok(raw) => raw,
+            Err(error) => {
+                if let Some(encoded) = encoded_query.as_ref() {
+                    let mut scratch = VectorSearchScratch {
+                        acquire: &mut acquire,
+                        release: &mut release,
+                    };
+                    scratch.release_vec(encoded, HnswSearchScratchContainer::QueryBytes);
+                }
+                return Err(map_core_bounded_error(error));
+            }
+        };
+        let mut scored = Vec::new();
+        let mut seen = HashSet::new();
+        let mut rows = Vec::new();
+        let mut exact_key = None;
+        let cap = hnsw_search_candidate_cap(self.ef_search, k);
+        let merge = (|| -> std::result::Result<(), E> {
+            let mut scratch = VectorSearchScratch {
+                acquire: &mut acquire,
+                release: &mut release,
+            };
+            let exact_score = bounded_exact_query_score(
+                query,
+                self.quantization,
+                encoded_query.as_deref(),
+                &mut before_distance,
+            )?;
+            if let Some(exact_score) = exact_score {
+                if matches!(self.quantization, VectorQuantization::F32) {
+                    exact_key = Some(bounded_f32_exact_key(query, &mut scratch)?);
+                }
+                let key = exact_key
+                    .as_deref()
+                    .or(encoded_query.as_deref())
+                    .unwrap_or_default();
+                before_source_entry()?;
+                let exact_rows = self.exact_rows.read();
+                if let Some(row_ids) = exact_rows.get(key) {
+                    let row_limit = cap.min(row_ids.len());
+                    let mut row_position = 0usize;
+                    while row_position < row_limit {
+                        before_source_entry()?;
+                        let row_id = *row_ids.get(row_position).ok_or_else(|| {
+                            E::from(Error::Other(
+                                "bounded HNSW exact-row position changed".to_string(),
+                            ))
+                        })?;
+                        row_position = row_position.checked_add(1).ok_or_else(|| {
+                            E::from(Error::Other(
+                                "bounded HNSW exact-row position overflow".to_string(),
+                            ))
+                        })?;
+                        let required = scored.len().checked_add(1).ok_or_else(|| {
+                            E::from(Error::Other(
+                                "bounded HNSW merge-result length overflow".to_string(),
+                            ))
+                        })?;
+                        scratch.ensure_vec_capacity(
+                            &mut scored,
+                            HnswSearchScratchContainer::MergeResults,
+                            required,
+                            "merge results",
+                            &mut before_source_entry,
+                        )?;
+                        scored.push((row_id, exact_score));
+                    }
+                }
+            }
+            before_source_entry()?;
+            let id_to_row = self.id_to_row.read();
+            let mut neighbour_position = 0usize;
+            while neighbour_position < raw.neighbours.len() {
+                before_source_entry()?;
+                let neighbour = raw.neighbours.get(neighbour_position).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW raw-neighbour position changed".to_string(),
+                    ))
+                })?;
+                neighbour_position = neighbour_position.checked_add(1).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW raw-neighbour position overflow".to_string(),
+                    ))
+                })?;
+                let Some(row_id) = id_to_row.get(&neighbour.d_id).copied() else {
+                    continue;
+                };
+                let required = scored.len().checked_add(1).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW merge-result length overflow".to_string(),
+                    ))
+                })?;
+                scratch.ensure_vec_capacity(
+                    &mut scored,
+                    HnswSearchScratchContainer::MergeResults,
+                    required,
+                    "merge results",
+                    &mut before_source_entry,
+                )?;
+                scored.push((row_id, 1.0 - neighbour.distance));
+            }
+            scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let mut scored_position = 0usize;
+            while scored_position < scored.len() {
+                before_source_entry()?;
+                let (row_id, score) = *scored.get(scored_position).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW scored-row position changed".to_string(),
+                    ))
+                })?;
+                scored_position = scored_position.checked_add(1).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW scored-row position overflow".to_string(),
+                    ))
+                })?;
+                if seen.contains(&row_id) {
+                    continue;
+                }
+                let required = seen.len().checked_add(1).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW seen-row length overflow".to_string(),
+                    ))
+                })?;
+                scratch.ensure_set_capacity(
+                    &mut seen,
+                    HnswSearchScratchContainer::SeenRows,
+                    required,
+                    "seen rows",
+                    &mut before_source_entry,
+                )?;
+                seen.insert(row_id);
+                if rows.len() == cap {
+                    break;
+                }
+                let required = rows.len().checked_add(1).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW result length overflow".to_string(),
+                    ))
+                })?;
+                scratch.ensure_vec_capacity(
+                    &mut rows,
+                    HnswSearchScratchContainer::Result,
+                    required,
+                    "result rows",
+                    &mut before_source_entry,
+                )?;
+                rows.push((row_id, score));
+            }
+            Ok(())
+        })();
+        let retained_bytes = rows
+            .capacity()
+            .checked_mul(std::mem::size_of::<(RowId, f32)>())
+            .ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded HNSW result capacity exceeds the native address space".to_string(),
+                ))
+            });
+        let mut scratch = VectorSearchScratch {
+            acquire: &mut acquire,
+            release: &mut release,
+        };
+        if let Some(key) = exact_key.as_ref() {
+            scratch.release_vec(key, HnswSearchScratchContainer::ExactKey);
+        }
+        if let Some(encoded) = encoded_query.as_ref() {
+            scratch.release_vec(encoded, HnswSearchScratchContainer::QueryBytes);
+        }
+        scratch.release_vec(&raw.neighbours, HnswSearchScratchContainer::Result);
+        scratch.release_vec(&scored, HnswSearchScratchContainer::MergeResults);
+        scratch.release_set(&seen, HnswSearchScratchContainer::SeenRows);
+        match merge {
+            Ok(()) => {
+                let retained_bytes = match retained_bytes {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        scratch.release_vec(&rows, HnswSearchScratchContainer::Result);
+                        return Err(error);
+                    }
+                };
+                Ok(HnswSearchMemoryResult {
+                    rows,
+                    retained_bytes,
+                })
+            }
+            Err(error) => {
+                scratch.release_vec(&rows, HnswSearchScratchContainer::Result);
+                Err(error)
+            }
+        }
     }
 
     #[doc(hidden)]

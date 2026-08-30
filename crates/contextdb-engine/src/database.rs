@@ -4,11 +4,13 @@ use crate::composite_store::{
     build_received_schema_change_log_entries, publish_prepared_change_log_entries,
     record_change_log_entries,
 };
+#[cfg(feature = "test-seams")]
+use crate::executor::bounded_read_test_support::{ExecutionProbe, TestSourceTouch, TestWorkSource};
 use crate::executor::{apply_on_conflict_updates, execute_plan, validate_plan_columns};
 use crate::memory_accounting::MemoryAccountant;
 use crate::persistence::{
-    AuthoritativePurgePersistenceProjection, LocalSchemaPersistenceProjection,
-    ReceivedSchemaPersistenceProjection, RedbPersistence,
+    AuthoritativePurgePersistenceProjection, LegacyMigrationOpenCapability,
+    LocalSchemaPersistenceProjection, ReceivedSchemaPersistenceProjection, RedbPersistence,
 };
 use crate::persistent_store::PersistentCompositeStore;
 use crate::plugin::{
@@ -16,12 +18,41 @@ use crate::plugin::{
     SubscriptionMetrics,
 };
 use crate::rank_formula::{FormulaEvalError, RankFormula};
+use crate::read_session::{
+    DatabaseOpenOptions, OpenDisposition, OwnerReadConfig, ReadSession,
+    owner_read_not_implemented_status,
+};
+#[cfg(feature = "test-seams")]
+use crate::read_session::{
+    ReadKernelSource, ReadKernelTestObserver, ReadRouteResourceSnapshot, ReadSessionEvent,
+    ReadSessionTestObserver,
+};
 use crate::schema_enforcer::validate_dml;
+
+/// The pathname that names a throwaway database rather than a file.
+const MEMORY_DATABASE_PATH: &str = ":memory:";
+
+/// Announce one startup resource to the route observer this open was given,
+/// when the build carries the observation seam at all.
+macro_rules! observe_open_event {
+    ($observer:expr, $event:ident) => {
+        #[cfg(feature = "test-seams")]
+        if let Some(observer) = &$observer {
+            observer.observe_event(ReadSessionEvent::$event);
+        }
+    };
+}
+
 use crate::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
     NaturalKey, RefusalCause, RowChange, SyncAdoption, SyncDirection, SyncDirectionHistory,
     VectorChange, natural_key_column_for_meta, natural_key_columns_for_meta,
     natural_key_from_row_values,
+};
+use contextdb_core::read_contract::{
+    DeadlineClock, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus, OwnerServiceTimeouts,
+    OwnerServingReason, OwnerServingState, ReadClientTimeouts, ReadFailure, ReadFailureKind,
+    ReadLimits,
 };
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor, PreparedGraphPublication};
@@ -4194,7 +4225,7 @@ pub(crate) struct TerminalRefusalPullContext {
     pub(crate) hub_node_id: String,
     pub(crate) generation: u64,
 }
-use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Condvar, Mutex, RwLock};
+use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Condvar, Mutex, MutexGuard, RwLock};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -4209,10 +4240,119 @@ use std::time::{Duration, Instant};
 type DynStore = Box<dyn WriteSetApplicator>;
 type GatedBfsEntry = (NodeId, u32, Vec<(NodeId, EdgeType)>);
 type GatedGraphNeighbor = (NodeId, EdgeType, HashMap<String, Value>, NodeId, NodeId);
+/// The visited ceiling a gated (context- or ACL-scoped) traversal keeps.
+/// The unrestricted one is `contextdb_graph::mem::MAX_VISITED`; this is the
+/// number the established gated walk refuses with.
+const GATED_BFS_VISITED_CEILING: usize = 10_000;
+
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 1024;
 const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
 const SAME_PROCESS_REOPEN_RETRY: Duration = Duration::from_millis(500);
 const CROSS_PROCESS_LOCK_SETTLE_RETRY: Duration = Duration::from_millis(250);
+
+/// Causal interception of the common writable-open entrance. An installed
+/// interceptor receives the complete options value before any startup
+/// resource is acquired and supplies the call's result. Convenience openers
+/// cannot satisfy this seam by recording a side counter and opening elsewhere.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub trait DatabaseOpenInterceptor: Send + Sync {
+    fn intercept(&self, path: &Path, options: &DatabaseOpenOptions) -> Result<Database>;
+}
+
+/// Events emitted by the actual legacy `Database::execute` path. Planning is
+/// observed at its production call site; pull events are reserved for the one
+/// shared pull-kernel entrance and terminal drain.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadExecutionConvergenceEvent {
+    PublicExecuteEntered,
+    PlanReady,
+    PullKernelEntered,
+    PullKernelSourceTouch {
+        source: ReadKernelSource,
+        completed_items: u64,
+    },
+    PullKernelDrained,
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub trait ReadExecutionConvergenceObserver: Send + Sync {
+    fn observe(&self, event: ReadExecutionConvergenceEvent);
+}
+
+/// This adapter is accepted only by the bounded executor's production probe
+/// entrance. It therefore cannot be satisfied by recording around an eager
+/// result after that result has already been materialized.
+#[cfg(feature = "test-seams")]
+struct ReadExecutionKernelProbe {
+    observer: Arc<dyn ReadExecutionConvergenceObserver>,
+}
+
+#[cfg(feature = "test-seams")]
+impl ExecutionProbe for ReadExecutionKernelProbe {
+    fn before_work(&self, _source: TestWorkSource, _completed_work: u64) {}
+
+    fn before_source_touch(&self, source: TestSourceTouch, completed_items: u64) {
+        self.observer
+            .observe(ReadExecutionConvergenceEvent::PullKernelSourceTouch {
+                source: source.into(),
+                completed_items,
+            });
+    }
+
+    fn cancellation_observed(&self, _completed_work: u64) {}
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static COMMON_OPTIONS_OPEN_INTERCEPTOR:
+        std::cell::RefCell<Option<Arc<dyn DatabaseOpenInterceptor>>> =
+        const { std::cell::RefCell::new(None) };
+    static READ_EXECUTION_CONVERGENCE_OBSERVER:
+        std::cell::RefCell<Option<Arc<dyn ReadExecutionConvergenceObserver>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "test-seams")]
+struct CommonOptionsOpenInterceptorGuard {
+    previous: Option<Arc<dyn DatabaseOpenInterceptor>>,
+}
+
+#[cfg(feature = "test-seams")]
+impl Drop for CommonOptionsOpenInterceptorGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        COMMON_OPTIONS_OPEN_INTERCEPTOR.with(|slot| {
+            let _ = slot.replace(previous);
+        });
+    }
+}
+
+#[cfg(feature = "test-seams")]
+struct ReadExecutionConvergenceObserverGuard {
+    previous: Option<Arc<dyn ReadExecutionConvergenceObserver>>,
+}
+
+#[cfg(feature = "test-seams")]
+impl Drop for ReadExecutionConvergenceObserverGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        READ_EXECUTION_CONVERGENCE_OBSERVER.with(|slot| {
+            let _ = slot.replace(previous);
+        });
+    }
+}
+
+#[cfg(feature = "test-seams")]
+fn observe_read_execution_convergence(event: ReadExecutionConvergenceEvent) {
+    let observer = READ_EXECUTION_CONVERGENCE_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer.observe(event);
+    }
+}
 const DEFAULT_TRIGGER_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(60);
 // redb may need a small metadata page on the next write, especially for a new
 // file with the format metadata table. Keep the disk-limit error deterministic
@@ -4452,7 +4592,10 @@ impl SnapshotInspector {
             Arc::new(MemoryAccountant::no_limit()),
             None,
             false,
+            OpenDisposition::CreateIfMissing,
         )?;
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_plugin_start();
         database.plugin.on_open()?;
         Ok(Self {
             database,
@@ -4548,7 +4691,7 @@ impl SnapshotInspector {
         let lineage = self
             .database
             .durable_lineage_record(table, natural_key)?
-            .map(|record| {
+            .map(|record| -> Result<LineageInspection> {
                 let purge_frontier_lsn = record
                     .purge_frontier
                     .as_deref()
@@ -4923,7 +5066,7 @@ struct AuthoritativePurgeSelection {
     local_row_id: RowId,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritativePurgeLiveRowSidecarSnapshot {
@@ -5407,10 +5550,33 @@ struct CachedStatement {
     plan: PhysicalPlan,
 }
 
+/// Identity of one open database handle, handed out at construction and never
+/// reused.
+///
+/// The thread-local registers below ask "is this work THIS database's?" -- is
+/// the rows-examined scope on the stack this statement's, is the callback that
+/// is running this handle's, is this handle's operation already open. An
+/// address cannot answer that: a dropped handle frees its address for the next
+/// one, so two handles that never coexisted can carry the same number and one
+/// is then mistaken for the other. What that costs is not theoretical for the
+/// first of those registers -- a colliding key mixes one database's examined
+/// rows into another's trace, and the number an operator reads to judge a
+/// query is then partly somebody else's.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct DatabaseId(u64);
+
+static NEXT_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
+
+impl DatabaseId {
+    fn next() -> Self {
+        Self(NEXT_DATABASE_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 #[derive(Debug)]
 struct ActiveQueryRowsExaminedScope {
     id: u64,
-    database_key: usize,
+    database_key: DatabaseId,
     rows_examined: u64,
 }
 
@@ -5427,14 +5593,14 @@ thread_local! {
 
 struct QueryRowsExaminedScope<'a> {
     database: &'a Database,
-    database_key: usize,
+    database_key: DatabaseId,
     id: u64,
     finished: bool,
 }
 
 impl<'a> QueryRowsExaminedScope<'a> {
     fn enter(database: &'a Database) -> Self {
-        let database_key = database as *const Database as usize;
+        let database_key = database.id;
         let id = QUERY_ROWS_EXAMINED_SCOPES.with(|scopes| {
             let mut scopes = scopes.borrow_mut();
             let id = scopes.next_id;
@@ -5516,7 +5682,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static CRON_CALLBACK_TX: std::cell::Cell<Option<TxId>> =
         const { std::cell::Cell::new(None) };
-    static CRON_CALLBACK_DB: std::cell::Cell<Option<usize>> =
+    static CRON_CALLBACK_DB: std::cell::Cell<Option<DatabaseId>> =
         const { std::cell::Cell::new(None) };
     static CRON_CALLBACK_VECTOR_SCHEMA_GATE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
@@ -5524,7 +5690,7 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static TRIGGER_CALLBACK_TX: std::cell::Cell<Option<TxId>> =
         const { std::cell::Cell::new(None) };
-    static TRIGGER_CALLBACK_DB: std::cell::Cell<Option<usize>> =
+    static TRIGGER_CALLBACK_DB: std::cell::Cell<Option<DatabaseId>> =
         const { std::cell::Cell::new(None) };
     static TRIGGER_CALLBACK_VECTOR_SCHEMA_GATE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
@@ -5534,7 +5700,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static TRIGGER_CALLBACK_WALLCLOCK: std::cell::Cell<Option<Wallclock>> =
         const { std::cell::Cell::new(None) };
-    static TRIGGER_INSERT_STATE_MACHINE_CACHE: std::cell::RefCell<HashMap<usize, HashMap<String, bool>>> =
+    static TRIGGER_INSERT_STATE_MACHINE_CACHE: std::cell::RefCell<HashMap<DatabaseId, HashMap<String, bool>>> =
         std::cell::RefCell::new(HashMap::new());
     static USER_COMMIT_ACTIVE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -5546,11 +5712,11 @@ thread_local! {
     /// established mixed DDL+row transaction path. Unlike the trigger-ready
     /// depth above, this authority is bound to one database handle and TxId;
     /// synchronous plugin reentry cannot inherit it for caller work.
-    static SYNC_APPLY_LOCAL_SCHEMA_BYPASS_STACK: std::cell::RefCell<Vec<(usize, TxId)>> =
+    static SYNC_APPLY_LOCAL_SCHEMA_BYPASS_STACK: std::cell::RefCell<Vec<(DatabaseId, TxId)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static SQL_WRITE_CONTROL_BYPASS_STACK: std::cell::RefCell<Vec<(usize, TxId)>> =
+    static SQL_WRITE_CONTROL_BYPASS_STACK: std::cell::RefCell<Vec<(DatabaseId, TxId)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static DB_OPERATION_STACK: std::cell::RefCell<Vec<usize>> =
+    static DB_OPERATION_STACK: std::cell::RefCell<Vec<DatabaseId>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// One outer SQL statement holds the shared schema-publication gate for
     /// its complete planning and execution lifetime. The key is the shared
@@ -5560,17 +5726,27 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static VECTOR_SCHEMA_READ_STACK: std::cell::RefCell<Vec<(usize, VectorIndexRef)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The vector indexes this thread holds through retained state — a bounded
+    /// cursor's schema claim, which outlives the statement that opened it.
+    ///
+    /// A schema change reads its own thread's list: a session that would have
+    /// to wait for a claim it holds itself is answered instead of parked. The
+    /// list is shared by handle rather than borrowed per thread because such a
+    /// claim may be released on a thread that did not open it; the claim is
+    /// removed from the opening thread's list wherever the release happens.
+    static VECTOR_SCHEMA_DETACHED_HOLDINGS: Arc<Mutex<Vec<(usize, VectorIndexRef)>>> =
+        Arc::new(Mutex::new(Vec::new()));
 }
 
 struct SyncApplyTriggerGateGuard;
 
 struct SyncApplyLocalSchemaBypassGuard {
-    db_id: usize,
+    db_id: DatabaseId,
     tx: TxId,
 }
 
 struct SqlWriteControlBypassGuard {
-    db_id: usize,
+    db_id: DatabaseId,
     tx: TxId,
 }
 
@@ -5612,6 +5788,18 @@ impl VectorSchemaGates {
 pub(crate) struct VectorSchemaReadGuard {
     db_id: usize,
     refs: Vec<VectorIndexRef>,
+    /// A statement-scoped guard is recorded on the thread that took it, so a
+    /// nested read on that same thread can reuse the claim instead of taking
+    /// the gate twice. A detached guard belongs to owned state — a retained
+    /// cursor — that outlives the statement that opened it and may be
+    /// released on a different thread than the one that opened it, so it is
+    /// never recorded on any thread's stack and never reuses another guard's
+    /// claim.
+    detached: bool,
+    /// The opening thread's detached-claim list, held by a detached guard so
+    /// its entries come off wherever the guard is released.
+    #[allow(clippy::type_complexity)]
+    detached_holdings: Option<Arc<Mutex<Vec<(usize, VectorIndexRef)>>>>,
     _guards: Vec<ArcRwLockReadGuard<parking_lot::RawRwLock, ()>>,
 }
 
@@ -5629,6 +5817,29 @@ impl VectorSchemaReadGuard {
         Self {
             db_id,
             refs,
+            detached: false,
+            detached_holdings: None,
+            _guards: guards,
+        }
+    }
+
+    /// Build a guard that carries its own gate handles and touches no
+    /// thread-local bookkeeping, so moving it between threads and releasing it
+    /// on a thread that did not open it leaves both threads' records intact.
+    fn new_detached(
+        db_id: usize,
+        refs: Vec<VectorIndexRef>,
+        guards: Vec<ArcRwLockReadGuard<parking_lot::RawRwLock, ()>>,
+    ) -> Self {
+        let holdings = VECTOR_SCHEMA_DETACHED_HOLDINGS.with(Arc::clone);
+        holdings
+            .lock()
+            .extend(refs.iter().cloned().map(|index| (db_id, index)));
+        Self {
+            db_id,
+            refs,
+            detached: true,
+            detached_holdings: Some(holdings),
             _guards: guards,
         }
     }
@@ -5636,6 +5847,23 @@ impl VectorSchemaReadGuard {
 
 impl Drop for VectorSchemaReadGuard {
     fn drop(&mut self) {
+        if self.detached {
+            // The claim comes off the list of the thread that opened it, which
+            // this guard carries, so releasing on a foreign thread still
+            // clears the record the opening thread is answered against.
+            if let Some(holdings) = self.detached_holdings.take() {
+                let mut holdings = holdings.lock();
+                for expected in self.refs.iter().rev() {
+                    if let Some(position) = holdings
+                        .iter()
+                        .rposition(|held| held == &(self.db_id, expected.clone()))
+                    {
+                        holdings.remove(position);
+                    }
+                }
+            }
+            return;
+        }
         VECTOR_SCHEMA_READ_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
             for expected in self.refs.iter().rev() {
@@ -5644,6 +5872,13 @@ impl Drop for VectorSchemaReadGuard {
             }
         });
     }
+}
+
+/// Whether this thread holds a retained claim on `index` through a bounded
+/// cursor it opened and has not closed.
+fn detached_vector_schema_claim_held(db_id: usize, index: &VectorIndexRef) -> bool {
+    let key = (db_id, index.clone());
+    VECTOR_SCHEMA_DETACHED_HOLDINGS.with(|holdings| holdings.lock().contains(&key))
 }
 
 pub(crate) struct VectorSchemaWriteGuard {
@@ -5705,22 +5940,27 @@ fn global_callback_active_count() -> &'static AtomicUsize {
 ///
 /// # Store ownership and concurrency
 ///
-/// A database file is opened by exactly one owner at a time. A second open of
-/// the same path — whether from another thread in this process or from a
-/// separate process — returns [`Error::DatabaseLocked`]; there is no read-only,
-/// shared, or replica open. Single-writer ownership is a deliberate guarantee of
-/// the substrate, not a missing feature, and it is enforced at two layers (an
-/// in-process open registry and an on-disk PID/OS file lock).
+/// Writing a database file belongs to exactly one owner at a time. A second
+/// writable open of the same path — whether from another thread in this process
+/// or from a separate process — returns [`Error::DatabaseLocked`].
+/// Single-writer ownership is a deliberate guarantee of the substrate, not a
+/// missing feature, and it is enforced at two layers (an in-process open
+/// registry and an on-disk PID/OS file lock).
 ///
-/// Embed it the way you embed any single-writer store (SQLite, LMDB, redb): one
-/// process opens the handle and keeps it for its lifetime, and every read and
-/// write — including answering queries on behalf of other parts of your
-/// application — goes through that one owner. For a long-running service this
-/// means the process that holds the handle serves its own reads: a second
-/// command reads by asking the running owner, not by re-opening the file, and
-/// you never keep a parallel copy of the data outside the owner to work around
-/// the lock. See the "Store Ownership & Concurrency" section of
-/// `docs/architecture.md`.
+/// Reading is a separate door that does not take the write lock:
+/// [`crate::ReadSession`] opens a read-only session over the same store and
+/// resolves one of two routes for its lifetime — the live owner's local channel
+/// when a process owns the store, or the committed file itself when none does.
+/// So a second process reads by opening a read session, which reaches the
+/// running owner when there is one and reads the committed snapshot when there
+/// is not.
+///
+/// Embed the writing side the way you embed any single-writer store (SQLite,
+/// LMDB, redb): one process opens the handle and keeps it for its lifetime, and
+/// every write goes through that one owner, which also serves the reads of the
+/// application it lives in. What you never do is keep a parallel copy of the
+/// data outside the owner to work around the lock. See the "Store Ownership &
+/// Concurrency" section of `docs/architecture.md`.
 ///
 /// Trigger concurrency follows the canonical callback contract documented on
 /// [`Error::CallbackActiveCrossThread`]: same-DB cross-thread trigger
@@ -5743,6 +5983,10 @@ type OutboundRowLineages = HashMap<(String, Vec<u8>, Lsn), crate::protocol::Wire
 type AuthoritativePurgeBlobReferences = (BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>);
 
 pub struct Database {
+    /// This handle's identity, never an address. Every handle gets its own,
+    /// including one derived by narrowing another's access, exactly as each
+    /// had its own address before.
+    id: DatabaseId,
     tx_mgr: Arc<TransactionManager<DynStore>>,
     relational_store: Arc<RelationalStore>,
     graph_store: Arc<GraphStore>,
@@ -5798,6 +6042,9 @@ pub struct Database {
     /// config write that changes Pending to Accepted; a crash before that
     /// promotion leaves the ordinary delete pending and resumable.
     persistence: Option<Arc<RedbPersistence>>,
+    /// Present only on a handle built from a committed image: the startup
+    /// rows a live store would have been asked for at open.
+    committed_image_startup: Option<Arc<CommittedImageStartupState>>,
     /// Engine-owned media repository. File-backed databases share their
     /// existing Redb; memory databases own a temporary file-backed Redb so
     /// large media never becomes process-resident merely because rows do.
@@ -5833,10 +6080,35 @@ pub struct Database {
     relational: MemRelationalExecutor<DynStore>,
     graph: MemGraphExecutor<DynStore>,
     vector: MemVectorExecutor<DynStore>,
-    session_tx: Mutex<Option<TxId>>,
+    /// The store file's length as the reader found it, for a handle built
+    /// from a committed image, which has no persistence to ask.
+    image_store_file_bytes: Option<u64>,
+    session_tx: Arc<Mutex<Option<TxId>>>,
+    /// The transaction slot of the handle a READER handle was opened from.
+    ///
+    /// A reader handle deliberately has no transaction control of its own, but
+    /// the reads it serves belong to whoever opened it: a writing session that
+    /// asks its own handle for a bounded read is entitled to see what that
+    /// session has done so far. So the reader watches the opener's slot rather
+    /// than owning one, which also means a COMMIT or ROLLBACK on the opener is
+    /// visible to the reader the moment it happens.
+    origin_session_tx: Option<Arc<Mutex<Option<TxId>>>>,
     instance_id: uuid::Uuid,
     owner_thread: thread::ThreadId,
     plugin: Arc<dyn DatabasePlugin>,
+    owner_read_config: Arc<OwnerReadConfig>,
+    /// The live owner-inspection service this open started, when it started
+    /// one. It holds a shared handle onto the same stores rather than this
+    /// value, so releasing the database releases the service with it.
+    owner_read_service: Option<Arc<crate::owner_read::OwnerReadService>>,
+    /// Why inspection is unavailable when serving was asked for and could not
+    /// start. The database itself opened; the caller is told the operating
+    /// system's own reason rather than discovering an empty result later.
+    owner_read_startup_failure: Option<String>,
+    #[cfg(feature = "test-seams")]
+    route_observer: Option<Arc<dyn crate::read_session::ReadSessionTestObserver>>,
+    #[cfg(feature = "test-seams")]
+    kernel_observer: Option<Arc<dyn crate::read_session::ReadKernelTestObserver>>,
     access: AccessConstraints,
     accountant: Arc<MemoryAccountant>,
     conflict_policies: RwLock<ConflictPolicies>,
@@ -5873,6 +6145,16 @@ pub struct Database {
     cron: Arc<CronState>,
     event_bus: Arc<EventBusState>,
     trigger: Arc<TriggerState>,
+    /// How long THIS handle waits for a same-database trigger callback to go
+    /// idle before the typed cross-thread error is due, when something has
+    /// stated a deadline other than [`DEFAULT_TRIGGER_DEADLOCK_TIMEOUT`].
+    ///
+    /// The deadline is behavior, so it is never taken from the environment:
+    /// no exported name moves it, and a journey that needs a shorter one
+    /// states it through `set_trigger_deadlock_timeout_for_test` on the very
+    /// handle under test. `None` -- the only value a shipped open produces --
+    /// means the shipped default.
+    trigger_deadlock_timeout_override: Mutex<Option<Duration>>,
     sync_relay_mode: Arc<AtomicBool>,
     in_memory_sync_progress: Arc<Mutex<InMemorySyncProgressState>>,
     in_memory_applied_push_watermarks: Arc<Mutex<HashMap<String, Lsn>>>,
@@ -5884,8 +6166,15 @@ pub struct Database {
     pending_event_bus_ddl: Mutex<HashMap<TxId, Vec<DdlChange>>>,
     pending_commit_metadata: Mutex<HashMap<TxId, PendingCommitMetadata>>,
     limit_update_lock: Arc<Mutex<()>>,
-    disk_limit: AtomicU64,
-    disk_limit_startup_ceiling: AtomicU64,
+    /// The store's disk budget, SHARED by every handle open on it.
+    ///
+    /// It is a property of the store, not of whoever is holding it: it is
+    /// persisted with the store and it governs the same file whoever asks. A
+    /// per-handle copy meant a limit set after a handle existed was invisible
+    /// to that handle -- so a writer's own owner-read service answered "no
+    /// disk limit" about a store that had one.
+    disk_limit: Arc<AtomicU64>,
+    disk_limit_startup_ceiling: Arc<AtomicU64>,
     /// Engine open-config for the engine's OWN durable trigger-audit history:
     /// an in-process, non-persisted retention window in seconds, defaulting
     /// to [`TRIGGER_AUDIT_RETENTION`]. Deliberately NOT backed by the redb
@@ -5902,6 +6191,13 @@ pub struct Database {
     /// through one derived handle is honored by cleanup running through
     /// another handle onto the same underlying database.
     snapshot_registry: Arc<SnapshotFloorRegistry>,
+    /// Node ids whose live row a retention pass already reclaimed while a
+    /// registered reader could still see adjacency entries touching them.
+    /// Those entries stay physically in place, and nothing else in the store
+    /// records that the id ever carried a row, so the next pass reads this
+    /// set to revisit them. Shared (not per-handle), like the registry
+    /// itself, so a cycle driven through any handle sees the same carry-over.
+    retention_deferred_edge_nodes: Arc<Mutex<HashSet<NodeId>>>,
     /// Engine open-config: `true` when this database's maintenance is
     /// `MaintenancePolicy::CallerDriven`. Shared, not per-handle, so the
     /// policy is a property of the database, not of one handle onto it.
@@ -5930,7 +6226,14 @@ pub struct Database {
     last_vector_search_used_hnsw: AtomicBool,
     last_vector_search_trace: RwLock<Option<VectorSearchDebugTrace>>,
     statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,
-    rank_formula_cache: RwLock<HashMap<(String, String), Arc<RankFormula>>>,
+    /// The rank-policy formulas this STORE has registered, held once and read
+    /// by every handle onto it. A derived handle -- a scoped view, a bounded
+    /// read session -- is another way of looking at the same store, not
+    /// another store, so it must see the formulas DDL registered whether that
+    /// DDL ran before the handle was taken or after it. A per-handle copy
+    /// answered "no such formula" to a search the other door answers.
+    #[allow(clippy::type_complexity)]
+    rank_formula_cache: Arc<RwLock<HashMap<(String, String), Arc<RankFormula>>>>,
     acl_grant_cache: RwLock<HashMap<AclGrantCacheKey, Arc<HashSet<uuid::Uuid>>>>,
     rank_policy_eval_count: AtomicU64,
     rank_policy_formula_parse_count: AtomicU64,
@@ -5945,6 +6248,11 @@ pub struct Database {
     commit_stage_wall_nanos: [AtomicU64; 7],
     corrupt_joined_values: RwLock<HashSet<(String, RowId, String)>>,
     resource_owner: bool,
+    /// What this handle is for, and therefore whether the store waits for it.
+    handle_role: HandleRole,
+    /// Shared by every handle on this store: how many holders are still live,
+    /// and what the owner left for the last of them to release.
+    finalization: Arc<StoreFinalization>,
 }
 
 /// Read-only handle for a validated schema-layout-legacy root opened solely
@@ -5952,7 +6260,28 @@ pub struct Database {
 /// [`Database`]: callers can snapshot the keyless rows the migration command
 /// must copy and close the source, but cannot execute SQL or invoke any other
 /// database mutation before privileged replay.
-pub struct LegacyMigrationSource(Database);
+///
+/// The acquired state owns the exact companion and store-file locks without
+/// opening Redb writable. The first migration read consumes those same locks
+/// into the private database only after the CLI has copied its untouched
+/// backup.
+pub struct LegacyMigrationSource {
+    /// The validated legacy store this source was opened on. It is what the
+    /// migration republishes, so the door derives its destination from here
+    /// rather than accepting one.
+    path: PathBuf,
+    state: Mutex<LegacyMigrationSourceState>,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum LegacyMigrationSourceState {
+    Acquired {
+        registry: OpenRegistryReservation,
+        persistence: LegacyMigrationOpenCapability,
+    },
+    Open(Database),
+    Closed,
+}
 
 /// One keyless legacy table's visible current rows. Changesets cannot carry
 /// these rows because they have no natural key, so the migration command
@@ -5963,49 +6292,827 @@ pub struct LegacyKeylessTableRows {
     pub rows: Vec<HashMap<String, Value>>,
 }
 
+/// One boundary [`LegacyMigrationSource::migrate_in_place`] passes through, in
+/// the exact order it reaches them. Exists so a proof of the crash-safety of
+/// every durable point can observe -- and pause at -- each one. The door
+/// reports them through its own test-build observation seam, never through a
+/// callback a caller supplies, so a shipped binary carries no way to reach
+/// into a migration mid-flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationBoundary {
+    TemporaryStoreOpened,
+    TemporaryStoreImported,
+    SourceStoreSealed,
+    TemporaryStoreBuilt,
+    TemporaryStoreDurablyPreparedAndOwned,
+    BeforeAtomicSwap,
+    AfterAtomicSwap,
+    TemporaryCompanionCleaned,
+    BeforeFinalGuardRelease,
+}
+
+/// Every fallible step [`LegacyMigrationSource::migrate_in_place`] can hit,
+/// carrying the underlying error. The re-record points share one variant
+/// because their wording is the same regardless of which of the door's
+/// several re-record calls failed.
+///
+/// The three groups differ in what the operator is left holding, which is why
+/// a caller can tell them apart: everything up to and including the swap
+/// attempt leaves the original store in place and every generated artifact
+/// removed; a failed swap says so specifically; and a failure after the swap
+/// means the migration is published and only the release of the old handles
+/// went wrong. [`Self::stage`] names which group this is.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrationError {
+    #[error("the migration target could not be created: {0}")]
+    TempStoreOpen(Error),
+    #[error("the migration target could not be recorded: {0}")]
+    RecordReplacementTarget(Error),
+    #[error("writing the migrated data failed: {0}")]
+    ImportLegacyData(Error),
+    #[error("copying keyless rows failed: {0}")]
+    KeylessRowsCopy(Error),
+    #[error("the migrated store could not be durably prepared: {0}")]
+    DurablyPrepare(Error),
+    #[error("{0}")]
+    AtomicSwap(std::io::Error),
+    #[error("{0}")]
+    PublishReplacement(Error),
+}
+
+/// Where in the migration a failure happened, in terms of what it left the
+/// operator holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationFailureStage {
+    /// The original store is untouched and usable, and every artifact the
+    /// attempt generated has been removed.
+    BeforeSwap,
+    /// The swap itself did not happen, for the reason carried.
+    AtSwap,
+    /// The migrated store is published; releasing the old handles failed.
+    AfterSwap,
+}
+
+impl MigrationError {
+    pub const fn stage(&self) -> MigrationFailureStage {
+        match self {
+            Self::TempStoreOpen(_)
+            | Self::RecordReplacementTarget(_)
+            | Self::ImportLegacyData(_)
+            | Self::KeylessRowsCopy(_)
+            | Self::DurablyPrepare(_) => MigrationFailureStage::BeforeSwap,
+            Self::AtomicSwap(_) => MigrationFailureStage::AtSwap,
+            Self::PublishReplacement(_) => MigrationFailureStage::AfterSwap,
+        }
+    }
+}
+
+/// Allocate the pathname the migration builds its replacement at.
+///
+/// The target is a sibling of the store being replaced, so the publishing
+/// rename is an atomic same-filesystem operation, and its name carries this
+/// process and a per-attempt sequence so two concurrent migrations of the
+/// same directory can never choose the same one. A name already present is
+/// skipped rather than reused.
+fn migration_temp_path(path: &Path) -> std::io::Result<PathBuf> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..1024 {
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(
+            ".migrate-{:08x}-{sequence:016x}.tmp",
+            std::process::id()
+        ));
+        let candidate = PathBuf::from(name);
+        match std::fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique migration target name",
+    ))
+}
+
+/// Report that the migration reached one of its durable boundaries.
+///
+/// A production build reports nothing: the boundaries exist so a crash proof
+/// can pause at each durable point, which is a test build's concern, and the
+/// door's signature must not carry a caller-supplied callback that could
+/// reach into the migration in a shipped binary.
+fn observe_migration_boundary(boundary: MigrationBoundary) {
+    #[cfg(feature = "test-seams")]
+    migration_boundary_seam::observe(boundary);
+    #[cfg(not(feature = "test-seams"))]
+    let _ = boundary;
+}
+
+/// Watching the migration door pass its durable boundaries.
+///
+/// A proof installs one observer for the duration of a migration and takes it
+/// down again; the door itself never learns who is watching.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod migration_boundary_seam {
+    use super::MigrationBoundary;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    type BoundaryObserver = Arc<dyn Fn(MigrationBoundary) + Send + Sync>;
+
+    static OBSERVER: OnceLock<Mutex<Option<BoundaryObserver>>> = OnceLock::new();
+
+    fn observer() -> &'static Mutex<Option<BoundaryObserver>> {
+        OBSERVER.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn install_boundary_observer_for_test(observe: BoundaryObserver) {
+        let mut slot = observer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(observe);
+    }
+
+    pub fn clear_boundary_observer_for_test() {
+        let mut slot = observer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+    }
+
+    pub(super) fn observe(boundary: MigrationBoundary) {
+        let installed = observer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(observe) = installed {
+            observe(boundary);
+        }
+    }
+}
+
+/// Replace the store at `destination` with the migrated root at `source`, in
+/// one rename. A test build can make exactly this step fail, to prove what a
+/// crash here leaves behind; a production build has no such seam.
+fn rename_migration_target(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(feature = "test-seams")]
+    if let Some(error) = migration_fault_seam::take_final_rename_failure(source, destination) {
+        return Err(error);
+    }
+    std::fs::rename(source, destination)
+}
+
+/// Drop the companion the migration target generated, once the swap has
+/// published the store it belonged to.
+fn remove_migration_temporary_companion(path: &Path) -> std::io::Result<()> {
+    #[cfg(feature = "test-seams")]
+    if let Some(error) = migration_fault_seam::before_temporary_companion_cleanup(path) {
+        return Err(error);
+    }
+    let result = std::fs::remove_file(path);
+    #[cfg(feature = "test-seams")]
+    migration_fault_seam::after_temporary_companion_cleanup(path, result.is_ok());
+    result
+}
+
+/// Making the migration's two irreversible filesystem steps fail on demand.
+///
+/// These live beside the door that performs them, not beside a caller: the
+/// caller no longer owns the swap, so it cannot own the swap's fault either.
+/// Every injector here is armed by a test, fires exactly once, and reports
+/// the exact paths it saw so a proof can show it hit the real step rather
+/// than a substitute.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod migration_fault_seam {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Debug)]
+    struct FinalRenameFaultRun {
+        token: u64,
+        attempts: usize,
+        source: Option<PathBuf>,
+        destination: Option<PathBuf>,
+        source_existed: bool,
+        companion_existed: bool,
+    }
+
+    #[derive(Debug, Default)]
+    struct FinalRenameFaultState {
+        next_token: u64,
+        active: Option<FinalRenameFaultRun>,
+    }
+
+    static FINAL_RENAME_FAULT: OnceLock<Mutex<FinalRenameFaultState>> = OnceLock::new();
+
+    fn final_rename_fault() -> &'static Mutex<FinalRenameFaultState> {
+        FINAL_RENAME_FAULT.get_or_init(|| Mutex::new(FinalRenameFaultState::default()))
+    }
+
+    #[derive(Debug)]
+    pub struct FinalRenameFaultGuard {
+        token: u64,
+        verified: bool,
+    }
+
+    impl Drop for FinalRenameFaultGuard {
+        fn drop(&mut self) {
+            if self.verified {
+                return;
+            }
+            let mut state = final_rename_fault()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.active.as_ref().map(|run| run.token) == Some(self.token) {
+                state.active = None;
+            }
+            drop(state);
+            if !std::thread::panicking() {
+                panic!("final-rename fault was dropped without proving its exact consumption");
+            }
+        }
+    }
+
+    impl FinalRenameFaultGuard {
+        pub fn verify_exact_injection_for_test(
+            mut self,
+            expected_source: &Path,
+            expected_destination: &Path,
+        ) {
+            let run = {
+                let mut state = final_rename_fault()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let run = state
+                    .active
+                    .take()
+                    .expect("final-rename fault was not active");
+                assert_eq!(run.token, self.token, "final-rename fault token changed");
+                run
+            };
+            assert_eq!(run.attempts, 1, "the final-rename fault must fire once");
+            assert_eq!(run.source.as_deref(), Some(expected_source));
+            assert_eq!(run.destination.as_deref(), Some(expected_destination));
+            assert!(
+                run.source_existed,
+                "the injector must leave the generated database present"
+            );
+            assert!(
+                run.companion_existed,
+                "the injector must leave the generated companion present"
+            );
+            self.verified = true;
+        }
+    }
+
+    pub fn arm_final_rename_failure_for_test() -> FinalRenameFaultGuard {
+        let mut state = final_rename_fault()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.active.is_none(),
+            "final-rename fault is already armed"
+        );
+        state.next_token = state.next_token.wrapping_add(1);
+        let token = state.next_token;
+        state.active = Some(FinalRenameFaultRun {
+            token,
+            attempts: 0,
+            source: None,
+            destination: None,
+            source_existed: false,
+            companion_existed: false,
+        });
+        FinalRenameFaultGuard {
+            token,
+            verified: false,
+        }
+    }
+
+    pub(super) fn take_final_rename_failure(
+        source: &Path,
+        destination: &Path,
+    ) -> Option<std::io::Error> {
+        let companion = contextdb_core::store_companion_path(source);
+        let mut state = final_rename_fault()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = state.active.as_mut()?;
+        if run.attempts != 0 {
+            return None;
+        }
+        run.attempts = 1;
+        run.source = Some(source.to_path_buf());
+        run.destination = Some(destination.to_path_buf());
+        run.source_existed = std::fs::symlink_metadata(source).is_ok();
+        run.companion_existed = std::fs::symlink_metadata(&companion).is_ok();
+        Some(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected final migration rename failure",
+        ))
+    }
+
+    #[derive(Debug)]
+    struct TemporaryCompanionCleanupFaultRun {
+        token: u64,
+        attempted_paths: Vec<PathBuf>,
+        injected_failures: usize,
+        real_removal_paths: Vec<PathBuf>,
+        successful_real_removals: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct TemporaryCompanionCleanupFaultState {
+        next_token: u64,
+        active: Option<TemporaryCompanionCleanupFaultRun>,
+    }
+
+    static TEMPORARY_COMPANION_CLEANUP_FAULT: OnceLock<Mutex<TemporaryCompanionCleanupFaultState>> =
+        OnceLock::new();
+
+    fn temporary_companion_cleanup_fault() -> &'static Mutex<TemporaryCompanionCleanupFaultState> {
+        TEMPORARY_COMPANION_CLEANUP_FAULT
+            .get_or_init(|| Mutex::new(TemporaryCompanionCleanupFaultState::default()))
+    }
+
+    #[derive(Debug)]
+    pub struct TemporaryCompanionCleanupFaultGuard {
+        token: u64,
+        verified: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TemporaryCompanionCleanupFaultObservation {
+        pub exact_path: PathBuf,
+        pub attempted_removals: usize,
+        pub injected_failures: usize,
+        pub real_removals: usize,
+        pub successful_real_removals: usize,
+    }
+
+    impl Drop for TemporaryCompanionCleanupFaultGuard {
+        fn drop(&mut self) {
+            if self.verified {
+                return;
+            }
+            let mut state = temporary_companion_cleanup_fault()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.active.as_ref().map(|run| run.token) == Some(self.token) {
+                state.active = None;
+            }
+            drop(state);
+            if !std::thread::panicking() {
+                panic!(
+                    "temporary-companion cleanup fault was dropped without proving its exact \
+                     consumption"
+                );
+            }
+        }
+    }
+
+    impl TemporaryCompanionCleanupFaultGuard {
+        pub fn verify_exact_retry_for_test(
+            mut self,
+            expected_path: &Path,
+        ) -> TemporaryCompanionCleanupFaultObservation {
+            let run = {
+                let mut state = temporary_companion_cleanup_fault()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let run = state
+                    .active
+                    .take()
+                    .expect("temporary-companion cleanup fault was not active");
+                assert_eq!(run.token, self.token, "cleanup fault token changed");
+                run
+            };
+            assert_eq!(
+                run.attempted_paths,
+                [expected_path.to_path_buf(), expected_path.to_path_buf()],
+                "the exact generated companion must receive the failed removal and one retry"
+            );
+            assert_eq!(
+                run.injected_failures, 1,
+                "the one-shot fault must fire once"
+            );
+            assert_eq!(
+                run.real_removal_paths,
+                [expected_path.to_path_buf()],
+                "the retry must perform the one real filesystem removal"
+            );
+            assert_eq!(
+                run.successful_real_removals, 1,
+                "the exact retry must remove the generated companion"
+            );
+            self.verified = true;
+            TemporaryCompanionCleanupFaultObservation {
+                exact_path: expected_path.to_path_buf(),
+                attempted_removals: run.attempted_paths.len(),
+                injected_failures: run.injected_failures,
+                real_removals: run.real_removal_paths.len(),
+                successful_real_removals: run.successful_real_removals,
+            }
+        }
+    }
+
+    pub fn arm_temporary_companion_cleanup_failure_for_test() -> TemporaryCompanionCleanupFaultGuard
+    {
+        let mut state = temporary_companion_cleanup_fault()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.active.is_none(),
+            "temporary-companion cleanup fault is already armed"
+        );
+        state.next_token = state.next_token.wrapping_add(1);
+        let token = state.next_token;
+        state.active = Some(TemporaryCompanionCleanupFaultRun {
+            token,
+            attempted_paths: Vec::new(),
+            injected_failures: 0,
+            real_removal_paths: Vec::new(),
+            successful_real_removals: 0,
+        });
+        TemporaryCompanionCleanupFaultGuard {
+            token,
+            verified: false,
+        }
+    }
+
+    pub(super) fn before_temporary_companion_cleanup(path: &Path) -> Option<std::io::Error> {
+        let mut state = temporary_companion_cleanup_fault()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = state.active.as_mut()?;
+        run.attempted_paths.push(path.to_path_buf());
+        // Only the first attempt is made to fail; the retry the door performs
+        // must reach the real removal.
+        if run.injected_failures == 0 {
+            run.injected_failures = 1;
+            return Some(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected temporary-companion cleanup failure",
+            ));
+        }
+        None
+    }
+
+    pub(super) fn after_temporary_companion_cleanup(path: &Path, removed: bool) {
+        let mut state = temporary_companion_cleanup_fault()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(run) = state.active.as_mut() else {
+            return;
+        };
+        run.real_removal_paths.push(path.to_path_buf());
+        if removed {
+            run.successful_real_removals += 1;
+        }
+    }
+}
+
+/// What a finished migration did, for the caller to report.
+///
+/// A receipt, not a handle: by the time it exists the migrated store is
+/// published at the original pathname and every handle the migration held is
+/// released, so there is nothing here a caller could still write through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReceipt {
+    pub applied_rows: usize,
+    pub keyless_rows_copied: u64,
+    pub keyless_table_receipts: Vec<(String, u64)>,
+}
+
 impl LegacyMigrationSource {
+    fn with_database<T>(&self, operation: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+        let mut state = self.state.lock();
+        if matches!(&*state, LegacyMigrationSourceState::Acquired { .. }) {
+            let acquired = std::mem::replace(&mut *state, LegacyMigrationSourceState::Closed);
+            let LegacyMigrationSourceState::Acquired {
+                registry,
+                persistence,
+            } = acquired
+            else {
+                unreachable!("legacy migration source state was just matched as acquired");
+            };
+            let database = Database::open_acquired_legacy_migration(registry, persistence)?;
+            *state = LegacyMigrationSourceState::Open(database);
+        }
+        match &*state {
+            LegacyMigrationSourceState::Open(database) => operation(database),
+            LegacyMigrationSourceState::Closed => {
+                Err(Error::Other("legacy migration source is closed".to_owned()))
+            }
+            LegacyMigrationSourceState::Acquired { .. } => {
+                unreachable!("acquired legacy migration source was not hydrated")
+            }
+        }
+    }
+
     /// Read the visible current rows of every keyless table. Any table scan
     /// failure aborts the whole snapshot; a table is never silently omitted.
     pub fn keyless_table_rows(&self) -> Result<BTreeMap<String, LegacyKeylessTableRows>> {
-        let mut result = BTreeMap::new();
-        for table_name in self.0.table_names() {
-            let Some(table_meta) = self.0.table_meta(&table_name) else {
-                continue;
-            };
-            if natural_key_columns_for_meta(&table_meta).is_some() {
-                continue;
-            }
+        self.with_database(|database| {
+            let mut result = BTreeMap::new();
+            for table_name in database.table_names() {
+                let Some(table_meta) = database.table_meta(&table_name) else {
+                    continue;
+                };
+                if natural_key_columns_for_meta(&table_meta).is_some() {
+                    continue;
+                }
 
-            let scan_result = scan_legacy_table_rows(&self.0, &table_name)?;
-            let columns = table_meta
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect::<Vec<_>>();
-            let rows = scan_result
-                .rows
-                .into_iter()
-                .map(|row| {
-                    columns
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, column)| {
-                            row.get(index).cloned().map(|value| (column.clone(), value))
-                        })
-                        .collect::<HashMap<_, _>>()
-                })
-                .collect::<Vec<_>>();
-            if !rows.is_empty() {
-                result.insert(table_name, LegacyKeylessTableRows { columns, rows });
+                let scan_result = scan_legacy_table_rows(database, &table_name)?;
+                let columns = table_meta
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>();
+                let rows = scan_result
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        columns
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, column)| {
+                                row.get(index).cloned().map(|value| (column.clone(), value))
+                            })
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .collect::<Vec<_>>();
+                if !rows.is_empty() {
+                    result.insert(table_name, LegacyKeylessTableRows { columns, rows });
+                }
             }
-        }
-        Ok(result)
+            Ok(result)
+        })
     }
 
-    /// Close the read-only migration source before the CLI atomically swaps
-    /// the newly written database into its place.
+    /// Copy the exact store this migration locked into `destination`, before
+    /// anything has hydrated it.
+    ///
+    /// The backup reads through the descriptor the source guard took, so the
+    /// source pathname is never resolved again: unlinking it or replacing it
+    /// with a symlink after the guard was acquired cannot redirect one byte.
+    /// A source that has already been hydrated no longer holds that
+    /// descriptor and is refused rather than served whatever the pathname
+    /// resolves to now -- the backup's whole point is that it precedes
+    /// Redb's first open-time write.
+    #[cfg(unix)]
+    pub fn copy_locked_source_to(&self, destination: &Path) -> Result<u64> {
+        match &*self.state.lock() {
+            LegacyMigrationSourceState::Acquired { persistence, .. } => {
+                persistence.copy_locked_source_to(destination)
+            }
+            LegacyMigrationSourceState::Open(_) => Err(Error::Other(
+                "the migration source was already hydrated, so the locked descriptor its untouched backup must read through is gone"
+                    .to_owned(),
+            )),
+            LegacyMigrationSourceState::Closed => {
+                Err(Error::Other("legacy migration source is closed".to_owned()))
+            }
+        }
+    }
+
+    /// Record, in the ORIGINAL source companion, the exact target this
+    /// migration is building.
+    ///
+    /// Recording is repeatable by design. The durable record names the target
+    /// by a checksummed fingerprint of its current bytes, and those bytes
+    /// change as the target is built, so the caller re-records at every point
+    /// from which a crash must still be able to identify the exact inode it
+    /// left behind. Re-recording never disturbs the surviving generation: the
+    /// companion's published record stands beside the pending one, and the
+    /// target the standing record names is retained rather than treated as
+    /// abandoned residue.
+    pub(crate) fn record_replacement_target(&self, target: &Path) -> Result<()> {
+        self.with_database(|database| {
+            database
+                .persistence
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Other("migration source has no persistence handle".to_owned())
+                })?
+                .prepare_replacement_database(target)
+        })
+    }
+
+    /// Migrate this validated legacy source in place and publish the result.
+    ///
+    /// Everything the migration operates on comes from the source itself: it
+    /// republishes at the source's own pathname, builds its replacement at a
+    /// sibling target this door allocates, and reads the keyless-table rows
+    /// it must copy out of the source it holds. A caller cannot redirect the
+    /// publication, name the target, or substitute the rows -- it asks for
+    /// this store to be migrated and receives a receipt.
+    ///
+    /// The work: open a fresh current-format root, import every row via
+    /// changeset replay, copy the current rows of every keyless table (not
+    /// representable in a changeset), durably record and prepare the exact
+    /// target -- re-recording after every operation that changes the target's
+    /// bytes -- swap it into place, drop the generated companion, and release
+    /// both handles, so a crash at any point recovers to exactly one inode.
+    ///
+    /// This is the ONE door onto this source's and the target's
+    /// durability-mutating operations (`record_replacement_target`,
+    /// [`Database::durably_prepare_migration_replacement`]); a caller staging
+    /// a migration replacement never calls either directly. On any failure
+    /// after the target is created, the target this call created is fully
+    /// rolled back -- the fresh root closed and removed, its companion
+    /// removed, and this source closed; a failure opening the target itself
+    /// leaves nothing to roll back beyond this source.
+    pub fn migrate_in_place(&self) -> std::result::Result<MigrationReceipt, MigrationError> {
+        fn lock_path_for(path: &Path) -> PathBuf {
+            store_companion_path(path)
+        }
+
+        let destination = self.path.as_path();
+        // Read the rows a changeset cannot carry before anything is built.
+        // A scan failure aborts the migration whole; a table is never
+        // silently omitted from what gets published.
+        let keyless_table_rows = match self.keyless_table_rows() {
+            Ok(rows) => rows,
+            Err(error) => {
+                let _ = self.close();
+                return Err(MigrationError::KeylessRowsCopy(error));
+            }
+        };
+        let keyless_table_rows = &keyless_table_rows;
+        let tmp_path = match migration_temp_path(destination) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = self.close();
+                return Err(MigrationError::TempStoreOpen(Error::Other(format!(
+                    "a migration target name could not be allocated: {error}"
+                ))));
+            }
+        };
+        let tmp_path = tmp_path.as_path();
+
+        let rollback_target = |tmp_db: Database| {
+            let _ = tmp_db.close();
+            let _ = std::fs::remove_file(tmp_path);
+            let _ = std::fs::remove_file(lock_path_for(tmp_path));
+            let _ = self.close();
+        };
+
+        let tmp_db = Database::open(tmp_path).map_err(|err| {
+            let _ = self.close();
+            MigrationError::TempStoreOpen(err)
+        })?;
+
+        // Record the exact target in the ORIGINAL companion before every
+        // point a crash could leave it behind. The record names the target
+        // by a fingerprint of its current bytes, so it is refreshed each
+        // time those bytes change; recovery then removes exactly this inode
+        // and nothing else.
+        if let Err(err) = self.record_replacement_target(tmp_path) {
+            rollback_target(tmp_db);
+            return Err(MigrationError::RecordReplacementTarget(err));
+        }
+        observe_migration_boundary(MigrationBoundary::TemporaryStoreOpened);
+
+        let applied_rows = match tmp_db.import_legacy_database(self) {
+            Ok(result) => result.applied_rows,
+            Err(err) => {
+                rollback_target(tmp_db);
+                return Err(MigrationError::ImportLegacyData(err));
+            }
+        };
+        if let Err(err) = self.record_replacement_target(tmp_path) {
+            rollback_target(tmp_db);
+            return Err(MigrationError::RecordReplacementTarget(err));
+        }
+        observe_migration_boundary(MigrationBoundary::TemporaryStoreImported);
+
+        // The source is now logically sealed for migration reads, but its
+        // Redb handle deliberately remains open through the caller's swap
+        // and publication.
+        if let Err(err) = self.record_replacement_target(tmp_path) {
+            rollback_target(tmp_db);
+            return Err(MigrationError::RecordReplacementTarget(err));
+        }
+        observe_migration_boundary(MigrationBoundary::SourceStoreSealed);
+
+        // Copy current rows of keyless tables into the migrated database.
+        // These rows are not representable in a changeset, so we copy the
+        // VISIBLE CURRENT state after the changeset replay. `columns` is the
+        // ONE ordered list this table's `LegacyKeylessTableRows` already
+        // carries, used for BOTH the column-name list and the `$name`
+        // placeholder list, so the two always name the same column in the
+        // same position; `row` is keyed by those same column names, so every
+        // `$name` placeholder resolves against the matching value regardless
+        // of `HashMap` iteration order.
+        let mut keyless_rows_copied = 0u64;
+        let mut keyless_table_receipts: Vec<(String, u64)> = Vec::new();
+        for (table_name, table_rows) in keyless_table_rows {
+            let columns = &table_rows.columns;
+            let rows = &table_rows.rows;
+            let column_list = columns.join(", ");
+            let placeholder_list = columns
+                .iter()
+                .map(|c| format!("${c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let insert_sql =
+                format!("INSERT INTO {table_name} ({column_list}) VALUES ({placeholder_list})");
+            let mut copied_for_table = 0u64;
+            for row in rows {
+                match tmp_db.execute(&insert_sql, row) {
+                    Ok(_) => {
+                        keyless_rows_copied += 1;
+                        copied_for_table += 1;
+                    }
+                    Err(err) => {
+                        rollback_target(tmp_db);
+                        return Err(MigrationError::KeylessRowsCopy(err));
+                    }
+                }
+            }
+            keyless_table_receipts.push((table_name.clone(), copied_for_table));
+        }
+        // Record the exact target in the ORIGINAL companion before every
+        // point a crash could leave it behind, as above.
+        if let Err(err) = self.record_replacement_target(tmp_path) {
+            rollback_target(tmp_db);
+            return Err(MigrationError::RecordReplacementTarget(err));
+        }
+        observe_migration_boundary(MigrationBoundary::TemporaryStoreBuilt);
+
+        // Record the finished target durably WITHOUT releasing it. Its Redb
+        // handle stays exclusively held through the caller's rename, so no
+        // other writer can open the exact inode being swapped in; it is
+        // released only after publication.
+        if let Err(err) = tmp_db.durably_prepare_migration_replacement() {
+            rollback_target(tmp_db);
+            return Err(MigrationError::DurablyPrepare(err));
+        }
+        observe_migration_boundary(MigrationBoundary::TemporaryStoreDurablyPreparedAndOwned);
+
+        // The swap. Until it succeeds the original generation is still the
+        // store at this pathname and its backup is already durable, so a
+        // failure abandons the migration whole: every artifact this attempt
+        // generated is removed and the operator is left with a usable store
+        // and nothing to finish by hand.
+        observe_migration_boundary(MigrationBoundary::BeforeAtomicSwap);
+        if let Err(error) = rename_migration_target(tmp_path, destination) {
+            rollback_target(tmp_db);
+            return Err(MigrationError::AtomicSwap(error));
+        }
+        observe_migration_boundary(MigrationBoundary::AfterAtomicSwap);
+
+        // The swap has already published the migrated store, so a transient
+        // failure to drop the generated companion must not become residue the
+        // operator has to clear: the exact same pathname is retried once.
+        let generated_companion = lock_path_for(tmp_path);
+        match remove_migration_temporary_companion(&generated_companion) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                let _ = remove_migration_temporary_companion(&generated_companion);
+            }
+        }
+        observe_migration_boundary(MigrationBoundary::TemporaryCompanionCleaned);
+        observe_migration_boundary(MigrationBoundary::BeforeFinalGuardRelease);
+
+        // Publication first, then the target handle: it is released only
+        // after the swap it was held to protect has been published.
+        let publication = self.close();
+        let released = tmp_db.close();
+        publication
+            .and(released)
+            .map_err(MigrationError::PublishReplacement)?;
+
+        Ok(MigrationReceipt {
+            applied_rows,
+            keyless_rows_copied,
+            keyless_table_receipts,
+        })
+    }
+
+    /// Close the migration source after replacement publication.
     pub fn close(&self) -> Result<()> {
-        self.0.close()
+        let state = std::mem::replace(&mut *self.state.lock(), LegacyMigrationSourceState::Closed);
+        match state {
+            LegacyMigrationSourceState::Acquired { .. } | LegacyMigrationSourceState::Closed => {
+                Ok(())
+            }
+            LegacyMigrationSourceState::Open(database) => {
+                let publication = database
+                    .persistence
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::Other("migration source has no persistence handle".to_owned())
+                    })?
+                    .publish_prepared_replacement_if_current();
+                let close = database.close();
+                publication.and(close)
+            }
+        }
     }
 }
 
@@ -6054,6 +7161,46 @@ pub(crate) struct AccessConstraints {
     principal: Option<Principal>,
 }
 
+/// Why a writer will not serve the visibility one read session declared.
+///
+/// It exists for the axis that cannot be narrowed: two identities have no
+/// ordering, so a declaration naming one the writer does not read as has no
+/// answer that is both the reader's and no wider than it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeclaredReadRefusal {
+    /// The session declared it reads as `declared` and the writer serving it
+    /// was opened as `serving`.
+    PrincipalConflict {
+        declared: Principal,
+        serving: Principal,
+    },
+}
+
+impl DeclaredReadRefusal {
+    /// What the refused reader is told, in the words it needs to declare
+    /// something this writer can serve -- or nothing at all: both identities,
+    /// named as identities rather than dumped as Rust values.
+    pub(crate) fn stated(&self) -> String {
+        match self {
+            Self::PrincipalConflict { declared, serving } => format!(
+                "this session declared it reads as {}, and the writer holding this store reads \
+                 as {}",
+                identity_wording(declared),
+                identity_wording(serving)
+            ),
+        }
+    }
+}
+
+/// One identity in the words a person reads.
+fn identity_wording(principal: &Principal) -> String {
+    match principal {
+        Principal::System => "the system identity".to_owned(),
+        Principal::Agent(name) => format!("the agent {name}"),
+        Principal::Human(name) => format!("the person {name}"),
+    }
+}
+
 fn narrowed_constraint_set<T: Ord + Clone>(
     parent: &Option<BTreeSet<T>>,
     child: Option<BTreeSet<T>>,
@@ -6095,10 +7242,14 @@ pub(crate) struct UpdateReplacementContext<'a> {
     pub(crate) created_at: Wallclock,
 }
 
+/// What a removal hands back to the accountant at the commit that removes it.
+///
+/// Adjacency has no entry here on purpose: deleting an edge stamps the entry
+/// and leaves it whole in both adjacency maps, so its bytes are still held
+/// and are handed back by the retention pass that physically removes it.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DeleteReleaseBytes {
     relational: Vec<usize>,
-    edges: Vec<usize>,
     vectors: Vec<usize>,
 }
 
@@ -6215,7 +7366,7 @@ fn open_file_registry() -> &'static OpenFileRegistry {
     })
 }
 
-fn canonical_database_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical_database_path(path: &Path) -> Result<PathBuf> {
     canonical_database_path_inner(path, 0)
 }
 
@@ -6265,6 +7416,123 @@ struct OpenRegistryReservation {
     active: bool,
 }
 
+/// What a handle on a store is FOR, and therefore whether the store waits for
+/// it.
+///
+/// A store is held open by the handle that acquired it and by every live
+/// reader looking at it. It is NOT held open by the handles its own components
+/// keep for themselves — the owner service's view of the store it serves, a
+/// background worker's view of the store it maintains — because those live for
+/// as long as the process does. Counting them would mean the store is never
+/// let go and the next opener is told forever that it is taken.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandleRole {
+    /// Acquired the store's resources; hands them over rather than releasing
+    /// them while a reader is still looking.
+    Owner,
+    /// A caller reading the store. The store outlives the owner for as long as
+    /// one of these is alive.
+    Reader,
+    /// A view the store keeps for its own machinery. Waits for nothing.
+    Internal,
+}
+
+impl HandleRole {
+    /// Whether the store waits for this handle before it is released.
+    const fn holds_the_store(self) -> bool {
+        matches!(self, Self::Owner | Self::Reader)
+    }
+}
+
+/// What a store still owes, and who is left to pay it.
+///
+/// Every handle on one store shares this. The owner handle is the one that
+/// ACQUIRED the store's resources, but it is not necessarily the last to let
+/// go: a session a blocked request or a suspended cursor is holding keeps the
+/// store alive after the owner handle is gone. Releasing while such a reader
+/// is still inside would pull the store out from under it and tell the next
+/// opener the store is free while somebody is still reading it.
+///
+/// So the owner hands what it holds to this record instead, and whichever
+/// holder turns out to be the last one pays it out on the way down.
+pub(crate) struct StoreFinalization {
+    live_holders: AtomicUsize,
+    pending: Mutex<Option<PendingStoreRelease>>,
+}
+
+/// The resources an owner acquired, waiting for the last holder to release.
+struct PendingStoreRelease {
+    persistence: Option<Arc<RedbPersistence>>,
+    open_registry_path: Option<PathBuf>,
+    owner_read_service: Option<Arc<crate::owner_read::OwnerReadService>>,
+    /// Present only when somebody else will pay this release out. A plugin is
+    /// told the store closed by whoever actually finishes it, and a handle
+    /// that finishes its own store is an ordinary drop, which owes the plugin
+    /// nothing.
+    plugin: Option<Arc<dyn DatabasePlugin>>,
+}
+
+impl StoreFinalization {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            live_holders: AtomicUsize::new(1),
+            pending: Mutex::new(None),
+        })
+    }
+
+    fn note_new_holder(&self) {
+        self.live_holders.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether the holder letting go now is the last one on this store.
+    ///
+    /// Counting past zero would be a bookkeeping fault rather than a release,
+    /// so a count already at zero stays there and answers "not the last": the
+    /// store has already been let go.
+    fn note_holder_released(&self) -> bool {
+        self.live_holders
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
+                live.checked_sub(1)
+            })
+            .is_ok_and(|previous| previous == 1)
+    }
+
+    fn defer(&self, release: PendingStoreRelease) {
+        *self.pending.lock() = Some(release);
+    }
+
+    fn take_pending(&self) -> Option<PendingStoreRelease> {
+        self.pending.lock().take()
+    }
+}
+
+/// Let go of everything an owner acquired for one store.
+fn release_store(release: PendingStoreRelease) {
+    if let Some(service) = &release.owner_read_service {
+        service.release_channel();
+        // The channel is gone and this owner will not take new work, so the
+        // record beside the store says exactly that for as long as this writer
+        // still holds it. A reader arriving inside that window is told the
+        // owner is winding down instead of meeting a lock it cannot explain.
+        if let Some(persistence) = &release.persistence {
+            let _ = persistence.record_owner_read_status(service.status());
+        }
+    }
+    if let Some(persistence) = &release.persistence {
+        let _ = persistence.prepare_armed_migration_replacement();
+        persistence.close();
+    }
+    if let Some(path) = &release.open_registry_path {
+        release_open_registry_path(path);
+    }
+    // The plugin hears about the close from whoever ends the store. The handle
+    // that opened it went away while a reader was still inside, so nothing
+    // else is left to tell it, and it is told exactly once -- here.
+    if let Some(plugin) = &release.plugin {
+        let _closed = plugin.on_close();
+    }
+}
+
 struct OpenFileRegistry {
     entries: Mutex<BTreeMap<PathBuf, OpenRegistryState>>,
     waiters: Condvar,
@@ -6289,7 +7557,7 @@ impl OpenRegistryState {
 }
 
 struct DatabaseOperationGuard<'a> {
-    db_id: usize,
+    db_id: DatabaseId,
     _lock: Option<parking_lot::RwLockReadGuard<'a, ()>>,
     // Every outer public operation observes one table-schema publication.
     // Local/received DDL already owns the write side before entering here, so
@@ -6424,8 +7692,12 @@ impl Drop for OpenRegistryReservation {
     }
 }
 
+/// `readers` is the runtime directory this deployment's direct readers publish
+/// themselves in, so a refusal names the readers actually holding the store.
+/// `None` means nobody stated one and the platform default is where they are.
 fn acquire_registry_and_persistence(
     canonical_path: &Path,
+    open_disposition: OpenDisposition,
 ) -> Result<(OpenRegistryReservation, Arc<RedbPersistence>)> {
     let retry_deadline = Instant::now() + SAME_PROCESS_REOPEN_RETRY;
     let cross_process_retry_deadline = Instant::now() + CROSS_PROCESS_LOCK_SETTLE_RETRY;
@@ -6445,10 +7717,22 @@ fn acquire_registry_and_persistence(
                 Err(err) => return Err(err),
             };
 
-        let persistence = if canonical_path.exists() {
-            RedbPersistence::open(canonical_path)
-        } else {
-            RedbPersistence::create(canonical_path)
+        // This is the one place a writable open decides between taking a
+        // store and bringing one into being, so it is the only place the
+        // disposition can be enforced without inventing a second door. Under
+        // `ExistingOnly` the existence question is not asked at all -- asking
+        // it and then acting on the answer is precisely the race the
+        // disposition exists to remove -- the ordinary open is attempted, and
+        // the attempt's own "nothing here" is the typed refusal.
+        let persistence = match open_disposition {
+            OpenDisposition::ExistingOnly => RedbPersistence::open_existing_only(canonical_path),
+            OpenDisposition::CreateIfMissing => {
+                if canonical_path.exists() {
+                    RedbPersistence::open(canonical_path)
+                } else {
+                    RedbPersistence::create(canonical_path)
+                }
+            }
         };
 
         match persistence {
@@ -6469,7 +7753,70 @@ fn acquire_registry_and_persistence(
                 drop(registry_reservation);
                 wait_for_open_registry_change(Duration::from_millis(1));
             }
+            Err(Error::ReadFailure(failure))
+                if failure.kind() == ReadFailureKind::HeldByWriter
+                    && Instant::now() < cross_process_retry_deadline =>
+            {
+                drop(registry_reservation);
+                wait_for_open_registry_change(Duration::from_millis(1));
+            }
+            // HeldByReaders deliberately falls through: Redb has already
+            // proved reader contention, so writer open refuses on this one
+            // attempt instead of spending the writer-settle retry window.
             Err(err) => return Err(err),
+        }
+    }
+}
+
+fn acquire_registry_and_legacy_migration(
+    canonical_path: &Path,
+) -> Result<(OpenRegistryReservation, LegacyMigrationOpenCapability)> {
+    let retry_deadline = Instant::now() + SAME_PROCESS_REOPEN_RETRY;
+    let cross_process_retry_deadline = Instant::now() + CROSS_PROCESS_LOCK_SETTLE_RETRY;
+
+    loop {
+        let registry_reservation =
+            match OpenRegistryReservation::acquire(canonical_path.to_path_buf()) {
+                Ok(reservation) => reservation,
+                Err(Error::DatabaseLocked { holder_pid, path })
+                    if holder_pid == std::process::id()
+                        && path == canonical_path
+                        && Instant::now() < retry_deadline =>
+                {
+                    wait_for_open_registry_change(Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+        match RedbPersistence::acquire_legacy_migration_capability(canonical_path) {
+            Ok(capability) => return Ok((registry_reservation, capability)),
+            Err(Error::DatabaseLocked { holder_pid, path })
+                if holder_pid == std::process::id()
+                    && path == canonical_path
+                    && Instant::now() < retry_deadline =>
+            {
+                drop(registry_reservation);
+                wait_for_open_registry_change(Duration::from_millis(1));
+            }
+            Err(Error::DatabaseLocked { holder_pid, path })
+                if holder_pid != std::process::id()
+                    && path == canonical_path
+                    && Instant::now() < cross_process_retry_deadline =>
+            {
+                drop(registry_reservation);
+                wait_for_open_registry_change(Duration::from_millis(1));
+            }
+            Err(Error::ReadFailure(failure))
+                if failure.kind() == ReadFailureKind::HeldByWriter
+                    && Instant::now() < cross_process_retry_deadline =>
+            {
+                drop(registry_reservation);
+                wait_for_open_registry_change(Duration::from_millis(1));
+            }
+            // A direct-reader lock is definitive and never enters the writer
+            // settle retry window.
+            Err(error) => return Err(error),
         }
     }
 }
@@ -6622,6 +7969,16 @@ pub struct PruningReport {
     /// commit and nothing used to remove them, so it grew with every write
     /// forever; retention now trims it to what a consumer can still name.
     pub pruned_commit_index_entries: u64,
+    /// Expired rows this cycle left physically in place because a REGISTERED
+    /// READER — an in-flight statement, a caller-held snapshot pin, or a
+    /// suspended bounded cursor — can still resolve to them. They are not
+    /// blocked and not lost: the next cycle that runs with no reader holding
+    /// them reclaims them. Without this count a cycle that deferred
+    /// everything reads exactly like a cycle with nothing to reclaim, so an
+    /// operator watching disk that is not coming back cannot tell that
+    /// closing a reader is what would move it. Counted from the rows the pass
+    /// actually held back, never from a configured expectation.
+    pub rows_deferred_for_readers: u64,
 }
 
 /// What the engine-owned maintenance loop is doing for this database.
@@ -6746,9 +8103,74 @@ struct SnapshotFloorRegistry {
     removal_pass_test_pause: Arc<ApplyPhasePause>,
 }
 
+/// One registered read snapshot, plus whatever the holder published about
+/// how long it stays entitled to that snapshot. A statement's registration
+/// and a caller-held pin carry no window: they last exactly as long as the
+/// guard does. A suspended bounded cursor carries its idle window, because
+/// the engine already refuses that cursor's next page once the window has
+/// passed -- see [`CursorIdleWindow`].
+struct RegisteredSnapshot {
+    snapshot: SnapshotId,
+    /// `None` for a registration that stays entitled for as long as it is
+    /// registered; `Some` for one whose holder has an idle deadline of its
+    /// own.
+    idle_window: Option<Arc<CursorIdleWindow>>,
+}
+
+impl RegisteredSnapshot {
+    /// Whether removal must still defer to this registration. A holder past
+    /// its own idle deadline is refused its next page, so deferring to it
+    /// would hold rows back for a reader that can never read them again.
+    fn holder_still_entitled(&self) -> bool {
+        self.idle_window
+            .as_ref()
+            .is_none_or(|window| window.holder_still_entitled())
+    }
+}
+
+/// The idle window a suspended bounded cursor publishes to removal, read
+/// off the SAME clock and the SAME `cursor_idle_ms` limit the cursor's own
+/// next-page check uses, so both answer "is this reader still entitled?"
+/// identically. The cursor stamps [`Self::touch`] every time it hands a page
+/// back; a reader that walks away stops stamping and falls out of the
+/// registered set that removal defers to.
+pub(crate) struct CursorIdleWindow {
+    clock: Arc<dyn DeadlineClock>,
+    idle_ms: u64,
+    last_used_ms: AtomicU64,
+}
+
+impl CursorIdleWindow {
+    pub(crate) fn new(clock: Arc<dyn DeadlineClock>, idle_ms: u64, opened_ms: u64) -> Self {
+        Self {
+            clock,
+            idle_ms,
+            last_used_ms: AtomicU64::new(opened_ms),
+        }
+    }
+
+    /// Record that the holder just used the cursor.
+    pub(crate) fn touch(&self, now_ms: u64) {
+        self.last_used_ms.store(now_ms, Ordering::SeqCst);
+    }
+
+    /// `true` while the holder is still inside its idle window. A clock that
+    /// reads BACKWARDS yields a zero-length idle here rather than an early
+    /// expiry: removal stays on the safe side and keeps deferring, and the
+    /// cursor's own next-page check is the one that reports the disordered
+    /// clock.
+    fn holder_still_entitled(&self) -> bool {
+        let idle = self
+            .clock
+            .now_ms()
+            .saturating_sub(self.last_used_ms.load(Ordering::SeqCst));
+        idle <= self.idle_ms
+    }
+}
+
 #[derive(Default)]
 struct SnapshotFloorState {
-    active: HashMap<u64, SnapshotId>,
+    active: HashMap<u64, RegisteredSnapshot>,
     /// `Some(pass)` while a version-cleanup removal pass is in flight;
     /// `None` means no pass is active. Set by `begin_removal_pass` the
     /// moment a pass samples its registered set and watermark; cleared (and
@@ -6776,32 +8198,87 @@ struct ActiveRemovalPass {
     watermark: TxId,
 }
 
+/// How long a withdrawable registration parks before it consults its
+/// caller's withdrawal again. A finishing pass wakes every parked
+/// registration directly, so this bounds only how long a caller that has
+/// already withdrawn stays parked before it is answered.
+const WITHDRAWAL_CHECK_INTERVAL: Duration = Duration::from_millis(5);
+
 impl SnapshotFloorRegistry {
+    /// Whether an in-flight removal pass must hold a registration for
+    /// `snapshot` until the pass finishes.
+    ///
+    /// Blocking rule: a pass can only ever prune a version superseded AT OR
+    /// BEFORE its own sampled `watermark` -- every row it can see was
+    /// committed under the SAME commit-lock hold that produced `watermark`
+    /// (`compact_currency_versions_inner` runs entirely inside
+    /// `with_commit_lock`, so nothing commits in between). A registration
+    /// for a snapshot STRICTLY AFTER `watermark` can therefore never
+    /// resolve a version this pass might remove (its `deleted_tx` is
+    /// `<= watermark < snapshot`, so `VersionedRow::visible_at` is false
+    /// regardless), and may register immediately. A snapshot AT OR BEFORE
+    /// `watermark` might be exactly what this pass is deciding about, and
+    /// this pass's own deferral only consulted the registered set at ITS
+    /// start -- which cannot already include a registration racing in now
+    /// -- so it must wait for the pass to finish rather than register onto
+    /// a sample that will never account for it.
+    fn pass_holds(state: &SnapshotFloorState, snapshot: SnapshotId) -> bool {
+        state
+            .active_pass
+            .is_some_and(|pass| snapshot.0 <= pass.watermark.0)
+    }
+
     fn register(self: &Arc<Self>, snapshot: SnapshotId) -> SnapshotRegistration {
         let mut state = self.state.lock();
-        while let Some(pass) = &state.active_pass {
-            // Blocking rule: this pass can only ever prune a version
-            // superseded AT OR BEFORE its own sampled `watermark` -- every
-            // row it can see was committed under the SAME commit-lock hold
-            // that produced `watermark` (`compact_currency_versions_inner`
-            // runs entirely inside `with_commit_lock`, so nothing commits
-            // in between). A registration for a snapshot STRICTLY AFTER
-            // `watermark` can therefore never resolve a version this pass
-            // might remove (its `deleted_tx` is `<= watermark < snapshot`,
-            // so `VersionedRow::visible_at` is false regardless), and may
-            // register immediately. A snapshot AT OR BEFORE `watermark`
-            // might be exactly what this pass is deciding about, and this
-            // pass's own deferral only consulted the registered set at ITS
-            // start -- which cannot already include a registration racing
-            // in now -- so it must wait for the pass to finish rather than
-            // register onto a sample that will never account for it.
-            if snapshot.0 > pass.watermark.0 {
-                break;
-            }
+        while Self::pass_holds(&state, snapshot) {
             self.pass_finished.wait(&mut state);
         }
+        self.admit(state, snapshot, None)
+    }
+
+    /// Register `snapshot` for a caller that can withdraw the read it is
+    /// registering for -- a bounded read, whose holder may cancel while this
+    /// call is parked behind an in-flight pass. The blocking rule is exactly
+    /// [`Self::pass_holds`], but the park is answerable: the withdrawal is
+    /// consulted on a bounded cadence, and a caller that has withdrawn gets
+    /// `None` -- it is owed a terminal answer of its own, not a registration
+    /// it no longer wants nor a hold that lasts the pass's persisted
+    /// removal. `idle_window` is the window a SUSPENDED cursor publishes, so
+    /// removal defers to it only while it is still entitled to another page.
+    fn register_withdrawable(
+        self: &Arc<Self>,
+        snapshot: SnapshotId,
+        idle_window: Option<Arc<CursorIdleWindow>>,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Option<SnapshotRegistration> {
+        let mut state = self.state.lock();
+        while Self::pass_holds(&state, snapshot) {
+            if withdrawn.is_cancelled() {
+                return None;
+            }
+            self.pass_finished
+                .wait_for(&mut state, WITHDRAWAL_CHECK_INTERVAL);
+        }
+        Some(self.admit(state, snapshot, idle_window))
+    }
+
+    /// Take the registration slot under the lock the caller already holds,
+    /// so nothing can begin a pass between the admission decision above and
+    /// the registered set growing here.
+    fn admit(
+        self: &Arc<Self>,
+        mut state: MutexGuard<'_, SnapshotFloorState>,
+        snapshot: SnapshotId,
+        idle_window: Option<Arc<CursorIdleWindow>>,
+    ) -> SnapshotRegistration {
         let token = self.next_token.fetch_add(1, Ordering::SeqCst);
-        state.active.insert(token, snapshot);
+        state.active.insert(
+            token,
+            RegisteredSnapshot {
+                snapshot,
+                idle_window,
+            },
+        );
         drop(state);
         SnapshotRegistration {
             registry: self.clone(),
@@ -6822,7 +8299,16 @@ impl SnapshotFloorRegistry {
     /// `SnapshotFloorState::active_pass`'s doc comment.
     fn begin_removal_pass(self: &Arc<Self>, watermark: TxId) -> ActiveRemovalPassGuard {
         let mut state = self.state.lock();
-        let mut registered_snapshots: Vec<SnapshotId> = state.active.values().copied().collect();
+        // A registration whose holder is past its own idle deadline is left
+        // out: the engine already refuses that holder's next page, so it is
+        // no longer entitled to hold anything back. See
+        // `RegisteredSnapshot::holder_still_entitled`.
+        let mut registered_snapshots: Vec<SnapshotId> = state
+            .active
+            .values()
+            .filter(|registered| registered.holder_still_entitled())
+            .map(|registered| registered.snapshot)
+            .collect();
         registered_snapshots.sort_unstable();
         state.active_pass = Some(ActiveRemovalPass { watermark });
         drop(state);
@@ -6884,10 +8370,33 @@ impl Drop for SnapshotRegistration {
 /// this makes the check `O(log n)` per version (a binary search) rather
 /// than `O(n)`.
 fn any_registered_snapshot_sees(registered_snapshots: &[SnapshotId], row: &VersionedRow) -> bool {
-    let created = row.created_tx.0;
-    let idx = registered_snapshots.partition_point(|s| s.0 < created);
+    any_registered_snapshot_sees_version(registered_snapshots, row.created_tx, row.deleted_tx)
+}
+
+/// The same question for an ADJACENCY entry. An edge carries its own
+/// creation and deletion stamps, and a schema-free store lets it point at an
+/// id that carries no row at all, so whether a reader can still see the edge
+/// is never answerable from the node rows around it -- see
+/// [`any_registered_snapshot_sees_version`].
+fn any_registered_snapshot_sees_edge(
+    registered_snapshots: &[SnapshotId],
+    entry: &AdjEntry,
+) -> bool {
+    any_registered_snapshot_sees_version(registered_snapshots, entry.created_tx, entry.deleted_tx)
+}
+
+/// Whether any registered snapshot still resolves a version created at
+/// `created_tx` and deleted at `deleted_tx` -- the shared rule behind both
+/// helpers above, with the same binary search over the sorted registered
+/// set.
+fn any_registered_snapshot_sees_version(
+    registered_snapshots: &[SnapshotId],
+    created_tx: TxId,
+    deleted_tx: Option<TxId>,
+) -> bool {
+    let idx = registered_snapshots.partition_point(|s| s.0 < created_tx.0);
     match registered_snapshots.get(idx) {
-        Some(candidate) => row.deleted_tx.is_none_or(|deleted| candidate.0 < deleted.0),
+        Some(candidate) => deleted_tx.is_none_or(|deleted| candidate.0 < deleted.0),
         None => false,
     }
 }
@@ -6942,6 +8451,9 @@ pub(crate) struct MaintenanceContext {
     /// after the setter runs. See that field's doc comment.
     trigger_audit_retention_secs: Arc<AtomicU64>,
     snapshot_registry: Arc<SnapshotFloorRegistry>,
+    /// Shared with the `Database` handle (same `Arc`) -- see that field's
+    /// doc comment.
+    retention_deferred_edge_nodes: Arc<Mutex<HashSet<NodeId>>>,
     last_maintenance_cycle_at: Arc<Mutex<Option<std::time::Instant>>>,
     last_auto_compact_at: Arc<Mutex<Option<std::time::Instant>>>,
     auto_compact_min_interval: Arc<Mutex<Duration>>,
@@ -7215,7 +8727,7 @@ fn log_maintenance_cycle(report: &MaintenanceReport) {
     {
         return;
     }
-    println!(
+    eprintln!(
         "maintenance_cycle pruned_rows={} reclaimed_bytes={} compacted={} file_shrank={} \
          future_dated_rows={} future_dated_tables={} trigger_audit_rows={} \
          currency_versions={} currency_redb_compacted={} auto_compact_ran={} \
@@ -7819,12 +9331,7 @@ pub fn open_memory_with_startup_limit(
     plugin: Arc<dyn DatabasePlugin>,
     memory_limit: Option<usize>,
 ) -> Result<Database> {
-    let accountant = memory_limit
-        .map(MemoryAccountant::with_budget)
-        .unwrap_or_else(MemoryAccountant::no_limit);
-    let db = Database::open_memory_internal(plugin, Arc::new(accountant))?;
-    db.plugin.on_open()?;
-    Ok(db)
+    open_with_startup_limits(MEMORY_DATABASE_PATH, plugin, memory_limit, None)
 }
 
 /// Open a file-backed database with numeric startup ceilings. The mutable
@@ -7835,19 +9342,15 @@ pub fn open_with_startup_limits(
     memory_limit: Option<usize>,
     disk_limit: Option<u64>,
 ) -> Result<Database> {
-    let path = path.as_ref();
-    if path.as_os_str() == ":memory:" {
-        return open_memory_with_startup_limit(plugin, memory_limit);
-    }
-    let accountant = memory_limit
-        .map(MemoryAccountant::with_budget)
-        .unwrap_or_else(MemoryAccountant::no_limit);
-    let db = Database::open_loaded(path, plugin, Arc::new(accountant), disk_limit, false)?;
-    db.plugin.on_open()?;
-    db.start_cron_tickler_if_schedules_present();
-    db.load_retention_sync_peer();
-    db.reconcile_maintenance_thread();
-    Ok(db)
+    Database::open_with_options(
+        path,
+        DatabaseOpenOptions {
+            plugin,
+            memory_limit,
+            disk_limit,
+            ..DatabaseOpenOptions::default()
+        },
+    )
 }
 
 impl Database {
@@ -7877,6 +9380,7 @@ impl Database {
         trigger: Arc<TriggerState>,
     ) -> Self {
         Self {
+            id: DatabaseId::next(),
             tx_mgr: tx_mgr.clone(),
             relational_store: relational.clone(),
             graph_store: graph.clone(),
@@ -7897,6 +9401,7 @@ impl Database {
             capture_detached_sync_write_set: Arc::new(AtomicBool::new(false)),
             detached_sync_write_set: Arc::new(Mutex::new(None)),
             persistence,
+            committed_image_startup: None,
             blob_repository,
             open_registry_path: Mutex::new(open_registry_path),
             operation_gate: Arc::new(RwLock::new(())),
@@ -7912,10 +9417,19 @@ impl Database {
                 hnsw,
                 accountant.clone(),
             ),
-            session_tx: Mutex::new(None),
+            image_store_file_bytes: None,
+            session_tx: Arc::new(Mutex::new(None)),
+            origin_session_tx: None,
             instance_id: uuid::Uuid::new_v4(),
             owner_thread: thread::current().id(),
             plugin,
+            owner_read_config: Arc::new(OwnerReadConfig::default()),
+            owner_read_service: None,
+            owner_read_startup_failure: None,
+            #[cfg(feature = "test-seams")]
+            route_observer: None,
+            #[cfg(feature = "test-seams")]
+            kernel_observer: None,
             access: AccessConstraints::default(),
             accountant,
             conflict_policies: RwLock::new(ConflictPolicies::uniform(
@@ -7945,12 +9459,15 @@ impl Database {
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             limit_update_lock: Arc::new(Mutex::new(())),
-            disk_limit: AtomicU64::new(disk_limit.unwrap_or(0)),
-            disk_limit_startup_ceiling: AtomicU64::new(disk_limit_startup_ceiling.unwrap_or(0)),
+            disk_limit: Arc::new(AtomicU64::new(disk_limit.unwrap_or(0))),
+            disk_limit_startup_ceiling: Arc::new(AtomicU64::new(
+                disk_limit_startup_ceiling.unwrap_or(0),
+            )),
             trigger_audit_retention_secs: Arc::new(AtomicU64::new(
                 TRIGGER_AUDIT_RETENTION.as_secs(),
             )),
             snapshot_registry: Arc::new(SnapshotFloorRegistry::default()),
+            retention_deferred_edge_nodes: Arc::new(Mutex::new(HashSet::new())),
             maintenance_caller_driven: Arc::new(AtomicBool::new(false)),
             last_maintenance_cycle_at: Arc::new(Mutex::new(None)),
             caller_driven_backlog_warned_at: Arc::new(Mutex::new(None)),
@@ -7963,7 +9480,7 @@ impl Database {
             last_vector_search_used_hnsw: AtomicBool::new(false),
             last_vector_search_trace: RwLock::new(None),
             statement_cache: RwLock::new(HashMap::new()),
-            rank_formula_cache: RwLock::new(HashMap::new()),
+            rank_formula_cache: Arc::new(RwLock::new(HashMap::new())),
             acl_grant_cache: RwLock::new(HashMap::new()),
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
@@ -7978,20 +9495,654 @@ impl Database {
             commit_stage_wall_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
             corrupt_joined_values: RwLock::new(HashSet::new()),
             resource_owner: true,
+            handle_role: HandleRole::Owner,
+            trigger_deadlock_timeout_override: Mutex::new(None),
+            finalization: StoreFinalization::new(),
         }
     }
 
     /// Opens the database file at `path`, becoming its sole owner for the
-    /// lifetime of the returned handle. A second open of the same path — this
-    /// process or another — returns [`Error::DatabaseLocked`]; see the "Store
-    /// ownership and concurrency" section on [`Database`]. Use
+    /// lifetime of the returned handle. A second open of the same path is
+    /// refused, and the refusal says who is holding it: from THIS process it
+    /// is [`Error::DatabaseLocked`], carrying the holding process id and the
+    /// path; from ANOTHER process it is a typed `HeldByWriter` read failure
+    /// whose reason names the holding process id and the store, so an operator
+    /// is told what to stop rather than only that they cannot proceed. See the
+    /// "Store ownership and concurrency" section on [`Database`]. Use
     /// [`Database::open_memory`] for an ephemeral instance.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_config(
-            path,
-            Arc::new(CorePlugin),
-            Arc::new(MemoryAccountant::no_limit()),
+        Self::open_with_options(path, DatabaseOpenOptions::default())
+    }
+
+    /// Open a database through the common writable-open configuration path.
+    ///
+    /// Every convenience opener builds its options and arrives here, so the
+    /// configuration a database was opened with is the configuration it can
+    /// be asked about afterwards.
+    pub fn open_with_options(path: impl AsRef<Path>, options: DatabaseOpenOptions) -> Result<Self> {
+        #[cfg(feature = "test-seams")]
+        {
+            let interceptor = COMMON_OPTIONS_OPEN_INTERCEPTOR.with(|slot| slot.borrow().clone());
+            if let Some(interceptor) = interceptor {
+                return interceptor.intercept(path.as_ref(), &options);
+            }
+        }
+        Self::open_configured(path.as_ref(), options)
+    }
+
+    fn open_configured(path: &Path, options: DatabaseOpenOptions) -> Result<Self> {
+        let in_memory = path.as_os_str() == ":memory:";
+        // A throwaway database has no file, so a ceiling on file growth is a
+        // configuration mistake rather than a limit to enforce. Saying so
+        // before anything is created keeps the refusal free of side effects.
+        if in_memory && options.disk_limit.is_some() {
+            return Err(Error::Other(format!(
+                "a disk limit cannot apply to '{}': an in-memory database has no file to bound",
+                path.display()
+            )));
+        }
+        let DatabaseOpenOptions {
+            owner_reads,
+            open_disposition,
+            plugin,
+            memory_limit,
+            disk_limit,
+            contexts,
+            scope_labels,
+            principal,
+            #[cfg(feature = "test-seams")]
+            test_observer,
+            #[cfg(feature = "test-seams")]
+            test_kernel_observer,
+        } = options;
+
+        let accountant = Arc::new(
+            memory_limit
+                .map(MemoryAccountant::with_budget)
+                .unwrap_or_else(MemoryAccountant::no_limit),
+        );
+        let mut db = if in_memory {
+            let db = Self::open_memory_internal(Arc::clone(&plugin), accountant)?;
+            observe_open_event!(test_observer, BlobRepositoryOpened);
+            db
+        } else {
+            // The observer this open was given stays in force for the whole
+            // of it, so the milestones a writer reaches below the options
+            // layer -- its first claim on the store, before anything about it
+            // is published -- still reach the caller that asked to see them.
+            #[cfg(feature = "test-seams")]
+            let db =
+                crate::read_session::with_writer_open_observer(test_observer.as_ref(), || {
+                    Self::open_loaded(
+                        path,
+                        Arc::clone(&plugin),
+                        accountant,
+                        disk_limit,
+                        false,
+                        open_disposition,
+                    )
+                })?;
+            #[cfg(not(feature = "test-seams"))]
+            let db = Self::open_loaded(
+                path,
+                Arc::clone(&plugin),
+                accountant,
+                disk_limit,
+                false,
+                open_disposition,
+            )?;
+            observe_open_event!(test_observer, OpenRegistryAcquired);
+            observe_open_event!(test_observer, PersistenceOpened);
+            observe_open_event!(test_observer, BlobRepositoryOpened);
+            db
+        };
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_plugin_start();
+        db.plugin.on_open()?;
+        observe_open_event!(test_observer, PluginOpened);
+        db.owner_read_config = Arc::new(owner_reads);
+        db.access = AccessConstraints {
+            contexts,
+            scope_labels,
+            principal,
+        };
+        #[cfg(feature = "test-seams")]
+        {
+            db.route_observer = test_observer.clone();
+            db.kernel_observer = test_kernel_observer;
+        }
+        if !in_memory {
+            db.start_cron_tickler_if_schedules_present();
+            db.load_retention_sync_peer();
+            db.reconcile_maintenance_thread();
+            match db.start_owner_read_service(path) {
+                Ok(service) => {
+                    db.owner_read_service = service;
+                    if db.owner_read_service.is_some() {
+                        observe_open_event!(test_observer, OwnerServiceStarted);
+                        // A caller that arrived while this writer was still
+                        // claiming the store can be told the answer now: the
+                        // channel is listening and says for itself that it is
+                        // serving. Keeping such a caller asleep until the
+                        // record is written would hold it past the moment its
+                        // answer existed.
+                        db.close_claim_window();
+                    }
+                }
+                Err(reason) => db.owner_read_startup_failure = Some(reason),
+            }
+            db.record_owner_read_status();
+        }
+        Ok(db)
+    }
+
+    /// Publish this writer's REAL serving state into the companion beside the
+    /// store.
+    ///
+    /// The record written when the store was claimed is necessarily earlier
+    /// than the answer -- a reader needs the channel address before the
+    /// channel exists -- so the decision is re-recorded once it is known and
+    /// again whenever it changes. It is the only thing a reader who cannot
+    /// reach a channel has to go on, which is why it must say what this writer
+    /// actually decided rather than a fixed placeholder.
+    ///
+    /// Failing to re-record never fails the operation that prompted it: the
+    /// writer works either way, and the worst case is the answer a reader
+    /// would have had before this record existed at all.
+    /// End this writer's claim window because its channel is up and can be
+    /// asked directly. A writer that is not serving has no channel to ask, so
+    /// its window closes when its decision reaches the companion instead.
+    fn close_claim_window(&self) {
+        if let Some(persistence) = &self.persistence {
+            persistence.close_claim_window();
+        }
+    }
+
+    fn record_owner_read_status(&self) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let status = self.owner_read_status();
+        if let Err(error) = persistence.record_owner_read_status(status) {
+            tracing::warn!(
+                error = %error,
+                "the store's recorded owner-serving state could not be updated"
+            );
+        }
+    }
+
+    /// Bring up the owner inspection channel beside a file-backed open.
+    ///
+    /// Failing to serve never fails the database open: the caller still gets
+    /// a working writer, and `owner_read_status` says why inspection is
+    /// unavailable instead of the caller discovering it as an empty result.
+    #[allow(clippy::unnecessary_wraps)]
+    fn start_owner_read_service(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Option<Arc<crate::owner_read::OwnerReadService>>, String> {
+        if !self.owner_read_config.enabled {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            self.start_owner_read_channel(path).map(Some)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(None)
+        }
+    }
+
+    #[cfg(unix)]
+    fn start_owner_read_channel(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Arc<crate::owner_read::OwnerReadService>, String> {
+        use crate::local_transport::{
+            ChannelPathFacts, LocalConfigurationSource, LocalHandshake, OWNER_ONLY_MODE,
+            StaleChannelAction, StaleChannelProbe, UnixLocalCarrier, channel_socket_path,
+            reconcile_stale_channel,
+        };
+        use crate::owner_read::{OwnerReadService, OwnerServiceSpec, ValidatedOwnerListener};
+        use contextdb_core::read_contract::{DeadlineClock, OwnerReadStatus, OwnerServingState};
+
+        let canonical = canonical_database_path(path).map_err(|error| error.to_string())?;
+        let (database_identity, writer_run, owner_user, channel_address) =
+            crate::persistence::published_writer_identity(&canonical)
+                .ok_or_else(|| "companion record has no published writer identity".to_owned())?;
+        // A directory an operator supplied IS the directory the channel goes
+        // in -- a packaged service or add-on has its service manager create
+        // and own exactly that path. Only the platform base is a container
+        // whose owner-only `contextdb` child this owner creates for itself.
+        let runtime_directory = crate::local_transport::runtime_directory_for_store(
+            self.owner_read_config.runtime_dir.as_deref(),
+            owner_user,
         )
+        .map_err(|error| error.to_string())?
+        .path()
+        .to_path_buf();
+        let channel_path = channel_socket_path(&runtime_directory, channel_address)
+            .map_err(|error| error.to_string())?;
+        let handshake = LocalHandshake::current(database_identity, writer_run, owner_user);
+        let clock: Arc<dyn DeadlineClock> = self.owner_read_clock();
+        // A pathname is not proof that a channel is stale. Ask it once inside
+        // the shipped connection budget, bind that evidence to the exact
+        // socket inode observed before the ask, and remove only that inode
+        // when nobody answers. A live, foreign, malformed, or concurrently
+        // replaced responder is preserved and this writer simply reports
+        // that its inspection service could not start.
+        match std::fs::symlink_metadata(&channel_path) {
+            Ok(_) => {
+                let deadline_ms = clock
+                    .now_ms()
+                    .checked_add(ReadClientTimeouts::default().connect_ms)
+                    .ok_or_else(|| "owner-channel startup deadline overflow".to_owned())?;
+                match reconcile_stale_channel(
+                    &UnixLocalCarrier,
+                    &StaleChannelProbe {
+                        path: channel_path.clone(),
+                        expected_owner: handshake.clone(),
+                    },
+                    clock.as_ref(),
+                    deadline_ms,
+                )
+                .map_err(|error| error.to_string())?
+                {
+                    StaleChannelAction::RemoveAndRetry => {}
+                    StaleChannelAction::Preserve => {
+                        return Err(
+                            "the existing owner channel could not be proven stale".to_owned()
+                        );
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let listener = ValidatedOwnerListener::new(ChannelPathFacts {
+            // These are the facts the channel is about to be created with;
+            // binding verifies the created socket against them.
+            path: channel_path,
+            runtime_directory,
+            is_socket: true,
+            owner: owner_user,
+            mode: OWNER_ONLY_MODE,
+        });
+        let spec = OwnerServiceSpec::new(
+            Arc::new(self.scoped_with_constraints(None, None, None)),
+            listener,
+            handshake,
+            OwnerReadStatus {
+                state: OwnerServingState::Serving,
+                reason: None,
+            },
+            (*self.owner_read_config).clone(),
+            if self.owner_read_config.limits == OwnerReadLimits::default()
+                && self.owner_read_config.timeouts == OwnerServiceTimeouts::default()
+            {
+                LocalConfigurationSource::Default
+            } else {
+                LocalConfigurationSource::Override
+            },
+            clock,
+        );
+        OwnerReadService::start(spec).map_err(|error| error.to_string())
+    }
+
+    #[cfg(unix)]
+    fn owner_read_clock(&self) -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
+        #[cfg(feature = "test-seams")]
+        if let Some(hooks) = &self.owner_read_config.test_hooks {
+            return Arc::clone(&hooks.clock);
+        }
+        Arc::new(crate::local_transport::MonotonicDeadlineClock::new())
+    }
+
+    /// Create an in-process bounded read view over this live database.
+    pub fn read_session(&self, limits: ReadLimits) -> Result<ReadSession> {
+        let _operation = self.open_operation()?;
+        Ok(ReadSession::from_live_database(
+            self.reader_handle(),
+            limits,
+        ))
+    }
+
+    /// Create an in-process bounded read view that reports what its reads are
+    /// doing while they run.
+    ///
+    /// A caller holding an open database gets the same running commentary a
+    /// caller opening the store by path gets: rows and bytes assembled, items
+    /// examined, and milliseconds spent are told to the observer from inside
+    /// each read, so a long read is distinguishable from a wedged one. There
+    /// is no hydration phase to report — this database is already open — so
+    /// the reports describe execution only.
+    ///
+    /// The reports carry the same bounds this session reads under: every
+    /// figure is progress against the ceiling of the same name in `limits`,
+    /// and reporting adds no work of its own beyond the observer's, which
+    /// runs inline on the reading thread and so is part of that read's cost.
+    pub fn read_session_with_progress(
+        &self,
+        limits: ReadLimits,
+        progress: Arc<dyn crate::read_progress::ReadProgressObserver>,
+    ) -> Result<ReadSession> {
+        let _operation = self.open_operation()?;
+        Ok(ReadSession::from_live_database_with_progress(
+            self.reader_handle(),
+            limits,
+            progress,
+        ))
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn read_session_with_observer_for_test(
+        &self,
+        limits: ReadLimits,
+        observer: Arc<dyn ReadSessionTestObserver>,
+    ) -> Result<ReadSession> {
+        let _operation = self.open_operation()?;
+        Ok(ReadSession::from_live_database_with_observer(
+            self.reader_handle(),
+            limits,
+            observer,
+        ))
+    }
+
+    /// Open a bounded reading session whose reads deadline against a clock the
+    /// caller drives. Live-database sessions otherwise hardcode the monotonic
+    /// clock, which leaves their deadline behaviour unreachable from a test;
+    /// the owner route already honours a supplied clock.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn read_session_with_clock_for_test(
+        &self,
+        limits: ReadLimits,
+        clock: Arc<dyn contextdb_core::read_contract::DeadlineClock>,
+    ) -> Result<ReadSession> {
+        let _operation = self.open_operation()?;
+        Ok(ReadSession::from_live_database_with_clock(
+            self.reader_handle(),
+            limits,
+            clock,
+        ))
+    }
+
+    /// Attach an observer that can be reached only through the bounded
+    /// executor probe used by this live-state session.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn read_session_with_kernel_observer_for_test(
+        &self,
+        limits: ReadLimits,
+        observer: Arc<dyn ReadKernelTestObserver>,
+    ) -> Result<ReadSession> {
+        let _operation = self.open_operation()?;
+        Ok(ReadSession::from_live_database_with_kernel_observer(
+            self.reader_handle(),
+            limits,
+            observer,
+        ))
+    }
+
+    /// What this open is holding, read without selecting a route.
+    ///
+    /// A live database IS the owner, so it can answer the same question a
+    /// reader's selected route answers, without dialling its own channel: the
+    /// channel identity it is reachable at, the owner-side counts, and whether
+    /// each resource an open acquires is still held. Reading it never counts
+    /// as a channel operation or a backend open, which is what lets a proof
+    /// tell an in-process dispatch from one that went through the channel.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn read_route_resources_for_test(&self) -> Result<ReadRouteResourceSnapshot> {
+        let observed = crate::read_probe::observed();
+        let owner = self
+            .owner_read_service
+            .as_ref()
+            .map(|service| service.resources());
+        Ok(ReadRouteResourceSnapshot {
+            channel_identity: self.channel_identity_for_test(),
+            // What THIS open started, not what the process has started. A
+            // count of every owner service anywhere in the process answers a
+            // different question than the one a caller asking about this
+            // database is asking, and drifts as soon as anything else opens.
+            owner_services_started: u64::from(self.owner_read_service.is_some()),
+            // This handle reaches its own stores directly. It has selected no
+            // route, so it has spoken over no channel and opened no direct
+            // backend, and asking it what it holds must not change that.
+            local_channel_operations: 0,
+            direct_backend_opens: 0,
+            bounded_source_items_completed: observed.bounded_source_touches,
+            active_owner_slots: owner.as_ref().map(|owner| owner.active_slots).unwrap_or(0),
+            active_cursors: owner.as_ref().map(|owner| owner.cursor_count).unwrap_or(0),
+            open_registry_owned: self.open_registry_path.lock().is_some(),
+            persistence_owned: self.persistence.is_some(),
+            blob_repository_owned: self.resource_owner,
+            plugin_open: self.resource_owner,
+            snapshot_registry_owned: self.resource_owner,
+            memory_accountant_owned: self.resource_owner,
+        })
+    }
+
+    /// Whether this process still holds the store at `path`.
+    ///
+    /// The open registry is the one place that answers this: an entry stands
+    /// for as long as some handle — or the finalizer still winding one down —
+    /// owns the store, and disappears when the last of them lets go.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn store_is_retained_by_this_process_for_test(path: &Path) -> bool {
+        let Ok(canonical) = canonical_database_path(path) else {
+            return false;
+        };
+        // Never wait for the registry: a finalizer that is mid-transition
+        // holds this lock while it works, and a caller asking what is still
+        // held must not be able to block behind the very release it is
+        // watching. A registry nobody can read at this instant is one somebody
+        // is still inside, so the store is still this process's.
+        match open_file_registry().entries.try_lock() {
+            Some(entries) => entries.contains_key(&canonical),
+            None => true,
+        }
+    }
+
+    /// The fixed-length key readers address this STORE by, whether or not this
+    /// open is serving it yet. The owner publishes what its kernel does for
+    /// its channel under this key, and a reader that dialled the same store
+    /// reads it there.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn store_channel_address_for_test(
+        &self,
+    ) -> Option<contextdb_core::read_contract::ChannelAddress> {
+        let persistence = self.persistence.as_ref()?;
+        crate::local_transport::derive_channel_address(persistence.path()).ok()
+    }
+
+    /// The fixed-length key this store's local channel is reachable at, when
+    /// this open is the one serving it.
+    #[cfg(feature = "test-seams")]
+    fn channel_identity_for_test(&self) -> Option<contextdb_core::read_contract::ChannelAddress> {
+        let persistence = self.persistence.as_ref()?;
+        self.owner_read_service.as_ref()?;
+        crate::local_transport::derive_channel_address(persistence.path()).ok()
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn with_common_open_interceptor_for_test<T>(
+        interceptor: Arc<dyn DatabaseOpenInterceptor>,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let previous = COMMON_OPTIONS_OPEN_INTERCEPTOR.with(|slot| slot.replace(Some(interceptor)));
+        let _guard = CommonOptionsOpenInterceptorGuard { previous };
+        operation()
+    }
+
+    /// Observe the ordinary public execution path without replacing it. The
+    /// supplied closure must call the real `Database::execute` door.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn with_read_execution_convergence_observer_for_test<T>(
+        &self,
+        observer: Arc<dyn ReadExecutionConvergenceObserver>,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let previous =
+            READ_EXECUTION_CONVERGENCE_OBSERVER.with(|slot| slot.replace(Some(observer)));
+        let _guard = ReadExecutionConvergenceObserverGuard { previous };
+        operation()
+    }
+
+    /// Called only by the shared pull kernel after it consumes the plan chosen
+    /// by the active public execution. Kept crate-private so tests cannot mint
+    /// a passing pull trace around a separate eager executor.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn observe_pull_kernel_entered_for_test() {
+        observe_read_execution_convergence(ReadExecutionConvergenceEvent::PullKernelEntered);
+    }
+
+    /// Capture the active public-execute observer as the probe passed into the
+    /// shared bounded kernel. Source-touch events can then originate only at
+    /// that kernel's production source loops, even if execution moves threads.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn read_execution_kernel_probe_for_test() -> Option<Arc<dyn ExecutionProbe>> {
+        READ_EXECUTION_CONVERGENCE_OBSERVER.with(|slot| {
+            slot.borrow().as_ref().map(|observer| {
+                Arc::new(ReadExecutionKernelProbe {
+                    observer: Arc::clone(observer),
+                }) as Arc<dyn ExecutionProbe>
+            })
+        })
+    }
+
+    /// Called only after the shared pull kernel reaches its one terminal drain.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn observe_pull_kernel_drained_for_test() {
+        observe_read_execution_convergence(ReadExecutionConvergenceEvent::PullKernelDrained);
+    }
+
+    /// Stop admitting owner reads and wait for the work already admitted,
+    /// through the configured drain deadline. Crossing that deadline leaves
+    /// the database open and every resource owned, so a later close finishes
+    /// what this one could not.
+    fn drain_owner_reads(&self) -> Result<()> {
+        let Some(service) = &self.owner_read_service else {
+            return Ok(());
+        };
+        if !self.resource_owner {
+            return Ok(());
+        }
+        service.shutdown_and_drain().map_err(|error| match error {
+            crate::owner_read::OwnerReadScaffoldError::Database(error) => error,
+            other => Error::Other(other.to_string()),
+        })
+    }
+
+    /// Ask this database's own owner handler a question from inside the
+    /// process that holds it.
+    ///
+    /// The embedded caller is the owner, so it reaches the handler directly:
+    /// no local channel, no authentication, and no admission slot, which is
+    /// why a saturated owner still answers its own process. A store with no
+    /// running owner service, or one configured without a handler, is told so
+    /// plainly rather than being made to wait.
+    pub(crate) fn request_owner_in_process(
+        &self,
+        namespace: &str,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        let Some(service) = &self.owner_read_service else {
+            return Err(Error::ReadFailure(
+                contextdb_core::read_contract::ReadFailure::new(
+                    contextdb_core::read_contract::ReadFailureKind::OwnerNotRunning,
+                    contextdb_core::read_contract::ReadFailureDetail::None,
+                )
+                .expect("an owner-not-running refusal carries no further detail"),
+            ));
+        };
+        service
+            .request_in_process(namespace, request)
+            .map_err(|error| match error {
+                crate::owner_read::OwnerReadScaffoldError::Database(error) => error,
+                crate::owner_read::OwnerReadScaffoldError::Refused(failure) => {
+                    Error::ReadFailure(failure)
+                }
+                other => Error::Other(other.to_string()),
+            })
+    }
+
+    /// Stop serving owner reads, without waiting for what is already running.
+    ///
+    /// Answers whether the resources this open is holding may be released now:
+    /// work still in flight is still using them.
+    fn stop_owner_reads_without_waiting(&self) -> bool {
+        let Some(service) = &self.owner_read_service else {
+            return true;
+        };
+        if !self.resource_owner {
+            return true;
+        }
+        match service.begin_shutdown() {
+            Ok(still_in_flight) => !still_in_flight,
+            Err(_) => false,
+        }
+    }
+
+    /// How many request frames this handle's owner service has taken off a
+    /// connection since it started, or `None` when this handle is not serving
+    /// one. Counted where the frame is read and before anything is decided
+    /// about it, so it answers whether a statement reached the owner at all --
+    /// which no other meter can, because a request the owner refuses and a
+    /// request that was never sent leave the same trace everywhere else.
+    /// Every accepted frame counts, an owner-status probe and an interrupt
+    /// included, so a caller compares a reading taken immediately before with
+    /// one taken immediately after.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn owner_received_request_count_for_test(&self) -> Option<u64> {
+        self.owner_read_service
+            .as_ref()
+            .map(|service| service.received_request_count())
+    }
+
+    /// The kernel observer this STORE carries, if one was attached when it was
+    /// opened. The owner service asks for it because the work a channel reader
+    /// requests runs on the owner's own thread, where a reader's thread-local
+    /// observer cannot reach.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn kernel_observer_for_test(
+        &self,
+    ) -> Option<Arc<dyn crate::read_session::ReadKernelTestObserver>> {
+        self.kernel_observer.clone()
+    }
+
+    /// Report the current owner-read lifecycle state without opening a route.
+    pub fn owner_read_status(&self) -> OwnerReadStatus {
+        if self.persistence.is_none() {
+            return OwnerReadStatus {
+                state: OwnerServingState::NotApplicable,
+                reason: None,
+            };
+        }
+        if let Some(service) = &self.owner_read_service {
+            return service.status();
+        }
+        if !self.owner_read_config.enabled {
+            return OwnerReadStatus {
+                state: OwnerServingState::ServingDisabled,
+                reason: Some(OwnerServingReason::DisabledByConfiguration),
+            };
+        }
+        if let Some(reason) = &self.owner_read_startup_failure {
+            return OwnerReadStatus {
+                state: OwnerServingState::NotServing,
+                reason: Some(OwnerServingReason::StartupFailure(reason.clone())),
+            };
+        }
+        owner_read_not_implemented_status()
     }
 
     /// Force-recreate a file-backed store while owning its normal open lock
@@ -8009,11 +10160,8 @@ impl Database {
     }
 
     pub fn open_memory() -> Self {
-        Self::open_memory_with_plugin_and_accountant(
-            Arc::new(CorePlugin),
-            Arc::new(MemoryAccountant::no_limit()),
-        )
-        .expect("failed to open in-memory database")
+        Self::open_with_options(MEMORY_DATABASE_PATH, DatabaseOpenOptions::default())
+            .expect("failed to open in-memory database")
     }
 
     /// The durable fabric identity kept beside this database, when this
@@ -8089,33 +10237,15 @@ impl Database {
         scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
         principal: Option<contextdb_core::types::Principal>,
     ) -> Result<Self> {
-        let access = AccessConstraints {
-            contexts,
-            scope_labels,
-            principal,
-        };
-        let path = path.as_ref();
-        let db = if path.as_os_str() == ":memory:" {
-            Self::open_memory_internal(
-                Arc::new(CorePlugin),
-                Arc::new(MemoryAccountant::no_limit()),
-            )?
-        } else {
-            let db = Self::open_loaded(
-                path,
-                Arc::new(CorePlugin),
-                Arc::new(MemoryAccountant::no_limit()),
-                None,
-                false,
-            )?;
-            db.plugin.on_open()?;
-            db
-        };
-        let db = db.with_access_constraints(access);
-        db.start_cron_tickler_if_schedules_present();
-        db.load_retention_sync_peer();
-        db.reconcile_maintenance_thread();
-        Ok(db)
+        Self::open_with_options(
+            path,
+            DatabaseOpenOptions {
+                contexts,
+                scope_labels,
+                principal,
+                ..DatabaseOpenOptions::default()
+            },
+        )
     }
 
     pub fn open_memory_with_constraints(
@@ -8123,16 +10253,8 @@ impl Database {
         scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
         principal: Option<contextdb_core::types::Principal>,
     ) -> Self {
-        Self::open_memory().with_access_constraints(AccessConstraints {
-            contexts,
-            scope_labels,
-            principal,
-        })
-    }
-
-    fn with_access_constraints(mut self, access: AccessConstraints) -> Self {
-        self.access = access;
-        self
+        Self::open_with_constraints(MEMORY_DATABASE_PATH, contexts, scope_labels, principal)
+            .expect("failed to open in-memory database with access constraints")
     }
 
     pub fn scoped_with_contexts(
@@ -8140,6 +10262,37 @@ impl Database {
         contexts: std::collections::BTreeSet<contextdb_core::types::ContextId>,
     ) -> Self {
         self.scoped_with_constraints(Some(contexts), None, None)
+    }
+
+    /// The handle one read session's DECLARATION reads through, or the reason
+    /// this writer will not serve that declaration at all.
+    ///
+    /// Contexts and scope labels are sets, so a declaration over them is an
+    /// INTERSECTION with what this writer may itself see and can only take
+    /// rows away. Identities are not sets: `Agent("service")` and
+    /// `Agent("tenant-a")` hold whatever grants each was given and neither is
+    /// inside the other, so there is no intersection to serve. So the
+    /// principal axis has its own rule -- a writer that named no identity
+    /// HONORS the declared one, a writer that named the same one serves it
+    /// unchanged, and a writer that named a DIFFERENT one refuses, because
+    /// keeping its own would answer the reader every row its grants open up,
+    /// which is strictly more than the reader declared.
+    pub(crate) fn scoped_for_read_declaration(
+        &self,
+        contexts: Option<std::collections::BTreeSet<contextdb_core::types::ContextId>>,
+        scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
+        principal: Option<contextdb_core::types::Principal>,
+    ) -> std::result::Result<Self, DeclaredReadRefusal> {
+        if let (Some(declared), Some(serving)) =
+            (principal.as_ref(), self.access.principal.as_ref())
+            && declared != serving
+        {
+            return Err(DeclaredReadRefusal::PrincipalConflict {
+                declared: declared.clone(),
+                serving: serving.clone(),
+            });
+        }
+        Ok(self.scoped_with_constraints(contexts, scope_labels, principal))
     }
 
     pub fn scoped_with_constraints(
@@ -8152,6 +10305,7 @@ impl Database {
         let scope_labels = narrowed_constraint_set(&self.access.scope_labels, scope_labels);
         let principal = self.access.principal.clone().or(principal);
         Self {
+            id: DatabaseId::next(),
             tx_mgr: self.tx_mgr.clone(),
             relational_store: self.relational_store.clone(),
             graph_store: self.graph_store.clone(),
@@ -8172,6 +10326,7 @@ impl Database {
             capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
             detached_sync_write_set: self.detached_sync_write_set.clone(),
             persistence: self.persistence.clone(),
+            committed_image_startup: self.committed_image_startup.clone(),
             blob_repository: self.blob_repository.clone(),
             open_registry_path: Mutex::new(None),
             operation_gate: self.operation_gate.clone(),
@@ -8190,10 +10345,19 @@ impl Database {
                 Arc::new(OnceLock::new()),
                 self.accountant.clone(),
             ),
-            session_tx: Mutex::new(None),
+            image_store_file_bytes: None,
+            session_tx: Arc::new(Mutex::new(None)),
+            origin_session_tx: None,
             instance_id: uuid::Uuid::new_v4(),
             owner_thread: thread::current().id(),
             plugin: self.plugin.clone(),
+            owner_read_config: self.owner_read_config.clone(),
+            owner_read_service: self.owner_read_service.clone(),
+            owner_read_startup_failure: self.owner_read_startup_failure.clone(),
+            #[cfg(feature = "test-seams")]
+            route_observer: self.route_observer.clone(),
+            #[cfg(feature = "test-seams")]
+            kernel_observer: self.kernel_observer.clone(),
             access: AccessConstraints {
                 contexts,
                 scope_labels,
@@ -8223,12 +10387,11 @@ impl Database {
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             limit_update_lock: self.limit_update_lock.clone(),
-            disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),
-            disk_limit_startup_ceiling: AtomicU64::new(
-                self.disk_limit_startup_ceiling.load(Ordering::SeqCst),
-            ),
+            disk_limit: Arc::clone(&self.disk_limit),
+            disk_limit_startup_ceiling: Arc::clone(&self.disk_limit_startup_ceiling),
             trigger_audit_retention_secs: self.trigger_audit_retention_secs.clone(),
             snapshot_registry: self.snapshot_registry.clone(),
+            retention_deferred_edge_nodes: self.retention_deferred_edge_nodes.clone(),
             maintenance_caller_driven: self.maintenance_caller_driven.clone(),
             last_maintenance_cycle_at: self.last_maintenance_cycle_at.clone(),
             caller_driven_backlog_warned_at: self.caller_driven_backlog_warned_at.clone(),
@@ -8241,7 +10404,10 @@ impl Database {
             last_vector_search_used_hnsw: AtomicBool::new(false),
             last_vector_search_trace: RwLock::new(None),
             statement_cache: RwLock::new(HashMap::new()),
-            rank_formula_cache: RwLock::new(HashMap::new()),
+            // The same cache, not a copy of it: this is another view onto one
+            // store, and a formula registered after the view was taken is one
+            // the view must still find.
+            rank_formula_cache: Arc::clone(&self.rank_formula_cache),
             acl_grant_cache: RwLock::new(HashMap::new()),
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
@@ -8256,18 +10422,63 @@ impl Database {
             commit_stage_wall_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
             corrupt_joined_values: RwLock::new(HashSet::new()),
             resource_owner: false,
+            // Derived handles are the store's own machinery unless a caller
+            // asks for a reader; `reader_handle` is the one door that says so.
+            handle_role: HandleRole::Internal,
+            trigger_deadlock_timeout_override: Mutex::new(
+                *self.trigger_deadlock_timeout_override.lock(),
+            ),
+            finalization: Arc::clone(&self.finalization),
         }
+    }
+
+    /// A handle for a caller who is going to READ this store.
+    ///
+    /// The store stays alive for as long as one of these does: a reader that
+    /// is mid-request, or holding a suspended cursor, is still looking at the
+    /// store after the handle that acquired it has gone away.
+    fn reader_handle(&self) -> Self {
+        let mut handle = self.scoped_with_constraints(None, None, None);
+        handle.handle_role = HandleRole::Reader;
+        // The reader has no transaction control of its own and gains none
+        // here; it only watches the opener's slot, so a read this session
+        // serves sees the work the session that opened it has staged, and
+        // stops seeing it the moment that session commits or rolls back.
+        handle.origin_session_tx = Some(Arc::clone(&self.session_tx));
+        self.finalization.note_new_holder();
+        handle
     }
     fn open_loaded(
         path: impl AsRef<Path>,
+        plugin: Arc<dyn DatabasePlugin>,
+        accountant: Arc<MemoryAccountant>,
+        startup_disk_limit: Option<u64>,
+        allow_legacy_table_meta_layout: bool,
+        open_disposition: OpenDisposition,
+    ) -> Result<Self> {
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_writable_database_open();
+        let canonical_path = canonical_database_path(path.as_ref())?;
+        let (registry_reservation, persistence) =
+            acquire_registry_and_persistence(&canonical_path, open_disposition)?;
+        Self::open_loaded_from_persistence(
+            registry_reservation,
+            persistence,
+            plugin,
+            accountant,
+            startup_disk_limit,
+            allow_legacy_table_meta_layout,
+        )
+    }
+
+    fn open_loaded_from_persistence(
+        registry_reservation: OpenRegistryReservation,
+        persistence: Arc<RedbPersistence>,
         plugin: Arc<dyn DatabasePlugin>,
         mut accountant: Arc<MemoryAccountant>,
         startup_disk_limit: Option<u64>,
         allow_legacy_table_meta_layout: bool,
     ) -> Result<Self> {
-        let canonical_path = canonical_database_path(path.as_ref())?;
-        let (registry_reservation, persistence) =
-            acquire_registry_and_persistence(&canonical_path)?;
         if let Some(persisted) = persistence.load_config_value::<usize>("memory_limit")? {
             let startup = accountant.usage();
             if let Some(ceiling) = startup.startup_ceiling {
@@ -8592,6 +10803,270 @@ impl Database {
         Ok(db)
     }
 
+    /// Declare who this handle reads as and which part of the store it is
+    /// looking at, after the handle exists.
+    ///
+    /// A writable open says the same thing in its options and this is the same
+    /// value it lands in, for the one caller that cannot: a committed image is
+    /// hydrated and projected before a read session's declaration can be
+    /// applied to it, so the declaration arrives here instead. Everything
+    /// downstream is identical -- the row gate reads this and nothing else.
+    pub(crate) fn declare_read_access(
+        &mut self,
+        contexts: Option<BTreeSet<ContextId>>,
+        scope_labels: Option<BTreeSet<ScopeLabel>>,
+        principal: Option<Principal>,
+    ) {
+        self.access = AccessConstraints {
+            contexts,
+            scope_labels,
+            principal,
+        };
+    }
+
+    /// A handle over a committed image that was already decoded and whose
+    /// source file is closed.
+    ///
+    /// This is the reading counterpart of `open_loaded_from_persistence`: the
+    /// same runtime stores, the same counters, and therefore the same planner
+    /// and the same physical decisions -- assembled from values instead of
+    /// from a live source. Nothing here can reach a file. There is no durable
+    /// store behind the composite, no open-registry claim, and no media
+    /// repository, because the image carries no media and the source is gone.
+    /// Every repair the writable path performs while loading is absent by
+    /// construction: a store that would need one was refused before the image
+    /// was ever built.
+    pub(crate) fn open_committed_image(
+        parts: crate::persistence::ReadPersistenceImageParts,
+        plugin: Arc<dyn DatabasePlugin>,
+        mut accountant: Arc<MemoryAccountant>,
+    ) -> Result<Self> {
+        let crate::persistence::ReadPersistenceImageParts {
+            table_meta: all_meta,
+            relational_tables,
+            forward_edges,
+            reverse_edges: _,
+            vector_entries,
+            current_vectors: _,
+            sync_source_lsns,
+            sync_source_kinds,
+            change_log: loaded_change_log,
+            ddl_log: loaded_ddl_log,
+            commit_index,
+            config_values,
+            sink_audit: _,
+            trigger_audit,
+            trigger_audit_stamps: _,
+            sink_queues,
+            store_file_bytes,
+        } = parts;
+        let startup = Arc::new(CommittedImageStartupState {
+            config_values: config_values.iter().cloned().collect(),
+            sink_queues,
+            trigger_audit,
+        });
+
+        let config_value = |key: &str| -> Option<&[u8]> {
+            config_values
+                .iter()
+                .find(|(stored, _)| stored == key)
+                .map(|(_, bytes)| bytes.as_slice())
+        };
+        if let Some(bytes) = config_value("memory_limit") {
+            let persisted =
+                crate::persistence::RedbPersistence::decode_config_value::<usize>(bytes)?;
+            let startup = accountant.usage();
+            if let Some(ceiling) = startup.startup_ceiling {
+                accountant.set_budget(Some(persisted.min(ceiling)))?;
+            } else if startup.limit.is_none() {
+                accountant = Arc::new(MemoryAccountant::with_runtime_budget(persisted));
+            }
+        }
+        let disk_limit = match config_value("disk_limit") {
+            Some(bytes) => Some(crate::persistence::RedbPersistence::decode_config_value::<
+                u64,
+            >(bytes)?),
+            None => None,
+        };
+
+        let relational = Arc::new(RelationalStore::new());
+        for (name, meta) in &all_meta {
+            let mut runtime_meta = meta.clone();
+            let user_indexes = runtime_meta
+                .indexes
+                .iter()
+                .filter(|index| index.kind == IndexKind::UserDeclared)
+                .cloned()
+                .collect::<Vec<_>>();
+            runtime_meta.indexes = crate::executor::auto_indexes_for_table_meta(&runtime_meta);
+            runtime_meta.indexes.extend(user_indexes);
+            relational.create_table(name, runtime_meta.clone());
+            for decl in &runtime_meta.indexes {
+                if decl.kind == IndexKind::Auto {
+                    relational.create_exact_index_storage(name, &decl.name, decl.columns.clone());
+                } else {
+                    relational.create_index_storage(name, &decl.name, decl.columns.clone());
+                }
+            }
+            for row in relational_tables.get(name).into_iter().flatten() {
+                relational.insert_loaded_row(name, row.clone());
+            }
+        }
+        relational.replace_sync_source_lsns(sync_source_lsns);
+        relational.replace_sync_source_kinds(sync_source_kinds);
+
+        let graph = Arc::new(GraphStore::new());
+        for edge in forward_edges {
+            graph.insert_loaded_edge(edge);
+        }
+
+        let hnsw = Arc::new(OnceLock::new());
+        let vector = Arc::new(VectorStore::new(hnsw.clone()));
+        for (table_name, meta) in &all_meta {
+            for column in &meta.columns {
+                if let ColumnType::Vector(dimension) = column.column_type {
+                    vector.register_index(
+                        VectorIndexRef::new(table_name, column.name.clone()),
+                        dimension,
+                        column.quantization,
+                    );
+                }
+            }
+        }
+        for entry in vector_entries {
+            vector.insert_loaded_vector(entry);
+        }
+
+        let max_row_id = relational.max_row_id();
+        let max_tx = max_tx_across_all(&relational, &graph, &vector);
+        let commit_index_max_lsn = commit_index.keys().next_back().copied().unwrap_or(Lsn(0));
+        let ddl_max_lsn = loaded_ddl_log
+            .iter()
+            .map(|(lsn, _)| *lsn)
+            .max()
+            .unwrap_or(Lsn(0));
+        let mut purge_frontier_max_lsn = Lsn(0);
+        for (key, bytes) in &config_values {
+            if !key.starts_with(Self::DURABLE_LINEAGE_CONFIG_PREFIX) {
+                continue;
+            }
+            let record = crate::persistence::RedbPersistence::decode_config_value::<
+                DurableLineageRecord,
+            >(bytes)?;
+            let expected_key = Self::durable_lineage_config_key(
+                &record.table,
+                &record.natural_key,
+                record.table_generation,
+            );
+            if *key != expected_key {
+                return Err(Error::SyncError(
+                    "durable lineage lifecycle key disagrees with its canonical record".to_string(),
+                ));
+            }
+            match (record.delete_obligation, record.purge_frontier.as_deref()) {
+                (DurableDeleteObligation::Purged, Some(frontier)) => {
+                    let frontier = frontier.parse::<u64>().map_err(|_| {
+                        Error::SyncError(
+                            "durable lineage purge frontier is not a valid LSN".to_string(),
+                        )
+                    })?;
+                    purge_frontier_max_lsn = purge_frontier_max_lsn.max(Lsn(frontier));
+                }
+                (DurableDeleteObligation::Purged, None) => {
+                    return Err(Error::SyncError(
+                        "durable purged lineage is missing its permanent frontier".to_string(),
+                    ));
+                }
+                (_, Some(_)) => {
+                    return Err(Error::SyncError(
+                        "non-purged durable lineage carries a purge frontier".to_string(),
+                    ));
+                }
+                (_, None) => {}
+            }
+        }
+        let max_lsn = max_lsn_across_all(&relational, &graph, &vector)
+            .max(commit_index_max_lsn)
+            .max(ddl_max_lsn)
+            .max(purge_frontier_max_lsn);
+        relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
+
+        let (initial_table_index, initial_lsn_refcounts) =
+            build_change_log_aux_indexes(&loaded_change_log);
+        let change_log = Arc::new(RwLock::new(loaded_change_log));
+        let change_log_table_index = Arc::new(RwLock::new(initial_table_index));
+        let change_log_lsn_refcounts = Arc::new(RwLock::new(initial_lsn_refcounts));
+        let ddl_log = Arc::new(RwLock::new(loaded_ddl_log));
+        let received_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let pending_local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let apply_phase_pause = Arc::new(ApplyPhasePause::new());
+        let store: DynStore = Box::new(CompositeStore::new_with_apply_phase_pause(
+            relational.clone(),
+            graph.clone(),
+            vector.clone(),
+            change_log.clone(),
+            change_log_table_index.clone(),
+            change_log_lsn_refcounts.clone(),
+            ddl_log.clone(),
+            accountant.clone(),
+            apply_phase_pause.clone(),
+        ));
+        let tx_mgr = Arc::new(TransactionManager::new_with_counters_and_commit_index(
+            store,
+            TxId(max_tx.0.saturating_add(1)),
+            Lsn(max_lsn.0.saturating_add(1)),
+            max_tx,
+            commit_index,
+        ));
+        let event_bus = Arc::new(EventBusState::new());
+        let trigger = Arc::new(TriggerState::new());
+
+        let mut db = Self::build_db(
+            tx_mgr,
+            relational,
+            graph,
+            vector,
+            hnsw,
+            change_log,
+            change_log_table_index,
+            change_log_lsn_refcounts,
+            ddl_log,
+            received_schema_stages,
+            pending_local_schema_stages,
+            local_schema_stages,
+            None,
+            BlobRepository::absent(),
+            None,
+            apply_phase_pause,
+            plugin,
+            accountant,
+            disk_limit,
+            None,
+            event_bus,
+            trigger,
+        );
+        db.committed_image_startup = Some(startup);
+        // This handle has no persistence to stat, so the length the reader
+        // measured of the file it read this image out of travels with the
+        // image and answers for it.
+        db.image_store_file_bytes = store_file_bytes;
+
+        for meta in all_meta.values() {
+            if !meta.dag_edge_types.is_empty() {
+                db.graph.register_dag_edge_types(&meta.dag_edge_types);
+            }
+        }
+        db.rebuild_rank_formula_cache_from_meta(&all_meta)?;
+        db.account_loaded_state()?;
+        maybe_prebuild_hnsw(&db.vector_store, db.accountant());
+        db.load_cron_state_from_persistence()?;
+        db.load_event_bus_state_from_persistence()?;
+        db.load_trigger_state_from_persistence()?;
+
+        Ok(db)
+    }
+
     fn open_memory_internal(
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
@@ -8661,12 +11136,27 @@ impl Database {
         global_callback_active_count().load(Ordering::SeqCst) > 0
     }
 
-    fn trigger_deadlock_timeout() -> Duration {
-        std::env::var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_millis)
+    /// The deadline this handle waits for a same-database trigger callback
+    /// to go idle. The shipped default governs unless this handle was told
+    /// otherwise through the private test seam; nothing in the environment
+    /// is consulted.
+    fn trigger_deadlock_timeout(&self) -> Duration {
+        self.trigger_deadlock_timeout_override
+            .lock()
             .unwrap_or(DEFAULT_TRIGGER_DEADLOCK_TIMEOUT)
+    }
+
+    /// States the deadline THIS handle waits for a same-database trigger
+    /// callback to go idle before the typed cross-thread error is due.
+    ///
+    /// A deadlock-guard journey needs a deadline far shorter than the shipped
+    /// one, and the deadline is behavior, so it can only be stated privately,
+    /// per handle -- never exported into the process, where it would become a
+    /// behavior surface every deployment could reach.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn set_trigger_deadlock_timeout_for_test(&self, timeout: std::time::Duration) {
+        *self.trigger_deadlock_timeout_override.lock() = Some(timeout);
     }
 
     fn open_operation_after_public_tx_control_wait(
@@ -8728,7 +11218,7 @@ impl Database {
     }
 
     fn wait_for_same_db_trigger_callback_idle(&self, surface: &'static str) -> Result<()> {
-        let timeout = Self::trigger_deadlock_timeout();
+        let timeout = self.trigger_deadlock_timeout();
         let started = Instant::now();
         let mut observed_wait = false;
         let mut guard = self.trigger.wait_lock.lock();
@@ -8818,7 +11308,7 @@ impl Database {
     }
 
     fn enter_sql_write_control_bypass(&self, tx: TxId) -> SqlWriteControlBypassGuard {
-        let db_id = self as *const Self as usize;
+        let db_id = self.id;
         SQL_WRITE_CONTROL_BYPASS_STACK.with(|stack| {
             stack.borrow_mut().push((db_id, tx));
         });
@@ -8826,7 +11316,7 @@ impl Database {
     }
 
     fn sql_write_control_bypass_active(&self, tx: TxId) -> bool {
-        let db_id = self as *const Self as usize;
+        let db_id = self.id;
         SQL_WRITE_CONTROL_BYPASS_STACK.with(|stack| stack.borrow().contains(&(db_id, tx)))
     }
 
@@ -8868,13 +11358,13 @@ impl Database {
     fn cron_callback_tx_bound_matches(&self, tx: TxId) -> bool {
         let cron_tx = CRON_CALLBACK_TX.with(|slot| slot.get());
         let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
-        cron_tx == Some(tx) && cron_db == Some(self as *const Self as usize)
+        cron_tx == Some(tx) && cron_db == Some(self.id)
     }
 
     pub(crate) fn trigger_callback_tx_bound_matches(&self, tx: TxId) -> bool {
         let trigger_tx = TRIGGER_CALLBACK_TX.with(|slot| slot.get());
         let trigger_db = TRIGGER_CALLBACK_DB.with(|slot| slot.get());
-        trigger_tx == Some(tx) && trigger_db == Some(self as *const Self as usize)
+        trigger_tx == Some(tx) && trigger_db == Some(self.id)
     }
 
     pub(crate) fn trigger_callback_wallclock(&self) -> Wallclock {
@@ -8885,6 +11375,21 @@ impl Database {
 
     fn callback_tx_bound_matches(&self, tx: TxId) -> bool {
         self.cron_callback_tx_bound_matches(tx) || self.trigger_callback_tx_bound_matches(tx)
+    }
+
+    /// This handle's identity. Two handles never share one, including a handle
+    /// constructed at an address a dropped handle used to occupy -- which is
+    /// the whole reason the identity is not the address.
+    pub(super) fn identity(&self) -> DatabaseId {
+        self.id
+    }
+
+    /// The same identity as a plain number, for a pin that has to compare many
+    /// handles' identities without reaching into the type.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn database_identity_for_test(&self) -> u64 {
+        self.id.0
     }
 
     pub(super) fn vector_schema_gate_id(&self) -> usize {
@@ -9420,7 +11925,7 @@ impl Database {
     }
 
     fn enter_sync_apply_local_schema_bypass(&self, tx: TxId) -> SyncApplyLocalSchemaBypassGuard {
-        let db_id = self as *const Self as usize;
+        let db_id = self.id;
         SYNC_APPLY_LOCAL_SCHEMA_BYPASS_STACK.with(|stack| {
             stack.borrow_mut().push((db_id, tx));
         });
@@ -9428,7 +11933,7 @@ impl Database {
     }
 
     fn sync_apply_local_schema_bypass_active(&self, tx: TxId) -> bool {
-        let db_id = self as *const Self as usize;
+        let db_id = self.id;
         SYNC_APPLY_LOCAL_SCHEMA_BYPASS_STACK.with(|stack| stack.borrow().contains(&(db_id, tx)))
     }
 
@@ -9452,6 +11957,8 @@ impl Database {
     }
 
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        #[cfg(feature = "test-seams")]
+        observe_read_execution_convergence(ReadExecutionConvergenceEvent::PublicExecuteEntered);
         let scope = QueryRowsExaminedScope::enter(self);
         let mut result = self.execute_with_rows_examined_scope(sql, params);
         scope.finish(&mut result);
@@ -9656,7 +12163,7 @@ impl Database {
 
     fn active_session_tx(&self) -> Option<TxId> {
         if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            let this_db = self as *const Self as usize;
+            let this_db = self.id;
             if CRON_CALLBACK_DB.with(|slot| slot.get()) == Some(this_db) {
                 return CRON_CALLBACK_TX.with(|slot| slot.get());
             }
@@ -9682,7 +12189,7 @@ impl Database {
             let active_tx = self.active_session_tx();
             let cron_tx = CRON_CALLBACK_TX.with(|slot| slot.get());
             let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
-            let this_db = self as *const Self as usize;
+            let this_db = self.id;
             if active_tx.is_none() || active_tx != cron_tx || cron_db != Some(this_db) {
                 return Err(Error::CallbackReentry {
                     kind: CallbackKind::Cron,
@@ -9697,8 +12204,8 @@ impl Database {
             if let Statement::DropTrigger { name } = stmt {
                 let drops_active_trigger = TRIGGER_CALLBACK_NAME
                     .with(|active_name| active_name.borrow().as_deref() == Some(name));
-                let drops_from_active_trigger_handle = TRIGGER_CALLBACK_DB
-                    .with(|active_db| active_db.get() == Some(self as *const Self as usize));
+                let drops_from_active_trigger_handle =
+                    TRIGGER_CALLBACK_DB.with(|active_db| active_db.get() == Some(self.id));
                 if drops_active_trigger && drops_from_active_trigger_handle {
                     return Ok(());
                 }
@@ -9712,7 +12219,7 @@ impl Database {
             let active_tx = self.active_session_tx();
             let trigger_tx = TRIGGER_CALLBACK_TX.with(|slot| slot.get());
             let trigger_db = TRIGGER_CALLBACK_DB.with(|slot| slot.get());
-            let this_db = self as *const Self as usize;
+            let this_db = self.id;
             if active_tx.is_none() || active_tx != trigger_tx || trigger_db != Some(this_db) {
                 self.record_user_commit_trigger_reentry();
                 return Err(Error::CallbackReentry {
@@ -9914,14 +12421,14 @@ impl Database {
         self.statement_cache.write().clear();
     }
 
-    fn clear_trigger_insert_state_machine_cache(db_key: usize) {
+    fn clear_trigger_insert_state_machine_cache(db_key: DatabaseId) {
         TRIGGER_INSERT_STATE_MACHINE_CACHE.with(|cache| {
             cache.borrow_mut().remove(&db_key);
         });
     }
 
     fn trigger_insert_table_has_state_machine(&self, table: &str) -> Result<bool> {
-        let db_key = self as *const Self as usize;
+        let db_key = self.id;
         if let Some(cached) = TRIGGER_INSERT_STATE_MACHINE_CACHE.with(|cache| {
             cache
                 .borrow()
@@ -10001,9 +12508,109 @@ impl Database {
                             .to_string(),
                     ));
                 }
-                execute_plan(self, plan, params, None)
+                let snapshot = self.snapshot_for_read();
+                self.run_read_plan(plan, params, None, snapshot)
             }
         }
+    }
+
+    /// Answer a read the way the reading surface answers it.
+    ///
+    /// The plan is already chosen, so nothing is planned again: it is drained
+    /// once through the same kernel a bounded read draws from, so one statement
+    /// asked at either door reads the same sources, in the same order, and
+    /// describes itself with the same words. This door is uncapped -- the
+    /// established embedding API promises an answer, not a ceiling -- and a
+    /// plan the kernel has no source for is run by the executor exactly as it
+    /// always was.
+    fn run_read_plan(
+        &self,
+        plan: &PhysicalPlan,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+    ) -> Result<QueryResult> {
+        if !crate::executor::bounded::kernel_can_answer(plan) {
+            return execute_plan(self, plan, params, tx);
+        }
+        // This door declares no ceilings, so the STORE's limits are the ones
+        // that govern it: consulted once, before anything is drained, and
+        // released when the statement ends. A refusal is the store's own typed
+        // error and travels out unchanged.
+        let _store_limits = self.uncapped_store_reservations(plan)?;
+        let clock: Arc<dyn contextdb_core::read_contract::DeadlineClock> =
+            Arc::new(crate::local_transport::MonotonicDeadlineClock::new());
+        // What THIS statement has already been charged with before the drain.
+        // Sources the kernel shares with the eager path bump it as they read,
+        // so the drain contributes part of its own figure on the way through.
+        let examined_before = self.this_statements_rows_examined();
+        let drained = crate::executor::bounded::drain_chosen_plan(
+            self,
+            plan,
+            params,
+            // The caller's own transaction, carried in rather than asked for:
+            // an explicit handle is not the session's transaction, so a read
+            // that asks the store which one is active is told none and answers
+            // from committed state alone.
+            tx,
+            snapshot,
+            clock,
+            #[cfg(feature = "test-seams")]
+            Self::read_execution_kernel_probe_for_test()
+                .map(crate::executor::bounded_read_test_support::kernel_probe),
+        );
+        match drained {
+            Ok(result) => {
+                // The kernel counts what it looked at on its own request
+                // context; the statement's scope is what the caller reads back
+                // in the trace. So the route tops that scope up to the kernel's
+                // figure -- only the part the shared sources did not already
+                // bump, because adding the whole figure counts a resolution
+                // scan twice, once through the source and once through the
+                // trace.
+                let contributed = match (self.this_statements_rows_examined(), examined_before) {
+                    (Some(after), Some(before)) => after.saturating_sub(before),
+                    // No scope of its own: nothing it reads is attributed to a
+                    // statement, so there is nothing to subtract.
+                    _ => 0,
+                };
+                self.__bump_rows_examined(result.trace.rows_examined.saturating_sub(contributed));
+                Ok(result)
+            }
+            // This door has no ceilings, so a refusal cannot be one; anything
+            // the kernel reports here is the engine's own error, carried out
+            // unchanged.
+            Err(crate::executor::BoundedExecutionError::Engine(error)) => Err(error),
+            Err(other) => Err(Error::Other(format!(
+                "uncapped read could not be answered: {other:?}"
+            ))),
+        }
+    }
+
+    /// What the statement now running has been charged with, or `None` when
+    /// nothing it reads is attributed to a statement at all.
+    ///
+    /// NOT the store-wide counter. That counter is stored back to zero by
+    /// whichever statement most recently entered a scope on this database and
+    /// is added to by every statement running against it, so a difference
+    /// taken across it belongs to no statement in particular: two callers
+    /// reading the same database at the same time would each fold part of the
+    /// other's reading into their own trace, and the number an operator uses
+    /// to judge a query would depend on what else happened to be running. The
+    /// scope stack is per thread and the statement's own entry is the innermost
+    /// one for this database, so reading it either side of the drain measures
+    /// this statement's shared sources and nobody else's.
+    fn this_statements_rows_examined(&self) -> Option<u64> {
+        let database_key = self.id;
+        QUERY_ROWS_EXAMINED_SCOPES.with(|scopes| {
+            scopes
+                .borrow()
+                .active
+                .iter()
+                .rev()
+                .find(|scope| scope.database_key == database_key)
+                .map(|scope| scope.rows_examined)
+        })
     }
 
     pub fn explain(&self, sql: &str) -> Result<String> {
@@ -10187,6 +12794,13 @@ impl Database {
         if !self.read_allowed_for_row(table, &meta, &row, snapshot)? {
             return Ok(false);
         }
+        // A quantized vector column is held in its index, not in the row, so
+        // an unfilled row carries NULL where the embedding belongs and a guard
+        // naming that column could never fire -- which is indistinguishable to
+        // the caller from a row that changed underneath.
+        let mut guarded = [row];
+        self.supplement_rows_for_caller(table, &mut guarded);
+        let [row] = guarded;
         if !predicates
             .iter()
             .all(|(column, value)| row.values.get(column) == Some(value))
@@ -10315,7 +12929,7 @@ impl Database {
                     };
                     let rows = live_rows.get(*table).map(Vec::as_slice).unwrap_or_default();
                     let row_bytes = rows.iter().fold(0usize, |row_bytes, row| {
-                        row_bytes.saturating_add(estimate_row_bytes_for_meta(
+                        row_bytes.saturating_add(retained_row_bytes_for_meta(
                             &row.values,
                             meta,
                             false,
@@ -11121,6 +13735,8 @@ impl Database {
 
         let result = (|| {
             if let Some(plan) = cached_plan {
+                #[cfg(feature = "test-seams")]
+                observe_read_execution_convergence(ReadExecutionConvergenceEvent::PlanReady);
                 let skip_static_dml_validation =
                     matches!(plan, PhysicalPlan::Update(_) | PhysicalPlan::Delete(_));
                 return self.run_planned_statement(
@@ -11137,6 +13753,8 @@ impl Database {
                 // Pre-resolve InSubquery expressions with CTE context before planning.
                 let stmt = self.pre_resolve_cte_subqueries(stmt, params, tx)?;
                 let plan = contextdb_planner::plan(&stmt)?;
+                #[cfg(feature = "test-seams")]
+                observe_read_execution_convergence(ReadExecutionConvergenceEvent::PlanReady);
                 self.cache_statement_if_eligible(sql, &stmt, &plan);
                 (stmt, plan)
             };
@@ -11226,7 +13844,9 @@ impl Database {
                     Some(self.enter_sql_write_control_bypass(tx))
                 };
                 let snapshot = self.snapshot_for_read();
-                self.with_snapshot_override(snapshot, || execute_plan(self, plan, params, Some(tx)))
+                self.with_snapshot_override(snapshot, || {
+                    self.run_read_plan(plan, params, Some(tx), snapshot)
+                })
             }
             None => self.execute_autocommit(plan, params, preopened_autocommit_tx),
         };
@@ -11615,6 +14235,12 @@ impl Database {
         if !trigger_callback_bound {
             self.validate_row_constraints(tx, table, &values, None)?;
         }
+        // Taken before the values are handed to the relational store, which
+        // moves them; the store that owns vectors is written the moment the
+        // row exists to carry them.
+        let row_vectors_source = values.clone();
+        self.blank_quantized_vector_values(table, &mut values);
+        let staged_before = self.staged_row_count(tx);
         if trigger_callback_bound && !self.has_access_constraints_for_query() {
             let has_state_machine = self.trigger_insert_table_has_state_machine(table)?;
             let row_id = self.relational_store.new_row_id();
@@ -11629,6 +14255,13 @@ impl Database {
                         values,
                         self.trigger_callback_wallclock(),
                     )?;
+                self.write_row_vectors_or_unstage(
+                    tx,
+                    table,
+                    inserted,
+                    &row_vectors_source,
+                    staged_before,
+                )?;
                 if let Some(key) = creation_key {
                     self.stage_local_creation_lineage(tx, table, key, inserted)?;
                 }
@@ -11640,6 +14273,13 @@ impl Database {
                 row_id,
                 values,
                 self.snapshot_for_read(),
+            )?;
+            self.write_row_vectors_or_unstage(
+                tx,
+                table,
+                inserted,
+                &row_vectors_source,
+                staged_before,
             )?;
             if let Some(key) = creation_key {
                 self.stage_local_creation_lineage(tx, table, key, inserted)?;
@@ -11655,6 +14295,7 @@ impl Database {
             values,
             self.snapshot_for_read(),
         )?;
+        self.write_row_vectors_or_unstage(tx, table, inserted, &row_vectors_source, staged_before)?;
         if let Some(key) = creation_key {
             self.stage_local_creation_lineage(tx, table, key, inserted)?;
         }
@@ -11672,6 +14313,7 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
         old_row_id: RowId,
+        place_vectors: bool,
     ) -> Result<RowId> {
         self.ensure_trigger_table_ready(table, "insert_row_replacing")?;
         let mut values =
@@ -11682,8 +14324,26 @@ impl Database {
             self.validate_row_constraints(tx, table, &values, Some(old_row_id))?;
         }
         self.assert_row_write_allowed(table, old_row_id, &values, self.snapshot_for_read())?;
-        self.relational
-            .insert_with_row_id(tx, table, old_row_id, values, self.snapshot_for_read())
+        // The UPDATE path places every vector column itself -- an assigned one
+        // is deleted and re-inserted, one the statement did not touch is moved
+        // to the new row identity -- so it asks for none to be placed here and
+        // each is stored once. An upsert that resolves onto an existing row
+        // has no such handling of its own and asks for them.
+        let row_vectors = if place_vectors {
+            self.row_vector_values(table, &values)
+        } else {
+            Vec::new()
+        };
+        self.blank_quantized_vector_values(table, &mut values);
+        let inserted = self.relational.insert_with_row_id(
+            tx,
+            table,
+            old_row_id,
+            values,
+            self.snapshot_for_read(),
+        )?;
+        self.write_row_vectors(tx, inserted, row_vectors)?;
+        Ok(inserted)
     }
 
     pub(crate) fn replace_row_after_update_validation(
@@ -11712,6 +14372,8 @@ impl Database {
         if context.meta.immutable {
             return Err(Error::ImmutableTable(table.to_string()));
         }
+        let mut values = values;
+        self.blank_quantized_vector_values(table, &mut values);
         let table_name = table.to_string();
         let row = VersionedRow {
             row_id,
@@ -11761,7 +14423,10 @@ impl Database {
         self.validate_row_constraints(tx, table, &values, None)?;
         let row_id = self.relational_store.new_row_id();
         self.assert_row_write_allowed(table, row_id, &values, self.snapshot())?;
-        match created_at {
+        let mut values = values;
+        let row_vectors = self.row_vector_values(table, &values);
+        self.blank_quantized_vector_values(table, &mut values);
+        let inserted = match created_at {
             Some(created_at) => self.relational.insert_with_row_id_at(
                 tx,
                 table,
@@ -11773,7 +14438,9 @@ impl Database {
             None => self
                 .relational
                 .insert_with_row_id(tx, table, row_id, values, self.snapshot()),
-        }
+        }?;
+        self.write_row_vectors(tx, inserted, row_vectors)?;
+        Ok(inserted)
     }
 
     /// Upsert a row that arrived over sync. See [`Self::insert_row_for_sync`]
@@ -12976,7 +15643,7 @@ impl Database {
                 return bytes;
             };
             rows.iter().fold(bytes, |bytes, row| {
-                bytes.saturating_add(estimate_row_bytes_for_meta(&row.values, meta, false))
+                bytes.saturating_add(retained_row_bytes_for_meta(&row.values, meta, false))
             })
         });
         let edges = edges
@@ -16727,6 +19394,16 @@ impl Database {
     }
     }
 
+    /// Test-introspection: the commit index as this handle would report it,
+    /// in LSN order. A fixture that wants the store's own answer asks for it
+    /// here rather than assembling one from counters it watched go by.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn commit_index_for_test(&self) -> Vec<(Lsn, TxId)> {
+        let _operation = self.assert_open_operation();
+        self.tx_mgr.commit_index_snapshot().into_iter().collect()
+    }
+
     /// Test-introspection: how many commit-index entries are retained, and the
     /// lowest LSN among them (`Lsn(0)` when the index is empty). Production-dead
     /// — nothing but tests reads it.
@@ -16903,12 +19580,23 @@ impl Database {
                 let natural_key = self
                     .table_meta(table)
                     .and_then(|meta| natural_key_from_row_values(&meta, &values));
+                let row_vectors_source = values.clone();
+                let staged_before = self.staged_row_count(tx);
+                let mut values = values;
+                self.blank_quantized_vector_values(table, &mut values);
                 let inserted = self.relational.insert_with_row_id(
                     tx,
                     table,
                     row_id,
                     values,
                     self.snapshot_for_read(),
+                )?;
+                self.write_row_vectors_or_unstage(
+                    tx,
+                    table,
+                    inserted,
+                    &row_vectors_source,
+                    staged_before,
                 )?;
                 if let Some(natural_key) = natural_key {
                     self.stage_local_creation_lineage(tx, table, natural_key, inserted)?;
@@ -16972,10 +19660,29 @@ impl Database {
                 .as_ref()
                 .and_then(|meta| natural_key_from_row_values(meta, &values));
 
-            self.relational
+            // The same ownership the other write doors use: the vectors are
+            // taken before the row is staged, the quantized slots are emptied
+            // so the row costs what the column declared, the vectors are
+            // placed in the store the column reads from, and a placement that
+            // cannot be made takes the row back out. Without this an upserted
+            // vector is in no index at all -- a search never finds the row,
+            // and the caller is told the row was inserted.
+            let row_vectors_source = values.clone();
+            let staged_before = self.staged_row_count(tx);
+            let mut values = values;
+            self.blank_quantized_vector_values(table, &mut values);
+            let inserted = self
+                .relational
                 .insert_with_row_id(tx, table, row_id, values, snapshot)?;
+            self.write_row_vectors_or_unstage(
+                tx,
+                table,
+                inserted,
+                &row_vectors_source,
+                staged_before,
+            )?;
             if let Some(natural_key) = natural_key {
-                self.stage_local_creation_lineage(tx, table, natural_key, row_id)?;
+                self.stage_local_creation_lineage(tx, table, natural_key, inserted)?;
             }
             if let (Some(uuid), Some(state), Some(_meta)) =
                 (row_uuid, new_state.as_deref(), meta.as_ref())
@@ -16998,16 +19705,30 @@ impl Database {
             .and_then(Value::as_text)
             .map(std::borrow::ToOwned::to_owned);
 
-        let changed = values
-            .iter()
-            .any(|(column, value)| existing.values.get(column) != Some(value));
+        // Compare what the store would hold against what it holds. A
+        // quantized column keeps an approximation and the row itself keeps
+        // nothing, so a diff against the caller's own full-precision input
+        // reports a change on every upsert of the same vector -- and each one
+        // would rewrite the row and place the vector again.
+        let stored_now = self.outbound_row_values(table, existing);
+        let changed = values.iter().any(|(column, value)| {
+            stored_now.get(column) != Some(&self.stored_form_of_value(table, column, value))
+        });
         if !changed {
             return Ok(UpsertResult::NoOp);
         }
         self.validate_commit_time_upsert_state_transition(table, existing, &values)?;
         self.relational.delete(tx, table, existing.row_id)?;
-        self.relational
-            .insert_with_row_id(tx, table, existing.row_id, values, snapshot)?;
+        // Placing the new vector is what retires the old one: the store
+        // deletes the entry this row already had before it takes the new one,
+        // so an updating upsert leaves one vector behind, not two.
+        let row_vectors = self.row_vector_values(table, &values);
+        let mut values = values;
+        self.blank_quantized_vector_values(table, &mut values);
+        let replaced =
+            self.relational
+                .insert_with_row_id(tx, table, existing.row_id, values, snapshot)?;
+        self.write_row_vectors(tx, replaced, row_vectors)?;
 
         if let (Some(uuid), Some(state), Some(_meta)) =
             (row_uuid, new_state.as_deref(), meta.as_ref())
@@ -18547,11 +21268,11 @@ impl Database {
 
         let incoming_row_bytes = self
             .table_meta(&table)
-            .map(|meta| estimate_row_bytes_for_meta(&incoming.values, &meta, false))
+            .map(|meta| retained_row_bytes_for_meta(&incoming.values, &meta, false))
             .unwrap_or_else(|| incoming.estimated_bytes());
         let replacement_row_bytes = self
             .table_meta(&table)
-            .map(|meta| estimate_row_bytes_for_meta(&values, &meta, false))
+            .map(|meta| retained_row_bytes_for_meta(&values, &meta, false))
             .unwrap_or_else(|| {
                 let mut replacement = incoming.clone();
                 replacement.values = values.clone();
@@ -19745,7 +22466,7 @@ impl Database {
         {
             let bytes = self
                 .table_meta(table)
-                .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
+                .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, false))
                 .unwrap_or_else(|| row.estimated_bytes());
             self.accountant.release(bytes);
         }
@@ -20449,7 +23170,7 @@ impl Database {
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
-        let row_bytes = estimate_row_bytes_for_meta(&next_values, &meta, false);
+        let row_bytes = retained_row_bytes_for_meta(&next_values, &meta, false);
         self.accountant.try_allocate_for(
             row_bytes,
             "update",
@@ -20515,7 +23236,7 @@ impl Database {
             }
             let bytes = self
                 .table_meta(&removed_table)
-                .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
+                .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, false))
                 .unwrap_or_else(|| row.estimated_bytes());
             self.accountant.release(bytes);
         }
@@ -20771,7 +23492,34 @@ impl Database {
         Ok(())
     }
 
+    /// Delete a row and everything the row owns.
+    ///
+    /// A vector column lives in its own index, not in the relational row, so
+    /// removing the relational body alone leaves every vector behind: the row
+    /// is gone from `SELECT` and still answered by nearest-neighbour search,
+    /// and the store keeps paying for what it holds.
     pub fn delete_row(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
+        self.delete_row_inner(tx, table, row_id, true)
+    }
+
+    /// Remove only the relational body of a row whose vectors the caller is
+    /// about to move or re-place itself, as row replacement does.
+    pub(crate) fn delete_row_keeping_vectors(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+    ) -> Result<()> {
+        self.delete_row_inner(tx, table, row_id, false)
+    }
+
+    fn delete_row_inner(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        release_vectors: bool,
+    ) -> Result<()> {
         self.ensure_no_mixed_local_schema_dml(tx)?;
         let trigger_callback_bound = self.trigger_callback_tx_bound_matches(tx);
         let _operation = if trigger_callback_bound || self.sql_write_control_bypass_active(tx) {
@@ -20790,13 +23538,42 @@ impl Database {
             // commits, so a failed inbound delete never becomes suppressible.
             self.clear_sync_tombstone(table, &natural_key);
         }
+        if release_vectors {
+            // Before the relational body goes, so a failure leaves the row and
+            // its vectors together rather than a row with no embeddings.
+            for index in self.vector_indexes_of_table(table) {
+                if self
+                    .vector_store_live_entry_for_row(&index, row_id, self.snapshot_for_read())
+                    .is_some()
+                {
+                    self.delete_vector(tx, index, row_id)?;
+                }
+            }
+        }
         self.relational.delete(tx, table, row_id)
+    }
+
+    /// One index reference per vector column the table declares.
+    pub(crate) fn vector_indexes_of_table(&self, table: &str) -> Vec<VectorIndexRef> {
+        self.table_meta(table)
+            .map(|meta| {
+                meta.columns
+                    .iter()
+                    .filter(|column| {
+                        matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                    })
+                    .map(|column| VectorIndexRef::new(table, column.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn scan(&self, table: &str, snapshot: SnapshotId) -> Result<Vec<VersionedRow>> {
         let _operation = self.open_operation()?;
         let rows = self.relational.scan(table, snapshot)?;
-        self.filter_rows_for_read(table, rows, snapshot)
+        let mut rows = self.filter_rows_for_read(table, rows, snapshot)?;
+        self.supplement_quantized_vectors(table, snapshot, &mut rows);
+        Ok(rows)
     }
 
     pub(crate) fn scan_in_tx_raw(
@@ -20805,7 +23582,9 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
     ) -> Result<Vec<VersionedRow>> {
-        self.relational.scan_with_tx(Some(tx), table, snapshot)
+        let mut rows = self.relational.scan_with_tx(Some(tx), table, snapshot)?;
+        self.supplement_quantized_vectors(table, snapshot, &mut rows);
+        Ok(rows)
     }
 
     /// Compute the in-tx overlay (deleted row_ids + matching staged inserts)
@@ -20855,7 +23634,8 @@ impl Database {
     ) -> Result<Vec<VersionedRow>> {
         let _operation = self.open_operation()?;
         let rows = self.relational.scan(table, snapshot)?;
-        let rows = self.filter_rows_for_read(table, rows, snapshot)?;
+        let mut rows = self.filter_rows_for_read(table, rows, snapshot)?;
+        self.supplement_rows_for_caller(table, &mut rows);
         Ok(rows.into_iter().filter(|row| predicate(row)).collect())
     }
 
@@ -20875,6 +23655,9 @@ impl Database {
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
         if self.read_allowed_for_row(table, &meta, &row, snapshot)? {
+            let mut found = [row];
+            self.supplement_rows_for_caller(table, &mut found);
+            let [row] = found;
             Ok(Some(row))
         } else {
             Ok(None)
@@ -21183,6 +23966,324 @@ impl Database {
                     .map(|entry| entry.properties.clone())
             });
         Ok(props)
+    }
+
+    /// Put every vector column of a row into the store that owns vectors.
+    ///
+    /// A `VECTOR(N)` column IS a named index, so the vector store is the one
+    /// place a vector lives and the row-write API is what puts it there.
+    /// Before this, only the SQL executor made the second call, so a caller
+    /// that wrote a row through this API left the column unindexed -- present
+    /// in the row, absent from every vector search, and charged nothing.
+    ///
+    /// Answers with what each write was charged, so a caller whose statement
+    /// fails afterwards hands back exactly what it took.
+    /// Leave a quantized vector column's slot empty in the row that is about
+    /// to be stored.
+    ///
+    /// A column declared with space-saving storage keeps its value in the
+    /// vector store, in the representation the column declared. A full-
+    /// precision copy in the row as well is the same value twice, and the
+    /// larger of the two: it makes a quantized column cost MORE live memory
+    /// per row than the space it was declared to save, so an operator who
+    /// asked for a smaller footprint is charged for the bigger one. The slot
+    /// is emptied rather than removed so what is written to disk is byte for
+    /// byte what it was -- persistence already stores nothing for these
+    /// columns and reads them back out of the same store.
+    pub(crate) fn blank_quantized_vector_values(
+        &self,
+        table: &str,
+        values: &mut HashMap<ColName, Value>,
+    ) {
+        let Some(meta) = self.table_meta(table) else {
+            return;
+        };
+        for column in &meta.columns {
+            if !matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                || matches!(column.quantization, contextdb_core::VectorQuantization::F32)
+            {
+                continue;
+            }
+            if let Some(slot) = values.get_mut(&column.name)
+                && matches!(slot, Value::Vector(_))
+            {
+                *slot = Value::Null;
+            }
+        }
+    }
+
+    /// Fill in the quantized vector columns of rows on their way to an
+    /// answer, from the store that holds them.
+    ///
+    /// The row does not keep a copy, so a reader that projects the column
+    /// takes the value from the store the column declared. What comes back is
+    /// what every other route already answers with -- the stored
+    /// approximation, not the caller's original -- so no answer changes.
+    pub(crate) fn supplement_quantized_vectors(
+        &self,
+        table: &str,
+        snapshot: SnapshotId,
+        rows: &mut [VersionedRow],
+    ) {
+        let Some(meta) = self.table_meta(table) else {
+            return;
+        };
+        let quantized: Vec<String> = meta
+            .columns
+            .iter()
+            .filter(|column| {
+                matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                    && !matches!(column.quantization, contextdb_core::VectorQuantization::F32)
+            })
+            .map(|column| column.name.clone())
+            .collect();
+        if quantized.is_empty() {
+            return;
+        }
+        for column in quantized {
+            let index = VectorIndexRef::new(table, column.clone());
+            for row in rows.iter_mut() {
+                if !matches!(row.values.get(&column), Some(Value::Null) | None) {
+                    continue;
+                }
+                if let Some(entry) = self
+                    .vector_store
+                    .live_entry_for_row(&index, row.row_id, snapshot)
+                {
+                    row.values
+                        .insert(column.clone(), Value::Vector(entry.vector));
+                }
+            }
+        }
+    }
+
+    /// What one row hands to a peer: its own values, with every quantized
+    /// vector column read back out of the store that holds it.
+    ///
+    /// The row keeps no copy of such a column, so a changeset assembled
+    /// straight from `row.values` would carry nothing where a vector belongs.
+    /// Filling it here is what keeps the payload a peer receives exactly what
+    /// it received before -- the same dequantized vector, under the same
+    /// column name, in the same shape -- on every route that builds one.
+    pub(crate) fn outbound_row_values(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+    ) -> HashMap<ColName, Value> {
+        let mut values = row.values.clone();
+        self.fill_quantized_from_store(table, row, &mut values);
+        values
+    }
+
+    fn fill_quantized_from_store(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+        values: &mut HashMap<ColName, Value>,
+    ) {
+        self.fill_quantized_columns(table, row.row_id, row.lsn, values);
+    }
+
+    fn fill_quantized_columns(
+        &self,
+        table: &str,
+        row_id: RowId,
+        lsn: Lsn,
+        values: &mut HashMap<ColName, Value>,
+    ) {
+        for column in self.quantized_vector_columns(table) {
+            if !matches!(values.get(&column), Some(Value::Null) | None) {
+                continue;
+            }
+            let index = VectorIndexRef::new(table, column.clone());
+            if let Some(vector) = self
+                .vector_store
+                .vector_for_row_lsn(&index, row_id, lsn)
+                .or_else(|| {
+                    self.vector_store
+                        .live_entry_for_row(&index, row_id, self.snapshot())
+                        .map(|entry| entry.vector)
+                })
+            {
+                values.insert(column, Value::Vector(vector));
+            }
+        }
+    }
+
+    /// Fill the quantized vector columns of whole rows on their way back to a
+    /// caller of the row API.
+    ///
+    /// `scan_filter` and `point_lookup` hand the caller the row itself -- there
+    /// is no projection to say which columns are wanted -- so every column the
+    /// row declares has to be answerable. A quantized column lives only in its
+    /// vector index, so a row handed back unfilled carries NULL where the
+    /// embedding belongs: a predicate testing it never matches, and a caller
+    /// reading it is told the row has no vector.
+    pub(crate) fn supplement_rows_for_caller(&self, table: &str, rows: &mut [VersionedRow]) {
+        if self.quantized_vector_columns(table).is_empty() {
+            return;
+        }
+        for row in rows.iter_mut() {
+            let (row_id, lsn) = (row.row_id, row.lsn);
+            let mut values = std::mem::take(&mut row.values);
+            self.fill_quantized_columns(table, row_id, lsn, &mut values);
+            row.values = values;
+        }
+    }
+
+    /// What a column will hold once the value given for it is written.
+    ///
+    /// A quantized column keeps an approximation of the vector it is given, so
+    /// this is what a diff has to compare against the stored row -- comparing
+    /// the caller's full-precision input instead reports a change that writing
+    /// it would not make.
+    fn stored_form_of_value(&self, table: &str, column: &str, value: &Value) -> Value {
+        let Value::Vector(vector) = value else {
+            return value.clone();
+        };
+        let Some(meta) = self.table_meta(table) else {
+            return value.clone();
+        };
+        let Some(declared) = meta
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == column)
+        else {
+            return value.clone();
+        };
+        if !matches!(declared.column_type, contextdb_core::ColumnType::Vector(_))
+            || matches!(
+                declared.quantization,
+                contextdb_core::VectorQuantization::F32
+            )
+        {
+            return value.clone();
+        }
+        Value::Vector(contextdb_vector::stored_vector_value(
+            vector,
+            declared.quantization,
+        ))
+    }
+
+    /// The value a row's vector column holds, from the store that holds it.
+    pub(crate) fn row_vector_for_column(
+        &self,
+        table: &str,
+        column: &str,
+        row_id: RowId,
+        lsn: Lsn,
+        snapshot: SnapshotId,
+    ) -> Option<Vec<f32>> {
+        let index = VectorIndexRef::new(table, column.to_owned());
+        // A reopened store's entries carry the generations they were written
+        // with, which a live snapshot comparison need not admit, so the row's
+        // own generation is asked first and visibility second.
+        self.vector_store
+            .live_entry_for_row(&index, row_id, snapshot)
+            .map(|entry| entry.vector)
+            .or_else(|| self.vector_store.vector_for_row_lsn(&index, row_id, lsn))
+    }
+
+    /// Which of a table's vector columns keep their value in the store alone.
+    pub(crate) fn quantized_vector_columns(&self, table: &str) -> Vec<String> {
+        self.table_meta(table)
+            .map(|meta| {
+                meta.columns
+                    .iter()
+                    .filter(|column| {
+                        matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                            && !matches!(
+                                column.quantization,
+                                contextdb_core::VectorQuantization::F32
+                            )
+                    })
+                    .map(|column| column.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The vector columns a row about to be written carries, taken before the
+    /// row's values are handed to the relational store.
+    pub(crate) fn row_vector_values(
+        &self,
+        table: &str,
+        values: &HashMap<ColName, Value>,
+    ) -> Vec<(VectorIndexRef, Vec<f32>)> {
+        let Some(meta) = self.table_meta(table) else {
+            return Vec::new();
+        };
+        meta.columns
+            .iter()
+            .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
+            .filter_map(|column| match values.get(&column.name) {
+                Some(Value::Vector(vector)) => Some((
+                    VectorIndexRef::new(table, column.name.clone()),
+                    vector.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Place a staged row's vector columns, and if any of them cannot be
+    /// placed, take the row back out of the write set.
+    ///
+    /// The vector store's write needs the row to be staged already -- it
+    /// checks that the identity it is given may be written -- so the vectors
+    /// cannot go first. What CAN hold is the invariant the executor's
+    /// accounting depends on: an insert that fails leaves NOTHING staged, so
+    /// the caller's compensation release is the only one that hands the row's
+    /// charge back. A row left staged behind a failure is released a second
+    /// time by the rollback.
+    pub(crate) fn write_row_vectors_or_unstage(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        values: &HashMap<ColName, Value>,
+        staged_before: usize,
+    ) -> Result<()> {
+        let captured = self.row_vector_values(table, values);
+        if captured.is_empty() {
+            return Ok(());
+        }
+        match self.write_row_vectors(tx, row_id, captured) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let _ = self.tx_mgr.with_write_set(tx, |ws| {
+                    ws.relational_inserts.truncate(staged_before);
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// How many rows this transaction has staged, read before one more is.
+    pub(crate) fn staged_row_count(&self, tx: TxId) -> usize {
+        self.tx_mgr
+            .with_write_set(tx, |ws| ws.relational_inserts.len())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn write_row_vectors(
+        &self,
+        tx: TxId,
+        row_id: RowId,
+        captured: Vec<(VectorIndexRef, Vec<f32>)>,
+    ) -> Result<Vec<usize>> {
+        let mut charged = Vec::new();
+        for (index, vector) in captured {
+            let bytes = self.vector_insert_accounted_bytes(&index, vector.len());
+            if let Err(error) = self.insert_vector_strict(tx, index, row_id, vector) {
+                for taken in &charged {
+                    self.accountant.release(*taken);
+                }
+                return Err(error);
+            }
+            charged.push(bytes);
+        }
+        Ok(charged)
     }
 
     pub fn insert_vector(
@@ -21644,6 +24745,7 @@ impl Database {
 
         let mut ranked = Vec::with_capacity(raw.len());
         for (row_id, vector_score) in raw {
+            crate::executor::observe_bounded_rank_candidate();
             let anchor = self.find_row_by_id_in_tx(tx, &query.table, row_id, snapshot)?;
             let joined = self.joined_row_for_rank_policy(tx, policy, &anchor, snapshot)?;
             self.rank_policy_eval_count.fetch_add(1, Ordering::SeqCst);
@@ -22230,15 +25332,38 @@ impl Database {
         }
     }
 
+    /// What holding one indexed vector costs the store, at admission and at
+    /// release alike.
+    ///
+    /// A vector column's value is retained TWICE: the relational row keeps
+    /// the vector it was given, and the vector store keeps its own copy in
+    /// whatever representation the index declares. Measured against the
+    /// allocator, a plain row with a vector column holds eight bytes for
+    /// every four written -- charging only the vector store's copy left an
+    /// operator's limit admitting twice what it allowed.
     pub(crate) fn vector_insert_accounted_bytes(
         &self,
         index: &VectorIndexRef,
         dimension: usize,
     ) -> usize {
-        self.vector_store
+        let row_copy = 24 + dimension.saturating_mul(std::mem::size_of::<f32>());
+        let Some(quantization) = self
+            .vector_store
             .try_state(index)
-            .map(|state| state.quantization().storage_bytes(dimension))
-            .unwrap_or_else(|| 24 + dimension.saturating_mul(std::mem::size_of::<f32>()))
+            .map(|state| state.quantization())
+        else {
+            return row_copy;
+        };
+        let stored_copy = quantization.storage_bytes(dimension);
+        if matches!(quantization, contextdb_core::VectorQuantization::F32) {
+            // A full-precision column keeps its value in the row as well, so
+            // the store's copy is the second of two.
+            return row_copy.saturating_add(stored_copy);
+        }
+        // A quantized column keeps ONE copy, in the store, in the
+        // representation the column declared. That is the whole point of
+        // declaring it, and it is what the charge says.
+        stored_copy
     }
 
     #[doc(hidden)]
@@ -24527,6 +27652,1403 @@ impl Database {
         })
     }
 
+    /// Capture the snapshot and detached registration owned by a bounded
+    /// pull operation. The boxed guard is lifetime-free because the registry
+    /// itself is reference counted; a cursor can therefore retain it together
+    /// with its owning `Arc<Database>`.
+    /// `None` means the caller withdrew the read while this registration was
+    /// parked behind an in-flight removal pass -- see
+    /// `SnapshotFloorRegistry::register_withdrawable`.
+    /// The transaction this handle has open, for a read that has to see it.
+    ///
+    /// Same answer `execute` uses to decide whether a statement runs inside a
+    /// transaction, so a bounded read over this handle and an uncapped one
+    /// agree about which transaction they are inside.
+    pub(crate) fn active_read_transaction(&self) -> Option<TxId> {
+        self.active_session_tx().or_else(|| {
+            self.origin_session_tx
+                .as_ref()
+                .and_then(|slot| *slot.lock())
+        })
+    }
+
+    /// What an open transaction changes about what a read of one table sees.
+    ///
+    /// This is the cheap half of the merge the uncapped path does in
+    /// `scan_with_tx`: which committed rows the transaction hides, and where
+    /// its own rows sit in its write set. The rows themselves stay where they
+    /// are until a read asks for one, so a bounded read charges each of them
+    /// as it touches it rather than paying for the whole transaction up front.
+    pub(crate) fn transaction_table_overlay(
+        &self,
+        tx: TxId,
+        table: &str,
+    ) -> Result<crate::executor::TransactionTableOverlay> {
+        self.tx_mgr.with_write_set(tx, |ws| {
+            let deleted: std::collections::HashSet<RowId> = ws
+                .relational_deletes
+                .iter()
+                .filter(|(staged_table, _, _)| staged_table == table)
+                .map(|(_, row_id, _)| *row_id)
+                .collect();
+            let delete_predicates: Vec<_> = ws
+                .relational_delete_predicates
+                .iter()
+                .filter(|predicate| predicate.table == table)
+                .cloned()
+                .collect();
+            // Newest version per row wins, and the surviving rows keep the
+            // order the transaction staged them in -- the same rule the
+            // uncapped merge follows, so both paths publish one answer.
+            let mut staged_identities = std::collections::HashSet::new();
+            let mut staged_positions: Vec<usize> = ws
+                .relational_inserts
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, (staged_table, row))| {
+                    staged_table == table && staged_identities.insert(row.row_id)
+                })
+                .map(|(position, _)| position)
+                .collect();
+            staged_positions.reverse();
+            let bytes = deleted
+                .len()
+                .saturating_mul(std::mem::size_of::<RowId>())
+                .saturating_add(
+                    staged_identities
+                        .len()
+                        .saturating_mul(std::mem::size_of::<RowId>()),
+                )
+                .saturating_add(
+                    staged_positions
+                        .len()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                )
+                .saturating_add(
+                    delete_predicates
+                        .iter()
+                        .map(|predicate| {
+                            predicate.table.len().saturating_add(
+                                predicate
+                                    .predicates
+                                    .iter()
+                                    .map(|(column, value)| {
+                                        column.len().saturating_add(value.estimated_bytes())
+                                    })
+                                    .sum::<usize>(),
+                            )
+                        })
+                        .sum::<usize>(),
+                );
+            crate::executor::TransactionTableOverlay {
+                deleted,
+                delete_predicates,
+                staged_positions,
+                staged_identities,
+                bytes,
+            }
+        })
+    }
+
+    /// One row the transaction has staged, cloned under the caller's charge.
+    ///
+    /// The identity is charged before it is read and the values before they
+    /// are copied, so a row this handle staged costs a bounded read exactly
+    /// what a committed row of the same shape costs.
+    pub(crate) fn transaction_staged_row(
+        &self,
+        tx: TxId,
+        position: usize,
+        before_touch: &mut dyn FnMut() -> std::result::Result<
+            (),
+            crate::executor::BoundedExecutionError,
+        >,
+        before_clone: &mut dyn FnMut(
+            usize,
+        ) -> std::result::Result<
+            (),
+            crate::executor::BoundedExecutionError,
+        >,
+    ) -> std::result::Result<Option<VersionedRow>, crate::executor::BoundedExecutionError> {
+        // Measured before it is copied, so the charge precedes the
+        // allocation it pays for, exactly as it does for a committed row.
+        let measured = self
+            .tx_mgr
+            .with_write_set(tx, |ws| {
+                ws.relational_inserts
+                    .get(position)
+                    .map(|(_, row)| row.estimated_bytes())
+            })
+            .map_err(crate::executor::BoundedExecutionError::from)?;
+        let Some(bytes) = measured else {
+            return Ok(None);
+        };
+        before_touch()?;
+        before_clone(bytes)?;
+        self.tx_mgr
+            .with_write_set(tx, |ws| {
+                ws.relational_inserts
+                    .get(position)
+                    .map(|(_, row)| row.clone())
+            })
+            .map_err(crate::executor::BoundedExecutionError::from)
+    }
+
+    /// What an open transaction changes about the vectors one index can be
+    /// searched over.
+    ///
+    /// The same five facts the established door merges by hand
+    /// (`query_vector_strict_with_write_set_exact`), read once and carried as
+    /// decisions rather than as a copy of the index: what this transaction
+    /// took out, what it re-filed elsewhere, and where its own vectors sit.
+    pub(crate) fn transaction_vector_overlay(
+        &self,
+        tx: TxId,
+        index: &VectorIndexRef,
+    ) -> Result<crate::executor::TransactionVectorOverlay> {
+        let committed_entries = self.vector_entry_count(index);
+        self.tx_mgr.with_write_set(tx, |ws| {
+            let mut removed: std::collections::HashSet<RowId> = ws
+                .vector_deletes
+                .iter()
+                .filter(|(delete_index, _, _)| delete_index == index)
+                .map(|(_, row_id, _)| *row_id)
+                .collect();
+            // A row deleted and then put back at the same identity is still
+            // there to be scored; only a deletion with no replacement takes
+            // the entry out of the search.
+            for (delete_table, row_id, _) in &ws.relational_deletes {
+                if delete_table != &index.table {
+                    continue;
+                }
+                let replaced = ws.relational_inserts.iter().any(|(insert_table, row)| {
+                    insert_table == &index.table && row.row_id == *row_id
+                });
+                if !replaced {
+                    removed.insert(*row_id);
+                }
+            }
+            let moved: HashMap<RowId, RowId> = ws
+                .vector_moves
+                .iter()
+                .filter(|(move_index, _, _, _)| move_index == index)
+                .map(|(_, from_row_id, to_row_id, _)| (*from_row_id, *to_row_id))
+                .collect();
+            // Newest version per row wins and the survivors keep the order the
+            // transaction staged them in -- the same rule the established
+            // merge follows, so both doors publish one answer.
+            let mut staged_identities = std::collections::HashSet::new();
+            let mut staged_positions: Vec<usize> = ws
+                .vector_inserts
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, entry)| {
+                    entry.index == *index
+                        && entry.deleted_tx.is_none()
+                        && staged_identities.insert(entry.row_id)
+                })
+                .map(|(position, _)| position)
+                .collect();
+            staged_positions.reverse();
+            let bytes = removed
+                .len()
+                .saturating_add(staged_identities.len())
+                .saturating_mul(std::mem::size_of::<RowId>())
+                .saturating_add(
+                    moved
+                        .len()
+                        .saturating_mul(std::mem::size_of::<(RowId, RowId)>()),
+                )
+                .saturating_add(
+                    staged_positions
+                        .len()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                );
+            let searchable_entry_count = committed_entries.saturating_add(staged_positions.len());
+            crate::executor::TransactionVectorOverlay {
+                removed,
+                moved,
+                staged_identities,
+                staged_positions,
+                searchable_entry_count,
+                bytes,
+            }
+        })
+    }
+
+    /// One vector the transaction has staged, cloned under the caller's
+    /// charge.
+    ///
+    /// The identity is charged before it is read and the payload before it is
+    /// copied, so a vector this handle staged costs a bounded read what a
+    /// committed entry of the same width costs.
+    pub(crate) fn transaction_staged_vector(
+        &self,
+        tx: TxId,
+        position: usize,
+        before_touch: &mut dyn FnMut() -> std::result::Result<
+            (),
+            crate::executor::BoundedExecutionError,
+        >,
+        before_clone: &mut dyn FnMut(
+            usize,
+        ) -> std::result::Result<
+            (),
+            crate::executor::BoundedExecutionError,
+        >,
+    ) -> std::result::Result<Option<(RowId, Vec<f32>)>, crate::executor::BoundedExecutionError>
+    {
+        // Measured before it is copied, so the charge precedes the allocation
+        // it pays for.
+        let measured = self
+            .tx_mgr
+            .with_write_set(tx, |ws| {
+                ws.vector_inserts.get(position).map(|entry| {
+                    (
+                        entry.row_id,
+                        entry
+                            .vector
+                            .len()
+                            .saturating_mul(std::mem::size_of::<f32>())
+                            .saturating_add(std::mem::size_of::<Vec<f32>>()),
+                    )
+                })
+            })
+            .map_err(crate::executor::BoundedExecutionError::from)?;
+        let Some((row_id, bytes)) = measured else {
+            return Ok(None);
+        };
+        before_touch()?;
+        before_clone(bytes)?;
+        self.tx_mgr
+            .with_write_set(tx, |ws| {
+                ws.vector_inserts
+                    .get(position)
+                    .map(|entry| (row_id, entry.vector.clone()))
+            })
+            .map_err(crate::executor::BoundedExecutionError::from)
+    }
+
+    pub(crate) fn bounded_read_snapshot_registration(
+        &self,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<(SnapshotId, Box<dyn Send + Sync>)>> {
+        let Some(snapshot) = self.try_snapshot_for_read() else {
+            return Err(closed_database_error());
+        };
+        let Some(registration) = self
+            .snapshot_registry
+            .register_withdrawable(snapshot, None, withdrawn)
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            snapshot,
+            Box::new(registration) as Box<dyn Send + Sync>,
+        )))
+    }
+
+    /// The same capture for a SUSPENDED cursor, which keeps its registration
+    /// alive between calls. It publishes the idle window it is judged by, so
+    /// removal defers to it only while it is still entitled to another page:
+    /// a caller that opens a cursor, reads a page and never comes back stops
+    /// holding rows back once that window passes. The returned window is the
+    /// cursor's to stamp on every page it hands out. `None` carries the same
+    /// meaning as on the read above: the caller withdrew while this
+    /// registration was parked behind an in-flight removal pass.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn bounded_cursor_snapshot_registration(
+        &self,
+        clock: Arc<dyn DeadlineClock>,
+        idle_ms: u64,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<(SnapshotId, Arc<CursorIdleWindow>, Box<dyn Send + Sync>)>> {
+        let Some(snapshot) = self.try_snapshot_for_read() else {
+            return Err(closed_database_error());
+        };
+        let opened_ms = clock.now_ms();
+        let window = Arc::new(CursorIdleWindow::new(clock, idle_ms, opened_ms));
+        let Some(registration) = self.snapshot_registry.register_withdrawable(
+            snapshot,
+            Some(Arc::clone(&window)),
+            withdrawn,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            snapshot,
+            window,
+            Box::new(registration) as Box<dyn Send + Sync>,
+        )))
+    }
+
+    /// Clone the shared accountant for an owned, suspendable request charge.
+    pub(crate) fn bounded_read_accountant(&self) -> Arc<MemoryAccountant> {
+        Arc::clone(&self.accountant)
+    }
+
+    /// Pre-resolve and statically validate an already-parsed bounded read
+    /// through the same planner validation functions used by ordinary
+    /// execution. The bounded entrance keeps parsing before `on_query`, just
+    /// like `Database::execute`, and hands this function that one AST rather
+    /// than parsing the statement a second time.
+    pub(crate) fn prepare_bounded_read_plan(
+        &self,
+        parsed: &Statement,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Statement, PhysicalPlan)> {
+        let resolved = self.pre_resolve_cte_subqueries(parsed, params, None)?;
+        let plan = contextdb_planner::plan(&resolved)?;
+        validate_plan_columns(self, &plan)?;
+        Ok((resolved, plan))
+    }
+
+    /// One row named by its identity, charged the way a scanned row is.
+    ///
+    /// The version index answers which version of this row the snapshot sees,
+    /// so the cost is the row asked for rather than the table's whole write
+    /// history. A caller that already knows which rows it wants -- a vector
+    /// search holding the ids it scored -- asks here instead of walking the
+    /// table and discarding everything it did not ask for.
+    pub(crate) fn bounded_row_by_identity<E>(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        before_touch: &mut (dyn FnMut() -> std::result::Result<(), E> + '_),
+        before_clone: &mut (dyn FnMut(usize) -> std::result::Result<(), E> + '_),
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        before_touch()?;
+        if let Some(tx) = tx {
+            // The reader's own transaction answers first: a row it staged is
+            // the row this read is about, and a row it deleted is not there.
+            let staged = self
+                .tx_mgr
+                .with_write_set(tx, |ws| {
+                    if let Some((_, row)) = ws
+                        .relational_inserts
+                        .iter()
+                        .rev()
+                        .find(|(insert_table, row)| insert_table == table && row.row_id == row_id)
+                    {
+                        return Some(Some(row.estimated_bytes()));
+                    }
+                    if ws
+                        .relational_deletes
+                        .iter()
+                        .any(|(delete_table, deleted, _)| {
+                            delete_table == table && *deleted == row_id
+                        })
+                    {
+                        return Some(None);
+                    }
+                    None
+                })
+                .map_err(E::from)?;
+            match staged {
+                Some(Some(bytes)) => {
+                    before_clone(bytes)?;
+                    return self
+                        .tx_mgr
+                        .with_write_set(tx, |ws| {
+                            ws.relational_inserts
+                                .iter()
+                                .rev()
+                                .find(|(insert_table, row)| {
+                                    insert_table == table && row.row_id == row_id
+                                })
+                                .map(|(_, row)| row.clone())
+                        })
+                        .map_err(E::from);
+                }
+                Some(None) => return Ok(None),
+                None => {}
+            }
+        }
+        let tables = self.relational_store.tables.read();
+        let Some(rows) = tables.get(table) else {
+            return Ok(None);
+        };
+        let Some(row) = self
+            .relational_store
+            .visible_version_position(table, rows, row_id, snapshot)
+            .and_then(|position| rows.get(position))
+        else {
+            return Ok(None);
+        };
+        // Measured where it still lives, so the charge precedes the copy it
+        // pays for.
+        before_clone(row.estimated_bytes())?;
+        Ok(Some(row.clone()))
+    }
+
+    pub(crate) fn bounded_physical_table_cursor(
+        &self,
+        table: &str,
+    ) -> Result<contextdb_relational::mem::BoundedPhysicalCursor> {
+        self.relational.bounded_physical_cursor(table)
+    }
+
+    pub(crate) fn bounded_physical_table_row_next<E>(
+        &self,
+        table: &str,
+        cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
+        before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        self.relational
+            .bounded_physical_row_next(table, cursor, before_touch, before_clone)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn bounded_index_next<E>(
+        &self,
+        table: &str,
+        index: &str,
+        cursor: &mut contextdb_relational::mem::BoundedIndexCursor,
+        before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<(IndexKey, contextdb_relational::IndexEntry)>, E>
+    where
+        E: From<Error>,
+    {
+        self.relational
+            .bounded_index_next(table, index, cursor, before_touch, before_clone)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded_ordered_table_row_next<E>(
+        &self,
+        table: &str,
+        column: &str,
+        direction: SortDirection,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
+        before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        self.relational.bounded_ordered_row_next(
+            table,
+            column,
+            direction,
+            snapshot,
+            cursor,
+            before_touch,
+            before_clone,
+        )
+    }
+
+    /// Charging is passed in rather than assumed, so the caller that owns the
+    /// ceiling stays the one that decides what a posting and a row cost.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded_exact_index_row_next<E>(
+        &self,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize) -> std::result::Result<(), E>,
+        before_clone: impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        self.relational.bounded_exact_index_row_next(
+            table,
+            index,
+            snapshot,
+            cursor,
+            before_touch,
+            before_retain,
+            release_retained,
+            before_clone,
+        )
+    }
+
+    /// A bounded read's schema claim is held by the read's own state, which a
+    /// retained cursor keeps alive between requests and hands between service
+    /// threads, so it takes the detached form rather than the statement-scoped
+    /// one.
+    pub(crate) fn bounded_vector_schema_read_many(
+        &self,
+        indexes: impl IntoIterator<Item = VectorIndexRef>,
+    ) -> VectorSchemaReadGuard {
+        self.vector_schema_read_many_detached(indexes)
+    }
+
+    /// What this transaction has staged for one row's vector, or `None` when it
+    /// has not touched that row and the committed value still stands. The inner
+    /// `None` is a row this transaction removed.
+    ///
+    /// The staged vector is MEASURED before it is copied, so the charge
+    /// precedes the allocation it pays for -- the same order a committed row is
+    /// charged in, and the reason this asks the write set twice rather than
+    /// cloning it once.
+    pub(crate) fn bounded_staged_row_vector<E>(
+        &self,
+        tx: TxId,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        before_copy: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<Option<Vec<f32>>>, E>
+    where
+        E: From<Error>,
+    {
+        let measured =
+            self.tx_mgr
+                .with_write_set(tx, |ws| {
+                    if let Some(entry) = ws.vector_inserts.iter().rev().find(|entry| {
+                        entry.index == *index
+                            && entry.row_id == row_id
+                            && entry.deleted_tx.is_none()
+                    }) {
+                        return Some(entry.vector.len() * std::mem::size_of::<f32>());
+                    }
+                    if ws
+                        .vector_deletes
+                        .iter()
+                        .rev()
+                        .any(|(deleted_index, deleted_row_id, _)| {
+                            deleted_index == index && *deleted_row_id == row_id
+                        })
+                    {
+                        return Some(0);
+                    }
+                    if ws.vector_moves.iter().rev().any(
+                        |(moved_index, from_row_id, to_row_id, _)| {
+                            moved_index == index && (*from_row_id == row_id || *to_row_id == row_id)
+                        },
+                    ) {
+                        return Some(0);
+                    }
+                    None
+                })
+                .map_err(E::from)?;
+        let Some(bytes) = measured else {
+            return Ok(None);
+        };
+        before_copy(bytes)?;
+        let entry = self
+            .vector_entry_for_row_in_tx(Some(tx), index, row_id, snapshot)
+            .map_err(E::from)?;
+        Ok(Some(entry.map(|entry| entry.vector)))
+    }
+
+    pub(crate) fn with_bounded_row_vector<E, T>(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        mut before_access_row: impl FnMut(usize) -> std::result::Result<(), E>,
+        use_vector: impl FnOnce(&[f32]) -> std::result::Result<T, E>,
+    ) -> std::result::Result<Option<T>, E>
+    where
+        E: From<Error>,
+    {
+        let meta = self
+            .table_meta(&index.table)
+            .ok_or_else(|| E::from(Error::TableNotFound(index.table.clone())))?;
+        let tables = self.relational_store.tables.read();
+        let row = tables
+            .get(&index.table)
+            .and_then(|rows| {
+                rows.iter()
+                    .rev()
+                    .find(|row| row.row_id == row_id && row.visible_at(snapshot))
+            })
+            .ok_or_else(|| {
+                E::from(Error::NotFound(format!(
+                    "row {row_id} in table {}",
+                    index.table
+                )))
+            })?;
+        // The read guard taken above is still live, so access evaluation
+        // borrows it rather than acquiring it a second time. A row the reader
+        // is not entitled to read is refused as the access decision it is;
+        // reporting it as missing tells the caller the store does not hold
+        // what it holds, and hides the refusal a caller branches on.
+        if let Some(denial) = self.bounded_read_denial_for_row_in_tables(
+            tx,
+            &tables,
+            &index.table,
+            &meta,
+            row,
+            snapshot,
+            &mut before_access_row,
+        )? {
+            return Err(E::from(denial));
+        }
+        // A reader inside its own transaction scores what that transaction
+        // staged: the vector this read is about may have been rewritten a
+        // moment ago by the same session, and answering from the committed
+        // value would name a different nearest neighbour while looking
+        // entirely correct doing it.
+        if let Some(tx) = tx
+            && let Some(staged) =
+                self.bounded_staged_row_vector(tx, index, row_id, snapshot, &mut before_access_row)?
+        {
+            return match staged {
+                Some(vector) => use_vector(&vector).map(Some),
+                None => Ok(None),
+            };
+        }
+        match row.values.get(&index.column) {
+            Some(Value::Vector(vector)) => use_vector(vector).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded_brute_force_vector_cursor<E>(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize),
+    ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, E>
+    where
+        E: From<Error>,
+    {
+        self.vector.bounded_brute_force_cursor(
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            before_source_entry,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    pub(crate) fn bounded_brute_force_vector_step<E>(
+        &self,
+        cursor: &mut contextdb_vector::mem::BoundedBruteForceCursor,
+        before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        before_distance: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize),
+    ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, E>
+    where
+        E: From<Error>,
+    {
+        self.vector.bounded_brute_force_step(
+            cursor,
+            before_source_entry,
+            before_distance,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    /// Run the bounded HNSW source and return the admitted rows with the bytes
+    /// still charged for them. The debug trace is moved into the last-search
+    /// slot rather than copied: its row-id vectors and index names were
+    /// admitted through the request's memory callbacks, so a copy would
+    /// duplicate that payload outside the accounting that allowed it. Because
+    /// the move hands the payload to a database-lifetime slot, the trace's
+    /// bytes are released at the moment of publication and the returned count
+    /// is the row payload the caller still owes. `None` means the exact
+    /// brute-force continuation must be used instead.
+    /// Reserve, against the store's memory limit, the working set a search
+    /// holds while it reads a transaction's own vectors.
+    ///
+    /// Taken BEFORE any vector is copied and named for the work it belongs to,
+    /// so an operator who hits the store's limit is told which operation the
+    /// limit stopped rather than being handed the read's own ceiling. This is
+    /// the same reservation, under the same name, that the established door
+    /// takes for the same merged image.
+    /// What the STORE's own memory limit says about a statement that declared
+    /// no ceilings of its own.
+    ///
+    /// A read that names its ceilings is governed by them, and the bounded
+    /// path deliberately holds nothing the store accounts for while it runs --
+    /// `bounded_pull_execution_contract.rs`'s exact-work matrix requires the
+    /// request's ceiling to refuse first and the read to leave no
+    /// database-accounted reservation behind. A read that names NO ceilings is
+    /// governed by the store instead, so this is where the store's limits are
+    /// consulted: once, before anything is drained, sized from the plan, and
+    /// released when the statement ends.
+    pub(crate) fn uncapped_store_reservations(
+        &self,
+        plan: &PhysicalPlan,
+    ) -> Result<Vec<Box<dyn Send + Sync>>> {
+        let mut held: Vec<Box<dyn Send + Sync>> = Vec::new();
+        if let Some(shape) = vector_search_shape_from_plan(plan) {
+            // The index's own width is the width of the vectors it holds, so
+            // this is the figure the established door computes from the query
+            // vector it has just resolved.
+            let dimension = self
+                .vector_store
+                .try_state(&shape.index)
+                .map(|state| state.dimension())
+                .unwrap_or(0);
+            let bytes = crate::executor::estimate_vector_search_bytes(dimension, shape.k);
+            let reservation = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                Arc::clone(&self.accountant),
+                bytes,
+                "vector_search",
+                "search",
+                "Reduce LIMIT/dimensionality or raise MEMORY_LIMIT before vector search.",
+            )?;
+            held.push(Box::new(reservation) as Box<dyn Send + Sync>);
+        }
+        // A traversal's frontier is NOT reserved here. Its size is not known
+        // until the drain resolves the starts, and pricing it from one start
+        // ahead of time refuses a traversal that resolves none and under-charges
+        // one that resolves many. The read holds that reservation itself and
+        // grows it as each start is resolved.
+        Ok(held)
+    }
+
+    pub(crate) fn bounded_vector_overlay_reservation(
+        &self,
+        index: &VectorIndexRef,
+        entry_count: usize,
+    ) -> Result<Option<Box<dyn Send + Sync>>> {
+        let dimension = self
+            .vector_store
+            .try_state(index)
+            .map(|state| state.dimension())
+            .unwrap_or(0);
+        let bytes = estimate_active_tx_vector_overlay_bytes(entry_count, dimension);
+        let reservation = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            Arc::clone(&self.accountant),
+            bytes,
+            "query",
+            &format!("active_tx_vector_overlay@{}.{}", index.table, index.column),
+            "Reduce active transaction vector search scope or raise MEMORY_LIMIT.",
+        )?;
+        Ok(Some(Box::new(reservation) as Box<dyn Send + Sync>))
+    }
+
+    /// Build this index's approximate graph if this snapshot is entitled to
+    /// one, and answer whether a graph is now there to search.
+    ///
+    /// The store decides and the store builds. A refusal is not this read's to
+    /// report: a search that could not have a graph still has an answer --
+    /// it scores the entries instead, which is exactly what the established
+    /// door does with the same refusal.
+    /// The standing visited ceiling a traversal keeps when the caller declared
+    /// no budget of its own.
+    ///
+    /// A read that names its own ceilings is governed by them; that is what a
+    /// bounded read is for, and the standing ceiling steps aside. A read that
+    /// names none keeps the ceiling it always had -- the same number, and the
+    /// same typed refusal, on both doors.
+    pub(crate) fn bounded_legacy_visited_cap(&self, declares_no_ceilings: bool) -> Option<usize> {
+        if !declares_no_ceilings {
+            return None;
+        }
+        Some(if self.access_is_admin() {
+            contextdb_graph::mem::MAX_VISITED
+        } else {
+            GATED_BFS_VISITED_CEILING
+        })
+    }
+
+    pub(crate) fn bounded_ensure_hnsw_built(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+    ) -> bool {
+        self.vector
+            .ensure_hnsw_built(index, snapshot)
+            .unwrap_or(false)
+    }
+
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded_hnsw_vector_search<E>(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        before_distance: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut release_retained: impl FnMut(usize),
+    ) -> std::result::Result<Option<(Vec<(RowId, f32)>, usize)>, E>
+    where
+        E: From<Error>,
+    {
+        self.last_vector_search_used_hnsw
+            .store(false, Ordering::SeqCst);
+        *self.last_vector_search_trace.write() = None;
+        let result = self.vector.bounded_hnsw_search(
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            before_source_entry,
+            before_distance,
+            before_retain,
+            &mut release_retained,
+        )?;
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        let contextdb_vector::mem::BoundedHnswResult {
+            rows,
+            trace,
+            retained_bytes,
+        } = result;
+        // The trace's payload leaves the request's accounting here: it is moved
+        // into the database-lifetime slot, which outlives the read. Its charge
+        // is settled at exactly that moment, so what the caller keeps owing is
+        // the row payload alone.
+        let trace_bytes = trace.retained_bytes();
+        let Some(row_bytes) = retained_bytes.checked_sub(trace_bytes) else {
+            release_retained(retained_bytes);
+            return Err(E::from(Error::Other(
+                "bounded vector trace charge exceeds the search charge".to_string(),
+            )));
+        };
+        self.last_vector_search_used_hnsw
+            .store(true, Ordering::SeqCst);
+        *self.last_vector_search_trace.write() = Some(trace.into_trace());
+        release_retained(trace_bytes);
+        Ok(Some((rows, row_bytes)))
+    }
+
+    /// Refuse a bounded vector read raised on a trigger or cron callback
+    /// thread.
+    ///
+    /// A bounded read's schema claim is detached: the retained cursor keeps it
+    /// between requests. On a callback thread the claim is deliberately EMPTY
+    /// -- those callbacks already run inside the commit mutex that vector DDL
+    /// metadata mutation also takes, so claiming the schema gate underneath
+    /// one would order commit-mutex before schema-gate and deadlock. An empty
+    /// claim is survivable for a statement that ends inside the callback, but
+    /// a cursor outlives it, so it would escape holding no schema protection
+    /// at all and could read an index concurrent DDL is rewriting.
+    ///
+    /// Neither available outcome is acceptable, so the read is refused rather
+    /// than served unprotected. Statement-scoped reads on a callback thread
+    /// are unchanged.
+    fn assert_bounded_vector_read_is_schema_protected(&self) -> Result<()> {
+        if self.callback_active_on_current_thread_for_this_db() {
+            return Err(Error::InvalidStateTransition(
+                "a bounded vector read cannot be opened inside a trigger or cron callback: its \
+                 schema claim would outlive the callback with no protection, and claiming the \
+                 schema gate under the commit mutex the callback already holds would deadlock -- \
+                 run the bounded read from the calling session instead"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bounded_vector_candidate_k(
+        &self,
+        index: &VectorIndexRef,
+        requested: usize,
+        sort_key: Option<&str>,
+    ) -> Result<usize> {
+        self.assert_bounded_vector_read_is_schema_protected()?;
+        let Some(sort_key) = sort_key else {
+            return Ok(requested);
+        };
+        let meta = self
+            .table_meta(&index.table)
+            .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+        let column = meta
+            .columns
+            .iter()
+            .find(|column| column.name == index.column)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+        let Some(policy) = column.rank_policy.as_ref() else {
+            return Err(Error::RankPolicyNotFound {
+                index: rank_index_name(&index.table, &index.column),
+                sort_key: sort_key.to_string(),
+            });
+        };
+        if policy.sort_key != sort_key {
+            return Err(Error::RankPolicyNotFound {
+                index: rank_index_name(&index.table, &index.column),
+                sort_key: sort_key.to_string(),
+            });
+        }
+        let _formula = self.rank_formula(&index.table, &index.column)?;
+        Ok(self.rank_policy_candidate_k(self.vector_entry_count(index), requested))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded_rank_candidate<E>(
+        &self,
+        index: &VectorIndexRef,
+        sort_key: &str,
+        anchor_row_id: RowId,
+        anchor_values: &HashMap<String, Value>,
+        vector_score: f32,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        mut before_candidate: impl FnMut() -> std::result::Result<(), E>,
+        before_access: impl FnMut(usize) -> std::result::Result<(), E>,
+        before_joined_clone: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_joined_clone: impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(Option<f32>, usize), E>
+    where
+        E: From<Error>,
+    {
+        before_candidate()?;
+        let meta = self
+            .table_meta(&index.table)
+            .ok_or_else(|| E::from(Error::TableNotFound(index.table.clone())))?;
+        let column = meta
+            .columns
+            .iter()
+            .find(|column| column.name == index.column)
+            .ok_or_else(|| {
+                E::from(Error::UnknownVectorIndex {
+                    index: index.clone(),
+                })
+            })?;
+        let policy = column.rank_policy.as_ref().ok_or_else(|| {
+            E::from(Error::RankPolicyNotFound {
+                index: rank_index_name(&index.table, &index.column),
+                sort_key: sort_key.to_string(),
+            })
+        })?;
+        if policy.sort_key != sort_key {
+            return Err(E::from(Error::RankPolicyNotFound {
+                index: rank_index_name(&index.table, &index.column),
+                sort_key: sort_key.to_string(),
+            }));
+        }
+        let formula = self
+            .rank_formula(&index.table, &index.column)
+            .map_err(E::from)?;
+        let joined = self.bounded_joined_row_for_rank_policy(
+            policy,
+            anchor_values,
+            snapshot,
+            tx,
+            &mut before_candidate,
+            before_access,
+            before_joined_clone,
+            release_joined_clone,
+        )?;
+        let joined_row = joined.as_ref().map(|(row, _)| row);
+        let joined_bytes = joined.as_ref().map_or(0, |(_, bytes)| *bytes);
+        self.rank_policy_eval_count.fetch_add(1, Ordering::SeqCst);
+        let evaluated = formula.eval_with_resolver(vector_score, |formula_column| {
+            if let Some(value) = anchor_values.get(formula_column) {
+                return rank_value_to_number(value, formula_column);
+            }
+            let Some(joined) = joined_row else {
+                return Ok(None);
+            };
+            if self.corrupt_joined_values.read().contains(&(
+                policy.joined_table.clone(),
+                joined.row_id,
+                formula_column.to_string(),
+            )) {
+                return Err(FormulaEvalError::CorruptJoinedColumn {
+                    column: formula_column.to_string(),
+                });
+            }
+            rank_value_to_number(
+                joined
+                    .values
+                    .get(formula_column)
+                    .map_or(&Value::Null, |value| value),
+                formula_column,
+            )
+        });
+        match evaluated {
+            Ok(Some(rank)) => Ok((Some(rank), joined_bytes)),
+            Ok(None) => Ok((Some(f32::NAN), joined_bytes)),
+            Err(error) => {
+                let error_row_id = if matches!(error, FormulaEvalError::CorruptJoinedColumn { .. })
+                {
+                    joined_row
+                        .map(|row| row.row_id)
+                        .map_or(anchor_row_id, |row_id| row_id)
+                } else {
+                    anchor_row_id
+                };
+                self.warn_rank_eval_error(&index.table, &index.column, error_row_id, &error);
+                Ok((None, joined_bytes))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_joined_row_for_rank_policy<E>(
+        &self,
+        policy: &RankPolicy,
+        anchor_values: &HashMap<String, Value>,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        before_candidate: &mut impl FnMut() -> std::result::Result<(), E>,
+        mut before_access: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut before_clone: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut release_clone: impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<(VersionedRow, usize)>, E>
+    where
+        E: From<Error>,
+    {
+        if policy.anchor_column.is_empty() {
+            return Err(E::from(Error::Other(format!(
+                "rank policy on index {}.{} has no resolved anchor join column",
+                policy.joined_table, policy.joined_column
+            ))));
+        }
+        let join_value = anchor_values
+            .get(&policy.anchor_column)
+            .cloned()
+            .map_or(Value::Null, |value| value);
+        if join_value == Value::Null {
+            return Ok(None);
+        }
+
+        let indexes = self.relational_store.indexes.read();
+        let storage = indexes
+            .get(&policy.joined_table)
+            .and_then(|table_indexes| table_indexes.get(&policy.protected_index))
+            .ok_or_else(|| {
+                E::from(Error::Other(format!(
+                    "rank policy protected index `{}` missing on table `{}`",
+                    policy.protected_index, policy.joined_table
+                )))
+            })?;
+        let Some((first_column, direction)) = storage.columns.first() else {
+            return Err(E::from(Error::Other(format!(
+                "rank policy protected index `{}` on `{}` has no columns",
+                policy.protected_index, policy.joined_table
+            ))));
+        };
+        if first_column != &policy.joined_column {
+            return Err(E::from(Error::Other(format!(
+                "rank policy protected index `{}` on `{}` no longer leads with `{}`",
+                policy.protected_index, policy.joined_table, policy.joined_column
+            ))));
+        }
+        let key_component = match direction {
+            SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(join_value.clone())),
+            SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(join_value.clone())),
+        };
+        let mut best_row_id = None;
+        let mut consider = |entries: &[contextdb_relational::IndexEntry]| {
+            for entry in entries {
+                before_candidate()?;
+                if entry.visible_at(snapshot)
+                    && best_row_id.is_none_or(|current| current < entry.row_id)
+                {
+                    best_row_id = Some(entry.row_id);
+                }
+            }
+            Ok::<(), E>(())
+        };
+        if storage.columns.len() == 1 {
+            if let Some(entries) = storage.exact_postings(&vec![key_component.clone()]) {
+                consider(entries)?;
+            }
+        } else if !storage.exact_only() {
+            for (key, entries) in storage.tree.range(vec![key_component.clone()]..) {
+                if key.first() != Some(&key_component) {
+                    break;
+                }
+                consider(entries)?;
+            }
+        }
+        drop(indexes);
+        // What this transaction has done to the joined table. A row it staged
+        // is in no index, so the walk above cannot see it; a row it deleted or
+        // rewrote must not win on the strength of the committed version the
+        // index still points at.
+        let overlay = match tx {
+            Some(tx) => Some(self.transaction_table_overlay(tx, &policy.joined_table)?),
+            None => None,
+        };
+        let best_row_id = best_row_id.filter(|row_id| {
+            overlay.as_ref().is_none_or(|overlay| {
+                !overlay.deleted.contains(row_id) && !overlay.staged_identities.contains(row_id)
+            })
+        });
+        let committed = 'committed: {
+            let Some(row_id) = best_row_id else {
+                break 'committed None;
+            };
+            self.bounded_committed_rank_join_row(
+                tx,
+                policy,
+                row_id,
+                &join_value,
+                snapshot,
+                overlay.as_ref(),
+                before_candidate,
+                &mut before_access,
+                &mut before_clone,
+                &mut release_clone,
+            )?
+        };
+        let staged = match (tx, overlay.as_ref()) {
+            (Some(tx), Some(overlay)) => self.bounded_staged_rank_join_row(
+                tx,
+                policy,
+                &join_value,
+                snapshot,
+                overlay,
+                before_candidate,
+                &mut before_access,
+                &mut before_clone,
+                &mut release_clone,
+            )?,
+            _ => None,
+        };
+        // Newest version wins, by the same rule the established merge applies
+        // over its own image of the table; the loser's copy is handed back
+        // where it was charged.
+        match (committed, staged) {
+            (Some(committed), Some(staged)) => {
+                if staged.0.row_id > committed.0.row_id {
+                    release_clone(committed.1)?;
+                    Ok(Some(staged))
+                } else {
+                    release_clone(staged.1)?;
+                    Ok(Some(committed))
+                }
+            }
+            (Some(committed), None) => Ok(Some(committed)),
+            (None, Some(staged)) => Ok(Some(staged)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// The committed row the join resolves to, read by the identity the index
+    /// named.
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_committed_rank_join_row<E>(
+        &self,
+        tx: Option<TxId>,
+        policy: &RankPolicy,
+        row_id: RowId,
+        join_value: &Value,
+        snapshot: SnapshotId,
+        overlay: Option<&crate::executor::TransactionTableOverlay>,
+        before_candidate: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        before_clone: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_clone: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<(VersionedRow, usize)>, E>
+    where
+        E: From<Error>,
+    {
+        let tables = self.relational_store.tables.read();
+        let Some(rows) = tables.get(&policy.joined_table) else {
+            return Ok(None);
+        };
+        // The index named the row identity, so the joined row is fetched by
+        // that identity: one charged inspection of the row the join resolves
+        // to, not a pass over rows the join excludes.
+        before_candidate()?;
+        let Some(row) = self
+            .relational_store
+            .visible_version_position(&policy.joined_table, rows, row_id, snapshot)
+            .and_then(|position| rows.get(position))
+        else {
+            return Ok(None);
+        };
+        if row
+            .values
+            .get(&policy.joined_column)
+            .is_none_or(|value| !values_equal_for_rank_join(value, join_value))
+        {
+            return Ok(None);
+        }
+        // A row this transaction deleted by value rather than by identity is
+        // gone for this reader too, and the index above cannot know it.
+        if let Some(overlay) = overlay
+            && contextdb_tx::row_matches_delete_predicates(
+                &overlay.delete_predicates,
+                &policy.joined_table,
+                row,
+            )
+        {
+            return Ok(None);
+        }
+        let meta = self
+            .table_meta(&policy.joined_table)
+            .ok_or_else(|| E::from(Error::TableNotFound(policy.joined_table.clone())))?;
+        // Selected under the read guard taken above, so access evaluation
+        // borrows it rather than acquiring it a second time.
+        if !self.bounded_read_allowed_for_row_in_tables(
+            tx,
+            &tables,
+            &policy.joined_table,
+            &meta,
+            row,
+            snapshot,
+            &mut *before_access,
+        )? {
+            return Ok(None);
+        }
+        let planned = bounded_rank_row_clone_planned_bytes(row).map_err(E::from)?;
+        before_clone(planned)?;
+        let cloned = row.clone();
+        let actual = match bounded_rank_row_retained_bytes(&cloned) {
+            Ok(actual) => actual,
+            Err(error) => {
+                release_clone(planned)?;
+                return Err(E::from(error));
+            }
+        };
+        if actual > planned {
+            if let Err(error) = before_clone(actual - planned) {
+                release_clone(planned)?;
+                return Err(error);
+            }
+        } else if planned > actual {
+            release_clone(planned - actual)?;
+        }
+        Ok(Some((cloned, actual)))
+    }
+
+    /// The best row this transaction has staged in the joined table for this
+    /// join value.
+    ///
+    /// A staged row is in no index, so it is walked one row at a time out of
+    /// the transaction's own write set -- the identity charged before it is
+    /// read and the values before they are copied, exactly as a committed row
+    /// is. The established door answers this by scanning the whole joined
+    /// table into memory, which is the unbounded read a ceiling exists to
+    /// prevent, so it is not reused here.
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_staged_rank_join_row<E>(
+        &self,
+        tx: TxId,
+        policy: &RankPolicy,
+        join_value: &Value,
+        snapshot: SnapshotId,
+        overlay: &crate::executor::TransactionTableOverlay,
+        before_candidate: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        before_clone: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_clone: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<(VersionedRow, usize)>, E>
+    where
+        E: From<Error>,
+    {
+        let meta = self
+            .table_meta(&policy.joined_table)
+            .ok_or_else(|| E::from(Error::TableNotFound(policy.joined_table.clone())))?;
+        let mut best: Option<(VersionedRow, usize)> = None;
+        for position in &overlay.staged_positions {
+            before_candidate()?;
+            let measured = self
+                .tx_mgr
+                .with_write_set(tx, |ws| {
+                    ws.relational_inserts.get(*position).map(|(_, row)| {
+                        (
+                            row.row_id,
+                            row.values
+                                .get(&policy.joined_column)
+                                .is_some_and(|value| values_equal_for_rank_join(value, join_value)),
+                        )
+                    })
+                })
+                .map_err(E::from)?;
+            let Some((row_id, matches)) = measured else {
+                continue;
+            };
+            // Only a row that beats what is already in hand is worth copying,
+            // so a transaction that staged many rows for this join pays for
+            // one copy, not one per row.
+            if !matches || best.as_ref().is_some_and(|(best, _)| best.row_id >= row_id) {
+                continue;
+            }
+            let planned = self
+                .tx_mgr
+                .with_write_set(tx, |ws| {
+                    ws.relational_inserts
+                        .get(*position)
+                        .map(|(_, row)| bounded_rank_row_clone_planned_bytes(row))
+                })
+                .map_err(E::from)?
+                .transpose()
+                .map_err(E::from)?;
+            let Some(planned) = planned else {
+                continue;
+            };
+            before_clone(planned)?;
+            let cloned = self
+                .tx_mgr
+                .with_write_set(tx, |ws| {
+                    ws.relational_inserts
+                        .get(*position)
+                        .map(|(_, row)| row.clone())
+                })
+                .map_err(E::from)?;
+            let Some(cloned) = cloned else {
+                release_clone(planned)?;
+                continue;
+            };
+            let actual = match bounded_rank_row_retained_bytes(&cloned) {
+                Ok(actual) => actual,
+                Err(error) => {
+                    release_clone(planned)?;
+                    return Err(E::from(error));
+                }
+            };
+            if actual > planned {
+                if let Err(error) = before_clone(actual - planned) {
+                    release_clone(planned)?;
+                    return Err(error);
+                }
+            } else if planned > actual {
+                release_clone(planned - actual)?;
+            }
+            // Judged after the copy because the gate reads the row, and a
+            // staged row exists nowhere else to be read from.
+            let tables = self.relational_store.tables.read();
+            let allowed = self.bounded_read_allowed_for_row_in_tables(
+                Some(tx),
+                &tables,
+                &policy.joined_table,
+                &meta,
+                &cloned,
+                snapshot,
+                &mut *before_access,
+            )?;
+            drop(tables);
+            if !allowed {
+                release_clone(actual)?;
+                continue;
+            }
+            if let Some((_, previous)) = best.replace((cloned, actual)) {
+                release_clone(previous)?;
+            }
+        }
+        Ok(best)
+    }
+
     pub(crate) fn vector_schema_read(&self, index: &VectorIndexRef) -> VectorSchemaReadGuard {
         self.vector_schema_read_many([index.clone()])
     }
@@ -24534,6 +29056,28 @@ impl Database {
     pub(crate) fn vector_schema_read_table(&self, table: &str) -> Option<VectorSchemaReadGuard> {
         let refs = self.vector_schema_refs_for_table(table);
         (!refs.is_empty()).then(|| self.vector_schema_read_many(refs))
+    }
+
+    /// Take one read handle on an index's schema gate.
+    ///
+    /// A thread that already holds a claim on this gate takes the handle
+    /// recursively: queueing behind a waiting schema change while holding a
+    /// claim that same change waits for would leave neither able to finish. A
+    /// thread that holds nothing queues fairly, so a waiting schema change is
+    /// never barged past and always reaches the front.
+    fn vector_schema_gate_read_handle(
+        &self,
+        db_id: usize,
+        index: &VectorIndexRef,
+        statement_claims: &[(usize, VectorIndexRef)],
+    ) -> ArcRwLockReadGuard<parking_lot::RawRwLock, ()> {
+        let gate = self.vector_schema_gates.gate_for(index);
+        let key = (db_id, index.clone());
+        if statement_claims.contains(&key) || detached_vector_schema_claim_held(db_id, index) {
+            gate.read_arc_recursive()
+        } else {
+            gate.read_arc()
+        }
     }
 
     pub(crate) fn vector_schema_read_many(
@@ -24552,32 +29096,105 @@ impl Database {
             let held = VECTOR_SCHEMA_READ_STACK.with(|stack| stack.borrow().clone());
             refs.iter()
                 .filter(|index| !held.contains(&(db_id, (*index).clone())))
-                .map(|index| self.vector_schema_gates.gate_for(index).read_arc())
+                .map(|index| self.vector_schema_gate_read_handle(db_id, index, &held))
                 .collect()
         };
         VectorSchemaReadGuard::new(db_id, refs, guards)
     }
 
-    pub(crate) fn vector_schema_write(&self, index: &VectorIndexRef) -> VectorSchemaWriteGuard {
+    /// Claim the same gates for state that outlives the statement that opened
+    /// it: a retained bounded cursor keeps its claim between requests and can
+    /// be released on a thread other than the one that opened it.
+    ///
+    /// Such a guard never reuses a statement's claim: doing so would leave the
+    /// cursor holding nothing the moment that statement ends. It always takes
+    /// handles of its own, fairly, so two sessions opening overlapping cursors
+    /// on one index cannot keep a waiting schema change from ever running.
+    /// Only where the opening thread already holds a claim on the same index —
+    /// its own statement's, or an earlier cursor's — is the handle taken
+    /// recursively, because a thread cannot queue behind a change that waits
+    /// for what it is holding.
+    ///
+    /// The claim is recorded against the opening thread, so a schema change
+    /// that thread runs later is answered with a refusal naming the cursor
+    /// instead of waiting for a cursor only it can close.
+    ///
+    /// The same-thread callback arm carries over unchanged: trigger and cron
+    /// callbacks already run inside the commit mutex that vector DDL metadata
+    /// mutation also takes, so claiming the schema gate underneath one would
+    /// order commit-mutex before schema-gate.
+    pub(crate) fn vector_schema_read_many_detached(
+        &self,
+        refs: impl IntoIterator<Item = VectorIndexRef>,
+    ) -> VectorSchemaReadGuard {
+        let db_id = self.vector_schema_gate_id();
+        let callback_thread = self.callback_active_on_current_thread_for_this_db();
+        let refs = VectorSchemaGates::sorted_refs(refs);
+        let guards = if callback_thread {
+            Vec::new()
+        } else {
+            let held = VECTOR_SCHEMA_READ_STACK.with(|stack| stack.borrow().clone());
+            refs.iter()
+                .map(|index| self.vector_schema_gate_read_handle(db_id, index, &held))
+                .collect()
+        };
+        VectorSchemaReadGuard::new_detached(db_id, refs, guards)
+    }
+
+    pub(crate) fn vector_schema_write(
+        &self,
+        index: &VectorIndexRef,
+    ) -> Result<VectorSchemaWriteGuard> {
         self.vector_schema_write_many([index.clone()])
     }
 
-    pub(crate) fn vector_schema_write_table(&self, table: &str) -> Option<VectorSchemaWriteGuard> {
+    pub(crate) fn vector_schema_write_table(
+        &self,
+        table: &str,
+    ) -> Result<Option<VectorSchemaWriteGuard>> {
         let refs = self.vector_schema_refs_for_table(table);
-        (!refs.is_empty()).then(|| self.vector_schema_write_many(refs))
+        if refs.is_empty() {
+            return Ok(None);
+        }
+        self.vector_schema_write_many(refs).map(Some)
     }
 
+    /// Claim every affected index's schema gate for a change to its shape.
+    ///
+    /// A session reading one of those indexes through a cursor it has not
+    /// closed is answered rather than parked: the wait it would otherwise
+    /// enter can only end when it runs a statement it can no longer reach.
+    /// Cursors held by other sessions are waited for, and inspection that
+    /// starts after this point queues behind the change.
     pub(crate) fn vector_schema_write_many(
         &self,
         refs: impl IntoIterator<Item = VectorIndexRef>,
-    ) -> VectorSchemaWriteGuard {
+    ) -> Result<VectorSchemaWriteGuard> {
         let refs = VectorSchemaGates::sorted_refs(refs);
+        self.refuse_schema_change_under_own_open_cursor(&refs)?;
         let guards = refs
             .iter()
             .map(|index| self.vector_schema_gates.gate_for(index).write_arc())
             .collect();
         self.vector_schema_gates.bump_epochs(&refs);
-        VectorSchemaWriteGuard { _guards: guards }
+        Ok(VectorSchemaWriteGuard { _guards: guards })
+    }
+
+    fn refuse_schema_change_under_own_open_cursor(&self, refs: &[VectorIndexRef]) -> Result<()> {
+        let db_id = self.vector_schema_gate_id();
+        let Some(index) = refs
+            .iter()
+            .find(|index| detached_vector_schema_claim_held(db_id, index))
+        else {
+            return Ok(());
+        };
+        Err(Error::ReadFailure(ReadFailure::cursor_already_open(
+            format!(
+                "this session is reading {}.{} through a cursor it has not closed, and this \
+                 change would have to wait for that cursor; close it and run the change again",
+                index.table, index.column
+            ),
+        )))
     }
 
     pub(crate) fn vector_schema_refs_for_table(&self, table: &str) -> Vec<VectorIndexRef> {
@@ -24722,10 +29339,11 @@ impl Database {
                     else {
                         continue;
                     };
+                    let values = self.outbound_row_values(&table, row);
                     out.push(RowChange {
                         table,
                         natural_key,
-                        values: row.values.clone(),
+                        values,
                         deleted: row.deleted_tx.is_some(),
                         lsn,
                         created_at: row.created_at,
@@ -24783,7 +29401,7 @@ impl Database {
     }
 
     fn bump_active_query_rows_examined_scope(&self, delta: u64) {
-        let database_key = self as *const Self as usize;
+        let database_key = self.id;
         QUERY_ROWS_EXAMINED_SCOPES.with(|scopes| {
             if let Some(scope) = scopes
                 .borrow_mut()
@@ -24835,6 +29453,23 @@ impl Database {
     pub fn __reset_relational_scan_rows_touched(&self) {
         let _operation = self.assert_open_operation();
         self.relational_store.reset_scan_rows_touched();
+    }
+
+    /// Index entries touched by ordered index walks since the last reset. It
+    /// witnesses the index side of a read the way the scanned-row counter
+    /// witnesses the table side.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __relational_index_entries_touched(&self) -> u64 {
+        let _operation = self.assert_open_operation();
+        self.relational_store.index_entries_touched()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __reset_relational_index_entries_touched(&self) {
+        let _operation = self.assert_open_operation();
+        self.relational_store.reset_index_entries_touched();
     }
 
     /// Index slots iterated during file-load/reopen replay. Read after
@@ -25637,6 +30272,7 @@ impl Database {
             trigger: self.trigger.clone(),
             tx_mgr: self.tx_mgr.clone(),
             snapshot_registry: self.snapshot_registry.clone(),
+            retention_deferred_edge_nodes: self.retention_deferred_edge_nodes.clone(),
             last_maintenance_cycle_at: self.last_maintenance_cycle_at.clone(),
             last_auto_compact_at: self.last_auto_compact_at.clone(),
             auto_compact_min_interval: self.auto_compact_min_interval.clone(),
@@ -25749,6 +30385,10 @@ impl Database {
         let pruning_guard = self.pruning_guard.clone();
         let thread_shutdown = shutdown.clone();
 
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_maintenance_worker_start();
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_background_worker_start();
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::SeqCst) {
                 sleep_with_shutdown(&thread_shutdown, interval);
@@ -25874,12 +30514,7 @@ impl Database {
     }
 
     pub fn open_memory_with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Result<Self> {
-        let db = Self::open_memory_with_plugin_and_accountant(
-            plugin,
-            Arc::new(MemoryAccountant::no_limit()),
-        )?;
-        db.plugin.on_open()?;
-        Ok(db)
+        Self::open_with_plugin(MEMORY_DATABASE_PATH, plugin)
     }
 
     /// Exports a transactionally consistent snapshot of this database into a
@@ -25906,7 +30541,9 @@ impl Database {
         let mut temp_name = dest.as_os_str().to_os_string();
         temp_name.push(format!(".{unique}.tmpexport"));
         let temp_path = PathBuf::from(temp_name);
-        let temp_lock_path = temp_path.with_extension("lock");
+        let mut temp_lock_name = temp_path.as_os_str().to_os_string();
+        temp_lock_name.push(".lock");
+        let temp_lock_path = PathBuf::from(temp_lock_name);
 
         match self.write_export_artifact(dest, &temp_path) {
             Ok(report) => {
@@ -26239,7 +30876,11 @@ impl Database {
     }
 
     pub fn close(&self) -> Result<()> {
-        let db_id = self as *const Self as usize;
+        // Owner reads stop first and completely: no new work is admitted,
+        // everything in flight is cancelled and drained, and only then does
+        // the database release the resources that work was holding.
+        self.drain_owner_reads()?;
+        let db_id = self.id;
         let _close_waiter = if Self::callback_active_process_wide() {
             Some(TriggerCloseWaiterGuard::new(&self.trigger))
         } else {
@@ -26290,10 +30931,15 @@ impl Database {
             self.blob_repository.close();
             self.subscriptions.lock().subscribers.clear();
             if !event_bus_shutdown.deferred_resource_cleanup() {
-                if let Some(persistence) = &self.persistence {
+                let replacement_preparation = if let Some(persistence) = &self.persistence {
+                    let result = persistence.prepare_armed_migration_replacement();
                     persistence.close();
-                }
+                    result
+                } else {
+                    Ok(())
+                };
                 self.release_open_registry();
+                replacement_preparation?;
             }
         }
         if self.resource_owner {
@@ -26304,7 +30950,7 @@ impl Database {
     }
 
     fn open_operation(&self) -> Result<DatabaseOperationGuard<'_>> {
-        let db_id = self as *const Self as usize;
+        let db_id = self.id;
         let nested = DB_OPERATION_STACK.with(|stack| stack.borrow().contains(&db_id));
         if nested {
             DB_OPERATION_STACK.with(|stack| stack.borrow_mut().push(db_id));
@@ -26474,18 +31120,13 @@ impl Database {
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
     ) -> Result<Self> {
-        let db = Self::open_loaded(
+        Self::open_with_options(
             path,
-            plugin,
-            Arc::new(MemoryAccountant::no_limit()),
-            None,
-            false,
-        )?;
-        db.plugin.on_open()?;
-        db.start_cron_tickler_if_schedules_present();
-        db.load_retention_sync_peer();
-        db.reconcile_maintenance_thread();
-        Ok(db)
+            DatabaseOpenOptions {
+                plugin,
+                ..DatabaseOpenOptions::default()
+            },
+        )
     }
 
     /// Load a root whose on-disk table/column schema predates this release's
@@ -26498,15 +31139,33 @@ impl Database {
     /// snapshot needed by the CLI and `close`; privileged keyed replay stays
     /// inside [`Self::import_legacy_database`].
     pub fn open_legacy_for_migration(path: impl AsRef<Path>) -> Result<LegacyMigrationSource> {
-        let path = path.as_ref();
-        if !RedbPersistence::is_legacy_format_store(path)? {
+        let canonical_path = canonical_database_path(path.as_ref())?;
+        if !RedbPersistence::is_legacy_format_store(&canonical_path)? {
             return Err(Error::Other(format!(
                 "legacy migration source must use the older table/column schema layout; '{}' is already current-format",
-                path.display()
+                canonical_path.display()
             )));
         }
-        let db = Self::open_loaded(
-            path,
+        let (registry, persistence) = acquire_registry_and_legacy_migration(&canonical_path)?;
+        Ok(LegacyMigrationSource {
+            path: canonical_path,
+            state: Mutex::new(LegacyMigrationSourceState::Acquired {
+                registry,
+                persistence,
+            }),
+        })
+    }
+
+    fn open_acquired_legacy_migration(
+        registry: OpenRegistryReservation,
+        capability: LegacyMigrationOpenCapability,
+    ) -> Result<Self> {
+        let persistence = Arc::new(RedbPersistence::open_legacy_migration_capability(
+            capability,
+        )?);
+        let db = Self::open_loaded_from_persistence(
+            registry,
+            persistence,
             Arc::new(CorePlugin),
             Arc::new(MemoryAccountant::no_limit()),
             None,
@@ -26520,11 +31179,32 @@ impl Database {
             let _ = db.close();
             return Err(Error::Other(format!(
                 "legacy migration source '{}' did not use the validated legacy table/column schema layout",
-                path.display()
+                db.persistence
+                    .as_ref()
+                    .map(|persistence| persistence.path().display().to_string())
+                    .unwrap_or_else(|| "<missing persistence>".to_owned())
             )));
         }
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_plugin_start();
         db.plugin.on_open()?;
-        Ok(LegacyMigrationSource(db))
+        Ok(db)
+    }
+
+    /// Durably record this migration target's replacement intent while
+    /// KEEPING its Redb handle.
+    ///
+    /// The ordinary close path does this and then releases the handle in one
+    /// step, which would leave the finished target unowned across the rename
+    /// that publishes it -- a window in which another writer could open the
+    /// exact inode being swapped in. Splitting the two lets the caller hold
+    /// exclusive ownership through the rename and release only after
+    /// publication, the same shape `RedbPersistence::recreate` uses for reset.
+    pub(crate) fn durably_prepare_migration_replacement(&self) -> Result<()> {
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| Error::Other("migration target has no persistence handle".to_owned()))?
+            .prepare_armed_migration_replacement()
     }
 
     /// Copy one verified legacy source into a fresh current-format target.
@@ -26537,10 +31217,20 @@ impl Database {
                 "legacy import requires a fresh empty current-format database".to_string(),
             ));
         }
-        self.apply_changes(
-            source.0.changes_since(Lsn(0)),
-            &Self::declared_sync_policies(true),
-        )
+        source.with_database(|source_database| {
+            let result = self.apply_changes(
+                source_database.changes_since(Lsn(0)),
+                &Self::declared_sync_policies(true),
+            )?;
+            let target = self.persistence.as_ref().ok_or_else(|| {
+                Error::Other("legacy import target has no persistence handle".to_owned())
+            })?;
+            let source = source_database.persistence.as_ref().ok_or_else(|| {
+                Error::Other("legacy import source has no persistence handle".to_owned())
+            })?;
+            target.arm_migration_replacement_source(Arc::clone(source))?;
+            Ok(result)
+        })
     }
 
     sync_test_seam! {
@@ -26566,7 +31256,16 @@ impl Database {
         if path.as_os_str() == ":memory:" {
             return Self::open_memory_with_plugin_and_accountant(plugin, accountant);
         }
-        let db = Self::open_loaded(path, plugin, accountant, startup_disk_limit, false)?;
+        let db = Self::open_loaded(
+            path,
+            plugin,
+            accountant,
+            startup_disk_limit,
+            false,
+            OpenDisposition::CreateIfMissing,
+        )?;
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_plugin_start();
         db.plugin.on_open()?;
         db.start_cron_tickler_if_schedules_present();
         db.load_retention_sync_peer();
@@ -26677,6 +31376,17 @@ impl Database {
         self.vector_store.index_infos()
     }
 
+    /// Where this handle reads the definitions, queues, and audit rings it
+    /// loads once at open, or nothing when it holds no durable state at all.
+    pub(super) fn startup_state(&self) -> Option<StartupState<'_>> {
+        if let Some(persistence) = self.persistence.as_deref() {
+            return Some(StartupState::Durable(persistence));
+        }
+        self.committed_image_startup
+            .as_deref()
+            .map(StartupState::Image)
+    }
+
     fn account_loaded_state(&self) -> Result<()> {
         let metadata_bytes = self
             .relational_store
@@ -26700,12 +31410,21 @@ impl Database {
                 .iter()
                 .fold(0usize, |acc, (table, rows)| {
                     let meta = self.table_meta(table);
-                    acc.saturating_add(rows.iter().fold(0usize, |inner, row| {
-                        inner.saturating_add(meta.as_ref().map_or_else(
-                            || row.estimated_bytes(),
-                            |meta| estimate_row_bytes_for_meta(&row.values, meta, false),
-                        ))
-                    }))
+                    // A version carrying `deleted_tx` was superseded or
+                    // deleted before this store was written to disk, and the
+                    // reclaim passes hand back only versions that still hold a
+                    // charge. Charging one here would strand bytes no pass can
+                    // return, so the row fold skips tombstoned versions
+                    // exactly as the edge fold below does.
+                    acc.saturating_add(rows.iter().filter(|row| row.deleted_tx.is_none()).fold(
+                        0usize,
+                        |inner, row| {
+                            inner.saturating_add(meta.as_ref().map_or_else(
+                                || row.estimated_bytes(),
+                                |meta| retained_row_bytes_for_meta(&row.values, meta, false),
+                            ))
+                        },
+                    ))
                 });
         self.accountant.try_allocate_for(
             row_bytes,
@@ -26746,11 +31465,22 @@ impl Database {
         Ok(())
     }
 
+    /// Give back what an abandoned transaction's inserts were holding.
+    ///
+    /// This runs on the CLOSE path, after the handle has already been marked
+    /// closed, so it reads the table's shape from the store directly instead
+    /// of through the public `table_meta`. Asking a closed handle for a public
+    /// operation is a programming error everywhere else and rightly panics;
+    /// here the handle is closed BY DESIGN and the work is the engine giving
+    /// its own accountant its bytes back. Going through the public door made
+    /// a `--write` session that ended with an inserting transaction still open
+    /// abort at teardown instead of rolling that transaction back.
     fn release_insert_allocations(&self, ws: &contextdb_tx::WriteSet) {
         for (table, row) in &ws.relational_inserts {
             let bytes = self
+                .relational_store
                 .table_meta(table)
-                .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
+                .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, false))
                 .unwrap_or_else(|| row.estimated_bytes());
             self.accountant.release(bytes);
         }
@@ -26777,17 +31507,18 @@ impl Database {
             {
                 bytes.relational.push(
                     self.table_meta(table)
-                        .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
+                        .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, false))
                         .unwrap_or_else(|| row.estimated_bytes()),
                 );
             }
         }
 
-        for (source, edge_type, target, _) in &ws.adj_deletes {
-            if let Some(edge) = self.find_edge(source, target, edge_type) {
-                bytes.edges.push(edge.estimated_bytes());
-            }
-        }
+        // Adjacency is deliberately absent. Deleting an edge stamps the
+        // entry and leaves it whole in both adjacency maps, so its bytes are
+        // still held; handing them back here told an operator the store had
+        // released memory it was still holding, and the limit stopped
+        // covering what the process held. The retention pass that physically
+        // removes the entry is the one release it gets.
 
         for (index, row_id, _) in &ws.vector_deletes {
             if let Some(vector) = self.find_vector_by_index_and_row(index, *row_id) {
@@ -26801,9 +31532,6 @@ impl Database {
 
     pub(crate) fn release_delete_allocations_from_bytes(&self, bytes: &DeleteReleaseBytes) {
         for bytes in &bytes.relational {
-            self.accountant.release(*bytes);
-        }
-        for bytes in &bytes.edges {
             self.accountant.release(*bytes);
         }
         for bytes in &bytes.vectors {
@@ -26821,6 +31549,7 @@ impl Database {
             .and_then(|state| state.find_by_row_id(index, row_id))
     }
 
+    #[allow(dead_code)]
     fn find_edge(&self, source: &NodeId, target: &NodeId, edge_type: &str) -> Option<AdjEntry> {
         self.graph_store
             .forward_adj
@@ -26978,6 +31707,31 @@ impl Database {
             "database handle is closed"
         );
         self.plugin.as_ref()
+    }
+
+    pub fn owner_read_config(&self) -> &OwnerReadConfig {
+        let _operation = self.assert_open_operation();
+        self.owner_read_config.as_ref()
+    }
+
+    pub fn memory_limit(&self) -> Option<usize> {
+        let _operation = self.assert_open_operation();
+        self.accountant.usage().limit
+    }
+
+    pub fn contexts(&self) -> Option<&BTreeSet<ContextId>> {
+        let _operation = self.assert_open_operation();
+        self.access.contexts.as_ref()
+    }
+
+    pub fn scope_labels(&self) -> Option<&BTreeSet<ScopeLabel>> {
+        let _operation = self.assert_open_operation();
+        self.access.scope_labels.as_ref()
+    }
+
+    pub fn principal(&self) -> Option<&Principal> {
+        let _operation = self.assert_open_operation();
+        self.access.principal.as_ref()
     }
 
     pub fn plugin_health(&self) -> PluginHealth {
@@ -27305,6 +32059,14 @@ impl Database {
 
     pub fn disk_file_size(&self) -> Option<u64> {
         let _operation = self.assert_open_operation();
+        // A handle reading a committed image holds no persistence, but it was
+        // read OUT OF a file and that file's length came with it. Answering
+        // `None` there made the same question about the same store answer
+        // with a number over a channel and with nothing at all against the
+        // file, when the file is the very thing the number measures.
+        if self.persistence.is_none() {
+            return self.image_store_file_bytes;
+        }
         self.persistence
             .as_ref()
             .map(|persistence| std::fs::metadata(persistence.path()).map(|meta| meta.len()))
@@ -28188,7 +32950,7 @@ impl Database {
                 rows.push(RowChange {
                     table: table_name.clone(),
                     natural_key,
-                    values: row.values.clone(),
+                    values: self.outbound_row_values(table_name, row),
                     deleted: false,
                     lsn: row.lsn,
                     created_at: row.created_at,
@@ -28335,7 +33097,7 @@ impl Database {
                 rows.push(RowChange {
                     table: table_name.clone(),
                     natural_key,
-                    values: row.values.clone(),
+                    values: self.outbound_row_values(table_name, row),
                     deleted: false,
                     lsn: row.lsn,
                     created_at: row.created_at,
@@ -28472,7 +33234,7 @@ impl Database {
                 continue;
             }
 
-            required = required.saturating_add(estimate_row_bytes_for_meta(
+            required = required.saturating_add(retained_row_bytes_for_meta(
                 &row.values,
                 table_meta,
                 false,
@@ -28480,10 +33242,15 @@ impl Database {
         }
 
         for edge in &changes.edges {
-            required = required.saturating_add(
-                96 + edge.edge_type.len().saturating_mul(16)
-                    + estimate_row_value_bytes(&edge.properties),
-            );
+            // The same estimate the apply itself will charge, so a preflight
+            // that says the batch fits is not followed by an apply that
+            // refuses it.
+            required = required.saturating_add(estimate_edge_bytes(
+                edge.source,
+                edge.target,
+                &edge.edge_type,
+                &edge.properties,
+            ));
         }
 
         for vector in &changes.vectors {
@@ -32605,6 +37372,14 @@ impl Database {
     }
 
     /// Returns the next TxId the allocator will issue on this database.
+    ///
+    /// A transaction that left no trace never happened, and its id was never
+    /// spent. The counter is durable only through committed work, so an id
+    /// allocated by a transaction that committed nothing may be handed out
+    /// again after a restart. Nothing observes that reuse: uncommitted work
+    /// never syncs and is never served, so no reader, peer, or reopened store
+    /// can hold the earlier id. Revisit this only if a surface ever exposes
+    /// allocated-but-uncommitted ids, which would make the reuse visible.
     pub fn next_tx(&self) -> TxId {
         let _operation = self.assert_open_operation();
         self.tx_mgr.peek_next_tx()
@@ -33981,7 +38756,7 @@ impl Database {
                                 crate::executor::estimate_drop_table_bytes(self, &name);
                             let prefix_trigger_ddl = std::mem::take(&mut trigger_ddl);
                             self.drain_vector_table_maintenance_for_ddl(&name);
-                            let _vector_schema = self.vector_schema_write_table(&name);
+                            let _vector_schema = self.vector_schema_write_table(&name)?;
                             self.allocate_ddl_lsn(|lsn| {
                                 self.log_drop_table_ddl_and_remove_triggers_with_prefix(
                                     &name,
@@ -33994,7 +38769,7 @@ impl Database {
                         } else if table_had_triggers {
                             let prefix_trigger_ddl = std::mem::take(&mut trigger_ddl);
                             self.drain_vector_table_maintenance_for_ddl(&name);
-                            let _vector_schema = self.vector_schema_write_table(&name);
+                            let _vector_schema = self.vector_schema_write_table(&name)?;
                             self.allocate_ddl_lsn(|lsn| {
                                 self.log_drop_table_ddl_and_remove_triggers_with_prefix(
                                     &name,
@@ -34066,7 +38841,8 @@ impl Database {
                                 .keys()
                                 .chain(incoming_vector_columns.keys())
                                 .map(|column| VectorIndexRef::new(&name, column.clone()));
-                            let _vector_schema = self.vector_schema_write_many(vector_schema_refs);
+                            let _vector_schema =
+                                self.vector_schema_write_many(vector_schema_refs)?;
                             self.allocate_ddl_lsn(|lsn| {
                                 let store = self.relational_store();
                                 let meta = Self::merged_sync_full_shape_vector_alter_meta(
@@ -34743,7 +39519,8 @@ impl Database {
                             );
                         }
                     }
-                    if let Err(err) = self.delete_row(tx, &row.table, local.row_id) {
+                    if let Err(err) = self.delete_row_keeping_vectors(tx, &row.table, local.row_id)
+                    {
                         if receipt.is_some() {
                             let _ = self.rollback(tx);
                             return Err(Error::SyncError(format!(
@@ -34951,7 +39728,9 @@ impl Database {
                                 )?
                                 .is_none()
                             {
-                                if let Err(err) = self.delete_row(tx, &row.table, conflict.row_id) {
+                                if let Err(err) =
+                                    self.delete_row_keeping_vectors(tx, &row.table, conflict.row_id)
+                                {
                                     constraint_error = Some(format!(
                                         "edge_wins unique replacement delete failed: {err}"
                                     ));
@@ -36453,11 +41232,13 @@ impl Database {
         let meta = self.relational_store.table_meta.read();
         let natural_key = natural_key_from_row_values(meta.get(table)?, &row.values)?;
 
-        let values = row
+        let mut values = row
             .values
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<HashMap<_, _>>();
+        drop(meta);
+        self.fill_quantized_from_store(table, row, &mut values);
         Some((natural_key, values))
     }
 
@@ -36711,6 +41492,198 @@ fn cached_table_meta(
 
 pub(crate) fn rank_index_name(table: &str, column: &str) -> String {
     format!("{table}.{column}")
+}
+
+fn bounded_rank_clone_size_error(operation: &str) -> Error {
+    Error::Other(format!(
+        "bounded {operation} memory size exceeds the native address space"
+    ))
+}
+
+fn bounded_rank_clone_checked_add(
+    left: usize,
+    right: usize,
+    operation: &str,
+) -> std::result::Result<usize, Error> {
+    left.checked_add(right)
+        .ok_or_else(|| bounded_rank_clone_size_error(operation))
+}
+
+fn bounded_rank_clone_checked_mul(
+    left: usize,
+    right: usize,
+    operation: &str,
+) -> std::result::Result<usize, Error> {
+    left.checked_mul(right)
+        .ok_or_else(|| bounded_rank_clone_size_error(operation))
+}
+
+fn bounded_rank_json_clone_planned_bytes(
+    value: &serde_json::Value,
+) -> std::result::Result<usize, Error> {
+    match value {
+        serde_json::Value::String(value) => Ok(value.len()),
+        serde_json::Value::Array(values) => {
+            let mut bytes = bounded_rank_clone_checked_mul(
+                values.len(),
+                std::mem::size_of::<serde_json::Value>(),
+                "rank joined JSON clone",
+            )?;
+            for value in values {
+                bytes = bounded_rank_clone_checked_add(
+                    bytes,
+                    bounded_rank_json_clone_planned_bytes(value)?,
+                    "rank joined JSON clone",
+                )?;
+            }
+            Ok(bytes)
+        }
+        serde_json::Value::Object(values) => {
+            let mut bytes = bounded_rank_clone_checked_mul(
+                values.len(),
+                std::mem::size_of::<(String, serde_json::Value)>(),
+                "rank joined JSON clone",
+            )?;
+            for (key, value) in values {
+                bytes = bounded_rank_clone_checked_add(bytes, key.len(), "rank joined JSON clone")?;
+                bytes = bounded_rank_clone_checked_add(
+                    bytes,
+                    bounded_rank_json_clone_planned_bytes(value)?,
+                    "rank joined JSON clone",
+                )?;
+            }
+            Ok(bytes)
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Ok(0)
+        }
+    }
+}
+
+fn bounded_rank_json_retained_bytes(
+    value: &serde_json::Value,
+) -> std::result::Result<usize, Error> {
+    match value {
+        serde_json::Value::String(value) => Ok(value.capacity()),
+        serde_json::Value::Array(values) => {
+            let mut bytes = bounded_rank_clone_checked_mul(
+                values.capacity(),
+                std::mem::size_of::<serde_json::Value>(),
+                "rank joined JSON clone",
+            )?;
+            for value in values {
+                bytes = bounded_rank_clone_checked_add(
+                    bytes,
+                    bounded_rank_json_retained_bytes(value)?,
+                    "rank joined JSON clone",
+                )?;
+            }
+            Ok(bytes)
+        }
+        serde_json::Value::Object(values) => {
+            let mut bytes = bounded_rank_clone_checked_mul(
+                values.len(),
+                std::mem::size_of::<(String, serde_json::Value)>(),
+                "rank joined JSON clone",
+            )?;
+            for (key, value) in values {
+                bytes = bounded_rank_clone_checked_add(
+                    bytes,
+                    key.capacity(),
+                    "rank joined JSON clone",
+                )?;
+                bytes = bounded_rank_clone_checked_add(
+                    bytes,
+                    bounded_rank_json_retained_bytes(value)?,
+                    "rank joined JSON clone",
+                )?;
+            }
+            Ok(bytes)
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Ok(0)
+        }
+    }
+}
+
+fn bounded_rank_value_clone_planned_bytes(value: &Value) -> std::result::Result<usize, Error> {
+    match value {
+        Value::Text(value) => Ok(value.len()),
+        Value::Vector(values) => bounded_rank_clone_checked_mul(
+            values.len(),
+            std::mem::size_of::<f32>(),
+            "rank joined vector clone",
+        ),
+        Value::Json(value) => bounded_rank_json_clone_planned_bytes(value),
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int64(_)
+        | Value::Float64(_)
+        | Value::Uuid(_)
+        | Value::Timestamp(_)
+        | Value::TxId(_) => Ok(0),
+    }
+}
+
+fn bounded_rank_value_retained_bytes(value: &Value) -> std::result::Result<usize, Error> {
+    match value {
+        Value::Text(value) => Ok(value.capacity()),
+        Value::Vector(values) => bounded_rank_clone_checked_mul(
+            values.capacity(),
+            std::mem::size_of::<f32>(),
+            "rank joined vector clone",
+        ),
+        Value::Json(value) => bounded_rank_json_retained_bytes(value),
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int64(_)
+        | Value::Float64(_)
+        | Value::Uuid(_)
+        | Value::Timestamp(_)
+        | Value::TxId(_) => Ok(0),
+    }
+}
+
+fn bounded_rank_row_clone_planned_bytes(row: &VersionedRow) -> std::result::Result<usize, Error> {
+    let mut bytes = bounded_rank_clone_checked_add(
+        std::mem::size_of::<VersionedRow>(),
+        bounded_rank_clone_checked_mul(
+            row.values.len(),
+            std::mem::size_of::<(String, Value)>(),
+            "rank joined row clone",
+        )?,
+        "rank joined row clone",
+    )?;
+    for (column, value) in &row.values {
+        bytes = bounded_rank_clone_checked_add(bytes, column.len(), "rank joined row clone")?;
+        bytes = bounded_rank_clone_checked_add(
+            bytes,
+            bounded_rank_value_clone_planned_bytes(value)?,
+            "rank joined row clone",
+        )?;
+    }
+    Ok(bytes)
+}
+
+fn bounded_rank_row_retained_bytes(row: &VersionedRow) -> std::result::Result<usize, Error> {
+    let mut bytes = bounded_rank_clone_checked_add(
+        std::mem::size_of::<VersionedRow>(),
+        bounded_rank_clone_checked_mul(
+            row.values.capacity(),
+            std::mem::size_of::<(String, Value)>(),
+            "rank joined row clone",
+        )?,
+        "rank joined row clone",
+    )?;
+    for (column, value) in &row.values {
+        bytes = bounded_rank_clone_checked_add(bytes, column.capacity(), "rank joined row clone")?;
+        bytes = bounded_rank_clone_checked_add(
+            bytes,
+            bounded_rank_value_retained_bytes(value)?,
+            "rank joined row clone",
+        )?;
+    }
+    Ok(bytes)
 }
 
 fn rank_value_to_number(
@@ -36988,6 +41961,24 @@ struct VectorExplainShape {
     restricted_candidates: bool,
 }
 
+/// The traversal steps a plan walks, if it walks any.
+#[allow(dead_code)]
+fn graph_bfs_steps_from_plan(plan: &PhysicalPlan) -> Option<&[contextdb_planner::GraphStepPlan]> {
+    match plan {
+        PhysicalPlan::GraphBfs { steps, .. } => Some(steps.as_slice()),
+        PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. } => graph_bfs_steps_from_plan(input),
+        PhysicalPlan::Join { left, right, .. } => {
+            graph_bfs_steps_from_plan(left).or_else(|| graph_bfs_steps_from_plan(right))
+        }
+        _ => None,
+    }
+}
+
 fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<VectorExplainShape> {
     match plan {
         PhysicalPlan::VectorSearch {
@@ -37064,6 +42055,100 @@ fn annotate_vector_search_strategy(mut output: String, strategy: &str) -> String
         search_from = insert_at + annotation.len();
     }
     output
+}
+
+/// The durable startup state a handle was built from, whether that is a
+/// live store or a decoded image.
+///
+/// Definitions, queues, and audit rings are read once at open. Sourcing
+/// them through one shape is what keeps a handle over a released image
+/// answering the same startup questions, in the same order, as the handle
+/// that still holds its file.
+pub(crate) enum StartupState<'a> {
+    Durable(&'a RedbPersistence),
+    Image(&'a CommittedImageStartupState),
+}
+
+impl StartupState<'_> {
+    pub(crate) fn config_value<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>> {
+        match self {
+            Self::Durable(persistence) => persistence.load_config_value(key),
+            Self::Image(image) => match image.config_values.get(key) {
+                Some(bytes) => Ok(Some(RedbPersistence::decode_config_value(bytes)?)),
+                None => Ok(None),
+            },
+        }
+    }
+
+    pub(crate) fn sink_queue<T: serde::de::DeserializeOwned>(&self, sink: &str) -> Result<Vec<T>> {
+        match self {
+            Self::Durable(persistence) => persistence.load_sink_queue(sink),
+            Self::Image(image) => image
+                .sink_queues
+                .get(sink)
+                .into_iter()
+                .flatten()
+                .map(|(_, bytes)| RedbPersistence::decode_config_value(bytes))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn trigger_audit_state(
+        &self,
+        ring_capacity: usize,
+    ) -> Result<(Vec<TriggerAuditEntry>, u64)> {
+        let persistence = match self {
+            Self::Durable(persistence) => {
+                return persistence.load_trigger_audit_state(ring_capacity);
+            }
+            Self::Image(image) => image,
+        };
+        let ring = persistence
+            .config_values
+            .get(crate::persistence::TRIGGER_AUDIT_RING_CONFIG_KEY)
+            .map(|bytes| RedbPersistence::decode_config_value::<Vec<TriggerAuditEntry>>(bytes))
+            .transpose()?;
+        let next_index = persistence
+            .config_values
+            .get(crate::persistence::TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY)
+            .map(|bytes| RedbPersistence::decode_config_value::<u64>(bytes))
+            .transpose()?;
+        if let (Some(mut ring), Some(next_index)) = (ring, next_index) {
+            let overflow = ring.len().saturating_sub(ring_capacity);
+            if overflow > 0 {
+                ring.drain(0..overflow);
+            }
+            return Ok((ring, next_index));
+        }
+
+        let mut ring = std::collections::VecDeque::new();
+        let mut next_index = 0;
+        for (key, bytes) in &persistence.trigger_audit {
+            if let Some(index) = key
+                .split(':')
+                .next()
+                .and_then(|raw| raw.parse::<u64>().ok())
+            {
+                next_index = next_index.max(index.saturating_add(1));
+            }
+            ring.push_back(RedbPersistence::decode_config_value(bytes)?);
+            if ring.len() > ring_capacity {
+                ring.pop_front();
+            }
+        }
+        Ok((ring.into_iter().collect(), next_index))
+    }
+}
+
+/// The startup rows of a committed image, kept for the one pass that
+/// reads them at open.
+pub(crate) struct CommittedImageStartupState {
+    config_values: BTreeMap<String, Vec<u8>>,
+    sink_queues: BTreeMap<String, Vec<(u64, Vec<u8>)>>,
+    trigger_audit: Vec<(String, Vec<u8>)>,
 }
 
 fn sanitize_loaded_row_for_meta(row: &mut VersionedRow, meta: &TableMeta) -> bool {
@@ -37374,6 +42459,15 @@ mod loaded_vector_supplement_tests {
     }
 }
 
+/// Put a full-precision vector column's value back into the rows a reopen
+/// loaded.
+///
+/// A column declared with space-saving storage is NOT put back: its value
+/// lives in the vector store, the row keeps an empty slot, and a reader fills
+/// it from there on demand. Putting it back here would give every reopened
+/// quantized table a full-precision copy per row that no read asked for and
+/// that nothing charges -- the declared footprint would hold while the store
+/// was live and quietly stop holding the moment it was reopened.
 fn hydrate_relational_vector_values(
     relational: &RelationalStore,
     vectors: &[VectorEntry],
@@ -37382,8 +42476,23 @@ fn hydrate_relational_vector_values(
     if vectors.is_empty() {
         return changed;
     }
+    let declared_meta = relational.table_meta.read();
+    let quantized = |table: &str, column: &str| -> bool {
+        declared_meta.get(table).is_some_and(|meta| {
+            meta.columns.iter().any(|declared| {
+                declared.name == column
+                    && !matches!(
+                        declared.quantization,
+                        contextdb_core::VectorQuantization::F32
+                    )
+            })
+        })
+    };
     let mut tables = relational.tables.write();
     for entry in vectors {
+        if quantized(&entry.index.table, &entry.index.column) {
+            continue;
+        }
         let Some(rows) = tables.get_mut(&entry.index.table) else {
             continue;
         };
@@ -37425,6 +42534,18 @@ fn maybe_prebuild_hnsw(vector_store: &VectorStore, accountant: &MemoryAccountant
     let _ = (vector_store, accountant);
 }
 
+/// What a row costs the store that KEEPS it, as opposed to what one copy of
+/// it occupies. An index over any of the row's columns keeps a whole clone of
+/// the value, so the memory a limit governs is `ROW_VALUE_RETENTIONS` copies;
+/// the per-copy figure is what a size report wants, not what admission does.
+fn retained_row_bytes_for_meta(
+    values: &HashMap<ColName, Value>,
+    meta: &TableMeta,
+    include_vectors: bool,
+) -> usize {
+    estimate_row_bytes_for_meta(values, meta, include_vectors).saturating_mul(ROW_VALUE_RETENTIONS)
+}
+
 fn estimate_row_bytes_for_meta(
     values: &HashMap<ColName, Value>,
     meta: &TableMeta,
@@ -37438,7 +42559,8 @@ fn estimate_row_bytes_for_meta(
         if !include_vectors && matches!(column.column_type, ColumnType::Vector(_)) {
             continue;
         }
-        bytes = bytes.saturating_add(32 + column.name.len() * 8 + value.estimated_bytes());
+        bytes =
+            bytes.saturating_add(estimate_value_key_bytes(&column.name) + value.estimated_bytes());
     }
     bytes
 }
@@ -37463,35 +42585,87 @@ fn estimate_edge_bytes(
 
 impl Drop for Database {
     fn drop(&mut self) {
-        {
+        // Owner reads stop first: the handle that is going away stops
+        // admitting work, cancels what is already in flight, announces that it
+        // is draining, and takes its channel down. Dropping the owner is how
+        // an embedded program ends, so a reader in the middle of a request has
+        // to learn about it the same way either route tells it.
+        //
+        // A drop does NOT wait for that work to finish. Waiting is what close
+        // is for: a caller who calls close asked for the wait and is told when
+        // the deadline could not be met, while a drop has no way to report
+        // that and no business blocking on a deadline whose clock the program
+        // may never advance again. So work still in flight does not stop the
+        // store being handed over: whoever is still inside it finishes, and
+        // the last one out pays the release.
+        if self.resource_owner && !self.closed.load(Ordering::SeqCst) {
+            let _stopped = self.stop_owner_reads_without_waiting();
+        }
+        let already_closed = {
             let _operation_barrier = self.operation_gate.write();
-            if self.closed.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            if self.resource_owner {
+            let already_closed = self.closed.swap(true, Ordering::SeqCst);
+            if !already_closed && self.resource_owner {
                 self.resource_closed.store(true, Ordering::SeqCst);
             }
-        }
-        if self.resource_owner {
-            self.pending_local_schema_stages.lock().clear();
-            self.local_schema_stages.lock().clear();
-        }
-        self.stop_cron_tickler();
-        let event_bus_shutdown = self.stop_event_bus_threads();
-        let runtime = self.pruning_runtime.get_mut();
-        runtime.shutdown.store(true, Ordering::SeqCst);
-        if let Some(handle) = runtime.handle.take() {
-            let _ = handle.join();
-        }
-        if self.resource_owner {
-            self.blob_repository.close();
-            self.subscriptions.lock().subscribers.clear();
-            if !event_bus_shutdown.deferred_resource_cleanup() {
-                if let Some(persistence) = &self.persistence {
-                    persistence.close();
-                }
-                self.release_open_registry();
+            already_closed
+        };
+        // A handle closed by hand has already done the work below, but it is
+        // still one of the holders this store is waiting on, so it still
+        // reports itself gone at the end.
+        let mut handed_over_here = false;
+        if !already_closed {
+            if self.resource_owner {
+                self.pending_local_schema_stages.lock().clear();
+                self.local_schema_stages.lock().clear();
             }
+            self.stop_cron_tickler();
+            let event_bus_shutdown = self.stop_event_bus_threads();
+            let runtime = self.pruning_runtime.get_mut();
+            runtime.shutdown.store(true, Ordering::SeqCst);
+            if let Some(handle) = runtime.handle.take() {
+                let _ = handle.join();
+            }
+            if self.resource_owner {
+                self.blob_repository.close();
+                self.subscriptions.lock().subscribers.clear();
+                if !event_bus_shutdown.deferred_resource_cleanup() {
+                    // What this owner acquired is ready to be let go -- but not
+                    // necessarily by this handle. A reader that is mid-request or
+                    // holding a suspended cursor is still looking at the store,
+                    // and a second opener must keep being told the store is taken
+                    // until that reader is done. So the owner hands the store over
+                    // and whichever holder is last pays it out below.
+                    //
+                    // A read still running is exactly that case rather than a
+                    // reason to keep the store: the handle that could have
+                    // waited for it is going away, so a store it held on to
+                    // here would stay held for the life of the process.
+                    self.finalization.defer(PendingStoreRelease {
+                        persistence: self.persistence.clone(),
+                        open_registry_path: self.open_registry_path.lock().take(),
+                        owner_read_service: self.owner_read_service.clone(),
+                        plugin: Some(Arc::clone(&self.plugin)),
+                    });
+                    handed_over_here = true;
+                }
+            }
+        }
+        // Every holder reports itself gone; the store's own machinery waits
+        // for nothing. The last holder out releases whatever the owner left,
+        // which is what keeps a store alive for exactly as long as somebody is
+        // still reading it.
+        if self.handle_role.holds_the_store()
+            && self.finalization.note_holder_released()
+            && let Some(mut release) = self.finalization.take_pending()
+        {
+            if handed_over_here {
+                // Nobody was still inside the store, so this handle is ending
+                // it here and now: an ordinary drop. A drop does not close a
+                // plugin -- only an explicit close does, and the finalizer
+                // does for the store this handle had to leave behind.
+                release.plugin = None;
+            }
+            release_store(release);
         }
     }
 }
@@ -37593,7 +42767,25 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
     // `retain_sync_source_lsns_for_table_rows` used to need.
     let mut orphaned_source_lsn_rows: Vec<(String, RowId)> = Vec::new();
     let mut released_row_bytes = 0usize;
+    // The physical bytes this pass reclaims (`released_row_bytes`) and the
+    // bytes it must hand back to the accountant are not the same set. A
+    // version carrying `deleted_tx` already had its charge released at commit,
+    // so returning it again here would report less memory than is live.
+    let mut accounted_row_bytes = 0usize;
     let mut blocked = Vec::new();
+
+    // Retention removes rows PHYSICALLY, exactly as version cleanup does, so
+    // it defers to the same read-snapshot registry: a row still visible to
+    // ANY registered reader (an in-flight statement, a caller-held
+    // `SnapshotPin`, or a suspended bounded cursor's pinned snapshot) is left
+    // for a later cycle rather than removed out from under it. The watermark
+    // is sampled under the SAME commit-lock hold this whole pass runs inside
+    // (`run_pruning` wraps this call in `with_commit_lock`), which is what
+    // `SnapshotFloorRegistry::register`'s blocking rule relies on -- see
+    // `compact_currency_versions_inner`, whose pattern this mirrors.
+    let watermark = tx_mgr.current_tx_max();
+    let active_removal_pass = ctx.snapshot_registry.begin_removal_pass(watermark);
+    ctx.snapshot_registry.removal_pass_test_pause.maybe_pause();
 
     let table_snapshot = relational_store.tables.read().clone();
     // A stamp further ahead than the tolerance can never age out on this
@@ -37604,6 +42796,8 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
         .saturating_add(RETENTION_CLOCK_SKEW_TOLERANCE.as_millis() as u64);
     let mut future_dated_rows = 0u64;
     let mut future_dated_tables: Vec<String> = Vec::new();
+    // Counted at the one place a row is actually held back, below.
+    let mut rows_deferred_for_readers = 0u64;
     for (table_name, rows) in &table_snapshot {
         let Some(meta) = metas.get(table_name) else {
             continue;
@@ -37647,6 +42841,16 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
             if !prune_candidates.contains(&row_key) {
                 continue;
             }
+            // An expired row a registered reader can still see is deferred,
+            // never removed mid-read: a live expired row is visible at every
+            // registered snapshot at or after its creation, and physically
+            // removing it would both hide data a pinned snapshot is entitled
+            // to see and shift the vector positions a suspended continuation
+            // re-anchors against.
+            if any_registered_snapshot_sees(active_removal_pass.registered_snapshots(), row) {
+                rows_deferred_for_readers = rows_deferred_for_readers.saturating_add(1);
+                continue;
+            }
             if let Some(reason) = prune_blocker_for_referenced_parent(
                 table_name,
                 row,
@@ -37674,12 +42878,17 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
                 .or_default()
                 .insert((row.row_id, row.lsn));
             row_keys.push((table_name.clone(), row.row_id, row.created_tx, row.lsn));
-            released_row_bytes = released_row_bytes.saturating_add(estimate_row_bytes_for_meta(
-                &row.values,
-                meta,
-                false,
-            ));
+            let version_bytes = retained_row_bytes_for_meta(&row.values, meta, false);
+            released_row_bytes = released_row_bytes.saturating_add(version_bytes);
             if row.deleted_tx.is_none() {
+                // A version that was never deleted still carries the charge it
+                // took at insert, so pruning it here is its ONE release. A
+                // version carrying `deleted_tx` was released at commit by
+                // `release_delete_allocations_from_bytes`; releasing it again
+                // would take the same bytes back twice. This is the rule the
+                // vector and edge reclaim below already follow — both are
+                // scoped to `pruned_live_row_ids`.
+                accounted_row_bytes = accounted_row_bytes.saturating_add(version_bytes);
                 pruned_live_row_ids.insert(row.row_id);
                 orphaned_source_lsn_rows.push((table_name.clone(), row.row_id));
                 if let Some(Value::Uuid(id)) = row.values.get("id") {
@@ -37693,13 +42902,20 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
         .values()
         .map(|versions| versions.len() as u64)
         .sum::<u64>();
-    if pruned_version_count == 0 {
+    // Node ids this pass must judge adjacency for: the ones whose live row
+    // it just reclaimed, plus the ones an earlier pass reclaimed a row for
+    // and had to leave adjacency behind because a registered reader could
+    // still see it. A pass that prunes no row at all still has to revisit
+    // that carry-over -- the reader it was waiting on may be gone.
+    let carried_edge_nodes: HashSet<NodeId> = ctx.retention_deferred_edge_nodes.lock().clone();
+    if pruned_version_count == 0 && carried_edge_nodes.is_empty() {
         return Ok(PruningReport {
             pruned_rows: 0,
             blocked_count: blocked.len() as u64,
             blocked,
             future_dated_rows,
             future_dated_tables,
+            rows_deferred_for_readers,
             ..PruningReport::default()
         });
     }
@@ -37726,7 +42942,20 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
             .filter(|entry| pruned_live_row_ids.contains(&entry.row_id))
             .collect()
     };
-    let removed_edges: Vec<AdjEntry> = if pruned_node_ids.is_empty() {
+    let mut reclaimable_edge_nodes = pruned_node_ids;
+    reclaimable_edge_nodes.extend(carried_edge_nodes.iter().copied());
+    // An adjacency entry is judged by the EDGE's own visibility, never by
+    // the node row that happens to sit at one of its ends: an edge committed
+    // before a registered snapshot is owed to that reader whether or not the
+    // id it points at still carries a row. An entry a registered snapshot
+    // can still see is left in place and revisited on a later pass, exactly
+    // as an expired row a reader can still see is.
+    let edge_is_reclaimable = |entry: &AdjEntry| -> bool {
+        (reclaimable_edge_nodes.contains(&entry.source)
+            || reclaimable_edge_nodes.contains(&entry.target))
+            && !any_registered_snapshot_sees_edge(active_removal_pass.registered_snapshots(), entry)
+    };
+    let removed_edges: Vec<AdjEntry> = if reclaimable_edge_nodes.is_empty() {
         Vec::new()
     } else {
         graph_store
@@ -37734,9 +42963,7 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
             .read()
             .values()
             .flat_map(|entries| entries.iter().cloned())
-            .filter(|entry| {
-                pruned_node_ids.contains(&entry.source) || pruned_node_ids.contains(&entry.target)
-            })
+            .filter(|entry| edge_is_reclaimable(entry))
             .collect()
     };
 
@@ -37763,6 +42990,9 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
         // (change-log-first WITHIN that transaction, exactly as the cleanup
         // path's fix), and the sync-source-lsn rows orphaned by a row whose
         // whole lifetime just ended. Nothing else is read or rewritten.
+        // Empty on a pass that only revisits deferred adjacency; the
+        // persisted call itself is a no-op then, and the edge removal below
+        // is the whole of that pass's durable work.
         persistence.prune_versions_scoped(
             &row_keys,
             &pruned_change_keys_vec,
@@ -37823,20 +43053,39 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
         }
     }
 
-    let released_vector_bytes = vector_store.prune_row_ids(&pruned_live_row_ids, accountant);
+    let released_vector_bytes = if pruned_live_row_ids.is_empty() {
+        0
+    } else {
+        vector_store.prune_row_ids(&pruned_live_row_ids, accountant)
+    };
 
     let mut released_edge_bytes = 0usize;
+    // Every adjacency entry this pass removes is charged until it is removed,
+    // whether it was stamped `deleted_tx` by an earlier commit or was still
+    // live at expiry: a tombstoned entry is still whole and still in both
+    // adjacency maps, so its bytes are still held. This pass is the one
+    // release, and it happens where the entry actually goes away.
+    let mut accounted_edge_bytes = 0usize;
+    // Ids whose adjacency this pass had to leave behind, so the next pass
+    // knows to come back to them. Rebuilt from what is actually still in
+    // place, so an id whose entries are all gone stops being carried.
+    let mut deferred_edge_nodes: HashSet<NodeId> = HashSet::new();
     {
         let mut forward = graph_store.forward_adj.write();
         for entries in forward.values_mut() {
             entries.retain(|entry| {
-                if pruned_node_ids.contains(&entry.source)
-                    || pruned_node_ids.contains(&entry.target)
-                {
+                if edge_is_reclaimable(entry) {
                     released_edge_bytes =
                         released_edge_bytes.saturating_add(entry.estimated_bytes());
+                    accounted_edge_bytes =
+                        accounted_edge_bytes.saturating_add(entry.estimated_bytes());
                     false
                 } else {
+                    for end in [entry.source, entry.target] {
+                        if reclaimable_edge_nodes.contains(&end) {
+                            deferred_edge_nodes.insert(end);
+                        }
+                    }
                     true
                 }
             });
@@ -37846,17 +43095,21 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
     {
         let mut reverse = graph_store.reverse_adj.write();
         for entries in reverse.values_mut() {
-            entries.retain(|entry| {
-                !pruned_node_ids.contains(&entry.source) && !pruned_node_ids.contains(&entry.target)
-            });
+            entries.retain(|entry| !edge_is_reclaimable(entry));
         }
         reverse.retain(|_, entries| !entries.is_empty());
     }
+    // A deferred entry is still charged and still physically present; it is
+    // released and handed back to the accountant on the pass that finally
+    // removes it, which is the same one release every other entry gets.
+    *ctx.retention_deferred_edge_nodes.lock() = deferred_edge_nodes;
 
+    // Reclaimed physical bytes are reported in full below; only the versions
+    // that still held a charge are returned to the accountant.
     accountant.release(
-        released_row_bytes
+        accounted_row_bytes
             .saturating_add(released_vector_bytes)
-            .saturating_add(released_edge_bytes),
+            .saturating_add(accounted_edge_bytes),
     );
 
     Ok(PruningReport {
@@ -37869,6 +43122,7 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
         future_dated_rows,
         future_dated_tables,
         pruned_commit_index_entries,
+        rows_deferred_for_readers,
         ..PruningReport::default()
     })
 }
@@ -38180,7 +43434,15 @@ fn compact_currency_versions_inner(
     // released row version: a vector write shares its row's `created_tx`/
     // `lsn` (same commit), so this triple names it exactly.
     let mut pruned_row_identities: HashSet<(RowId, TxId, Lsn)> = HashSet::new();
+    // The subset of `pruned_row_identities` whose versions still hold their
+    // charge. The full set drives physical removal; only this subset is
+    // returned to the accountant.
+    let mut charged_row_identities: HashSet<(RowId, TxId, Lsn)> = HashSet::new();
     let mut released_row_bytes = 0usize;
+    // See the retention pass above: the bytes this pass physically reclaims
+    // and the bytes it returns to the accountant are different sets. A version
+    // superseded by an update carries `deleted_tx` and was released at commit.
+    let mut accounted_row_bytes = 0usize;
     let mut versions_deferred_for_readers = 0u64;
 
     for table in tables {
@@ -38226,9 +43488,21 @@ fn compact_currency_versions_inner(
                 .insert((row.row_id, row.lsn));
             row_keys.push((table.to_string(), row.row_id, row.created_tx, row.lsn));
             pruned_row_identities.insert((row.row_id, row.created_tx, row.lsn));
+            if row.deleted_tx.is_none() {
+                charged_row_identities.insert((row.row_id, row.created_tx, row.lsn));
+            }
             if let Some(meta) = metas.get(table) {
-                released_row_bytes = released_row_bytes
-                    .saturating_add(estimate_row_bytes_for_meta(&row.values, meta, false));
+                let version_bytes = retained_row_bytes_for_meta(&row.values, meta, false);
+                released_row_bytes = released_row_bytes.saturating_add(version_bytes);
+                if row.deleted_tx.is_none() {
+                    // An update stamps the version it supersedes with
+                    // `deleted_tx` and releases its charge at commit, so this
+                    // pass reclaims the memory without returning the bytes a
+                    // second time. A non-keeper version that was never marked
+                    // deleted still holds its charge, and this is its one
+                    // release.
+                    accounted_row_bytes = accounted_row_bytes.saturating_add(version_bytes);
+                }
             }
         }
     }
@@ -38388,12 +43662,27 @@ fn compact_currency_versions_inner(
             }
         }
     }
+    // The vector copy attached to a version that was stamped `deleted_tx`
+    // had its bytes handed back at the commit that superseded it, so removing
+    // that copy here reclaims memory without returning the bytes again. The
+    // accounted share is summed from the entries whose version still holds a
+    // charge; the physical removal still covers every pruned version.
+    let accounted_vector_bytes = released_vectors
+        .iter()
+        .filter(|entry| {
+            charged_row_identities.contains(&(entry.row_id, entry.created_tx, entry.lsn))
+        })
+        .fold(0usize, |acc, entry| {
+            acc.saturating_add(entry.estimated_bytes())
+        });
     let released_vector_bytes = if released_vectors.is_empty() {
         0
     } else {
         vector_store.prune_superseded_versions(&pruned_row_identities)
     };
-    accountant.release(released_row_bytes.saturating_add(released_vector_bytes));
+    // Reclaimed physical bytes are reported in full below; only the versions
+    // that still held a charge are returned to the accountant.
+    accountant.release(accounted_row_bytes.saturating_add(accounted_vector_bytes));
 
     let mut compacted_tables: Vec<String> = pruned_versions_by_table.keys().cloned().collect();
     compacted_tables.sort();
@@ -39239,6 +44528,15 @@ fn sql_type_for_ast(data_type: &DataType) -> String {
     }
 }
 
+/// The one place a column's `ACL REFERENCES` clause is written. Both column
+/// renderers -- the parsed-statement one and the stored-metadata one -- call
+/// it, so a table declared through SQL and the same table read back out of the
+/// store print the same access control rather than two shapes that only agree
+/// by accident.
+fn append_acl_reference(ty: &mut String, ref_table: &str, ref_column: &str) {
+    ty.push_str(&format!(" ACL REFERENCES {ref_table}({ref_column})"));
+}
+
 fn sql_type_for_ast_column(
     col: &contextdb_parser::ast::ColumnDef,
     _rules: &[contextdb_parser::ast::AstPropagationRule],
@@ -39270,6 +44568,9 @@ fn sql_type_for_ast_column(
                 }
             }
         }
+    }
+    if let Some(acl) = &col.acl_ref {
+        append_acl_reference(&mut ty, &acl.ref_table, &acl.ref_column);
     }
     if col.primary_key {
         ty.push_str(" PRIMARY KEY");
@@ -39360,6 +44661,9 @@ pub(crate) fn sql_type_for_meta_column(
                 ty.push_str(" ABORT ON FAILURE");
             }
         }
+    }
+    if let Some(acl) = &col.acl_ref {
+        append_acl_reference(&mut ty, &acl.ref_table, &acl.ref_column);
     }
     if col.primary_key {
         ty.push_str(" PRIMARY KEY");

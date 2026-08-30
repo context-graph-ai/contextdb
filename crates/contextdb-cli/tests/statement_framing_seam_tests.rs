@@ -60,11 +60,20 @@
 
 use contextdb_cli::formatter::format_query_result_json;
 use contextdb_cli::testing::{
-    InputContext, LineRouting, OutputOptions, SessionState, StatementBuffer, feed_line,
+    InputContext, LineRouting, OutputOptions, Session, SessionState, StatementBuffer, feed_line,
     interactive_readline_filter, route_line, session_exit_code, statement_terminator,
 };
+use contextdb_core::read_contract::ReadLimits;
 use contextdb_engine::Database;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// A writing session over a throwaway in-memory database — the mode
+/// `:memory:` always has, and the one these framing fixtures need.
+fn writing_session(database: &Arc<Database>) -> Session {
+    Session::writing(Arc::clone(database), ReadLimits::default())
+        .expect("a live database opens its own bounded read view")
+}
 
 // ============================================================================
 // Continuation state across fed lines.
@@ -267,8 +276,9 @@ fn buffer_is_empty_after_a_terminated_statement_leaves_only_a_trailing_comment()
 /// the module doc comment) — that preprocessing is a separate, currently
 /// buggy step ABOVE `feed_line`, not part of `feed_line`'s own contract.
 /// Returns the resulting database and the session exit code.
-fn drive(lines: &[&str], interactive: bool) -> (Database, i32) {
-    let db = Database::open_memory();
+fn drive(lines: &[&str], interactive: bool) -> (Arc<Database>, i32) {
+    let db = Arc::new(Database::open_memory());
+    let session_handle = writing_session(&db);
     let mut session = SessionState::default();
     let mut pending = StatementBuffer::default();
 
@@ -277,9 +287,12 @@ fn drive(lines: &[&str], interactive: bool) -> (Database, i32) {
             interactive,
             script_line: if interactive { None } else { Some(idx + 1) },
             output: OutputOptions::default(),
+            // These fixtures frame statements against an in-memory database,
+            // which is writable with no flag at all.
+            store_writes_permitted: true,
         };
         let keep_going = feed_line(
-            &db,
+            &session_handle,
             None,
             None,
             line,
@@ -355,8 +368,9 @@ fn scripted_and_interactive_drives_of_feed_line_leave_identical_database_state()
 /// not, hands back the RAW text — never trimmed), then that text goes
 /// straight to `feed_line`. This is the actual production decision
 /// `run_interactive` makes, not a test-side reimplementation of it.
-fn drive_interactive_via_seam(lines: &[&str]) -> Database {
-    let db = Database::open_memory();
+fn drive_interactive_via_seam(lines: &[&str]) -> Arc<Database> {
+    let db = Arc::new(Database::open_memory());
+    let session_handle = writing_session(&db);
     let mut session = SessionState::default();
     let mut pending = StatementBuffer::default();
 
@@ -368,9 +382,10 @@ fn drive_interactive_via_seam(lines: &[&str]) -> Database {
             interactive: true,
             script_line: None,
             output: OutputOptions::default(),
+            store_writes_permitted: true,
         };
         let keep_going = feed_line(
-            &db,
+            &session_handle,
             None,
             None,
             fed,

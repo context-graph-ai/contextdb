@@ -140,11 +140,11 @@ impl Drop for CronCallbackThreadGuard<'_> {
 
 impl Database {
     pub(super) fn load_cron_state_from_persistence(&self) -> Result<()> {
-        let Some(persistence) = self.persistence.as_ref() else {
+        let Some(source) = self.startup_state() else {
             return Ok(());
         };
         if let Some(schedules) =
-            persistence.load_config_value::<Vec<CronSchedule>>(CRON_SCHEDULES_CONFIG_KEY)?
+            source.config_value::<Vec<CronSchedule>>(CRON_SCHEDULES_CONFIG_KEY)?
         {
             let mut stored = self.cron.schedules.lock();
             stored.clear();
@@ -157,9 +157,7 @@ impl Database {
                 .schedule_count
                 .store(stored.len() as u64, Ordering::SeqCst);
         }
-        if let Some(entries) =
-            persistence.load_config_value::<Vec<CronAuditEntry>>(CRON_AUDIT_CONFIG_KEY)?
-        {
+        if let Some(entries) = source.config_value::<Vec<CronAuditEntry>>(CRON_AUDIT_CONFIG_KEY)? {
             let mut audit = self.cron.audit.lock();
             audit.clear();
             let start = entries.len().saturating_sub(MAX_CRON_AUDIT_DEPTH);
@@ -387,6 +385,10 @@ impl Database {
         runtime.shutdown.store(false, Ordering::SeqCst);
         let shutdown = runtime.shutdown.clone();
         let db = self.worker_handle_for_background();
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_cron_worker_start();
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_background_worker_start();
         let handle = thread::spawn(move || db.cron_tickler_loop(shutdown));
         runtime.handle = Some(handle);
     }
@@ -608,7 +610,7 @@ impl Database {
                 let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
                     let prior_lsn = slot.replace(Some(reserved_lsn));
                     let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
-                    let this_db = self as *const Self as usize;
+                    let this_db = self.identity();
                     let prior_db = CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
                     let gate_id = self.vector_schema_gate_id();
                     let prior_gate = CRON_CALLBACK_VECTOR_SCHEMA_GATE
@@ -792,6 +794,7 @@ impl Database {
 
     fn worker_handle_for_background(&self) -> Database {
         Database {
+            id: super::DatabaseId::next(),
             tx_mgr: self.tx_mgr.clone(),
             relational_store: self.relational_store.clone(),
             graph_store: self.graph_store.clone(),
@@ -812,6 +815,7 @@ impl Database {
             capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
             detached_sync_write_set: self.detached_sync_write_set.clone(),
             persistence: self.persistence.clone(),
+            committed_image_startup: self.committed_image_startup.clone(),
             blob_repository: self.blob_repository.clone(),
             open_registry_path: Mutex::new(None),
             operation_gate: self.operation_gate.clone(),
@@ -830,10 +834,19 @@ impl Database {
                 Arc::new(OnceLock::new()),
                 self.accountant.clone(),
             ),
-            session_tx: Mutex::new(None),
+            image_store_file_bytes: None,
+            session_tx: Arc::new(Mutex::new(None)),
+            origin_session_tx: None,
             instance_id: self.instance_id,
             owner_thread: self.owner_thread,
             plugin: self.plugin.clone(),
+            owner_read_config: self.owner_read_config.clone(),
+            owner_read_service: None,
+            owner_read_startup_failure: None,
+            #[cfg(feature = "test-seams")]
+            route_observer: None,
+            #[cfg(feature = "test-seams")]
+            kernel_observer: None,
             access: AccessConstraints::default(),
             accountant: self.accountant.clone(),
             conflict_policies: RwLock::new(self.conflict_policies.read().clone()),
@@ -859,12 +872,11 @@ impl Database {
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             limit_update_lock: self.limit_update_lock.clone(),
-            disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),
-            disk_limit_startup_ceiling: AtomicU64::new(
-                self.disk_limit_startup_ceiling.load(Ordering::SeqCst),
-            ),
+            disk_limit: Arc::clone(&self.disk_limit),
+            disk_limit_startup_ceiling: Arc::clone(&self.disk_limit_startup_ceiling),
             trigger_audit_retention_secs: self.trigger_audit_retention_secs.clone(),
             snapshot_registry: self.snapshot_registry.clone(),
+            retention_deferred_edge_nodes: self.retention_deferred_edge_nodes.clone(),
             maintenance_caller_driven: self.maintenance_caller_driven.clone(),
             last_maintenance_cycle_at: self.last_maintenance_cycle_at.clone(),
             caller_driven_backlog_warned_at: self.caller_driven_backlog_warned_at.clone(),
@@ -877,7 +889,9 @@ impl Database {
             last_vector_search_used_hnsw: AtomicBool::new(false),
             last_vector_search_trace: RwLock::new(None),
             statement_cache: RwLock::new(HashMap::new()),
-            rank_formula_cache: RwLock::new(self.rank_formula_cache.read().clone()),
+            // The same cache, not a copy of it: a formula registered after this
+            // handle was derived is one this handle must still find.
+            rank_formula_cache: Arc::clone(&self.rank_formula_cache),
             acl_grant_cache: RwLock::new(HashMap::new()),
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
@@ -892,6 +906,13 @@ impl Database {
             commit_stage_wall_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
             corrupt_joined_values: RwLock::new(self.corrupt_joined_values.read().clone()),
             resource_owner: false,
+            // A background worker is the store's own machinery: it lives as
+            // long as the process, so the store must never wait for it.
+            handle_role: super::HandleRole::Internal,
+            trigger_deadlock_timeout_override: Mutex::new(
+                *self.trigger_deadlock_timeout_override.lock(),
+            ),
+            finalization: Arc::clone(&self.finalization),
         }
     }
 }
@@ -1010,11 +1031,7 @@ fn compute_due_decision(schedule: &CronSchedule, now: u64) -> DueDecision {
 }
 
 fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
+    contextdb_core::Wallclock::now().0
 }
 
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {

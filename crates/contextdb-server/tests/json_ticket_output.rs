@@ -61,6 +61,13 @@ fn show_ticket_json_emits_structured_object() {
         dial.contains("--tenant-id acme") && dial.contains(ticket),
         "dial_command must carry the tenant and the ticket: {v}"
     );
+    // Sync is a writer capability: without --write the printed command is
+    // refused at argument validation and nothing runs.
+    assert!(
+        dial.contains("--write"),
+        "dial_command must carry --write, or the command it tells the operator to run is \
+         refused before any statement executes: {v}"
+    );
 
     assert!(
         v.get("endpoint").is_some(),

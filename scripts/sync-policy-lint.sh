@@ -15,6 +15,7 @@
 #   0  every table's declared (or defaulted) policy is delete-safe — no findings
 #   1  at least one table would strand a delete — findings printed to stdout
 #   2  usage error
+#   3  could not read the store — `.tables` failed or was refused
 set -euo pipefail
 
 cli="${CONTEXTDB_CLI:-contextdb}"
@@ -33,14 +34,23 @@ if [[ ! -e "$db_path" ]]; then
   exit 2
 fi
 
-# Inspect a COPY, never the original — same read-write-peek rule as the health
-# check script.
-peek_dir="$(mktemp -d)"
-trap 'rm -rf "$peek_dir"' EXIT
-peek_path="$peek_dir/peek.db"
-cp "$db_path" "$peek_path"
-
-mapfile -t tables < <(printf '.tables\n' | "$cli" "$peek_path" --json | jq -r '.tables[]')
+# Read the store directly — same rule as the health check script. A plain
+# `contextdb <path>` open (no `--write`) is a bounded read session: it never
+# creates or mutates the store, so there is no peek copy to make here (and a
+# copy of the main file alone would leave its `.lock` companion behind anyway).
+#
+# The `.tables` call is captured into a variable, not piped straight into
+# `mapfile < <(...)`: a process substitution runs in a subshell whose exit
+# status the parent shell never checks, so `set -e` cannot see a failed or
+# refused read there — it would silently yield zero tables and this script
+# would print the "nothing to lint" success message for a store it never
+# actually read. Capturing the command substitution first means a nonzero
+# exit from `$cli` fails this script's own `set -e` before jq ever runs.
+if ! tables_json="$(printf '.tables\n' | "$cli" "$db_path" --json)"; then
+  printf 'FAIL could not read the store: %s\n' "$db_path" >&2
+  exit 3
+fi
+mapfile -t tables < <(printf '%s' "$tables_json" | jq -r '.tables.items[]')
 
 if [[ "${#tables[@]}" -eq 0 ]]; then
   printf 'no tables — nothing to lint\n'
@@ -49,11 +59,12 @@ fi
 
 findings=0
 for t in "${tables[@]}"; do
-  schema_json="$(printf '.schema %s\n' "$t" | "$cli" "$peek_path" --json)"
-  # Absent key == the engine's own documented default.
-  policy="$(printf '%s' "$schema_json" | jq -r '.conflict_policy // "keep_first"')"
-  direction="$(printf '%s' "$schema_json" | jq -r '.sync_direction // "two_way"')"
-  explicit_policy="$(printf '%s' "$schema_json" | jq -r 'has("conflict_policy")')"
+  schema_json="$(printf '.schema %s\n' "$t" | "$cli" "$db_path" --json)"
+  # `.schema` nests everything under `schema`. Absent key == the engine's own
+  # documented default.
+  policy="$(printf '%s' "$schema_json" | jq -r '.schema.conflict_policy // "keep_first"')"
+  direction="$(printf '%s' "$schema_json" | jq -r '.schema.sync_direction // "two_way"')"
+  explicit_policy="$(printf '%s' "$schema_json" | jq -r '.schema | has("conflict_policy")')"
 
   if [[ "$explicit_policy" == "false" ]]; then
     printf 'INFO %-32s no explicit SYNC CONFLICT — defaults to KEEP FIRST\n' "$t"

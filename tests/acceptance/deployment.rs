@@ -98,6 +98,7 @@ fn f47_cli_has_logging_debug_mode_for_troubleshooting() {
     let tmp = TempDir::new().expect("tempdir");
     let output = Command::new(cli_bin())
         .arg(tmp.path().join("f47.db"))
+        .arg("--write")
         .env("RUST_LOG", "debug")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

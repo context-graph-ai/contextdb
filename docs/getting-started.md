@@ -1,6 +1,6 @@
 # Getting Started
 
-Run contextdb in under a minute.
+Run contextdb in 2 minutes.
 
 ---
 
@@ -42,6 +42,9 @@ cargo build --release -p contextdb-cli
 ```bash
 contextdb :memory:
 ```
+
+`:memory:` is always writable: it creates no file, so there is nothing for a flag to authorize.
+A file-backed store is different — see [Persist to Disk](#persist-to-disk).
 
 Try the state machine — the feature that makes contextdb different from plain SQL:
 
@@ -93,6 +96,115 @@ WHERE id = '550e8400-e29b-41d4-a716-446655440001';
 
 The row stays at its original `decision_type`; the session continues. To record a correction, INSERT a new row and mark the original `superseded`.
 
+## Persist to Disk
+
+Replace `:memory:` with a file path, and add `--write` — creating and changing a store is what
+that flag authorizes:
+
+```bash
+contextdb ./my.db --write
+```
+
+The `:memory:` work above is gone with that session, so recreate the `decisions` table here —
+this is the store the rest of this page reads:
+
+```sql
+CREATE TABLE decisions (
+  id UUID PRIMARY KEY,
+  status TEXT NOT NULL,
+  reasoning TEXT
+) STATE MACHINE (status: draft -> [active, rejected], active -> [superseded]);
+
+INSERT INTO decisions (id, status, reasoning)
+VALUES ('550e8400-e29b-41d4-a716-446655440000', 'draft', 'initial assessment');
+
+UPDATE decisions SET status = 'active'
+WHERE id = '550e8400-e29b-41d4-a716-446655440000';
+```
+
+One database file plus its `.lock` companion (`my.db` and `my.db.lock`), and a third file —
+`my.db.fabric-identity.key` — once the store has synced. Crash-safe via redb. Reopen and your data
+is there. Without `--write` the same path opens a read-only session instead, which is the subject
+of the next chapter.
+
+## Inspecting a store safely
+
+You have a contextdb store on disk — maybe your own, maybe one a running service owns — and you
+want to look inside without any risk of changing it. That is the default command:
+
+```bash
+contextdb ./my.db
+```
+
+This opens a **read-only session**. It never creates a store, never mutates one, and leaves
+every byte of the store folder unchanged; anything that would write is refused with
+`write_requires_flag` telling you to add `--write`. <!-- enforced by: read_cli_journeys_invocation::reading_an_idle_store_leaves_every_byte_and_the_folder_listing_unchanged, read_cli_journeys_invocation::a_reading_session_refuses_every_mutating_statement_before_it_executes, read_cli_journeys_invocation::bare_path_on_a_missing_store_refuses_and_creates_nothing -->
+
+### 1. Look around
+
+```text
+contextdb(ro)> .tables
+decisions
+has_more: false
+
+contextdb(ro)> .schema decisions
+CREATE TABLE decisions (
+  id UUID PRIMARY KEY,
+  status TEXT NOT NULL,
+  reasoning TEXT
+) STATE MACHINE (status: active -> [superseded], draft -> [active, rejected]);
+
+contextdb(ro)> SELECT id, status FROM decisions;
++--------------------------------------+--------+
+| id                                   | status |
++--------------------------------------+--------+
+| 550e8400-e29b-41d4-a716-446655440000 | active |
++--------------------------------------+--------+
+(1 rows)
+```
+
+Three shapes to expect. `.tables` is a bounded page, so it always closes with a `has_more:` line.
+`.schema` prints the from-states sorted, not in the order you declared them. And an ordinary
+`SELECT` renders as a bordered table with exactly one `(N rows)` footer.
+
+The first reading command prints one route notice on stderr telling you **how** you are reading.
+In human mode that is one sentence — `reading the committed snapshot taken at
+2026-08-29T06:41:47Z` when nobody owns the store (you are reading a point-in-time snapshot), or
+`reading through the live owner's local channel` when a live process owns it and is serving you
+its committed state over an authenticated local channel (same commands, same shapes). Under
+`--json` the same notice carries the machine form in `detail.route` (`"file"` or `"owner"`) and
+`detail.snapshot_at` (the committed moment on the file route, `null` on the owner route) — the
+shapes are in [`docs/cli.md`](cli.md#reading-routes).
+<!-- enforced by: read_cli_journeys_session_shape::the_route_notice_is_emitted_once_on_stderr_at_the_first_store_reading_command -->
+
+### 2. Everything else a reading session can do
+
+The read surface has exactly one reference — [`docs/cli.md`](cli.md). Rather than restate it here
+and let the two copies drift, three sentences and where each one is spelled out in full:
+
+- **A result that crosses a ceiling is refused whole — never truncated, no partial rows** — and
+  the refusal names both escapes and carries a copy-ready `.cursor open <statement>` you can page
+  it with: [Ordinary results: complete or refused](cli.md#ordinary-results-complete-or-refused)
+  and [Large results: the session cursor](cli.md#large-results-the-session-cursor).
+  <!-- enforced by: read_cli_journeys_ordinary_results::one_row_past_the_ceiling_publishes_nothing_and_names_the_ceiling, read_cli_journeys_ordinary_results::the_refusal_carries_the_statement_and_a_copy_ready_cursor_command -->
+- **Which escape is honest depends on your route**, so check the route notice or `.owner status`
+  first: raising `--read-result-rows` / `--read-result-bytes` for a one-shot export works on the
+  **file** route only — on the **owner** route the ceilings are the owner's, a reader cannot raise
+  them, and the cursor is the in-session escape. If a live process owns the store, `contextdb
+  <path>` reads through that owner automatically and `--write` is refused with `held_by_writer`:
+  [Reading routes](cli.md#reading-routes) and [Declared limits](cli.md#declared-limits).
+  <!-- enforced by: read_cli_journeys_live_owner::the_owner_route_refusal_names_the_writer_side_change_and_the_cursor, read_cli_journeys_live_owner::a_reading_session_routes_through_the_live_owner_and_says_so_once, read_cli_journeys_live_owner::a_second_writer_is_refused_and_told_how_to_read_instead, read_cli_journeys_live_owner::owner_status_reports_the_serving_owner_as_control_data -->
+- **Scripts pass `--json`**: stdout is one JSON document per statement, every notice and error is
+  a JSON document on stderr, and the process exit code is one of four — `0` success, `1` a valid
+  run with a refused statement, `2` an invalid invocation, `3` a `.sync push` whose outcome is
+  unconfirmed: [Exit Codes](cli.md#exit-codes).
+  <!-- enforced by: read_cli_journeys_session_shape::a_piped_session_is_a_full_session_including_the_cursor -->
+
+### 3. Scratch space
+
+`contextdb :memory:` is a disposable, always-writable playground — no file, no `--write`
+needed, gone on exit. <!-- enforced by: read_cli_journeys_invocation::memory_store_is_writable_without_the_flag_and_accepts_the_flag_as_a_no_op -->
+
 ## Indexes and Scale
 
 contextdb is designed for agents holding tens of thousands of entities with
@@ -130,90 +242,17 @@ the first column of any declared or auto-index reports `Scan`.
 
 ## Rank Vector Search by Outcomes
 
-Vector search can use a schema-declared rank policy when cosine similarity is
-not the only signal. The joined column must be indexed:
+Vector search does not have to rank by cosine similarity alone. Declare a `RANK_POLICY` on the
+vector column and every caller asking for the same `SORT_KEY` gets the same outcome-weighted
+ordering — resolved at DDL time, stored with the schema, and replicated through sync — so the row
+that is closest but *failed* sorts below the row that was less similar and *worked*. No
+application copies formula text into its queries.
 
-```bash
-contextdb :memory: <<'SQL'
-CREATE TABLE outcomes (
-  id UUID PRIMARY KEY,
-  decision_id UUID NOT NULL,
-  success BOOLEAN NOT NULL
-);
-CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id);
-
-CREATE TABLE decisions (
-  id UUID PRIMARY KEY,
-  description TEXT NOT NULL,
-  confidence REAL,
-  embedding VECTOR(2) RANK_POLICY (
-    JOIN outcomes ON decision_id,
-    FORMULA 'coalesce({confidence}, 1.0) * coalesce({success}, 1.0)',
-    SORT_KEY effective_confidence
-  )
-);
-
-INSERT INTO decisions (id, description, confidence, embedding) VALUES
-  ('11111111-1111-1111-1111-111111111111', 'closest but failed', 1.0, [1.0, 0.0]),
-  ('22222222-2222-2222-2222-222222222222', 'less similar but worked', 1.0, [0.5, 0.0]),
-  ('33333333-3333-3333-3333-333333333333', 'fallback with no outcome', 0.25, [0.75, 0.0]);
-
-INSERT INTO outcomes (id, decision_id, success) VALUES
-  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '11111111-1111-1111-1111-111111111111', FALSE),
-  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '22222222-2222-2222-2222-222222222222', TRUE);
-
-SELECT id, description, confidence
-FROM decisions
-ORDER BY embedding <=> [1.0, 0.0] USE RANK effective_confidence
-LIMIT 5;
-SQL
-```
-
-Expected ordering (simplified for readability — the real session also prints an `ok (...)` line
-per statement above, with each piped `INSERT`'s own literal text echoed right before its `ok`
-line, and the actual `SELECT` renders as a bordered `+---+` table, not this bare list):
-
-```text
-22222222-2222-2222-2222-222222222222 | less similar but worked | 1.0
-33333333-3333-3333-3333-333333333333 | fallback with no outcome | 0.25
-11111111-1111-1111-1111-111111111111 | closest but failed | 1.0
-```
-
-The formula and join path are resolved at DDL time, stored with the schema, and
-replicated through sync. `JOIN outcomes ON decision_id` looks up
-`outcomes.decision_id` through `outcomes_decision_id_idx` and compares it with
-`decisions.id`. Search results are ranked by the formula before the top-k
-cutoff. On large HNSW-backed indexes, this ranking applies to the vector
-candidates returned by ANN retrieval; use a single current summary row on the
-joined side when outcome ranking must be deterministic.
-
-Rank policies are schema. To change a policy today, recreate the affected table
-with the new `RANK_POLICY` clause and reload the rows:
-
-```sql
-DROP TABLE decisions;
-
-CREATE TABLE decisions (
-  id UUID PRIMARY KEY,
-  description TEXT NOT NULL,
-  confidence REAL,
-  embedding VECTOR(2) RANK_POLICY (
-    JOIN outcomes ON decision_id,
-    FORMULA 'coalesce({vector_score}, 0.0) * coalesce({confidence}, 1.0) * coalesce({success}, 1.0)',
-    SORT_KEY effective_confidence
-  )
-);
-```
-
-## Persist to Disk
-
-Replace `:memory:` with a file path. Everything else works the same:
-
-```bash
-contextdb ./my.db
-```
-
-Single file. Crash-safe via redb. Reopen and your data is there.
+- Grammar — `RANK_POLICY`, `JOIN`, the `FORMULA` placeholders, `SORT_KEY`, `USE RANK`:
+  [`docs/query-language.md`](query-language.md#rank-policies).
+- Runnable walkthrough with the expected ordering, the same query without `USE RANK` for
+  contrast, the join-index requirement, the HNSW/ANN caveat, and how to change a policy:
+  [`skills/vector-search/SKILL.md`](../skills/vector-search/SKILL.md).
 
 ## Use as a Library
 
@@ -256,92 +295,41 @@ contextdb-engine = "1.0.0"
 contextdb-core = "1.0.0"
 ```
 
-## Sync Across Two Machines
+### Reading a store from a second process
 
-contextdb syncs by dialing a key, not by connecting to a broker. One machine runs a hub; any number of edges dial it directly using a ticket the hub prints — no message broker, no port-forwarding, and (on a LAN) no external infrastructure at all.
+`Database::open` takes ownership of a store file, so one process holds it at a time. Reading is a
+separate door. `ReadSession::open` (or `ReadSession::open_with_options`, which carries the
+caller's own limits and deadlines) reads a store whether or not somebody owns it: it routes
+through the live owner's local channel when a process owns the store, and reads the committed
+file directly when none does.
 
-### Start the hub
+`ReadSession::open_owner_only` is the third door — the one for questions only a *running owner*
+can answer (what the process is doing, whether it is serving yet). It takes the owner route when a
+process owns the store, and when none does it says `owner_not_running` rather than falling through
+to the file. Four exported names, and that is the whole surface:
 
-On machine A, run a sync hub — a `contextdb-server` process the edges dial into:
+```rust
+use contextdb_engine::{ReadSession, ReadSessionOptions};
 
-```bash
-contextdb-server --db-path hub.db --tenant-id demo
+// The live owner if one is running, the committed file if not.
+let session = ReadSession::open("./my.db")?;
+
+// The same, with the caller's own ceilings and deadlines.
+let bounded = ReadSession::open_with_options("./my.db", ReadSessionOptions::default())?;
+
+// Administrative asking and readiness probing: an owner, or nothing.
+let owner = ReadSession::open_owner_only("./my.db", ReadSessionOptions::default())?;
 ```
 
-On startup it prints an enrollment ticket and the exact command an edge runs to connect (substitute your own database path for `<client-db-path>`):
-
-```text
-enrollment ticket: <ticket>
-To connect a client, run:
-  contextdb <client-db-path> --sync-endpoint <ticket> --tenant-id demo
-```
-
-The ticket *is* the hub's cryptographic identity — dial-by-key. Whoever holds it can dial the hub directly, wherever it is, including from behind NAT (the edge dials out; nothing needs to be reachable on machine A). The hub only serves — you don't type SQL at it; your data lives on the edges that dial in. For scripting, three flags skip the banner: `--show-ticket` prints the bare ticket and exits, `--ticket-file <path>` writes it to a file, and `--json` emits a JSON object with `enrollment_ticket`, `dial_command`, `endpoint`, and `tenant_id`.
-
-**Treat the ticket as sensitive bearer material, not a public identifier.** There is no allowlist —
-anyone who obtains the ticket can enroll and sync with the hub until the hub's identity changes.
-Keep any file it's written to (`--ticket-file`, `--json` output, shell history) out of version
-control and restrict its file permissions. If a ticket leaks, rotate by re-keying the hub — delete
-`hub.db.fabric-identity.key` and restart, which changes the hub's identity and invalidates every
-previously issued ticket.
-
-### Connect two edges
-
-On each edge machine, paste the ticket, giving each its own database file:
-
-```bash
-# machine B
-contextdb edge-1.db --sync-endpoint <ticket> --tenant-id demo
-# machine C
-contextdb edge-2.db --sync-endpoint <ticket> --tenant-id demo
-```
-
-The ticket is pinned to each edge's identity key on first connect, so later reconnects are authenticated the same way. Two machines on one LAN sync with nothing running in the middle — no cloud relay or other third party.
-
-### Converge in both directions
-
-Sync is push/pull, driven from the REPL with `.sync` meta-commands. On edge 1, create a small example table (`decisions` is a table you define — contextdb ships no built-in schema), insert a row, and push:
-
-```sql
--- on machine B (edge 1)
-CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT NOT NULL, reasoning TEXT);
-INSERT INTO decisions (id, status, reasoning) VALUES ('750e8400-e29b-41d4-a716-446655440020', 'active', 'captured on edge 1');
-.sync push
-```
-
-On edge 2, pull and read it back — the schema and the row both arrive:
-
-```sql
--- on machine C (edge 2)
-.sync pull
-SELECT * FROM decisions WHERE id = '750e8400-e29b-41d4-a716-446655440020';
--- returns the row captured on edge 1
-```
-
-Now the other direction. Insert a row on edge 2, push, and pull it onto edge 1:
-
-```sql
--- on machine C (edge 2)
-INSERT INTO decisions (id, status, reasoning) VALUES ('850e8400-e29b-41d4-a716-446655440030', 'active', 'captured on edge 2');
-.sync push
-```
-
-```sql
--- on machine B (edge 1)
-.sync pull
-SELECT * FROM decisions WHERE id = '850e8400-e29b-41d4-a716-446655440030';
--- returns the row captured on edge 2
-```
-
-Both edges now hold the same two rows, converged through the hub. `.sync status` reports what's pending in each direction before you push or pull. Table direction and conflict behavior are durable `CREATE TABLE`/`ALTER TABLE` declarations (`SYNC ...` and `SYNC CONFLICT ...`), not session commands. The sync meta-commands and auto-sync are in the [CLI Reference](cli.md); the wire protocol is covered in the Architecture doc's Sync section.
-
-### Restart durability
-
-The hub keeps its identity in `<db-path>.fabric-identity.key` next to the database file (here, `hub.db.fabric-identity.key`). Restarting the hub reuses that key, so the same ticket — and every edge already pinned to it — keeps working. Back this file up like a credential; never commit it to source control.
+Why `open_owner_only` never falls through to the file, what a readiness probe would otherwise do
+to the writer it is waiting for, and how a refused read splits into a stable `kind()` and a
+machine-readable `detail()`:
+[`docs/architecture.md`](architecture.md#store-ownership--concurrency).
 
 ## What's Next
 
 - [Why contextdb?](why-contextdb.md) — the problems it solves and how it compares to alternatives
 - [Usage Scenarios](usage-scenarios.md) — 16 problem-first walkthroughs with SQL
 - [Query Language](query-language.md) — full SQL, graph, and vector reference
+- [Sync Across Two Machines](sync-two-machines.md) — stand up a hub, enroll two edges, converge both ways
 - [CLI Reference](cli.md) — REPL commands, sync, scripting

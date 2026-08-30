@@ -407,6 +407,11 @@ pub struct RelationalStore {
     pub index_maintenance_visits: AtomicU64,
     pub open_index_maintenance_visits: AtomicU64,
     pub scan_rows_touched: AtomicU64,
+    /// Index entries a source read through an ordered index walk. It counts
+    /// what the index side of a read touched, which the row counter cannot
+    /// show: a read served entirely through an index touches no scanned rows
+    /// at all.
+    pub index_entries_touched: AtomicU64,
     next_row_id: AtomicU64,
 }
 
@@ -430,6 +435,7 @@ impl RelationalStore {
             index_maintenance_visits: AtomicU64::new(0),
             open_index_maintenance_visits: AtomicU64::new(0),
             scan_rows_touched: AtomicU64::new(0),
+            index_entries_touched: AtomicU64::new(0),
             next_row_id: AtomicU64::new(1),
         }
     }
@@ -827,6 +833,64 @@ impl RelationalStore {
         rows.get(position)
             .filter(|row| row.row_id == row_id && row.visible_at(snapshot))
             .cloned()
+    }
+
+    pub(crate) fn row_by_id_before_clone<E>(
+        &self,
+        table: &str,
+        row_id: RowId,
+        snapshot: contextdb_core::SnapshotId,
+        before_clone: impl FnOnce(&VersionedRow) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E> {
+        let tables = self.tables.read();
+        let Some(rows) = tables.get(table) else {
+            return Ok(None);
+        };
+        let version_positions = self.row_version_positions.read();
+        let Some(positions) = version_positions.get(&(table.to_string(), row_id)) else {
+            return Ok(None);
+        };
+        let candidate_count = positions.partition_point(|position| {
+            rows.get(*position)
+                .is_some_and(|row| row.row_id == row_id && row.created_tx.0 <= snapshot.0)
+        });
+        let Some(position) = candidate_count
+            .checked_sub(1)
+            .and_then(|candidate| positions.get(candidate))
+        else {
+            return Ok(None);
+        };
+        let Some(row) = rows
+            .get(*position)
+            .filter(|row| row.row_id == row_id && row.visible_at(snapshot))
+        else {
+            return Ok(None);
+        };
+        before_clone(row)?;
+        Ok(Some(row.clone()))
+    }
+
+    /// Where the version of `row_id` visible at `snapshot` sits in the rows
+    /// the caller already holds. The row's own ordered version list names the
+    /// position, so resolving one identity costs an ordered probe rather than
+    /// a pass over the table.
+    pub fn visible_version_position(
+        &self,
+        table: &str,
+        rows: &[VersionedRow],
+        row_id: RowId,
+        snapshot: contextdb_core::SnapshotId,
+    ) -> Option<usize> {
+        let version_positions = self.row_version_positions.read();
+        let positions = version_positions.get(&(table.to_string(), row_id))?;
+        let candidate_count = positions.partition_point(|position| {
+            rows.get(*position)
+                .is_some_and(|row| row.row_id == row_id && row.created_tx.0 <= snapshot.0)
+        });
+        let position = *positions.get(candidate_count.checked_sub(1)?)?;
+        rows.get(position)
+            .filter(|row| row.row_id == row_id && row.visible_at(snapshot))
+            .map(|_| position)
     }
 
     pub fn live_row_by_id(&self, table: &str, row_id: RowId) -> Option<VersionedRow> {
@@ -1402,6 +1466,21 @@ impl RelationalStore {
 
     pub fn reset_scan_rows_touched(&self) {
         self.scan_rows_touched.store(0, Ordering::Relaxed);
+    }
+
+    pub fn bump_index_entries_touched(&self, entries: u64) {
+        // Observability-only counter, on the same relaxed footing as the
+        // scanned-row counter beside it.
+        self.index_entries_touched
+            .fetch_add(entries, Ordering::Relaxed);
+    }
+
+    pub fn index_entries_touched(&self) -> u64 {
+        self.index_entries_touched.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_index_entries_touched(&self) {
+        self.index_entries_touched.store(0, Ordering::Relaxed);
     }
 
     pub fn alter_table_add_column(

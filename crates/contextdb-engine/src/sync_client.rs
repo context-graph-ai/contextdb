@@ -339,6 +339,8 @@ impl std::fmt::Debug for SyncClient {
 
 impl SyncClient {
     pub fn new(db: Arc<Database>, endpoint: &str, tenant_id: TenantId) -> Self {
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_sync_client_start();
         let (transport, lineage_signer) =
             crate::transport::sync_client_transport_with_lineage_signer(
                 endpoint,

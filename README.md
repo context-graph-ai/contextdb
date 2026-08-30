@@ -105,11 +105,13 @@ let rx = db.subscribe();
 // rx is a std::sync::mpsc::Receiver<CommitEvent>
 ```
 
-**Ownership:** a database file has exactly one owner at a time — a second open of
-the same path (this process or another) returns `Error::DatabaseLocked`. One
-process holds the handle for its lifetime and serves reads/writes through it; a
-separate command reads by asking that owner, not by re-opening the file, and you
-never keep a copy of the data outside it. See
+**Ownership:** a database file has exactly one *writer* at a time — a second
+writable open of the same path (this process or another) returns
+`Error::DatabaseLocked`. Reading is a separate door that does not take the write
+lock: while a process owns the store, a read session is served by that owner over
+its authenticated local channel, and when nobody owns it several direct readers
+read the committed snapshot side by side. Either way there is no copy of the data
+outside the store. See
 [Store Ownership & Concurrency](docs/architecture.md#store-ownership--concurrency).
 
 ### Triggers
@@ -270,9 +272,11 @@ storage footprint; omitted quantization defaults to `F32`.
 ### Upgrading From 0.3.x
 
 Opening a legacy vector store without the named-index format marker returns
-`LegacyVectorStoreDetected`. For teams upgrading from 0.3.x, recovery is
-explicit: sync from a peer already on the named-index storage format, or
-recreate the schema and reimport the data.
+`LegacyVectorStoreDetected`. `contextdb migrate <path>` brings the store forward
+in place, writing a `<path>.bak` backup first — rehearse it on a copy, and take a
+`contextdb snapshot export` beforehand. If that store is unavailable to you,
+recovery is still explicit: sync from a peer already on the named-index storage
+format, or recreate the schema and reimport the data.
 
 ## What It Does
 
@@ -292,7 +296,7 @@ recreate the schema and reimport the data.
 
 **Plugin system** — `DatabasePlugin` trait with lifecycle hooks (`pre_commit`, `post_commit`, `on_open`, `on_close`, `on_ddl`, `on_query`, `post_query`, `health`, `describe`, `on_sync_push`, `on_sync_pull`). Applications inject plugins via `Database::open_with_plugin()`.
 
-**Subscriptions** — `db.subscribe()` returns a broadcast channel of `CommitEvent`s for reactive downstream processing.
+**Subscriptions** — `db.subscribe()` returns a `std::sync::mpsc::Receiver<CommitEvent>`, one per subscriber, and every commit is fanned out to all of them. `db.subscribe_with_capacity(n)` sets the per-subscriber queue depth.
 
 ## Scale Envelope
 
@@ -302,7 +306,7 @@ contextdb is designed for agentic memory, not data warehousing:
 - Sparse graphs with bounded traversal (depth <= 10)
 - Append-heavy writes, small transactions
 - Configurable memory budget via `SET MEMORY_LIMIT` (no hard-coded ceiling)
-- Configurable file-growth budget via `SET DISK_LIMIT` / `SHOW DISK_LIMIT` or `--disk-limit` / `CONTEXTDB_DISK_LIMIT` for file-backed databases
+- Configurable file-growth budget via `SET DISK_LIMIT` / `SHOW DISK_LIMIT` or `--disk-limit` for file-backed databases
 - See [Architecture](docs/architecture.md#memory-limit-on-edge-devices) for memory-limit behavior on edge devices.
 - Laptops, ARM64 devices (browser and mobile via Rust's WASM target are future directions)
 
@@ -312,13 +316,16 @@ Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/
 
 | Doc | What it covers |
 |-----|---------------|
+| **[Capability Index](docs/capability-index.md)** | One page: what contextdb is, what it is not, and the numbers it stops at |
 | **[Getting Started](docs/getting-started.md)** | Build, first REPL session, library embedding — 2 minutes |
 | **[Why contextdb?](docs/why-contextdb.md)** | Problem statement, design philosophy, comparison with alternatives |
 | **[Usage Scenarios](docs/usage-scenarios.md)** | 16 problem-first walkthroughs: constraints, graph queries, vector search, sync, propagation |
 | **[Query Language](docs/query-language.md)** | SQL, graph MATCH, vector search, constraints, built-in functions |
+| **[Sync Across Two Machines](docs/sync-two-machines.md)** | Stand up a hub, enroll two edges, converge in both directions |
 | **[CLI Reference](docs/cli.md)** | REPL commands, sync commands, non-interactive scripting |
 | **[Architecture](docs/architecture.md)** | Crate map, storage engine, MVCC, sync protocol, work ledger and blob plane, upgrades and recovery, plugin system |
 | **[Benchmarking](docs/benchmarking.md)** | How the benchmarks are built and run |
+| **[Agent Readiness](docs/agent-readiness.md)** | How this repo measures whether AI assistants can use and contribute to it |
 
 ## Architecture
 

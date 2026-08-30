@@ -18,7 +18,7 @@ pub use crate::repl::{
 /// `SessionState` lets a test drive the interactive path exactly as the terminal
 /// would — no PTY — and drive the scripted path beside it to compare the two;
 /// `session_exit_code` turns the accumulated state into the process exit code.
-pub use crate::repl::{InputContext, SessionState, feed_line, session_exit_code};
+pub use crate::repl::{InputContext, Session, SessionState, feed_line, session_exit_code};
 
 /// Re-exported here too so a test that builds an [`InputContext`] needs one
 /// import path, not two. This one is genuine public API — it is also

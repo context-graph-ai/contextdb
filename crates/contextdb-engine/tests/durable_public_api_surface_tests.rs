@@ -266,8 +266,16 @@ fn legacy_migration_source_is_read_only_and_current_roots_are_refused_unchanged(
     ));
     assert_eq!(
         legacy_methods,
-        BTreeSet::from(["close".to_string(), "keyless_table_rows".to_string()]),
-        "the validated legacy source may expose only its fixed read-only snapshot and close operations"
+        BTreeSet::from([
+            "close".to_string(),
+            "copy_locked_source_to".to_string(),
+            "keyless_table_rows".to_string(),
+            "migrate_in_place".to_string(),
+        ]),
+        "the validated legacy source may expose only its fixed read-only snapshot, its untouched \
+         backup copy, its close operation, and the one door that performs a migration whole -- \
+         never the durability-mutating operations that door alone may drive, and never a handle \
+         onto the store it is building"
     );
 
     let dir = tempfile::tempdir().expect("current-format tempdir");

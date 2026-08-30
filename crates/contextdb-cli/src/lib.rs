@@ -1,4 +1,5 @@
 pub mod auto_sync;
+mod command_registry;
 pub mod formatter;
 mod json_output;
 pub mod ops;
@@ -27,4 +28,9 @@ pub use contextdb_server::exit_codes::{
 /// speaks — the binary reports its own startup and shutdown failures through
 /// the same two, so one process emits one format.
 pub use json_output::ErrorClass;
-pub use repl::{OutputOptions, run};
+pub use repl::{OutputOptions, ReadProgressReporter, Session, run};
+
+/// The one discovery surface for command spellings. The binary's argument
+/// parser and the REPL's own `.help` both read their spellings from here, so a
+/// command can never appear in one surface and be missing from the other.
+pub use command_registry::{canonical_help_signatures, operational_command_discovery};

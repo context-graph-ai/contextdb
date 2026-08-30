@@ -1,9 +1,13 @@
+pub mod companion;
 pub mod error;
 pub mod memory;
+#[doc(hidden)]
+pub mod read_contract;
 pub mod table_meta;
 pub mod traits;
 pub mod types;
 
+pub use companion::store_companion_path;
 pub use error::{CallbackKind, Error, Result};
 pub use memory::*;
 // Explicit re-exports only — do NOT glob-export `table_meta::*`. `SortDirection`

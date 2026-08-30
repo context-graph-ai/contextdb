@@ -34,7 +34,7 @@
 use crate::Database;
 use crate::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_core::{Error, Result, TxId, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Every ledger table, in one place. The `work_` prefix is reserved.
 pub const WORK_LEDGER_TABLES: [&str; 7] = [
@@ -128,6 +128,34 @@ pub(crate) const CREATE_WORK_CAPABILITIES: &str = "CREATE TABLE work_capabilitie
      tags JSON NOT NULL, \
      detail JSON, \
      advertised_at TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
+
+/// Two of the history tables keep MANY rows per job -- a claim per attempt in
+/// `work_claims`, a failure per attempt in `work_failures` -- so `job_id` is
+/// the column every state question looks a job up by, and in neither table is
+/// it the primary key. Without these secondary indexes, asking about one job's
+/// attempts means walking every job's, and the price of a fixed question grows
+/// with the ledger it is asked of. The remaining history tables keep at most
+/// one row per job under a `job_id` primary key, so their lookups are already
+/// keyed.
+pub(crate) const CREATE_WORK_CLAIMS_JOB_ID_INDEX: &str =
+    "CREATE INDEX work_claims_job_id ON work_claims (job_id)";
+pub(crate) const CREATE_WORK_FAILURES_JOB_ID_INDEX: &str =
+    "CREATE INDEX work_failures_job_id ON work_failures (job_id)";
+
+/// The secondary indexes above, paired with the table and index name that
+/// decide whether a store already carries them.
+pub(crate) const WORK_LEDGER_JOB_ID_INDEXES: [(&str, &str, &str); 2] = [
+    (
+        "work_claims",
+        "work_claims_job_id",
+        CREATE_WORK_CLAIMS_JOB_ID_INDEX,
+    ),
+    (
+        "work_failures",
+        "work_failures_job_id",
+        CREATE_WORK_FAILURES_JOB_ID_INDEX,
+    ),
+];
 
 /// Materialized input chunks: (sequence number, payload bytes).
 pub type ExecutionInputs = Vec<(i64, Vec<u8>)>;
@@ -459,6 +487,47 @@ pub enum JobState {
     Cancelled,
 }
 
+/// How many jobs of a caller's batch stand in each state, one bucket per
+/// [`JobState`] plus one for ids the ledger has no job row for.
+///
+/// The buckets always sum to the number of ids asked about, so a caller can
+/// render a batch's standing without a second pass: an id the ledger has
+/// never seen is counted as `unknown` rather than silently dropped, and an id
+/// repeated in the batch is counted once per appearance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobStateCounts {
+    /// Submitted, with no live claim and no terminal row.
+    pub pending: usize,
+    /// Held by a claim whose lease is still ahead of the supplied time.
+    pub leased: usize,
+    /// A result row came back.
+    pub done: usize,
+    /// Failure rows reached the job's attempt ceiling.
+    pub failed: usize,
+    /// Called off before a result came back.
+    pub cancelled: usize,
+    /// No job row exists for this id.
+    pub unknown: usize,
+}
+
+impl JobStateCounts {
+    /// How many ids these buckets account for -- always the length of the
+    /// batch they were computed from.
+    pub const fn total(&self) -> usize {
+        self.pending + self.leased + self.done + self.failed + self.cancelled + self.unknown
+    }
+
+    fn record(&mut self, state: &JobState) {
+        match state {
+            JobState::Pending => self.pending += 1,
+            JobState::Leased { .. } => self.leased += 1,
+            JobState::Done => self.done += 1,
+            JobState::Failed => self.failed += 1,
+            JobState::Cancelled => self.cancelled += 1,
+        }
+    }
+}
+
 /// The read-back form of a submitted job.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobSnapshot {
@@ -718,6 +787,21 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
         }
         db.execute(create, &HashMap::new())?;
     }
+    // The two tables that keep several rows per job need `job_id` reachable
+    // without a walk. A store created before these indexes existed gains them
+    // the first time its ledger is opened -- an upgraded root must not go on
+    // paying the size of the whole ledger to answer a question about a handful
+    // of jobs. Keyed off the index the store already carries, so this stays
+    // idempotent exactly like the table creation above.
+    for (table, index, create) in WORK_LEDGER_JOB_ID_INDEXES {
+        let Some(meta) = db.table_meta(table) else {
+            continue;
+        };
+        if meta.indexes.iter().any(|declared| declared.name == index) {
+            continue;
+        }
+        db.execute(create, &HashMap::new())?;
+    }
     // A root created BEFORE `work_capabilities` declared its own HISTORY /
     // SYNC CONFLICT clauses (this installer is idempotent-by-absence, so an
     // existing table is never re-created) would otherwise silently lose
@@ -967,13 +1051,64 @@ pub fn submit_job<I: AsRef<[u8]>>(db: &Database, spec: &JobSpec, inputs: &[I]) -
     }
 }
 
+/// Read rows and report what reading them cost, in rows the engine had to
+/// look at. Every ledger read goes through here, so a caller that wants the
+/// price of a question can add up the answers.
+fn select_rows_with_work(
+    db: &Database,
+    sql: &str,
+    params: &HashMap<String, Value>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>, u64)> {
+    let result = db.execute(sql, params)?;
+    Ok((result.columns, result.rows, result.trace.rows_examined))
+}
+
 fn select_rows(
     db: &Database,
     sql: &str,
     params: &HashMap<String, Value>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    let result = db.execute(sql, params)?;
-    Ok((result.columns, result.rows))
+    let (columns, rows, _work) = select_rows_with_work(db, sql, params)?;
+    Ok((columns, rows))
+}
+
+/// How many ids one keyed read carries. A batch larger than this is split
+/// into several reads rather than one statement of unbounded width; each read
+/// still touches only rows belonging to the ids it names.
+const KEYED_LOOKUP_WIDTH: usize = 128;
+
+/// Read `columns` from `table` for exactly the jobs in `job_ids`, handing each
+/// read's rows to `visit` as they arrive, and adding what the reads cost to
+/// `work`. The `job_id` column is what every one of these tables is keyed or
+/// indexed by, so the rows looked at belong to the ids handed in.
+fn read_rows_for_jobs(
+    db: &Database,
+    columns: &str,
+    table: &str,
+    job_ids: &[&str],
+    work: &mut LedgerWork,
+    mut visit: impl FnMut(&[String], &[Vec<Value>]) -> Result<()>,
+) -> Result<()> {
+    for chunk in job_ids.chunks(KEYED_LOOKUP_WIDTH) {
+        let mut params = HashMap::with_capacity(chunk.len());
+        let mut placeholders = String::new();
+        for (position, job_id) in chunk.iter().enumerate() {
+            if position > 0 {
+                placeholders.push_str(", ");
+            }
+            let name = format!("job_id_{position}");
+            placeholders.push('$');
+            placeholders.push_str(&name);
+            params.insert(name, text(job_id));
+        }
+        let sql = format!("SELECT {columns} FROM {table} WHERE job_id IN ({placeholders})");
+        let (columns, rows, examined) = select_rows_with_work(db, &sql, &params)?;
+        work.rows_examined = work.rows_examined.saturating_add(examined);
+        if !rows.is_empty() {
+            visit(&columns, &rows)?;
+        }
+    }
+    Ok(())
 }
 
 fn job_row(db: &Database, job_id: &str) -> Result<Option<JobSnapshot>> {
@@ -987,39 +1122,44 @@ fn job_row(db: &Database, job_id: &str) -> Result<Option<JobSnapshot>> {
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    let snapshot = JobSnapshot {
-        job_id: text_at(row, column_index(&columns, "job_id")?, "job_id")?,
-        work_class: text_at(row, column_index(&columns, "work_class")?, "work_class")?,
-        mode: text_at(row, column_index(&columns, "mode")?, "mode")?,
+    Ok(Some(job_snapshot_from_row(&columns, row)?))
+}
+
+/// Read one submitted job out of a `work_jobs` row. One place, so a job read
+/// on its own and a job read as part of a batch are the same job.
+fn job_snapshot_from_row(columns: &[String], row: &[Value]) -> Result<JobSnapshot> {
+    Ok(JobSnapshot {
+        job_id: text_at(row, column_index(columns, "job_id")?, "job_id")?,
+        work_class: text_at(row, column_index(columns, "work_class")?, "work_class")?,
+        mode: text_at(row, column_index(columns, "mode")?, "mode")?,
         requirement_tags: string_list(
             &json_at(
                 row,
-                column_index(&columns, "requirement_tags")?,
+                column_index(columns, "requirement_tags")?,
                 "requirement_tags",
             )?,
             "requirement_tags",
         )?,
         input_refs: input_refs_from_json(&json_at(
             row,
-            column_index(&columns, "input_refs")?,
+            column_index(columns, "input_refs")?,
             "input_refs",
         )?)?,
         output_schema: opt_text_at(
             row,
-            column_index(&columns, "output_schema")?,
+            column_index(columns, "output_schema")?,
             "output_schema",
         )?,
-        priority: int_at(row, column_index(&columns, "priority")?, "priority")?,
-        deadline_ms: opt_int_at(row, column_index(&columns, "deadline")?, "deadline")?,
-        max_attempts: int_at(row, column_index(&columns, "max_attempts")?, "max_attempts")?,
+        priority: int_at(row, column_index(columns, "priority")?, "priority")?,
+        deadline_ms: opt_int_at(row, column_index(columns, "deadline")?, "deadline")?,
+        max_attempts: int_at(row, column_index(columns, "max_attempts")?, "max_attempts")?,
         submitter_node_id: text_at(
             row,
-            column_index(&columns, "submitter_node_id")?,
+            column_index(columns, "submitter_node_id")?,
             "submitter_node_id",
         )?,
-        submitted_at_ms: int_at(row, column_index(&columns, "submitted_at")?, "submitted_at")?,
-    };
-    Ok(Some(snapshot))
+        submitted_at_ms: int_at(row, column_index(columns, "submitted_at")?, "submitted_at")?,
+    })
 }
 
 /// Read back one job's submitted form.
@@ -1027,6 +1167,7 @@ pub fn job_snapshot(db: &Database, job_id: &str) -> Result<Option<JobSnapshot>> 
     job_row(db, job_id)
 }
 
+#[derive(Clone)]
 struct ClaimRow {
     attempt: i64,
     node_id: String,
@@ -1080,6 +1221,17 @@ fn cancellation_exists(db: &Database, job_id: &str) -> Result<bool> {
     Ok(!rows.is_empty())
 }
 
+fn result_exists(db: &Database, job_id: &str) -> Result<bool> {
+    let mut params = HashMap::new();
+    params.insert("job_id".to_string(), text(job_id));
+    let (_, rows) = select_rows(
+        db,
+        "SELECT job_id FROM work_results WHERE job_id = $job_id",
+        &params,
+    )?;
+    Ok(!rows.is_empty())
+}
+
 /// Compute a job's state from its rows. `now_ms` is supplied by the caller —
 /// lease expiry is advisory wall-clock, never engine-trusted time.
 ///
@@ -1088,24 +1240,100 @@ fn cancellation_exists(db: &Database, job_id: &str) -> Result<bool> {
 /// attempt ceiling mean failed; a live claim on the highest attempt means
 /// leased; otherwise pending. This function reads jobs, claims, results,
 /// failures, and cancellations — never `work_inputs` — so input retention
-/// provably cannot change any computed state.
+/// provably cannot change any computed state. Every one of those reads is a
+/// keyed lookup of the one job asked about: `job_id` is the primary key of the
+/// tables that keep a single row per job, and a declared index on the two that
+/// keep a row per attempt, so asking about one job never costs a walk of the
+/// whole ledger. The reads stop at the first rule that settles the job.
 pub fn job_state(db: &Database, job_id: &str, now_ms: i64) -> Result<JobState> {
     let Some(job) = job_row(db, job_id)? else {
         return Err(Error::NotFound(format!("work ledger job {job_id}")));
     };
-    if job_result(db, job_id)?.is_some() {
+    let mut rows = LedgerJobRows { db, job_id };
+    state_of_job(&job, &mut rows, now_ms)
+}
+
+/// A job's state rows, however they were fetched.
+///
+/// The derivation below asks these questions in precedence order and stops at
+/// the first answer that settles the job, so a single-job answer never reads
+/// more of the ledger than the question needs. A batch answers the same
+/// questions from rows it read once for the whole batch.
+trait JobStateRows {
+    fn result_recorded(&mut self) -> Result<bool>;
+    fn cancellation_recorded(&mut self) -> Result<bool>;
+    fn failed_attempts(&mut self) -> Result<Vec<i64>>;
+    fn claims(&mut self) -> Result<Vec<ClaimRow>>;
+}
+
+/// One job's rows, read from the ledger only as the derivation asks for them.
+struct LedgerJobRows<'a> {
+    db: &'a Database,
+    job_id: &'a str,
+}
+
+impl JobStateRows for LedgerJobRows<'_> {
+    fn result_recorded(&mut self) -> Result<bool> {
+        result_exists(self.db, self.job_id)
+    }
+
+    fn cancellation_recorded(&mut self) -> Result<bool> {
+        cancellation_exists(self.db, self.job_id)
+    }
+
+    fn failed_attempts(&mut self) -> Result<Vec<i64>> {
+        failure_attempts(self.db, self.job_id)
+    }
+
+    fn claims(&mut self) -> Result<Vec<ClaimRow>> {
+        claim_rows(self.db, self.job_id)
+    }
+}
+
+/// One job's rows, picked out of a batch that was read table by table.
+struct BatchedJobRows<'a> {
+    job_id: &'a str,
+    results: &'a HashSet<String>,
+    cancellations: &'a HashSet<String>,
+    failures: &'a HashMap<String, Vec<i64>>,
+    claims: &'a HashMap<String, Vec<ClaimRow>>,
+}
+
+impl JobStateRows for BatchedJobRows<'_> {
+    fn result_recorded(&mut self) -> Result<bool> {
+        Ok(self.results.contains(self.job_id))
+    }
+
+    fn cancellation_recorded(&mut self) -> Result<bool> {
+        Ok(self.cancellations.contains(self.job_id))
+    }
+
+    fn failed_attempts(&mut self) -> Result<Vec<i64>> {
+        Ok(self.failures.get(self.job_id).cloned().unwrap_or_default())
+    }
+
+    fn claims(&mut self) -> Result<Vec<ClaimRow>> {
+        Ok(self.claims.get(self.job_id).cloned().unwrap_or_default())
+    }
+}
+
+/// The one derivation, applied to a job whose row is already in hand. Both
+/// [`job_state`] and [`job_state_counts`] answer through this, so a single
+/// job and a batch of jobs can never disagree about what a job's rows mean.
+fn state_of_job(job: &JobSnapshot, rows: &mut dyn JobStateRows, now_ms: i64) -> Result<JobState> {
+    if rows.result_recorded()? {
         return Ok(JobState::Done);
     }
-    if cancellation_exists(db, job_id)? {
+    if rows.cancellation_recorded()? {
         return Ok(JobState::Cancelled);
     }
-    let failures = failure_attempts(db, job_id)?;
+    let failures = rows.failed_attempts()?;
     if (failures.len() as i64) >= job.max_attempts {
         return Ok(JobState::Failed);
     }
-    let claims = claim_rows(db, job_id)?;
+    let claims = rows.claims()?;
     // A claim holds the lease only while its deadline is ahead AND its own
-    // attempt has no failure row — a recorded failure releases the lease
+    // attempt has no failure row -- a recorded failure releases the lease
     // immediately (the failure row is what makes the next attempt legal).
     if let Some(highest) = claims.iter().max_by_key(|c| c.attempt)
         && highest.lease_deadline_ms > now_ms
@@ -1118,6 +1346,172 @@ pub fn job_state(db: &Database, job_id: &str, now_ms: i64) -> Result<JobState> {
         });
     }
     Ok(JobState::Pending)
+}
+
+/// What answering a ledger question cost, in rows the engine had to look at.
+///
+/// This is the figure a caller uses to hold the ledger to its own promise:
+/// the price of a question about a fixed set of jobs is set by that set, not
+/// by how much unrelated work the ledger happens to be holding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LedgerWork {
+    /// Rows the engine looked at across every read the answer needed.
+    pub rows_examined: u64,
+}
+
+/// How the jobs in `job_ids` stand right now, as counts per state.
+///
+/// This is [`job_state`] over a batch: every id is decided by the same
+/// derivation, in the same precedence order, from the same rows, so the
+/// counts always agree with asking about each id one at a time. `now_ms` is
+/// supplied by the caller for the same reason -- lease expiry is advisory
+/// wall-clock, never engine-trusted time.
+///
+/// **The work is bounded by the batch, not by the ledger.** Each ledger table
+/// is read once for the whole batch, keyed by the ids handed in: `job_id` is
+/// the primary key of the tables that keep one row per job and a declared
+/// index on the two that keep one row per attempt, so no ledger table is
+/// walked end to end. A caller asking about ten jobs pays for ten jobs whether
+/// the ledger holds a dozen rows or millions, which is what makes this the
+/// right call to make from a hot loop tracking a fixed set of jobs. Use
+/// [`job_state_counts_with_work`] to hear what an answer actually cost.
+///
+/// An id with no job row is counted in `unknown` rather than refused, so one
+/// forgotten or pruned id does not cost the caller the whole batch's answer.
+/// The buckets sum to `job_ids.len()`.
+pub fn job_state_counts(
+    db: &Database,
+    job_ids: &[impl AsRef<str>],
+    now_ms: i64,
+) -> Result<JobStateCounts> {
+    let (counts, _work) = job_state_counts_with_work(db, job_ids, now_ms)?;
+    Ok(counts)
+}
+
+/// [`job_state_counts`], plus what answering it cost.
+///
+/// Same counts, same derivation; the second half of the answer is the price
+/// the ledger paid to produce it, so a caller can hold the boundedness promise
+/// above to account rather than to trust.
+pub fn job_state_counts_with_work(
+    db: &Database,
+    job_ids: &[impl AsRef<str>],
+    now_ms: i64,
+) -> Result<(JobStateCounts, LedgerWork)> {
+    let mut counts = JobStateCounts::default();
+    let mut work = LedgerWork::default();
+    if job_ids.is_empty() {
+        return Ok((counts, work));
+    }
+
+    let mut wanted: Vec<&str> = job_ids.iter().map(AsRef::as_ref).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+
+    let mut jobs: HashMap<String, JobSnapshot> = HashMap::new();
+    read_rows_for_jobs(db, "*", "work_jobs", &wanted, &mut work, |columns, rows| {
+        for row in rows {
+            let snapshot = job_snapshot_from_row(columns, row)?;
+            jobs.insert(snapshot.job_id.clone(), snapshot);
+        }
+        Ok(())
+    })?;
+
+    let mut results: HashSet<String> = HashSet::new();
+    read_rows_for_jobs(
+        db,
+        "job_id",
+        "work_results",
+        &wanted,
+        &mut work,
+        |columns, rows| {
+            let id_idx = column_index(columns, "job_id")?;
+            for row in rows {
+                results.insert(text_at(row, id_idx, "job_id")?);
+            }
+            Ok(())
+        },
+    )?;
+
+    let mut cancellations: HashSet<String> = HashSet::new();
+    read_rows_for_jobs(
+        db,
+        "job_id",
+        "work_cancellations",
+        &wanted,
+        &mut work,
+        |columns, rows| {
+            let id_idx = column_index(columns, "job_id")?;
+            for row in rows {
+                cancellations.insert(text_at(row, id_idx, "job_id")?);
+            }
+            Ok(())
+        },
+    )?;
+
+    let mut failures: HashMap<String, Vec<i64>> = HashMap::new();
+    read_rows_for_jobs(
+        db,
+        "job_id, attempt",
+        "work_failures",
+        &wanted,
+        &mut work,
+        |columns, rows| {
+            let id_idx = column_index(columns, "job_id")?;
+            let attempt_idx = column_index(columns, "attempt")?;
+            for row in rows {
+                failures
+                    .entry(text_at(row, id_idx, "job_id")?)
+                    .or_default()
+                    .push(int_at(row, attempt_idx, "attempt")?);
+            }
+            Ok(())
+        },
+    )?;
+
+    let mut claims: HashMap<String, Vec<ClaimRow>> = HashMap::new();
+    read_rows_for_jobs(
+        db,
+        "job_id, attempt, node_id, lease_deadline",
+        "work_claims",
+        &wanted,
+        &mut work,
+        |columns, rows| {
+            let id_idx = column_index(columns, "job_id")?;
+            let attempt_idx = column_index(columns, "attempt")?;
+            let node_idx = column_index(columns, "node_id")?;
+            let lease_idx = column_index(columns, "lease_deadline")?;
+            for row in rows {
+                claims
+                    .entry(text_at(row, id_idx, "job_id")?)
+                    .or_default()
+                    .push(ClaimRow {
+                        attempt: int_at(row, attempt_idx, "attempt")?,
+                        node_id: text_at(row, node_idx, "node_id")?,
+                        lease_deadline_ms: int_at(row, lease_idx, "lease_deadline")?,
+                    });
+            }
+            Ok(())
+        },
+    )?;
+
+    for job_id in job_ids {
+        let job_id = job_id.as_ref();
+        match jobs.get(job_id) {
+            Some(job) => {
+                let mut rows = BatchedJobRows {
+                    job_id,
+                    results: &results,
+                    cancellations: &cancellations,
+                    failures: &failures,
+                    claims: &claims,
+                };
+                counts.record(&state_of_job(job, &mut rows, now_ms)?);
+            }
+            None => counts.unknown += 1,
+        }
+    }
+    Ok((counts, work))
 }
 
 /// The jobs `node_id` may claim right now: state pending, every requirement

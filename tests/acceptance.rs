@@ -108,6 +108,8 @@ mod query_surface;
 mod schema_evolution;
 #[path = "acceptance/schema_lifecycle.rs"]
 mod schema_lifecycle;
+#[path = "acceptance/server_owner_reads.rs"]
+mod server_owner_reads;
 #[path = "acceptance/single_pk_concurrent_update.rs"]
 mod single_pk_concurrent_update;
 #[path = "acceptance/snapshot_read_stability.rs"]

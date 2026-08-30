@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 /// (inline `&'static str` templates, never `kind.to_string()`). The RED stub
 /// commit intentionally allocates in this `Display` impl so the allocator probe
 /// fails until the implementation commit replaces it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CallbackKind {
     Trigger,
     Cron,
@@ -75,9 +75,26 @@ fn acl_denied_display(table: &str, row_id: &RowId, principal: &Principal) -> Str
     )
 }
 
+/// The engine's own answers.
+///
+/// This vocabulary is the engine's, and it is free to grow and be reordered:
+/// no wire carries it. A caller reading over the local owner channel is still
+/// entitled to the same answer an in-process call would have produced, but
+/// that entitlement is met by the read channel's own error document, which
+/// names each class a read can return under a tag written down in its own
+/// source. Adding, reordering, or reshaping a variant here cannot move a byte
+/// a reader parses.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("bounded read session is not implemented")]
+    ReadSessionNotImplemented,
+    #[error("owner reads did not drain before shutdown deadline")]
+    OwnerReadDrainTimeout,
+    #[error("read operation was cancelled")]
+    ReadCancelled,
+    #[error("{0}")]
+    ReadFailure(crate::read_contract::ReadFailure),
     #[error("table not found: {0}")]
     TableNotFound(String),
     #[error("{0} are immutable")]
@@ -184,8 +201,16 @@ pub enum Error {
         found_format_marker: String,
         expected_release: String,
     },
-    #[error("corrupt vector store at {path}: {reason}")]
+    #[error("corrupt store at {path}: {reason}")]
     StoreCorrupted { path: String, reason: String },
+    #[error(
+        "no store at {path}: this open was asked to change a store that already exists, so it created nothing — point it at an existing store, or open it with the creating disposition if a new one is wanted"
+    )]
+    StoreMissing { path: String },
+    #[error(
+        "the store's identity could not be proven, so its fingerprint identifies nothing: more than one name resolves to the file at {path}"
+    )]
+    StoreIdentityUnprovable { path: String },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("transaction not found: {0}")]
@@ -301,8 +326,8 @@ pub enum Error {
     ColumnTypeMismatch {
         table: String,
         column: String,
-        expected: &'static str,
-        actual: &'static str,
+        expected: String,
+        actual: String,
     },
     #[error("tx id out of range: {table}.{column} value {value} exceeds max {max}")]
     TxIdOutOfRange {
@@ -386,7 +411,7 @@ pub enum Error {
     )]
     SyncTriggerEffectNotAllowed {
         trigger_name: String,
-        effect: &'static str,
+        effect: String,
     },
     #[error("trigger operation requires an admin database handle: {operation}")]
     TriggerRequiresAdmin { operation: String },
@@ -402,10 +427,11 @@ pub enum Error {
     /// Canonical callback contract: same-DB trigger Class B waits and
     /// proceeds; unrelated DBs are independent; Class A callback-thread reentry
     /// returns [`Error::CallbackReentry`]; cron same-DB Class B returns this
-    /// typed error immediately; if a same-DB trigger wait exceeds
-    /// `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` (default 60 seconds, no enforced
-    /// minimum), the engine returns this typed error and emits exactly one
-    /// `tracing::warn!` with `trigger_name`, `waited_ms`, and `surface`.
+    /// typed error immediately; if a same-DB trigger wait exceeds the engine's
+    /// deadlock-guard deadline of 60 seconds -- a fixed deadline no
+    /// environment name can move -- the engine returns this typed error and
+    /// emits exactly one `tracing::warn!` with `trigger_name`, `waited_ms`,
+    /// and `surface`.
     ///
     /// Greppable cross-process substring (sync-wire, log scrapers): the Display
     /// string contains `"callback active on another thread"` for both kinds.
@@ -469,6 +495,18 @@ pub enum Error {
     StoreHandleRecycleFailed { path: String, reason: String },
     #[error("{0}")]
     Other(String),
+}
+
+impl Error {
+    pub const fn owner_read_drain_timeout() -> Self {
+        Self::OwnerReadDrainTimeout
+    }
+}
+
+impl From<crate::read_contract::ReadFailure> for Error {
+    fn from(failure: crate::read_contract::ReadFailure) -> Self {
+        Self::ReadFailure(failure)
+    }
 }
 
 fn drop_blocked_rank_policy_display(

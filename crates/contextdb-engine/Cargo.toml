@@ -13,7 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-test-seams = ["contextdb-vector/test-seams"]
+in-process-test-seams = []
+test-seams = ["in-process-test-seams", "contextdb-vector/test-seams"]
 # Build-only validation facility used by the installed release smoke. It keeps
 # the real Iroh path and exposes only two fixed crash checkpoints; it does not
 # enable the broader test seam.
@@ -83,8 +84,14 @@ getrandom = "0.3"
 # LAN-local address lookup for `lookup=mdns`; enabled only by `mdns` above.
 iroh-mdns-address-lookup = { version = "0.4", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# Local owner-channel peer identity uses the audited Linux/macOS APIs supplied
+# by nix.  It stays outside the default Windows build and does not imply an
+# async runtime dependency.
+nix = { version = "0.30.1", features = ["fs", "mount", "poll", "socket", "user"] }
+
 [dev-dependencies]
-contextdb-server = { path = "../contextdb-server", features = ["test-seams"] }
+contextdb-server = { path = "../contextdb-server", features = ["in-process-test-seams"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 num_cpus = "1.16"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -92,6 +99,8 @@ regex = "1"
 tracing-subscriber = "0.3"
 serial_test = "3"
 syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
+toml = "0.8"
 
 [[test]]
 name = "integration"
@@ -100,6 +109,136 @@ path = "../../tests/integration.rs"
 [[test]]
 name = "acceptance"
 path = "../../tests/acceptance.rs"
+
+# Read-surface integration proofs intentionally use crate-hidden observation
+# seams. Listing them explicitly prevents those seams from being unified into
+# ordinary library tests, where the no-feature direct-reader journey runs.
+[[test]]
+name = "bounded_pull_execution_contract"
+path = "tests/bounded_pull_execution_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "database_open_options_contract"
+path = "tests/database_open_options_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "direct_file_reader_contract_tests"
+path = "tests/direct_file_reader_contract_tests.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "local_transport_address"
+path = "tests/local_transport_address.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "local_transport_authentication"
+path = "tests/local_transport_authentication.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "local_transport_containment"
+path = "tests/local_transport_containment.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "local_transport_deadlines"
+path = "tests/local_transport_deadlines.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "local_transport_framing"
+path = "tests/local_transport_framing.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "local_transport_protocol"
+path = "tests/local_transport_protocol.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "local_transport_runtime"
+path = "tests/local_transport_runtime.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "local_transport_stale"
+path = "tests/local_transport_stale.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "local_transport_wire_values"
+path = "tests/local_transport_wire_values.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "owner_read_admission_contract"
+path = "tests/owner_read_admission_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "owner_read_client_contract"
+path = "tests/owner_read_client_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "owner_read_lifecycle_contract"
+path = "tests/owner_read_lifecycle_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "owner_read_service_contract"
+path = "tests/owner_read_service_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "read_contract_encoding"
+path = "tests/read_contract_encoding.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "read_persistence_coordination_contract_tests"
+path = "tests/read_persistence_coordination_contract_tests.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "read_session_application_contract"
+path = "tests/read_session_application_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "read_session_route_contract"
+path = "tests/read_session_route_contract.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "server_resource_policy_contract_tests"
+path = "tests/server_resource_policy_contract_tests.rs"
+required-features = ["test-seams"]
+
+# The SQL surface suite drives the raw sync-apply primitive
+# (`Database::apply_changes` and the `ConflictPolicies` it takes), which the
+# default build keeps crate-private and only the test seam opens. Declaring
+# that here is what makes `cargo test -p contextdb-engine --test sql_tests`
+# buildable on its own: without it the target is compiled with default
+# features and dies on three private-item errors, and the suite only ever ran
+# because a workspace build happens to unify the seam in from another crate.
+[[test]]
+name = "sql_tests"
+path = "tests/sql_tests.rs"
+required-features = ["test-seams"]
+
+# The local-CREATE-TABLE wall drives the same raw sync-apply primitive so its
+# control can prove the ARRIVING-DDL adopt path is untouched by the local
+# refusal. `Database::apply_changes` and the `ConflictPolicies` it takes are
+# crate-private in a default build, so declare the seam here for the same
+# reason `sql_tests` declares it.
+[[test]]
+name = "a_local_create_table_never_replaces_an_existing_table"
+path = "tests/a_local_create_table_never_replaces_an_existing_table.rs"
+required-features = ["test-seams"]
 
 [[bench]]
 name = "engine_throughput"

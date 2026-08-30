@@ -83,6 +83,7 @@ fn cli(path: &std::path::Path, hub: &RunningHub, tenant: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     command
         .arg(path)
+        .arg("--write")
         .arg("--json")
         .args(["--sync-endpoint", &hub.ticket])
         .args(["--tenant-id", tenant]);
@@ -111,11 +112,13 @@ fn run(mut command: Command, input: &str) -> (Option<i32>, String, String) {
 }
 
 fn row_count(stdout: &str) -> Option<i64> {
+    // A successful ordinary SELECT is one namespaced result document carrying
+    // its rows, not a bare array.
     stdout
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| v.as_array().cloned())
+        .filter_map(|document| document.get("result")?.get("rows")?.as_array().cloned())
         .flatten()
         .find_map(|row| row.get("n").and_then(|n| n.as_i64()))
 }

@@ -323,7 +323,7 @@ pub(super) enum StageOutcome {
     },
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StageSnapshot {
     pub subject: String,
@@ -334,7 +334,7 @@ pub(super) struct StageSnapshot {
     pub fragments: Vec<StagedFragmentSnapshot>,
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StagedFragmentSnapshot {
     pub sequence: u32,
@@ -494,7 +494,7 @@ fn remove_completed_stage_at_root(
     parent.remove_held_tree_child(&leaf, stage, "completed oversized request stage")
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(super) fn snapshot_stage(
     stage_root: &Path,
     authenticated_node_id: &str,
@@ -597,7 +597,7 @@ pub(super) fn snapshot_stage(
 /// Return read-only snapshots for every persisted oversized request under this
 /// endpoint's private staging root. This is test-only observability: it never
 /// exposes a stage path or changes staged media.
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 pub(super) fn snapshot_all_stages(stage_root: &Path) -> TransportResult<Vec<StageSnapshot>> {
     let mut snapshots = Vec::new();
     let Some(root) = stage_root_dir_optional(stage_root)? else {
@@ -613,7 +613,7 @@ pub(super) fn snapshot_all_stages(stage_root: &Path) -> TransportResult<Vec<Stag
     Ok(snapshots)
 }
 
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 fn snapshot_all_stages_at(
     directory: &StageDir,
     depth: usize,
@@ -1939,7 +1939,7 @@ fn stage_dir_from_root(
     }
 }
 
-#[cfg(all(unix, feature = "test-seams"))]
+#[cfg(all(unix, any(test, feature = "test-seams")))]
 fn stage_dir_optional_from_root(
     root: &StageDir,
     root_path: &Path,

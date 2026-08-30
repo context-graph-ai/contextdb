@@ -23,7 +23,9 @@ fn run_cli_at(
     stdin_sql: &str,
 ) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
-    cmd.arg(db_path);
+    // The exit-code fixtures create and mutate a file-backed store, so they go
+    // through the invocation the contract makes responsible for creation.
+    cmd.arg(db_path).arg("--write");
     for a in extra_args {
         cmd.arg(a);
     }

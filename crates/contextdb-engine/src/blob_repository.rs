@@ -700,7 +700,11 @@ impl BlobPartialState {
 /// One engine-owned blob repository.
 #[doc(hidden)]
 pub struct BlobRepository {
-    persistence: Arc<RedbPersistence>,
+    /// Absent when the owning handle reads a committed image whose source
+    /// file is already closed. Media lives in the durable store, so an image
+    /// that outlives its file carries none, and every media operation says so
+    /// rather than inventing a store to hold it.
+    persistence: Option<Arc<RedbPersistence>>,
     ephemeral_dir: Option<Arc<tempfile::TempDir>>,
     fences: Arc<BlobHashFenceRegistry>,
     operation_gate: Arc<BlobRepositoryOperationGate>,
@@ -708,10 +712,34 @@ pub struct BlobRepository {
 }
 
 impl BlobRepository {
+    /// A repository for a handle that has no durable store to hold media.
+    pub fn absent() -> Arc<Self> {
+        Arc::new(Self {
+            persistence: None,
+            ephemeral_dir: None,
+            fences: Arc::new(BlobHashFenceRegistry::default()),
+            operation_gate: Arc::new(BlobRepositoryOperationGate::default()),
+            bounded_blob_bytes_read: AtomicU64::new(0),
+        })
+    }
+
+    /// The durable store behind this repository, or the refusal that says
+    /// this handle never had one.
+    fn store(&self) -> Result<&RedbPersistence> {
+        self.persistence.as_deref().ok_or_else(|| {
+            Error::Other(
+                "this handle reads a committed image whose source is released, so it holds no media repository"
+                    .to_string(),
+            )
+        })
+    }
+
     /// Attach blob tables to an existing file-backed database.
     pub fn shared(persistence: Arc<RedbPersistence>) -> Arc<Self> {
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_blob_repository_open();
         Arc::new(Self {
-            persistence,
+            persistence: Some(persistence),
             ephemeral_dir: None,
             fences: Arc::new(BlobHashFenceRegistry::default()),
             operation_gate: Arc::new(BlobRepositoryOperationGate::default()),
@@ -721,6 +749,8 @@ impl BlobRepository {
 
     /// Create a disk-bounded ephemeral repository for `Database::open_memory`.
     pub fn ephemeral() -> Result<Arc<Self>> {
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_blob_repository_open();
         let dir = Arc::new(
             tempfile::tempdir()
                 .map_err(|err| Error::Other(format!("create ephemeral blob repository: {err}")))?,
@@ -729,7 +759,7 @@ impl BlobRepository {
             &dir.path().join("contextdb-blobs.redb"),
         )?);
         Ok(Arc::new(Self {
-            persistence,
+            persistence: Some(persistence),
             ephemeral_dir: Some(dir),
             fences: Arc::new(BlobHashFenceRegistry::default()),
             operation_gate: Arc::new(BlobRepositoryOperationGate::default()),
@@ -762,7 +792,7 @@ impl BlobRepository {
     }
 
     fn generation_state_under_operation(&self, hash: &[u8; 32]) -> Result<BlobHashGenerationState> {
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let table = match read.open_table(HASH_GENERATIONS_TABLE) {
                 Ok(table) => table,
@@ -876,7 +906,7 @@ impl BlobRepository {
     pub fn delete_ordinary(self: &Arc<Self>, hash: [u8; 32], force: bool) -> Result<bool> {
         let hashes = BTreeSet::from([hash]);
         let guard = self.acquire_exclusive_sorted(&hashes)?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let mut state = {
                 let table = write
@@ -1031,7 +1061,7 @@ impl BlobRepository {
         staging.provisional_generation = Some((guard.hash, guard.generation));
         staging.adapter_state = adapter_state;
         let bytes = encode(&staging)?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             {
                 let mut table = write
@@ -1056,7 +1086,7 @@ impl BlobRepository {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let table = match read.open_table(IMPORT_STAGING_TABLE) {
                 Ok(table) => table,
@@ -1093,7 +1123,7 @@ impl BlobRepository {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let table = match read.open_table(IMPORT_STAGING_TABLE) {
                 Ok(table) => table,
@@ -1136,7 +1166,7 @@ impl BlobRepository {
                 "provisional staging reclaim lost its exclusive hash fence".to_string(),
             ));
         }
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let staging = {
                 let table = write
@@ -1178,7 +1208,7 @@ impl BlobRepository {
                     .to_string(),
             ));
         }
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let staging = {
                 let table = write
@@ -1262,7 +1292,7 @@ impl BlobRepository {
                 "blob staging fragment is outside its declared logical block".to_string(),
             ));
         }
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let mut staging = {
                 let table = write
@@ -1366,7 +1396,7 @@ impl BlobRepository {
                 "blob staging value exceeds its logical block bound".to_string(),
             ));
         }
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let mut staging = {
                 let table = write
@@ -1462,7 +1492,7 @@ impl BlobRepository {
             RefusedByPurge,
             StaleGeneration,
         }
-        let outcome = self.persistence.with_db(|db| {
+        let outcome = self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let staging = {
                 let table = write
@@ -1802,7 +1832,7 @@ impl BlobRepository {
     /// Synchronously remove every unbound staging role.
     pub fn discard_staging(&self, object_id: [u8; 16]) -> Result<()> {
         let _operation = self.begin_operation()?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let staging = {
                 let table = write
@@ -1842,7 +1872,7 @@ impl BlobRepository {
             ));
         }
 
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let table_names = read
                 .list_tables()
@@ -2178,7 +2208,7 @@ impl BlobRepository {
         let mut reverse_key = manifest_key.to_vec();
         reverse_key.extend_from_slice(&tag.name);
 
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let mut generation_state = {
                 let table = write
@@ -2265,7 +2295,7 @@ impl BlobRepository {
     #[doc(hidden)]
     pub fn authoritative_purge_roles_for_test(&self, hash: &[u8; 32]) -> Result<BTreeSet<String>> {
         let _operation = self.begin_operation()?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let mut roles = BTreeSet::new();
             if let Ok(generations) = read.open_table(HASH_GENERATIONS_TABLE)
@@ -2367,7 +2397,7 @@ impl BlobRepository {
             return Ok(None);
         }
         let guard = self.begin_shared_generation(*hash)?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let generations = read
                 .open_table(HASH_GENERATIONS_TABLE)
@@ -2428,7 +2458,7 @@ impl BlobRepository {
             return Ok(None);
         }
         let guard = self.begin_shared_generation(*hash)?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let key = Self::manifest_key(hash, guard.generation());
             let manifests = read
@@ -2515,7 +2545,7 @@ impl BlobRepository {
             return Ok(None);
         }
         let guard = self.begin_shared_generation(hash)?;
-        let (manifest, partial) = self.persistence.with_db(|db| {
+        let (manifest, partial) = self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let key = Self::manifest_key(&hash, guard.generation());
             let manifests = read
@@ -2587,7 +2617,7 @@ impl BlobRepository {
         } else {
             PAYLOAD_CHUNKS_TABLE
         };
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let generations = read
                 .open_table(HASH_GENERATIONS_TABLE)
@@ -2652,7 +2682,7 @@ impl BlobRepository {
             )));
         }
         let _operation = self.begin_operation()?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let table = match read.open_table(TAGS_BY_NAME_TABLE) {
                 Ok(table) => table,
@@ -2686,7 +2716,7 @@ impl BlobRepository {
             )));
         }
         let _operation = self.begin_operation()?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let table = match read.open_table(HASH_GENERATIONS_TABLE) {
                 Ok(table) => table,
@@ -2719,7 +2749,7 @@ impl BlobRepository {
     /// Canonical addressability predicate used immediately before serving.
     pub fn has_tag_role(&self, hash: &[u8; 32], role: BlobTagRole) -> Result<bool> {
         let _operation = self.begin_operation()?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let generations = match read.open_table(HASH_GENERATIONS_TABLE) {
                 Ok(table) => table,
@@ -2761,7 +2791,7 @@ impl BlobRepository {
     #[cfg(any(test, feature = "test-seams"))]
     pub fn count_tag_role(&self, role: BlobTagRole) -> Result<u64> {
         let _operation = self.begin_operation()?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let table = match read.open_table(TAGS_BY_NAME_TABLE) {
                 Ok(table) => table,
@@ -2794,7 +2824,7 @@ impl BlobRepository {
             hashes.insert(previous.hash);
         }
         let guard = self.begin_shared_generation_set(&hashes)?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let current_previous = {
                 let by_name = write
@@ -2857,7 +2887,7 @@ impl BlobRepository {
         let mut cursor = from.map(ToOwned::to_owned);
         let mut deleted = 0u64;
         loop {
-            let victims = self.persistence.with_db(|db| {
+            let victims = self.store()?.with_db(|db| {
                 let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
                 let table = match read.open_table(TAGS_BY_NAME_TABLE) {
                     Ok(table) => table,
@@ -2884,7 +2914,7 @@ impl BlobRepository {
             }
             let hashes = victims.iter().map(|record| record.hash).collect();
             let guard = self.begin_shared_generation_set(&hashes)?;
-            self.persistence.with_db(|db| {
+            self.store()?.with_db(|db| {
                 let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
                 for record in &victims {
                     if guard.generation(&record.hash) != Some(record.generation) {
@@ -2939,7 +2969,7 @@ impl BlobRepository {
             .tag_by_name(from)?
             .ok_or_else(|| Error::Other("blob tag does not exist".to_string()))?;
         let guard = self.begin_shared_generation_set(&BTreeSet::from([record.hash]))?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
             let current = {
                 let by_name = write
@@ -3007,7 +3037,7 @@ impl BlobRepository {
 
     fn tag_by_name(&self, name: &[u8]) -> Result<Option<BlobTagRecord>> {
         let _operation = self.begin_operation()?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             let table = match read.open_table(TAGS_BY_NAME_TABLE) {
                 Ok(table) => table,
@@ -3026,7 +3056,7 @@ impl BlobRepository {
     /// later purge commits, and does not hold the database commit mutex.
     pub fn begin_export_snapshot(&self) -> Result<BlobExportSnapshot> {
         let operation = self.begin_operation()?;
-        self.persistence.with_db(|db| {
+        self.store()?.with_db(|db| {
             let read = db.begin_read().map_err(RedbPersistence::storage_error)?;
             Ok(BlobExportSnapshot {
                 read,
@@ -3042,8 +3072,10 @@ impl BlobRepository {
             return;
         }
         self.fences.close();
-        if self.ephemeral_dir.is_some() {
-            self.persistence.close();
+        if self.ephemeral_dir.is_some()
+            && let Some(persistence) = self.persistence.as_ref()
+        {
+            persistence.close();
         }
         self.operation_gate.finish_close();
     }

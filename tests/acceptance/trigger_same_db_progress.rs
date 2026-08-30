@@ -27,9 +27,11 @@ type LabeledQueryResults = Arc<Mutex<Vec<(&'static str, Result<QueryResult>)>>>;
 type LabeledUnitResults = Arc<Mutex<Vec<(&'static str, Result<()>)>>>;
 
 // RAII guard that removes a process-wide env var on drop, ensuring cleanup on
-// panic or normal exit. Used by t30_17 + the surface-named siblings (t30_17_commit
-// / _rollback / _apply_changes / _close) that override
-// `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` for their bounded-budget assertion.
+// panic or normal exit. Used by the C8 journey, which exports
+// `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` precisely to prove that exporting it
+// changes nothing. The deadlock-guard journeys state their deadline through the
+// handle's private seam instead, because the environment is not a behavior
+// surface.
 pub(crate) struct EnvGuard(pub &'static str);
 impl Drop for EnvGuard {
     fn drop(&mut self) {
@@ -131,6 +133,10 @@ impl DatabasePlugin for ParkAutocommitOnQueryPlugin {
 }
 
 // ---------- Shared helpers ----------
+
+// The deadline the deadlock-guard journeys wait before the typed cross-thread
+// error is due. Stated to each handle under test through the private seam.
+const GUARD_DEADLINE: Duration = Duration::from_millis(2000);
 
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
@@ -2203,16 +2209,14 @@ fn t30_16d_sql_autocommit_dml_does_not_rewait_inside_outer_execute_operation() {
 fn t30_17_deadlock_guard_timeout_unhealthy_park_returns_typed_err_plus_one_warn_event() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
-    // SAFETY: 2024 edition requires unsafe for env mutation. EnvGuard ensures
-    // cleanup even if the test panics (see Stub 2 helper).
-    unsafe {
-        std::env::set_var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS", "2000");
-    }
-    let _env_guard = EnvGuard("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS");
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
         let parked_forever_done = Arc::new(Barrier::new(2));
         let db = Arc::new(Database::open_memory());
+        // The deadline this guard waits is stated to the handle under test,
+        // never exported into the process: the environment is not a behavior
+        // surface, so a shorter deadline is a private test seam.
+        db.set_trigger_deadlock_timeout_for_test(GUARD_DEADLINE);
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
             .unwrap();
         db.execute("CREATE TRIGGER probe_trigger ON t WHEN INSERT", &empty())
@@ -2309,6 +2313,96 @@ fn t30_17_deadlock_guard_timeout_unhealthy_park_returns_typed_err_plus_one_warn_
     .expect("t30_17 deadlocked");
 }
 
+// C8 — the environment is not a behavior surface. The CLI and the server read
+// exactly two environment names, both of them locations a process has to know
+// before it can open anything; every behavior name is gone. A deadline that
+// decides when a parked tx-control surface gives up is behavior, so exporting
+// `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` must change nothing at all — no
+// shorter wait, no earlier typed error, no different telemetry. A test that
+// needs a shorter deadline states it through the private seam instead.
+#[test]
+#[serial]
+fn c8_the_trigger_deadlock_environment_variable_changes_nothing() {
+    // A hundredth of the shipped deadline: if the environment could move it,
+    // the probe below would give up almost at once.
+    const EXPORTED_MS: &str = "50";
+    // Long enough that an environment-shortened deadline could not still be
+    // waiting, and far short of the shipped deadline that actually governs.
+    const OBSERVATION: Duration = Duration::from_secs(3);
+
+    // SAFETY: 2024 edition requires unsafe for env mutation. EnvGuard removes
+    // the name again on every exit, panic included.
+    unsafe {
+        std::env::set_var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS", EXPORTED_MS);
+    }
+    let _env_guard = EnvGuard("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS");
+    run_with_timeout(|| {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let db = Arc::new(Database::open_memory());
+        db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
+            .unwrap();
+        db.execute("CREATE TRIGGER probe_trigger ON t WHEN INSERT", &empty())
+            .unwrap();
+        let entered_cb = entered.clone();
+        let release_cb = release.clone();
+        db.register_trigger_callback("probe_trigger", move |_db, _ctx| {
+            entered_cb.wait();
+            release_cb.wait();
+            Ok(())
+        })
+        .unwrap();
+        db.complete_initialization().unwrap();
+
+        let fire = fire_trigger_in_thread(db.clone(), 0x30C8);
+        entered.wait();
+        let mut release_guard = BarrierReleaseGuard::armed(release.clone());
+
+        let (tell, heard) = mpsc::channel();
+        let probe_db = db.clone();
+        let probe = thread::spawn(move || {
+            let outcome = probe_db.begin();
+            let gave_up = outcome.is_err();
+            if let Ok(tx) = outcome {
+                let _ = probe_db.rollback(tx);
+            }
+            let _ = tell.send(gave_up);
+        });
+
+        let early = heard.recv_timeout(OBSERVATION);
+        let still_waiting = early.is_err();
+
+        release.wait();
+        release_guard.disarm();
+        fire.join().unwrap().unwrap();
+        let gave_up = match early {
+            Ok(gave_up) => gave_up,
+            Err(_) => heard
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the released probe reports how its wait ended"),
+        };
+        probe.join().unwrap();
+
+        assert!(
+            still_waiting,
+            "the exported deadline must not move the guard: the probe gave up inside \
+             {OBSERVATION:?} while the shipped deadline was still running"
+        );
+        assert!(
+            !gave_up,
+            "a probe released by the callback proceeds; it must not report the typed \
+             cross-thread error the guard raises on timeout"
+        );
+
+        let snap = db.trigger_progress_telemetry_snapshot_for_test();
+        assert_eq!(
+            snap.deadlock_guard_timeout_observed, 0,
+            "no deadline fired, so no timeout is recorded; snap={snap:?}"
+        );
+    })
+    .expect("c8 environment-inertness probe deadlocked");
+}
+
 // ============================================================================
 // Cross-surface deadlock-guard siblings: the `tracing::warn!` and structured-field
 // shape must engage on every public tx-control surface, not just begin(). FIX 14:
@@ -2322,14 +2416,14 @@ fn t30_17_deadlock_guard_timeout_unhealthy_park_returns_typed_err_plus_one_warn_
 fn t30_17_deadlock_guard_commit() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
-    unsafe {
-        std::env::set_var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS", "2000");
-    }
-    let _env_guard = EnvGuard("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS");
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
         let parked_forever_done = Arc::new(Barrier::new(2));
         let db = Arc::new(Database::open_memory());
+        // The deadline this guard waits is stated to the handle under test,
+        // never exported into the process: the environment is not a behavior
+        // surface, so a shorter deadline is a private test seam.
+        db.set_trigger_deadlock_timeout_for_test(GUARD_DEADLINE);
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
             .unwrap();
         db.execute("CREATE TRIGGER probe_trigger ON t WHEN INSERT", &empty())
@@ -2405,14 +2499,14 @@ fn t30_17_deadlock_guard_commit() {
 fn t30_17_deadlock_guard_rollback() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
-    unsafe {
-        std::env::set_var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS", "2000");
-    }
-    let _env_guard = EnvGuard("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS");
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
         let parked_forever_done = Arc::new(Barrier::new(2));
         let db = Arc::new(Database::open_memory());
+        // The deadline this guard waits is stated to the handle under test,
+        // never exported into the process: the environment is not a behavior
+        // surface, so a shorter deadline is a private test seam.
+        db.set_trigger_deadlock_timeout_for_test(GUARD_DEADLINE);
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
             .unwrap();
         db.execute("CREATE TRIGGER probe_trigger ON t WHEN INSERT", &empty())
@@ -2472,14 +2566,14 @@ fn t30_17_deadlock_guard_apply_changes() {
     use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy};
     t30_install_global_subscriber();
     t30_reset_warn_counters();
-    unsafe {
-        std::env::set_var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS", "2000");
-    }
-    let _env_guard = EnvGuard("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS");
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
         let parked_forever_done = Arc::new(Barrier::new(2));
         let db = Arc::new(Database::open_memory());
+        // The deadline this guard waits is stated to the handle under test,
+        // never exported into the process: the environment is not a behavior
+        // surface, so a shorter deadline is a private test seam.
+        db.set_trigger_deadlock_timeout_for_test(GUARD_DEADLINE);
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
             .unwrap();
         db.execute("CREATE TRIGGER probe_trigger ON t WHEN INSERT", &empty())
@@ -2540,14 +2634,14 @@ fn t30_17_deadlock_guard_apply_changes() {
 fn t30_17_deadlock_guard_close() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
-    unsafe {
-        std::env::set_var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS", "2000");
-    }
-    let _env_guard = EnvGuard("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS");
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
         let parked_forever_done = Arc::new(Barrier::new(2));
         let db = Arc::new(Database::open_memory());
+        // The deadline this guard waits is stated to the handle under test,
+        // never exported into the process: the environment is not a behavior
+        // surface, so a shorter deadline is a private test seam.
+        db.set_trigger_deadlock_timeout_for_test(GUARD_DEADLINE);
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
             .unwrap();
         db.execute("CREATE TRIGGER probe_trigger ON t WHEN INSERT", &empty())
@@ -3676,14 +3770,14 @@ fn t30_16_release() {
 fn t30_17_release() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
-    unsafe {
-        std::env::set_var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS", "2000");
-    }
-    let _env_guard = EnvGuard("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS");
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
         let parked_forever_done = Arc::new(Barrier::new(2));
         let db = Arc::new(Database::open_memory());
+        // The deadline this guard waits is stated to the handle under test,
+        // never exported into the process: the environment is not a behavior
+        // surface, so a shorter deadline is a private test seam.
+        db.set_trigger_deadlock_timeout_for_test(GUARD_DEADLINE);
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
             .unwrap();
         db.execute("CREATE TRIGGER probe_trigger ON t WHEN INSERT", &empty())

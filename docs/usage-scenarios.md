@@ -5,6 +5,8 @@
 For background on why these problems exist and how contextdb compares to alternatives, see [Why contextdb?](why-contextdb.md). To build and try these examples yourself, see [Getting Started](getting-started.md).
 
 > **Note:** Examples use `$param` parameter binding syntax, which works in the Rust API via `db.execute(sql, &params)`. The CLI REPL does not support parameter binding — use literal values directly when trying these interactively.
+>
+> Scenarios build on each other's schemas rather than redeclaring them. A block that needs a table an earlier scenario created says so immediately above it; run that block first, in the same store.
 
 ---
 
@@ -34,7 +36,7 @@ CREATE TABLE entities (
   name TEXT NOT NULL,
   entity_type TEXT NOT NULL,
   properties JSON
-)
+);
 
 -- Immutable observation log
 CREATE TABLE observations (
@@ -45,7 +47,7 @@ CREATE TABLE observations (
   source TEXT NOT NULL,
   embedding VECTOR(384),
   recorded_at TIMESTAMP DEFAULT NOW()
-) IMMUTABLE
+) IMMUTABLE;
 
 -- Graph edges connecting entities, decisions, observations
 CREATE TABLE edges (
@@ -53,7 +55,7 @@ CREATE TABLE edges (
   source_id UUID NOT NULL,
   target_id UUID NOT NULL,
   edge_type TEXT NOT NULL
-) DAG('DEPENDS_ON', 'BASED_ON')
+) DAG('DEPENDS_ON', 'BASED_ON');
 ```
 
 Insert an observation and link it to its entity:
@@ -107,8 +109,10 @@ CREATE TABLE decisions (
   entity_type TEXT,
   created_at TIMESTAMP,
   embedding VECTOR(384)
-) STATE MACHINE (status: draft -> [active, rejected], active -> [superseded, invalidated])
+) STATE MACHINE (status: draft -> [active, rejected], active -> [superseded, invalidated]);
 ```
+
+Against that `decisions` table, one composite index serves the whole access pattern:
 
 ```sql
 CREATE INDEX idx_decisions_by_ctx ON decisions (context_id, entity_type, created_at DESC, id DESC);
@@ -119,7 +123,10 @@ CREATE INDEX idx_decisions_by_ctx ON decisions (context_id, entity_type, created
 UPDATE decisions SET status = 'active' WHERE id = $id;
 
 -- Rejected by the database: draft -> superseded
-UPDATE decisions SET status = 'superseded' WHERE id = $id;
+-- ($other_draft_id is a second row still in `draft`; a `draft` row may only
+-- move to `active` or `rejected`. Reusing $id here would instead demonstrate
+-- the legal `active -> superseded` hop the line above just enabled.)
+UPDATE decisions SET status = 'superseded' WHERE id = $other_draft_id;
 -- Error: invalid state transition: draft -> superseded
 ```
 
@@ -140,7 +147,7 @@ CREATE TABLE intentions (
   id UUID PRIMARY KEY,
   goal TEXT NOT NULL,
   status TEXT NOT NULL
-) STATE MACHINE (status: active -> [archived, completed])
+) STATE MACHINE (status: active -> [archived, completed]);
 
 CREATE TABLE decisions (
   id UUID PRIMARY KEY,
@@ -152,7 +159,7 @@ CREATE TABLE decisions (
   embedding VECTOR(384)
 ) STATE MACHINE (status: active -> [invalidated, superseded])
   PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated
-  PROPAGATE ON STATE invalidated EXCLUDE VECTOR
+  PROPAGATE ON STATE invalidated EXCLUDE VECTOR;
 ```
 
 When you archive an intention:
@@ -196,7 +203,7 @@ basis_entities AS (
 SELECT sd.id, sd.description, sd.confidence, e.name, e.properties
 FROM similar_decisions sd
 LEFT JOIN basis_entities be ON TRUE
-LEFT JOIN entities e ON e.id = be.b_id
+LEFT JOIN entities e ON e.id = be.b_id;
 ```
 
 This combines all three paradigms:
@@ -220,7 +227,7 @@ SELECT b_id FROM GRAPH_TABLE(
   MATCH (entity)<-[:BASED_ON]-(decision)
   WHERE entity.id = $changed_entity_id
   COLUMNS (decision.id AS b_id)
-)
+);
 ```
 
 The PROPAGATE constraints (Scenario 3) handle automatic invalidation. This query is for when the application wants to inspect what *would* be affected before triggering a state change.
@@ -244,7 +251,7 @@ WITH affected AS (
 SELECT d.id, d.description, d.status, d.confidence
 FROM decisions d
 INNER JOIN affected a ON d.id = a.b_id
-WHERE d.status = 'active'
+WHERE d.status = 'active';
 ```
 
 **This composed form does not get the same trace as the bare query above.** Today it plans as a
@@ -319,7 +326,7 @@ WITH affected AS (
 SELECT d.id, d.description, d.confidence
 FROM decisions d
 INNER JOIN affected a ON d.id = a.b_id
-WHERE d.status = 'active'
+WHERE d.status = 'active';
 ```
 
 The agent didn't know to watch for `rate_limit`. No one configured a trigger for it. But because the decision was linked to the entity via a `BASED_ON` edge, the graph traversal finds it, and the application can compute the basis diff: the entity's state at decision time vs. now.
@@ -353,7 +360,7 @@ candidates AS (
 -- Rank by semantic similarity to the current query
 SELECT id, data FROM candidates
 ORDER BY embedding <=> $query_embedding
-LIMIT 5
+LIMIT 5;
 ```
 
 Graph-first (narrow the scope), then vector (rank within scope). The inverse — vector-first, then graph — works equally well for different access patterns.
@@ -372,7 +379,7 @@ CREATE TABLE digests (
   source TEXT NOT NULL,
   summary TEXT NOT NULL,
   embedding VECTOR(384)
-) IMMUTABLE
+) IMMUTABLE;
 
 -- Find relevant conversations, then trace what was extracted from them
 WITH relevant AS (
@@ -390,7 +397,7 @@ extracted AS (
 )
 SELECT d.id, d.description, d.status
 FROM decisions d
-INNER JOIN extracted e ON d.id = e.b_id
+INNER JOIN extracted e ON d.id = e.b_id;
 ```
 
 ---
@@ -406,14 +413,14 @@ contextdb-server --tenant-id production --db-path ./server.db
 # Instance 1 (laptop app) — works offline, pushes when connected.
 # A pasted ticket is auto-pinned to this edge's identity key
 # (./local1.db.fabric-identity.key), so `.sync status` shows the rewritten spec.
-contextdb ./local1.db --tenant-id production --sync-endpoint <ticket>
+contextdb ./local1.db --write --tenant-id production --sync-endpoint <ticket>
 contextdb> CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL);
 contextdb> INSERT INTO sensors VALUES ('...', 'temp-north', 23.5);
 contextdb> .sync push
 Pushed: 1 applied, 0 skipped, 0 conflicts
 
 # Instance 2 (another machine) — pulls and gets everything, including schema
-contextdb ./local2.db --tenant-id production --sync-endpoint <ticket>
+contextdb ./local2.db --write --tenant-id production --sync-endpoint <ticket>
 contextdb> .sync pull
 Pulled: 1 applied, 0 skipped, 0 conflicts
 contextdb> SELECT * FROM sensors;
@@ -425,13 +432,13 @@ Sync behavior is declared per table:
 
 ```sql
 -- Conflict resolution is declared on the table itself (keep-first is the default)
-CREATE TABLE observations (id UUID PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST
+CREATE TABLE observations (id UUID PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST;
 ```
 
 ```
-contextdb> ALTER TABLE observations SET SYNC PUSH ONLY
-contextdb> ALTER TABLE decisions SET SYNC TWO WAY
-contextdb> ALTER TABLE scratch SET SYNC OFF
+contextdb> ALTER TABLE observations SET SYNC PUSH ONLY;
+contextdb> ALTER TABLE decisions SET SYNC TWO WAY;
+contextdb> ALTER TABLE scratch SET SYNC OFF;
 ```
 
 Each instance stores its data in a single file. No WAL directories, no journal files, no auxiliary indexes. Back up the file, copy it to another machine, or embed it in a container image.
@@ -443,10 +450,15 @@ Sync survives restarts. Change logs are ephemeral — they exist in memory for i
 In Rust:
 
 ```rust
+use contextdb_core::TenantId;
+use contextdb_engine::Database;
 use contextdb_server::SyncClient;
+use std::sync::Arc;
 
-// The endpoint parameter is the server's enrollment ticket.
-let client = SyncClient::new(db.clone(), &server_ticket, "production");
+// `db` is an Arc<Database>; the endpoint parameter is the server's enrollment
+// ticket; the tenant is the TenantId newtype, not a bare &str.
+let db: Arc<Database> = Arc::new(Database::open(std::path::Path::new("./edge.db"))?);
+let client = SyncClient::new(db.clone(), &server_ticket, TenantId::from("production"));
 client.push().await?;
 client.pull_default().await?;
 ```
@@ -463,14 +475,14 @@ CREATE TABLE scratch (
   id UUID PRIMARY KEY,
   content TEXT,
   created_at TIMESTAMP DEFAULT NOW()
-) RETAIN 24 HOURS
+) RETAIN 24 HOURS;
 
 -- Observations are kept for 30 days, but not purged until synced
 CREATE TABLE observations (
   id UUID PRIMARY KEY,
   data JSON,
   embedding VECTOR(384)
-) RETAIN 30 DAYS SYNC SAFE
+) RETAIN 30 DAYS SYNC SAFE;
 ```
 
 The background pruning loop handles cleanup. `SYNC SAFE` ensures no data is lost before it reaches the server.
@@ -487,7 +499,7 @@ CREATE TABLE node_heartbeat (
   node_id TEXT PRIMARY KEY,
   state TEXT NOT NULL,
   reported_at TIMESTAMP NOT NULL
-) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST
+) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST;
 ```
 
 The maintenance loop collapses each `node_id` back to its single current version on the same
@@ -579,7 +591,7 @@ CREATE TABLE blueprints (
   template TEXT NOT NULL,
   slots JSON NOT NULL,
   embedding VECTOR(384)
-) IMMUTABLE
+) IMMUTABLE;
 
 -- What we're trying to achieve - an instance of a blueprint
 CREATE TABLE intentions (
@@ -590,7 +602,7 @@ CREATE TABLE intentions (
   bindings JSON,
   context_id UUID NOT NULL,
   embedding VECTOR(384)
-) STATE MACHINE (status: active -> [archived, completed, paused], paused -> [active])
+) STATE MACHINE (status: active -> [archived, completed, paused], paused -> [active]);
 
 -- What we chose to do - always in service of an intention
 CREATE TABLE decisions (
@@ -604,7 +616,7 @@ CREATE TABLE decisions (
   embedding VECTOR(384)
 ) STATE MACHINE (status: active -> [invalidated, superseded])
   PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated
-  PROPAGATE ON STATE invalidated EXCLUDE VECTOR
+  PROPAGATE ON STATE invalidated EXCLUDE VECTOR;
 ```
 
 The flow:
@@ -669,7 +681,7 @@ CREATE TABLE outcomes (
   success BOOLEAN NOT NULL,
   impact TEXT,
   measured_at TIMESTAMP DEFAULT NOW()
-) IMMUTABLE
+) IMMUTABLE;
 
 CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id);
 
@@ -687,7 +699,7 @@ INSERT INTO edges (id, source_id, target_id, edge_type)
 VALUES ($edge_id, $decision_id, $outcome_id, 'HAS_OUTCOME');
 ```
 
-Declare the outcome-weighted rank policy on the decision vector:
+Declare the outcome-weighted rank policy on the decision vector. The `JOIN outcomes ON decision_id` clause is resolved at DDL time, so the `outcomes` table above must already exist in this store — declaring it against a missing table refuses with `rank policy on index 'decisions.embedding' joins unknown table 'outcomes'`:
 
 ```sql
 CREATE TABLE decisions (
@@ -700,7 +712,7 @@ CREATE TABLE decisions (
     FORMULA 'coalesce({confidence}, 1.0) * coalesce({success}, 1.0)',
     SORT_KEY effective_confidence
   )
-) STATE MACHINE (status: active -> [invalidated, superseded])
+) STATE MACHINE (status: active -> [invalidated, superseded]);
 ```
 
 Now precedent search factors in outcomes inside the vector top-k selection:
@@ -710,7 +722,7 @@ SELECT id, description, confidence
 FROM decisions
 WHERE status IN ('active', 'superseded')
 ORDER BY embedding <=> $task_embedding USE RANK effective_confidence
-LIMIT 20
+LIMIT 20;
 ```
 
 The engine looks up `outcomes.decision_id` through the protected
@@ -758,7 +770,7 @@ Raw similarity returns the nearest documents:
 SELECT id, title
 FROM documents
 ORDER BY embedding <=> $query_embedding
-LIMIT 3
+LIMIT 3;
 ```
 
 Ranked search uses the annotation metric before applying the final limit:
@@ -767,7 +779,7 @@ Ranked search uses the annotation metric before applying the final limit:
 SELECT id, title
 FROM documents
 ORDER BY embedding <=> $query_embedding USE RANK editorial_rank
-LIMIT 3
+LIMIT 3;
 ```
 
 Example ordering:
@@ -800,7 +812,7 @@ CREATE TABLE invalidations (
   detected_at TIMESTAMP DEFAULT NOW(),
   resolved_at TIMESTAMP,
   resolution_decision_id UUID
-) STATE MACHINE (status: pending -> [acknowledged], acknowledged -> [resolved, dismissed])
+) STATE MACHINE (status: pending -> [acknowledged], acknowledged -> [resolved, dismissed]);
 ```
 
 When impact analysis detects staleness, the application creates an invalidation record:
@@ -827,7 +839,7 @@ SELECT i.id, i.severity, i.basis_diff,
        d.description, d.confidence
 FROM invalidations i
 INNER JOIN decisions d ON d.id = i.affected_decision_id
-WHERE i.status = 'pending'
+WHERE i.status = 'pending';
 
 -- Acknowledge it
 UPDATE invalidations SET status = 'acknowledged' WHERE id = $inv_id;
@@ -858,20 +870,20 @@ CREATE TABLE articles (
   embedding VECTOR(384)
 ) STATE MACHINE (status: draft -> [review], review -> [published, rejected],
                  rejected -> [draft], published -> [archived])
-  PROPAGATE ON STATE archived EXCLUDE VECTOR
+  PROPAGATE ON STATE archived EXCLUDE VECTOR;
 
 CREATE TABLE categories (
   id UUID PRIMARY KEY,
   parent_id UUID,
   name TEXT NOT NULL
-)
+);
 
 CREATE TABLE category_edges (
   id UUID PRIMARY KEY,
   source_id UUID NOT NULL,
   target_id UUID NOT NULL,
   edge_type TEXT NOT NULL
-) DAG('CHILD_OF')
+) DAG('CHILD_OF');
 
 CREATE TABLE edit_log (
   id UUID PRIMARY KEY,
@@ -879,7 +891,7 @@ CREATE TABLE edit_log (
   editor TEXT NOT NULL,
   diff JSON,
   edited_at TIMESTAMP DEFAULT NOW()
-) RETAIN 365 DAYS
+) RETAIN 365 DAYS;
 ```
 
 Same enforceable policies, completely different domain:
@@ -890,11 +902,12 @@ Same enforceable policies, completely different domain:
 
 These are database-level guarantees. The application declares the policy once in the schema. Every consumer — every agent, every API, every sync peer — is bound by it.
 
-Schemas evolve at runtime too. As an agent learns about a new domain, it adds columns, renames fields, or drops what's no longer useful:
+Schemas evolve at runtime too. As an agent learns about a new domain, it adds columns, renames fields, or drops what's no longer useful. This block alters `observations`, `entities` and `scratch` — the tables Scenario 1 and Scenario 10 declare — so run those blocks in the same store first:
 
 ```sql
 ALTER TABLE observations ADD COLUMN confidence REAL;
 ALTER TABLE entities RENAME COLUMN entity_type TO kind;
+ALTER TABLE scratch ADD COLUMN debug_notes TEXT;
 ALTER TABLE scratch DROP COLUMN debug_notes;
 ```
 
@@ -910,7 +923,7 @@ A realistic agentic memory schema — one example schema built on contextdb's pr
 
 ```sql
 -- Isolation boundary (example table - you define contexts, contextdb doesn't ship one)
-CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT NOT NULL)
+CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT NOT NULL);
 
 -- Things in the world
 CREATE TABLE entities (
@@ -919,7 +932,7 @@ CREATE TABLE entities (
   name TEXT NOT NULL,
   context_id UUID NOT NULL,
   properties JSON
-)
+);
 
 -- What happened (append-only facts, auto-expire after 90 days)
 CREATE TABLE observations (
@@ -930,7 +943,7 @@ CREATE TABLE observations (
   source TEXT NOT NULL,
   embedding VECTOR(384),
   recorded_at TIMESTAMP DEFAULT NOW()
-) RETAIN 90 DAYS SYNC SAFE
+) RETAIN 90 DAYS SYNC SAFE;
 
 -- Reusable intent templates
 CREATE TABLE blueprints (
@@ -939,7 +952,7 @@ CREATE TABLE blueprints (
   template TEXT NOT NULL,
   slots JSON NOT NULL,
   embedding VECTOR(384)
-) IMMUTABLE
+) IMMUTABLE;
 
 -- What we're trying to achieve - may instantiate a blueprint
 CREATE TABLE intentions (
@@ -950,7 +963,7 @@ CREATE TABLE intentions (
   bindings JSON,
   context_id UUID NOT NULL,
   embedding VECTOR(384)
-) STATE MACHINE (status: active -> [archived, completed, paused], paused -> [active])
+) STATE MACHINE (status: active -> [archived, completed, paused], paused -> [active]);
 
 -- What we chose to do - always in service of an intention
 CREATE TABLE decisions (
@@ -965,7 +978,7 @@ CREATE TABLE decisions (
 ) STATE MACHINE (status: active -> [invalidated, superseded])
   PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated
   PROPAGATE ON STATE invalidated EXCLUDE VECTOR
-  PROPAGATE ON STATE superseded EXCLUDE VECTOR
+  PROPAGATE ON STATE superseded EXCLUDE VECTOR;
 
 -- What actually happened after a decision
 CREATE TABLE outcomes (
@@ -974,7 +987,7 @@ CREATE TABLE outcomes (
   success BOOLEAN NOT NULL,
   impact TEXT,
   measured_at TIMESTAMP DEFAULT NOW()
-) IMMUTABLE
+) IMMUTABLE;
 
 -- Staleness notices with their own lifecycle
 CREATE TABLE invalidations (
@@ -987,7 +1000,7 @@ CREATE TABLE invalidations (
   detected_at TIMESTAMP DEFAULT NOW(),
   resolved_at TIMESTAMP,
   resolution_decision_id UUID
-) STATE MACHINE (status: pending -> [acknowledged], acknowledged -> [resolved, dismissed])
+) STATE MACHINE (status: pending -> [acknowledged], acknowledged -> [resolved, dismissed]);
 
 -- Conversation summaries (retrieval anchor)
 CREATE TABLE digests (
@@ -996,7 +1009,7 @@ CREATE TABLE digests (
   summary TEXT NOT NULL,
   embedding VECTOR(384),
   context_id UUID NOT NULL
-) IMMUTABLE
+) IMMUTABLE;
 
 -- Relationships between everything
 CREATE TABLE edges (
@@ -1004,7 +1017,7 @@ CREATE TABLE edges (
   source_id UUID NOT NULL,
   target_id UUID NOT NULL,
   edge_type TEXT NOT NULL
-) DAG('DEPENDS_ON', 'BASED_ON', 'CITES')
+) DAG('DEPENDS_ON', 'BASED_ON', 'CITES');
 ```
 
 This example schema gives an agent all of this — but every capability below is a contextdb primitive doing the work; `decisions`, `observations`, `intentions`, and the rest are just the tables this walkthrough chose to declare it on:
@@ -1014,7 +1027,7 @@ This example schema gives an agent all of this — but every capability below is
 - **Automatic invalidation** — `PROPAGATE` cascades status changes through the graph; `invalidations` is this schema's example of a first-class record of that, not something contextdb ships
 - **Feedback loop** — a `RANK_POLICY` join (Scenario 13) lets `outcomes` weight future precedent search; the joined table can be anything you define
 - **Intent normalization** — `blueprints` is an example pattern-normalization table, made durable only by the `IMMUTABLE` policy declared on it
-- **Sync** — contextdb's sync layer moves whatever tables you declare, `Both`/`Push`/`None` per table; local instances work offline, push/pull when connected
+- **Sync** — contextdb's sync layer moves whatever tables you declare, `SYNC TWO WAY`/`PUSH ONLY`/`PULL ONLY`/`OFF` per table; local instances work offline, push/pull when connected
 - **Retention** — `RETAIN` expires rows on any table you attach it to; here, `observations`
 
 None of this is contextdb's schema — it's one example schema, built entirely from primitives contextdb actually ships: `STATE MACHINE`, `DAG`, `PROPAGATE`, `IMMUTABLE`, `RETAIN`, vector columns, graph traversal, and sync. Your schema will look different, and contextdb enforces it just the same.

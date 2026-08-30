@@ -5,7 +5,7 @@ description: Run the operator lifecycle on a contextdb store — enforce RETAIN 
 
 # Operating a store
 
-The recovery/maintenance verbs (`repair`, `migrate`, `reset --force`) and the destructive-op
+The recovery/maintenance verbs (`diagnose`, `migrate`, `reset --force`) and the destructive-op
 confirmation rule already live in
 [`AGENTS.md`'s destructive-op table and migration rehearsal](../../AGENTS.md#destructive-commands-need-explicit-confirmation) —
 read that first; this skill does not repeat it. What this skill covers instead: driving `RETAIN`
@@ -27,13 +27,13 @@ telling a healthy-but-slow sync pull apart from a genuinely stuck one.
    export <path> <dest>`, recipe 3. This is the safe prerequisite AGENTS.md's table already points
    at; the worked example here is the copy-paste form.
 4. **Tell a healthy long-running pull apart from a stuck one** → recipe 4, `pull_pages_read`.
-5. **If you need `repair`/`migrate`/`reset`**, go straight to
+5. **If you need `diagnose`/`migrate`/`reset`**, go straight to
    [AGENTS.md's destructive-op table](../../AGENTS.md#destructive-commands-need-explicit-confirmation)
    — this skill doesn't re-derive those, it composes with them (recipe 3 is the backup step you take
    before using them).
-6. **If you need the no-read-only-open peek pattern**, that's
-   [`skills/using-contextdb/SKILL.md`](../using-contextdb/SKILL.md) — every recipe below that opens
-   a store you don't own follows it.
+6. **Need to just look at a store without any destructive risk?** Plain `contextdb <path>` (no
+   `--write`) already is a bounded read session — see
+   [AGENTS.md's "Reading is safe by default"](../../AGENTS.md#reading-is-safe-by-default).
 
 ## Recipe 1 — enforce `RETAIN` on demand with `.maintenance run`
 
@@ -50,17 +50,17 @@ telling a healthy-but-slow sync pull apart from a genuinely stuck one.
 ### Worked example 1 — a 1-second window, `--json`
 
 ```bash
-contextdb ./life.db --json <<'SQL'
+contextdb ./life.db --write --json <<'SQL'
 CREATE TABLE pings (id UUID PRIMARY KEY, note TEXT) RETAIN 1 SECONDS;
 INSERT INTO pings (id, note) VALUES ('bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb', 'short-lived');
 SQL
 sleep 1.2
-printf '.maintenance run\nSELECT COUNT(*) AS n FROM pings;\n' | contextdb ./life.db --json
+printf '.maintenance run\nSELECT COUNT(*) AS n FROM pings;\n' | contextdb ./life.db --write --json
 ```
 
 ```json
-{"maintenance_cycle":{"compaction":{"bytes_after":61440,"bytes_before":61440,"duration_micros":3095,"file_shrank":false,"fragmentation_before":0.8407264122596154,"ran":true},"currency_pruned_versions":0,"currency_redb_compacted":false,"currency_versions_deferred_for_readers":0,"file_shrank":true,"pruned_rows":1,"pruned_trigger_audit_rows":0,"reclaimed_bytes":360}}
-[{"n":0}]
+{"maintenance_cycle":{"compaction":{"bytes_after":61440,"bytes_before":61440,"duration_micros":3095,"file_shrank":false,"fragmentation_before":0.8407264122596154,"ran":true},"currency_pruned_versions":0,"currency_redb_compacted":false,"currency_versions_deferred_for_readers":0,"file_shrank":true,"pruned_rows":1,"pruned_trigger_audit_rows":0,"reclaimed_bytes":360,"rows_deferred_for_readers":0}}
+{"result":{"columns":["n"],"rows":[{"n":0}]}}
 ```
 
 `pruned_rows:1` confirms the expiry actually fired; `n:0` confirms the row is gone.
@@ -72,20 +72,27 @@ printf '.maintenance status\n' | contextdb ./life.db --json
 ```
 
 ```json
-{"maintenance":{"active_maintenance_loops":1,"currency_compaction_enabled":false,"policy":"engine_owned","retention_enabled":true,"running":true}}
+{"maintenance":{"active_maintenance_loops":0,"currency_compaction_enabled":false,"policy":"engine_owned","retention_enabled":true,"running":false}}
 ```
 
+`retention_enabled:true` is the fact to read here: some table in this store declares `RETAIN`, so
+there is something for a cycle to reclaim. `running:false` with `active_maintenance_loops:0` is
+expected from a one-shot CLI session — it runs no background maintenance loop of its own, which is
+exactly why `.maintenance run` exists as the synchronous door. A long-lived embedding process that
+owns the store reports its own loop here.
+
 ```bash
-printf '.maintenance run\nSELECT COUNT(*) AS n FROM pings;\n' | contextdb ./life.db
+printf '.maintenance run\nSELECT COUNT(*) AS n FROM pings;\n' | contextdb ./life.db --write
 ```
 
 ```text
-pruned_rows=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true
+pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true
 +---+
 | n |
 +---+
 | 0 |
 +---+
+(1 rows)
 ```
 
 Run right after Worked example 1 on the same `life.db`, `pruned_rows` here is honestly `0`, not `1`
@@ -124,7 +131,7 @@ at all — that's a sign to go back to step 1, not a broken maintenance loop.
 ### Worked example 1 — refused without `--force`, then erased
 
 ```bash
-contextdb ./p.db --json <<'SQL'
+contextdb ./p.db --write --json <<'SQL'
 CREATE TABLE scratch (id UUID PRIMARY KEY, note TEXT);
 INSERT INTO scratch (id, note) VALUES ('11111111-1111-1111-1111-111111111111', 'a');
 INSERT INTO scratch (id, note) VALUES ('22222222-2222-2222-2222-222222222222', 'b');
@@ -147,7 +154,7 @@ echo "SELECT COUNT(*) AS n FROM scratch;" | contextdb ./p.db --json
 purge './p.db': erased 2 row(s) from 'scratch'.
 ```
 ```json
-[{"n":0}]
+{"result":{"columns":["n"],"rows":[{"n":0}]}}
 ```
 
 ### Worked example 2 — the never-connected limit and the first-connect honesty case
@@ -170,11 +177,12 @@ same key:
 
 ```text
 Pulled: 1 applied, 0 skipped, 0 conflicts
-+--------------------------------------+-----------------------+
-| id                                   | note                   |
-+--------------------------------------+-----------------------+
-| 11111111-1111-1111-1111-111111111111 | from-hub-independent   |
-+--------------------------------------+-----------------------+
++--------------------------------------+----------------------+
+| id                                   | note                 |
++--------------------------------------+----------------------+
+| 11111111-1111-1111-1111-111111111111 | from-hub-independent |
++--------------------------------------+----------------------+
+(1 rows)
 ```
 
 The row is back — this is step 5's honesty case, verified live, not a hypothetical. **If you need
@@ -191,7 +199,7 @@ every current and future peer converges on the erasure.
 ### Worked example — export, then read the exported counts back
 
 ```bash
-contextdb ./snap.db --json <<'SQL'
+contextdb ./snap.db --write --json <<'SQL'
 CREATE TABLE t (id UUID PRIMARY KEY, x TEXT);
 INSERT INTO t (id, x) VALUES ('11111111-1111-1111-1111-111111111111', 'v');
 SQL
@@ -214,22 +222,23 @@ backup has no recovery path.
    this is a background printer the CLI runs for you when stdin is a real terminal.
 2. In a **scripted/piped** session, or from your own Rust code driving a `SyncClient` directly, the
    counter is exposed as `pull_pages_read` — cumulative pages this client process has read across
-   every pull it has issued, reset only when the process restarts. Read it from `.sync status
-   --json` after a pull completes, or poll it from your own code on a background thread the way
-   the CLI's own interactive printer does (`client.pull_pages_read()` before and after a delay
-   while a pull runs on another thread) — **a genuinely live two-shell-process poll won't work**,
-   because a store has exactly one owner at a time (see `using-contextdb`), so a second `contextdb`
-   process can't open the same file to check on a pull in progress.
+   every pull it has issued, reset only when the process restarts. Read it from `.sync status` in a
+   `--json` session after a pull completes, or poll it from your own code on a background thread
+   the way the CLI's own interactive printer does (`client.pull_pages_read()` before and after a
+   delay while a pull runs on another thread) — **a genuinely live two-shell-process poll won't
+   work**. A second process can certainly read the store while the puller holds it (that read is
+   served by the puller over its owner channel), but `pull_pages_read` counts what *this client
+   process* has read; it is not store state, so no other process can observe it.
 3. Validate a completed pull's liveness retroactively: `pull_pages_read > 0` on a pull that
    `applied` more than a handful of rows means real multi-page work happened, not an instant no-op.
 
 Both examples below assume a hub is already up and `$TICKET` holds its enrollment ticket — see the
 `sync` skill's §1 if you need to stand one up first.
 
-### Worked example 1 — `.sync status --json` after a push and pull
+### Worked example 1 — `.sync status` under `--json`, after a push and pull
 
 ```bash
-printf '.sync status\n' | contextdb ./edge-a.db --tenant-id p --sync-endpoint "$TICKET" --json
+printf '.sync status\n' | contextdb ./edge-a.db --write --tenant-id p --sync-endpoint "$TICKET" --json
 ```
 
 ```json
@@ -244,7 +253,7 @@ blocks until its own pull returns) always reports `false` here regardless of his
 ### Worked example 2 — after a real pull, human output
 
 ```bash
-contextdb ./edge-b.db --tenant-id p --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-b.db --write --tenant-id p --sync-endpoint "$TICKET" <<'SQL'
 .sync pull
 .sync status
 SQL
@@ -280,7 +289,7 @@ hang — a `0`-page pull with `applied:0` is often just "already converged," not
 
 ## Next
 
-- The destructive-op table, migration rehearsal, and the read-write-peek rule this skill builds on → [`AGENTS.md`](../../AGENTS.md)
+- The destructive-op table, migration rehearsal, and the safe-reading-by-default contract this skill builds on → [`AGENTS.md`](../../AGENTS.md)
 - Open a database, run SQL, read `--json`, branch on exit codes → [`skills/using-contextdb/SKILL.md`](../using-contextdb/SKILL.md)
 - Push/pull, watermarks, the delete-durability recipe → [`skills/sync/SKILL.md`](../sync/SKILL.md)
 - Wire up sinks/routes/schedules so there's something to observe here → [`skills/running-triggers-and-schedules/SKILL.md`](../running-triggers-and-schedules/SKILL.md)

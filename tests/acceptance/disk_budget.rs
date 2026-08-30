@@ -28,7 +28,7 @@ fn a_db1_disk_limit_flag_sets_startup_ceiling() {
     let db_path = temp_db_file(&tmp, "a_db1.db");
     let output = run_cli_script(
         &db_path,
-        &["--disk-limit", "4M"],
+        &["--write", "--disk-limit", "4M"],
         "SHOW DISK_LIMIT;\n.quit\n",
     );
     assert!(
@@ -42,14 +42,18 @@ fn a_db1_disk_limit_flag_sets_startup_ceiling() {
     );
 }
 
-#[test]
-fn a_db2_env_var_sets_startup_ceiling() {
+/// Run the CLI over a fresh store with the given extra arguments and
+/// environment, ask it what its disk ceiling is, and hand back what it said.
+fn show_disk_limit(name: &str, extra_args: &[&str], env: &[(&str, &str)]) -> String {
     let tmp = TempDir::new().expect("tempdir");
-    let db_path = temp_db_file(&tmp, "a_db2.db");
+    let db_path = temp_db_file(&tmp, name);
     ensure_release_binaries();
-    let output = std::process::Command::new(cli_bin())
-        .arg(&db_path)
-        .env("CONTEXTDB_DISK_LIMIT", "2M")
+    let mut command = std::process::Command::new(cli_bin());
+    command.arg(&db_path).arg("--write").args(extra_args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -64,12 +68,37 @@ fn a_db2_env_var_sets_startup_ceiling() {
                 .expect("write stdin");
             child.wait_with_output()
         })
-        .expect("CLI with env var");
+        .expect("CLI reports its disk ceiling");
     assert!(output.status.success());
-    let stdout = output_string(&output.stdout);
+    output_string(&output.stdout)
+}
+
+/// The startup disk ceiling is something the operator states on the command
+/// line. The environment is not a behavior surface: a `CONTEXTDB_*` alias for
+/// the same ceiling is not read, and setting one changes nothing and says
+/// nothing -- which is what keeps a ceiling auditable from the invocation
+/// alone, rather than from whatever the surrounding shell happened to export.
+#[test]
+fn a_db2_the_command_line_sets_the_startup_disk_ceiling_and_the_environment_does_not() {
+    // 2M = 2097152 bytes.
+    let stated = show_disk_limit("a_db2-stated.db", &["--disk-limit", "2M"], &[]);
     assert!(
-        stdout.contains("2097152"),
-        "SHOW DISK_LIMIT must report startup ceiling of 2M: {stdout}"
+        stated.contains("2097152"),
+        "SHOW DISK_LIMIT must report the ceiling the command line stated: {stated}"
+    );
+
+    let from_environment = show_disk_limit(
+        "a_db2-environment.db",
+        &[],
+        &[("CONTEXTDB_DISK_LIMIT", "2M")],
+    );
+    assert!(
+        !from_environment.contains("2097152"),
+        "an environment alias must not set the startup ceiling: {from_environment}"
+    );
+    assert!(
+        from_environment.contains("none"),
+        "a store nobody gave a ceiling reports it has none: {from_environment}"
     );
 }
 
@@ -79,7 +108,7 @@ fn a_db3_set_disk_limit_below_startup_ceiling_works() {
     let db_path = temp_db_file(&tmp, "a_db3.db");
     let output = run_cli_script(
         &db_path,
-        &["--disk-limit", "4M"],
+        &["--write", "--disk-limit", "4M"],
         "SET DISK_LIMIT '1M';\nSHOW DISK_LIMIT;\n.quit\n",
     );
     assert!(output.status.success());
@@ -127,7 +156,7 @@ fn a_db5_file_backed_disk_limit_survives_restart() {
 
     let configured = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         "SET DISK_LIMIT '1M';\nSHOW DISK_LIMIT;\n.quit\n",
     );
     assert!(configured.status.success());
@@ -179,7 +208,13 @@ async fn a_db6_server_disk_limit_rejects_sync_push_clearly() {
     let mut server = spawn_server(&server_path, "a_db6", &sync.bind_spec);
     let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
-        &["--tenant-id", "a_db6", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "a_db6",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         ".sync push\n.quit\n",
         std::time::Duration::from_secs(30),
     );
@@ -201,7 +236,7 @@ async fn a_db6_server_disk_limit_rejects_sync_push_clearly() {
         "failed sync push must not leave partially visible remote rows on the server"
     );
 
-    let reopened = run_cli_script(&server_path, &[], "SHOW DISK_LIMIT;\n.quit\n");
+    let reopened = run_cli_script(&server_path, &["--write"], "SHOW DISK_LIMIT;\n.quit\n");
     assert!(reopened.status.success());
     let reopened_stdout = output_string(&reopened.stdout);
     assert!(

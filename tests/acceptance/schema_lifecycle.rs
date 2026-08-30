@@ -12,12 +12,24 @@ async fn f22_table_created_on_edge_pushed_new_edge_gets_schema_via_pull() {
     let mut server = spawn_server(&server_path, "f22", &sync.bind_spec);
     let _ = run_cli_script(
         &edge_a,
-        &["--tenant-id", "f22", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "f22",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\nINSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a');\n.sync push\n.quit\n",
     );
     let pulled = run_cli_script(
         &edge_b,
-        &["--tenant-id", "f22", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "f22",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         ".sync pull\n.tables\nSELECT count(*) FROM sensors;\n.quit\n",
     );
     stop_child(&mut server);
@@ -37,12 +49,24 @@ async fn f23_schema_mismatch_between_edge_and_server_is_detected() {
     let mut server = spawn_server(&server_path, "f23", &sync.bind_spec);
     let _ = run_cli_script(
         &edge_a,
-        &["--tenant-id", "f23", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "f23",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.sync push\n.quit\n",
     );
     let output = run_cli_script(
         &edge_b,
-        &["--tenant-id", "f23", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "f23",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL);\n.sync push\n.quit\n",
     );
     stop_child(&mut server);

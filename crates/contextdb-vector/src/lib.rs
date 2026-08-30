@@ -12,4 +12,5 @@ pub use hnsw::{HnswGraphStats, HnswIndex};
 pub use mem::{MemVectorExecutor, VectorSearchDebugTrace};
 #[doc(hidden)]
 pub use memory_budget::MemoryBudget;
+pub use quantized::stored_vector_value;
 pub use store::{PreparedVectorPublication, VectorStore};

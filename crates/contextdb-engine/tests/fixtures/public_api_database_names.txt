@@ -12,6 +12,7 @@ committed_watermark
 compact_currency_versions
 compact_now
 complete_initialization
+contexts
 cron_status
 current_lsn
 ddl_log_since
@@ -43,6 +44,7 @@ list_triggers
 live_vector_entry
 maintenance_policy
 maintenance_status
+memory_limit
 next_tx
 open
 open_as_principal
@@ -55,8 +57,11 @@ open_memory_with_plugin
 open_memory_with_scope_labels
 open_with_constraints
 open_with_contexts
+open_with_options
 open_with_plugin
 open_with_scope_labels
+owner_read_config
+owner_read_status
 persisted_sync_applied_push_watermark
 persisted_sync_applied_push_watermark_for_node
 persisted_sync_applied_push_watermark_for_node_incarnation
@@ -68,8 +73,11 @@ plugin
 plugin_describe
 plugin_health
 point_lookup
+principal
 query_bfs
 query_vector
+read_session
+read_session_with_progress
 register_cron_callback
 register_sink
 register_trigger_callback
@@ -83,6 +91,7 @@ run_pruning_cycle
 run_pruning_cycle_checked
 scan
 scan_filter
+scope_labels
 scoped_with_constraints
 scoped_with_contexts
 semantic_search

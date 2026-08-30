@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -37,6 +38,132 @@ pub struct MemoryUsage {
     pub used: usize,
     pub available: Option<usize>,
     pub startup_ceiling: Option<usize>,
+}
+
+/// An owned database-accountant charge used by suspendable read operations.
+///
+/// Unlike the short-lived call-site pairs used by the eager executor, this
+/// reservation can grow as a pull source retains continuation state and can
+/// outlive the stack frame that opened a cursor. Dropping it returns the
+/// complete charge exactly once.
+#[derive(Debug)]
+pub(crate) struct OwnedMemoryReservation {
+    accountant: Arc<MemoryAccountant>,
+    bytes: usize,
+}
+
+/// A stack-scoped database-accountant charge. This is used where an existing
+/// execution primitive can unwind from inside its source loop; the charge is
+/// then returned even though control never reaches the primitive's ordinary
+/// success/error epilogue.
+pub(crate) struct ScopedMemoryReservation<'a> {
+    accountant: &'a MemoryAccountant,
+    bytes: usize,
+}
+
+impl<'a> ScopedMemoryReservation<'a> {
+    pub(crate) fn try_new_for(
+        accountant: &'a MemoryAccountant,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<Self> {
+        accountant.try_allocate_for(bytes, subsystem, operation, hint)?;
+        Ok(Self { accountant, bytes })
+    }
+}
+
+impl Drop for ScopedMemoryReservation<'_> {
+    fn drop(&mut self) {
+        self.accountant.release(self.bytes);
+    }
+}
+
+impl OwnedMemoryReservation {
+    pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {
+        Self {
+            accountant,
+            bytes: 0,
+        }
+    }
+
+    /// Grow a held reservation under a name the store's limit can report.
+    ///
+    /// The unlabelled `try_grow` below reports a refusal as the bounded read's
+    /// own retain; a reservation held on behalf of one named piece of work
+    /// grows here instead, so a refusal names that work.
+    pub(crate) fn try_grow_for(
+        &mut self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<()> {
+        let next = self.bytes.checked_add(bytes).ok_or_else(|| {
+            contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem: subsystem.to_string(),
+                operation: operation.to_string(),
+                requested_bytes: bytes,
+                available_bytes: usize::MAX - self.bytes,
+                budget_limit_bytes: usize::MAX,
+                hint: hint.to_string(),
+            }
+        })?;
+        self.accountant
+            .try_allocate_for(bytes, subsystem, operation, hint)?;
+        self.bytes = next;
+        Ok(())
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn try_shrink(&mut self, bytes: usize) -> contextdb_core::Result<()> {
+        let remaining = self.bytes.checked_sub(bytes).ok_or_else(|| {
+            contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem: "bounded_read".to_string(),
+                operation: "release".to_string(),
+                requested_bytes: bytes,
+                available_bytes: self.bytes,
+                budget_limit_bytes: self.bytes,
+                hint: "The read gave back more memory than it was holding.".to_string(),
+            }
+        })?;
+        self.accountant.release(bytes);
+        self.bytes = remaining;
+        Ok(())
+    }
+}
+
+impl OwnedMemoryReservation {
+    /// Take a reservation the store's limit can name, and hold it for as long
+    /// as the guard lives.
+    ///
+    /// The unlabelled `try_grow` above reports a refusal as the bounded read's
+    /// own retain, which tells an operator nothing about WHICH piece of work
+    /// the store-wide limit stopped. A read that holds a working set on behalf
+    /// of one named operation reserves it here instead, so the refusal carries
+    /// that operation's name the way the same work reports it on any other
+    /// path.
+    pub(crate) fn try_new_for(
+        accountant: Arc<MemoryAccountant>,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<Self> {
+        accountant.try_allocate_for(bytes, subsystem, operation, hint)?;
+        Ok(Self { accountant, bytes })
+    }
+}
+
+impl Drop for OwnedMemoryReservation {
+    fn drop(&mut self) {
+        self.accountant.release(self.bytes);
+        self.bytes = 0;
+    }
 }
 
 impl MemoryAccountant {
@@ -112,7 +239,16 @@ impl MemoryAccountant {
                 }
             }
 
-            let next = used.saturating_add(bytes);
+            let Some(next) = used.checked_add(bytes) else {
+                return Err(contextdb_core::Error::MemoryBudgetExceeded {
+                    subsystem: "memory".to_string(),
+                    operation: "allocate".to_string(),
+                    requested_bytes: bytes,
+                    available_bytes: usize::MAX - used,
+                    budget_limit_bytes: usize::MAX,
+                    hint: "Reduce retained data or working-set size.".to_string(),
+                });
+            };
             if self
                 .used
                 .compare_exchange(used, next, Ordering::SeqCst, Ordering::SeqCst)

@@ -50,11 +50,14 @@ fn run_cli(extra_args: &[&str], stdin_sql: &str) -> (bool, String, String) {
 }
 
 /// The last stdout line that parses as JSON of the requested shape.
-fn last_json(stdout: &str) -> Option<serde_json::Value> {
+/// The rows of the last result document on stdout. A successful ordinary
+/// SELECT is one namespaced, column-carrying document — never a bare array.
+fn last_result_rows(stdout: &str) -> Option<Vec<serde_json::Value>> {
     stdout
         .lines()
         .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .find_map(|document| document.get("result")?.get("rows")?.as_array().cloned())
 }
 
 // ============================================================================
@@ -80,9 +83,9 @@ SELECT id, name FROM t;
         "a real multi-line schema file (docs/getting-started.md:137 shape) must run end to end. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
 
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(
         arr.len(),
         1,
@@ -113,9 +116,9 @@ SELECT body FROM notes;
         ok,
         "a `;` inside a quoted string must not split the statement. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(arr.len(), 1, "stdout:\n{stdout}");
     assert_eq!(
         arr[0]["body"],
@@ -144,9 +147,9 @@ SELECT body FROM notes WHERE id = '33333333-3333-3333-3333-333333333333';
         ok,
         "a multi-line statement with an embedded quoted `;` must run end to end. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(arr.len(), 1, "stdout:\n{stdout}");
     assert_eq!(
         arr[0]["body"],
@@ -194,9 +197,9 @@ fn multiple_statements_on_a_single_physical_line_all_run() {
         ok,
         "three `;`-separated statements on one physical line must all run. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(arr.len(), 1, "stdout:\n{stdout}");
     assert_eq!(arr[0]["v"], serde_json::json!("same-line"));
 }
@@ -223,9 +226,9 @@ SELECT body FROM notes2 WHERE id = '55555555-5555-5555-5555-555555555555';
         ok,
         "a string whose first physical line ends in `;` must not be treated as a complete statement. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(arr.len(), 1, "stdout:\n{stdout}");
     assert_eq!(
         arr[0]["body"],
@@ -251,9 +254,9 @@ SELECT body FROM notes3 WHERE id = '66666666-6666-6666-6666-666666666666';
         ok,
         "an escaped quote immediately before the terminator must not confuse the scan. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(arr.len(), 1, "stdout:\n{stdout}");
     assert_eq!(arr[0]["body"], serde_json::json!("ends in quote'"));
 }
@@ -270,9 +273,9 @@ SELECT body FROM notes4 WHERE id = '77777777-7777-7777-7777-777777777777';
         ok,
         "an escaped quote next to an embedded `;` must not confuse the scan. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(arr.len(), 1, "stdout:\n{stdout}");
     assert_eq!(arr[0]["body"], serde_json::json!("it's a semi;test"));
 }
@@ -293,9 +296,9 @@ SELECT \"a;b\" FROM quoted_col WHERE id = '88888888-8888-8888-8888-888888888888'
         ok,
         "a `;` inside a double-quoted identifier must not split the statement. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(arr.len(), 1, "stdout:\n{stdout}");
     assert_eq!(arr[0]["a;b"], serde_json::json!("value1"));
 }
@@ -320,9 +323,9 @@ SELECT v FROM t2 WHERE id = '99999999-9999-9999-9999-999999999999';
         ok,
         "a `;` inside a `--` comment on an earlier line must not end the statement. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(arr.len(), 1, "stdout:\n{stdout}");
     assert_eq!(arr[0]["v"], serde_json::json!("ok"));
 }
@@ -343,9 +346,9 @@ SELECT v FROM t3 WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
         ok,
         "a `;` inside a `/* */` comment on an earlier line must not end the statement. stderr:\n{stderr}\nstdout:\n{stdout}"
     );
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let arr = last_result_rows(&stdout).unwrap_or_else(|| {
+        panic!("no result document on stdout. stdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     assert_eq!(arr.len(), 1, "stdout:\n{stdout}");
     assert_eq!(arr[0]["v"], serde_json::json!("ok2"));
 }

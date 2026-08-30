@@ -50,7 +50,7 @@ async fn f06a_data_written_on_edge_appears_on_server_automatically() {
     let mut server = spawn_server(&server_path, tenant, &bind_spec);
     let edge = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         "\
 CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
 INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a');\n\
@@ -73,7 +73,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000010', '
     let checker_path = edge_path.with_file_name("f06a-checker.db");
     let checker_setup = run_cli_script(
         &checker_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.quit\n",
     );
     assert!(
@@ -84,7 +84,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000010', '
     let synced = wait_until(Duration::from_secs(30), || {
         let check = run_cli_script(
             &checker_path,
-            &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+            &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
             ".sync pull\n\
              SELECT count(*) FROM sensors;\n\
              .quit\n",
@@ -106,7 +106,7 @@ macro_rules! sync_red_test {
             let mut server = spawn_server(&server_path, tenant, &bind_spec);
             let output = run_cli_script(
                 &edge_path,
-                &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+                &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
                 $script,
             );
             assert!(output.status.success());
@@ -128,14 +128,14 @@ async fn f06b_data_from_another_edge_appears_on_this_edge_automatically() {
     script.push_str(".quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script,
     );
     assert!(output.status.success());
     stop_child(&mut server);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         "SELECT count(*) FROM sensors;\n.quit\n",
     );
     assert!(output_string(&output.stdout).contains("10"));
@@ -153,7 +153,7 @@ async fn f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog() {
     script.push_str(".quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script,
     );
     assert!(output.status.success());
@@ -173,7 +173,7 @@ async fn f06_edge_pushes_data_server_has_it() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script,
     );
     assert!(output.status.success());
@@ -195,7 +195,7 @@ async fn f07_two_consecutive_pushes_do_not_duplicate_data() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script,
     );
     assert!(output.status.success());
@@ -215,14 +215,14 @@ async fn f08_push_then_pull_on_a_fresh_edge() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script,
     );
     assert!(output.status.success());
     let fresh_path = edge_path.with_file_name("fresh-edge.db");
     let pulled = run_cli_script(
         &fresh_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.sync pull\nSELECT count(*) FROM sensors\n.quit\n",
     );
     stop_child(&mut server);
@@ -241,7 +241,7 @@ async fn f09_pull_after_server_restart_returns_data() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script,
     );
     assert!(output.status.success());
@@ -250,14 +250,14 @@ async fn f09_pull_after_server_restart_returns_data() {
     let fresh_path = edge_path.with_file_name("fresh-after-restart.db");
     let initialized = run_cli_script(
         &fresh_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.quit\n",
     );
     assert!(initialized.status.success());
     let pulled_ok = wait_until(Duration::from_secs(5), || {
         let pulled = run_cli_script(
             &fresh_path,
-            &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+            &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
             ".sync pull\nSELECT count(*) FROM sensors;\n.quit\n",
         );
         output_string(&pulled.stdout).contains("100")
@@ -282,7 +282,7 @@ async fn f09b_edge_closes_reopens_pushes_more_data() {
     script1.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script1,
     );
     assert!(output.status.success());
@@ -292,7 +292,7 @@ async fn f09b_edge_closes_reopens_pushes_more_data() {
     script2.push_str(".sync push\n.quit\n");
     let reopened = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script2,
     );
     assert!(reopened.status.success());
@@ -313,14 +313,14 @@ async fn f09c_edge_crash_recovers_then_pushes() {
     script1.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script1,
     );
     assert!(output.status.success());
     // Crash session: insert 25 rows then kill (simulating crash)
     let mut child = spawn_cli(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
     );
     let mut crash_script = gen_sensor_inserts(25);
     crash_script.push('\n');
@@ -348,7 +348,7 @@ async fn f09c_edge_crash_recovers_then_pushes() {
     script3.push_str(".sync push\n.quit\n");
     let reopened = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script3,
     );
     assert!(reopened.status.success());
@@ -368,7 +368,7 @@ async fn f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry() {
     script.push_str(".quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script,
     );
     assert!(output.status.success());
@@ -407,7 +407,13 @@ async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge
     let edge1_path = edge_path.with_file_name("f09f-edge1.db");
     let edge1_output = run_cli_script(
         &edge1_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL) SYNC CONFLICT KEEP LATEST;\n\
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'valid');\n\
          .sync push\n\
@@ -420,7 +426,13 @@ async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge
     let edge2_path = edge_path.with_file_name("f09f-edge2.db");
     let violation_output = run_cli_script(
         &edge2_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP LATEST;\n\
          INSERT INTO sensors (id) VALUES ('00000000-0000-0000-0000-000000000002');\n\
          .sync push\n\
@@ -469,7 +481,13 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     let edge_a_path = edge_path.with_file_name("f09h-edge-a.db");
     let push_output = run_cli_script(
         &edge_a_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL);\n\
          INSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 1.0);\n\
          .sync push\n\
@@ -481,7 +499,13 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     let edge_b_path = edge_path.with_file_name("f09h-edge-b.db");
     let pull_output = run_cli_script(
         &edge_b_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, label TEXT, score INTEGER);\n\
          .sync pull\n\
          .quit\n",
@@ -511,7 +535,13 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
     let edge_a_path = temp_db_file(&tmp, "f09i-edge-a.db");
     let setup = run_cli_script(
         &edge_a_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         &format!(
             "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> [review, archived])) SYNC CONFLICT KEEP LATEST;\n\
              INSERT INTO tasks (id, status) VALUES ('{row_id}', 'active');\n\
@@ -525,7 +555,13 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
     let edge_b_path = temp_db_file(&tmp, "f09i-edge-b.db");
     let edge_b = run_cli_script(
         &edge_b_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         &format!(
             "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> [review, archived])) SYNC CONFLICT KEEP LATEST;\n\
              .sync pull\n\
@@ -542,7 +578,13 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
         let checker_path = temp_db_file(&tmp, "f09i-checker.db");
         let check = run_cli_script(
             &checker_path,
-            &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+            &[
+                "--write",
+                "--tenant-id",
+                tenant,
+                "--sync-endpoint",
+                &sync.ticket,
+            ],
             &format!(
                 "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT) SYNC CONFLICT KEEP LATEST;\n\
                  .sync pull\n\
@@ -563,7 +605,13 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
     // This push must report a conflict — the row is no longer in "active" state.
     let conflict_push = run_cli_script(
         &edge_a_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         &format!(
             "ALTER TABLE tasks SET SYNC CONFLICT KEEP FIRST;\n\
              UPDATE tasks SET status = 'archived' WHERE id = '{row_id}';\n\
@@ -611,7 +659,7 @@ async fn f10_edge_offline_for_one_hour_then_pushes_backlog() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &ticket],
+        &["--write", "--tenant-id", tenant, "--sync-endpoint", &ticket],
         &script,
     );
     assert!(output.status.success());
@@ -633,7 +681,13 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     // Start CLI with spawn_cli (keeps process alive)
     let mut child = spawn_cli(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
     );
 
     // Enable auto-sync, create table, insert a row
@@ -650,7 +704,13 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     let checker_path = edge_path.with_file_name("f12-checker.db");
     let checker_setup = run_cli_script(
         &checker_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP LATEST;\n.quit\n",
     );
     assert!(
@@ -660,7 +720,13 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     let found = wait_until(Duration::from_secs(30), || {
         let check = run_cli_script(
             &checker_path,
-            &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+            &[
+                "--write",
+                "--tenant-id",
+                tenant,
+                "--sync-endpoint",
+                &sync.ticket,
+            ],
             ".sync pull\n\
              SELECT count(*) FROM sensors;\n\
              .quit\n",
@@ -692,7 +758,13 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
 
     let mut child = spawn_cli(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
     );
 
     // Create table, insert, enable auto-sync, then UPDATE.
@@ -712,7 +784,13 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
     let checker_path = edge_path.with_file_name("f12b-checker.db");
     let checker_setup = run_cli_script(
         &checker_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP LATEST;\n.quit\n",
     );
     assert!(
@@ -745,7 +823,13 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
 
         let check = run_cli_script(
             &checker_path,
-            &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+            &[
+                "--write",
+                "--tenant-id",
+                tenant,
+                "--sync-endpoint",
+                &sync.ticket,
+            ],
             ".sync pull\n\
              SELECT name FROM sensors WHERE id = '00000000-0000-0000-0000-000000000001';\n\
              .quit\n",
@@ -800,7 +884,13 @@ async fn f12c_auto_sync_pushes_deletes() {
 
     let mut child = spawn_cli(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
     );
 
     // Create table, insert 2 rows, push, enable auto-sync, then DELETE one
@@ -817,7 +907,13 @@ async fn f12c_auto_sync_pushes_deletes() {
     let checker_path = edge_path.with_file_name("f12c-checker.db");
     let checker_setup = run_cli_script(
         &checker_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP LATEST;\n.quit\n",
     );
     assert!(
@@ -832,7 +928,13 @@ async fn f12c_auto_sync_pushes_deletes() {
     let found = wait_until(Duration::from_secs(30), || {
         let check = run_cli_script(
             &checker_path,
-            &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+            &[
+                "--write",
+                "--tenant-id",
+                tenant,
+                "--sync-endpoint",
+                &sync.ticket,
+            ],
             ".sync pull\n\
              SELECT count(*) FROM sensors;\n\
              .quit\n",
@@ -866,7 +968,13 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
 
     let mut child = spawn_cli(
         &edge_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
     );
     write_child_stdin(
         &mut child,
@@ -881,7 +989,13 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
     let checker_path = edge_path.with_file_name("f12d-checker.db");
     let checker_setup = run_cli_script(
         &checker_path,
-        &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            tenant,
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.quit\n",
     );
     assert!(
@@ -892,7 +1006,13 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
     let found = wait_until(Duration::from_secs(30), || {
         let check = run_cli_script(
             &checker_path,
-            &["--tenant-id", tenant, "--sync-endpoint", &sync.ticket],
+            &[
+                "--write",
+                "--tenant-id",
+                tenant,
+                "--sync-endpoint",
+                &sync.ticket,
+            ],
             ".sync pull\n\
              SELECT count(*) FROM sensors;\n\
              .quit\n",
@@ -925,6 +1045,7 @@ async fn f12e_quit_flushes_pending_auto_sync_work() {
     let output = run_cli_script(
         &edge_path,
         &[
+            "--write",
             "--tenant-id",
             tenant,
             "--sync-endpoint",
@@ -960,6 +1081,7 @@ async fn f12e_quit_flushes_pending_delete_with_long_debounce() {
     let output = run_cli_script(
         &edge_path,
         &[
+            "--write",
             "--tenant-id",
             tenant,
             "--sync-endpoint",
@@ -1002,6 +1124,7 @@ async fn f12f_quit_reports_failed_final_sync_flush() {
     let output = run_cli_script(
         &edge_path,
         &[
+            "--write",
             "--tenant-id",
             "f12f_quit_reports_failed_final_sync_flush",
             "--sync-endpoint",
@@ -1038,6 +1161,7 @@ async fn f11_push_during_endpoint_outage_gives_a_clear_error() {
     let output = run_cli_script(
         &edge_path,
         &[
+            "--write",
             "--tenant-id",
             "f11_push_during_endpoint_outage_gives_a_clear_error",
             "--sync-endpoint",

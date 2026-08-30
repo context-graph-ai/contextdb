@@ -1,10 +1,10 @@
-//! Machine-readable output (`--json`) and bounded default output (`--all`) for
-//! the CLI (usability jobs USR-8 / AGT-8 / AGT-15).
+//! Machine-readable output (`--json`) and complete human output for the CLI.
 //!
-//! An agent or script needs query results as structured JSON, and the default
-//! human table must be bounded (a `SELECT *` on a large table dumped hundreds of
-//! rows with no cap or narrowing hint). These drive the binary end-to-end so the
-//! flags are proven through clap, the REPL, and the formatter together.
+//! An agent or script needs query results as structured JSON, and a human
+//! result is COMPLETE or it is refused — no renderer truncates, and the row-cap
+//! flag that used to disable a truncating renderer no longer exists. These
+//! drive the binary end-to-end so the behavior is proven through the argument
+//! parser, the REPL, and the formatter together.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -37,12 +37,19 @@ fn run_cli(extra_args: &[&str], stdin_sql: &str) -> (bool, String, String) {
     )
 }
 
-/// The last stdout line that parses as JSON of the requested shape.
-fn last_json(stdout: &str) -> Option<serde_json::Value> {
+/// The rows of the last result document on stdout.
+///
+/// A successful ordinary SELECT is ONE namespaced, column-carrying document —
+/// `{"result":{"columns":[…],"rows":[…]}}` — not a bare array. A consumer that
+/// could not tell a result apart from a cursor page or an error document had no
+/// contract to parse, which is why the bare array is gone with no deprecation
+/// layer.
+fn last_result_rows(stdout: &str) -> Option<Vec<serde_json::Value>> {
     stdout
         .lines()
         .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .find_map(|document| document.get("result")?.get("rows")?.as_array().cloned())
 }
 
 #[test]
@@ -54,12 +61,8 @@ fn json_select_emits_array_of_objects() {
     let (ok, stdout, stderr) = run_cli(&["--json"], sql);
     assert!(ok, "cli must exit 0. stderr:\n{stderr}\nstdout:\n{stdout}");
 
-    let arr = stdout
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}"));
+    let arr = last_result_rows(&stdout)
+        .unwrap_or_else(|| panic!("no result document on stdout. stdout:\n{stdout}"));
 
     assert_eq!(arr.len(), 2, "two rows expected, got:\n{stdout}");
     assert_eq!(arr[0]["id"], serde_json::json!(1));
@@ -87,46 +90,53 @@ fn data_row_count(stdout: &str) -> usize {
     bar_lines.saturating_sub(1)
 }
 
+/// A human result publishes every row it has. The old default truncated at 100
+/// and printed a footer naming a flag to turn the truncation off; both are
+/// gone, because a result the renderer silently shortened is an answer nobody
+/// can trust.
 #[test]
-fn default_output_caps_at_100_rows_with_footer() {
+fn human_output_publishes_every_row_of_a_complete_result() {
     let (ok, stdout, stderr) = run_cli(&[], &insert_n_then_select(150));
     assert!(ok, "cli must exit 0. stderr:\n{stderr}");
     assert_eq!(
         data_row_count(&stdout),
-        100,
-        "default output must cap at 100 data rows. stdout tail:\n{}",
+        150,
+        "every row of a complete result is printed. stdout tail:\n{}",
         stdout.lines().rev().take(6).collect::<Vec<_>>().join("\n")
     );
     assert!(
-        stdout.contains("showing 100 of 150 rows") && stdout.contains("--all"),
-        "footer must name the total and --all. stdout:\n{stdout}"
+        !stdout.contains("showing"),
+        "no truncation footer exists to print. stdout:\n{stdout}"
     );
 }
 
+/// The flag that disabled the removed truncation is removed with it, and with
+/// no deprecation layer: it is an invalid invocation, not a no-op.
 #[test]
-fn all_flag_disables_the_cap_and_footer() {
-    let (ok, stdout, stderr) = run_cli(&["--all"], &insert_n_then_select(150));
-    assert!(ok, "cli must exit 0. stderr:\n{stderr}");
+fn the_removed_row_cap_flag_is_not_an_accepted_spelling() {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
+    cmd.arg(":memory:").arg("--all");
+    let out = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn contextdb-cli");
     assert_eq!(
-        data_row_count(&stdout),
-        150,
-        "--all must print every row. stdout tail:\n{}",
-        stdout.lines().rev().take(4).collect::<Vec<_>>().join("\n")
-    );
-    assert!(
-        !stdout.contains("showing 100 of"),
-        "--all must not print the cap footer. stdout:\n{stdout}"
+        out.status.code(),
+        Some(2),
+        "a removed flag is rejected by the argument parser. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
 #[test]
-fn json_output_is_uncapped() {
+fn json_output_publishes_every_row() {
     let (ok, stdout, stderr) = run_cli(&["--json"], &insert_n_then_select(150));
     assert!(ok, "cli must exit 0. stderr:\n{stderr}");
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}"));
-    assert_eq!(arr.len(), 150, "JSON output must not be capped");
+    let arr = last_result_rows(&stdout)
+        .unwrap_or_else(|| panic!("no result document on stdout. stdout:\n{stdout}"));
+    assert_eq!(arr.len(), 150, "machine rendering publishes every row too");
 }
 
 // A UNIQUE-violation runtime error used to leave `ok` true (exit 0), because
@@ -188,20 +198,19 @@ fn json_stdout_is_pure_and_run_exits_one_when_a_runtime_error_occurs() {
 
     // The surviving statements still produced their JSON (the first insert and
     // the final one-row select).
-    let arr = last_json(&stdout)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_else(|| panic!("no JSON array on stdout. stdout:\n{stdout}"));
+    let arr = last_result_rows(&stdout)
+        .unwrap_or_else(|| panic!("no result document on stdout. stdout:\n{stdout}"));
     assert_eq!(arr.len(), 1, "only the first row committed");
     assert_eq!(arr[0]["name"], serde_json::json!("a"));
 }
 
 #[test]
-fn rows_under_the_cap_have_no_footer() {
+fn a_small_result_prints_its_rows_and_nothing_else() {
     let (ok, stdout, stderr) = run_cli(&[], &insert_n_then_select(3));
     assert!(ok, "cli must exit 0. stderr:\n{stderr}");
     assert_eq!(data_row_count(&stdout), 3);
     assert!(
         !stdout.contains("showing"),
-        "a result under the cap must not print a footer. stdout:\n{stdout}"
+        "no truncation footer exists to print. stdout:\n{stdout}"
     );
 }

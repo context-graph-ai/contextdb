@@ -617,24 +617,24 @@ impl Database {
     }
 
     pub(super) fn load_event_bus_state_from_persistence(&self) -> Result<()> {
-        let Some(persistence) = self.persistence.as_ref() else {
+        let Some(source) = self.startup_state() else {
             return Ok(());
         };
         let definitions = EventBusDefinitions {
-            event_types: persistence
-                .load_config_value::<Vec<EventTypeDef>>(EVENT_TYPES_CONFIG_KEY)?
+            event_types: source
+                .config_value::<Vec<EventTypeDef>>(EVENT_TYPES_CONFIG_KEY)?
                 .unwrap_or_default()
                 .into_iter()
                 .map(|event_type| (event_type.name.clone(), event_type))
                 .collect(),
-            sinks: persistence
-                .load_config_value::<Vec<SinkDef>>(SINKS_CONFIG_KEY)?
+            sinks: source
+                .config_value::<Vec<SinkDef>>(SINKS_CONFIG_KEY)?
                 .unwrap_or_default()
                 .into_iter()
                 .map(|sink| (sink.name.clone(), sink))
                 .collect(),
-            routes: persistence
-                .load_config_value::<Vec<RouteDef>>(ROUTES_CONFIG_KEY)?
+            routes: source
+                .config_value::<Vec<RouteDef>>(ROUTES_CONFIG_KEY)?
                 .unwrap_or_default()
                 .into_iter()
                 .map(|route| (route.name.clone(), route))
@@ -656,7 +656,7 @@ impl Database {
         queues.clear();
         let mut max_id = 0u64;
         for sink in sink_names {
-            let queue = persistence.load_sink_queue::<SinkQueueEntry>(&sink)?;
+            let queue = source.sink_queue::<SinkQueueEntry>(&sink)?;
             max_id = max_id.max(queue.iter().map(|entry| entry.id).max().unwrap_or(0));
             queues.insert(sink, queue.into());
         }
@@ -1781,6 +1781,10 @@ impl Database {
             persistence: self.persistence.clone(),
         };
         let thread_shutdown = shutdown.clone();
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_event_delivery_start();
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_background_worker_start();
         let handle = thread::spawn(move || worker.dispatch_loop(thread_shutdown));
         runtimes.insert(
             sink.to_string(),

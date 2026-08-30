@@ -38,7 +38,13 @@ async fn f12_server_crash_mid_push_does_not_corrupt_server_data() {
     let mut server = spawn_server(&server_path, "f12", &sync.bind_spec);
     let _ = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f12", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "f12",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
@@ -56,7 +62,13 @@ async fn f13_sync_reconnect_does_not_require_edge_restart() {
     let mut server = spawn_server(&server_path, "f13", &sync.bind_spec);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f13", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "f13",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.sync reconnect\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
@@ -74,14 +86,26 @@ async fn f14_server_restart_does_not_require_edge_restart() {
     let mut server = spawn_server(&server_path, "f14", &sync.bind_spec);
     let _ = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f14", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "f14",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
     server = spawn_server(&server_path, "f14", &sync.bind_spec);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f14", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "f14",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         "INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'x');\n.sync push\n.quit\n",
     );
     stop_child(&mut server);

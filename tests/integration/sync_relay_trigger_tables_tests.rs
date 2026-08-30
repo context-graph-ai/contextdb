@@ -328,9 +328,12 @@ fn assert_relay_still_rejects_trigger_table_schema_violation() {
             Err(Error::ColumnTypeMismatch {
                 ref table,
                 ref column,
-                expected: "TEXT",
-                actual: "TxId",
-            }) if table == "widgets" && column == "label"
+                ref expected,
+                ref actual,
+            }) if table == "widgets"
+                && column == "label"
+                && expected == "TEXT"
+                && actual == "TxId"
         ),
         "relay mode must preserve row/schema validation for trigger-table rows; got {result:?}"
     );

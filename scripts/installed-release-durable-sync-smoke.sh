@@ -221,8 +221,19 @@ help="$($cli --help 2>&1)"
   || fail "ordinary CLI hides role-mechanic policy names"
 pass "ordinary CLI hides verifier and role-mechanic policy controls"
 for removed_command in policy direction; do
+  removed_store="$work/removed-$removed_command.db"
+  # Whether a session still knows a command is a question about that session's
+  # vocabulary, so it has to be asked of a store the session can open. A path
+  # with no store is refused at the door, before any command is read: assert
+  # that contract on its own, then create the store and ask it the question.
+  missing_output="$(printf '.quit\n' | "$cli" "$removed_store" --json 2>&1 || true)"
+  [[ "$missing_output" == *"store_not_found"* ]] \
+    || fail "reading a path with no store refuses as store_not_found"
+  pass "reading a path with no store refuses as store_not_found"
+  printf '.quit\n' | "$cli" "$removed_store" --write --json >/dev/null 2>&1 \
+    || fail "a writable open creates the store the removed-command probe reads"
   removed_output="$(printf '.sync %s\n.quit\n' "$removed_command" \
-    | "$cli" "$work/removed-$removed_command.db" --json 2>&1 || true)"
+    | "$cli" "$removed_store" --json 2>&1 || true)"
   removed_output_lower="$(printf '%s' "$removed_output" | tr '[:upper:]' '[:lower:]')"
   [[ "$removed_output_lower" == *"$removed_command"* \
      && ( "$removed_output_lower" == *"unknown"* || "$removed_output_lower" == *"unrecognized"* ) ]] \

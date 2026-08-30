@@ -26,7 +26,7 @@ fn f01_create_insert_quit_reopen_query() {
         ));
     }
     script.push_str(".quit\n");
-    let first = run_cli_script(&db_path, &[], &script);
+    let first = run_cli_script(&db_path, &["--write"], &script);
     assert!(first.status.success());
 
     let second = run_cli_script(
@@ -51,7 +51,11 @@ CREATE TABLE workflows (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status:
 CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS_ON');\n\
 CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(384));\n\
 .quit\n";
-    assert!(run_cli_script(&db_path, &[], create).status.success());
+    assert!(
+        run_cli_script(&db_path, &["--write"], create)
+            .status
+            .success()
+    );
 
     let output = run_cli_script(
         &db_path,
@@ -73,7 +77,7 @@ CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(384));\n\
 fn f03_kill_9_during_idle_does_not_corrupt() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f03.db");
-    let mut child = spawn_cli(&db_path, &[]);
+    let mut child = spawn_cli(&db_path, &["--write"]);
     let mut script = String::from("CREATE TABLE kill_test (id UUID PRIMARY KEY, name TEXT);\n");
     for idx in 0..100 {
         script.push_str(&format!(
@@ -91,7 +95,11 @@ fn f03_kill_9_during_idle_does_not_corrupt() {
     );
     stop_child(&mut child);
 
-    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM kill_test;\n.quit\n");
+    let reopened = run_cli_script(
+        &db_path,
+        &["--write"],
+        "SELECT count(*) FROM kill_test;\n.quit\n",
+    );
     assert!(reopened.status.success());
     assert!(output_string(&reopened.stdout).contains("100"));
 }
@@ -103,7 +111,7 @@ fn f04_empty_database_file_is_a_valid_starting_point() {
     let db_path = temp_db_file(&tmp, "f04.db");
     let output = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         "\
 CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
 INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a');\n\
@@ -126,11 +134,11 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', '
 fn f05_two_processes_cannot_open_the_same_database_file() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f05.db");
-    let mut first = spawn_cli(&db_path, &[]);
+    let mut first = spawn_cli(&db_path, &["--write"]);
     write_child_stdin(&mut first, "CREATE TABLE sensors (id UUID PRIMARY KEY);\n");
     thread::sleep(Duration::from_millis(200));
 
-    let second = run_cli_script_allow_startup_failure(&db_path, &[], ".quit\n");
+    let second = run_cli_script_allow_startup_failure(&db_path, &["--write"], ".quit\n");
     stop_child(&mut first);
 
     assert!(
@@ -138,7 +146,7 @@ fn f05_two_processes_cannot_open_the_same_database_file() {
         "second process should fail while first holds the database"
     );
     let stderr = output_string(&second.stderr).to_lowercase();
-    assert!(stderr.contains("locked") || stderr.contains("in use"));
+    assert!(stderr.contains("holds this store for writing"));
 }
 
 /// I inserted graph edges, quit, reopened, and a multi-hop graph traversal still found the connected nodes.
@@ -154,7 +162,7 @@ INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 
 INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'EDGE');\n\
 INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000003', 'EDGE');\n\
 .quit\n";
-    let _ = run_cli_script(&db_path, &[], script);
+    let _ = run_cli_script(&db_path, &["--write"], script);
 
     let query = "\
 SELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,2}(b) WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS(b.id AS target_id));\n\
@@ -425,7 +433,7 @@ fn f05i_rollback_does_not_persist_after_restart() {
     let db_path = temp_db_file(&tmp, "f05i.db");
     let output = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         "\
 CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
 BEGIN;\n\
@@ -452,11 +460,6 @@ fn f05j_dag_constraint_survives_restart_and_rejects_cycles() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f05j.db");
     let db = Database::open(&db_path).expect("open db");
-    db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
-        &empty_params(),
-    )
-    .expect("create entities");
     db.execute(
         "CREATE TABLE edge_rows (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES')",
         &empty_params(),
@@ -735,8 +738,12 @@ fn f112_legacy_vector_store_open_returns_typed_error_with_rebuild_guidance() {
             expected_release,
         }) => {
             assert!(
-                matches!(found_format_marker.as_str(), "" | "0.3.x"),
-                "marker must be either empty (no metadata table) or '0.3.x'; got: {found_format_marker}"
+                matches!(
+                    found_format_marker.as_str(),
+                    "" | "0.3.x" | "legacy or missing durable layout"
+                ),
+                "marker must be empty (no metadata table), '0.3.x', or the read-only-decoder's \
+                 pre-companion classification; got: {found_format_marker}"
             );
             assert_eq!(expected_release, "1.0.0");
             // The Display message must give both canonical recovery paths so the operator can act

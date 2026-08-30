@@ -88,7 +88,7 @@ fn edge(root: &Path, name: &str, ticket: &str) -> Result<Edge, String> {
     declare(&db)?;
     let client = SyncClient::new(
         db.clone(),
-        &peer_dial_spec(&ticket, &directory.join("edge.identity")),
+        &peer_dial_spec(ticket, &directory.join("edge.identity")),
         TenantId::from(TENANT),
     );
     Ok(Edge { db, client })

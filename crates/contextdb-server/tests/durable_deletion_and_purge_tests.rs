@@ -1008,8 +1008,12 @@ fn assert_no_export_attempt_files(directory: &Path, artifact: &Path) {
                 .into_owned()
         })
         .filter(|name| {
+            // Only the attempt's own residue (`{artifact}.{uuid}.tmpexport` and
+            // its `.lock`) is leftover; the artifact's persistent
+            // `{artifact}.lock` companion is not an attempt file and must
+            // never be flagged here.
             name.starts_with(&attempt_prefix)
-                && (name.ends_with(".tmpexport") || name.ends_with(".lock"))
+                && (name.ends_with(".tmpexport") || name.ends_with(".tmpexport.lock"))
         })
         .collect::<Vec<_>>();
     assert!(

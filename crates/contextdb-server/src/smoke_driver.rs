@@ -905,6 +905,109 @@ fn ddl_kind(change: &DdlChange) -> &'static str {
     }
 }
 
+fn validate_path_parent(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or_else(|| "verifier path parent does not exist".to_string())?;
+    if parent.as_os_str().is_empty() {
+        return Err("verifier paths must have an explicit parent".to_string());
+    }
+    Ok(())
+}
+
+fn write_ticket(path: &Path, ticket: &str) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let open = |create_new| {
+            let mut options = OpenOptions::new();
+            options
+                .write(true)
+                .create_new(create_new)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o600);
+            options.open(path)
+        };
+        let mut file = match open(true) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => open(false)
+                .map_err(|_| "cannot securely replace verifier ticket file".to_string())?,
+            Err(_) => return Err("cannot create verifier ticket file".to_string()),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|_| "cannot inspect verifier ticket file".to_string())?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+        {
+            return Err(
+                "verifier ticket path must be one regular file owned by this user".to_string(),
+            );
+        }
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err("cannot make verifier ticket file private".to_string());
+        }
+        file.set_len(0)
+            .map_err(|_| "cannot truncate verifier ticket file".to_string())?;
+        file.write_all(ticket.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "cannot durably write verifier ticket file".to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|_| "cannot create verifier ticket file".to_string())?;
+        file.write_all(ticket.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "cannot durably write verifier ticket file".to_string())
+    }
+}
+
+fn read_ticket(path: &Path) -> Result<String, String> {
+    let ticket = std::fs::read_to_string(path)
+        .map_err(|_| "cannot read verifier ticket file".to_string())?;
+    let ticket = ticket.trim().to_string();
+    if ticket.is_empty() {
+        return Err("verifier ticket file is empty".to_string());
+    }
+    Ok(ticket)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[cfg(test)]
 mod ddl_vector_tests {
     use super::*;
@@ -1062,109 +1165,5 @@ mod ddl_vector_tests {
             )
             .is_err()
         );
-    }
-}
-
-fn validate_path_parent(path: &Path) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .filter(|parent| parent.is_dir())
-        .ok_or_else(|| "verifier path parent does not exist".to_string())?;
-    if parent.as_os_str().is_empty() {
-        return Err("verifier paths must have an explicit parent".to_string());
-    }
-    Ok(())
-}
-
-fn write_ticket(path: &Path, ticket: &str) -> Result<(), String> {
-    use std::fs::OpenOptions;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-        let open = |create_new| {
-            let mut options = OpenOptions::new();
-            options
-                .write(true)
-                .create_new(create_new)
-                .custom_flags(libc::O_NOFOLLOW)
-                .mode(0o600);
-            options.open(path)
-        };
-        let mut file = match open(true) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => open(false)
-                .map_err(|_| "cannot securely replace verifier ticket file".to_string())?,
-            Err(_) => return Err("cannot create verifier ticket file".to_string()),
-        };
-        let metadata = file
-            .metadata()
-            .map_err(|_| "cannot inspect verifier ticket file".to_string())?;
-        if !metadata.file_type().is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.nlink() != 1
-        {
-            return Err(
-                "verifier ticket path must be one regular file owned by this user".to_string(),
-            );
-        }
-        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
-            return Err("cannot make verifier ticket file private".to_string());
-        }
-        file.set_len(0)
-            .map_err(|_| "cannot truncate verifier ticket file".to_string())?;
-        return file
-            .write_all(ticket.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "cannot durably write verifier ticket file".to_string());
-    }
-    #[cfg(not(unix))]
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .map_err(|_| "cannot create verifier ticket file".to_string())?;
-        file.write_all(ticket.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "cannot durably write verifier ticket file".to_string())
-    }
-}
-
-fn read_ticket(path: &Path) -> Result<String, String> {
-    let ticket = std::fs::read_to_string(path)
-        .map_err(|_| "cannot read verifier ticket file".to_string())?;
-    let ticket = ticket.trim().to_string();
-    if ticket.is_empty() {
-        return Err("verifier ticket file is empty".to_string());
-    }
-    Ok(ticket)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-async fn wait_for_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = sigterm.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
     }
 }

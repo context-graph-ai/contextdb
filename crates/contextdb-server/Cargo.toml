@@ -39,7 +39,11 @@ mdns = ["iroh", "contextdb-engine/mdns"]
 # below turns it on for this crate's OWN test targets, which is what lets the
 # seam tests run in the default `cargo test -p contextdb-server` gate without
 # the accessor existing for anyone else.
-test-seams = ["contextdb-engine/test-seams"]
+# The engine acceptance suite needs only the deterministic in-process fabric;
+# keeping that seam separate avoids enabling engine test seams in ordinary
+# engine library tests through Cargo feature unification.
+in-process-test-seams = ["contextdb-engine/in-process-test-seams"]
+test-seams = ["in-process-test-seams", "contextdb-engine/test-seams"]
 production-smoke-driver = ["iroh", "contextdb-engine/production-smoke-driver"]
 
 [[bin]]

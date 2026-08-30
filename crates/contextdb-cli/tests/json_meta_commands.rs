@@ -62,6 +62,16 @@ fn find_doc<'a>(docs: &'a [serde_json::Value], key: &str) -> Option<&'a serde_js
     docs.iter().find(|d| d.get(key).is_some())
 }
 
+/// The payload of the `.schema` document.
+///
+/// `.schema` publishes one NAMESPACED document — `{"schema":{…}}` — like every
+/// other meta-command; the un-namespaced form, whose fields sat at the top
+/// level beside nothing that named them, is gone. Asserting through this
+/// helper keeps every schema pin reading the payload rather than the envelope.
+fn schema_payload(docs: &[serde_json::Value]) -> Option<serde_json::Value> {
+    docs.iter().find_map(|d| d.get("schema").cloned())
+}
+
 // 1. `.tables` under --json must emit a `{"tables": [...]}` document,
 // never a bare name list (one `println!` per table).
 #[test]
@@ -76,11 +86,22 @@ fn json_tables_emits_sorted_table_array() {
     let docs = assert_all_lines_are_json(&stdout, ".tables under --json");
     let tables_doc = find_doc(&docs, "tables").unwrap_or_else(|| {
         panic!(
-            ".tables under --json must emit a {{\"tables\": [...]}} document, \
-             never a bare name list, one per line. stdout:\n{stdout}"
+            ".tables under --json must emit a namespaced page document, never a bare \
+             name list one per line. stdout:\n{stdout}"
         )
     });
-    assert_eq!(tables_doc["tables"], serde_json::json!(["a", "b", "c"]));
+    // A page document, not a bare array: `.tables` is resumable, so it states
+    // whether another page exists and carries the continuation that fetches
+    // one exactly when there is one.
+    assert_eq!(
+        tables_doc["tables"]["items"],
+        serde_json::json!(["a", "b", "c"])
+    );
+    assert_eq!(tables_doc["tables"]["has_more"], serde_json::json!(false));
+    assert!(
+        tables_doc["tables"]["continuation"].is_null(),
+        "continuation is null exactly when has_more is false: {tables_doc}"
+    );
 }
 
 // 2. `.schema` under --json must emit a structured document, never raw
@@ -109,7 +130,7 @@ fn json_schema_emits_every_declared_policy() {
     let (code, stdout, stderr) = run_cli(&["--json"], sql);
     assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
     let docs = assert_all_lines_are_json(&stdout, ".schema widgets under --json");
-    let schema = find_doc(&docs, "table").unwrap_or_else(|| {
+    let schema = schema_payload(&docs).unwrap_or_else(|| {
         panic!(
             ".schema under --json must emit a structured document with a \
              \"table\" key, never raw DDL text. stdout:\n{stdout}"
@@ -192,7 +213,7 @@ fn json_schema_emits_every_declared_policy() {
     );
     assert_eq!(code2, Some(0), "stdout:\n{stdout2}\nstderr:\n{stderr2}");
     let docs2 = assert_all_lines_are_json(&stdout2, ".schema edges under --json");
-    let edges_schema = find_doc(&docs2, "table").unwrap_or_else(|| {
+    let edges_schema = schema_payload(&docs2).unwrap_or_else(|| {
         panic!(".schema edges under --json must emit a structured document. stdout:\n{stdout2}")
     });
     assert_eq!(
@@ -213,7 +234,7 @@ fn json_schema_ddl_field_equals_human_schema_output() {
     let (json_code, json_stdout, json_stderr) = run_cli(&["--json"], sql);
     assert_eq!(json_code, Some(0), "stderr:\n{json_stderr}");
     let docs = assert_all_lines_are_json(&json_stdout, ".schema t under --json");
-    let schema = find_doc(&docs, "table").unwrap_or_else(|| {
+    let schema = schema_payload(&docs).unwrap_or_else(|| {
         panic!(".schema under --json must emit a structured document. stdout:\n{json_stdout}")
     });
     let ddl = schema["ddl"]
@@ -245,7 +266,7 @@ fn json_schema_omits_undeclared_policy_keys() {
     let (code, stdout, stderr) = run_cli(&["--json"], sql);
     assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
     let docs = assert_all_lines_are_json(&stdout, ".schema t under --json");
-    let schema = find_doc(&docs, "table").unwrap_or_else(|| {
+    let schema = schema_payload(&docs).unwrap_or_else(|| {
         panic!(".schema under --json must emit a structured document. stdout:\n{stdout}")
     });
 
@@ -283,7 +304,7 @@ fn json_schema_suppresses_auto_indexes() {
     let (code, stdout, stderr) = run_cli(&["--json"], sql);
     assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
     let docs = assert_all_lines_are_json(&stdout, ".schema t under --json");
-    let schema = find_doc(&docs, "table").unwrap_or_else(|| {
+    let schema = schema_payload(&docs).unwrap_or_else(|| {
         panic!(".schema under --json must emit a structured document. stdout:\n{stdout}")
     });
     let indexes = schema["indexes"].as_array().unwrap_or_else(|| {
@@ -560,7 +581,9 @@ fn json_mixed_session_stdout_is_pure_json_lines() {
     // return "columns" there, which is a real defect in this probe, not a
     // property of a correct implementation. `"tables"` is checked before
     // `"table"` so the two don't collide (neither document carries both).
-    const KNOWN_KEYS: &[&str] = &["rows_affected", "tables", "table", "explain"];
+    // Every document on stdout names its own payload — there is no bare array
+    // and no bare field set left in this stream.
+    const KNOWN_KEYS: &[&str] = &["rows_affected", "result", "tables", "schema", "explain"];
     let top_level_keys: Vec<&str> = docs
         .iter()
         .map(|d| {
@@ -575,10 +598,9 @@ fn json_mixed_session_stdout_is_pure_json_lines() {
         vec![
             "rows_affected",
             "rows_affected",
-            // the SELECT's array has no top-level key — a bare JSON array.
-            "<non-object>",
+            "result",
             "tables",
-            "table",
+            "schema",
             "explain",
         ]
     );
@@ -640,5 +662,83 @@ fn human_mode_meta_output_is_unchanged() {
     assert!(
         !stdout.trim_start().starts_with('{') && !stdout.trim_start().starts_with('['),
         "human mode must never emit a JSON document, got stdout:\n{stdout}"
+    );
+}
+
+// Access control on the readback surfaces. `docs/cli.md` promises `.schema`
+// "reflects the table's full *enforced* policy" and that "its printed DDL
+// re-parses to a table with the same policy," listing only column `DEFAULT`
+// clauses and `STATE MACHINE` from-state ordering as literal exceptions. A
+// column declared `ACL REFERENCES acl_grants(acl_id)` is reported on neither
+// surface: the human DDL prints a bare `acl_id UUID` and the `--json` column
+// carries no reference at all, so an operator replaying the printed DDL
+// rebuilds the table with row-level authorization removed and no warning.
+//
+// The `--json` shape mirrors the foreign-key one already published:
+// `acl_references: {"table": …, "column": …}` beside `references`.
+#[test]
+fn json_schema_reports_a_declared_acl_reference_on_both_surfaces() {
+    let sql = "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID);\n\
+               CREATE TABLE notes (id INTEGER PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), payload TEXT);\n\
+               .schema notes\n";
+    let (code, stdout, stderr) = run_cli(&["--json"], sql);
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let docs = assert_all_lines_are_json(&stdout, ".schema notes under --json");
+    let schema = schema_payload(&docs).unwrap_or_else(|| {
+        panic!(".schema must publish its namespaced document. stdout:\n{stdout}")
+    });
+
+    let columns = schema["columns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("schema.columns must be an array, got: {schema}"));
+    let acl_col = columns
+        .iter()
+        .find(|c| c["name"] == serde_json::json!("acl_id"))
+        .expect("acl_id column must be present");
+    assert_eq!(
+        acl_col["acl_references"]["table"],
+        serde_json::json!("acl_grants"),
+        "the --json schema answer must name the table an access-controlled column grants \
+         against; today the column carries no reference at all, so an agent testing for the \
+         presence of a policy concludes the table declares none. Column: {acl_col}"
+    );
+    assert_eq!(
+        acl_col["acl_references"]["column"],
+        serde_json::json!("acl_id"),
+        "the --json schema answer must name the grant column as well. Column: {acl_col}"
+    );
+
+    let ddl = schema["ddl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("schema.ddl must be a string, got: {schema}"));
+    assert!(
+        ddl.contains("ACL REFERENCES acl_grants(acl_id)"),
+        "the published DDL must carry the ACL clause -- docs/cli.md promises the printed DDL \
+         re-parses to a table with the same policy, and names only DEFAULT and STATE MACHINE \
+         ordering as exceptions. DDL:\n{ddl}"
+    );
+}
+
+#[test]
+fn human_schema_prints_the_acl_clause_and_leaves_a_plain_foreign_key_alone() {
+    let sql = "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID);\n\
+               CREATE TABLE parent (id UUID PRIMARY KEY);\n\
+               CREATE TABLE notes (id INTEGER PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), payload TEXT);\n\
+               CREATE TABLE child (id UUID PRIMARY KEY, p UUID REFERENCES parent(id));\n\
+               .schema child\n\
+               .schema notes\n";
+    let (code, stdout, stderr) = run_cli(&[], sql);
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        stdout.contains("p UUID REFERENCES parent(id)"),
+        "control: an ordinary foreign key already prints its REFERENCES clause and must keep \
+         doing so. stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ACL REFERENCES acl_grants(acl_id)"),
+        "`.schema notes` prints `acl_id UUID` today, dropping the access control the table \
+         enforces; an operator who snapshots and replays that DDL rebuilds the table without \
+         row-level authorization. stdout:\n{stdout}"
     );
 }

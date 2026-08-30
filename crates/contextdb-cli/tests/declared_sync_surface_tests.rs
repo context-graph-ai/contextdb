@@ -25,6 +25,9 @@ fn run_cli_at_with_status(
     }
     let mut child = command
         .arg(path)
+        // A file-backed session that changes the store — schema, rows, or sync
+        // — is authorized by `--write`; a bare path only reads.
+        .arg("--write")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -140,8 +143,8 @@ fn public_sync_output_uses_only_declared_policy_words() {
     let document = json_output
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|value| value.get("table").is_some())
-        .unwrap_or_else(|| panic!(".schema --json must emit its table document: {json_output}"));
+        .find_map(|value| value.get("schema").cloned())
+        .unwrap_or_else(|| panic!(".schema --json must emit its schema document: {json_output}"));
     assert_eq!(document["sync_direction"], "two_way");
     assert_eq!(document["conflict_policy"], "keep_first");
     assert_no_role_mechanic_words(&document.to_string(), "ordinary-table JSON schema");
@@ -367,6 +370,7 @@ fn cli(path: &std::path::Path, hub: &RunningHub, tenant: &str, debounce_ms: u64)
     let mut command = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     command
         .arg(path)
+        .arg("--write")
         .arg("--json")
         .args(["--sync-endpoint", &hub.ticket])
         .args(["--tenant-id", tenant])

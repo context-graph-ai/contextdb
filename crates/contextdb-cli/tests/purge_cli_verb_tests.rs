@@ -46,7 +46,9 @@ fn run_purge(path: &std::path::Path, extra: &[&str]) -> (Option<i32>, String, St
 
 fn run_cli(path: &std::path::Path, sql: &str) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
-    cmd.arg(path).arg("--json");
+    // These fixtures create and mutate a file-backed store, which `--write`
+    // is what authorizes.
+    cmd.arg(path).arg("--write").arg("--json");
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -70,12 +72,14 @@ fn run_cli(path: &std::path::Path, sql: &str) -> (Option<i32>, String, String) {
 fn row_count(path: &std::path::Path, table: &str) -> usize {
     let (code, stdout, stderr) = run_cli(path, &format!("SELECT * FROM {table};\n"));
     assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    // A successful ordinary SELECT is one namespaced result document carrying
+    // its rows, not a bare array.
     stdout
         .lines()
         .filter(|l| !l.trim().is_empty())
         .flat_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v.is_array())
-        .flat_map(|v| v.as_array().cloned().unwrap_or_default())
+        .filter_map(|document| document.get("result")?.get("rows")?.as_array().cloned())
+        .flatten()
         .count()
 }
 
@@ -279,6 +283,7 @@ async fn purge_with_force_erasure_survives_a_sync_pull() {
     // same row: a pull must not resurrect what purge erased.
     let mut pull = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     pull.arg(&edge_path)
+        .arg("--write")
         .arg("--json")
         .args(["--sync-endpoint", &hub.ticket])
         .args(["--tenant-id", "acme"]);

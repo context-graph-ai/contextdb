@@ -59,10 +59,14 @@ fn explain_json_delete_leaves_rows_intact() {
         docs.iter().any(|d| d.get("explain").is_some()),
         "an explain document must be emitted, got docs:\n{docs:?}"
     );
+    // The follow-up SELECT publishes one namespaced result document; the bare
+    // row array it used to publish is gone with no deprecation layer.
     let rows = docs
         .last()
-        .and_then(|d| d.as_array().cloned())
-        .unwrap_or_else(|| panic!("the follow-up SELECT must emit a JSON array, got:\n{stdout}"));
+        .and_then(|d| d.get("result")?.get("rows")?.as_array().cloned())
+        .unwrap_or_else(|| {
+            panic!("the follow-up SELECT must emit a result document, got:\n{stdout}")
+        });
     assert_eq!(
         rows.len(),
         2,
@@ -86,10 +90,14 @@ fn explain_json_update_leaves_rows_intact() {
         docs.iter().any(|d| d.get("explain").is_some()),
         "an explain document must be emitted, got docs:\n{docs:?}"
     );
+    // The follow-up SELECT publishes one namespaced result document; the bare
+    // row array it used to publish is gone with no deprecation layer.
     let rows = docs
         .last()
-        .and_then(|d| d.as_array().cloned())
-        .unwrap_or_else(|| panic!("the follow-up SELECT must emit a JSON array, got:\n{stdout}"));
+        .and_then(|d| d.get("result")?.get("rows")?.as_array().cloned())
+        .unwrap_or_else(|| {
+            panic!("the follow-up SELECT must emit a result document, got:\n{stdout}")
+        });
     assert_eq!(
         rows.len(),
         1,
@@ -117,10 +125,14 @@ fn explain_json_insert_does_not_add_a_row() {
         docs.iter().any(|d| d.get("explain").is_some()),
         "an explain document must be emitted, got docs:\n{docs:?}"
     );
+    // The follow-up SELECT publishes one namespaced result document; the bare
+    // row array it used to publish is gone with no deprecation layer.
     let rows = docs
         .last()
-        .and_then(|d| d.as_array().cloned())
-        .unwrap_or_else(|| panic!("the follow-up SELECT must emit a JSON array, got:\n{stdout}"));
+        .and_then(|d| d.get("result")?.get("rows")?.as_array().cloned())
+        .unwrap_or_else(|| {
+            panic!("the follow-up SELECT must emit a result document, got:\n{stdout}")
+        });
     assert_eq!(
         rows.len(),
         0,

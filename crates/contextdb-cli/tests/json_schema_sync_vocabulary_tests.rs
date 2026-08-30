@@ -47,13 +47,22 @@ fn run_cli(stdin_sql: &str) -> (Option<i32>, String, String) {
     )
 }
 
+/// The payload of the `.schema` document.
+///
+/// `.schema` publishes one NAMESPACED document — `{"schema":{…}}` — like every
+/// other meta-command; the un-namespaced form, whose fields sat at the top
+/// level beside nothing that named them, is gone.
 fn schema_document(stdout: &str) -> serde_json::Value {
     stdout
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-        .find(|d| d.get("table").is_some())
-        .unwrap_or_else(|| panic!(".schema under --json must emit a document with a \"table\" key, got stdout:\n{stdout}"))
+        .find_map(|d| d.get("schema").cloned())
+        .unwrap_or_else(|| {
+            panic!(
+                ".schema under --json must emit a namespaced schema document, got stdout:\n{stdout}"
+            )
+        })
 }
 
 /// Every `sync_direction` DDL clause the engine accepts, and the wire word

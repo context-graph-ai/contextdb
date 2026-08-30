@@ -69,6 +69,25 @@ pub(crate) enum StoredVector {
     },
 }
 
+/// The value a quantized column actually stores.
+///
+/// A column declared with space-saving vector storage keeps a compressed
+/// approximation, not the caller's original. Anything that answers a read of
+/// such a column has to answer with what is stored, so this is the one place
+/// that says what "stored" means -- used both when the value is put away and
+/// when a reader asks what the store holds, so the two can never drift.
+///
+/// Applying it twice returns the same values it returned the first time: the
+/// input is already on the grid its own bounds define.
+pub fn stored_vector_value(vector: &[f32], quantization: VectorQuantization) -> Vec<f32> {
+    match quantization {
+        VectorQuantization::F32 => vector.to_vec(),
+        VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
+            StoredVector::from_f32(vector, quantization).to_f32()
+        }
+    }
+}
+
 impl StoredVector {
     pub fn from_f32(vector: &[f32], quantization: VectorQuantization) -> Self {
         match quantization {

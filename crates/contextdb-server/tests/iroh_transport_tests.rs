@@ -6,7 +6,8 @@ use contextdb_core::{TenantId, Value};
 use contextdb_engine::Database;
 use contextdb_server::transport::iroh::{
     EndpointSpec, IrohServer, LookupChoice, PeerRequest, PublishChoice, RelayChoice, SYNC_ALPN,
-    client_with_test_controller_for_test, is_iroh_endpoint, peer_connect, peer_request,
+    ServerResourcePolicy, client_with_test_controller_for_test, is_iroh_endpoint, peer_connect,
+    peer_request,
 };
 use contextdb_server::transport::{
     HandlerRegistration, IncomingRequest, RequestHandler, client_transport,
@@ -1577,10 +1578,13 @@ async fn runtime_response_staging_budget_refuses_and_cleans_an_over_budget_publi
 
     let hub_dir = tempfile::tempdir().expect("hub tempdir");
     let hub_identity = identity_file(&hub_dir);
-    let endpoint = within(IrohServer::bind(&format!(
-        "{}&response-staging-bytes=1",
-        bind_spec(&hub_identity)
-    )))
+    let endpoint = within(IrohServer::bind_with_resource_policy(
+        &bind_spec(&hub_identity),
+        ServerResourcePolicy {
+            response_staging_bytes: Some(1),
+            ..ServerResourcePolicy::default()
+        },
+    ))
     .await
     .expect("bind budgeted authenticated hub");
     let controller = endpoint.large_request_test_controller();
@@ -2893,7 +2897,12 @@ fn iroh_word_confined_to_adapter_and_config_surface() {
         // The engine feature gate and audits legitimately name the adapter
         // while keeping consumer sync callers transport-neutral.
         "contextdb-engine/src/lib.rs",
+        // These read-surface containment proofs name the remote adapter only
+        // to reject it as a dependency of direct and same-machine reading.
+        "contextdb-engine/tests/direct_file_reader_contract_tests.rs",
+        "contextdb-engine/tests/local_transport_containment.rs",
         "contextdb-engine/tests/durable_public_api_surface_tests.rs",
+        "contextdb-engine/tests/server_resource_policy_contract_tests.rs",
         "contextdb-engine/tests/sync_source_mirror_tests.rs",
         // The test-estate ratchet audit names test FILES (including this one)
         // in its per-file sleep counts — filenames, not transport use.
@@ -3044,18 +3053,18 @@ async fn enrollment_ticket_failures_redact_the_ticket_at_every_entrypoint() {
         &["invalid value", "port"],
     );
     record(
-        "parser invalid response staging",
+        "parser former response staging key",
         parser(format!(
             "iroh:?identity=/tmp/safe.key&response-staging-bytes={ticket}"
         )),
-        &["invalid value", "response-staging-bytes"],
+        &["top-level", "--response-staging-bytes"],
     );
     record(
         "parser unknown key",
         parser(format!("iroh:?{ticket}=ignored")),
         &[
             "unknown parameter",
-            "accepted: identity, port, relay, relay-ca, publish, lookup, response-staging-bytes, pre-admission-connections, pre-admission-bytes, request-read-idle-ms, to",
+            "accepted: identity, port, relay, relay-ca, publish, lookup, to",
         ],
     );
     record(
@@ -3250,10 +3259,13 @@ async fn oversized_stage_diagnostics_redact_bearer_tokens_from_identity_filename
     FabricIdentity::load_or_generate(&cleanup_identity).expect("persist cleanup identity");
     let cleanup_root = stage_root_for(&cleanup_identity);
     seal_stage_root(&cleanup_root);
-    let cleanup_result = within(IrohServer::bind(&format!(
-        "{}&response-staging-bytes=1",
-        bind_spec(&cleanup_identity)
-    )))
+    let cleanup_result = within(IrohServer::bind_with_resource_policy(
+        &bind_spec(&cleanup_identity),
+        ServerResourcePolicy {
+            response_staging_bytes: Some(1),
+            ..ServerResourcePolicy::default()
+        },
+    ))
     .await;
     unseal_stage_root(&cleanup_root);
     let cleanup_diagnostic = match cleanup_result {

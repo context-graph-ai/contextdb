@@ -24,6 +24,7 @@ pub mod chunking;
 pub use contextdb_engine::error;
 pub mod exit_codes;
 pub use contextdb_engine::identity;
+pub mod owner_read_options;
 pub use contextdb_engine::protocol;
 pub use contextdb_engine::subjects;
 pub mod sync_client {
@@ -44,6 +45,7 @@ pub mod work_ledger;
 #[cfg(feature = "iroh")]
 pub use blob_resolver::{BlobStore, ResolveError};
 pub use contextdb_engine::FabricIdentity;
+pub use owner_read_options::{OwnerConfiguration, OwnerReadOptions};
 pub use sync_client::SyncClient;
 #[doc(hidden)]
 pub use sync_client::{acceptance_stamped_push_batches_for_test, split_changeset_for_test};
@@ -53,7 +55,7 @@ pub use sync_server::SyncServer;
 /// worker/claim/push surface can spin a runtime without taking its own direct `tokio` dependency.
 pub use tokio;
 pub use transfer_receipts::{TransferCounters, TransferDirection, TransferPlane, TransferReceipt};
-#[cfg(any(test, feature = "test-seams"))]
+#[cfg(any(test, feature = "in-process-test-seams", feature = "test-seams"))]
 pub use transport::in_process::InProcessBroker;
 // Transport-neutral peer endpoint surface for embedding consumers (e.g.
 // a downstream fabric runtime): a consumer names `PeerEndpoint` / `PeerEndpointSpec`

@@ -3231,7 +3231,7 @@ fn local_create_of_work_claims_with_a_table_level_propagate_option_refuses() {
 /// which declares no state machine at all -- must refuse. Confirmed live:
 /// accepted today for the same reason the IMMUTABLE probes above are --
 /// `refuse_engine_owned_reserved_name_shape` receives only 5 of
-/// `CreateTablePlan`'s 13 fields (name/columns/unique_constraints/
+/// `CreateTablePlan`'s 14 fields (name/columns/unique_constraints/
 /// primary_key_columns/composite_foreign_keys); `state_machine` is never
 /// passed in.
 #[test]

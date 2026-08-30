@@ -475,12 +475,18 @@ async fn run_installed_cli_refusals(
             .map_err(|_| "cannot close auto CLI database offline".to_string())?;
     }
 
+    // Auto-sync pushes this session's own edits, so it is a writing session
+    // like every other journey here.
     let mut child = Command::new(cli)
         .arg(&auto_db)
         .arg("--json")
-        .env("CONTEXTDB_SYNC_ENDPOINT", &hub.ticket)
-        .env("CONTEXTDB_TENANT_ID", tenant)
-        .env("CONTEXTDB_SYNC_DEBOUNCE_MS", "0")
+        .arg("--write")
+        .arg("--sync-endpoint")
+        .arg(&hub.ticket)
+        .arg("--tenant-id")
+        .arg(tenant)
+        .arg("--sync-debounce-ms")
+        .arg("0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1016,6 +1022,13 @@ async fn run_offline_delete_refused(root: &Path, cli: &Path) -> Result<(), Strin
     hub.stop().await
 }
 
+/// Drives the installed CLI through one journey and collects what it said.
+///
+/// Every journey run this way writes -- it declares a table, edits rows, or
+/// pushes and pulls -- and the CLI reads a store by default, so the session
+/// takes `--write`. That flag is also what creates a store the journey has not
+/// opened yet. A probe that means to READ must not come through here: it would
+/// be handed the writing session it is trying to prove it does not need.
 fn run_cli(
     cli: &Path,
     db: &Path,
@@ -1025,17 +1038,15 @@ fn run_cli(
     debounce_ms: u64,
 ) -> Result<(ExitStatus, String, String), String> {
     let mut command = Command::new(cli);
-    command
-        .arg(db)
-        .arg("--json")
-        .env_remove("CONTEXTDB_SYNC_ENDPOINT")
-        .env_remove("CONTEXTDB_TENANT_ID")
-        .env_remove("CONTEXTDB_SYNC_DEBOUNCE_MS");
+    command.arg(db).arg("--json").arg("--write");
     if let Some(ticket) = ticket {
         command
-            .env("CONTEXTDB_SYNC_ENDPOINT", ticket)
-            .env("CONTEXTDB_TENANT_ID", tenant)
-            .env("CONTEXTDB_SYNC_DEBOUNCE_MS", debounce_ms.to_string());
+            .arg("--sync-endpoint")
+            .arg(ticket)
+            .arg("--tenant-id")
+            .arg(tenant)
+            .arg("--sync-debounce-ms")
+            .arg(debounce_ms.to_string());
     }
     let mut child = command
         .stdin(Stdio::piped())

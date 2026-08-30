@@ -9,16 +9,30 @@ Two different jobs bring an agent here. Pick one; you do not need the other half
 
 ## Safety boundaries (both jobs, read before you run anything)
 
-### There is no read-only way to open a store
+### Reading is safe by default
 
-Plain `contextdb <path>` is **always** a read-write session. Even a no-op meta-command like
-`.help` rewrites the file's bytes. Never open a store you must not alter just to look at it —
-copy it first and open the copy, or use `repair`, which is genuinely read-only:
+Plain `contextdb <path>` opens an existing store for a bounded **read session** — it never
+creates the store, never opens it through a writable handle, and leaves every byte in the store
+folder unchanged. A no-op meta-command like `.help` does not rewrite anything either. The session
+resolves one of two read routes and never switches mid-session:
+
+- **Owner route** — a live process already owns the store, so the session is served that
+  owner's committed state over its authenticated local channel.
+- **File route** — nobody owns the store, so the session reads the committed snapshot directly
+  from the file. Several direct readers coexist on one store.
+
+There is nothing to copy first — reading never requires a peek copy. Two contracts to know
+before you script against this:
+
+- **A missing store is refused, not created.** `contextdb <path>` against a path that does not
+  exist returns `store_not_found`; only `contextdb <path> --write` creates it.
+- **Mutation needs the flag.** SQL or a meta-command that would change state is refused with
+  `write_requires_flag` on a read session — add `--write` to run it.
 
 ```bash
-contextdb repair ./their.db                       # read-only diagnosis, never modifies
-peek="$(mktemp -d)/peek.db"; cp ./their.db "$peek" # read the DATA without touching the original
-echo ".tables" | contextdb "$peek" --json
+contextdb ./their.db                              # bounded read session, never modifies
+echo ".tables" | contextdb ./their.db --json       # reads without copying anything
+contextdb ./their.db --write                       # explicit read-write session
 ```
 
 ### Destructive commands need explicit confirmation
@@ -30,7 +44,7 @@ there, run them freely and without asking.
 
 | Goal | Sanctioned command | Guardrail |
 |---|---|---|
-| Find out why a store will not open | `contextdb repair <path>` | Read-only. Always safe. Start here. |
+| Find out why a store will not open | `contextdb diagnose <path>` | Read-only. Always safe. Start here. |
 | Bring a legacy-format root forward | `contextdb migrate <path>` | Rehearse on a copy first (procedure below). Writes `<path>.bak`. |
 | Recreate a wedged or corrupt store | `contextdb reset <path> --force` | Destroys all data. Recover what you need from a backup or a healthy sync peer first. `--force` is mandatory; without it the CLI refuses and exits `2`. |
 | Take a backup before any of the above | `contextdb snapshot export <path> <dest>` | Purge-fenced; the safe prerequisite for `migrate` and `reset`. |
@@ -73,15 +87,24 @@ db="$(mktemp -d)/scratch.db"
 printf "%s\n" \
   "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT NOT NULL);" \
   "INSERT INTO decisions VALUES ('550e8400-e29b-41d4-a716-446655440000', 'draft');" \
-  "SELECT * FROM decisions;" | contextdb "$db" --json
+  "SELECT * FROM decisions;" | contextdb "$db" --write --json
 # {"rows_affected":0}
 # {"rows_affected":1}
-# [{"id":"550e8400-e29b-41d4-a716-446655440000","status":"draft"}]
+# {"result":{"columns":["id","status"],"rows":[{"id":"550e8400-e29b-41d4-a716-446655440000","status":"draft"}]}}
 ```
 
-Prefer `--json` and read named fields; never scrape the human table output, which is capped at
-100 rows and reflows freely. Under `--json`, stdout is JSON Lines (results only) and everything
-else — errors `{"error":{"class":...}}`, notices, traces — goes to stderr. Branch on the exit code:
+`--write` is what creates the store and authorizes the `CREATE`/`INSERT`; drop it once you are
+only reading the store back.
+
+Prefer `--json` and read named fields; never scrape the human table output, which reflows freely.
+A successful ordinary `SELECT` is one namespaced document — `{"result":{"columns":[…],"rows":[…]}}`
+— so a consumer reads `.result.rows`, and metadata commands answer under their own keys
+(`.tables` → `{"tables":{"items":[…],"has_more":…,"continuation":…}}`). Nothing truncates a
+result and there is no row cap to disable: a result either publishes complete or refuses with
+`owner_limit_exceeded` under the declared `--read-result-rows` / `--read-result-bytes` ceilings,
+and the refusal prints the `.cursor open` command that pages it instead. Under `--json`, stdout is
+JSON Lines (results only) and everything else — errors `{"error":{"class":...}}`, notices, traces
+— goes to stderr. Branch on the exit code:
 `0` success, `1` the run failed, `2` the command line was wrong so nothing ran, `3` a `.sync push`
 was interrupted and is unconfirmed, so re-push (never treat `3` as failure).
 
@@ -161,6 +184,13 @@ Describe the capability, then go to the crate that owns it — do not go looking
 | A function that works in `SELECT` but is refused in `ORDER BY` | You added it to `eval_function` only. Those two lists are hand-synced with no cross-reference — add every new function to both. |
 | Grammar, DDL clauses, `PROPAGATE` | Parser crate; grammar reference is [`docs/query-language.md`](docs/query-language.md). |
 | Sync protocol, conflict arbitration, work ledger | Engine crate owns the implementations; the server crate re-exports them. Never add a mirror module in the server — extend the engine and re-export. |
+| How a bounded read session opens and which route it takes | Engine crate, `read_session.rs` — it assembles the one public `ReadSession` and its two routes. Adding a third route, or a second way to open a store for reading, is out of bounds. |
+| Reading a store nobody owns (the committed-snapshot file route) | Engine crate, `direct_file_reader.rs`. |
+| Serving readers from a live writer (admission, client, service) | Engine crate, `owner_read/`. |
+| Addressing, authenticating, framing or timing the owner channel | Engine crate, `local_transport/`. Never open a second transport beside it. |
+| How a read is actually executed and charged against its budgets | Engine crate, `executor/bounded.rs` — the one execution kernel both routes share. Never give a consumer its own execution semantics. |
+| The trusted companion, the claim window, reader holds, published reader identities | Engine crate, `persistence.rs`. |
+| A refusal class or kind a reader can branch on | Core crate, `read_contract.rs` — the shared typed vocabulary. Never define a second refusal type downstream of it. |
 | Anything else | [`docs/architecture.md`](docs/architecture.md#crate-map) maps all 11 crates and the dependency direction. |
 
 ### Testing discipline

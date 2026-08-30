@@ -535,6 +535,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 name = "contextdb-core"
 version = "1.0.0"
 dependencies = [
+ "bincode 2.0.1",
  "rand 0.9.2",
  "roaring",
  "serde",
@@ -567,6 +568,7 @@ dependencies = [
  "iroh-tickets",
  "irpc",
  "libc",
+ "nix",
  "parking_lot",
  "range-collections",
  "redb",
@@ -2492,6 +2494,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mio"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2729,6 +2740,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

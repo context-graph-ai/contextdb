@@ -4,6 +4,9 @@ use crate::database::{
 };
 use crate::rank_formula::RankFormula;
 use crate::sync_types::{DdlChange, natural_key_from_row_values};
+use contextdb_core::read_contract::{
+    CursorPage, DeadlineClock, OwnerReadCancellation, ReadFailure, ReadLimits,
+};
 use contextdb_core::*;
 use contextdb_parser::ast::{
     AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement,
@@ -16,7 +19,8 @@ use contextdb_planner::{
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -26,6 +30,1592 @@ use time::format_description::well_known::Rfc3339;
 // the complete local DDL validation/projection after another schema writer
 // released the allocation lock.
 const RETRY_LOCAL_SCHEMA_PROJECTION: &str = "__contextdb_internal_retry_local_schema_projection__";
+
+pub(crate) mod bounded;
+
+/// One suspended cursor's snapshot pin: the snapshot it reads, the idle
+/// window its registration is judged by, and the registration holding both.
+pub(crate) type BoundedCursorSnapshotPin = (
+    SnapshotId,
+    Arc<crate::database::CursorIdleWindow>,
+    Box<dyn Send + Sync>,
+);
+
+/// The copy a caller takes of one stored vector, with the bytes it charged
+/// for that copy.
+pub(crate) type BoundedRowVectorClone = (Vec<f32>, usize);
+
+/// Scored vector candidates, with the bytes their scores retain.
+pub(crate) type BoundedVectorCandidates = (Vec<(RowId, f32)>, usize);
+
+/// The store a bounded read runs against.
+///
+/// The kernel reaches every source through this seam, so a read is described
+/// by the questions it asks rather than by which handle answers them. A live
+/// engine handle and a read-only image hydrated from a file are one shape
+/// here, which is what keeps both reading routes on the same planner, the
+/// same statistics, and the same physical decisions rather than on two
+/// projections that drift.
+///
+/// Callbacks arrive erased and every fallible source answer carries the
+/// kernel's own refusal type. The underlying store methods are generic over
+/// the caller's error only because they sit below this module; this kernel is
+/// their sole caller, so the seam fixes that error and stays usable behind a
+/// shared pointer, which is what a suspended cursor retains between fetches.
+// Source signatures mirror the store methods this seam fronts, one for one,
+// so a source cannot answer a differently shaped question than the store.
+#[allow(clippy::too_many_arguments)]
+/// What a transaction a handle has open changes about what its own reads see
+/// of one table.
+///
+/// The uncapped read path performs this merge in one pass over the whole
+/// table; a bounded read cannot, because every row it touches has to be
+/// charged before it is touched. So the cheap half -- which committed rows the
+/// transaction hides, and where its own rows are -- is captured once here, and
+/// the rows themselves are pulled one at a time and charged like any other.
+#[derive(Debug, Default)]
+pub(crate) struct TransactionTableOverlay {
+    /// Committed rows the transaction has staged for deletion by identity.
+    pub(crate) deleted: std::collections::HashSet<RowId>,
+    /// Deletions the transaction staged by value rather than by identity.
+    pub(crate) delete_predicates: Vec<contextdb_tx::RelationalDeletePredicate>,
+    /// Where this table's staged rows sit in the transaction's write set,
+    /// newest version per row, in the order the transaction staged them.
+    pub(crate) staged_positions: Vec<usize>,
+    /// The identities of those staged rows, so a committed row the
+    /// transaction has rewritten is passed over and its staged version
+    /// published instead.
+    pub(crate) staged_identities: std::collections::HashSet<RowId>,
+    /// What holding the above costs.
+    pub(crate) bytes: usize,
+}
+
+impl TransactionTableOverlay {
+    /// Nothing staged, nothing hidden: the read is the same read it would
+    /// have been with no transaction open.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.deleted.is_empty()
+            && self.delete_predicates.is_empty()
+            && self.staged_positions.is_empty()
+    }
+}
+
+/// What an open transaction changes about the vectors ONE index can be
+/// searched over.
+///
+/// A transaction's own vectors are no more in the store than its rows are, and
+/// no approximate graph can describe them, so a read that has to see them
+/// scores the merged image instead. That is the choice the established door
+/// already makes for exactly this case.
+#[derive(Default)]
+pub(crate) struct TransactionVectorOverlay {
+    /// Entries the transaction has taken out of this index: the vectors it
+    /// deleted, and the rows it deleted relationally without putting a row
+    /// back at the same identity.
+    pub(crate) removed: std::collections::HashSet<RowId>,
+    /// Entries it re-filed under another identity. A cosine score does not
+    /// depend on the identity it is filed under, so a move is published by
+    /// re-keying what the committed walk already scored -- the vector never
+    /// has to be read a second time to move it.
+    pub(crate) moved: HashMap<RowId, RowId>,
+    /// Identities the transaction staged a vector for, so the committed entry
+    /// is passed over and the staged one published in its place.
+    pub(crate) staged_identities: std::collections::HashSet<RowId>,
+    /// Where this index's staged vectors sit in the write set, newest version
+    /// per row, in the order the transaction staged them.
+    pub(crate) staged_positions: Vec<usize>,
+    /// How many entries this index can be searched over once the
+    /// transaction's own vectors are counted in. A source that stops at the
+    /// statement's LIMIT would truncate before the overlay has had its say --
+    /// dropping a row this transaction removed still leaves the answer one
+    /// short, and a row it staged never gets to compete at all -- so the
+    /// source is asked for this many and the truncation happens after.
+    pub(crate) searchable_entry_count: usize,
+    /// What holding the above costs.
+    pub(crate) bytes: usize,
+}
+
+impl TransactionVectorOverlay {
+    /// Nothing staged, nothing withdrawn, nothing moved: the search is the
+    /// search it would have been with no transaction open.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.moved.is_empty() && self.staged_positions.is_empty()
+    }
+
+    /// Kept only when it actually changes the search, so every later read of
+    /// it is a plain `is_some` rather than a re-test of three collections.
+    pub(crate) fn into_option_if_not_empty(self) -> Option<Self> {
+        (!self.is_empty()).then_some(self)
+    }
+}
+
+pub(crate) trait ReadExecutionTarget: Send + Sync {
+    /// The value a row's vector column holds, taken from the store that holds
+    /// it. A column declared with space-saving storage keeps its value there
+    /// and nowhere else, so a read that names such a column asks here.
+    fn row_vector_for_column(
+        &self,
+        table: &str,
+        column: &str,
+        row_id: RowId,
+        lsn: Lsn,
+        snapshot: SnapshotId,
+    ) -> Option<Vec<f32>>;
+
+    /// Which of a table's vector columns keep their value in the store alone.
+    fn quantized_vector_columns(&self, table: &str) -> Vec<String>;
+
+    fn plugin(&self) -> &dyn crate::plugin::DatabasePlugin;
+
+    fn table_meta(&self, table: &str) -> Option<TableMeta>;
+
+    fn natural_key_column_for_table(&self, table: &str) -> Result<String>;
+
+    fn row_id_for_natural_key_in_tx(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        key_col: &str,
+        key_value: &Value,
+        snapshot: SnapshotId,
+    ) -> Result<Option<RowId>>;
+
+    fn prepare_bounded_read_plan(
+        &self,
+        parsed: &Statement,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Statement, PhysicalPlan)>;
+
+    fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant>;
+
+    /// Answer one of the read-classified statements a store makes about
+    /// ITSELF -- the memory and disk budgets in force, the sync conflict
+    /// policy each table declares, the vector indexes it holds.
+    ///
+    /// These read no rows, so they have no source to walk and no page to cut;
+    /// they read live engine state and hand back a small fixed answer. They
+    /// are still READS (`statement_effect` classifies them so), so a reading
+    /// session has to be able to run them, which is why they arrive here
+    /// rather than being refused as "not a SELECT". A target with no engine
+    /// state to describe keeps the old refusal.
+    fn store_state_answer(&self, plan: &PhysicalPlan) -> Result<QueryResult> {
+        let _ = plan;
+        Err(Error::PlanError(
+            "bounded execution accepts read-only SELECT plans".to_string(),
+        ))
+    }
+
+    /// The plan the engine WOULD run for this statement, rendered without
+    /// running it.
+    ///
+    /// Explaining a read runs it, because the route a read really takes is
+    /// only known once it has taken it. Explaining a write cannot run it, so
+    /// what it answers is the plan itself -- planning reads schema and
+    /// chooses a strategy, and changes nothing.
+    fn explain_plan_without_running_it(&self, sql: &str) -> Result<String> {
+        let _ = sql;
+        Err(Error::PlanError(
+            "bounded execution accepts read-only SELECT plans".to_string(),
+        ))
+    }
+
+    /// The transaction this target has open, if it has one.
+    ///
+    /// A transaction's own rows are not in the store: they sit in its write
+    /// set until it commits, so no snapshot can reveal them. A read over the
+    /// handle that owns the transaction therefore has to be TOLD about it to
+    /// see its own writes. A committed file, and a target that owns no
+    /// transaction, answers `None` and reads exactly as before.
+    fn active_read_transaction(&self) -> Option<TxId> {
+        None
+    }
+
+    /// What that transaction changes about what a read of one table sees.
+    fn transaction_table_overlay(&self, tx: TxId, table: &str) -> Result<TransactionTableOverlay> {
+        let _ = (tx, table);
+        Ok(TransactionTableOverlay::default())
+    }
+
+    /// One row the transaction has staged, cloned under the caller's charge,
+    /// exactly as a committed row is. `position` is an entry of
+    /// [`TransactionTableOverlay::staged_positions`].
+    fn transaction_staged_row(
+        &self,
+        tx: TxId,
+        position: usize,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        let _ = (tx, position, before_touch, before_clone);
+        Ok(None)
+    }
+
+    /// What that transaction changes about the vectors one index can be
+    /// searched over.
+    fn transaction_vector_overlay(
+        &self,
+        tx: TxId,
+        index: &VectorIndexRef,
+    ) -> Result<TransactionVectorOverlay> {
+        let _ = (tx, index);
+        Ok(TransactionVectorOverlay::default())
+    }
+
+    /// One vector the transaction has staged, cloned under the caller's
+    /// charge, exactly as a committed entry is. `position` is an entry of
+    /// [`TransactionVectorOverlay::staged_positions`].
+    fn transaction_staged_vector(
+        &self,
+        tx: TxId,
+        position: usize,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<(RowId, Vec<f32>)>, BoundedExecutionError> {
+        let _ = (tx, position, before_touch, before_clone);
+        Ok(None)
+    }
+
+    fn bounded_read_snapshot_registration(
+        &self,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<(SnapshotId, Box<dyn Send + Sync>)>>;
+
+    fn bounded_cursor_snapshot_registration(
+        &self,
+        clock: Arc<dyn DeadlineClock>,
+        idle_ms: u64,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<BoundedCursorSnapshotPin>>;
+
+    fn assert_table_read_allowed(&self, table: &str) -> Result<()>;
+
+    fn bounded_read_requires_candidate_filter(&self, table: &str) -> Result<bool>;
+
+    fn bounded_read_allowed_for_row(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        meta: &TableMeta,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+        before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<bool, BoundedExecutionError>;
+
+    /// Whether this index pick PINS the row it is asking about -- an equality
+    /// on a key that identifies at most one row. A read shaped like that is
+    /// asking about a row it names, so being told "no such row" about a row
+    /// that exists is a lie; a read that is not so shaped is asking what it
+    /// may see, and hiding is the honest answer. The executor draws this line
+    /// itself; the kernel asks the same question rather than forming a second
+    /// opinion.
+    fn read_pick_names_one_row(
+        &self,
+        table: &str,
+        pick: &IndexPick,
+        filter: Option<&Expr>,
+        params: &HashMap<String, Value>,
+    ) -> bool {
+        let _ = (table, pick, filter, params);
+        false
+    }
+
+    /// The same question for a source that asks an index whole keys rather
+    /// than picking a run.
+    ///
+    /// Being built on columns that identify one row is not enough: a
+    /// primary-key index is unique whether the statement names ONE key or a
+    /// list of them, and a list is a set. So the statement is asked too, the
+    /// same way the pick above asks it -- one equality per anchor column, or
+    /// this read is a set read and hides what it may not see.
+    fn read_index_names_one_row(
+        &self,
+        table: &str,
+        index: &str,
+        filter: Option<&Expr>,
+        params: &HashMap<String, Value>,
+    ) -> bool {
+        let _ = (table, index, filter, params);
+        false
+    }
+
+    /// The same decision with the REASON a row was withheld, for a caller that
+    /// must refuse rather than skip. An entitlement decision is not a missing
+    /// row, so the reader is told which it is.
+    fn bounded_read_denial_for_row(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        meta: &TableMeta,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+        before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<Error>, BoundedExecutionError>;
+
+    /// One row named by its identity, read the bounded way.
+    ///
+    /// A caller that already knows WHICH rows it wants asks for those rows.
+    /// Finding them by walking the table instead costs what the table has ever
+    /// been written, not what the caller asked for -- every superseded version
+    /// of every row, inspected and discarded, for each row published.
+    fn bounded_row_by_identity(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
+
+    fn bounded_physical_table_cursor(
+        &self,
+        table: &str,
+    ) -> Result<contextdb_relational::mem::BoundedPhysicalCursor>;
+
+    fn bounded_physical_table_row_next(
+        &self,
+        table: &str,
+        cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_ordered_table_row_next(
+        &self,
+        table: &str,
+        column: &str,
+        direction: contextdb_core::SortDirection,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
+
+    /// One visible row at a time from the exact keys a predicate names, for
+    /// an index that keeps postings by key rather than in order.
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_exact_index_row_next(
+        &self,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError>;
+
+    fn bounded_vector_schema_read_many(
+        &self,
+        indexes: Vec<VectorIndexRef>,
+    ) -> crate::database::VectorSchemaReadGuard;
+
+    fn assert_vector_index_exists_under_schema_read(&self, index: &VectorIndexRef) -> Result<()>;
+
+    fn validate_vector_under_schema_read(
+        &self,
+        index: &VectorIndexRef,
+        actual: usize,
+    ) -> Result<()>;
+
+    fn bounded_vector_candidate_k(
+        &self,
+        index: &VectorIndexRef,
+        requested: usize,
+        sort_key: Option<&str>,
+    ) -> Result<usize>;
+
+    /// The copy the caller makes while the row is still borrowed under the
+    /// schema read, reported with the bytes it charged for.
+    fn with_bounded_row_vector(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        use_vector: &mut dyn FnMut(
+            &[f32],
+        ) -> std::result::Result<
+            BoundedRowVectorClone,
+            BoundedExecutionError,
+        >,
+    ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_brute_force_vector_cursor(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>;
+
+    fn bounded_brute_force_vector_step(
+        &self,
+        cursor: &mut contextdb_vector::mem::BoundedBruteForceCursor,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_hnsw_vector_search(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<BoundedVectorCandidates>, BoundedExecutionError>;
+
+    /// Build this index's approximate graph if this snapshot is entitled to
+    /// one, and answer whether a graph is now there to search.
+    ///
+    /// A search does not build on its own terms: it asks the store, which
+    /// builds under its own maintenance lock and its own rules. Without this,
+    /// a store searched only through this door would never build a graph at
+    /// all -- every search would score every row, and say so.
+    fn bounded_ensure_hnsw_built(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> bool {
+        let _ = (index, snapshot);
+        false
+    }
+
+    /// The standing visited ceiling a traversal keeps when the caller declared
+    /// no budget of its own, and `None` when it declared one -- a declared
+    /// budget is what replaces the ceiling.
+    fn bounded_legacy_visited_cap(&self, declares_no_ceilings: bool) -> Option<usize> {
+        let _ = declares_no_ceilings;
+        None
+    }
+
+    /// Reserve, against the STORE's memory limit, the working set a search
+    /// holds while it is reading a transaction's own vectors.
+    ///
+    /// The read's own ceiling governs what this request may hold; the store's
+    /// limit governs what the store may hold for everyone. Both apply, and a
+    /// refusal from the store's limit has to name the work it stopped, so an
+    /// operator can act on it. The guard releases when the search is done with
+    /// it.
+    fn bounded_vector_overlay_reservation(
+        &self,
+        index: &VectorIndexRef,
+        entry_count: usize,
+    ) -> Result<Option<Box<dyn Send + Sync>>> {
+        let _ = (index, entry_count);
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_rank_candidate(
+        &self,
+        index: &VectorIndexRef,
+        sort_key: &str,
+        anchor_row_id: RowId,
+        anchor_values: &HashMap<String, Value>,
+        vector_score: f32,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        before_candidate: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_joined_clone: &mut dyn FnMut(
+            usize,
+        )
+            -> std::result::Result<(), BoundedExecutionError>,
+        release_joined_clone: &mut dyn FnMut(
+            usize,
+        )
+            -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(Option<f32>, usize), BoundedExecutionError>;
+
+    fn bounded_graph_edge_cursor(
+        &self,
+        direction: contextdb_core::Direction,
+        snapshot: SnapshotId,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<crate::database::gate::BoundedGraphEdgeCursor, BoundedExecutionError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_graph_edge_next(
+        &self,
+        cursor: &mut crate::database::gate::BoundedGraphEdgeCursor,
+        edge_types: Option<&[EdgeType]>,
+        tx: Option<TxId>,
+        before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        entry_read: &mut dyn FnMut(),
+    ) -> std::result::Result<
+        Option<crate::database::gate::CountedGraphScanEdge>,
+        BoundedExecutionError,
+    >;
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_graph_bfs_cursor(
+        &self,
+        tx: Option<TxId>,
+        start: NodeId,
+        edge_types: Option<&[EdgeType]>,
+        direction: contextdb_core::Direction,
+        min_depth: u32,
+        max_depth: u32,
+        snapshot: SnapshotId,
+        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, BoundedExecutionError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_graph_bfs_next(
+        &self,
+        cursor: &mut contextdb_graph::mem::BoundedBfsCursor,
+        before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_path_element: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+        staged_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        staged_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        staged_hand_back: &mut dyn FnMut(usize),
+        entry_read: &mut dyn FnMut(),
+        visited_cap: Option<usize>,
+        tx: Option<TxId>,
+    ) -> std::result::Result<
+        Option<contextdb_graph::mem::BoundedTraversalNode>,
+        BoundedExecutionError,
+    >;
+
+    /// Predicate resolution and value coercion are part of what a source
+    /// answers: an index probe and a graph filter must be read against the
+    /// same column types and the same snapshot that produced the rows.
+    #[allow(dead_code)]
+    fn resolve_graph_filter_at_snapshot(
+        &self,
+        expr: &Expr,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+        ctes: &[Cte],
+    ) -> Result<Expr>;
+
+    /// The in-process store, when this target is one. A subquery has to be
+    /// PLANNED against a real store before it can be read, and planning is the
+    /// half both doors share; a target that is not a store never carries a
+    /// subquery to plan.
+    fn as_database_for_subquery_plan(&self) -> Option<&Database> {
+        None
+    }
+
+    /// The start vertices a filter names, resolved against the store the way
+    /// the executor resolves them. A start named by anything other than its id
+    /// is still a pinned start; a door that cannot resolve one walks every edge
+    /// in the store to answer a probe.
+    #[allow(dead_code)]
+    fn resolve_graph_start_nodes_from_filter(
+        &self,
+        filter: &Expr,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+        start_alias: &str,
+    ) -> Result<GraphStartResolution>;
+
+    fn graph_filter_matches_bindings(
+        &self,
+        filter: &Expr,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+        bindings: &HashMap<String, uuid::Uuid>,
+    ) -> Result<bool>;
+
+    fn coerce_into_column(
+        &self,
+        table: &str,
+        col: &str,
+        value: Value,
+        current_tx_max: Option<TxId>,
+        active_tx: Option<TxId>,
+    ) -> Result<Value>;
+
+    fn coerce_pick_shape_to_column_type(&self, table: &str, pick: &IndexPick) -> Result<IndexPick>;
+
+    /// Run one complete bounded read and answer in the reading surface's own
+    /// words: the result and the canonical bytes that publish it.
+    ///
+    /// The reading routes hold this seam and nothing below it, so the answer
+    /// they get has to be sayable in their vocabulary: a complete result, a
+    /// typed refusal, or the withdrawal a cancelled caller asked for. The
+    /// bytes are produced here, by the one shared encoder, so two routes
+    /// answering the same question publish the same bytes rather than two
+    /// encodings that agree until they do not.
+    fn read_query(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: &OwnerReadCancellation,
+    ) -> std::result::Result<(QueryResult, Vec<u8>), crate::direct_file_reader::DirectFileReaderError>;
+
+    /// Open a paged read and hand back its first page together with the
+    /// continuation that produces the rest.
+    ///
+    /// The continuation is itself a target: a suspended read is still a thing
+    /// you ask for rows, so it answers the same seam rather than a second one
+    /// the reading routes would have to learn.
+    ///
+    /// The answer is the continuation, the first page as the route publishes
+    /// it, and -- when that page already drained the read -- the empty page
+    /// the drained cursor keeps answering from then on.
+    #[allow(clippy::type_complexity)]
+    fn open_read_cursor(
+        self: Arc<Self>,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: &OwnerReadCancellation,
+        snapshot: crate::direct_file_reader::DirectSnapshot,
+    ) -> std::result::Result<
+        (
+            Arc<dyn ReadExecutionTarget>,
+            crate::direct_file_reader::DirectCursorPage,
+            Option<crate::direct_file_reader::DirectCursorPage>,
+        ),
+        crate::direct_file_reader::DirectFileReaderError,
+    >;
+
+    /// The next page of a suspended read, and the drained page that replaces
+    /// the read once this one ends it.
+    fn read_cursor_pages(
+        &self,
+        rows: Option<NonZeroUsize>,
+        cancellation: &OwnerReadCancellation,
+    ) -> std::result::Result<
+        (
+            crate::direct_file_reader::DirectCursorPage,
+            Option<crate::direct_file_reader::DirectCursorPage>,
+        ),
+        crate::direct_file_reader::DirectFileReaderError,
+    >;
+
+    /// Whether the suspended read behind this target is still there.
+    ///
+    /// A refusal that answered the REQUEST -- an explicit page count above the
+    /// row ceiling, say -- pulls nothing and consumes no continuation position,
+    /// so the read is exactly where the caller left it. A target that keeps a
+    /// suspended read says so here, and the routes above it then refuse the
+    /// request without throwing away the cursor the refusal tells the caller to
+    /// use. A target holding no cursor at all answers no.
+    fn read_cursor_retains_continuation(&self) -> bool {
+        false
+    }
+
+    /// Release a suspended read and everything it still holds.
+    fn close_read_cursor(
+        &self,
+    ) -> std::result::Result<(), crate::direct_file_reader::DirectFileReaderError>;
+
+    /// Answer one metadata question about a committed image, including the
+    /// plan question, which is answered by this same planner rather than by a
+    /// second description of it.
+    fn read_metadata(
+        &self,
+        request: crate::direct_file_reader::DirectMetadataRequest,
+        image: &crate::direct_file_reader::DirectOwnedImage,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        continuation: Option<&str>,
+    ) -> std::result::Result<
+        crate::direct_file_reader::DirectMetadataResponse,
+        crate::direct_file_reader::DirectFileReaderError,
+    >;
+}
+
+/// One page, as a reading route publishes it.
+fn published_page(
+    page: CursorPage,
+    snapshot: crate::direct_file_reader::DirectSnapshot,
+) -> std::result::Result<
+    crate::direct_file_reader::DirectCursorPage,
+    crate::direct_file_reader::DirectFileReaderError,
+> {
+    let canonical_bytes = crate::read_contract::encode_cursor_page(&page).map_err(|error| {
+        crate::direct_file_reader::DirectFileReaderError::Engine(error.to_string())
+    })?;
+    Ok(crate::direct_file_reader::DirectCursorPage {
+        page,
+        canonical_bytes,
+        snapshot,
+    })
+}
+
+/// The empty page a read answers with once it is drained, or nothing while
+/// there is still more to come.
+fn drained_page(
+    published: &crate::direct_file_reader::DirectCursorPage,
+) -> std::result::Result<
+    Option<crate::direct_file_reader::DirectCursorPage>,
+    crate::direct_file_reader::DirectFileReaderError,
+> {
+    if published.page.has_more {
+        return Ok(None);
+    }
+    published_page(
+        CursorPage {
+            columns: published.page.columns.clone(),
+            rows: Vec::new(),
+            has_more: false,
+        },
+        published.snapshot,
+    )
+    .map(Some)
+}
+
+/// The reading surface's answer to one bounded-kernel outcome.
+pub(crate) fn read_answer<T>(
+    outcome: std::result::Result<T, BoundedExecutionError>,
+) -> std::result::Result<T, crate::direct_file_reader::DirectFileReaderError> {
+    use crate::direct_file_reader::DirectFileReaderError;
+
+    outcome.map_err(|error| match error {
+        BoundedExecutionError::Refused(failure) => DirectFileReaderError::ReadFailure(failure),
+        BoundedExecutionError::Cancelled => DirectFileReaderError::Cancelled,
+        BoundedExecutionError::Unimplemented => {
+            DirectFileReaderError::Engine("this read has no approved bounded plan".to_owned())
+        }
+        BoundedExecutionError::Engine(engine) => DirectFileReaderError::Engine(engine.to_string()),
+    })
+}
+
+/// A suspended bounded read, kept behind the same seam the store answers so a
+/// reading route retains one shape rather than two.
+pub(crate) struct BoundedCursorTarget {
+    store: Arc<dyn ReadExecutionTarget>,
+    cursor: std::sync::Mutex<BoundedCursorHandle>,
+    /// What the engine actually reserved to keep this read suspended, and
+    /// therefore what is returned when it ends. It drops to zero on the
+    /// release, so however a cursor ends -- drained, closed, refused -- the
+    /// bytes come back exactly once.
+    retained: std::sync::atomic::AtomicU64,
+    released: std::sync::atomic::AtomicBool,
+    snapshot: crate::direct_file_reader::DirectSnapshot,
+}
+
+impl BoundedCursorTarget {
+    fn new(
+        store: Arc<dyn ReadExecutionTarget>,
+        cursor: BoundedCursorHandle,
+        retained: u64,
+        snapshot: crate::direct_file_reader::DirectSnapshot,
+    ) -> Arc<Self> {
+        #[cfg(feature = "test-seams")]
+        {
+            crate::read_probe::note_cursor_opened();
+            crate::read_probe::note_cursor_bytes_charged(retained);
+        }
+        Arc::new(Self {
+            store,
+            cursor: std::sync::Mutex::new(cursor),
+            retained: std::sync::atomic::AtomicU64::new(retained),
+            released: std::sync::atomic::AtomicBool::new(false),
+            snapshot,
+        })
+    }
+
+    /// End this read once, whatever ended it.
+    fn release(&self) -> std::result::Result<(), crate::direct_file_reader::DirectFileReaderError> {
+        if self
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let retained = self.retained.swap(0, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(feature = "test-seams")]
+        {
+            crate::read_probe::note_cursor_closed();
+            crate::read_probe::note_cursor_bytes_returned(retained);
+        }
+        #[cfg(not(feature = "test-seams"))]
+        let _ = retained;
+        self.with_cursor(close_bounded_cursor)
+    }
+
+    fn with_cursor<T>(
+        &self,
+        act: impl FnOnce(&mut BoundedCursorHandle) -> std::result::Result<T, BoundedExecutionError>,
+    ) -> std::result::Result<T, crate::direct_file_reader::DirectFileReaderError> {
+        let mut cursor = self
+            .cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        read_answer(act(&mut cursor))
+    }
+}
+
+/// The live engine handle is the production source, and the file route reads
+/// through a hydrated handle of the same shape rather than a second answer to
+/// these questions.
+#[allow(clippy::too_many_arguments)]
+impl ReadExecutionTarget for Database {
+    fn row_vector_for_column(
+        &self,
+        table: &str,
+        column: &str,
+        row_id: RowId,
+        lsn: Lsn,
+        snapshot: SnapshotId,
+    ) -> Option<Vec<f32>> {
+        Database::row_vector_for_column(self, table, column, row_id, lsn, snapshot)
+    }
+
+    fn quantized_vector_columns(&self, table: &str) -> Vec<String> {
+        Database::quantized_vector_columns(self, table)
+    }
+
+    fn plugin(&self) -> &dyn crate::plugin::DatabasePlugin {
+        Database::plugin(self)
+    }
+
+    fn table_meta(&self, table: &str) -> Option<TableMeta> {
+        Database::table_meta(self, table)
+    }
+
+    fn natural_key_column_for_table(&self, table: &str) -> Result<String> {
+        Database::natural_key_column_for_table(self, table)
+    }
+
+    fn row_id_for_natural_key_in_tx(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        key_col: &str,
+        key_value: &Value,
+        snapshot: SnapshotId,
+    ) -> Result<Option<RowId>> {
+        Database::row_id_for_natural_key_in_tx(self, tx, table, key_col, key_value, snapshot)
+    }
+
+    fn prepare_bounded_read_plan(
+        &self,
+        parsed: &Statement,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Statement, PhysicalPlan)> {
+        Database::prepare_bounded_read_plan(self, parsed, params)
+    }
+
+    fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
+        Database::bounded_read_accountant(self)
+    }
+
+    fn store_state_answer(&self, plan: &PhysicalPlan) -> Result<QueryResult> {
+        // The same arms the uncapped path runs, asked of the same handle:
+        // one implementation, so a budget read over a channel and the same
+        // read against the file cannot drift apart.
+        execute_plan(self, plan, &HashMap::new(), None)
+    }
+
+    fn explain_plan_without_running_it(&self, sql: &str) -> Result<String> {
+        Database::explain(self, sql)
+    }
+
+    fn active_read_transaction(&self) -> Option<TxId> {
+        Database::active_read_transaction(self)
+    }
+
+    fn transaction_table_overlay(&self, tx: TxId, table: &str) -> Result<TransactionTableOverlay> {
+        Database::transaction_table_overlay(self, tx, table)
+    }
+
+    fn transaction_staged_row(
+        &self,
+        tx: TxId,
+        position: usize,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        Database::transaction_staged_row(self, tx, position, before_touch, before_clone)
+    }
+
+    fn transaction_vector_overlay(
+        &self,
+        tx: TxId,
+        index: &VectorIndexRef,
+    ) -> Result<TransactionVectorOverlay> {
+        Database::transaction_vector_overlay(self, tx, index)
+    }
+
+    fn transaction_staged_vector(
+        &self,
+        tx: TxId,
+        position: usize,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<(RowId, Vec<f32>)>, BoundedExecutionError> {
+        Database::transaction_staged_vector(self, tx, position, before_touch, before_clone)
+    }
+
+    fn bounded_read_snapshot_registration(
+        &self,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<(SnapshotId, Box<dyn Send + Sync>)>> {
+        Database::bounded_read_snapshot_registration(self, withdrawn)
+    }
+
+    fn bounded_cursor_snapshot_registration(
+        &self,
+        clock: Arc<dyn DeadlineClock>,
+        idle_ms: u64,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<BoundedCursorSnapshotPin>> {
+        Database::bounded_cursor_snapshot_registration(self, clock, idle_ms, withdrawn)
+    }
+
+    fn assert_table_read_allowed(&self, table: &str) -> Result<()> {
+        Database::assert_table_read_allowed(self, table)
+    }
+
+    fn bounded_read_requires_candidate_filter(&self, table: &str) -> Result<bool> {
+        Database::bounded_read_requires_candidate_filter(self, table)
+    }
+
+    fn bounded_read_allowed_for_row(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        meta: &TableMeta,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+        before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<bool, BoundedExecutionError> {
+        Database::bounded_read_allowed_for_row(
+            self,
+            tx,
+            table,
+            meta,
+            row,
+            snapshot,
+            before_access_row,
+        )
+    }
+
+    fn bounded_read_denial_for_row(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        meta: &TableMeta,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+        before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<Error>, BoundedExecutionError> {
+        Database::bounded_read_denial_for_row(
+            self,
+            tx,
+            table,
+            meta,
+            row,
+            snapshot,
+            before_access_row,
+        )
+    }
+
+    fn read_pick_names_one_row(
+        &self,
+        table: &str,
+        pick: &IndexPick,
+        filter: Option<&Expr>,
+        params: &HashMap<String, Value>,
+    ) -> bool {
+        match filter {
+            Some(filter) => is_anchor_shape_index_pick(self, table, pick, filter, params),
+            None => pick_names_one_row(self, table, pick).is_some(),
+        }
+    }
+
+    fn read_index_names_one_row(
+        &self,
+        table: &str,
+        index: &str,
+        filter: Option<&Expr>,
+        params: &HashMap<String, Value>,
+    ) -> bool {
+        let Some(meta) = self.table_meta(table) else {
+            return false;
+        };
+        let Some(declaration) = meta
+            .indexes
+            .iter()
+            .find(|declaration| declaration.name == index)
+        else {
+            return false;
+        };
+        let columns: Vec<&str> = declaration
+            .columns
+            .iter()
+            .map(|(column, _)| column.as_str())
+            .collect();
+        let Some(anchor_columns) = unique_anchor_columns_for_pick(&meta, &columns) else {
+            return false;
+        };
+        // A source with no residual predicate cannot be naming one row: the
+        // keys it is probing came from somewhere, and without the statement to
+        // confirm an equality there is nothing that says the somewhere was a
+        // single key.
+        filter
+            .is_some_and(|filter| filter_has_equality_for_columns(filter, params, &anchor_columns))
+    }
+
+    fn bounded_row_by_identity(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        Database::bounded_row_by_identity(
+            self,
+            tx,
+            table,
+            row_id,
+            snapshot,
+            before_touch,
+            before_clone,
+        )
+    }
+
+    fn bounded_physical_table_cursor(
+        &self,
+        table: &str,
+    ) -> Result<contextdb_relational::mem::BoundedPhysicalCursor> {
+        Database::bounded_physical_table_cursor(self, table)
+    }
+
+    fn bounded_physical_table_row_next(
+        &self,
+        table: &str,
+        cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        Database::bounded_physical_table_row_next(self, table, cursor, before_touch, before_clone)
+    }
+
+    fn bounded_exact_index_row_next(
+        &self,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        Database::bounded_exact_index_row_next(
+            self,
+            table,
+            index,
+            snapshot,
+            cursor,
+            before_touch,
+            before_retain,
+            release_retained,
+            before_clone,
+        )
+    }
+
+    fn bounded_ordered_table_row_next(
+        &self,
+        table: &str,
+        column: &str,
+        direction: contextdb_core::SortDirection,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        Database::bounded_ordered_table_row_next(
+            self,
+            table,
+            column,
+            direction,
+            snapshot,
+            cursor,
+            before_touch,
+            before_clone,
+        )
+    }
+
+    fn bounded_vector_schema_read_many(
+        &self,
+        indexes: Vec<VectorIndexRef>,
+    ) -> crate::database::VectorSchemaReadGuard {
+        Database::bounded_vector_schema_read_many(self, indexes)
+    }
+
+    fn assert_vector_index_exists_under_schema_read(&self, index: &VectorIndexRef) -> Result<()> {
+        Database::assert_vector_index_exists_under_schema_read(self, index)
+    }
+
+    fn validate_vector_under_schema_read(
+        &self,
+        index: &VectorIndexRef,
+        actual: usize,
+    ) -> Result<()> {
+        Database::validate_vector_under_schema_read(self, index, actual)
+    }
+
+    fn bounded_vector_candidate_k(
+        &self,
+        index: &VectorIndexRef,
+        requested: usize,
+        sort_key: Option<&str>,
+    ) -> Result<usize> {
+        Database::bounded_vector_candidate_k(self, index, requested, sort_key)
+    }
+
+    fn with_bounded_row_vector(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        use_vector: &mut dyn FnMut(
+            &[f32],
+        ) -> std::result::Result<
+            BoundedRowVectorClone,
+            BoundedExecutionError,
+        >,
+    ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError> {
+        Database::with_bounded_row_vector(
+            self,
+            index,
+            row_id,
+            snapshot,
+            tx,
+            before_access_row,
+            |vector| use_vector(vector),
+        )
+    }
+
+    fn bounded_brute_force_vector_cursor(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>
+    {
+        Database::bounded_brute_force_vector_cursor(
+            self,
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            before_source_entry,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    fn bounded_brute_force_vector_step(
+        &self,
+        cursor: &mut contextdb_vector::mem::BoundedBruteForceCursor,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError> {
+        Database::bounded_brute_force_vector_step(
+            self,
+            cursor,
+            before_source_entry,
+            before_distance,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    fn bounded_hnsw_vector_search(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<BoundedVectorCandidates>, BoundedExecutionError> {
+        Database::bounded_hnsw_vector_search(
+            self,
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            before_source_entry,
+            before_distance,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    fn bounded_ensure_hnsw_built(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> bool {
+        Database::bounded_ensure_hnsw_built(self, index, snapshot)
+    }
+
+    fn bounded_legacy_visited_cap(&self, declares_no_ceilings: bool) -> Option<usize> {
+        Database::bounded_legacy_visited_cap(self, declares_no_ceilings)
+    }
+
+    fn bounded_vector_overlay_reservation(
+        &self,
+        index: &VectorIndexRef,
+        entry_count: usize,
+    ) -> Result<Option<Box<dyn Send + Sync>>> {
+        Database::bounded_vector_overlay_reservation(self, index, entry_count)
+    }
+
+    fn bounded_rank_candidate(
+        &self,
+        index: &VectorIndexRef,
+        sort_key: &str,
+        anchor_row_id: RowId,
+        anchor_values: &HashMap<String, Value>,
+        vector_score: f32,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        before_candidate: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_joined_clone: &mut dyn FnMut(
+            usize,
+        )
+            -> std::result::Result<(), BoundedExecutionError>,
+        release_joined_clone: &mut dyn FnMut(
+            usize,
+        )
+            -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(Option<f32>, usize), BoundedExecutionError> {
+        Database::bounded_rank_candidate(
+            self,
+            index,
+            sort_key,
+            anchor_row_id,
+            anchor_values,
+            vector_score,
+            snapshot,
+            tx,
+            before_candidate,
+            before_access,
+            before_joined_clone,
+            release_joined_clone,
+        )
+    }
+
+    fn bounded_graph_edge_cursor(
+        &self,
+        direction: contextdb_core::Direction,
+        snapshot: SnapshotId,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<crate::database::gate::BoundedGraphEdgeCursor, BoundedExecutionError>
+    {
+        Database::bounded_graph_edge_cursor(
+            self,
+            direction,
+            snapshot,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    fn bounded_graph_edge_next(
+        &self,
+        cursor: &mut crate::database::gate::BoundedGraphEdgeCursor,
+        edge_types: Option<&[EdgeType]>,
+        tx: Option<TxId>,
+        before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        entry_read: &mut dyn FnMut(),
+    ) -> std::result::Result<
+        Option<crate::database::gate::CountedGraphScanEdge>,
+        BoundedExecutionError,
+    > {
+        Database::bounded_graph_edge_next(
+            self,
+            cursor,
+            edge_types,
+            tx,
+            before_edge,
+            before_access,
+            before_retain,
+            release_retained,
+            entry_read,
+        )
+    }
+
+    fn bounded_graph_bfs_cursor(
+        &self,
+        tx: Option<TxId>,
+        start: NodeId,
+        edge_types: Option<&[EdgeType]>,
+        direction: contextdb_core::Direction,
+        min_depth: u32,
+        max_depth: u32,
+        snapshot: SnapshotId,
+        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, BoundedExecutionError>
+    {
+        Database::bounded_graph_bfs_cursor(
+            self,
+            tx,
+            start,
+            edge_types,
+            direction,
+            min_depth,
+            max_depth,
+            snapshot,
+            before_access,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    fn bounded_graph_bfs_next(
+        &self,
+        cursor: &mut contextdb_graph::mem::BoundedBfsCursor,
+        before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_path_element: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+        staged_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        staged_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        staged_hand_back: &mut dyn FnMut(usize),
+        entry_read: &mut dyn FnMut(),
+        visited_cap: Option<usize>,
+        tx: Option<TxId>,
+    ) -> std::result::Result<
+        Option<contextdb_graph::mem::BoundedTraversalNode>,
+        BoundedExecutionError,
+    > {
+        Database::bounded_graph_bfs_next(
+            self,
+            cursor,
+            before_edge,
+            before_path_element,
+            before_access,
+            before_retain,
+            release_retained,
+            staged_touch,
+            staged_retain,
+            staged_hand_back,
+            entry_read,
+            visited_cap,
+            tx,
+        )
+    }
+
+    fn resolve_graph_filter_at_snapshot(
+        &self,
+        expr: &Expr,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+        ctes: &[Cte],
+    ) -> Result<Expr> {
+        resolve_graph_filter_at_snapshot(self, expr, params, tx, snapshot, ctes)
+    }
+
+    fn as_database_for_subquery_plan(&self) -> Option<&Database> {
+        Some(self)
+    }
+
+    fn resolve_graph_start_nodes_from_filter(
+        &self,
+        filter: &Expr,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+        start_alias: &str,
+    ) -> Result<GraphStartResolution> {
+        resolve_graph_start_nodes_from_filter(self, filter, params, tx, snapshot, start_alias)
+    }
+
+    fn graph_filter_matches_bindings(
+        &self,
+        filter: &Expr,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+        bindings: &HashMap<String, uuid::Uuid>,
+    ) -> Result<bool> {
+        graph_filter_matches_bindings(self, filter, params, tx, snapshot, bindings)
+    }
+
+    fn coerce_into_column(
+        &self,
+        table: &str,
+        col: &str,
+        value: Value,
+        current_tx_max: Option<TxId>,
+        active_tx: Option<TxId>,
+    ) -> Result<Value> {
+        coerce_into_column(self, table, col, value, current_tx_max, active_tx)
+    }
+
+    fn coerce_pick_shape_to_column_type(&self, table: &str, pick: &IndexPick) -> Result<IndexPick> {
+        coerce_pick_shape_to_column_type(self, table, pick)
+    }
+
+    fn read_query(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: &OwnerReadCancellation,
+    ) -> std::result::Result<(QueryResult, Vec<u8>), crate::direct_file_reader::DirectFileReaderError>
+    {
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_cancellation(crate::read_probe::CANCELLATION_EXECUTE, cancellation);
+        let complete = read_answer(bounded::execute(
+            self,
+            sql,
+            params,
+            limits,
+            clock,
+            cancellation.clone(),
+            #[cfg(feature = "test-seams")]
+            crate::read_session::session_kernel_probe_for_test(),
+        ))?;
+        let canonical =
+            crate::read_contract::encode_query_result(&complete.result).map_err(|error| {
+                crate::direct_file_reader::DirectFileReaderError::Engine(error.to_string())
+            })?;
+        Ok((complete.result, canonical))
+    }
+
+    fn open_read_cursor(
+        self: Arc<Self>,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: &OwnerReadCancellation,
+        snapshot: crate::direct_file_reader::DirectSnapshot,
+    ) -> std::result::Result<
+        (
+            Arc<dyn ReadExecutionTarget>,
+            crate::direct_file_reader::DirectCursorPage,
+            Option<crate::direct_file_reader::DirectCursorPage>,
+        ),
+        crate::direct_file_reader::DirectFileReaderError,
+    > {
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_cancellation(
+            crate::read_probe::CANCELLATION_CURSOR_OPEN,
+            cancellation,
+        );
+        let store: Arc<dyn ReadExecutionTarget> = self;
+        let accountant = store.bounded_read_accountant();
+        let before = accountant.usage().used;
+        let opened = read_answer(bounded::open_cursor(
+            Arc::clone(&store),
+            sql,
+            params,
+            limits,
+            clock,
+            cancellation.clone(),
+            #[cfg(feature = "test-seams")]
+            crate::read_session::session_kernel_probe_for_test(),
+        ))?;
+        // What the suspended read holds is what the engine's own accounting
+        // says it holds; a page that reserved nothing measurable still costs
+        // the continuation itself, so the floor is one byte rather than none.
+        let retained = accountant.usage().used.saturating_sub(before).max(1);
+        let continuation =
+            BoundedCursorTarget::new(store, opened.cursor, retained as u64, snapshot);
+        let published = published_page(opened.first_page, snapshot)?;
+        let drained = drained_page(&published)?;
+        if drained.is_some() {
+            continuation.close_read_cursor()?;
+        }
+        Ok((continuation, published, drained))
+    }
+
+    fn read_cursor_pages(
+        &self,
+        rows: Option<NonZeroUsize>,
+        cancellation: &OwnerReadCancellation,
+    ) -> std::result::Result<
+        (
+            crate::direct_file_reader::DirectCursorPage,
+            Option<crate::direct_file_reader::DirectCursorPage>,
+        ),
+        crate::direct_file_reader::DirectFileReaderError,
+    > {
+        let _ = (rows, cancellation);
+        Err(
+            crate::direct_file_reader::DirectFileReaderError::CursorUnavailable(
+                crate::direct_file_reader::DirectCursorUnavailable::Closed,
+            ),
+        )
+    }
+
+    fn close_read_cursor(
+        &self,
+    ) -> std::result::Result<(), crate::direct_file_reader::DirectFileReaderError> {
+        Err(
+            crate::direct_file_reader::DirectFileReaderError::CursorUnavailable(
+                crate::direct_file_reader::DirectCursorUnavailable::Closed,
+            ),
+        )
+    }
+
+    fn read_metadata(
+        &self,
+        request: crate::direct_file_reader::DirectMetadataRequest,
+        image: &crate::direct_file_reader::DirectOwnedImage,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        continuation: Option<&str>,
+    ) -> std::result::Result<
+        crate::direct_file_reader::DirectMetadataResponse,
+        crate::direct_file_reader::DirectFileReaderError,
+    > {
+        crate::read_image::project_metadata(self, request, image, limits, clock, continuation)
+    }
+}
 
 /// Local structural DDL validates cross-table rules (notably foreign keys)
 /// before taking the allocation lock. The complete map, rather than only the
@@ -48,6 +1638,336 @@ pub(crate) fn execute_plan(
     }
 }
 
+/// The single internal entrance to bounded read production.
+///
+/// This remains separate from [`execute_plan`] so existing uncapped callers do
+/// not acquire bounded-read behavior implicitly.  The test-feature adapter
+/// reaches this entrance through the real relational, graph, and vector stores.
+/// Bounded results and cursors share one production pull kernel for each
+/// source shape that has a fallible source handoff.
+pub(crate) fn execute_bounded(
+    db: &Database,
+    sql: &str,
+    params: &HashMap<String, Value>,
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    cancellation: OwnerReadCancellation,
+    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
+    bounded::execute(
+        db,
+        sql,
+        params,
+        limits,
+        clock,
+        cancellation,
+        #[cfg(feature = "test-seams")]
+        probe,
+    )
+}
+
+/// Run one bounded read against a target that is not the writable database --
+/// a released committed image, say -- and answer in the engine's own words.
+///
+/// This is the same kernel entrance as [`execute_bounded`] with its answer
+/// left un-flattened. A route that must report the same fault the same way
+/// whichever way it reached the store needs the typed answer, and the direct
+/// reader's own doors deliberately cannot carry one.
+pub(crate) fn execute_bounded_on_target(
+    db: &dyn ReadExecutionTarget,
+    sql: &str,
+    params: &HashMap<String, Value>,
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    cancellation: OwnerReadCancellation,
+    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
+    bounded::execute(
+        db,
+        sql,
+        params,
+        limits,
+        clock,
+        cancellation,
+        #[cfg(feature = "test-seams")]
+        probe,
+    )
+}
+
+/// Open a bounded cursor over the same pull kernel as [`execute_bounded`].
+///
+/// Cursor suspension owns the same kernel continuation; this is not a second
+/// cursor implementation and a fetch never reparses or reruns the statement.
+pub(crate) fn open_bounded_cursor(
+    db: Arc<Database>,
+    sql: &str,
+    params: &HashMap<String, Value>,
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    cancellation: OwnerReadCancellation,
+    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
+    bounded::open_cursor(
+        db,
+        sql,
+        params,
+        limits,
+        clock,
+        cancellation,
+        #[cfg(feature = "test-seams")]
+        probe,
+    )
+}
+
+/// Resume one cursor fetch.  A cursor retains pull state; it must not rerun
+/// the statement or collect the complete result before slicing a page.
+pub(crate) fn fetch_bounded_cursor(
+    cursor: &mut BoundedCursorHandle,
+    rows: Option<NonZeroUsize>,
+    cancellation: OwnerReadCancellation,
+    #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
+    bounded::fetch_cursor(
+        cursor,
+        rows,
+        cancellation,
+        #[cfg(feature = "test-seams")]
+        probe,
+    )
+}
+
+/// Whether a bounded cursor still holds a read a caller can ask anything of.
+pub(crate) fn bounded_cursor_is_live(cursor: &BoundedCursorHandle) -> bool {
+    bounded::cursor_is_live(cursor)
+}
+
+/// Close a bounded cursor and release every retained kernel charge.
+pub(crate) fn close_bounded_cursor(
+    cursor: &mut BoundedCursorHandle,
+) -> std::result::Result<(), BoundedExecutionError> {
+    bounded::close_cursor(cursor)
+}
+
+#[derive(Debug)]
+pub(crate) enum BoundedExecutionError {
+    /// Compatibility variant retained for the owner-protocol error mapping;
+    /// approved read plans no longer return it from the bounded kernel.
+    #[allow(dead_code)]
+    Unimplemented,
+    /// A limit refusal preserves canonical typed detail rather than turning a
+    /// completed eager collection into an opaque error string.
+    Refused(ReadFailure),
+    /// Cancellation is distinct from a limit refusal and publishes no partial
+    /// ordinary result.
+    Cancelled,
+    Engine(Error),
+}
+
+impl From<Error> for BoundedExecutionError {
+    fn from(error: Error) -> Self {
+        match error {
+            // A refusal that already says which ceiling stopped the read, or
+            // what moved underneath it, stays a refusal the caller can branch
+            // on rather than collapsing into an engine fault.
+            Error::ReadFailure(failure) => Self::Refused(failure),
+            other => Self::Engine(other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BoundedWorkSource {
+    TableScan,
+    IndexRange,
+    UnindexedSort,
+    GraphTraversal,
+    VectorCandidates,
+    RankCandidates,
+    AccessControl,
+}
+
+impl BoundedWorkSource {
+    /// What a reservation for this source is FOR, in the operation vocabulary
+    /// a store-budget refusal reports.
+    ///
+    /// A read governed by the store's `MEMORY_LIMIT` is refused with a typed
+    /// answer that names the work the budget stopped. An unnamed reservation
+    /// reaches an operator as "memory/allocate", which tells them a number and
+    /// nothing they can act on -- which of a statement's parts to make smaller.
+    pub(crate) const fn reservation_operation(self) -> &'static str {
+        match self {
+            Self::TableScan => "read/table_scan",
+            Self::IndexRange => "read/index_range",
+            Self::UnindexedSort => "read/sort_buffer",
+            Self::GraphTraversal => "read/graph_traversal",
+            Self::VectorCandidates => "read/vector_candidates",
+            Self::RankCandidates => "read/rank_candidates",
+            Self::AccessControl => "read/access_control",
+        }
+    }
+}
+
+/// The concrete item a bounded source is about to inspect.  This stays more
+/// specific than [`BoundedWorkSource`] because the test seam must prove that
+/// the production loop stopped before touching the next index entry, graph
+/// edge, vector candidate, sort candidate, or access-controlled row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BoundedSourceTouch {
+    TableRow,
+    IndexEntry,
+    SortCandidate,
+    GraphEdge,
+    /// One adjacency entry actually read, counted once however many steps the
+    /// walk takes over it. `GraphEdge` charges the WORK a walk does -- reading
+    /// the entry, testing its type, deciding whether to expand it, growing the
+    /// visited set -- several times for one entry; this counts the entries
+    /// themselves, which is what the executor reports as examined.
+    AdjacencyEntry,
+    BruteForceVectorCandidate,
+    HnswCandidate,
+    RankCandidate,
+    AccessRow,
+}
+
+/// Test-feature observability names upstream work and memory so enforcing only
+/// final result size cannot satisfy the bounded-read contract.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BoundedExecutionTelemetry {
+    pub(crate) work_units: u64,
+    pub(crate) source_work: BTreeMap<BoundedWorkSource, u64>,
+    pub(crate) source_peak_temporary_bytes: BTreeMap<BoundedWorkSource, u64>,
+    pub(crate) encoded_bytes: u64,
+    pub(crate) peak_temporary_bytes: u64,
+    pub(crate) cancellation_observed: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundedExecutionResult {
+    pub(crate) result: QueryResult,
+    pub(crate) telemetry: BoundedExecutionTelemetry,
+}
+
+/// Lifetime-free cursor ownership for route/session registries.
+///
+/// The handle owns one `Arc` state instead of borrowing `Database`.  The
+/// kernel populates the open resource bundle exactly once;
+/// refusal, expiry, exhaustion, or explicit close must atomically replace it
+/// with `Released`.  Cancellation never performs that transition.  Dropping
+/// the last handle also drops every still-open RAII resource without a
+/// self-reference or lifetime extension.
+pub(crate) struct BoundedCursorHandle {
+    _state: Arc<BoundedCursorExecutionState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundedCursorOpen {
+    pub(crate) cursor: BoundedCursorHandle,
+    pub(crate) first_page: CursorPage,
+    pub(crate) telemetry: BoundedExecutionTelemetry,
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundedCursorFetch {
+    pub(crate) page: CursorPage,
+    pub(crate) telemetry: BoundedExecutionTelemetry,
+}
+
+#[cfg(feature = "test-seams")]
+impl BoundedCursorHandle {
+    /// What an open cursor is holding, part by part. A cursor that has
+    /// already ended holds nothing, and says so with an all-zero breakdown
+    /// rather than refusing the question.
+    pub(crate) fn continuation_bytes(
+        &self,
+    ) -> std::result::Result<bounded::ContinuationBytes, BoundedExecutionError> {
+        let lifecycle = match self._state.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match &*lifecycle {
+            BoundedCursorLifecycle::Open(state) => state.continuation_bytes(),
+            BoundedCursorLifecycle::Exhausted(_) | BoundedCursorLifecycle::Released(_) => {
+                Ok(bounded::ContinuationBytes::default())
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for BoundedCursorHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundedCursorHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+struct BoundedCursorExecutionState {
+    lifecycle: std::sync::Mutex<BoundedCursorLifecycle>,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum BoundedCursorLifecycle {
+    Open(bounded::CursorState),
+    Exhausted(Vec<String>),
+    Released(BoundedCursorTerminalReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedCursorTerminalReason {
+    Refused,
+    Expired,
+    ExplicitClose,
+}
+
+pub(crate) fn observe_bounded_access_control_row() {
+    bounded::observe_access_control_row();
+}
+
+pub(crate) fn observe_bounded_rank_candidate() {
+    bounded::observe_rank_candidate();
+}
+
+/// A deterministic probe is compiled only with the existing test-seams
+/// feature. Supported bounded source loops call `before_source_touch`
+/// immediately before inspecting a real item. HNSW observation comes from the
+/// sealed distance event while the adjacent fallible control callback enforces
+/// work, time, and cancellation before distance evaluation. Temporary memory
+/// callbacks bracket the real database-accountant reservation.
+///
+/// Tests can advance the shared monotonic clock or cancel inside a source
+/// batch without delay.  The pull kernel also calls `cancellation_observed`
+/// immediately before returning the cancellation refusal.
+#[cfg(feature = "test-seams")]
+pub(crate) trait BoundedExecutionProbe: Send + Sync {
+    fn before_work(&self, source: BoundedWorkSource, completed_work: u64);
+    fn before_source_touch(&self, touch: BoundedSourceTouch, completed_items: u64);
+    /// This callback can only arrive through the vector crate's sealed
+    /// `HnswCandidateDistanceEvent`, emitted immediately before real distance
+    /// work.  Calling `before_source_touch(HnswCandidate, ..)` in executor
+    /// post-processing is rejected by the test adapter.
+    fn before_hnsw_candidate_distance(
+        &self,
+        event: contextdb_vector::hnsw::HnswCandidateDistanceEvent,
+    );
+    fn before_temporary_reservation(
+        &self,
+        source: BoundedWorkSource,
+        requested_bytes: u64,
+        held_temporary_bytes: u64,
+    );
+    fn after_temporary_reservation(
+        &self,
+        source: BoundedWorkSource,
+        reserved_bytes: u64,
+        held_temporary_bytes: u64,
+    );
+    fn cancellation_observed(&self, completed_work: u64);
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod bounded_read_test_support;
+
 fn execute_plan_once(
     db: &Database,
     plan: &PhysicalPlan,
@@ -63,6 +1983,36 @@ fn execute_plan_once(
             // the DDL allocation lock so another structural write cannot make
             // a previously valid CREATE overwrite or contradict it.
             let validated_schema = db.relational_store().table_meta.read().clone();
+            // A name the store already carries is answered from that same
+            // baseline, before any other door judges the declaration: the
+            // decision and the allocation lock's `schema_snapshot_matches`
+            // guard must read one snapshot, or a table created between a
+            // fresh read and the lock would slip past both and be redefined.
+            //
+            // Redefining an existing table is a SYNC operation only. The
+            // arriving-DDL adopt arm (`database.rs`'s `CreateTable` branch)
+            // takes a peer's declaration on purpose; a statement a person
+            // typed locally never may, because replacing the column list
+            // drops the values in every column the new text omits. So the
+            // bare spelling refuses and destroys nothing, and `IF NOT
+            // EXISTS` -- which the parser has always accepted and the
+            // executor has never read -- is the documented no-op: the
+            // existing table is left exactly as it is and the statement
+            // answers ok.
+            if validated_schema.contains_key(&p.name) {
+                if p.if_not_exists {
+                    return Ok(QueryResult::empty_with_affected(0));
+                }
+                return Err(Error::SchemaInvalid {
+                    reason: format!(
+                        "table '{}' already exists: CREATE TABLE never redefines a table, so \
+                         nothing was changed -- use CREATE TABLE IF NOT EXISTS to make a \
+                         re-declaration a no-op, ALTER TABLE to change the shape, or DROP \
+                         TABLE first",
+                        p.name
+                    ),
+                });
+            }
             if p.name.eq_ignore_ascii_case("acl_grants")
                 && p.columns.iter().any(|column| column.acl_ref.is_some())
             {
@@ -245,7 +2195,7 @@ fn execute_plan_once(
                         matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
                     })
                     .map(|column| VectorIndexRef::new(&p.name, column.name.clone()));
-                let _vector_schema = db.vector_schema_write_many(vector_schema_refs);
+                let _vector_schema = db.vector_schema_write_many(vector_schema_refs)?;
                 db.allocate_ddl_lsn(|lsn| {
                     if !schema_snapshot_matches(db, &validated_schema) {
                         return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
@@ -334,7 +2284,7 @@ fn execute_plan_once(
             validate_projected_foreign_keys_after_drop_table(db, name)?;
             let bytes_to_release = estimate_drop_table_bytes(db, name);
             db.drain_vector_table_maintenance_for_ddl(name);
-            let _vector_schema = db.vector_schema_write_table(name);
+            let _vector_schema = db.vector_schema_write_table(name)?;
             db.allocate_ddl_lsn(|lsn| {
                 if !schema_snapshot_matches(db, &validated_schema) {
                     return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
@@ -440,9 +2390,11 @@ fn execute_plan_once(
                         )?;
                     }
                     let added_vector = matches!(col.data_type, DataType::Vector(_));
-                    let _vector_schema = added_vector.then(|| {
-                        db.vector_schema_write(&VectorIndexRef::new(&p.table, col.name.clone()))
-                    });
+                    let _vector_schema = added_vector
+                        .then(|| {
+                            db.vector_schema_write(&VectorIndexRef::new(&p.table, col.name.clone()))
+                        })
+                        .transpose()?;
                     db.allocate_ddl_lsn(|lsn| {
                         let old_meta = db.table_meta(&p.table).ok_or_else(|| {
                             Error::Other(format!("table '{}' not found", p.table))
@@ -596,11 +2548,13 @@ fn execute_plan_once(
                             index: dependent_user_indexes[0].clone(),
                         });
                     }
-                    let _vector_schema = dropped_vector_column.then(|| {
-                        let index = VectorIndexRef::new(&p.table, name.clone());
-                        db.drain_vector_index_maintenance_for_ddl(&index);
-                        db.vector_schema_write(&index)
-                    });
+                    let _vector_schema = dropped_vector_column
+                        .then(|| {
+                            let index = VectorIndexRef::new(&p.table, name.clone());
+                            db.drain_vector_index_maintenance_for_ddl(&index);
+                            db.vector_schema_write(&index)
+                        })
+                        .transpose()?;
                     db.allocate_ddl_lsn(|lsn| {
                         let old_meta = db.table_meta(&p.table).ok_or_else(|| {
                             Error::Other(format!("table '{}' not found", p.table))
@@ -757,7 +2711,7 @@ fn execute_plan_once(
                         let new_index = VectorIndexRef::new(&p.table, to.clone());
                         db.validate_vector_index_rename_for_ddl(&p.table, from, to)?;
                         db.drain_vector_index_maintenance_for_ddl(&old_index);
-                        Some(db.vector_schema_write_many([old_index, new_index]))
+                        Some(db.vector_schema_write_many([old_index, new_index])?)
                     } else {
                         None
                     };
@@ -1631,7 +3585,8 @@ fn execute_plan_once(
             let (query_vec, query_vector_source) =
                 resolve_query_vector_from_expr(db, query_expr, params, tx, snapshot)?;
             let vector_bytes = estimate_vector_search_bytes(query_vec.len(), *k as usize);
-            db.accountant().try_allocate_for(
+            let _vector_memory = crate::memory_accounting::ScopedMemoryReservation::try_new_for(
+                db.accountant(),
                 vector_bytes,
                 "vector_search",
                 "search",
@@ -1652,8 +3607,8 @@ fn execute_plan_once(
                         candidate_bitmap,
                     )
                 });
-                db.accountant().release(vector_bytes);
                 let (results, used_hnsw) = res?;
+                drop(_vector_memory);
                 let schema_columns = db.table_meta(table).map(|meta| {
                     meta.columns
                         .into_iter()
@@ -1707,8 +3662,8 @@ fn execute_plan_once(
                 candidate_bitmap.as_ref(),
                 snapshot,
             );
-            db.accountant().release(vector_bytes);
             let (res, used_hnsw) = res?;
+            drop(_vector_memory);
 
             // Re-materialize: look up actual rows by row_id so SELECT * returns user columns
             let result_row_ids = res.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
@@ -1771,74 +3726,43 @@ fn execute_plan_once(
         PhysicalPlan::MaterializeCte { input, .. } => execute_plan(db, input, params, tx),
         PhysicalPlan::Project { input, columns } => {
             let input_result = execute_plan(db, input, params, tx)?;
-            let has_aggregate = columns.iter().any(|column| {
-                matches!(
-                    &column.expr,
-                    Expr::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count")
-                )
-            });
-            if has_aggregate {
-                if columns.iter().any(|column| {
-                    !matches!(
-                        &column.expr,
-                        Expr::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count")
-                    )
-                }) {
-                    return Err(Error::PlanError(
-                        "mixed aggregate and non-aggregate columns without GROUP BY".to_string(),
-                    ));
+            if projection_aggregates(columns) {
+                let mut running = Vec::with_capacity(columns.len());
+                for column in columns {
+                    let Some(aggregate) = column_aggregate(column) else {
+                        return Err(mixed_aggregate_error());
+                    };
+                    running.push(AggregateState::new(aggregate));
                 }
 
-                let output_columns = columns
-                    .iter()
-                    .map(|column| {
-                        column.alias.clone().unwrap_or_else(|| match &column.expr {
-                            Expr::FunctionCall { name, .. } => name.clone(),
-                            _ => "expr".to_string(),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-
-                let aggregate_row = columns
-                    .iter()
-                    .map(|column| match &column.expr {
-                        Expr::FunctionCall { name: _, args } => {
-                            let count = if matches!(
-                                args.as_slice(),
-                                [Expr::Column(contextdb_parser::ast::ColumnRef { table: None, column })]
-                                if column == "*"
-                            ) {
-                                input_result.rows.len() as i64
-                            } else {
-                                input_result
-                                    .rows
-                                    .iter()
-                                    .filter_map(|row| {
-                                        args.first().map(|arg| {
-                                            eval_query_result_expr(
-                                                arg,
-                                                row,
-                                                &input_result.columns,
-                                                params,
-                                            )
-                                        })
-                                    })
-                                    .collect::<Result<Vec<_>>>()?
-                                    .into_iter()
-                                    .filter(|value| *value != Value::Null)
-                                    .count() as i64
-                            };
-                            Ok(Value::Int64(count))
+                for row in &input_result.rows {
+                    for (column, state) in columns.iter().zip(running.iter_mut()) {
+                        let Expr::FunctionCall { args, .. } = &column.expr else {
+                            return Err(mixed_aggregate_error());
+                        };
+                        match aggregate_input(args) {
+                            AggregateInput::Row => state.admit(AggregateItem::Row)?,
+                            AggregateInput::Nothing => state.admit(AggregateItem::Nothing)?,
+                            AggregateInput::Value(argument) => {
+                                let value = eval_query_result_expr(
+                                    argument,
+                                    row,
+                                    &input_result.columns,
+                                    params,
+                                )?;
+                                state.admit(AggregateItem::Value(&value))?;
+                            }
                         }
-                        _ => Err(Error::PlanError(
-                            "mixed aggregate and non-aggregate columns without GROUP BY"
-                                .to_string(),
-                        )),
-                    })
+                    }
+                }
+
+                let aggregate_row = running
+                    .iter()
+                    .map(AggregateState::finish)
                     .collect::<Result<Vec<_>>>()?;
 
                 return Ok(QueryResult {
-                    columns: output_columns,
+                    columns: project_output_columns(columns),
                     rows: vec![aggregate_row],
                     rows_affected: 0,
                     trace: input_result.trace.clone(),
@@ -1846,15 +3770,7 @@ fn execute_plan_once(
                 });
             }
 
-            let output_columns = columns
-                .iter()
-                .map(|c| {
-                    c.alias.clone().unwrap_or_else(|| match &c.expr {
-                        Expr::Column(col) => col.column.clone(),
-                        _ => "expr".to_string(),
-                    })
-                })
-                .collect::<Vec<_>>();
+            let output_columns = project_output_columns(columns);
 
             let mut output_rows = Vec::with_capacity(input_result.rows.len());
             for row in &input_result.rows {
@@ -2318,7 +4234,7 @@ fn eval_project_expr(
             negated,
         } => {
             let needle = eval_query_result_expr(expr, row, input_columns, params)?;
-            let matched = list.iter().try_fold(false, |found, item| {
+            let matched = list.iter().try_fold(false, |found, item| -> Result<bool> {
                 if found {
                     Ok(true)
                 } else {
@@ -2489,7 +4405,7 @@ fn exec_insert(
         if !vector_columns.is_empty() {
             validate_vector_columns(db, &p.table, &values)?;
         }
-        let row_bytes = estimate_row_bytes_for_meta(&values, &insert_meta, false);
+        let row_bytes = retained_row_bytes_for_meta(&values, &insert_meta, false);
         db.accountant().try_allocate_for(
             row_bytes,
             "insert",
@@ -2497,7 +4413,6 @@ fn exec_insert(
             "Reduce row size or raise MEMORY_LIMIT before inserting more data.",
         )?;
         let checkpoint = db.write_set_checkpoint(txid)?;
-        let mut vector_allocations = Vec::new();
         let graph_edge = if route_inserts_to_graph {
             match (
                 values.get("source_id"),
@@ -2514,9 +4429,8 @@ fn exec_insert(
         } else {
             None
         };
-        let vector_values = vector_values_for_table(db, &p.table, &values);
 
-        let row_id = if let Some(on_conflict) = &p.on_conflict {
+        let _row_id = if let Some(on_conflict) = &p.on_conflict {
             if on_conflict.columns.is_empty() {
                 db.accountant().release(row_bytes);
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
@@ -2640,7 +4554,9 @@ fn exec_insert(
                                 }
                             }
                         }
-                        if let Err(err) = db.delete_row(txid, &p.table, existing_row.row_id) {
+                        if let Err(err) =
+                            db.delete_row_keeping_vectors(txid, &p.table, existing_row.row_id)
+                        {
                             db.accountant().release(row_bytes);
                             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                             return Err(err);
@@ -2657,6 +4573,7 @@ fn exec_insert(
                             &p.table,
                             upsert_values,
                             existing_row.row_id,
+                            true,
                         ) {
                             Ok(row_id) => row_id,
                             Err(err) => {
@@ -2708,20 +4625,6 @@ fn exec_insert(
                     db.accountant().release(row_bytes);
                     return Err(err);
                 }
-            }
-        }
-
-        if row_id != RowId(0) {
-            for (column, v) in &vector_values {
-                let index = contextdb_core::VectorIndexRef::new(&p.table, column.clone());
-                let vector_bytes = db.vector_insert_accounted_bytes(&index, v.len());
-                if let Err(err) = db.insert_vector_strict(txid, index, row_id, v.clone()) {
-                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-                    db.accountant().release(row_bytes);
-                    release_accounted_bytes(db, &vector_allocations);
-                    return Err(err);
-                }
-                vector_allocations.push(vector_bytes);
             }
         }
 
@@ -3317,19 +5220,20 @@ fn exec_update(
                     return Err(err);
                 }
             }
-            if let Err(err) = db.delete_row(txid, &p.table, row.row_id) {
+            if let Err(err) = db.delete_row_keeping_vectors(txid, &p.table, row.row_id) {
                 db.accountant().release(new_row_bytes);
                 return Err(err);
             }
 
-            let new_row_id = match db.insert_row_replacing(txid, &p.table, values, row.row_id) {
-                Ok(row_id) => row_id,
-                Err(err) => {
-                    db.accountant().release(new_row_bytes);
-                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-                    return Err(err);
-                }
-            };
+            let new_row_id =
+                match db.insert_row_replacing(txid, &p.table, values, row.row_id, false) {
+                    Ok(row_id) => row_id,
+                    Err(err) => {
+                        db.accountant().release(new_row_bytes);
+                        let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                        return Err(err);
+                    }
+                };
             for index in &vector_indexes {
                 if assigned_vector_columns.contains(&index.column) {
                     continue;
@@ -3642,7 +5546,12 @@ fn validate_sort_key(
 /// same helpers, so the two cannot drift.
 fn plan_output_columns(db: &Database, plan: &PhysicalPlan) -> Option<Vec<String>> {
     match plan {
-        PhysicalPlan::Scan { table, .. } if table == "dual" => Some(Vec::new()),
+        // `dual` names a zero-column constant source only while no table
+        // carries that name; once an operator creates one, its own columns are
+        // what a query over it may name.
+        PhysicalPlan::Scan { table, .. } if table == "dual" && db.table_meta(table).is_none() => {
+            Some(Vec::new())
+        }
         PhysicalPlan::Scan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
             scan_output_columns(db, table)
         }
@@ -3731,13 +5640,175 @@ fn scan_output_columns(db: &Database, table: &str) -> Option<Vec<String>> {
     Some(columns)
 }
 
-/// A projection's output names, mirroring both executor derivations: a COUNT
-/// aggregate names the column after the function, everything else after the
-/// projected column, and an explicit alias always wins.
+/// An aggregate a projected column can name.
+///
+/// Recognising an aggregate is decided HERE and nowhere else. Every read
+/// route -- the eager executor, the bounded kernel, and the column-naming
+/// helper all three doors share -- asks this, so a function added to this
+/// list is an aggregate on every route at once instead of on whichever route
+/// remembered to match its name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Aggregate {
+    /// `COUNT(*)` counts rows; `COUNT(<expr>)` counts the rows whose argument
+    /// is not NULL.
+    Count,
+    /// `SUM(<expr>)` adds the argument's values, skipping NULLs. Over no rows
+    /// at all it is NULL, which is a different answer from zero.
+    Sum,
+}
+
+impl Aggregate {
+    /// The aggregate a function name asks for, matched the way SQL matches
+    /// function names.
+    fn named(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("count") {
+            Some(Self::Count)
+        } else if name.eq_ignore_ascii_case("sum") {
+            Some(Self::Sum)
+        } else {
+            None
+        }
+    }
+}
+
+/// The aggregate this projected column computes, or `None` when it projects
+/// an ordinary expression.
+pub(crate) fn column_aggregate(column: &contextdb_planner::ProjectColumn) -> Option<Aggregate> {
+    match &column.expr {
+        Expr::FunctionCall { name, .. } => Aggregate::named(name),
+        _ => None,
+    }
+}
+
+/// Whether this projection is an aggregate projection at all.
+pub(crate) fn projection_aggregates(columns: &[contextdb_planner::ProjectColumn]) -> bool {
+    columns
+        .iter()
+        .any(|column| column_aggregate(column).is_some())
+}
+
+/// The refusal a projection earns when it names an aggregate beside a plain
+/// column and has no GROUP BY to put the plain column under.
+pub(crate) fn mixed_aggregate_error() -> Error {
+    Error::PlanError("mixed aggregate and non-aggregate columns without GROUP BY".to_string())
+}
+
+/// The standard-SQL out-of-range refusal, raised instead of wrapping an
+/// aggregate's running total around.
+fn aggregate_out_of_range() -> Error {
+    Error::PlanError("integer out of range".to_string())
+}
+
+/// What an aggregate reads out of each input row.
+pub(crate) enum AggregateInput<'expr> {
+    /// The `*` argument: the row itself, whatever it holds.
+    Row,
+    /// An expression the row is asked for.
+    Value(&'expr Expr),
+    /// No argument at all.
+    Nothing,
+}
+
+/// What an aggregate reads out of each input row, decided from the call's
+/// argument list once so both doors read the same argument.
+pub(crate) fn aggregate_input(args: &[Expr]) -> AggregateInput<'_> {
+    match args.first() {
+        None => AggregateInput::Nothing,
+        Some(Expr::Column(ColumnRef {
+            table: None,
+            column,
+        })) if column == "*" => AggregateInput::Row,
+        Some(first) => AggregateInput::Value(first),
+    }
+}
+
+/// One input row's contribution to an aggregate.
+pub(crate) enum AggregateItem<'value> {
+    /// The row itself.
+    Row,
+    /// What the aggregate's argument evaluated to on this row.
+    Value(&'value Value),
+    /// The aggregate names no argument, so this row contributes nothing.
+    Nothing,
+}
+
+/// One aggregate's running answer over the rows read so far.
+///
+/// Both doors fold their rows in here, so the eager answer and the bounded
+/// one cannot disagree about NULLs, about overflow, or about what an
+/// aggregate over no rows at all is. The bounded door additionally keeps this
+/// between cursor fetches, which is what lets an aggregate finish across
+/// pages.
+pub(crate) enum AggregateState {
+    Count(u64),
+    /// A SUM that has admitted no value yet.
+    SumEmpty,
+    SumInt(i64),
+    SumFloat(f64),
+}
+
+impl AggregateState {
+    pub(crate) fn new(aggregate: Aggregate) -> Self {
+        match aggregate {
+            Aggregate::Count => Self::Count(0),
+            Aggregate::Sum => Self::SumEmpty,
+        }
+    }
+
+    /// Fold one row's contribution into the running answer.
+    pub(crate) fn admit(&mut self, item: AggregateItem<'_>) -> Result<()> {
+        if let Self::Count(count) = self {
+            if matches!(
+                item,
+                AggregateItem::Value(Value::Null) | AggregateItem::Nothing
+            ) {
+                return Ok(());
+            }
+            *count = count.checked_add(1).ok_or_else(aggregate_out_of_range)?;
+            return Ok(());
+        }
+        let AggregateItem::Value(value) = item else {
+            return Err(Error::PlanError("SUM needs a column to add".to_string()));
+        };
+        // A running total widens to a float the first time a float reaches
+        // it, and never wraps: an integer total that cannot hold one more
+        // value is the standard out-of-range refusal.
+        let next = match (&*self, value) {
+            (_, Value::Null) => return Ok(()),
+            (Self::SumEmpty, Value::Int64(added)) => Self::SumInt(*added),
+            (Self::SumEmpty, Value::Float64(added)) => Self::SumFloat(*added),
+            (Self::SumInt(total), Value::Int64(added)) => Self::SumInt(
+                total
+                    .checked_add(*added)
+                    .ok_or_else(aggregate_out_of_range)?,
+            ),
+            (Self::SumInt(total), Value::Float64(added)) => Self::SumFloat(*total as f64 + *added),
+            (Self::SumFloat(total), Value::Int64(added)) => Self::SumFloat(*total + *added as f64),
+            (Self::SumFloat(total), Value::Float64(added)) => Self::SumFloat(*total + *added),
+            _ => return Err(Error::PlanError("SUM adds a numeric column".to_string())),
+        };
+        *self = next;
+        Ok(())
+    }
+
+    /// The single value this aggregate publishes.
+    pub(crate) fn finish(&self) -> Result<Value> {
+        match self {
+            Self::Count(count) => i64::try_from(*count)
+                .map(Value::Int64)
+                .map_err(|_| aggregate_out_of_range()),
+            Self::SumEmpty => Ok(Value::Null),
+            Self::SumInt(total) => Ok(Value::Int64(*total)),
+            Self::SumFloat(total) => Ok(Value::Float64(*total)),
+        }
+    }
+}
+
+/// A projection's output names, mirroring both executor derivations: an
+/// aggregate names the column after the function it called, everything else
+/// after the projected column, and an explicit alias always wins.
 fn project_output_columns(columns: &[contextdb_planner::ProjectColumn]) -> Vec<String> {
-    let has_aggregate = columns.iter().any(|column| {
-        matches!(&column.expr, Expr::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
-    });
+    let has_aggregate = projection_aggregates(columns);
     columns
         .iter()
         .map(|column| {
@@ -4103,7 +6174,7 @@ fn estimate_table_row_bytes(
     let meta = db
         .table_meta(table)
         .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
-    Ok(estimate_row_bytes_for_meta(values, &meta, false))
+    Ok(retained_row_bytes_for_meta(values, &meta, false))
 }
 
 // ========================= Index scan planning + execution =========================
@@ -4136,7 +6207,7 @@ impl IndexPredicateShape {
 }
 
 #[derive(Debug, Clone)]
-struct IndexPick {
+pub(crate) struct IndexPick {
     name: String,
     columns: Vec<(String, contextdb_core::SortDirection)>,
     /// Shape on the FIRST indexed column. Only one shape drives the scan.
@@ -4543,21 +6614,34 @@ fn values_constraint_equal(left: &Value, right: &Value) -> bool {
     left == right || compare_values(left, right).is_some_and(|ord| ord == Ordering::Equal)
 }
 
-fn is_anchor_shape_index_pick(
+/// Whether this pick PINS the row it asks about: an equality on columns that
+/// identify at most one row. This is the whole of the question when the pick
+/// is all a reader has -- the pick's own shape says the predicate is an
+/// equality, and the columns say what it is an equality on.
+pub(crate) fn pick_names_one_row(
+    db: &Database,
+    table: &str,
+    pick: &IndexPick,
+) -> Option<Vec<String>> {
+    if !matches!(pick.shape, IndexPredicateShape::Equality(_)) {
+        return None;
+    }
+    let meta = db.table_meta(table)?;
+    let pick_cols: Vec<&str> = pick.columns.iter().map(|(col, _)| col.as_str()).collect();
+    unique_anchor_columns_for_pick(&meta, &pick_cols)
+}
+
+pub(crate) fn is_anchor_shape_index_pick(
     db: &Database,
     table: &str,
     pick: &IndexPick,
     filter: &Expr,
     params: &HashMap<String, Value>,
 ) -> bool {
-    if !matches!(pick.shape, IndexPredicateShape::Equality(_)) {
-        return false;
-    }
-    let Some(meta) = db.table_meta(table) else {
-        return false;
-    };
-    let pick_cols: Vec<&str> = pick.columns.iter().map(|(col, _)| col.as_str()).collect();
-    let Some(anchor_cols) = unique_anchor_columns_for_pick(&meta, &pick_cols) else {
+    // The pick decides whether the shape pins a row; the filter confirms the
+    // statement really carries that equality, which a caller holding the
+    // residual predicate can check and a caller holding only the pick cannot.
+    let Some(anchor_cols) = pick_names_one_row(db, table, pick) else {
         return false;
     };
     filter_has_equality_for_columns(filter, params, &anchor_cols)
@@ -4968,6 +7052,56 @@ fn mentions_column_ref(expr: &Expr, column: &str) -> bool {
 /// Walk the index's B-tree per the picked shape, fetch matching rows by
 /// row_id, apply residual filter, return VersionedRow list.
 #[allow(clippy::too_many_arguments)]
+/// The complete keys an exact-lookup index is probed with for this pick, or
+/// nothing when the pick cannot be answered that way.
+///
+/// An index built for exact lookup has no order, so only a shape that names
+/// WHOLE keys can use it -- an equality, an in-list, or a null test -- and
+/// only when the pushed prefix covers every indexed column. A range, a
+/// negation, or a partial prefix has to fall back to a scan. Both the
+/// ordinary executor and the bounded kernel ask this one question, so the two
+/// can never disagree about which index answers a query.
+pub(crate) fn exact_probe_keys(indexed_columns: usize, pick: &IndexPick) -> Option<Vec<IndexKey>> {
+    if pick.prefix_empty {
+        return None;
+    }
+    if 1 + pick.suffix_values.len() != indexed_columns {
+        return None;
+    }
+    let wrap = |direction: contextdb_core::SortDirection, value: Value| -> DirectedValue {
+        match direction {
+            contextdb_core::SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value)),
+            contextdb_core::SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value)),
+        }
+    };
+    let leading_direction = pick
+        .columns
+        .first()
+        .map(|(_, direction)| *direction)
+        .unwrap_or(contextdb_core::SortDirection::Asc);
+    let suffix = pick
+        .suffix_values
+        .iter()
+        .zip(pick.columns.iter().skip(1))
+        .map(|(value, (_, direction))| wrap(*direction, value.clone()))
+        .collect::<Vec<_>>();
+    let key_for = |leading: Value| -> IndexKey {
+        let mut key = Vec::with_capacity(1 + suffix.len());
+        key.push(wrap(leading_direction, leading));
+        key.extend(suffix.iter().cloned());
+        key
+    };
+    match &pick.shape {
+        IndexPredicateShape::Equality(value) => Some(vec![key_for(value.clone())]),
+        IndexPredicateShape::InList(values) => Some(values.iter().cloned().map(key_for).collect()),
+        IndexPredicateShape::IsNull => Some(vec![key_for(Value::Null)]),
+        IndexPredicateShape::NotEqual(_)
+        | IndexPredicateShape::Range { .. }
+        | IndexPredicateShape::IsNotNull => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_index_scan(
     db: &Database,
     table: &str,
@@ -4981,16 +7115,7 @@ fn execute_index_scan(
     use contextdb_core::{DirectedValue, SortDirection, TotalOrdAsc, TotalOrdDesc};
     use std::ops::Bound;
 
-    // NaN equality short-circuit (I19): `col = NaN` or bound param NaN → empty.
-    if let IndexPredicateShape::Equality(rhs) = &pick.shape
-        && let Value::Float64(f) = rhs
-        && f.is_nan()
-    {
-        return Ok((Vec::new(), 0));
-    }
-    // NULL equality short-circuit: `col = $p` with $p = NULL → empty (NULL
-    // comparisons are UNKNOWN in SQL).
-    if let IndexPredicateShape::Equality(Value::Null) = &pick.shape {
+    if pick_matches_nothing(pick) {
         return Ok((Vec::new(), 0));
     }
 
@@ -5140,43 +7265,23 @@ fn execute_index_scan(
     };
 
     if storage.exact_only() {
-        let exact_key_complete = 1 + suffix_prefix.len() == storage.columns.len();
-        let collect_exact_key = |postings: &mut Vec<contextdb_relational::IndexEntry>,
-                                 examined: &mut u64,
-                                 key: &[DirectedValue]| {
-            let key = key.to_vec();
+        // One rule for which keys an exact index is probed with, shared with
+        // the bounded kernel so the two paths cannot disagree about which
+        // index answers a query.
+        let Some(keys) = exact_probe_keys(storage.columns.len(), pick) else {
+            drop(indexes);
+            let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+            let rows_examined = rows.len() as u64;
+            return Ok((rows, rows_examined));
+        };
+        for key in keys {
             if let Some(entries) = storage.exact_postings(&key) {
                 for e in entries {
-                    *examined += 1;
+                    rows_examined += 1;
                     if e.visible_at(snapshot) {
                         postings.push(e.clone());
                     }
                 }
-            }
-        };
-        match &pick.shape {
-            IndexPredicateShape::Equality(v) if exact_key_complete => {
-                let mut probe_prefix = Vec::with_capacity(1 + suffix_prefix.len());
-                make_probe_prefix(v.clone(), &mut probe_prefix);
-                collect_exact_key(&mut postings, &mut rows_examined, &probe_prefix);
-            }
-            IndexPredicateShape::InList(vs) if exact_key_complete => {
-                let mut probe_prefix = Vec::with_capacity(1 + suffix_prefix.len());
-                for v in vs {
-                    make_probe_prefix(v.clone(), &mut probe_prefix);
-                    collect_exact_key(&mut postings, &mut rows_examined, &probe_prefix);
-                }
-            }
-            IndexPredicateShape::IsNull if exact_key_complete => {
-                let mut probe_prefix = Vec::with_capacity(1 + suffix_prefix.len());
-                make_probe_prefix(Value::Null, &mut probe_prefix);
-                collect_exact_key(&mut postings, &mut rows_examined, &probe_prefix);
-            }
-            _ => {
-                drop(indexes);
-                let rows = scan_rows_for_select(db, table, snapshot, tx)?;
-                let rows_examined = rows.len() as u64;
-                return Ok((rows, rows_examined));
             }
         }
     } else {
@@ -5428,44 +7533,64 @@ fn try_elide_sort(
     let Some((table, _alias, filter)) = find_scan(input) else {
         return Ok(None);
     };
-    // If the underlying Scan has a WHERE, route through the Scan executor
-    // path so it gets the narrow range / correct rows_examined accounting.
-    // Path B on the Sort arm will detect the IndexScan trace + matching
-    // prefix and flip `sort_elided` on the result.
-    if filter.is_some() {
+    let Some(matching) = sort_elision_index_decl(db, input, keys) else {
         return Ok(None);
+    };
+    run_index_scan_with_order(db, table, &matching, filter.as_ref(), params, tx)
+}
+
+/// The index whose own order lets an ORDER BY be answered without sorting
+/// anything, for a scan that carries no predicate.
+///
+/// One rule, asked by both doors. A read that decides this for itself ends up
+/// sorting where the other door does not, or claiming an order the rows it
+/// returns are not in.
+pub(crate) fn sort_elision_index_decl(
+    db: &dyn ReadExecutionTarget,
+    input: &PhysicalPlan,
+    keys: &[contextdb_planner::SortKey],
+) -> Option<contextdb_core::IndexDecl> {
+    fn find_scan(plan: &PhysicalPlan) -> Option<(&String, &Option<Expr>)> {
+        match plan {
+            PhysicalPlan::Scan { table, filter, .. } => Some((table, filter)),
+            PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Limit { input, .. } => find_scan(input),
+            _ => None,
+        }
+    }
+    let (table, filter) = find_scan(input)?;
+    // A scan that carries a WHERE reads one run of the index its predicate
+    // names, and whether THAT order answers the sort is a different question,
+    // asked by `sort_keys_match_index_prefix` once the run is known.
+    if filter.is_some() {
+        return None;
     }
     // Keys must all be simple column references.
-    let key_cols: Option<Vec<(&str, &contextdb_parser::ast::SortDirection)>> = keys
+    let key_cols: Vec<(&str, &contextdb_parser::ast::SortDirection)> = keys
         .iter()
         .map(|k| match &k.expr {
             Expr::Column(r) => Some((r.column.as_str(), &k.direction)),
             _ => None,
         })
-        .collect();
-    let Some(key_cols) = key_cols else {
-        return Ok(None);
-    };
-    let meta = match db.table_meta(table) {
-        Some(m) => m,
-        None => return Ok(None),
-    };
-    let matching_index = meta.indexes.iter().find(|decl| {
-        if decl.kind == contextdb_core::IndexKind::Auto {
-            return false;
-        }
-        if decl.columns.len() < key_cols.len() {
-            return false;
-        }
-        decl.columns
-            .iter()
-            .zip(key_cols.iter())
-            .all(|((col, dir), (kcol, kdir))| col == kcol && core_dir_matches_ast(*dir, **kdir))
-    });
-    let Some(matching) = matching_index else {
-        return Ok(None);
-    };
-    run_index_scan_with_order(db, table, matching, filter.as_ref(), params, tx)
+        .collect::<Option<Vec<_>>>()?;
+    let meta = db.table_meta(table)?;
+    meta.indexes
+        .iter()
+        .find(|decl| {
+            if decl.kind == contextdb_core::IndexKind::Auto {
+                return false;
+            }
+            if decl.columns.len() < key_cols.len() {
+                return false;
+            }
+            decl.columns
+                .iter()
+                .zip(key_cols.iter())
+                .all(|((col, dir), (kcol, kdir))| col == kcol && core_dir_matches_ast(*dir, **kdir))
+        })
+        .cloned()
 }
 
 /// Execute an IndexScan over `table` with `index`, applying the optional
@@ -5536,8 +7661,23 @@ fn run_index_scan_with_order(
     Ok(Some(result))
 }
 
-fn sort_keys_match_index_prefix(
-    db: &Database,
+/// Whether this predicate can match no row at all, so the answer is zero rows
+/// having read none.
+///
+/// `col = NaN` never matches -- NaN equals nothing, itself included -- and
+/// `col = NULL` is UNKNOWN rather than true, so neither reaches the store.
+/// Both doors ask this one function; a read that decides it for itself returns
+/// a row the other door excludes.
+pub(crate) fn pick_matches_nothing(pick: &IndexPick) -> bool {
+    match &pick.shape {
+        IndexPredicateShape::Equality(Value::Float64(f)) if f.is_nan() => true,
+        IndexPredicateShape::Equality(Value::Null) => true,
+        _ => pick.prefix_empty,
+    }
+}
+
+pub(crate) fn sort_keys_match_index_prefix(
+    db: &dyn ReadExecutionTarget,
     input: &PhysicalPlan,
     index_name: &str,
     keys: &[contextdb_planner::SortKey],
@@ -5714,6 +7854,17 @@ fn validate_update_state_transition(
     )))
 }
 
+/// What a row costs the store that KEEPS it: an index over any of its columns
+/// keeps a whole clone of the value, so the memory a limit governs is
+/// `ROW_VALUE_RETENTIONS` copies of what one copy occupies.
+fn retained_row_bytes_for_meta(
+    values: &HashMap<String, Value>,
+    meta: &TableMeta,
+    include_vectors: bool,
+) -> usize {
+    estimate_row_bytes_for_meta(values, meta, include_vectors).saturating_mul(ROW_VALUE_RETENTIONS)
+}
+
 fn estimate_row_bytes_for_meta(
     values: &HashMap<String, Value>,
     meta: &TableMeta,
@@ -5727,18 +7878,19 @@ fn estimate_row_bytes_for_meta(
         if !include_vectors && matches!(column.column_type, ColumnType::Vector(_)) {
             continue;
         }
-        bytes = bytes.saturating_add(32 + column.name.len() * 8 + value.estimated_bytes());
+        bytes =
+            bytes.saturating_add(estimate_value_key_bytes(&column.name) + value.estimated_bytes());
     }
     bytes
 }
 
-fn estimate_vector_search_bytes(dimension: usize, k: usize) -> usize {
+pub(crate) fn estimate_vector_search_bytes(dimension: usize, k: usize) -> usize {
     k.saturating_mul(3)
         .saturating_mul(dimension)
         .saturating_mul(std::mem::size_of::<f32>())
 }
 
-fn estimate_bfs_working_bytes<T>(
+pub(crate) fn estimate_bfs_working_bytes<T>(
     frontier: &[T],
     steps: &[contextdb_planner::GraphStepPlan],
 ) -> usize {
@@ -5786,7 +7938,7 @@ pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
     let row_bytes = rows.iter().fold(0usize, |acc, row| {
         acc.saturating_add(meta.as_ref().map_or_else(
             || row.estimated_bytes(),
-            |meta| estimate_row_bytes_for_meta(&row.values, meta, false),
+            |meta| retained_row_bytes_for_meta(&row.values, meta, false),
         ))
     });
     let vector_bytes = rows
@@ -5802,9 +7954,19 @@ pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
                 row.values.get("target_id").and_then(Value::as_uuid),
                 row.values.get("edge_type").and_then(Value::as_text),
             ) {
-                (Some(_), Some(_), Some(edge_type)) => acc.saturating_add(
-                    96 + edge_type.len().saturating_mul(16)
-                        + estimate_row_value_bytes(&HashMap::new()),
+                // Released through the same estimate the insert charged, so
+                // dropping a table gives back exactly what holding it took.
+                (Some(source), Some(target), Some(edge_type)) => acc.saturating_add(
+                    AdjEntry {
+                        source: *source,
+                        target: *target,
+                        edge_type: edge_type.to_string(),
+                        properties: HashMap::new(),
+                        created_tx: TxId(0),
+                        deleted_tx: None,
+                        lsn: Lsn(0),
+                    }
+                    .estimated_bytes(),
                 ),
                 _ => acc,
             }
@@ -5867,12 +8029,14 @@ fn scan_rows_for_select(
     snapshot: SnapshotId,
     tx: Option<TxId>,
 ) -> Result<Vec<VersionedRow>> {
-    if let Some(tx) = tx {
+    let mut rows = if let Some(tx) = tx {
         let rows = db.scan_in_tx_raw(tx, table, snapshot)?;
-        db.filter_rows_for_read_in_tx(Some(tx), table, rows, snapshot)
+        db.filter_rows_for_read_in_tx(Some(tx), table, rows, snapshot)?
     } else {
-        db.scan(table, snapshot)
-    }
+        db.scan(table, snapshot)?
+    };
+    db.supplement_quantized_vectors(table, snapshot, &mut rows);
+    Ok(rows)
 }
 
 fn rows_by_row_id(
@@ -5892,6 +8056,7 @@ fn rows_by_row_id(
             rows.push(row);
         }
     }
+    db.supplement_quantized_vectors(table, snapshot, &mut rows);
     Ok(rows)
 }
 
@@ -6044,7 +8209,7 @@ fn eval_expr_value(
             negated,
         } => {
             let needle = eval_expr_value(row, expr, params)?;
-            let matched = list.iter().try_fold(false, |found, item| {
+            let matched = list.iter().try_fold(false, |found, item| -> Result<bool> {
                 if found {
                     Ok(true)
                 } else {
@@ -6241,7 +8406,7 @@ fn eval_bool_expr(
                 return Ok(None);
             }
 
-            let matched = list.iter().try_fold(false, |found, item| {
+            let matched = list.iter().try_fold(false, |found, item| -> Result<bool> {
                 if found {
                     Ok(true)
                 } else {
@@ -6600,14 +8765,20 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value> {
             .find(|value| **value != Value::Null)
             .cloned()
             .unwrap_or(Value::Null)),
-        "now" => Ok(Value::Timestamp(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|err| Error::PlanError(err.to_string()))?
-                .as_secs() as i64,
-        )),
+        "now" => Ok(Value::Timestamp(now_timestamp_seconds()?)),
         _ => Err(Error::PlanError(format!("unknown function: {}", name))),
     }
+}
+
+/// Seconds since the epoch for `NOW()`. Reaching the clock through
+/// `eval_function` first normalizes the function name into a fresh `String`;
+/// a caller that has already identified the function calls this instead, so
+/// no scratch is allocated outside whatever budget governs it.
+fn now_timestamp_seconds() -> Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| Error::PlanError(err.to_string()))?
+        .as_secs() as i64)
 }
 
 fn like_matches(value: &str, pattern: &str) -> bool {
@@ -6671,6 +8842,37 @@ pub(crate) fn resolve_in_subqueries_with_ctes(
     tx: Option<TxId>,
     ctes: &[Cte],
 ) -> Result<Expr> {
+    // The eager door reads the inner answer the eager way: the whole result at
+    // once, with no ceiling over it, which is exactly what it promises its
+    // callers.
+    let mut drain = |plan: &PhysicalPlan, select: &Expr| -> Result<Vec<Value>> {
+        let result = execute_plan(db, plan, params, tx)?;
+        result
+            .rows
+            .iter()
+            .map(|row| eval_project_expr(select, row, &result.columns, params))
+            .collect()
+    };
+    resolve_in_subqueries_with_drain(db, expr, params, ctes, &mut drain)
+}
+
+/// The shape of `IN (subquery)` resolution that both doors share: the same
+/// correlation refusal, the same planning, the same literal conversion, the
+/// same walk over the surrounding expression. What differs is how the inner
+/// answer's rows are READ, which is the only part that has to be bounded, so
+/// that part is the caller's.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::only_used_in_recursion)]
+pub(crate) fn resolve_in_subqueries_with_drain<E>(
+    db: &Database,
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    ctes: &[Cte],
+    drain: &mut dyn FnMut(&PhysicalPlan, &Expr) -> std::result::Result<Vec<Value>, E>,
+) -> std::result::Result<Expr, E>
+where
+    E: From<Error>,
+{
     match expr {
         Expr::InSubquery {
             expr,
@@ -6699,51 +8901,56 @@ pub(crate) fn resolve_in_subqueries_with_ctes(
             if let Some(where_clause) = &subquery.where_clause
                 && has_outer_table_ref(where_clause, &subquery_tables)
             {
-                return Err(Error::Other(
+                return Err(E::from(Error::Other(
                     "correlated subqueries are not supported".to_string(),
-                ));
+                )));
             }
 
             let query_plan = plan(&Statement::Select(SelectStatement {
                 ctes: ctes.to_vec(),
                 body: (**subquery).clone(),
-            }))?;
+            }))
+            .map_err(E::from)?;
             // A subquery is planned here at execution time rather than being a
             // subtree of the root plan, so it needs the plan-time pass applied
             // to it directly — otherwise it would be the one path where an
             // unknown column is still only caught while rows are being read.
-            validate_plan_columns(db, &query_plan)?;
-            let result = execute_plan(db, &query_plan, params, tx)?;
+            validate_plan_columns(db, &query_plan).map_err(E::from)?;
             let select_expr = subquery
                 .columns
                 .first()
                 .map(|column| column.expr.clone())
-                .ok_or_else(|| Error::PlanError("subquery must select one column".to_string()))?;
-            let list = result
-                .rows
-                .iter()
-                .map(|row| eval_project_expr(&select_expr, row, &result.columns, params))
-                .collect::<Result<Vec<_>>>()?
+                .ok_or_else(|| {
+                    E::from(Error::PlanError(
+                        "subquery must select one column".to_string(),
+                    ))
+                })?;
+            let list = drain(&query_plan, &select_expr)?
                 .into_iter()
                 .map(value_to_literal)
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()
+                .map_err(E::from)?;
             Ok(Expr::InList {
-                expr: Box::new(resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)?),
+                expr: Box::new(resolve_in_subqueries_with_drain(
+                    db, expr, params, ctes, drain,
+                )?),
                 list,
                 negated: *negated,
             })
         }
         Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-            left: Box::new(resolve_in_subqueries_with_ctes(db, left, params, tx, ctes)?),
+            left: Box::new(resolve_in_subqueries_with_drain(
+                db, left, params, ctes, drain,
+            )?),
             op: *op,
-            right: Box::new(resolve_in_subqueries_with_ctes(
-                db, right, params, tx, ctes,
+            right: Box::new(resolve_in_subqueries_with_drain(
+                db, right, params, ctes, drain,
             )?),
         }),
         Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {
             op: *op,
-            operand: Box::new(resolve_in_subqueries_with_ctes(
-                db, operand, params, tx, ctes,
+            operand: Box::new(resolve_in_subqueries_with_drain(
+                db, operand, params, ctes, drain,
             )?),
         }),
         Expr::InList {
@@ -6751,11 +8958,13 @@ pub(crate) fn resolve_in_subqueries_with_ctes(
             list,
             negated,
         } => Ok(Expr::InList {
-            expr: Box::new(resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)?),
+            expr: Box::new(resolve_in_subqueries_with_drain(
+                db, expr, params, ctes, drain,
+            )?),
             list: list
                 .iter()
-                .map(|item| resolve_in_subqueries_with_ctes(db, item, params, tx, ctes))
-                .collect::<Result<Vec<_>>>()?,
+                .map(|item| resolve_in_subqueries_with_drain(db, item, params, ctes, drain))
+                .collect::<std::result::Result<Vec<_>, E>>()?,
             negated: *negated,
         }),
         Expr::Like {
@@ -6763,22 +8972,26 @@ pub(crate) fn resolve_in_subqueries_with_ctes(
             pattern,
             negated,
         } => Ok(Expr::Like {
-            expr: Box::new(resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)?),
-            pattern: Box::new(resolve_in_subqueries_with_ctes(
-                db, pattern, params, tx, ctes,
+            expr: Box::new(resolve_in_subqueries_with_drain(
+                db, expr, params, ctes, drain,
+            )?),
+            pattern: Box::new(resolve_in_subqueries_with_drain(
+                db, pattern, params, ctes, drain,
             )?),
             negated: *negated,
         }),
         Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
-            expr: Box::new(resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)?),
+            expr: Box::new(resolve_in_subqueries_with_drain(
+                db, expr, params, ctes, drain,
+            )?),
             negated: *negated,
         }),
         Expr::FunctionCall { name, args } => Ok(Expr::FunctionCall {
             name: name.clone(),
             args: args
                 .iter()
-                .map(|arg| resolve_in_subqueries_with_ctes(db, arg, params, tx, ctes))
-                .collect::<Result<Vec<_>>>()?,
+                .map(|arg| resolve_in_subqueries_with_drain(db, arg, params, ctes, drain))
+                .collect::<std::result::Result<Vec<_>, E>>()?,
         }),
         _ => Ok(expr.clone()),
     }
@@ -6918,7 +9131,7 @@ fn eval_query_result_bool_expr(
                 return Ok(None);
             }
 
-            let matched = list.iter().try_fold(false, |found, item| {
+            let matched = list.iter().try_fold(false, |found, item| -> Result<bool> {
                 if found {
                     Ok(true)
                 } else {
@@ -7162,10 +9375,16 @@ enum GraphTraceShape {
     GraphBfs,
 }
 
-struct GraphStartResolution {
-    ids: Vec<uuid::Uuid>,
-    predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]>,
-    pinned: bool,
+pub(crate) struct GraphStartResolution {
+    pub(crate) ids: Vec<uuid::Uuid>,
+    pub(crate) predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]>,
+    pub(crate) pinned: bool,
+    /// Rows this resolution read to find the starts. The eager route reports
+    /// them through the query-wide counter; a bounded read has no such counter
+    /// and puts them in its own trace, so the figure is returned as well as
+    /// bumped.
+    #[allow(dead_code)]
+    pub(crate) examined: u64,
 }
 
 type GraphFrontierRow = (HashMap<String, uuid::Uuid>, uuid::Uuid, u32);
@@ -7238,7 +9457,7 @@ fn graph_query_trace(
 /// Resolve start nodes for a graph traversal from a WHERE filter like
 /// `a.name = 'entity-0'`. Uses a matching relational index when one exists and
 /// otherwise reports the full row scan needed to resolve the start vertices.
-fn resolve_graph_start_nodes_from_filter(
+pub(crate) fn resolve_graph_start_nodes_from_filter(
     db: &Database,
     filter: &Expr,
     params: &HashMap<String, Value>,
@@ -7246,24 +9465,83 @@ fn resolve_graph_start_nodes_from_filter(
     snapshot: contextdb_core::SnapshotId,
     start_alias: &str,
 ) -> Result<GraphStartResolution> {
+    // The eager door reads the candidate rows the eager way: whole result sets,
+    // no ceiling, which is what it promises its callers.
+    let mut read = |table: &str, pick: Option<&IndexPick>| -> Result<(Vec<uuid::Uuid>, u64)> {
+        let (rows, scanned) = match pick {
+            Some(pick) => execute_index_scan(
+                db,
+                table,
+                pick,
+                snapshot,
+                tx,
+                IndexScanAccessMode::Select,
+                None,
+                params,
+            )?,
+            None => {
+                let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+                let scanned = rows.len() as u64;
+                (rows, scanned)
+            }
+        };
+        db.__bump_rows_examined(scanned);
+        Ok((
+            rows.into_iter()
+                .filter_map(|row| match row.values.get("id") {
+                    Some(Value::Uuid(id)) => Some(*id),
+                    _ => None,
+                })
+                .collect(),
+            scanned,
+        ))
+    };
+    resolve_graph_start_nodes_with_reader(db, filter, params, tx, snapshot, start_alias, &mut read)
+}
+
+/// The shape of start resolution both doors share: which filter names a start,
+/// which tables can describe one, which predicates were pushed, and the final
+/// per-candidate confirmation. What differs is how the candidate ROWS are read,
+/// which is the only part that has to be bounded.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn resolve_graph_start_nodes_with_reader<E>(
+    db: &Database,
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+    start_alias: &str,
+    read: &mut dyn FnMut(
+        &str,
+        Option<&IndexPick>,
+    ) -> std::result::Result<(Vec<uuid::Uuid>, u64), E>,
+) -> std::result::Result<GraphStartResolution, E>
+where
+    E: From<Error>,
+{
     let mut predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]> =
         smallvec::SmallVec::new();
+    let mut examined = 0_u64;
 
     let Some(start_filter) = graph_start_resolution_filter(filter, start_alias) else {
         return Ok(GraphStartResolution {
             ids: Vec::new(),
             predicates_pushed,
             pinned: false,
+            examined,
         });
     };
     if let Some(ids) =
-        resolve_graph_start_ids_from_filter(db, &start_filter, params, tx, snapshot, start_alias)?
+        resolve_graph_start_ids_from_filter(db, &start_filter, params, tx, snapshot, start_alias)
+            .map_err(E::from)?
     {
         predicates_pushed.push(Cow::Owned(format!("{start_alias}.id")));
         return Ok(GraphStartResolution {
             ids,
             predicates_pushed,
             pinned: true,
+            examined,
         });
     }
 
@@ -7273,6 +9551,7 @@ fn resolve_graph_start_nodes_from_filter(
             ids: Vec::new(),
             predicates_pushed,
             pinned: false,
+            examined,
         });
     }
     if graph_start_filter_needs_unpinned_null_semantics(&start_filter, start_alias) {
@@ -7280,6 +9559,7 @@ fn resolve_graph_start_nodes_from_filter(
             ids: Vec::new(),
             predicates_pushed,
             pinned: false,
+            examined,
         });
     }
     for column in &start_columns {
@@ -7299,45 +9579,26 @@ fn resolve_graph_start_nodes_from_filter(
         }
 
         let analysis = analyze_filter_for_index(&start_filter, &meta.indexes, params);
-        if let Some(pick) = analysis.pick.as_ref() {
-            let (rows, examined) = execute_index_scan(
-                db,
-                &table_name,
-                pick,
-                snapshot,
-                tx,
-                IndexScanAccessMode::Select,
-                None,
-                params,
-            )?;
-            db.__bump_rows_examined(examined);
-            for row in rows {
-                if let Some(Value::Uuid(id)) = row.values.get("id") {
-                    candidate_ids.insert(*id);
-                }
-            }
-        } else {
-            let rows = scan_rows_for_select(db, &table_name, snapshot, tx)?;
-            db.__bump_rows_examined(rows.len() as u64);
-            for row in rows {
-                if let Some(Value::Uuid(id)) = row.values.get("id") {
-                    candidate_ids.insert(*id);
-                }
-            }
-        }
+        let (ids, scanned) = read(&table_name, analysis.pick.as_ref())?;
+        examined = examined.saturating_add(scanned);
+        candidate_ids.extend(ids);
     }
     let mut ids = Vec::new();
     for id in candidate_ids {
         let bindings = HashMap::from([(start_alias.to_string(), id)]);
-        if graph_filter_matches_bindings(db, &start_filter, params, tx, snapshot, &bindings)? {
+        if graph_filter_matches_bindings(db, &start_filter, params, tx, snapshot, &bindings)
+            .map_err(E::from)?
+        {
             ids.push(id);
         }
     }
-    db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
+    db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)
+        .map_err(E::from)?;
     Ok(GraphStartResolution {
         ids,
         predicates_pushed,
         pinned: true,
+        examined,
     })
 }
 
@@ -8186,27 +10447,6 @@ fn has_exact_column_type(meta: &TableMeta, name: &str, column_type: &ColumnType)
         && columns.next().is_none()
 }
 
-fn vector_values_for_table(
-    db: &Database,
-    table: &str,
-    values: &HashMap<String, Value>,
-) -> Vec<(String, Vec<f32>)> {
-    db.table_meta(table)
-        .map(|meta| {
-            meta.columns
-                .iter()
-                .filter_map(|column| match column.column_type {
-                    contextdb_core::ColumnType::Vector(_) => match values.get(&column.name) {
-                        Some(Value::Vector(vector)) => Some((column.name.clone(), vector.clone())),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn vector_indexes_for_table(db: &Database, table: &str) -> Vec<contextdb_core::VectorIndexRef> {
     db.table_meta(table)
         .map(|meta| {
@@ -8257,8 +10497,8 @@ fn coerce_value_for_column(
             return Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: "UNKNOWN",
-                actual: "TxId",
+                expected: "UNKNOWN".to_owned(),
+                actual: "TxId".to_owned(),
             });
         }
         return Ok(coerce_uuid_if_needed(col_name, v));
@@ -8279,8 +10519,8 @@ fn coerce_value_for_column_with_meta(
             return Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: "UNKNOWN",
-                actual: "TxId",
+                expected: "UNKNOWN".to_owned(),
+                actual: "TxId".to_owned(),
             });
         }
         return Ok(coerce_uuid_if_needed(col_name, v));
@@ -8291,8 +10531,8 @@ fn coerce_value_for_column_with_meta(
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: "UUID",
-                actual: "TxId",
+                expected: "UUID".to_owned(),
+                actual: "TxId".to_owned(),
             }),
             other => coerce_uuid_value(other),
         },
@@ -8300,8 +10540,8 @@ fn coerce_value_for_column_with_meta(
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: "TIMESTAMP",
-                actual: "TxId",
+                expected: "TIMESTAMP".to_owned(),
+                actual: "TxId".to_owned(),
             }),
             other => coerce_timestamp_value(other),
         },
@@ -8309,17 +10549,17 @@ fn coerce_value_for_column_with_meta(
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: format_vector_type(dim),
-                actual: "TxId",
+                expected: format_vector_type(dim).to_owned(),
+                actual: "TxId".to_owned(),
             }),
-            other => coerce_vector_value(table, col_name, other, dim),
+            other => coerce_vector_value(table, col_name, other, dim, col.quantization),
         },
         contextdb_core::ColumnType::Integer => match v {
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: "INTEGER",
-                actual: "TxId",
+                expected: "INTEGER".to_owned(),
+                actual: "TxId".to_owned(),
             }),
             other => Ok(coerce_uuid_if_needed(col_name, other)),
         },
@@ -8327,8 +10567,8 @@ fn coerce_value_for_column_with_meta(
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: "REAL",
-                actual: "TxId",
+                expected: "REAL".to_owned(),
+                actual: "TxId".to_owned(),
             }),
             other => Ok(coerce_uuid_if_needed(col_name, other)),
         },
@@ -8336,8 +10576,8 @@ fn coerce_value_for_column_with_meta(
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: "TEXT",
-                actual: "TxId",
+                expected: "TEXT".to_owned(),
+                actual: "TxId".to_owned(),
             }),
             // A column DECLARED `TEXT` preserves its text — including a value that happens to parse
             // as a UUID. The id-name heuristic in `coerce_uuid_if_needed` is for untyped/UUID
@@ -8350,8 +10590,8 @@ fn coerce_value_for_column_with_meta(
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: "BOOLEAN",
-                actual: "TxId",
+                expected: "BOOLEAN".to_owned(),
+                actual: "TxId".to_owned(),
             }),
             other => Ok(coerce_uuid_if_needed(col_name, other)),
         },
@@ -8359,8 +10599,8 @@ fn coerce_value_for_column_with_meta(
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
                 table: table.to_string(),
                 column: col_name.to_string(),
-                expected: "JSON",
-                actual: "TxId",
+                expected: "JSON".to_owned(),
+                actual: "TxId".to_owned(),
             }),
             other => Ok(coerce_uuid_if_needed(col_name, other)),
         },
@@ -8461,8 +10701,8 @@ fn coerce_txid_value(
         other => Err(Error::ColumnTypeMismatch {
             table: table.to_string(),
             column: col.to_string(),
-            expected: "TXID",
-            actual: value_variant_name(&other),
+            expected: "TXID".to_owned(),
+            actual: value_variant_name(&other).to_owned(),
         }),
     }
 }
@@ -8523,12 +10763,31 @@ fn coerce_timestamp_value(v: Value) -> Result<Value> {
     }
 }
 
-fn coerce_vector_value(table: &str, column: &str, v: Value, expected_dim: usize) -> Result<Value> {
+fn coerce_vector_value(
+    table: &str,
+    column: &str,
+    v: Value,
+    expected_dim: usize,
+    quantization: contextdb_core::VectorQuantization,
+) -> Result<Value> {
+    // A vector column holds embeddings and nothing else. Anything that is not
+    // an absent embedding, an embedding, or the text spelling of one is
+    // refused here -- at the door, before the statement stages a row or a
+    // searchable vector -- so a caller that binds a scalar by mistake is told
+    // which column rejected it instead of having the store accept a value the
+    // column cannot hold and surfacing it only when the file is read back.
     let vector = match v {
         Value::Null => return Ok(Value::Null),
         Value::Vector(vector) => vector,
         Value::Text(text) => parse_text_vector_literal(&text)?,
-        other => return Ok(other),
+        other => {
+            return Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: column.to_string(),
+                expected: format_vector_type(expected_dim).to_owned(),
+                actual: value_variant_name(&other).to_owned(),
+            });
+        }
     };
 
     if vector.len() != expected_dim {
@@ -8540,7 +10799,17 @@ fn coerce_vector_value(table: &str, column: &str, v: Value, expected_dim: usize)
         ));
     }
 
-    Ok(Value::Vector(vector))
+    // A column declared with space-saving storage keeps an approximation, so
+    // the value the row carries from here on is the value that will be
+    // stored. Taking the loss once, at the boundary where the value enters
+    // the column, is what makes the same query answer the same way while the
+    // writer is still warm, after a restart, and through a reader of the
+    // closed file -- instead of the writer alone answering from a precision
+    // that no longer exists anywhere else.
+    Ok(Value::Vector(contextdb_vector::stored_vector_value(
+        &vector,
+        quantization,
+    )))
 }
 
 fn vector_dimension_error(table: &str, column: &str, expected: usize, got: usize) -> Error {
@@ -9392,6 +11661,13 @@ fn refuse_engine_owned_reserved_name_shape(
         unique_constraints,
         primary_key_columns,
         composite_foreign_keys,
+        // Deliberately exempt: `IF NOT EXISTS` is not part of a table's
+        // declared shape. It only decides what a collision on an existing
+        // name does, and the collision door in the `CreateTable` arm answers
+        // that before this shape door ever runs -- so a reserved name reaches
+        // here only when no such table exists yet, where the flag has nothing
+        // to say.
+        if_not_exists: _,
         immutable,
         state_machine,
         dag_edge_types,
@@ -10871,6 +13147,620 @@ fn project_graph_frontier_rows(
 fn release_accounted_bytes(db: &Database, bytes: &[usize]) {
     for bytes in bytes {
         db.accountant().release(*bytes);
+    }
+}
+
+impl ReadExecutionTarget for BoundedCursorTarget {
+    fn row_vector_for_column(
+        &self,
+        table: &str,
+        column: &str,
+        row_id: RowId,
+        lsn: Lsn,
+        snapshot: SnapshotId,
+    ) -> Option<Vec<f32>> {
+        self.store
+            .row_vector_for_column(table, column, row_id, lsn, snapshot)
+    }
+
+    fn quantized_vector_columns(&self, table: &str) -> Vec<String> {
+        self.store.quantized_vector_columns(table)
+    }
+
+    fn store_state_answer(&self, plan: &PhysicalPlan) -> Result<QueryResult> {
+        self.store.store_state_answer(plan)
+    }
+
+    fn explain_plan_without_running_it(&self, sql: &str) -> Result<String> {
+        self.store.explain_plan_without_running_it(sql)
+    }
+
+    fn plugin(&self) -> &dyn crate::plugin::DatabasePlugin {
+        self.store.plugin()
+    }
+
+    fn table_meta(&self, table: &str) -> Option<TableMeta> {
+        self.store.table_meta(table)
+    }
+
+    fn natural_key_column_for_table(&self, table: &str) -> Result<String> {
+        self.store.natural_key_column_for_table(table)
+    }
+
+    fn row_id_for_natural_key_in_tx(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        key_col: &str,
+        key_value: &Value,
+        snapshot: SnapshotId,
+    ) -> Result<Option<RowId>> {
+        self.store
+            .row_id_for_natural_key_in_tx(tx, table, key_col, key_value, snapshot)
+    }
+
+    fn prepare_bounded_read_plan(
+        &self,
+        parsed: &Statement,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Statement, PhysicalPlan)> {
+        self.store.prepare_bounded_read_plan(parsed, params)
+    }
+
+    fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
+        self.store.bounded_read_accountant()
+    }
+
+    fn bounded_read_snapshot_registration(
+        &self,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<(SnapshotId, Box<dyn Send + Sync>)>> {
+        self.store.bounded_read_snapshot_registration(withdrawn)
+    }
+
+    fn bounded_cursor_snapshot_registration(
+        &self,
+        clock: Arc<dyn DeadlineClock>,
+        idle_ms: u64,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<BoundedCursorSnapshotPin>> {
+        self.store
+            .bounded_cursor_snapshot_registration(clock, idle_ms, withdrawn)
+    }
+
+    fn assert_table_read_allowed(&self, table: &str) -> Result<()> {
+        self.store.assert_table_read_allowed(table)
+    }
+
+    fn bounded_read_requires_candidate_filter(&self, table: &str) -> Result<bool> {
+        self.store.bounded_read_requires_candidate_filter(table)
+    }
+
+    fn bounded_read_allowed_for_row(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        meta: &TableMeta,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+        before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<bool, BoundedExecutionError> {
+        self.store
+            .bounded_read_allowed_for_row(tx, table, meta, row, snapshot, before_access_row)
+    }
+
+    fn bounded_read_denial_for_row(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        meta: &TableMeta,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+        before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<Error>, BoundedExecutionError> {
+        self.store
+            .bounded_read_denial_for_row(tx, table, meta, row, snapshot, before_access_row)
+    }
+
+    fn bounded_row_by_identity(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        self.store
+            .bounded_row_by_identity(tx, table, row_id, snapshot, before_touch, before_clone)
+    }
+
+    fn bounded_physical_table_cursor(
+        &self,
+        table: &str,
+    ) -> Result<contextdb_relational::mem::BoundedPhysicalCursor> {
+        self.store.bounded_physical_table_cursor(table)
+    }
+
+    fn bounded_physical_table_row_next(
+        &self,
+        table: &str,
+        cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        self.store
+            .bounded_physical_table_row_next(table, cursor, before_touch, before_clone)
+    }
+
+    fn bounded_exact_index_row_next(
+        &self,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        self.store.bounded_exact_index_row_next(
+            table,
+            index,
+            snapshot,
+            cursor,
+            before_touch,
+            before_retain,
+            release_retained,
+            before_clone,
+        )
+    }
+
+    fn bounded_ordered_table_row_next(
+        &self,
+        table: &str,
+        column: &str,
+        direction: contextdb_core::SortDirection,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
+        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
+        self.store.bounded_ordered_table_row_next(
+            table,
+            column,
+            direction,
+            snapshot,
+            cursor,
+            before_touch,
+            before_clone,
+        )
+    }
+
+    fn bounded_vector_schema_read_many(
+        &self,
+        indexes: Vec<VectorIndexRef>,
+    ) -> crate::database::VectorSchemaReadGuard {
+        self.store.bounded_vector_schema_read_many(indexes)
+    }
+
+    fn assert_vector_index_exists_under_schema_read(&self, index: &VectorIndexRef) -> Result<()> {
+        self.store
+            .assert_vector_index_exists_under_schema_read(index)
+    }
+
+    fn validate_vector_under_schema_read(
+        &self,
+        index: &VectorIndexRef,
+        actual: usize,
+    ) -> Result<()> {
+        self.store.validate_vector_under_schema_read(index, actual)
+    }
+
+    fn bounded_vector_candidate_k(
+        &self,
+        index: &VectorIndexRef,
+        requested: usize,
+        sort_key: Option<&str>,
+    ) -> Result<usize> {
+        self.store
+            .bounded_vector_candidate_k(index, requested, sort_key)
+    }
+
+    fn with_bounded_row_vector(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        before_access_row: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        use_vector: &mut dyn FnMut(
+            &[f32],
+        ) -> std::result::Result<
+            BoundedRowVectorClone,
+            BoundedExecutionError,
+        >,
+    ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError> {
+        self.store.with_bounded_row_vector(
+            index,
+            row_id,
+            snapshot,
+            tx,
+            before_access_row,
+            use_vector,
+        )
+    }
+
+    fn bounded_brute_force_vector_cursor(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<contextdb_vector::mem::BoundedBruteForceCursor, BoundedExecutionError>
+    {
+        self.store.bounded_brute_force_vector_cursor(
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            before_source_entry,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    fn bounded_brute_force_vector_step(
+        &self,
+        cursor: &mut contextdb_vector::mem::BoundedBruteForceCursor,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError> {
+        self.store.bounded_brute_force_vector_step(
+            cursor,
+            before_source_entry,
+            before_distance,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    fn bounded_hnsw_vector_search(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<BoundedVectorCandidates>, BoundedExecutionError> {
+        self.store.bounded_hnsw_vector_search(
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            before_source_entry,
+            before_distance,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    fn bounded_rank_candidate(
+        &self,
+        index: &VectorIndexRef,
+        sort_key: &str,
+        anchor_row_id: RowId,
+        anchor_values: &HashMap<String, Value>,
+        vector_score: f32,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        before_candidate: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        before_joined_clone: &mut dyn FnMut(
+            usize,
+        )
+            -> std::result::Result<(), BoundedExecutionError>,
+        release_joined_clone: &mut dyn FnMut(
+            usize,
+        )
+            -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(Option<f32>, usize), BoundedExecutionError> {
+        self.store.bounded_rank_candidate(
+            index,
+            sort_key,
+            anchor_row_id,
+            anchor_values,
+            vector_score,
+            snapshot,
+            tx,
+            before_candidate,
+            before_access,
+            before_joined_clone,
+            release_joined_clone,
+        )
+    }
+
+    fn bounded_graph_edge_cursor(
+        &self,
+        direction: contextdb_core::Direction,
+        snapshot: SnapshotId,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<crate::database::gate::BoundedGraphEdgeCursor, BoundedExecutionError>
+    {
+        self.store
+            .bounded_graph_edge_cursor(direction, snapshot, before_retain, release_retained)
+    }
+
+    fn bounded_graph_edge_next(
+        &self,
+        cursor: &mut crate::database::gate::BoundedGraphEdgeCursor,
+        edge_types: Option<&[EdgeType]>,
+        tx: Option<TxId>,
+        before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        entry_read: &mut dyn FnMut(),
+    ) -> std::result::Result<
+        Option<crate::database::gate::CountedGraphScanEdge>,
+        BoundedExecutionError,
+    > {
+        self.store.bounded_graph_edge_next(
+            cursor,
+            edge_types,
+            tx,
+            before_edge,
+            before_access,
+            before_retain,
+            release_retained,
+            entry_read,
+        )
+    }
+
+    fn bounded_graph_bfs_cursor(
+        &self,
+        tx: Option<TxId>,
+        start: NodeId,
+        edge_types: Option<&[EdgeType]>,
+        direction: contextdb_core::Direction,
+        min_depth: u32,
+        max_depth: u32,
+        snapshot: SnapshotId,
+        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, BoundedExecutionError>
+    {
+        self.store.bounded_graph_bfs_cursor(
+            tx,
+            start,
+            edge_types,
+            direction,
+            min_depth,
+            max_depth,
+            snapshot,
+            before_access,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    fn bounded_graph_bfs_next(
+        &self,
+        cursor: &mut contextdb_graph::mem::BoundedBfsCursor,
+        before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_path_element: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+        staged_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        staged_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        staged_hand_back: &mut dyn FnMut(usize),
+        entry_read: &mut dyn FnMut(),
+        visited_cap: Option<usize>,
+        tx: Option<TxId>,
+    ) -> std::result::Result<
+        Option<contextdb_graph::mem::BoundedTraversalNode>,
+        BoundedExecutionError,
+    > {
+        self.store.bounded_graph_bfs_next(
+            cursor,
+            before_edge,
+            before_path_element,
+            before_access,
+            before_retain,
+            release_retained,
+            staged_touch,
+            staged_retain,
+            staged_hand_back,
+            entry_read,
+            visited_cap,
+            tx,
+        )
+    }
+
+    fn resolve_graph_filter_at_snapshot(
+        &self,
+        expr: &Expr,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+        ctes: &[Cte],
+    ) -> Result<Expr> {
+        self.store
+            .resolve_graph_filter_at_snapshot(expr, params, tx, snapshot, ctes)
+    }
+
+    fn as_database_for_subquery_plan(&self) -> Option<&Database> {
+        self.store.as_database_for_subquery_plan()
+    }
+
+    fn resolve_graph_start_nodes_from_filter(
+        &self,
+        filter: &Expr,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+        start_alias: &str,
+    ) -> Result<GraphStartResolution> {
+        self.store
+            .resolve_graph_start_nodes_from_filter(filter, params, tx, snapshot, start_alias)
+    }
+
+    fn graph_filter_matches_bindings(
+        &self,
+        filter: &Expr,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        snapshot: SnapshotId,
+        bindings: &HashMap<String, uuid::Uuid>,
+    ) -> Result<bool> {
+        self.store
+            .graph_filter_matches_bindings(filter, params, tx, snapshot, bindings)
+    }
+
+    fn coerce_into_column(
+        &self,
+        table: &str,
+        col: &str,
+        value: Value,
+        current_tx_max: Option<TxId>,
+        active_tx: Option<TxId>,
+    ) -> Result<Value> {
+        self.store
+            .coerce_into_column(table, col, value, current_tx_max, active_tx)
+    }
+
+    fn coerce_pick_shape_to_column_type(&self, table: &str, pick: &IndexPick) -> Result<IndexPick> {
+        self.store.coerce_pick_shape_to_column_type(table, pick)
+    }
+
+    fn read_query(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: &OwnerReadCancellation,
+    ) -> std::result::Result<(QueryResult, Vec<u8>), crate::direct_file_reader::DirectFileReaderError>
+    {
+        self.store
+            .read_query(sql, params, limits, clock, cancellation)
+    }
+
+    fn open_read_cursor(
+        self: Arc<Self>,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: &OwnerReadCancellation,
+        snapshot: crate::direct_file_reader::DirectSnapshot,
+    ) -> std::result::Result<
+        (
+            Arc<dyn ReadExecutionTarget>,
+            crate::direct_file_reader::DirectCursorPage,
+            Option<crate::direct_file_reader::DirectCursorPage>,
+        ),
+        crate::direct_file_reader::DirectFileReaderError,
+    > {
+        Arc::clone(&self.store).open_read_cursor(sql, params, limits, clock, cancellation, snapshot)
+    }
+
+    fn read_cursor_pages(
+        &self,
+        rows: Option<NonZeroUsize>,
+        cancellation: &OwnerReadCancellation,
+    ) -> std::result::Result<
+        (
+            crate::direct_file_reader::DirectCursorPage,
+            Option<crate::direct_file_reader::DirectCursorPage>,
+        ),
+        crate::direct_file_reader::DirectFileReaderError,
+    > {
+        #[cfg(feature = "test-seams")]
+        crate::read_probe::note_cancellation(
+            crate::read_probe::CANCELLATION_CURSOR_FETCH,
+            cancellation,
+        );
+        let fetched = self.with_cursor(|cursor| {
+            fetch_bounded_cursor(
+                cursor,
+                rows,
+                cancellation.clone(),
+                #[cfg(feature = "test-seams")]
+                crate::read_session::session_kernel_probe_for_test(),
+            )
+            .map(|fetch| fetch.page)
+        });
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            Err(crate::direct_file_reader::DirectFileReaderError::Cancelled) => {
+                return Err(crate::direct_file_reader::DirectFileReaderError::Cancelled);
+            }
+            // A refusal the kernel answered without disturbing the suspended
+            // read leaves the cursor open, so there is nothing to give back and
+            // the caller keeps the escape the refusal just named.
+            Err(error) if self.read_cursor_retains_continuation() => {
+                return Err(error);
+            }
+            Err(error) => {
+                // A refused read is over: it returns its bytes here rather
+                // than waiting for a caller to remember to close it.
+                #[cfg(feature = "test-seams")]
+                crate::read_probe::note_cursor_refusal();
+                self.release()?;
+                return Err(error);
+            }
+        };
+        let published = published_page(fetched, self.snapshot)?;
+        let drained = drained_page(&published)?;
+        if drained.is_some() {
+            self.release()?;
+        }
+        Ok((published, drained))
+    }
+
+    fn read_cursor_retains_continuation(&self) -> bool {
+        let cursor = self
+            .cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        bounded::cursor_retains_continuation(&cursor)
+    }
+
+    fn close_read_cursor(
+        &self,
+    ) -> std::result::Result<(), crate::direct_file_reader::DirectFileReaderError> {
+        self.release()
+    }
+
+    fn read_metadata(
+        &self,
+        request: crate::direct_file_reader::DirectMetadataRequest,
+        image: &crate::direct_file_reader::DirectOwnedImage,
+        limits: ReadLimits,
+        clock: Arc<dyn DeadlineClock>,
+        continuation: Option<&str>,
+    ) -> std::result::Result<
+        crate::direct_file_reader::DirectMetadataResponse,
+        crate::direct_file_reader::DirectFileReaderError,
+    > {
+        self.store
+            .read_metadata(request, image, limits, clock, continuation)
     }
 }
 

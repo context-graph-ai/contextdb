@@ -1,4 +1,5 @@
 use crate::common::{cli_bin, ensure_release_binaries, run_cli_script};
+use contextdb_core::read_contract::ReadFailureKind;
 use contextdb_core::{Error, Lsn, SnapshotId, Value};
 use contextdb_engine::Database;
 use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
@@ -33,6 +34,22 @@ fn current_test_exe_for_child() -> PathBuf {
     }
 }
 
+/// The advisory companion beside a store: its own pathname with `.lock`
+/// appended, which is the naming rule the store itself uses.
+fn advisory_lock_path(database_path: &std::path::Path) -> PathBuf {
+    let mut name = database_path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Take the advisory companion away while a handle is still alive. The
+/// in-process registry, not this file, is what makes a second open illegal, so
+/// removing it must change nothing about who may open the store.
+fn remove_advisory_lock(database_path: &std::path::Path) {
+    std::fs::remove_file(advisory_lock_path(database_path))
+        .expect("the advisory lock file exists while a handle holds the store");
+}
+
 fn assert_error<T>(result: contextdb_core::Result<T>, message: &str) -> Error {
     let err = result.err();
     assert!(err.is_some(), "{message}: expected Err, got Ok");
@@ -48,8 +65,7 @@ fn t19_01_same_process_second_open_returns_typed_database_locked() {
     let _h1 = Database::open(&path).expect("first open succeeds");
     // A same-process registry must be authoritative even if the advisory lock
     // file disappears while the first handle is still alive.
-    let lock_path = path.with_extension("lock");
-    std::fs::remove_file(&lock_path).expect("test removes advisory lock file");
+    remove_advisory_lock(&path);
     let result = Database::open(&path);
     let err = assert_error(result, "second open in same process must be rejected");
     match err {
@@ -74,6 +90,7 @@ fn t19_02_cross_process_concurrent_open_returns_typed_database_locked() {
     // Spawn the CLI binary which holds the path open.
     let mut child = Command::new(cli_bin())
         .arg(&path)
+        .arg("--write")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -92,13 +109,18 @@ fn t19_02_cross_process_concurrent_open_returns_typed_database_locked() {
     let result = Database::open(&path);
     let err = assert_error(result, "concurrent cross-process open must be rejected");
     assert!(
-        matches!(err, Error::DatabaseLocked { .. }),
-        "expected DatabaseLocked, got: {err}"
+        matches!(&err, Error::ReadFailure(f) if f.kind() == ReadFailureKind::HeldByWriter),
+        "expected HeldByWriter, got: {err}"
     );
-    if let Error::DatabaseLocked { holder_pid, .. } = &err {
-        assert_eq!(*holder_pid, child.id(), "holder_pid must match child PID");
-        assert_ne!(*holder_pid, 0, "holder_pid must be non-zero");
-    }
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("process {} holds", child.id())),
+        "message must name the holding child pid: {message}"
+    );
+    assert!(
+        message.contains(&path.display().to_string()),
+        "message must name the locked path: {message}"
+    );
     {
         use contextdb_core::types::{ContextId, Principal, ScopeLabel};
         use std::collections::BTreeSet;
@@ -112,20 +134,20 @@ fn t19_02_cross_process_concurrent_open_returns_typed_database_locked() {
             result,
             "cross-process composed constraints open must be rejected",
         );
-        match err {
-            Error::DatabaseLocked {
-                holder_pid,
-                path: p,
-            } => {
-                assert_eq!(
-                    holder_pid,
-                    child.id(),
-                    "holder_pid for composed open must match child PID"
+        match &err {
+            Error::ReadFailure(f) if f.kind() == ReadFailureKind::HeldByWriter => {
+                let message = err.to_string();
+                assert!(
+                    message.contains(&format!("process {} holds", child.id())),
+                    "message for composed open must name the holding child pid: {message}"
                 );
-                assert_eq!(p, path, "composed open lock error path must match");
+                assert!(
+                    message.contains(&path.display().to_string()),
+                    "message for composed open must name the locked path: {message}"
+                );
             }
             other => {
-                panic!("expected DatabaseLocked for cross-process composed open, got: {other:?}")
+                panic!("expected HeldByWriter for cross-process composed open, got: {other:?}")
             }
         }
     }
@@ -148,7 +170,7 @@ INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'row-2'
 INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'row-3');
 INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'row-4');
 ";
-    let out = run_cli_script(&path, &[], script);
+    let out = run_cli_script(&path, &["--write"], script);
     assert!(
         out.status.success(),
         "child process should seed committed rows; stderr={}",
@@ -255,8 +277,9 @@ fn t19_07_cross_variant_open_rejected() {
 
     // Variant A: open_as_principal first.
     let h1 = Database::open_as_principal(&path, Principal::Agent("a1".into())).unwrap();
-    std::fs::remove_file(path.with_extension("lock"))
-        .expect("test removes advisory lock file to force canonical registry path");
+    // Force the canonical registry path: with the advisory file gone, only the
+    // in-process registry can still refuse the aliases below.
+    remove_advisory_lock(&path);
 
     #[cfg(unix)]
     {
@@ -465,9 +488,16 @@ fn t19_11_lockfile_unlink_does_not_split_cross_process_authority() {
     if let Ok(path) = env::var("CONTEXTDB_T19_CHILD_OPEN_PATH") {
         let path = PathBuf::from(path);
         match Database::open(&path) {
-            Err(Error::DatabaseLocked { .. }) => std::process::exit(0),
+            Err(Error::ReadFailure(f)) if f.kind() == ReadFailureKind::HeldByWriter => {
+                std::process::exit(0)
+            }
             Ok(_) => std::process::exit(2),
-            Err(_) => std::process::exit(3),
+            Err(other) => {
+                // Named on the child's stderr so a refusal that lost its type
+                // is diagnosable from the parent's failure output.
+                eprintln!("child open refused with: {other:?}");
+                std::process::exit(3)
+            }
         }
     }
 
@@ -475,7 +505,7 @@ fn t19_11_lockfile_unlink_does_not_split_cross_process_authority() {
     let path = tmp.path().join("split.redb");
 
     let _h1 = Database::open(&path).expect("first open succeeds");
-    std::fs::remove_file(path.with_extension("lock")).expect("test removes advisory lock file");
+    remove_advisory_lock(&path);
 
     let err = assert_error(
         Database::open(&path),
@@ -493,8 +523,12 @@ fn t19_11_lockfile_unlink_does_not_split_cross_process_authority() {
         .env("CONTEXTDB_T19_CHILD_OPEN_PATH", &path)
         .status()
         .unwrap();
+    // The child branch above encodes what it saw: 0 the typed held-by-writer
+    // refusal, 2 an open that SUCCEEDED, 3 some other error.
     assert!(
         child.success(),
-        "cross-process open must remain locked after sidecar removal and rejected same-process open"
+        "cross-process open must remain locked after sidecar removal and rejected same-process \
+         open; the child reported {:?} (2 = it opened the store, 3 = it failed some other way)",
+        child.code()
     );
 }

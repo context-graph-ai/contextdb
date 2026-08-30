@@ -74,9 +74,13 @@ use contextdb_engine::work_ledger::install_work_ledger_schema;
 install_work_ledger_schema(&db)?;
 ```
 
-Each ledger table carries a deliberate conflict policy — read them from
-`work_ledger_conflict_policy_entries()`, or apply them onto an existing `ConflictPolicies` with
-`apply_work_ledger_policy_overrides(&mut policies)` before standing up a hub.
+Each ledger table carries a deliberate conflict policy, and there is nothing for you to wire up:
+the engine's own sync chokepoints merge those per-table policies over whatever `ConflictPolicies`
+a hub is standing up, so no caller can arbitrate a work table incorrectly. Nor is there anything to
+read them back with — `work_ledger_conflict_policy_entries` exists only under the crate's
+non-default `test-seams` feature, and `apply_work_ledger_policy_overrides` is `pub(crate)` in a
+normal build. To see the shipped arbitration from outside, run `SHOW SYNC_CONFLICT_POLICY` against
+a store with the ledger schema installed.
 
 ## Submit a job
 
@@ -171,14 +175,6 @@ are — this is a filed bug, deferred to a follow-up run, not a contract you sho
 **Practical guidance: don't run those ALTERs against a fabric store, whether or not the engine
 currently stops you.**
 
-<!-- VERIFY-AT-TIP --> The exact guard boundary above (SYNC CONFLICT guarded on all nine; RETAIN /
-HISTORY / sync-direction unguarded on the five hub-refereed tables; eight of nine rows rendering
-under `SHOW SYNC_CONFLICT_POLICY`) reflects the current gap plus a round-5 fix landing on the
-sibling `run-c-flow0` branch; this skill's own worked examples were executed against binaries
-pinned at `7e2d22a`, which predate that work, so re-verify this paragraph specifically (not the
-rest of the file) against a binary built at tip once `run-c-flow0` merges, before treating it as
-executed/confirmed.
-
 ## Claim across machines
 
 `contextdb_server::work_ledger::claim_job` **claims by push**: it inserts a local claim row, pushes
@@ -203,8 +199,16 @@ happens; everything around it is ledger bookkeeping.
 
 `contextdb_server::BlobStore` moves opaque, content-addressed bytes node to node.
 
+`BlobStore::new` takes an `Arc<Database>`, so hold the handle in an `Arc` from the moment you open
+it — `Database` itself is not `Clone`, and the ledger calls above take `&db`, which an `Arc` derefs
+to unchanged:
+
 ```rust
+use contextdb_engine::Database;
 use contextdb_server::BlobStore;
+use std::sync::Arc;
+
+let db = Arc::new(Database::open(std::path::Path::new("./work.db"))?);
 
 let blob_store = BlobStore::new(db.clone(), policy, identity_path);
 
@@ -226,9 +230,13 @@ let bytes_written = blob_store
     .await?;
 ```
 
-Failures are a matchable `ResolveError`, not a string: `Unentitled`, `PolicyForbidden`,
-`HashMismatch`, `HolderUnreachable`, `LocalStoreUnavailable`, `BlobNotFound`, `TransferAborted`,
-`SinkWrite`.
+Failures are a matchable `ResolveError`, not a string, and it has nine variants — the enum is not
+`#[non_exhaustive]`, so an exhaustive `match` must cover all of them: `Unentitled`,
+`PolicyForbidden`, `HashMismatch`, `HolderUnreachable`, `LocalStoreUnavailable`, `BlobNotFound`,
+`TransferAborted`, `SinkWrite`, and `FetchTimedOut { after_ms }`. `FetchTimedOut` is the one that
+means "still not known" — the fetch passed its `BlobFetchPolicy::fetch_deadline_ms` bound — as
+against `HolderUnreachable` (a definitive dial failure) and `TransferAborted` (a definitive
+mid-stream drop), so retrying it is reasonable where retrying those two is not.
 
 ## The entitlement rule — the actual security boundary
 

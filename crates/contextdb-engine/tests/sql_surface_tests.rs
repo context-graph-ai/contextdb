@@ -7439,11 +7439,35 @@ fn integrity_03_retain_pruning_releases_memory() {
 
 #[test]
 fn integrity_04_edge_delete_releases_memory() {
+    // Deleting an edge tombstones it: the entry stays whole in both adjacency
+    // maps, so the store is still holding it and is still charged for it. The
+    // bytes come back where the entry actually goes away -- the pass that
+    // drops it. Both halves are pinned, because a release at the delete would
+    // be the accountant handing back memory the process never freed, and a
+    // limit that no longer covers what is held.
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+    let _clock = {
+        let now = Arc::clone(&now);
+        contextdb_core::Wallclock::test_clock_guard(move || now.load(Ordering::SeqCst))
+    };
+
     let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
     let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY) RETAIN 1 SECONDS",
+        &empty(),
+    )
+    .unwrap();
 
     let source = Uuid::new_v4();
     let target = Uuid::new_v4();
+    for id in [source, target] {
+        db.execute(
+            "INSERT INTO nodes (id) VALUES ($id)",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    }
     let baseline = accountant.usage().used;
 
     let tx = db.begin_or_panic();
@@ -7461,9 +7485,26 @@ fn integrity_04_edge_delete_releases_memory() {
     db.commit(tx).unwrap();
 
     let used_after_delete = accountant.usage().used;
+    assert_eq!(
+        used_after_delete, used_after_insert,
+        "a deleted edge is tombstoned rather than removed, so the accountant still covers what \
+         the store is still holding: before={used_after_insert}, after={used_after_delete}"
+    );
+
+    // Past the declared window. The pass runs on this thread, under the clock
+    // the guard above installs.
+    now.fetch_add(5_000, Ordering::SeqCst);
+    let report = db.run_pruning_cycle_checked().unwrap();
+    assert_eq!(
+        report.pruned_rows, 2,
+        "both rows the edge connects are past their window: {report:?}"
+    );
+
+    let used_after_pass = accountant.usage().used;
     assert!(
-        used_after_delete + 128 < used_after_insert,
-        "edge delete must release adjacency memory: before={used_after_insert}, after={used_after_delete}"
+        used_after_pass + 128 < used_after_insert,
+        "the pass that drops the tombstoned entry is where the bytes come back: \
+         before={used_after_insert}, after={used_after_pass}"
     );
 }
 
@@ -10834,11 +10875,16 @@ fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
     let vector_search_bytes = 3usize
         .saturating_mul(f.source_vec.len())
         .saturating_mul(std::mem::size_of::<f32>());
+    // The read retains a small amount of its own working set before the
+    // overlay reservation is asked. This slack covers that retention with
+    // headroom, but stays far smaller than the overlay reservation itself,
+    // so the overlay reservation remains the one the budget refuses.
+    const SLACK_BEFORE_OVERLAY: usize = 64;
     accountant
         .set_budget(Some(
             before_budget_probe
                 .saturating_add(vector_search_bytes)
-                .saturating_add(32),
+                .saturating_add(SLACK_BEFORE_OVERLAY),
         ))
         .unwrap();
     let budget_err = prv_expect_query_err(
@@ -11533,4 +11579,221 @@ fn renaming_a_composite_primary_key_column_is_refused() {
         !meta.columns.iter().any(|c| c.name == "ws"),
         "the rename did not take effect",
     );
+}
+
+// ============================================================
+// A vector column takes embeddings. A scalar bound where an
+// embedding belongs is refused at the door, by name, and nothing
+// of the refused statement survives -- no row, no searchable
+// embedding, and no change to an embedding already stored.
+// ============================================================
+
+const VECTOR_WRITE_DOOR_DDL: &str =
+    "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))";
+
+/// The values a caller binds by mistake where an embedding belongs, paired
+/// with the name the refusal has to report for each.
+fn non_embedding_bindings() -> Vec<(&'static str, Value, &'static str)> {
+    vec![
+        ("an integer", Value::Int64(7), "Int64"),
+        ("a boolean", Value::Bool(true), "Bool"),
+        (
+            "a json object",
+            Value::Json(serde_json::json!({"embedding": "later"})),
+            "Json",
+        ),
+    ]
+}
+
+fn assert_embedding_column_refusal(err: Error, label: &str, bound_value_name: &str) {
+    match err {
+        Error::ColumnTypeMismatch {
+            table,
+            column,
+            expected,
+            actual,
+        } => {
+            assert_eq!(table, "evidence", "the refusal names the table for {label}");
+            assert_eq!(
+                column, "embedding",
+                "the refusal names the column for {label}"
+            );
+            assert_eq!(
+                expected, "VECTOR(3)",
+                "the refusal names the declared column type for {label}"
+            );
+            assert_eq!(
+                actual, bound_value_name,
+                "the refusal names the value that was bound for {label}"
+            );
+        }
+        other => panic!(
+            "{label} bound where an embedding belongs must be refused as a column type \
+             mismatch, got {other:?}"
+        ),
+    }
+}
+
+/// An INSERT that binds a scalar where an embedding belongs is refused before
+/// anything is staged: the caller gets the typed refusal naming the column, the
+/// table is still empty, and a neighbour search finds nothing -- rather than the
+/// store quietly accepting a value the column cannot hold and only surfacing it
+/// when someone later reads the file.
+#[test]
+fn inserting_a_scalar_where_an_embedding_belongs_stores_nothing() {
+    for (label, bound, bound_value_name) in non_embedding_bindings() {
+        let db = Database::open_memory();
+        db.execute(VECTOR_WRITE_DOOR_DDL, &empty())
+            .expect("the evidence table creates");
+        let id = Uuid::from_u128(0x9100_0000_0000_0000_0000_0000_0000_0001);
+
+        let err = db
+            .execute(
+                "INSERT INTO evidence (id, note, embedding) VALUES ($id, $note, $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("note", Value::Text(format!("bound-{label}"))),
+                    ("embedding", bound.clone()),
+                ]),
+            )
+            .expect_err(&format!(
+                "an INSERT binding {label} where an embedding belongs must be refused",
+            ));
+        assert_embedding_column_refusal(err, label, bound_value_name);
+
+        let rows = db
+            .execute("SELECT id FROM evidence", &empty())
+            .expect("the table still reads");
+        assert!(
+            rows.rows.is_empty(),
+            "the refused INSERT of {label} left a row behind: {:?}",
+            rows.rows,
+        );
+
+        let search = db
+            .execute(
+                "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+                &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0]))]),
+            )
+            .expect("the neighbour search still answers");
+        assert!(
+            search.rows.is_empty(),
+            "the refused INSERT of {label} left a searchable embedding behind: {:?}",
+            search.rows,
+        );
+    }
+}
+
+/// Refusing scalars must not refuse the two forms a vector column has always
+/// taken: an exact-dimension embedding, and the text form that parses to one.
+#[test]
+fn a_vector_column_still_takes_an_embedding_and_its_text_form() {
+    let db = Database::open_memory();
+    db.execute(VECTOR_WRITE_DOOR_DDL, &empty())
+        .expect("the evidence table creates");
+    let bound = Uuid::from_u128(0x9100_0000_0000_0000_0000_0000_0000_0011);
+    let written = Uuid::from_u128(0x9100_0000_0000_0000_0000_0000_0000_0012);
+
+    db.execute(
+        "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'bound', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(bound)),
+            ("embedding", Value::Vector(vec![0.95_f32, 0.05, 0.0])),
+        ]),
+    )
+    .expect("an exact-dimension embedding is accepted");
+    db.execute(
+        "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'written', '[0.0, 0.9, 0.1]')",
+        &params(vec![("id", Value::Uuid(written))]),
+    )
+    .expect("the text form of an embedding is accepted");
+
+    let rows = db
+        .execute("SELECT id, embedding FROM evidence ORDER BY note", &empty())
+        .expect("both rows read back");
+    let embedding_idx = rows
+        .columns
+        .iter()
+        .position(|column| column == "embedding")
+        .expect("the embedding column is projected");
+    assert_eq!(rows.rows.len(), 2, "both accepted rows are stored");
+    for row in &rows.rows {
+        assert!(
+            matches!(row[embedding_idx], Value::Vector(_)),
+            "an accepted embedding is stored as an embedding, got {:?}",
+            row[embedding_idx],
+        );
+    }
+}
+
+/// An UPDATE that binds a scalar where an embedding belongs is refused the same
+/// way, and the embedding already stored is exactly what it was: the refused
+/// statement neither rewrites the row nor moves the row in a neighbour search.
+#[test]
+fn updating_an_embedding_with_a_scalar_leaves_the_stored_embedding_alone() {
+    for (label, bound, bound_value_name) in non_embedding_bindings() {
+        let db = Database::open_memory();
+        db.execute(VECTOR_WRITE_DOOR_DDL, &empty())
+            .expect("the evidence table creates");
+        let near = Uuid::from_u128(0x9200_0000_0000_0000_0000_0000_0000_0001);
+        let far = Uuid::from_u128(0x9200_0000_0000_0000_0000_0000_0000_0002);
+        let stored = vec![0.95_f32, 0.05, 0.0];
+        for (id, note, embedding) in [
+            (near, "near", stored.clone()),
+            (far, "far", vec![0.0_f32, 0.1, 0.9]),
+        ] {
+            db.execute(
+                "INSERT INTO evidence (id, note, embedding) VALUES ($id, $note, $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("note", Value::Text(note.to_owned())),
+                    ("embedding", Value::Vector(embedding)),
+                ]),
+            )
+            .expect("the seed row is accepted");
+        }
+
+        let err = db
+            .execute(
+                "UPDATE evidence SET embedding = $embedding WHERE id = $id",
+                &params(vec![
+                    ("id", Value::Uuid(near)),
+                    ("embedding", bound.clone()),
+                ]),
+            )
+            .expect_err(&format!(
+                "an UPDATE binding {label} where an embedding belongs must be refused",
+            ));
+        assert_embedding_column_refusal(err, label, bound_value_name);
+
+        let rows = db
+            .execute(
+                "SELECT embedding FROM evidence WHERE id = $id",
+                &params(vec![("id", Value::Uuid(near))]),
+            )
+            .expect("the row still reads");
+        assert_eq!(rows.rows.len(), 1, "the refused UPDATE kept the row");
+        assert_eq!(
+            rows.rows[0][0],
+            Value::Vector(stored.clone()),
+            "the refused UPDATE of {label} rewrote the stored embedding",
+        );
+
+        let search = db
+            .execute(
+                "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+                &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0]))]),
+            )
+            .expect("the neighbour search still answers");
+        assert_eq!(
+            search.rows.len(),
+            1,
+            "the neighbour search still answers after refusing {label}",
+        );
+        assert_eq!(
+            search.rows[0][0],
+            Value::Uuid(near),
+            "the refused UPDATE of {label} moved the row in the neighbour search",
+        );
+    }
 }

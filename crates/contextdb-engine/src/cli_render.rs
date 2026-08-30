@@ -126,6 +126,48 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
     buf
 }
 
+/// What `.explain` shows about a statement's route: the plan it took, the
+/// index it went through, what it pushed into that index, what it turned down
+/// and why, and whether the ordering came for free.
+///
+/// One place owns this shape. `.explain` on a statement the CLI could run and
+/// `.explain` on one it could only plan are the same question about the same
+/// route, so an operator must not have to learn two answers -- and a caller
+/// that already HAS the result must not have to run the statement a second
+/// time to be told about it.
+pub fn render_explain_trace(trace: &QueryTrace) -> String {
+    let mut out = String::new();
+    out.push_str(trace.physical_plan);
+    if let Some(idx) = &trace.index_used {
+        out.push_str(&format!(" {{ index: {idx} }}"));
+    }
+    out.push('\n');
+    if !trace.predicates_pushed.is_empty() {
+        out.push_str("  predicates_pushed: [");
+        for (i, p) in trace.predicates_pushed.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(p.as_ref());
+        }
+        out.push_str("]\n");
+    }
+    if !trace.indexes_considered.is_empty() {
+        out.push_str("  indexes_considered: [");
+        for (i, c) in trace.indexes_considered.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("{}: {}", c.name, c.rejected_reason));
+        }
+        out.push_str("]\n");
+    }
+    if trace.sort_elided {
+        out.push_str("  sort_elided: true\n");
+    }
+    out
+}
+
 /// Render the `.explain <sql>` REPL output. Runs the SQL to populate the
 /// trace, then formats the physical plan + index-usage summary.
 pub fn render_explain(
@@ -134,36 +176,7 @@ pub fn render_explain(
     params: &std::collections::HashMap<String, Value>,
 ) -> contextdb_core::Result<String> {
     let result = db.execute(sql, params)?;
-    let mut out = String::new();
-    out.push_str(result.trace.physical_plan);
-    if let Some(idx) = &result.trace.index_used {
-        out.push_str(&format!(" {{ index: {idx} }}"));
-    }
-    out.push('\n');
-    if !result.trace.predicates_pushed.is_empty() {
-        out.push_str("  predicates_pushed: [");
-        for (i, p) in result.trace.predicates_pushed.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(p.as_ref());
-        }
-        out.push_str("]\n");
-    }
-    if !result.trace.indexes_considered.is_empty() {
-        out.push_str("  indexes_considered: [");
-        for (i, c) in result.trace.indexes_considered.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(&format!("{}: {}", c.name, c.rejected_reason));
-        }
-        out.push_str("]\n");
-    }
-    if result.trace.sort_elided {
-        out.push_str("  sort_elided: true\n");
-    }
-    Ok(out)
+    Ok(render_explain_trace(&result.trace))
 }
 
 pub fn render_query_trace(trace: &QueryTrace, rows_examined: u64) -> String {

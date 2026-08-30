@@ -476,10 +476,7 @@ impl SyncServer {
 /// The hub's wall clock in ms since the Unix epoch — the timestamp stamped on
 /// a recorded node contact. A clock before the epoch records 0 (never panics).
 fn hub_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    i64::try_from(contextdb_core::Wallclock::now().0).unwrap_or(i64::MAX)
 }
 
 fn to_transport_error(err: contextdb_core::Error) -> TransportError {

@@ -10,7 +10,7 @@ fn a_ma1_memory_limit_flag_sets_ceiling() {
     let db_path = temp_db_file(&tmp, "a_ma1.db");
     let output = run_cli_script(
         &db_path,
-        &["--memory-limit", "4G"],
+        &["--write", "--memory-limit", "4G"],
         "SHOW MEMORY_LIMIT;\n.quit\n",
     );
     assert!(
@@ -28,14 +28,18 @@ fn a_ma1_memory_limit_flag_sets_ceiling() {
 // ---------------------------------------------------------------------------
 // A-MA2 — RED: CONTEXTDB_MEMORY_LIMIT env var sets ceiling
 // ---------------------------------------------------------------------------
-#[test]
-fn a_ma2_env_var_sets_ceiling() {
+/// Run the CLI over a fresh store with the given extra arguments and
+/// environment, ask it what its memory ceiling is, and hand back what it said.
+fn show_memory_limit(name: &str, extra_args: &[&str], env: &[(&str, &str)]) -> String {
     let tmp = TempDir::new().expect("tempdir");
-    let db_path = temp_db_file(&tmp, "a_ma2.db");
+    let db_path = temp_db_file(&tmp, name);
     ensure_release_binaries();
-    let output = std::process::Command::new(cli_bin())
-        .arg(&db_path)
-        .env("CONTEXTDB_MEMORY_LIMIT", "512M")
+    let mut command = std::process::Command::new(cli_bin());
+    command.arg(&db_path).arg("--write").args(extra_args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -45,18 +49,42 @@ fn a_ma2_env_var_sets_ceiling() {
             child
                 .stdin
                 .as_mut()
-                .unwrap()
+                .expect("stdin")
                 .write_all(b"SHOW MEMORY_LIMIT;\n.quit\n")
-                .unwrap();
+                .expect("write stdin");
             child.wait_with_output()
         })
-        .expect("CLI with env var");
+        .expect("CLI reports its memory ceiling");
     assert!(output.status.success());
-    let stdout = output_string(&output.stdout);
+    output_string(&output.stdout)
+}
+
+/// The startup memory ceiling is something the operator states on the command
+/// line. The environment is not a behavior surface: a `CONTEXTDB_*` alias for
+/// the same ceiling is not read, and setting one changes nothing and says
+/// nothing -- which is what keeps a ceiling auditable from the invocation
+/// alone, rather than from whatever the surrounding shell happened to export.
+#[test]
+fn a_ma2_the_command_line_sets_the_startup_memory_ceiling_and_the_environment_does_not() {
     // 512M = 536870912 bytes.
+    let stated = show_memory_limit("a_ma2-stated.db", &["--memory-limit", "512M"], &[]);
     assert!(
-        stdout.contains("536870912"),
-        "SHOW must report startup_ceiling of 512M: {stdout}"
+        stated.contains("536870912"),
+        "SHOW MEMORY_LIMIT must report the ceiling the command line stated: {stated}"
+    );
+
+    let from_environment = show_memory_limit(
+        "a_ma2-environment.db",
+        &[],
+        &[("CONTEXTDB_MEMORY_LIMIT", "512M")],
+    );
+    assert!(
+        !from_environment.contains("536870912"),
+        "an environment alias must not set the startup ceiling: {from_environment}"
+    );
+    assert!(
+        from_environment.contains("none"),
+        "a store nobody gave a ceiling reports it has none: {from_environment}"
     );
 }
 
@@ -69,7 +97,7 @@ fn a_ma3_set_lower_than_ceiling() {
     let db_path = temp_db_file(&tmp, "a_ma3.db");
     let output = run_cli_script(
         &db_path,
-        &["--memory-limit", "4G"],
+        &["--write", "--memory-limit", "4G"],
         "SET MEMORY_LIMIT '1G';\nSHOW MEMORY_LIMIT;\n.quit\n",
     );
     assert!(output.status.success());
@@ -146,7 +174,7 @@ fn a_ma6_error_message_has_diagnostic_fields() {
     let db_path = temp_db_file(&tmp, "a_ma6.db");
     let output = run_cli_script(
         &db_path,
-        &["--memory-limit", "512"],
+        &["--write", "--memory-limit", "512"],
         "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'test data that exceeds tiny budget');\n.quit\n",
     );
     assert_eq!(
@@ -175,7 +203,7 @@ fn a_ma7_insert_exhaust_delete_insert() {
     let db_path = temp_db_file(&tmp, "a_ma7.db");
     let output = run_cli_script(
         &db_path,
-        &["--memory-limit", "2048"],
+        &["--write", "--memory-limit", "2048"],
         concat!(
             "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\n",
             "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'first');\n",
@@ -210,7 +238,7 @@ fn a_ma8_no_memory_limit_flag_works() {
     let db_path = temp_db_file(&tmp, "a_ma8.db");
     let output = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         concat!(
             "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\n",
             "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'works');\n",
@@ -241,7 +269,7 @@ fn a_ma9_memory_limit_survives_restart() {
 
     let configured = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         "SET MEMORY_LIMIT '1K';\nSHOW MEMORY_LIMIT;\n.quit\n",
     );
     assert!(configured.status.success());
@@ -253,7 +281,7 @@ fn a_ma9_memory_limit_survives_restart() {
 
     let reopened = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         &format!(
             "SHOW MEMORY_LIMIT;\nCREATE TABLE big (id UUID PRIMARY KEY, payload TEXT);\nINSERT INTO big (id, payload) VALUES ('00000000-0000-0000-0000-000000000001', '{}');\n.quit\n",
             "x".repeat(4096)

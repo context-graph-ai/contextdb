@@ -1,11 +1,6 @@
 use contextdb_core::Value;
 use contextdb_engine::QueryResult;
 
-/// Default cap on the number of data rows printed in the human table. A
-/// `SELECT *` on a large table would otherwise dump every row; the cap keeps
-/// default output bounded and prints a footer naming how to see more.
-pub const DEFAULT_ROW_CAP: usize = 100;
-
 pub fn format_query_result(result: &QueryResult) -> String {
     format_query_result_with_empty_headers(result, false)
 }
@@ -17,50 +12,34 @@ pub fn format_query_result_with_empty_headers(
     render_table(&result.columns, &result.rows, show_empty_headers)
 }
 
-/// Render the human table, capping data rows at `cap` when set. When the cap
-/// truncates, a footer line names the total and the `--all` override. `None`
-/// prints every row (the `--all` path).
-pub fn format_query_result_capped(
-    result: &QueryResult,
-    cap: Option<usize>,
-    show_empty_headers: bool,
-) -> String {
-    let total = result.rows.len();
-    let limit = cap.map(|c| c.min(total)).unwrap_or(total);
-    let mut out = render_table(&result.columns, &result.rows[..limit], show_empty_headers);
-    if limit < total {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!(
-            "-- showing {limit} of {total} rows; narrow with WHERE/LIMIT, or pass --all to print every row"
-        ));
-    }
-    out
+/// Rows as objects keyed by column name, one object per row.
+///
+/// One builder for every machine surface that publishes rows — an ordinary
+/// result and a cursor page alike — so the two can never render the same row
+/// differently.
+pub fn rows_as_objects(columns: &[String], rows: &[Vec<Value>]) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|row| {
+            let object: serde_json::Map<String, serde_json::Value> = columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    let cell = row
+                        .get(index)
+                        .map(value_to_json)
+                        .unwrap_or(serde_json::Value::Null);
+                    (column.clone(), cell)
+                })
+                .collect();
+            serde_json::Value::Object(object)
+        })
+        .collect()
 }
 
 /// Serialize a query result as a JSON array of objects (column name → value),
-/// one object per row. Uncapped — a machine consumer pages itself.
+/// one object per row.
 pub fn format_query_result_json(result: &QueryResult) -> String {
-    let rows: Vec<serde_json::Value> = result
-        .rows
-        .iter()
-        .map(|row| {
-            let obj: serde_json::Map<String, serde_json::Value> = result
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, col)| {
-                    let cell = row
-                        .get(i)
-                        .map(value_to_json)
-                        .unwrap_or(serde_json::Value::Null);
-                    (col.clone(), cell)
-                })
-                .collect();
-            serde_json::Value::Object(obj)
-        })
-        .collect();
+    let rows = rows_as_objects(&result.columns, &result.rows);
     serde_json::to_string(&serde_json::Value::Array(rows)).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -101,7 +80,7 @@ fn render_table(columns: &[String], data: &[Vec<Value>], show_empty_headers: boo
 
     let rows: Vec<Vec<String>> = data
         .iter()
-        .map(|row| row.iter().map(value_to_string).collect())
+        .map(|row| row.iter().map(render_value).collect())
         .collect();
 
     for row in &rows {
@@ -149,7 +128,10 @@ fn render_table(columns: &[String], data: &[Vec<Value>], show_empty_headers: boo
     out
 }
 
-fn value_to_string(v: &Value) -> String {
+/// One cell as a person reads it. Shared by the human table and any other
+/// human rendering of a row, so two surfaces never print the same value
+/// differently.
+pub fn render_value(v: &Value) -> String {
     match v {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => b.to_string(),

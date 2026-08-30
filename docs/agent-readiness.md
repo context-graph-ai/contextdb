@@ -18,7 +18,7 @@ this repository and its docs:
 | Query (state machine) | Drive a state-machine table through `PROPAGATE` transitions. |
 | Vector | Hybrid graph + vector queries against embedding columns. |
 | Sync | Stand up a hub, enroll two edges, and reach a correct KEEP-FIRST collision outcome. |
-| Repair | Recovery: repair/reset a store, and get a no-op migrate refused as expected. |
+| Diagnose | Recovery: diagnose/reset a store, and get a no-op migrate refused as expected. |
 | Retention | Operator lifecycle: retention windows and durable delete that survive sync and restart. |
 
 Every attempt is graded by executable post-conditions — process exit codes and the real
@@ -27,7 +27,7 @@ looks right. At the release-candidate commit measured here (`9d362f6`), the fron
 passed all three attempts on all seven tasks (7/7). The fast-tier model passed six of the seven
 tasks fully and passed only one of three attempts on the seventh, the vector task. The
 third-party model likewise passed six of the seven tasks fully and passed only one of three
-attempts on the seventh, the repair task. A separate control run removed the repository's
+attempts on the seventh, the diagnose task. A separate control run removed the repository's
 agent-guidance files (`AGENTS.md` and the per-task `skills/`) and covered one operator task and
 one orientation task: with the guidance gone, the operator task still passed 3/3 but took roughly
 1.3-1.4x the turns and wall-clock time, and the orientation task took roughly twice as long (9

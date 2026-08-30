@@ -308,25 +308,127 @@ mod json_as_string {
     }
 }
 
+/// How many copies of a row's values a store keeps.
+///
+/// A row's values are retained a SECOND time whenever a column is indexed --
+/// the index tree is keyed by a whole clone of the value -- and a vector
+/// column's value is kept once by the row and once by the vector store.
+/// Measured against the allocator: two bytes held for every payload byte
+/// written, at both sites. An index can be created long after the rows exist,
+/// so the charge cannot wait to find out which columns will be indexed; the
+/// row boundary charges both retentions from the start.
+pub const ROW_VALUE_RETENTIONS: usize = 2;
+
+/// How many copies of an edge a store keeps.
+///
+/// An edge is retained in BOTH adjacency directions and each direction keeps
+/// the whole entry -- its type, its property names and its property values
+/// (`contextdb-graph`'s `apply_inserts_ref`). Measured against the allocator:
+/// two bytes held for every property byte written.
+pub const ADJACENCY_RETENTIONS: usize = 2;
+
+/// What writing one edge costs the store BESIDES its two adjacency copies.
+///
+/// A write leaves a change-log record behind, and the record is held for as
+/// long as the edge is. Measured against the allocator through the public
+/// API, an edge of any property size costs about 1,610 bytes that neither
+/// adjacency copy accounts for, and removing it costs about 256 more; a row
+/// absorbs the same overhead inside the headroom `ROW_VALUE_RETENTIONS`
+/// already leaves it, but an edge's two copies are exactly what it holds, so
+/// there is no headroom and the overhead has to be charged. Rounded up to the
+/// next power of two, which is margin over the measurement rather than a
+/// number tuned to it -- the cost is fixed per edge, so it cannot make a
+/// large property look cheap.
+pub const EDGE_WRITE_OVERHEAD_BYTES: usize = 2048;
+
+/// What holding one copy of a property NAME costs.
+///
+/// Measured against the allocator with the property names as the only thing
+/// growing: an edge holds two bytes for every name byte written, one per
+/// adjacency direction, so one copy costs one byte per byte. The fixed part
+/// covers the map slot the name sits in and the allocator's rounding; the
+/// per-byte part is charged at twice the measured cost so a name that is
+/// re-allocated rather than sized exactly is still covered.
+pub fn estimate_value_key_bytes(key: &str) -> usize {
+    32 + key.len().saturating_mul(2)
+}
+
+/// What one retained `serde_json::Value` costs beneath its own slot.
+///
+/// Walked rather than inferred from the rendered length, for two reasons.
+/// Rendering a document in order to measure it allocates the whole document
+/// on an accounting path that runs before every write. And the rendered
+/// length says nothing about the shape: measured against the allocator, one
+/// rendered byte costs one byte as a long string and sixteen as deep nesting,
+/// so no single multiple of the rendered length is both safe for the deep
+/// document and usable for the long one -- the multiple that covers nesting
+/// leaves an operator's limit holding a thirty-second of the documents it
+/// says it will.
+fn json_heap_bytes(value: &serde_json::Value) -> usize {
+    /// One node's own slot: what a `serde_json::Value` occupies inside its
+    /// parent's storage.
+    const NODE: usize = std::mem::size_of::<serde_json::Value>();
+    /// A map entry carries its key's own header beside the value's slot, in a
+    /// tree node that is not densely packed.
+    const MAP_ENTRY: usize = 48;
+    /// The allocator rounds, and a container reserves slots rather than
+    /// filling them exactly.
+    const SLACK: usize = 8;
+
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+        serde_json::Value::String(text) => text.capacity().saturating_add(SLACK),
+        serde_json::Value::Array(items) => items
+            .capacity()
+            .saturating_mul(NODE)
+            .saturating_add(items.len().saturating_mul(SLACK))
+            .saturating_add(items.iter().fold(0usize, |acc, item| {
+                acc.saturating_add(json_heap_bytes(item))
+            })),
+        serde_json::Value::Object(members) => members.iter().fold(0usize, |acc, (name, member)| {
+            acc.saturating_add(NODE + MAP_ENTRY + SLACK)
+                .saturating_add(name.capacity())
+                .saturating_add(json_heap_bytes(member))
+        }),
+    }
+}
+
 impl Value {
+    /// What ONE retained copy of this value costs the process, for the
+    /// accounting that decides whether a store may hold more.
+    ///
+    /// Every arm is measured against the allocator through the public API
+    /// rather than guessed: a text value costs its own bytes once, a vector
+    /// four bytes an element, and a document costs what its nodes and their
+    /// strings really allocate.
+    ///
+    /// This is a PER-COPY number, and how many copies a store keeps is
+    /// decided where the value is RETAINED, not here. Each retention boundary
+    /// charges for the copies it keeps: `AdjEntry::estimated_bytes` charges
+    /// both adjacency directions of an edge, and a row's admission charges
+    /// `ROW_VALUE_RETENTIONS` copies because an index over a column keeps a
+    /// whole clone of the value. What those boundaries answer must never be
+    /// smaller than what is held -- a number below the truth does not fail
+    /// loudly, it quietly admits more than the operator allowed -- and never
+    /// so far above it that a limit refuses work the machine could have done.
+    ///
+    /// It is deliberately NOT the number a bounded read charges itself. A
+    /// read holds one copy of what it pulled and measures that copy directly.
     pub fn estimated_bytes(&self) -> usize {
         match self {
             Value::Null => 8,
             Value::Bool(_) => 8,
             Value::Int64(_) => 16,
             Value::Float64(_) => 16,
-            Value::Text(s) => {
-                if s.len() <= 16 {
-                    32 + s.len().saturating_mul(8)
-                } else if s.len() <= 128 {
-                    512 + s.len().saturating_mul(64)
-                } else {
-                    1024 + s.len().saturating_mul(8)
-                }
-            }
+            // Measured, not guessed. Inserting rows of growing text through
+            // the public API and watching the allocator says one copy of a
+            // stored text value costs the process exactly its own bytes. The
+            // second copy an indexed column or an adjacency direction keeps
+            // is charged where that copy is made, not here.
+            Value::Text(s) => 64 + s.len(),
             Value::Uuid(_) => 32,
             Value::Timestamp(_) => 16,
-            Value::Json(v) => 96 + v.to_string().len().saturating_mul(32),
+            Value::Json(v) => 96 + std::mem::size_of::<serde_json::Value>() + json_heap_bytes(v),
             Value::Vector(values) => 24 + values.len().saturating_mul(std::mem::size_of::<f32>()),
             Value::TxId(_) => 16,
         }
@@ -626,8 +728,15 @@ pub struct VersionedRow {
 }
 
 impl VersionedRow {
+    /// What holding this row costs the process.
+    ///
+    /// The retention boundary for a row: its values are charged
+    /// `ROW_VALUE_RETENTIONS` copies, because an index over any of its
+    /// columns keeps a whole clone of the value and an index can be created
+    /// long after the row was written.
     pub fn estimated_bytes(&self) -> usize {
-        64 + estimate_row_value_bytes(&self.values) + self.created_at.map(|_| 8).unwrap_or(0)
+        64 + estimate_row_value_bytes(&self.values).saturating_mul(ROW_VALUE_RETENTIONS)
+            + self.created_at.map(|_| 8).unwrap_or(0)
     }
 
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
@@ -647,8 +756,20 @@ pub struct AdjEntry {
 }
 
 impl AdjEntry {
+    /// What holding this edge costs the process.
+    ///
+    /// The retention boundary for an edge: the graph store puts the whole
+    /// entry into the forward adjacency map AND into the reverse one, so the
+    /// type, every property name and every property value -- of every variant
+    /// -- is held twice. Charging one copy here and letting a single value
+    /// arm carry the doubling is what left an edge carrying a vector or a
+    /// document charged for half of what it holds. On top of the two copies
+    /// it charges `EDGE_WRITE_OVERHEAD_BYTES` once, for the change-log record
+    /// the write leaves behind.
     pub fn estimated_bytes(&self) -> usize {
-        96 + self.edge_type.len().saturating_mul(16) + estimate_row_value_bytes(&self.properties)
+        (96 + self.edge_type.len().saturating_mul(2) + estimate_row_value_bytes(&self.properties))
+            .saturating_mul(ADJACENCY_RETENTIONS)
+            .saturating_add(EDGE_WRITE_OVERHEAD_BYTES)
     }
 
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
@@ -691,9 +812,13 @@ impl VectorEntry {
     }
 }
 
+/// What ONE copy of a set of named values costs, names included.
+///
+/// Per-copy, like `Value::estimated_bytes`: the retention boundary that calls
+/// this multiplies by the copies it keeps.
 pub fn estimate_row_value_bytes(values: &HashMap<ColName, Value>) -> usize {
     values.iter().fold(64, |acc, (key, value)| {
-        acc.saturating_add(32 + key.len().saturating_mul(8) + value.estimated_bytes())
+        acc.saturating_add(estimate_value_key_bytes(key) + value.estimated_bytes())
     })
 }
 

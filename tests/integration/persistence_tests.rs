@@ -146,7 +146,15 @@ fn run_live_cli_script(
     db_path: &str,
     script: &str,
 ) -> std::result::Result<std::process::Output, String> {
-    let mut child = spawn_cli(db_path, &[]);
+    run_live_cli_script_with_args(db_path, &[], script)
+}
+
+fn run_live_cli_script_with_args(
+    db_path: &str,
+    extra_args: &[&str],
+    script: &str,
+) -> std::result::Result<std::process::Output, String> {
+    let mut child = spawn_cli(db_path, extra_args);
     match child
         .stdin
         .as_mut()
@@ -224,7 +232,9 @@ fn assert_file_backed_cli_persistence_through_spawn_helper() {
          INSERT INTO t (id, v) VALUES ('{id}', 'alpha');\n\
          .quit\n"
     );
-    let output1 = run_live_cli_script(path.to_str().unwrap(), &script1)
+    // Session 1 creates the store, so it needs the writable open; session 2 stays
+    // read-only and must still see what session 1 wrote.
+    let output1 = run_live_cli_script_with_args(path.to_str().unwrap(), &["--write"], &script1)
         .expect("file-backed CLI session 1 should spawn release binary");
     let stdout1 = String::from_utf8_lossy(&output1.stdout);
     let stderr1 = String::from_utf8_lossy(&output1.stderr);
@@ -1567,7 +1577,9 @@ fn p20_dimension_mismatch_rejected_after_restart() {
 fn p21_cli_persists_across_sessions() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("cli.db");
-    let mut child1 = spawn_cli(path.to_str().unwrap(), &[]);
+    // The first session creates the store, so it opens writable; the second opens
+    // read-only and must still read back the first session's row.
+    let mut child1 = spawn_cli(path.to_str().unwrap(), &["--write"]);
     {
         let stdin = child1.stdin.as_mut().unwrap();
         writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT);").unwrap();

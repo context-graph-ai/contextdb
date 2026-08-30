@@ -33,7 +33,7 @@ including the refusal you need to know about before you rely on this table stayi
 ### Worked example 1 — dependency chain, cycle refused
 
 ```bash
-contextdb ./graph.db <<'SQL'
+contextdb ./graph.db --write <<'SQL'
 CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE edges (
   id UUID PRIMARY KEY,
@@ -79,7 +79,7 @@ Now close the loop (`leaf -> root`, which combined with the existing chain would
 
 ```bash
 echo "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ('cccccccc-cccc-cccc-cccc-cccccccccccc', '33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 'DEPENDS_ON');" \
-  | contextdb ./graph.db
+  | contextdb ./graph.db --write
 ```
 
 ```text
@@ -101,7 +101,7 @@ introduce a cycle that wasn't already possible.
 
 ```bash
 echo "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ('dddddddd-dddd-dddd-dddd-dddddddddddd', '11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 'DEPENDS_ON');" \
-  | contextdb ./graph.db --json
+  | contextdb ./graph.db --write --json
 ```
 
 ```json
@@ -148,13 +148,13 @@ SQL
 ```
 
 ```json
-[{"name":"mid"},{"name":"leaf"}]
+{"result":{"columns":["name"],"rows":[{"name":"mid"},{"name":"leaf"}]}}
 ```
 
 ### Worked example 2 — incoming edges: "what depends on this basis?"
 
 ```bash
-contextdb ./basis.db <<'SQL'
+contextdb ./basis.db --write <<'SQL'
 CREATE TABLE decisions (id UUID PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL) DAG('BASED_ON');
 INSERT INTO decisions (id, name) VALUES ('11111111-1111-1111-1111-111111111111', 'use-rds');
@@ -182,7 +182,7 @@ SQL
 ```
 
 ```json
-[{"name":"use-rds"}]
+{"result":{"columns":["name"],"rows":[{"name":"use-rds"}]}}
 ```
 
 **Validate a traversal that returns nothing** by checking the edge exists at all first:
@@ -205,7 +205,7 @@ is empty. **If `GRAPH_TABLE(...)  AS alias` followed by `JOIN` fails to parse, g
 ### Worked example 1 — legal transition, then reading the result
 
 ```bash
-contextdb ./decisions.db <<'SQL'
+contextdb ./decisions.db --write <<'SQL'
 CREATE TABLE tasks (
   id UUID PRIMARY KEY,
   status TEXT NOT NULL
@@ -226,6 +226,7 @@ ok (rows_affected=1)
 +-------------+
 | invalidated |
 +-------------+
+(1 rows)
 ```
 
 ### Worked example 2 — illegal transition refused, row unchanged
@@ -235,7 +236,7 @@ refused:
 
 ```bash
 echo "UPDATE tasks SET status='active' WHERE id='11111111-1111-1111-1111-111111111111';" \
-  | contextdb ./decisions.db --json
+  | contextdb ./decisions.db --write --json
 ```
 
 ```json
@@ -244,9 +245,12 @@ echo "UPDATE tasks SET status='active' WHERE id='11111111-1111-1111-1111-1111111
 
 Exit code `1`. Confirm the row didn't move: `SELECT status FROM tasks WHERE id = '...';` still
 reads `invalidated`. **If an `UPDATE` you expected to be legal is refused, re-read the
-`STATE MACHINE (...)` clause with `.schema tasks`** — `state_machine.transitions` in the `--json`
-output is the literal transition graph the engine is enforcing, so compare it directly against
-what you typed rather than guessing.
+`STATE MACHINE (...)` clause with `.schema tasks`** — `.schema.state_machine.transitions` in the `--json`
+output is the transition graph the engine is enforcing, so compare it directly against what you
+typed rather than guessing. Compare it as a set of edges, not as text: transitions are held as a
+map keyed by from-state, so both the JSON and the human `.schema` DDL list the from-states sorted
+rather than in the order you declared them. A reordered listing is the same graph, not a
+discrepancy.
 
 ## Recipe 4 — `PROPAGATE ON EDGE`: cascade a transition along the graph
 
@@ -260,7 +264,7 @@ what you typed rather than guessing.
 ### Worked example — invalidating a basis cascades to what cites it
 
 ```bash
-contextdb ./cascade.db --json <<'SQL'
+contextdb ./cascade.db --write --json <<'SQL'
 CREATE TABLE tasks (
   id UUID PRIMARY KEY,
   name TEXT NOT NULL,
@@ -291,7 +295,7 @@ SQL
 {"rows_affected":1}
 {"rows_affected":1}
 {"rows_affected":1}
-[{"id":"11111111-1111-1111-1111-111111111111","name":"basis-decision","status":"invalidated"},{"id":"22222222-2222-2222-2222-222222222222","name":"dependent-decision","status":"invalidated"}]
+{"result":{"columns":["id","name","status"],"rows":[{"id":"11111111-1111-1111-1111-111111111111","name":"basis-decision","status":"invalidated"},{"id":"22222222-2222-2222-2222-222222222222","name":"dependent-decision","status":"invalidated"}]}}
 ```
 
 **If the cascade didn't reach a row you expected**, check the edge direction against the clause's

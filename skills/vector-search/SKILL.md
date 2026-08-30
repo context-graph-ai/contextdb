@@ -31,7 +31,7 @@ function** — `<=>` is the whole surface.
 ## Declare an embedding column
 
 ```bash
-contextdb ./vec.db <<'SQL'
+contextdb ./vec.db --write <<'SQL'
 CREATE TABLE evidence (
   id UUID PRIMARY KEY,
   category TEXT,
@@ -51,7 +51,7 @@ Quantization is per column: `F32` (default), `SQ8`, `SQ4` — the knob for stora
 ## Search
 
 ```bash
-contextdb ./vec.db <<'SQL'
+contextdb ./vec.db --write <<'SQL'
 INSERT INTO evidence (id, category, vector_text) VALUES ('11111111-1111-1111-1111-111111111111', 'A', [1.0, 0.0, 0.0, 0.0]);
 INSERT INTO evidence (id, category, vector_text) VALUES ('22222222-2222-2222-2222-222222222222', 'A', [0.9, 0.1, 0.0, 0.0]);
 INSERT INTO evidence (id, category, vector_text) VALUES ('33333333-3333-3333-3333-333333333333', 'B', [0.0, 1.0, 0.0, 0.0]);
@@ -81,7 +81,7 @@ printf "SELECT id FROM evidence WHERE category = 'A' ORDER BY vector_text <=> [1
   | contextdb ./vec.db --json
 ```
 ```json
-[{"id":"11111111-1111-1111-1111-111111111111"},{"id":"22222222-2222-2222-2222-222222222222"}]
+{"result":{"columns":["id"],"rows":[{"id":"11111111-1111-1111-1111-111111111111"},{"id":"22222222-2222-2222-2222-222222222222"}]}}
 ```
 
 ### Search by an existing row's vector
@@ -129,7 +129,7 @@ no application copies formula text into its queries.
 The joined column must be indexed.
 
 ```bash
-contextdb :memory: <<'SQL'
+contextdb ./rank.db --write <<'SQL'
 CREATE TABLE outcomes (
   id UUID PRIMARY KEY,
   decision_id UUID NOT NULL,
@@ -167,9 +167,14 @@ SQL
 Expected ordering — the vector-nearest row comes **last**, because it failed:
 
 ```text
-22222222-2222-2222-2222-222222222222 | less similar but worked | 1.0
-33333333-3333-3333-3333-333333333333 | fallback with no outcome | 0.25
-11111111-1111-1111-1111-111111111111 | closest but failed | 1.0
++--------------------------------------+--------------------------+------------+
+| id                                   | description              | confidence |
++--------------------------------------+--------------------------+------------+
+| 22222222-2222-2222-2222-222222222222 | less similar but worked  | 1          |
+| 33333333-3333-3333-3333-333333333333 | fallback with no outcome | 0.25       |
+| 11111111-1111-1111-1111-111111111111 | closest but failed       | 1          |
++--------------------------------------+--------------------------+------------+
+(3 rows)
 ```
 
 `{confidence}` binds a column on the anchor row, `{success}` a column on the joined row, and
@@ -183,7 +188,8 @@ clause and reload the rows.
 
 ### Worked example 2 — the same query, without `USE RANK`, to see what the policy actually changes
 
-Run this against the identical `rank.db` from example 1, dropping `USE RANK effective_confidence`:
+Run this against the `rank.db` example 1 just built, dropping `USE RANK effective_confidence` —
+no `--write`, because it only reads:
 
 ```bash
 echo "SELECT id, description FROM decisions ORDER BY embedding <=> [1.0, 0.0] LIMIT 5;" \
@@ -191,7 +197,7 @@ echo "SELECT id, description FROM decisions ORDER BY embedding <=> [1.0, 0.0] LI
 ```
 
 ```json
-[{"description":"closest but failed","id":"11111111-1111-1111-1111-111111111111"},{"description":"less similar but worked","id":"22222222-2222-2222-2222-222222222222"},{"description":"fallback with no outcome","id":"33333333-3333-3333-3333-333333333333"}]
+{"result":{"columns":["id","description"],"rows":[{"description":"closest but failed","id":"11111111-1111-1111-1111-111111111111"},{"description":"less similar but worked","id":"22222222-2222-2222-2222-222222222222"},{"description":"fallback with no outcome","id":"33333333-3333-3333-3333-333333333333"}]}}
 ```
 
 Plain cosine order puts the row that FAILED first, because it's the closest vector. That is exactly
@@ -301,7 +307,7 @@ depth is 10.
 ## Depth
 
 - Operator, `ROW_VECTOR`, pre-filtering, indexing thresholds, rank-policy grammar: [`docs/query-language.md`](../../docs/query-language.md#vector-similarity-search)
-- Rank policy walkthrough with expected ordering: [`docs/getting-started.md`](../../docs/getting-started.md#rank-vector-search-by-outcomes)
+- Rank policy grammar — `RANK_POLICY`, `JOIN`, `FORMULA` placeholders, `SORT_KEY`, `USE RANK`: [`docs/query-language.md`](../../docs/query-language.md#rank-policies)
 - More hybrid patterns: [`docs/usage-scenarios.md`](../../docs/usage-scenarios.md) scenarios 4, 7, 8, 13
 
 ## Next

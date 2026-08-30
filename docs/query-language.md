@@ -32,6 +32,24 @@ CREATE TABLE documents (
 
 See [Table Options](#table-options) for IMMUTABLE, STATE MACHINE, DAG, RETAIN, HISTORY, SYNC, and PROPAGATE.
 
+`CREATE TABLE` never redefines a table that already exists. A second
+`CREATE TABLE documents (...)` is refused, naming the table, and the existing
+declaration and every row in it are left exactly as they were — nothing is
+replaced and no column's values are dropped. To re-run a schema script
+harmlessly, write the idempotent spelling:
+
+```sql
+CREATE TABLE IF NOT EXISTS documents (
+  id UUID PRIMARY KEY,
+  data JSON
+)
+```
+
+`IF NOT EXISTS` creates the table when the name is free and does nothing at all
+when it is taken — the existing table keeps its own columns and rows even when
+the skipped declaration describes a different shape. Use `ALTER TABLE` to change
+a live table's shape, or `DROP TABLE` first to start over.
+
 Later examples in this reference also use a second illustrative table, `items`:
 
 ```sql
@@ -312,6 +330,26 @@ CREATE TABLE media (
 ```
 
 Valid quantization values are `F32`, `SQ8`, and `SQ4`; the default is `F32`.
+
+A `VECTOR(n)` column holds embeddings and nothing else. Every write door — `INSERT`, `UPDATE`, a
+conditional `UPDATE`, `ON CONFLICT ... DO UPDATE`, and a column default — accepts an embedding of
+the declared dimension, the text spelling of one (`'[0.1, 0.2, 0.3]'`), or `NULL` where the column
+is nullable. Anything else is refused before the statement stages a row, with
+`ColumnTypeMismatch { table, column, expected, actual }` naming the column that rejected it and
+the type of the value that was bound. A scalar, boolean, or JSON value bound into a vector column
+by mistake is therefore reported at the statement that bound it, not discovered later when the
+store is read back.
+
+`NOT NULL` on a vector column keeps that meaning when the store is read directly — the route a
+reader takes when no live process owns the file (see [CLI Reference](cli.md)). Such a read serves
+a row only when the file still holds the embedding the declaration promises; where it does not,
+the read is refused with `direct_read_requires_writer` rather than handing back a row whose
+required column has quietly vanished, and a writable open (`--write`) is what mends the store. The
+rule follows the declaration, not the storage layout: a quantized `SQ8`/`SQ4` column keeps its
+embedding in the vector index instead of in the row, so a required quantized column is served from
+that stored embedding and refused when the embedding is gone, exactly as a required `F32` column is
+refused when its cell holds no embedding. A nullable vector column is untouched by all of this —
+an absent embedding is a value there, and the row is served with `NULL`.
 Each vector column is a separate `(table, column)` index. Search routes to the
 column named in `ORDER BY`:
 
@@ -506,6 +544,7 @@ CREATE TABLE child (
 | `DEFAULT expr` | Default value for inserts |
 | `REFERENCES table(col)` / `FOREIGN KEY (...) REFERENCES ...` | Foreign key — writes are rejected if the referenced row or tuple does not exist; in explicit transactions the error may surface at `COMMIT` |
 | `IMMUTABLE` | Column is audit-frozen — INSERT sets the value once; `UPDATE`, `ON CONFLICT DO UPDATE`, sync-apply mutations, and schema-altering DDL against the column are rejected with `Error::ImmutableColumn` |
+| `ACL REFERENCES table(col)` | Column carries the row's access-control id — a non-administrative handle reads the row only when its principal holds a matching grant; a handle with no grant-holding principal is refused the table with `Error::PrincipalRequired` |
 
 ### Audit-Frozen Columns
 
@@ -538,6 +577,76 @@ UPDATE tasks SET status = 'superseded' WHERE id = '11111111-1111-4111-8111-11111
 ```
 
 Nothing disappears. The audit trail shows both the original commitment and its correction.
+
+### Access-Controlled Rows (ACL)
+
+Row-level authorization is opt-in and declared by the application, not built into the engine's tables. A data table names the column that carries each row's access-control id, and a grant table says which principal holds which id:
+
+```sql
+CREATE TABLE acl_grants (
+  id UUID PRIMARY KEY,
+  principal_kind TEXT,
+  principal_id TEXT,
+  acl_id UUID
+);
+
+CREATE TABLE notes (
+  id INTEGER PRIMARY KEY,
+  context_id UUID CONTEXT_ID,
+  acl_id UUID ACL REFERENCES acl_grants(acl_id),
+  payload TEXT
+);
+```
+
+Grant a principal one access-control id by inserting a grant row. `principal_kind` is `'Agent'` or `'Human'`; `principal_id` is that principal's name:
+
+```sql
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id)
+VALUES ('33333333-3333-4333-8333-333333333333', 'Agent', 'report-reader',
+        '44444444-4444-4444-8444-444444444444');
+```
+
+Read through a handle that names the principal. The same handle form serves an ordinary query and a bounded read session, and both answer the same rows:
+
+```rust
+let reader = database.scoped_with_constraints(
+    None,
+    None,
+    Some(Principal::Agent("report-reader".to_string())),
+);
+let rows = reader.execute("SELECT payload FROM notes ORDER BY id", &HashMap::new())?;
+let bounded = reader.read_session(ReadLimits::default())?
+    .execute("SELECT payload FROM notes ORDER BY id", &HashMap::new())?;
+```
+
+Rows whose `acl_id` the principal was not granted are absent from both answers.
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_granting_principal_sees_the_same_rows_on_both_live_routes -->
+
+A handle that narrowed itself by context or scope but named no principal that can hold grants is **refused** the table with `Error::PrincipalRequired`. Authorization is a property the table declared, not an axis the reader opts into, so narrowing by some other axis never turns the grant filter off.
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_context_only_handle_is_refused_an_access_controlled_table_on_both_live_routes -->
+
+`Principal::System` cannot hold grants and is refused the same way.
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_system_principal_is_refused_an_access_controlled_table_on_both_live_routes -->
+
+Constraints compose. A handle that names both a context and a principal hides the rows outside its context *and* the rows it holds no grant for:
+
+```rust
+let reader = database.scoped_with_constraints(
+    Some(BTreeSet::from([ContextId::new(context)])),
+    None,
+    Some(Principal::Agent("report-reader".to_string())),
+);
+```
+
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_context_and_principal_handle_hides_the_foreign_context_and_ungranted_rows_on_both_live_routes -->
+
+An administrative handle — one that declared no context, no scope, and no principal — reads every row, and a table that declares no `ACL REFERENCES` column is unaffected: it keeps narrowing by exactly the axes it does declare.
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_table_without_an_acl_declaration_narrows_by_context_alone_on_every_route -->
+
+A direct read of a CLOSED store is not a handle that declared anything. `ReadSession::open` on a path with no live owner, and the CLI pointed at a path, read the committed store as its owner does: no principal is declared, so every row is returned, ACL column or not. Row-level authorization therefore governs handles that declare a principal — an embedded `scoped_with_constraints` reader and a read served by a live owner — while who may read a closed store at all is governed by the file's permissions.
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::the_direct_route_reads_a_closed_store_as_its_owner_with_no_declared_narrowing -->
+
+ACL is authorization, not relevance ranking. A withheld row is withheld because the reader is not entitled to it; it is never scored, ordered, or surfaced as a lower-ranked result.
 
 ### Composite Uniqueness
 
@@ -883,10 +992,44 @@ WHERE embedding IS NOT NULL
 |----------|---------|-------------|
 | `COUNT(*)` | INTEGER | Count all rows |
 | `COUNT(col)` | INTEGER | Count non-NULL values in column |
+| `SUM(col)` | INTEGER or FLOAT | Add the non-NULL values in a numeric column |
 | `COALESCE(a, b, ...)` | varies | First non-NULL argument |
 | `NOW()` | TIMESTAMP | Current Unix timestamp |
 
-COUNT operates over the entire result set. No GROUP BY or HAVING — use CTEs or application-level grouping for aggregation.
+COUNT and SUM operate over the entire result set. No GROUP BY or HAVING — use CTEs or application-level grouping for aggregation.
+
+**`NOW()` in an `INSERT ... VALUES` list is refused for a `NOT NULL` column.** Writing it into a
+nullable column is accepted, and `UPDATE ... SET ts = NOW()` is accepted for either; but
+
+```sql
+CREATE TABLE audits (id UUID PRIMARY KEY, ts TIMESTAMP NOT NULL);
+INSERT INTO audits (id, ts) VALUES ($id, NOW());
+-- Error: plan error: unsupported expression in schema enforcer
+```
+
+The `NOT NULL` check runs in the schema enforcer, which evaluates literals rather than call
+expressions. Declare the column `DEFAULT NOW()` and omit it from the `INSERT` instead — the
+default is applied for you and the row lands with a real timestamp:
+
+```sql
+CREATE TABLE audits (id UUID PRIMARY KEY, ts TIMESTAMP NOT NULL DEFAULT NOW());
+INSERT INTO audits (id) VALUES ($id);
+```
+
+`SUM` skips NULLs, returns NULL (not zero) when no row reaches it, adds an
+INTEGER column as an integer and refuses an out-of-range total rather than
+wrapping it, and adds a FLOAT column as a float. A non-numeric column is an
+error. The output column is named after the function unless you alias it:
+
+```sql
+SELECT SUM(amount) FROM payments WHERE status = 'settled';
+SELECT SUM(amount) AS settled_total FROM payments;
+```
+
+An aggregate read through a cursor finishes across pages: each fetch adds up
+as much input as that fetch's work budget allows, and a fetch that runs out
+returns an empty page with more still to come. The total arrives on the page
+that reaches the end of the input.
 
 ---
 
@@ -1109,7 +1252,7 @@ These are explicitly rejected with descriptive error messages:
 | `UNION` / `INTERSECT` / `EXCEPT` | Not supported |
 | `INSERT ... SELECT` | Not supported |
 | Subqueries outside `IN` | `SubqueryNotSupported` |
-| SUM, AVG, MIN, MAX | Not supported (COUNT only) |
+| AVG, MIN, MAX | Not supported (COUNT and SUM only) |
 
 ## Indexes
 
@@ -1264,3 +1407,4 @@ programmatic trace. Multi-hop or variable-length traversals report `GraphBfs`.
 | `ColumnNotFound { table, column }` | `CREATE INDEX` naming a column that does not exist on the table — also the class every `WHERE` / `JOIN ... ON` / `ORDER BY` / `SELECT`-list unknown-column or unrecognized-qualifier reference uses (see [Column Qualifiers](#column-qualifiers) and the `SELECT` section above) |
 | `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_`, `__unique_`, or `__fk_` (reserved for auto-indexes) |
 | `UniqueViolation { table, column }` | A duplicate value on a `UNIQUE` column, or a duplicate tuple on a table-level `UNIQUE (col, ...)` (`column` names every column of the constraint); also a `PRIMARY KEY` duplicate |
+| `ColumnTypeMismatch { table, column, expected, actual }` | A value that is not an embedding, the text spelling of one, or a permitted `NULL` was written into a `VECTOR(n)` column (see [Column Types](#column-types)) |

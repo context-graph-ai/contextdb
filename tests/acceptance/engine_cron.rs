@@ -370,7 +370,7 @@ fn t27_07_schedule_persists_across_engine_restart() {
 CREATE TABLE log (id UUID PRIMARY KEY);
 CREATE SCHEDULE persistent EVERY '500 MILLISECONDS' TX (cb) MISSED_TICK_POLICY 'catch-up' WITHIN 60 SECONDS;
 ";
-    let out = run_cli_script(&path, &[], script);
+    let out = run_cli_script(&path, &["--write"], script);
     assert!(
         out.status.success(),
         "child process should persist schedule; stderr={}",
@@ -566,7 +566,7 @@ CREATE TABLE log (id UUID PRIMARY KEY);
 CREATE SCHEDULE doomed EVERY '500 MILLISECONDS' TX (cb) MISSED_TICK_POLICY 'skip-and-audit';
 DROP SCHEDULE doomed;
 ";
-    let out = run_cli_script(&path, &[], script);
+    let out = run_cli_script(&path, &["--write"], script);
     assert!(
         out.status.success(),
         "child process should persist schedule drop; stderr={}",

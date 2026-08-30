@@ -28,7 +28,7 @@ async fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() 
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f25", "--sync-endpoint", ticket],
+        &["--write", "--tenant-id", "f25", "--sync-endpoint", ticket],
         &script,
     );
     assert!(
@@ -41,7 +41,7 @@ async fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() 
     let fresh_path = temp_db_file(&tmp, "f25-fresh.db");
     let pull_output = run_cli_script(
         &fresh_path,
-        &["--tenant-id", "f25", "--sync-endpoint", ticket],
+        &["--write", "--tenant-id", "f25", "--sync-endpoint", ticket],
         "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);\n\
          .sync pull\n\
          SELECT count(*) FROM items;\n\
@@ -81,7 +81,7 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
 
     let push_output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f26", "--sync-endpoint", ticket],
+        &["--write", "--tenant-id", "f26", "--sync-endpoint", ticket],
         &script,
     );
     assert!(
@@ -93,7 +93,7 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
     let fresh_path = temp_db_file(&tmp, "f26-fresh.db");
     let pull_output = run_cli_script(
         &fresh_path,
-        &["--tenant-id", "f26", "--sync-endpoint", ticket],
+        &["--write", "--tenant-id", "f26", "--sync-endpoint", ticket],
         "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);\n\
          .sync pull\n\
          SELECT count(*) FROM items;\n\
@@ -133,7 +133,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     script1.push_str(".sync push\n.quit\n");
     let push1 = run_cli_script(
         &source_path,
-        &["--tenant-id", "f27", "--sync-endpoint", ticket],
+        &["--write", "--tenant-id", "f27", "--sync-endpoint", ticket],
         &script1,
     );
     assert!(push1.status.success());
@@ -141,7 +141,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     // Initial pull — puller gets 100 rows
     let pull1 = run_cli_script(
         &puller_path,
-        &["--tenant-id", "f27", "--sync-endpoint", ticket],
+        &["--write", "--tenant-id", "f27", "--sync-endpoint", ticket],
         "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);\n\
          .sync pull\n\
          SELECT count(*) FROM items;\n\
@@ -166,7 +166,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     script2.push_str(".sync push\n.quit\n");
     let push2 = run_cli_script(
         &source_path,
-        &["--tenant-id", "f27", "--sync-endpoint", ticket],
+        &["--write", "--tenant-id", "f27", "--sync-endpoint", ticket],
         &script2,
     );
     assert!(push2.status.success());
@@ -174,7 +174,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     // Incremental pull — puller gets the 50 new rows (total 150)
     let pull2 = run_cli_script(
         &puller_path,
-        &["--tenant-id", "f27", "--sync-endpoint", ticket],
+        &["--write", "--tenant-id", "f27", "--sync-endpoint", ticket],
         ".sync pull\n\
          SELECT count(*) FROM items;\n\
          .quit\n",

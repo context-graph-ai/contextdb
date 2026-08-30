@@ -25,7 +25,7 @@ fn f37_readme_quick_start_actually_works() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f37.db");
     for block in sql_blocks {
-        let output = run_cli_script(&db_path, &[], &(block + "\n.quit\n"));
+        let output = run_cli_script(&db_path, &["--write"], &(block + "\n.quit\n"));
         assert!(
             output.status.success(),
             "README example should execute successfully: {}",
@@ -64,7 +64,7 @@ fn f39_error_messages_on_bad_sql_are_actionable() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let output = run_cli_script(
         &temp_db_file(&tmp, "f39.db"),
-        &[],
+        &["--write"],
         "SELET * FROM t\n.quit\n",
     );
     let stderr = output_string(&output.stderr).to_lowercase();

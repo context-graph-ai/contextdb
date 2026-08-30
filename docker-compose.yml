@@ -3,15 +3,22 @@ services:
     # To build from source instead: docker compose build
     image: ghcr.io/context-graph-ai/contextdb-server:latest
     build: .
-    environment:
-      # Dial-by-key sync endpoint. The identity key persists on the mounted
-      # volume so the server keeps the same cryptographic identity across
-      # restarts. Port 4433/udp carries the sync traffic.
-      # NOTE: /data/fabric-identity.key is a SECRET — back up the volume and
-      # never commit or share the key; losing it invalidates issued tickets.
-      CONTEXTDB_SYNC_ENDPOINT: "iroh:?identity=/data/fabric-identity.key&port=4433"
-      CONTEXTDB_TENANT_ID: "default"
-      CONTEXTDB_DB_PATH: "/data/server.db"
+    # `contextdb-server` is the image's ENTRYPOINT and takes its configuration
+    # from flags. Of the three settings below only the database path has an
+    # environment name (`CONTEXTDB_DB_PATH`); `--tenant-id` is required and
+    # `--sync-endpoint` has no environment form at all, so both must be passed
+    # here or the container exits 2 before it serves. See docs/cli.md,
+    # "The environment is not a behavior surface."
+    #
+    # Dial-by-key sync endpoint. The identity key persists on the mounted
+    # volume so the server keeps the same cryptographic identity across
+    # restarts. Port 4433/udp carries the sync traffic.
+    # NOTE: /data/fabric-identity.key is a SECRET — back up the volume and
+    # never commit or share the key; losing it invalidates issued tickets.
+    command:
+      - "--db-path=/data/server.db"
+      - "--tenant-id=default"
+      - "--sync-endpoint=iroh:?identity=/data/fabric-identity.key&port=4433"
     ports:
       - "4433:4433/udp"
     volumes:

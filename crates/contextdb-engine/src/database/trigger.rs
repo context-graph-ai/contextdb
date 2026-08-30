@@ -350,22 +350,21 @@ impl Drop for TriggerCallbackThreadGuard {
 
 impl Database {
     pub(super) fn load_trigger_state_from_persistence(&self) -> Result<()> {
-        let Some(persistence) = self.persistence.as_ref() else {
+        let Some(source) = self.startup_state() else {
             return Ok(());
         };
-        let mut declarations = persistence
-            .load_config_value::<Vec<TriggerDeclaration>>(TRIGGER_DECLARATIONS_CONFIG_KEY)?
+        let mut declarations = source
+            .config_value::<Vec<TriggerDeclaration>>(TRIGGER_DECLARATIONS_CONFIG_KEY)?
             .unwrap_or_default();
-        let including_sync = persistence
-            .load_config_value::<BTreeSet<String>>(TRIGGER_INCLUDING_SYNC_CONFIG_KEY)?
+        let including_sync = source
+            .config_value::<BTreeSet<String>>(TRIGGER_INCLUDING_SYNC_CONFIG_KEY)?
             .unwrap_or_default();
         for declaration in &mut declarations {
             declaration.including_sync = including_sync.contains(&declaration.name);
         }
         self.replace_trigger_declarations(declarations);
 
-        let (ring_history, next_index) =
-            persistence.load_trigger_audit_state(TRIGGER_AUDIT_RING_CAPACITY)?;
+        let (ring_history, next_index) = source.trigger_audit_state(TRIGGER_AUDIT_RING_CAPACITY)?;
         {
             self.trigger.volatile_audit_history.lock().clear();
         }
@@ -1302,7 +1301,7 @@ impl Database {
                 };
                 effect.map_or(error, |effect| Error::SyncTriggerEffectNotAllowed {
                     trigger_name: declaration.name.clone(),
-                    effect,
+                    effect: effect.to_owned(),
                 })
             });
         if let Err(error) = callback_result {
@@ -1461,7 +1460,7 @@ impl Database {
         if let Some(effect) = forbidden {
             return Err(Error::SyncTriggerEffectNotAllowed {
                 trigger_name: trigger_name.to_string(),
-                effect,
+                effect: effect.to_owned(),
             });
         }
         Ok(())
@@ -1501,7 +1500,7 @@ impl Database {
         ctx: &TriggerContext,
         callback: TriggerCallback,
     ) -> Result<()> {
-        let this_db = self as *const Self as usize;
+        let this_db = self.identity();
         let result = TRIGGER_CALLBACK_TX.with(|tx_slot| {
             let prior_tx = tx_slot.replace(Some(tx));
             let prior_db = TRIGGER_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
@@ -1513,6 +1512,8 @@ impl Database {
                 TRIGGER_CALLBACK_NAME.with(|name| name.replace(Some(ctx.trigger_name.clone())));
             let prior_wallclock =
                 TRIGGER_CALLBACK_WALLCLOCK.with(|slot| slot.replace(Some(current_wallclock())));
+            #[cfg(feature = "test-seams")]
+            crate::read_probe::note_trigger_callback_start();
             let result = catch_unwind(AssertUnwindSafe(|| callback(self, ctx)));
             let user_commit_reentry = self.take_user_commit_trigger_reentry();
             Self::clear_trigger_insert_state_machine_cache(this_db);
@@ -1983,7 +1984,7 @@ impl Database {
     }
 
     pub(super) fn active_trigger_tx_for_this_handle(&self) -> Option<TxId> {
-        let this_db = self as *const Self as usize;
+        let this_db = self.identity();
         if TRIGGER_CALLBACK_DB.with(|db| db.get()) == Some(this_db) {
             TRIGGER_CALLBACK_TX.with(|tx| tx.get())
         } else {
@@ -2109,9 +2110,9 @@ mod sync_effect_tests {
         assert!(matches!(
             error,
             Error::SyncTriggerEffectNotAllowed {
-                trigger_name,
-                effect: "vector insert/delete/move"
-            } if trigger_name == "received_insert"
+                ref trigger_name,
+                ref effect,
+            } if trigger_name == "received_insert" && effect == "vector insert/delete/move"
         ));
         db.rollback(tx).unwrap();
     }

@@ -101,6 +101,7 @@ fn cli(path: &std::path::Path, hub: &RunningHub, tenant: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     command
         .arg(path)
+        .arg("--write")
         .arg("--json")
         .args(["--sync-endpoint", &hub.ticket])
         .args(["--tenant-id", tenant]);

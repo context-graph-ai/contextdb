@@ -125,7 +125,12 @@ The main parameters occuring in constructing the graph or in searching are:
     modify the search strategy. The interested user should check the paper to see the impact. By default
     the values are as recommended in the paper.
 
-## Benchmarks and Examples [(examples)](./examples)
+## Benchmarks and Examples
+
+This fork carries the library only — the upstream `examples/` and `tests/` directories were
+not vendored, and `Cargo.toml` sets `autoexamples = false` / `autotests = false`. The example
+and benchmark sources the rest of this section describes live in upstream
+[`hnsw_rs`](https://github.com/jean-pierreBoth/hnswlib-rs).
 
 Some examples are taken from the [ann-benchmarks site](https://github.com/erikbern/ann-benchmarks)
 and recall rates and request/s are given in comments in the examples files for some input parameters.

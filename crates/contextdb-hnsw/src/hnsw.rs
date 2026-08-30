@@ -793,6 +793,303 @@ pub struct Hnsw<'b, T: Clone + Send + Sync + 'b, D: Distance<T>> {
     pub(crate) datamap_opt: bool,
 } // end of Hnsw
 
+/// The owned element storage of one search-local HNSW container.  The event
+/// intentionally reports only collection capacity and element size; it does
+/// not infer allocator bookkeeping that Rust does not expose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswSearchScratchContainer {
+    CandidateHeap,
+    ReturnHeap,
+    VisitedPoints,
+    Result,
+    MergeResults,
+    SeenRows,
+    QueryBytes,
+    ExactKey,
+}
+
+/// A pre-growth or release event for request-bounded HNSW search scratch.
+/// `Reserve` is emitted before the collection grows; `Reconcile` reports the
+/// capacity observed after that allocation, and `Release` is emitted before
+/// the owned element storage is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswSearchScratchEvent {
+    Reserve {
+        container: HnswSearchScratchContainer,
+        previous_capacity: usize,
+        requested_capacity: usize,
+        element_bytes: usize,
+    },
+    Reconcile {
+        container: HnswSearchScratchContainer,
+        requested_capacity: usize,
+        actual_capacity: usize,
+        element_bytes: usize,
+    },
+    Release {
+        container: HnswSearchScratchContainer,
+        capacity: usize,
+        element_bytes: usize,
+    },
+}
+
+/// Search results returned by [`Hnsw::search_with_bounded_control`].  The
+/// caller owns the `Result` container capacity reported by the corresponding
+/// scratch events until it consumes or drops `neighbours`.
+#[derive(Debug)]
+pub struct HnswSearchResult {
+    pub neighbours: Vec<Neighbour>,
+}
+
+/// Failure from the additive bounded search API. Callback errors retain their
+/// caller-defined type; capacity and allocation failures are reported without
+/// changing the established infallible search API.
+#[derive(Debug)]
+pub enum HnswBoundedSearchError<E> {
+    Callback(E),
+    CapacityOverflow(&'static str),
+    AllocationFailed(&'static str),
+    CapacityInvariant(&'static str),
+    /// A graph-ordering invariant the search relies on did not hold. The
+    /// bounded path reports it instead of panicking so every scratch charge
+    /// still travels its release path.
+    SearchInvariant(&'static str),
+}
+
+struct QueryScratchControl<'a, E> {
+    acquire: &'a mut dyn FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+    release: &'a mut dyn FnMut(HnswSearchScratchEvent),
+}
+
+impl<'a, E> QueryScratchControl<'a, E> {
+    fn next_capacity(
+        &self,
+        current: usize,
+        required: usize,
+        operation: &'static str,
+    ) -> std::result::Result<usize, HnswBoundedSearchError<E>> {
+        if current == 0 {
+            return Ok(required);
+        }
+        Ok(current
+            .checked_mul(2)
+            .ok_or(HnswBoundedSearchError::CapacityOverflow(operation))?
+            .max(required))
+    }
+
+    fn release_capacity(
+        &mut self,
+        container: HnswSearchScratchContainer,
+        capacity: usize,
+        element_bytes: usize,
+    ) {
+        if capacity != 0 && element_bytes != 0 {
+            (self.release)(HnswSearchScratchEvent::Release {
+                container,
+                capacity,
+                element_bytes,
+            });
+        }
+    }
+
+    fn allocate_vec<T>(
+        &mut self,
+        container: HnswSearchScratchContainer,
+        requested_capacity: usize,
+        operation: &'static str,
+    ) -> std::result::Result<Vec<T>, HnswBoundedSearchError<E>> {
+        if requested_capacity == 0 || std::mem::size_of::<T>() == 0 {
+            return Ok(Vec::new());
+        }
+        let element_bytes = std::mem::size_of::<T>();
+        (self.acquire)(HnswSearchScratchEvent::Reserve {
+            container,
+            previous_capacity: 0,
+            requested_capacity,
+            element_bytes,
+        })
+        .map_err(HnswBoundedSearchError::Callback)?;
+        let mut values = Vec::new();
+        if values.try_reserve_exact(requested_capacity).is_err() {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(HnswBoundedSearchError::AllocationFailed(operation));
+        }
+        let actual_capacity = values.capacity();
+        if actual_capacity < requested_capacity {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(HnswBoundedSearchError::CapacityInvariant(operation));
+        }
+        if let Err(error) = (self.acquire)(HnswSearchScratchEvent::Reconcile {
+            container,
+            requested_capacity,
+            actual_capacity,
+            element_bytes,
+        }) {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(HnswBoundedSearchError::Callback(error));
+        }
+        Ok(values)
+    }
+
+    /// Grow a scratch heap. Each migrated element is charged through the
+    /// caller's work control first, so a doubling chain stays inside the work
+    /// budget and stays cancellable. The old buffer is moved out before the
+    /// walk, so a refusal part-way through releases both the replacement and
+    /// the old capacity here — the caller's own release path would otherwise
+    /// see an emptied heap and give back nothing for the old allocation.
+    fn ensure_heap_capacity<T: Ord>(
+        &mut self,
+        container: HnswSearchScratchContainer,
+        values: &mut BinaryHeap<T>,
+        required: usize,
+        operation: &'static str,
+        before_work: &mut dyn FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), HnswBoundedSearchError<E>> {
+        if required <= values.capacity() {
+            return Ok(());
+        }
+        let element_bytes = std::mem::size_of::<T>();
+        let previous_capacity = values.capacity();
+        let requested_capacity = self.next_capacity(previous_capacity, required, operation)?;
+        let mut replacement = self.allocate_vec(container, requested_capacity, operation)?;
+        let mut source = std::mem::take(values).into_vec().into_iter();
+        let mut remaining = source.len();
+        while remaining != 0 {
+            if let Err(error) = before_work() {
+                self.release_capacity(container, replacement.capacity(), element_bytes);
+                self.release_capacity(container, previous_capacity, element_bytes);
+                return Err(HnswBoundedSearchError::Callback(error));
+            }
+            let Some(value) = source.next() else {
+                self.release_capacity(container, replacement.capacity(), element_bytes);
+                self.release_capacity(container, previous_capacity, element_bytes);
+                return Err(HnswBoundedSearchError::CapacityInvariant(operation));
+            };
+            remaining = match remaining.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => {
+                    self.release_capacity(container, replacement.capacity(), element_bytes);
+                    self.release_capacity(container, previous_capacity, element_bytes);
+                    return Err(HnswBoundedSearchError::CapacityOverflow(operation));
+                }
+            };
+            replacement.push(value);
+        }
+        *values = BinaryHeap::from(replacement);
+        self.release_capacity(container, previous_capacity, element_bytes);
+        Ok(())
+    }
+
+    fn allocate_set<T>(
+        &mut self,
+        container: HnswSearchScratchContainer,
+        requested_capacity: usize,
+        operation: &'static str,
+    ) -> std::result::Result<HashSet<T>, HnswBoundedSearchError<E>>
+    where
+        T: std::hash::Hash + Eq,
+    {
+        if requested_capacity == 0 || std::mem::size_of::<T>() == 0 {
+            return Ok(HashSet::new());
+        }
+        let element_bytes = std::mem::size_of::<T>();
+        (self.acquire)(HnswSearchScratchEvent::Reserve {
+            container,
+            previous_capacity: 0,
+            requested_capacity,
+            element_bytes,
+        })
+        .map_err(HnswBoundedSearchError::Callback)?;
+        let mut values = HashSet::new();
+        if values.try_reserve(requested_capacity).is_err() {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(HnswBoundedSearchError::AllocationFailed(operation));
+        }
+        let actual_capacity = values.capacity();
+        if actual_capacity < requested_capacity {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(HnswBoundedSearchError::CapacityInvariant(operation));
+        }
+        if let Err(error) = (self.acquire)(HnswSearchScratchEvent::Reconcile {
+            container,
+            requested_capacity,
+            actual_capacity,
+            element_bytes,
+        }) {
+            self.release_capacity(container, requested_capacity, element_bytes);
+            return Err(HnswBoundedSearchError::Callback(error));
+        }
+        Ok(values)
+    }
+
+    /// Grow the visited-point set. Each migrated element is charged through
+    /// the caller's work control first, so a doubling chain that copies tens of
+    /// thousands of elements stays inside the work budget and stays
+    /// cancellable, exactly as the vector-side twin of this migration does.
+    fn ensure_set_capacity<T>(
+        &mut self,
+        container: HnswSearchScratchContainer,
+        values: &mut HashSet<T>,
+        required: usize,
+        operation: &'static str,
+        before_work: &mut dyn FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), HnswBoundedSearchError<E>>
+    where
+        T: std::hash::Hash + Eq + Copy,
+    {
+        if required <= values.capacity() {
+            return Ok(());
+        }
+        let previous_capacity = values.capacity();
+        let requested_capacity = self.next_capacity(previous_capacity, required, operation)?;
+        let mut replacement = self.allocate_set(container, requested_capacity, operation)?;
+        let mut remaining = values.len();
+        let mut source = values.iter();
+        while remaining != 0 {
+            if let Err(error) = before_work() {
+                self.release_capacity(container, replacement.capacity(), std::mem::size_of::<T>());
+                return Err(HnswBoundedSearchError::Callback(error));
+            }
+            let Some(value) = source.next().copied() else {
+                self.release_capacity(container, replacement.capacity(), std::mem::size_of::<T>());
+                return Err(HnswBoundedSearchError::CapacityInvariant(operation));
+            };
+            remaining = match remaining.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => {
+                    self.release_capacity(
+                        container,
+                        replacement.capacity(),
+                        std::mem::size_of::<T>(),
+                    );
+                    return Err(HnswBoundedSearchError::CapacityOverflow(operation));
+                }
+            };
+            replacement.insert(value);
+        }
+        let old = std::mem::replace(values, replacement);
+        drop(old);
+        self.release_capacity(container, previous_capacity, std::mem::size_of::<T>());
+        Ok(())
+    }
+
+    fn release_vec<T>(&mut self, container: HnswSearchScratchContainer, values: &Vec<T>) {
+        self.release_capacity(container, values.capacity(), std::mem::size_of::<T>());
+    }
+
+    fn release_heap<T: Ord>(
+        &mut self,
+        container: HnswSearchScratchContainer,
+        values: &BinaryHeap<T>,
+    ) {
+        self.release_capacity(container, values.capacity(), std::mem::size_of::<T>());
+    }
+
+    fn release_set<T>(&mut self, container: HnswSearchScratchContainer, values: &HashSet<T>) {
+        self.release_capacity(container, values.capacity(), std::mem::size_of::<T>());
+    }
+}
+
 impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     /// allocation function
     /// . max_nb_connection : number of neighbours stored, by layer, in tables. Must be less than 256.
@@ -1129,6 +1426,154 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         );
         return_points
     } // end of search_layer
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_search_layer<E>(
+        &self,
+        point: &[T],
+        entry_point: Arc<Point<'b, T>>,
+        ef: usize,
+        layer: u8,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), E>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), E>,
+        scratch: &mut QueryScratchControl<'_, E>,
+    ) -> std::result::Result<BinaryHeap<PointWithOrder<'b, T>>, HnswBoundedSearchError<E>> {
+        let mut return_points = BinaryHeap::<PointWithOrder<T>>::new();
+        before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+        if self.layer_indexed_points.points_by_layer.read()[layer as usize].is_empty() {
+            return Ok(return_points);
+        }
+        if entry_point.p_id.1 < 0 {
+            return Ok(return_points);
+        }
+        let mut visited_point_ids = HashSet::<PointId>::new();
+        let mut candidate_points = BinaryHeap::<PointWithOrder<T>>::new();
+        let search = (|| {
+            before_distance().map_err(HnswBoundedSearchError::Callback)?;
+            let dist_to_entry_point = self.dist_f.eval(point, entry_point.data.get_v());
+            scratch.ensure_set_capacity(
+                HnswSearchScratchContainer::VisitedPoints,
+                &mut visited_point_ids,
+                1,
+                "visited points",
+                before_source_entry,
+            )?;
+            visited_point_ids.insert(entry_point.p_id);
+            scratch.ensure_heap_capacity(
+                HnswSearchScratchContainer::CandidateHeap,
+                &mut candidate_points,
+                1,
+                "candidate heap",
+                before_source_entry,
+            )?;
+            scratch.ensure_heap_capacity(
+                HnswSearchScratchContainer::ReturnHeap,
+                &mut return_points,
+                1,
+                "return heap",
+                before_source_entry,
+            )?;
+            candidate_points.push(PointWithOrder::new(&entry_point, -dist_to_entry_point));
+            return_points.push(PointWithOrder::new(&entry_point, dist_to_entry_point));
+
+            while let Some(candidate) = candidate_points.pop() {
+                let Some(farthest) = return_points.peek() else {
+                    break;
+                };
+                if farthest.dist_to_ref.is_nan() || farthest.dist_to_ref < 0. {
+                    return Err(HnswBoundedSearchError::SearchInvariant(
+                        "return-heap distance",
+                    ));
+                }
+                if candidate.dist_to_ref.is_nan() || candidate.dist_to_ref > 0. {
+                    return Err(HnswBoundedSearchError::SearchInvariant(
+                        "candidate-heap distance",
+                    ));
+                }
+                if -candidate.dist_to_ref > farthest.dist_to_ref {
+                    break;
+                }
+                before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                let neighbours_guard = candidate.point_ref.neighbours.read();
+                let neighbours = &neighbours_guard[layer as usize];
+                let mut neighbour_position = 0usize;
+                while neighbour_position < neighbours.len() {
+                    before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                    let neighbour = neighbours.get(neighbour_position).ok_or(
+                        HnswBoundedSearchError::CapacityInvariant("layer neighbours"),
+                    )?;
+                    neighbour_position = neighbour_position.checked_add(1).ok_or(
+                        HnswBoundedSearchError::CapacityOverflow("layer neighbour position"),
+                    )?;
+                    if visited_point_ids.contains(&neighbour.point_ref.p_id) {
+                        continue;
+                    }
+                    let next_visited = visited_point_ids
+                        .len()
+                        .checked_add(1)
+                        .ok_or(HnswBoundedSearchError::CapacityOverflow("visited points"))?;
+                    scratch.ensure_set_capacity(
+                        HnswSearchScratchContainer::VisitedPoints,
+                        &mut visited_point_ids,
+                        next_visited,
+                        "visited points",
+                        before_source_entry,
+                    )?;
+                    visited_point_ids.insert(neighbour.point_ref.p_id);
+                    let Some(farthest_distance) =
+                        return_points.peek().map(|point| point.dist_to_ref)
+                    else {
+                        break;
+                    };
+                    before_distance().map_err(HnswBoundedSearchError::Callback)?;
+                    let distance = self.dist_f.eval(point, neighbour.point_ref.data.get_v());
+                    if !(distance < farthest_distance || return_points.len() < ef) {
+                        continue;
+                    }
+                    let next_candidates = candidate_points
+                        .len()
+                        .checked_add(1)
+                        .ok_or(HnswBoundedSearchError::CapacityOverflow("candidate heap"))?;
+                    let next_returns = return_points
+                        .len()
+                        .checked_add(1)
+                        .ok_or(HnswBoundedSearchError::CapacityOverflow("return heap"))?;
+                    scratch.ensure_heap_capacity(
+                        HnswSearchScratchContainer::CandidateHeap,
+                        &mut candidate_points,
+                        next_candidates,
+                        "candidate heap",
+                        before_source_entry,
+                    )?;
+                    scratch.ensure_heap_capacity(
+                        HnswSearchScratchContainer::ReturnHeap,
+                        &mut return_points,
+                        next_returns,
+                        "return heap",
+                        before_source_entry,
+                    )?;
+                    candidate_points.push(PointWithOrder::new(&neighbour.point_ref, -distance));
+                    return_points.push(PointWithOrder::new(&neighbour.point_ref, distance));
+                    if return_points.len() > ef {
+                        return_points.pop();
+                    }
+                }
+            }
+            Ok(())
+        })();
+        scratch.release_heap(HnswSearchScratchContainer::CandidateHeap, &candidate_points);
+        scratch.release_set(
+            HnswSearchScratchContainer::VisitedPoints,
+            &visited_point_ids,
+        );
+        match search {
+            Ok(()) => Ok(return_points),
+            Err(error) => {
+                scratch.release_heap(HnswSearchScratchContainer::ReturnHeap, &return_points);
+                Err(error)
+            }
+        }
+    }
 
     /// insert a tuple (&Vec, usize) with its external id as given by the client.
     ///  The insertion method gives the point an internal id.
@@ -1662,6 +2107,140 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     /// A rule of thumb could be between knbn and max_nb_connection.
     pub fn search(&self, data: &[T], knbn: usize, ef_arg: usize) -> Vec<Neighbour> {
         self.search_possible_filter(data, knbn, ef_arg, None)
+    }
+
+    /// Additive request-bounded search. Source-entry and distance controls are
+    /// separate so work is charged once per inspected entry while cancellation
+    /// and deadline checks still run immediately before every distance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_bounded_control<E, S, Dst, A, R>(
+        &self,
+        data: &[T],
+        knbn: usize,
+        ef_arg: usize,
+        mut before_source_entry: S,
+        mut before_distance: Dst,
+        mut acquire: A,
+        mut release: R,
+    ) -> std::result::Result<HnswSearchResult, HnswBoundedSearchError<E>>
+    where
+        S: FnMut() -> std::result::Result<(), E>,
+        Dst: FnMut() -> std::result::Result<(), E>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
+    {
+        let mut scratch = QueryScratchControl {
+            acquire: &mut acquire,
+            release: &mut release,
+        };
+        let entry_point = {
+            before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+            let entry_point_opt_ref = self.layer_indexed_points.entry_point.read();
+            let Some(entry_point) = entry_point_opt_ref.as_ref() else {
+                return Ok(HnswSearchResult {
+                    neighbours: Vec::new(),
+                });
+            };
+            Arc::clone(entry_point)
+        };
+
+        before_distance().map_err(HnswBoundedSearchError::Callback)?;
+        let mut dist_to_entry = self.dist_f.eval(data, entry_point.as_ref().data.get_v());
+        let mut pivot = Arc::clone(&entry_point);
+        let mut new_pivot = None;
+        for layer in (1..=entry_point.p_id.0).rev() {
+            let mut has_changed = false;
+            {
+                before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                let neighbours_guard = pivot.neighbours.read();
+                let neighbours = &neighbours_guard[layer as usize];
+                let mut neighbour_position = 0usize;
+                while neighbour_position < neighbours.len() {
+                    before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                    let neighbour = neighbours.get(neighbour_position).ok_or(
+                        HnswBoundedSearchError::CapacityInvariant("upper-layer neighbours"),
+                    )?;
+                    neighbour_position = neighbour_position.checked_add(1).ok_or(
+                        HnswBoundedSearchError::CapacityOverflow("upper-layer neighbour position"),
+                    )?;
+                    before_distance().map_err(HnswBoundedSearchError::Callback)?;
+                    let candidate_distance =
+                        self.dist_f.eval(data, neighbour.point_ref.data.get_v());
+                    if candidate_distance < dist_to_entry {
+                        new_pivot = Some(Arc::clone(&neighbour.point_ref));
+                        has_changed = true;
+                        dist_to_entry = candidate_distance;
+                    }
+                }
+            }
+            if has_changed {
+                pivot = Arc::clone(new_pivot.as_ref().unwrap());
+            }
+        }
+
+        let ef = ef_arg.max(knbn);
+        let mut layer = 0u8;
+        let layer_to_search = loop {
+            before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+            if self
+                .get_point_indexation()
+                .get_layer_nb_point(layer as usize)
+                > 0
+            {
+                break layer;
+            }
+            layer = layer
+                .checked_add(1)
+                .ok_or(HnswBoundedSearchError::SearchInvariant("populated layer"))?;
+        };
+        let neighbours_heap = self.bounded_search_layer(
+            data,
+            pivot,
+            ef,
+            layer_to_search,
+            &mut before_source_entry,
+            &mut before_distance,
+            &mut scratch,
+        )?;
+        let neighbours = neighbours_heap.into_sorted_vec();
+        let last = knbn.min(ef).min(neighbours.len());
+        let mut result =
+            match scratch.allocate_vec(HnswSearchScratchContainer::Result, last, "search result") {
+                Ok(result) => result,
+                Err(error) => {
+                    scratch.release_vec(HnswSearchScratchContainer::ReturnHeap, &neighbours);
+                    return Err(error);
+                }
+            };
+        let copied =
+            (|| {
+                let mut position = 0usize;
+                while position < last {
+                    before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                    let neighbour = neighbours.get(position).ok_or(
+                        HnswBoundedSearchError::CapacityInvariant("sorted search results"),
+                    )?;
+                    position =
+                        position
+                            .checked_add(1)
+                            .ok_or(HnswBoundedSearchError::CapacityOverflow(
+                                "search result position",
+                            ))?;
+                    result.push(Neighbour::new(
+                        neighbour.point_ref.origin_id,
+                        neighbour.dist_to_ref,
+                        neighbour.point_ref.p_id,
+                    ));
+                }
+                Ok(())
+            })();
+        if let Err(error) = copied {
+            scratch.release_vec(HnswSearchScratchContainer::Result, &result);
+            scratch.release_vec(HnswSearchScratchContainer::ReturnHeap, &neighbours);
+            return Err(error);
+        }
+        scratch.release_vec(HnswSearchScratchContainer::ReturnHeap, &neighbours);
+        Ok(HnswSearchResult { neighbours: result })
     }
 
     fn search_with_id(

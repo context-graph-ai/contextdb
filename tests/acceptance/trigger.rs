@@ -8146,7 +8146,7 @@ fn including_sync_forbidden_effect_families_are_typed_atomic_and_audited() {
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         );
         assert!(
-            matches!(result, Err(Error::SyncTriggerEffectNotAllowed { effect: actual, .. }) if actual == effect.expected_family()),
+            matches!(result, Err(Error::SyncTriggerEffectNotAllowed { effect: ref actual, .. }) if actual == effect.expected_family()),
             "{effect:?} must return the dedicated received-trigger effect error: {result:?}"
         );
         assert_eq!(
@@ -8334,10 +8334,8 @@ fn including_sync_txid_identity_placeholder_is_typed_while_fixed_and_local_are_a
         if active_placeholder {
             assert!(matches!(
                 result,
-                Err(Error::SyncTriggerEffectNotAllowed {
-                    effect: "TXID identity placeholder",
-                    ..
-                })
+                Err(Error::SyncTriggerEffectNotAllowed { ref effect, .. })
+                    if effect == "TXID identity placeholder"
             ));
             assert_eq!(db.current_lsn(), before);
             assert_eq!(count_rows(&db, "sync_trigger_source"), 0);

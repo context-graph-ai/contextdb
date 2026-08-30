@@ -71,8 +71,7 @@ pub const SYNC_ALPN: &[u8] = b"contextdb.sync.v6";
 /// exact one-frame path. A larger opaque request uses the authenticated
 /// durable-fragment path below, while replies remain bounded by this ceiling.
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-/// Safe defaults for the server-local pre-admission resource policy. Operators
-/// can declare tighter or wider bounds in the bind endpoint spec.
+/// Safe defaults for the server-local pre-admission resource policy.
 const DEFAULT_PRE_ADMISSION_CONNECTIONS: usize = 128;
 const DEFAULT_PRE_ADMISSION_BYTES: usize = MAX_FRAME_BYTES;
 const DEFAULT_REQUEST_READ_IDLE: Duration = Duration::from_secs(30);
@@ -308,9 +307,76 @@ pub enum RelayChoice {
     N0Public,
 }
 
+/// Server-local bounds, declared independently from endpoint identity and
+/// routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerResourcePolicy {
+    pub response_staging_bytes: Option<u64>,
+    pub pre_admission_connections: usize,
+    pub pre_admission_bytes: usize,
+    pub request_read_idle_ms: u64,
+}
+
+impl Default for ServerResourcePolicy {
+    fn default() -> Self {
+        Self {
+            response_staging_bytes: None,
+            pre_admission_connections: DEFAULT_PRE_ADMISSION_CONNECTIONS,
+            pre_admission_bytes: DEFAULT_PRE_ADMISSION_BYTES,
+            request_read_idle_ms: DEFAULT_REQUEST_READ_IDLE.as_millis() as u64,
+        }
+    }
+}
+
+impl ServerResourcePolicy {
+    /// Validate values before any identity, socket, or database resource is opened.
+    pub fn validate(&self) -> TransportResult<()> {
+        if self.response_staging_bytes == Some(0) {
+            return Err(TransportError::Unreachable(
+                "--response-staging-bytes must be greater than zero when set".to_string(),
+            ));
+        }
+        if self.pre_admission_connections == 0
+            || self.pre_admission_connections > Semaphore::MAX_PERMITS
+        {
+            return Err(TransportError::Unreachable(format!(
+                "--pre-admission-connections must be between 1 and {}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        if self.pre_admission_bytes == 0
+            || self.pre_admission_bytes > Semaphore::MAX_PERMITS
+            || u32::try_from(self.pre_admission_bytes).is_err()
+        {
+            return Err(TransportError::Unreachable(
+                "--pre-admission-bytes must fit the pre-admission transport carrier".to_string(),
+            ));
+        }
+        if self.request_read_idle_ms == 0 {
+            return Err(TransportError::Unreachable(
+                "--request-read-idle-ms must be greater than zero".to_string(),
+            ));
+        }
+        let request_read_idle = Duration::from_millis(self.request_read_idle_ms);
+        // A timeout is represented as the current monotonic tick plus this
+        // duration. The largest u64 millisecond value leaves no room for even
+        // one current-clock tick, although some platforms' wider Instant
+        // representation would otherwise accept it and make validation vary
+        // by operating system.
+        if self.request_read_idle_ms == u64::MAX
+            || Instant::now().checked_add(request_read_idle).is_none()
+        {
+            return Err(TransportError::Unreachable(
+                "--request-read-idle-ms is too large for the monotonic clock".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A parsed transport endpoint spec.
 ///
-/// Server (bind) form: `iroh:?identity=<key-file>[&port=<u16>][&relay=<none|n0|url>][&response-staging-bytes=<positive-u64>][&pre-admission-connections=<positive-usize>][&pre-admission-bytes=<positive-u32>][&request-read-idle-ms=<positive-u64>]`
+/// Server (bind) form: `iroh:?identity=<key-file>[&port=<u16>][&relay=<none|n0|url>][&relay-ca=<path>][&publish=<url|n0>][&lookup=<url|n0|mdns|dns:origin>]`.
 /// Client (dial) form: a ticket string printed by the server, optionally
 /// prefixed `iroh:`.
 #[derive(Debug, Clone)]
@@ -321,10 +387,6 @@ pub struct EndpointSpec {
     relay_ca: Option<PathBuf>,
     publish: Option<PublishChoice>,
     lookup: Option<LookupChoice>,
-    response_staging_bytes: Option<u64>,
-    pre_admission_connections: Option<usize>,
-    pre_admission_bytes: Option<usize>,
-    request_read_idle_ms: Option<u64>,
     dial_ticket: Option<String>,
 }
 
@@ -373,10 +435,6 @@ impl EndpointSpec {
             relay_ca: None,
             publish: None,
             lookup: None,
-            response_staging_bytes: None,
-            pre_admission_connections: None,
-            pre_admission_bytes: None,
-            request_read_idle_ms: None,
             dial_ticket: None,
         }
     }
@@ -432,56 +490,20 @@ impl EndpointSpec {
                         url => LookupChoice::Custom(url.to_string()),
                     })
                 }
-                "response-staging-bytes" => {
-                    let bytes: u64 = value.parse().map_err(|_| {
-                        "invalid value for `response-staging-bytes` in sync endpoint spec (expected a positive byte count)".to_string()
-                    })?;
-                    if bytes == 0 {
-                        return Err("invalid value for `response-staging-bytes` in sync endpoint spec (expected a positive byte count)".to_string());
-                    }
-                    spec.response_staging_bytes = Some(bytes);
-                }
-                "pre-admission-connections" => {
-                    let connections: usize = value.parse().map_err(|_| {
-                        "invalid value for `pre-admission-connections` in sync endpoint spec (expected a positive connection count)".to_string()
-                    })?;
-                    if connections == 0 || connections > Semaphore::MAX_PERMITS {
-                        return Err("invalid value for `pre-admission-connections` in sync endpoint spec (expected a positive connection count)".to_string());
-                    }
-                    spec.pre_admission_connections = Some(connections);
-                }
-                "pre-admission-bytes" => {
-                    let bytes: usize = value.parse().map_err(|_| {
-                        "invalid value for `pre-admission-bytes` in sync endpoint spec (expected a positive byte count no larger than u32::MAX)".to_string()
-                    })?;
-                    if bytes == 0 || u32::try_from(bytes).is_err() {
-                        return Err("invalid value for `pre-admission-bytes` in sync endpoint spec (expected a positive byte count no larger than u32::MAX)".to_string());
-                    }
-                    spec.pre_admission_bytes = Some(bytes);
-                }
-                "request-read-idle-ms" => {
-                    let millis: u64 = value.parse().map_err(|_| {
-                        "invalid value for `request-read-idle-ms` in sync endpoint spec (expected a positive millisecond count)".to_string()
-                    })?;
-                    if millis == 0 {
-                        return Err("invalid value for `request-read-idle-ms` in sync endpoint spec (expected a positive millisecond count)".to_string());
-                    }
-                    spec.request_read_idle_ms = Some(millis);
+                "response-staging-bytes"
+                | "pre-admission-connections"
+                | "pre-admission-bytes"
+                | "request-read-idle-ms" => {
+                    return Err(format!(
+                        "server resource policy belongs in top-level `--{key}`, not sync endpoint spec"
+                    ));
                 }
                 _ => {
                     return Err(format!(
-                        "unknown parameter at position {position} in sync endpoint spec (accepted: identity, port, relay, relay-ca, publish, lookup, response-staging-bytes, pre-admission-connections, pre-admission-bytes, request-read-idle-ms, to)"
+                        "unknown parameter at position {position} in sync endpoint spec (accepted: identity, port, relay, relay-ca, publish, lookup, to)"
                     ));
                 }
             }
-        }
-        if spec.dial_ticket.is_some()
-            && (spec.response_staging_bytes.is_some()
-                || spec.pre_admission_connections.is_some()
-                || spec.pre_admission_bytes.is_some()
-                || spec.request_read_idle_ms.is_some())
-        {
-            return Err("server-local resource policy cannot be used with to=".to_string());
         }
         Ok(spec)
     }
@@ -496,10 +518,6 @@ impl EndpointSpec {
             relay_ca: None,
             publish: None,
             lookup: None,
-            response_staging_bytes: None,
-            pre_admission_connections: None,
-            pre_admission_bytes: None,
-            request_read_idle_ms: None,
             dial_ticket: Some(candidate.to_string()),
         })
     }
@@ -544,34 +562,6 @@ impl EndpointSpec {
     /// operator opted in. Absent by default — tickets carry the addresses.
     pub fn lookup(&self) -> Option<&LookupChoice> {
         self.lookup.as_ref()
-    }
-
-    /// Optional server-local durable oversized-response storage budget. It is
-    /// not carried in enrollment tickets and defaults to no pressure eviction.
-    pub fn response_staging_bytes(&self) -> Option<u64> {
-        self.response_staging_bytes
-    }
-
-    /// Maximum simultaneous incoming connection/handshake tasks. This is a
-    /// server-local resource policy and is never carried in enrollment tickets.
-    pub fn pre_admission_connections(&self) -> usize {
-        self.pre_admission_connections
-            .unwrap_or(DEFAULT_PRE_ADMISSION_CONNECTIONS)
-    }
-
-    /// Maximum aggregate bytes reserved by sync request frames before they
-    /// have reached route admission.
-    pub fn pre_admission_bytes(&self) -> usize {
-        self.pre_admission_bytes
-            .unwrap_or(DEFAULT_PRE_ADMISSION_BYTES)
-    }
-
-    /// Maximum time a request-frame read may make no application-byte progress.
-    pub fn request_read_idle(&self) -> Duration {
-        Duration::from_millis(
-            self.request_read_idle_ms
-                .unwrap_or(DEFAULT_REQUEST_READ_IDLE.as_millis() as u64),
-        )
     }
 }
 
@@ -2162,13 +2152,37 @@ async fn release_closed_endpoint_handles(endpoints: Vec<Endpoint>) -> Result<(),
 }
 
 impl IrohServer {
+    /// Bind with an explicit server-local resource policy.
+    pub async fn bind_with_resource_policy(
+        spec: &str,
+        policy: ServerResourcePolicy,
+    ) -> TransportResult<Self> {
+        policy.validate()?;
+        Self::bind_with_validated_resource_policy(spec, policy).await
+    }
+
     /// Bind an endpoint per `spec` (must be a bind spec with an identity
     /// path). The keypair is loaded or generated by the fabric identity
     /// module and handed to the endpoint — never minted by the transport.
     pub async fn bind(spec: &str) -> TransportResult<Self> {
-        let parsed = EndpointSpec::parse(spec).ok_or_else(|| {
-            TransportError::Unreachable("not a bindable endpoint spec".to_string())
-        })?;
+        Self::bind_with_resource_policy(spec, ServerResourcePolicy::default()).await
+    }
+
+    async fn bind_with_validated_resource_policy(
+        spec: &str,
+        policy: ServerResourcePolicy,
+    ) -> TransportResult<Self> {
+        let parsed = match EndpointSpec::parse_detailed(spec) {
+            Ok(Some(parsed)) => parsed,
+            Err(error) if is_top_level_resource_policy_remedy(&error) => {
+                return Err(TransportError::Unreachable(error));
+            }
+            Ok(None) | Err(_) => {
+                return Err(TransportError::Unreachable(
+                    "not a bindable endpoint spec".to_string(),
+                ));
+            }
+        };
         if parsed.dial_ticket().is_some() {
             return Err(TransportError::Unreachable(
                 "cannot bind a serving endpoint from a dial ticket".to_string(),
@@ -2302,7 +2316,7 @@ impl IrohServer {
         );
 
         let stage_root = durable_large_request_stage_path(identity_path);
-        if let Some(budget) = parsed.response_staging_bytes() {
+        if let Some(budget) = policy.response_staging_bytes {
             let cleanup_root = stage_root.clone();
             let cleanup = tokio::task::spawn_blocking(move || {
                 enforce_response_stage_budget(&cleanup_root, budget, &[])
@@ -2335,14 +2349,14 @@ impl IrohServer {
             large_request_stage: DurableLargeRequestStage {
                 root: stage_root,
                 lock: Arc::new(tokio::sync::Mutex::new(())),
-                response_staging_budget: parsed.response_staging_bytes(),
+                response_staging_budget: policy.response_staging_bytes,
                 #[cfg(feature = "test-seams")]
                 control: Arc::new(LargeRequestTestControlState::default()),
             },
             pre_admission: PreAdmissionGuardrails::new(
-                parsed.pre_admission_connections(),
-                parsed.pre_admission_bytes(),
-                parsed.request_read_idle(),
+                policy.pre_admission_connections,
+                policy.pre_admission_bytes,
+                Duration::from_millis(policy.request_read_idle_ms),
             ),
             accept_loop: Arc::new(AcceptLoopLifecycle::new()),
             transport_endpoint,
@@ -2579,6 +2593,16 @@ impl IrohServer {
         });
         self.accept_loop.install(task).await;
     }
+}
+
+fn is_top_level_resource_policy_remedy(error: &str) -> bool {
+    matches!(
+        error,
+        "server resource policy belongs in top-level `--response-staging-bytes`, not sync endpoint spec"
+            | "server resource policy belongs in top-level `--pre-admission-connections`, not sync endpoint spec"
+            | "server resource policy belongs in top-level `--pre-admission-bytes`, not sync endpoint spec"
+            | "server resource policy belongs in top-level `--request-read-idle-ms`, not sync endpoint spec"
+    )
 }
 
 async fn serve_peer_connection(
@@ -2819,8 +2843,16 @@ pub fn client_with_test_controller_for_test(
 }
 
 pub(super) fn server(spec: &str) -> Arc<dyn ServerTransport> {
+    server_with_resource_policy(spec, ServerResourcePolicy::default())
+}
+
+pub(super) fn server_with_resource_policy(
+    spec: &str,
+    policy: ServerResourcePolicy,
+) -> Arc<dyn ServerTransport> {
     Arc::new(LazyBoundServerTransport {
         spec: spec.to_string(),
+        policy,
     })
 }
 
@@ -3299,6 +3331,13 @@ impl ClientTransport for IrohClientTransport {
 /// serve time from the spec.
 struct LazyBoundServerTransport {
     spec: String,
+    policy: ServerResourcePolicy,
+}
+
+impl LazyBoundServerTransport {
+    async fn bind_server(&self) -> TransportResult<IrohServer> {
+        IrohServer::bind_with_resource_policy(&self.spec, self.policy.clone()).await
+    }
 }
 
 impl ServerTransport for LazyBoundServerTransport {
@@ -3308,7 +3347,7 @@ impl ServerTransport for LazyBoundServerTransport {
         shutdown: Arc<AtomicBool>,
     ) -> TransportFuture<'a, ()> {
         Box::pin(async move {
-            let server = IrohServer::bind(&self.spec).await?;
+            let server = self.bind_server().await?;
             tracing::info!(
                 ticket = %server.ticket(),
                 node_id = %server.node_id(),
@@ -4860,13 +4899,15 @@ async fn write_reply(
 #[cfg(test)]
 mod sticky_port_tests {
     use super::{
-        EndpointSpec, IrohServer, MAX_FRAME_BYTES, MAX_RESPONSE_CONTROL_BYTES,
-        MAX_TRACKED_RESPONSE_TRANSFERS, PreAdmissionGuardrails, RESPONSE_TRANSFER_IDLE_TIMEOUT,
-        ResponseTransferPaths, SyncRouteState, TransportError, client, client_with_lineage_signer,
+        EndpointSpec, IrohServer, LazyBoundServerTransport, MAX_FRAME_BYTES,
+        MAX_RESPONSE_CONTROL_BYTES, MAX_TRACKED_RESPONSE_TRANSFERS, PreAdmissionGuardrails,
+        RESPONSE_TRANSFER_IDLE_TIMEOUT, ResponseTransferPaths, Semaphore, ServerResourcePolicy,
+        SyncRouteState, TransportError, client, client_with_lineage_signer,
         complete_large_response, decode_large_response_control_frame,
         durable_large_request_stage_path, read_exact_with_progress, read_sticky_ports,
-        stage_large_response, stage_large_response_with_budget, sync_client_with_lineage_signer,
-        validate_large_request_progress, validate_large_response_completion,
+        stage_large_response, stage_large_response_with_budget, sticky_port_path,
+        sync_client_with_lineage_signer, validate_large_request_progress,
+        validate_large_response_completion,
     };
     use crate::identity::FabricIdentity;
     use crate::transport::large_request_staging::LargeRequestProgress;
@@ -4879,6 +4920,172 @@ mod sticky_port_tests {
         ResponseTransferPaths {
             stage: std::path::PathBuf::from(format!("responses/{name}")),
             completion: std::path::PathBuf::from(format!("response-completions/{name}")),
+        }
+    }
+
+    fn independent_resource_policies() -> [(&'static str, ServerResourcePolicy); 4] {
+        let defaults = ServerResourcePolicy::default();
+        [
+            (
+                "response-staging",
+                ServerResourcePolicy {
+                    response_staging_bytes: Some(7 * 1024 * 1024),
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "connections",
+                ServerResourcePolicy {
+                    pre_admission_connections: 3,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "bytes",
+                ServerResourcePolicy {
+                    pre_admission_bytes: 2 * 1024 * 1024,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "request-idle",
+                ServerResourcePolicy {
+                    request_read_idle_ms: 1_234,
+                    ..defaults
+                },
+            ),
+        ]
+    }
+
+    fn actual_resource_policy(server: &IrohServer) -> ServerResourcePolicy {
+        ServerResourcePolicy {
+            response_staging_bytes: server.large_request_stage.response_staging_budget,
+            pre_admission_connections: server.pre_admission.connection_permits.available_permits(),
+            pre_admission_bytes: server.pre_admission.payload_permits.available_permits(),
+            request_read_idle_ms: server.pre_admission.request_read_idle.as_millis() as u64,
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_resource_policy_drives_every_guardrail_for_eager_and_lazy_binds() {
+        let root = tempfile::tempdir().expect("temporary identities");
+        for (name, policy) in independent_resource_policies() {
+            let eager_spec = format!(
+                "iroh:?identity={}",
+                root.path().join(format!("eager-{name}.key")).display()
+            );
+            let eager = IrohServer::bind_with_resource_policy(&eager_spec, policy.clone())
+                .await
+                .expect("eager bind with explicit policy");
+            let eager_actual = actual_resource_policy(&eager);
+            eager.close().await;
+            assert_eq!(
+                eager_actual, policy,
+                "eager bind must honor {name} independently"
+            );
+
+            let lazy = LazyBoundServerTransport {
+                spec: format!(
+                    "iroh:?identity={}",
+                    root.path().join(format!("lazy-{name}.key")).display()
+                ),
+                policy: policy.clone(),
+            };
+            let lazy_bound = lazy
+                .bind_server()
+                .await
+                .expect("lazy bind with explicit policy");
+            let lazy_actual = actual_resource_policy(&lazy_bound);
+            lazy_bound.close().await;
+            assert_eq!(
+                lazy_actual, policy,
+                "lazy bind must honor {name} independently"
+            );
+        }
+    }
+
+    async fn assert_invalid_resource_policy_is_refused_before_identity(
+        name: &str,
+        policy: ServerResourcePolicy,
+    ) {
+        let root = tempfile::tempdir().expect("temporary identity directory");
+        let identity = root.path().join(format!("{name}.key"));
+        let spec = format!("iroh:?identity={}", identity.display());
+        match IrohServer::bind_with_resource_policy(&spec, policy).await {
+            Err(_) => {}
+            Ok(server) => {
+                server.close().await;
+                panic!("invalid policy must be refused before binding")
+            }
+        }
+        assert!(
+            !identity.exists(),
+            "invalid policy must be refused before creating an identity"
+        );
+        assert!(
+            !sticky_port_path(&identity).exists(),
+            "invalid policy must be refused before binding a socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_policy_rejects_invalid_values_before_identity_or_bind() {
+        let defaults = ServerResourcePolicy::default();
+        let too_many_permits = Semaphore::MAX_PERMITS
+            .checked_add(1)
+            .expect("semaphore maximum leaves one representable invalid value");
+        for (name, policy) in [
+            (
+                "zero-response-staging",
+                ServerResourcePolicy {
+                    response_staging_bytes: Some(0),
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "zero-connections",
+                ServerResourcePolicy {
+                    pre_admission_connections: 0,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "zero-bytes",
+                ServerResourcePolicy {
+                    pre_admission_bytes: 0,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "zero-idle",
+                ServerResourcePolicy {
+                    request_read_idle_ms: 0,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "too-many-connections",
+                ServerResourcePolicy {
+                    pre_admission_connections: too_many_permits,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "too-many-bytes",
+                ServerResourcePolicy {
+                    pre_admission_bytes: too_many_permits,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "idle-duration-overflow",
+                ServerResourcePolicy {
+                    request_read_idle_ms: u64::MAX,
+                    ..defaults
+                },
+            ),
+        ] {
+            assert_invalid_resource_policy_is_refused_before_identity(name, policy).await;
         }
     }
 
@@ -5210,62 +5417,43 @@ mod sticky_port_tests {
         );
     }
 
+    fn assert_endpoint_policy_key_is_refused(endpoint: String, parameter: &str) {
+        let flag = format!("--{}", parameter.split_once('=').expect("key=value").0);
+        let error = EndpointSpec::parse_detailed(&endpoint)
+            .expect_err("resource policy belongs in top-level server configuration");
+        assert!(
+            error.contains("top-level") && error.contains(&flag),
+            "endpoint refusal must name the top-level {flag} setting: {error}"
+        );
+    }
+
     #[test]
-    fn parser_accepts_only_positive_server_local_staging_budget() {
-        let parsed =
-            EndpointSpec::parse(
-                "iroh:?identity=/tmp/hub.key&response-staging-bytes=1048576&pre-admission-connections=12&pre-admission-bytes=8388608&request-read-idle-ms=45000",
-            )
-                .expect("positive staging budget parses");
-        assert_eq!(parsed.response_staging_bytes(), Some(1_048_576));
-        assert_eq!(parsed.pre_admission_connections(), 12);
-        assert_eq!(parsed.pre_admission_bytes(), 8_388_608);
-        assert_eq!(
-            parsed.request_read_idle(),
-            std::time::Duration::from_secs(45)
-        );
-        assert!(
-            EndpointSpec::parse_detailed("iroh:?identity=/tmp/hub.key&response-staging-bytes=0")
-                .is_err()
-        );
-        assert!(
-            EndpointSpec::parse_detailed("iroh:?identity=/tmp/hub.key&response-staging-bytes=nope")
-                .is_err()
-        );
+    fn bind_endpoint_specs_refuse_server_resource_policy_keys() {
         for parameter in [
-            "pre-admission-connections=0",
-            "pre-admission-connections=nope",
-            "pre-admission-bytes=0",
-            "pre-admission-bytes=4294967296",
-            "request-read-idle-ms=0",
-            "request-read-idle-ms=nope",
-        ] {
-            assert!(
-                EndpointSpec::parse_detailed(&format!("iroh:?identity=/tmp/hub.key&{parameter}"))
-                    .is_err(),
-                "invalid server-local policy must be refused: {parameter}"
-            );
-        }
-        let secret = iroh::SecretKey::from_bytes(&[7; 32]);
-        let ticket =
-            iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::new(secret.public()))
-                .to_string();
-        assert!(
-            EndpointSpec::parse_detailed(&format!("iroh:?response-staging-bytes=1&to={ticket}"))
-                .is_err()
-        );
-        assert!(
-            EndpointSpec::parse_detailed(&format!("iroh:?to={ticket}&response-staging-bytes=1"))
-                .is_err()
-        );
-        for parameter in [
+            "response-staging-bytes=1",
             "pre-admission-connections=1",
             "pre-admission-bytes=1",
             "request-read-idle-ms=1",
         ] {
-            assert!(
-                EndpointSpec::parse_detailed(&format!("iroh:?to={ticket}&{parameter}")).is_err(),
-                "dial specs must refuse server-local policy: {parameter}"
+            assert_endpoint_policy_key_is_refused(
+                format!("iroh:?identity=/tmp/hub.key&{parameter}"),
+                parameter,
+            );
+        }
+    }
+
+    #[test]
+    fn dial_endpoint_specs_refuse_server_resource_policy_keys() {
+        let ticket = test_ticket();
+        for parameter in [
+            "response-staging-bytes=1",
+            "pre-admission-connections=1",
+            "pre-admission-bytes=1",
+            "request-read-idle-ms=1",
+        ] {
+            assert_endpoint_policy_key_is_refused(
+                format!("iroh:?to={ticket}&{parameter}"),
+                parameter,
             );
         }
     }
@@ -5366,8 +5554,11 @@ mod sticky_port_tests {
         assert!(response_stage_path(&root, &first).exists());
         assert!(response_completion_path(&root, &second).exists());
         server.close().await;
-        let pressured = format!("{spec}&response-staging-bytes=1");
-        let server = IrohServer::bind(&pressured)
+        let pressure = ServerResourcePolicy {
+            response_staging_bytes: Some(1),
+            ..ServerResourcePolicy::default()
+        };
+        let server = IrohServer::bind_with_resource_policy(&spec, pressure.clone())
             .await
             .expect("configured startup cleanup");
         assert!(!response_stage_path(&root, &first).exists());
@@ -5385,13 +5576,14 @@ mod sticky_port_tests {
                 .local_addr()
                 .expect("port")
                 .port();
-            let failed_spec = format!(
-                "iroh:?identity={}&port={port}&response-staging-bytes=1",
-                identity.display()
+            let failed_spec = format!("iroh:?identity={}&port={port}", identity.display());
+            assert!(
+                IrohServer::bind_with_resource_policy(&failed_spec, pressure.clone())
+                    .await
+                    .is_err()
             );
-            assert!(IrohServer::bind(&failed_spec).await.is_err());
             std::fs::remove_file(&root).expect("remove staging-root link");
-            let rebound = IrohServer::bind(&failed_spec)
+            let rebound = IrohServer::bind_with_resource_policy(&failed_spec, pressure)
                 .await
                 .expect("failed sweep closed the explicit port");
             rebound.close().await;

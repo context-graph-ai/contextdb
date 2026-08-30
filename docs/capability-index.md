@@ -52,11 +52,11 @@ of truth.
   an edge dials.
 - **Not yet bound to Python or TypeScript.** Rust library and CLI today; other language bindings
   are on the roadmap (README).
-- **Not schema-stable across the wire pre-release.** Until the first tagged release, the sync
-  wire protocol may change in place with no version bump; every machine in a fleet tracks the
-  same `dev` build. Post-release, a peer speaking a different protocol version is refused loudly
-  on push, pull, and status — nothing is lost, but nothing syncs either, until every participant
-  upgrades.
+- **Wire-version-locked across a fleet.** The sync wire protocol carries a version byte, and a
+  peer speaking a different one is refused loudly on push, pull, and status
+  (`protocol version mismatch: received <n>, supported <m> — upgrade both ends to the same
+  contextdb release`). Nothing is lost, but nothing syncs either, until every participant
+  upgrades, so plan a fleet rollout as a coordinated upgrade of every hub and edge.
 
 ## Where it stops — the numbers
 
@@ -69,11 +69,18 @@ of truth.
   `work_node_contacts`) carry a fixed, engine-owned shape and policy — an operator table using
   any other name is entirely unrestricted. See [Architecture](architecture.md).
 - **A table that syncs needs a declared identity** (a `PRIMARY KEY` or an indexed `id` column) —
-  a keyless table with any sync direction other than `SYNC OFF` refuses loudly rather than
-  silently failing to replicate. See [Query Language](query-language.md).
+  the `CREATE TABLE` is accepted, and a keyless table declared with any sync direction other than
+  `SYNC OFF` then refuses loudly at its first push rather than silently failing to replicate. See
+  [Query Language](query-language.md).
 - **Memory and disk are configurable, not unbounded**: `SET MEMORY_LIMIT` and `SET DISK_LIMIT`
   (or the process-start bootstrap functions) are how a caller sets a ceiling; there is no
   hard-coded default cap.
+- **A CLI read is bounded, and a bounded read is complete or refused**: one `SELECT` succeeds only
+  within the declared ceilings — 500 rows and 4 MiB by default — and crossing either publishes no
+  rows and refuses with `owner_limit_exceeded`. Nothing is ever silently truncated, there is no
+  flag that disables the ceiling, and `.cursor open` / `.cursor fetch` is how a larger result is
+  paged. The embedded `Database::execute` library call keeps its uncapped contract.
+  See [CLI Reference](cli.md).
 
 ---
 

@@ -51,6 +51,12 @@ fn dir_names(dir: &Path) -> Vec<String> {
     names
 }
 
+fn appended_companion_path(path: &Path) -> PathBuf {
+    let mut companion = path.as_os_str().to_os_string();
+    companion.push(".lock");
+    PathBuf::from(companion)
+}
+
 /// The canonical on-disk export fixture: a fresh temp dir holding an opened
 /// `src.db` and the `artifact.db` destination path. Tests with divergent
 /// layouts (multiple artifacts, re-export, separate temp roots) keep their own
@@ -1030,7 +1036,7 @@ fn ce15_source_unaffected_and_second_export_reflects_new_commits() {
         "export must not change source rows"
     );
     assert!(
-        src_path.with_extension("lock").exists(),
+        appended_companion_path(&src_path).exists(),
         "source advisory lock must remain in place after export"
     );
 
@@ -1321,7 +1327,7 @@ fn ce19_artifact_is_independent_of_source() {
         .expect("artifact must open while the source is open in the same process");
     assert_has_tables(&artifact, &["t"], "CE19");
     assert!(
-        src_path.with_extension("lock").exists(),
+        appended_companion_path(&src_path).exists(),
         "source lock must be unaffected by opening the artifact"
     );
 

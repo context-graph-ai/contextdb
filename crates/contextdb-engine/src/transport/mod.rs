@@ -2,7 +2,7 @@
 //! moves bytes. Concrete transports live in submodules; the sync logic names
 //! only these types.
 
-#[cfg(any(test, feature = "test-seams"))]
+#[cfg(any(test, feature = "in-process-test-seams", feature = "test-seams"))]
 pub mod in_process;
 #[cfg(feature = "iroh")]
 pub mod iroh;
@@ -24,7 +24,7 @@ pub use iroh::EndpointSpec as PeerEndpointSpec;
 #[cfg(feature = "iroh")]
 pub use iroh::IrohServer as PeerEndpoint;
 #[cfg(feature = "iroh")]
-pub use iroh::{bind_spec as peer_bind_spec, dial_spec as peer_dial_spec};
+pub use iroh::{ServerResourcePolicy, bind_spec as peer_bind_spec, dial_spec as peer_dial_spec};
 
 /// Gate endpoint-owned integration on the transport implementation without
 /// exposing its feature selection to server-facing modules.
@@ -294,6 +294,23 @@ pub fn server_transport(endpoint: &str) -> Arc<dyn ServerTransport> {
     Arc::new(InvalidSpecTransport {
         message: "this build does not include the authenticated Iroh sync transport".to_string(),
     })
+}
+
+/// Construct a lazy server transport with explicit server-local resource
+/// bounds. Endpoint strings remain transport identity and routing only.
+#[cfg(feature = "iroh")]
+pub fn server_transport_with_resource_policy(
+    endpoint: &str,
+    policy: iroh::ServerResourcePolicy,
+) -> Arc<dyn ServerTransport> {
+    match iroh::EndpointSpec::parse_detailed(endpoint) {
+        Ok(Some(_)) => iroh::server_with_resource_policy(endpoint, policy),
+        Err(message) => Arc::new(InvalidSpecTransport { message }),
+        Ok(None) => Arc::new(InvalidSpecTransport {
+            message: "supplied sync endpoint/spec is unsupported; use an Iroh bind specification"
+                .to_string(),
+        }),
+    }
 }
 
 /// Both-sides transport for a spec that names this stack's endpoint form but

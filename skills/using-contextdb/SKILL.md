@@ -16,21 +16,41 @@ schema to migrate to: **contextdb ships no built-in schema**, you create your ow
 ## Open a database
 
 ```bash
-contextdb ./demo.db      # persisted; single file, crash-safe
-contextdb :memory:       # ephemeral, discarded on exit
+contextdb ./demo.db              # read an existing store; never creates, never mutates
+contextdb ./demo.db --write      # create it if missing, and permit mutation
+contextdb :memory:               # ephemeral writable scratch, discarded on exit
 ```
 
-A file has exactly one owner at a time. A second open of the same path — from this process or
-another — fails with `DatabaseLocked`. Keep one session; don't fan out concurrent CLI calls at the
-same file.
+**Plain `contextdb <path>` (no `--write`) is a bounded read session by default** — it never
+creates the store, never opens a writable handle, and leaves every byte in the store folder
+unchanged; even `.help` doesn't rewrite anything. There is nothing to copy first. Two refusals
+follow from that, and both are what you will hit first if you copy a recipe without the flag:
 
-**There is no read-only way to open a store with plain `contextdb <path>` — not even a no-op
-meta-command like `.help`.** Every session, including one that only reads, rewrites the file's
-bytes. Before you open a store you must not alter — someone else's, a backup, anything you didn't
-create for this task — read
-[`AGENTS.md`'s "There is no read-only way to open a store"](../../AGENTS.md#there-is-no-read-only-way-to-open-a-store)
-for the sanctioned copy-first / `repair` pattern. `scripts/store-health-check.sh` (below) already
-follows it — read it as a working example of the pattern, not just the prose.
+```bash
+# A store that does not exist. A read session never creates one.
+contextdb ./missing.db </dev/null
+# stderr: Error: there is no store at this path: read-image store is not there: No such file or
+#         directory (os error 2); --write creates it
+# exit:   1
+
+# A store that DOES exist — create ./demo.db first with the paste below, or this second
+# example answers `store_not_found` too, not the write refusal it is here to show.
+echo "INSERT INTO decisions VALUES ('550e8400-e29b-41d4-a716-446655440000', 'draft');" \
+  | contextdb ./demo.db
+# stderr: Error: this statement writes, so it needs a write session; rerun with --write
+# exit:   1
+```
+
+`:memory:` is always writable and needs no flag; an explicit `--write` on it is an accepted no-op.
+
+Reading is not exclusive. Several direct readers coexist on one store, and while a live process
+owns the store a read session is served by that owner over its authenticated local channel — same
+commands, same output shapes. `DatabaseLocked` is the *writable*-open refusal only: `--write`
+against a store a live writer already owns is refused (`held_by_writer`), and the refusal tells
+you that dropping `--write` reaches that owner's channel. See
+[`AGENTS.md`'s "Reading is safe by default"](../../AGENTS.md#reading-is-safe-by-default) for the
+owner-route/file-route contract. `scripts/store-health-check.sh` (below) reads a store directly,
+with no peek copy, as a working example.
 
 When stdin is not a terminal the CLI runs in **pipe mode**: no banner, no prompt, results on
 stdout, every error and diagnostic on stderr, and the process exit code tells you what happened.
@@ -43,7 +63,7 @@ the first `;` that is **not** inside a quoted string or a comment, so a real sch
 written. Anything still open when the input ends is run at that point.
 
 ```bash
-contextdb ./demo.db <<'SQL'
+contextdb ./demo.db --write <<'SQL'
 CREATE TABLE decisions (
   id UUID PRIMARY KEY,
   description TEXT NOT NULL,
@@ -71,14 +91,17 @@ ok (rows_affected=1)
 +--------------------------------------+-----------------+--------+
 | 550e8400-e29b-41d4-a716-446655440000 | adopt contextdb | active |
 +--------------------------------------+-----------------+--------+
+(1 rows)
 ```
+
+Every successful ordinary `SELECT` ends with exactly one `(N rows)` footer and nothing else.
 
 The `STATE MACHINE` clause is enforced by the engine, not by your code. Push the row backwards and
 it is refused:
 
 ```bash
 echo "UPDATE decisions SET status = 'draft' WHERE id = '550e8400-e29b-41d4-a716-446655440000';" \
-  | contextdb ./demo.db
+  | contextdb ./demo.db --write
 # stderr: Error: invalid state transition: active -> draft
 # exit:   1
 ```
@@ -107,8 +130,9 @@ contextdb> CREATE TABLE notes (
 ok (rows_affected=0)
 ```
 
-Human table output is capped at 100 rows and prints a footer saying so; pass `--all` to print every
-row. Under `--json` there is no cap and `--all` is a no-op.
+Human output prints one row per line and ends with a single `(N rows)` footer. No renderer
+truncates and there is no row cap to disable — a result publishes complete or refuses. There is no
+pager either: pipe to `less` if you want one.
 
 ## Machine output: `--json`
 
@@ -116,19 +140,43 @@ row. Under `--json` there is no cap and `--all` is a no-op.
 statement or meta-command that produced a result, and nothing else. A run that produced no results
 writes nothing to stdout.
 
-A query is one line, a JSON array of row objects, uncapped:
+A query is one line: one namespaced document carrying the result's columns and its rows.
 
 ```bash
 echo "SELECT id, status FROM decisions;" | contextdb ./demo.db --json
 ```
 ```json
-[{"id":"550e8400-e29b-41d4-a716-446655440000","status":"active"}]
+{"result":{"columns":["id","status"],"rows":[{"id":"550e8400-e29b-41d4-a716-446655440000","status":"active"}]}}
 ```
 
 ```bash
-echo "SELECT id, status FROM decisions;" | contextdb ./demo.db --json | jq -r '.[].status'
+echo "SELECT id, status FROM decisions;" | contextdb ./demo.db --json | jq -r '.result.rows[].status'
 # active
 ```
+
+`columns` carries the declared order, so a consumer can render a table without guessing it back
+out of the first row.
+
+### A result is complete or refused — it is never truncated
+
+A `SELECT` succeeds only when the whole result fits the declared ceilings (`--read-result-rows`,
+500 by default, and `--read-result-bytes`, 4 MiB). Crossing either one publishes **no rows** and
+refuses with `owner_limit_exceeded`, exit `1`; the refusal carries the refused statement and the
+copy-ready command that pages it instead, all on one line:
+
+```text
+Error: the answer went past the rows this read is allowed: 500 rows; .cursor open SELECT * FROM decisions; raise --read-result-rows / --read-result-bytes for a deliberate one-shot export
+```
+
+Under `--json` the same refusal is
+`{"error":{"class":"io","detail":{"kind":"owner_limit_exceeded","limit":"result_rows","remedy_command":".cursor open SELECT * FROM decisions","statement":"SELECT * FROM decisions","value":500}, ...}}`
+— branch on `detail.kind` and run `detail.remedy_command` verbatim.
+
+So the two escapes for a big read are: raise `--read-result-rows` / `--read-result-bytes` for a
+deliberate one-shot export on a store nobody owns, or page it with the session cursor —
+`.cursor open <SELECT>`, then `.cursor fetch` until `has_more` is `false`. Reading through a live
+owner you can only lower the owner's ceiling, never raise it, so the cursor is the in-session
+escape there. Details: [`docs/cli.md`](../../docs/cli.md#large-results-the-session-cursor).
 
 A non-query statement is a small status object:
 
@@ -150,11 +198,16 @@ document, keyed by its payload:
 printf '.tables\n' | contextdb ./demo.db --json
 ```
 ```json
-{"tables":["decisions"]}
+{"tables":{"continuation":null,"has_more":false,"items":["decisions"]}}
 ```
 
+`.tables` and `.events status` answer as bounded pages: as many complete items as fit
+`result_bytes`, plus `has_more` and a `continuation` string that is non-null exactly when
+`has_more` is true. Resume with `.tables --continue <continuation>`; a continuation is accepted
+only by the command that issued it.
+
 ```bash
-printf '.schema decisions\n' | contextdb ./demo.db --json | jq '.state_machine'
+printf '.schema decisions\n' | contextdb ./demo.db --json | jq '.schema.state_machine'
 ```
 ```json
 {"column":"status","transitions":{"active":["superseded"],"draft":["active","rejected"]}}
@@ -165,7 +218,7 @@ unique / immutable flags, `references` with its propagate clause, vector quantiz
 policy), `primary_key`, `indexes`, `state_machine`, `retain`, `sync_direction`, `conflict_policy`,
 `dag_edge_types`, `propagate` — plus `ddl`, the exact text the human `.schema` prints, so a
 snapshot/replay flow keeps working. **A policy the table never declared is absent, not defaulted.**
-Test with `jq 'has("retain")'`, never by comparing against a value nobody wrote.
+Test with `jq '.schema | has("retain")'`, never by comparing against a value nobody wrote.
 
 Which plan the engine chose:
 
@@ -214,7 +267,7 @@ Precedence: a definitive error (`1`) dominates an unconfirmed push (`3`), which 
 ```bash
 echo "SELECT * FROM decisions;" | contextdb ./demo.db --json > rows.json 2> errors.jsonl
 case $? in
-  0) jq -r '.[].id' rows.json ;;
+  0) jq -r '.result.rows[].id' rows.json ;;
   2) echo "bad invocation — nothing ran"; cat errors.jsonl ;;
   3) echo "push unconfirmed — re-push on next start" ;;
   *) echo "run failed"; jq -r '.error.class + ": " + .error.message' errors.jsonl ;;
@@ -239,7 +292,8 @@ from an interactive session, because nobody can act on it once the process is go
   `vector-search` skill.
 - **Not supported, by design:** `GROUP BY`/`HAVING`, `UNION`/`INTERSECT`/`EXCEPT`,
   `INSERT ... SELECT`, window functions, `WITH RECURSIVE`, subqueries outside `IN`, and aggregates
-  other than `COUNT`. Full list: [`docs/query-language.md`](../../docs/query-language.md#unsupported-features).
+  other than `COUNT` and `SUM` (`AVG`, `MIN` and `MAX` each refuse with
+  `plan error: unknown function`). Full list: [`docs/query-language.md`](../../docs/query-language.md#unsupported-features).
 - **Logs go to stderr** at level `ERROR` by default; raise with `RUST_LOG=debug`.
 
 ## Verify a store deterministically — run the script, don't hand-check
@@ -250,24 +304,27 @@ you expect, every table's row count is actually readable — run
 same three checks by hand:
 
 1. `CONTEXTDB_CLI=<path-to-contextdb> scripts/store-health-check.sh ./demo.db`
-2. Expected output on a healthy store: an `OK   repair: ...` line, an `OK   .tables: N table(s)`
+2. Expected output on a healthy store: an `OK   diagnose: ...` line, an `OK   .tables: N table(s)`
    line, then one `OK   <table>  <n> row(s)` line per table.
 3. Exit code `0` means every check passed. **If it exits `1`, the printed line tells you exactly
-   which check failed** (repair reported a problem, or one table's row count was unreadable) — go
-   fix that specific thing rather than re-running the whole store from scratch.
+   which check failed** (diagnose reported a problem, or one table's row count was unreadable) —
+   go fix that specific thing rather than re-running the whole store from scratch.
 
 ```bash
 CONTEXTDB_CLI=./bin/contextdb scripts/store-health-check.sh ./demo.db
 ```
 ```text
-OK   repair: repair: './demo.db' is current-format and its schema layout reads cleanly; nothing to repair.
+OK   diagnose: diagnose: './demo.db' is current-format and its schema layout reads cleanly; nothing to correct.
 OK   .tables: 1 table(s)
 OK   decisions                        1 row(s)
 ```
 
-The script itself follows the copy-first pattern above — it never opens your original file for the
-inspection half, only a `mktemp -d` peek copy — so it is also the reference implementation to copy
-if you're writing your own read-only-feeling check.
+Each store-reading step also emits one `read_route` notice on stderr, naming the route and the
+committed snapshot it read; stdout stays the `OK`/`FAIL` lines the script's exit code summarizes.
+
+The script itself reads the store directly — a plain `contextdb <path>` open (no `--write`) is
+already a bounded read session, so there is no peek copy to make — making it also the reference
+implementation to copy if you're writing your own read-only check.
 
 ## Embedding it instead
 
@@ -299,6 +356,46 @@ db.execute(
 `$name` parameter binding is the library path — the CLI has no parameter binding, so CLI recipes
 use literals. Details and the plugin/subscription surface:
 [`docs/getting-started.md`](../../docs/getting-started.md#use-as-a-library).
+
+## Restrict which rows a reader sees
+
+Row-level authorization is opt-in and declared by the application. A data table names the column
+carrying each row's access-control id; a grant table says which principal holds which id:
+
+```sql
+CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID);
+CREATE TABLE notes (id INTEGER PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), payload TEXT);
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id)
+VALUES ('33333333-3333-4333-8333-333333333333', 'Agent', 'report-reader',
+        '44444444-4444-4444-8444-444444444444');
+```
+
+Read through a handle that names the principal. An ordinary query and a bounded read session
+answer the same rows, and rows the principal holds no grant for are absent from both:
+
+```rust
+let reader = db.scoped_with_constraints(None, None,
+    Some(Principal::Agent("report-reader".to_string())));
+let rows = reader.execute("SELECT payload FROM notes ORDER BY id", &HashMap::new())?;
+```
+
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_granting_principal_sees_the_same_rows_on_both_live_routes -->
+
+A handle that narrowed itself by context or scope but named no principal that can hold grants is
+refused the table with `Error::PrincipalRequired` — narrowing by another axis never turns the
+grant filter off.
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_context_only_handle_is_refused_an_access_controlled_table_on_both_live_routes -->
+
+An administrative handle — no context, no scope, no principal — reads every row, and a table that
+declares no `ACL REFERENCES` column is unaffected.
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_table_without_an_acl_declaration_narrows_by_context_alone_on_every_route -->
+
+A direct read of a CLOSED store declares nothing: `ReadSession::open` on a path with no live owner, or the CLI pointed at a path, reads it as its owner does and sees every row. Row-level authorization governs handles that name a principal; file permissions govern who may read a closed store at all.
+<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::the_direct_route_reads_a_closed_store_as_its_owner_with_no_declared_narrowing -->
+
+ACL is authorization, not relevance ranking: a withheld row is withheld because the reader is not
+entitled to it, never scored or surfaced lower. Full recipe:
+[`docs/query-language.md`](../../docs/query-language.md#access-controlled-rows-acl).
 
 ## Next
 

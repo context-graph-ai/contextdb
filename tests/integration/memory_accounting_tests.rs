@@ -10,6 +10,41 @@ fn empty() -> HashMap<String, Value> {
     HashMap::new()
 }
 
+const ITEMS_SCHEMA: &str = "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)";
+const ITEMS_INSERT: &str = "INSERT INTO items (id, name) VALUES ($id, $name)";
+
+/// A budget no arm in this file comes near; it is only ever used while measuring.
+const MEASUREMENT_BUDGET: usize = 64 * 1024 * 1024;
+
+fn items_row(name: &str) -> HashMap<String, Value> {
+    make_params(vec![
+        ("id", Value::Uuid(Uuid::new_v4())),
+        ("name", Value::Text(name.to_string())),
+    ])
+}
+
+/// Creates the table and stores one row of `name`, reporting what the schema and
+/// that row each cost the accountant. Arms below size their budget from this
+/// rather than writing a number down, so they keep pinning the promised behavior
+/// when the charge model changes.
+fn measure_schema_and_row(
+    db: &Database,
+    accountant: &MemoryAccountant,
+    name: &str,
+) -> (usize, usize) {
+    db.execute(ITEMS_SCHEMA, &empty())
+        .expect("measuring CREATE TABLE must succeed");
+    let schema_bytes = accountant.usage().used;
+    db.execute(ITEMS_INSERT, &items_row(name))
+        .expect("measuring INSERT must succeed");
+    let row_bytes = accountant.usage().used - schema_bytes;
+    assert!(
+        row_bytes > 0,
+        "a stored row must cost the accountant something, measured {row_bytes}"
+    );
+    (schema_bytes, row_bytes)
+}
+
 // ---------------------------------------------------------------------------
 // M01 — RED: INSERT succeeds when under budget
 // ---------------------------------------------------------------------------
@@ -57,25 +92,23 @@ fn m01_insert_succeeds_under_budget() {
 // ---------------------------------------------------------------------------
 #[test]
 fn m02_insert_rejected_when_budget_exceeded() {
-    // 4KB budget — enough for CREATE TABLE overhead, too small for a large INSERT.
-    let accountant = Arc::new(MemoryAccountant::with_budget(4096));
-    let db = Database::open_memory_with_accountant(accountant.clone());
-    db.execute(
-        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
-        &empty(),
-    )
-    .unwrap();
+    const NAME: &str = "this string is long enough to exceed 64 bytes budget";
 
-    let result = db.execute(
-        "INSERT INTO items (id, name) VALUES ($id, $name)",
-        &make_params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            (
-                "name",
-                Value::Text("this string is long enough to exceed 64 bytes budget".to_string()),
-            ),
-        ]),
+    let measured = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
+    let (schema_bytes, row_bytes) = measure_schema_and_row(
+        &Database::open_memory_with_accountant(measured.clone()),
+        &measured,
+        NAME,
     );
+
+    // Enough for the schema and less than one row: CREATE TABLE fits, the INSERT
+    // cannot.
+    let budget = schema_bytes + row_bytes / 2;
+    let accountant = Arc::new(MemoryAccountant::with_budget(budget));
+    let db = Database::open_memory_with_accountant(accountant);
+    db.execute(ITEMS_SCHEMA, &empty()).unwrap();
+
+    let result = db.execute(ITEMS_INSERT, &items_row(NAME));
     assert!(result.is_err(), "INSERT must fail when budget exceeded");
     let err = result.unwrap_err();
     match &err {
@@ -91,7 +124,7 @@ fn m02_insert_rejected_when_budget_exceeded() {
             assert!(!operation.is_empty());
             assert!(*requested_bytes > 0);
             assert_eq!(
-                *budget_limit_bytes, 4096,
+                *budget_limit_bytes, budget,
                 "budget_limit_bytes must be the total budget"
             );
             assert!(
@@ -109,15 +142,24 @@ fn m02_insert_rejected_when_budget_exceeded() {
 // ---------------------------------------------------------------------------
 #[test]
 fn m03_delete_reclaims_memory_for_insert() {
-    // Budget sized to fit schema + one row (schema now includes an auto-PK
-    // IndexDecl), but not two rows.
-    let accountant = Arc::new(MemoryAccountant::with_budget(820));
+    let measured = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
+    let (schema_bytes, row_bytes) = measure_schema_and_row(
+        &Database::open_memory_with_accountant(measured.clone()),
+        &measured,
+        "first",
+    );
+
+    // The live limit holds the schema, one row, and half a row of slack: one row
+    // fits, a second does not, and a row re-inserted after the DELETE fits again.
+    // The ceiling stays generous so the closing read-back can be paid for once the
+    // insert promises are settled.
+    let budget = schema_bytes + row_bytes + row_bytes / 2;
+    let accountant = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
+    accountant
+        .set_budget(Some(budget))
+        .expect("lowering the live limit under the ceiling must succeed");
     let db = Database::open_memory_with_accountant(accountant.clone());
-    db.execute(
-        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
-        &empty(),
-    )
-    .unwrap();
+    db.execute(ITEMS_SCHEMA, &empty()).unwrap();
 
     let id1 = Uuid::new_v4();
     // First INSERT should succeed.
@@ -169,6 +211,12 @@ fn m03_delete_reclaims_memory_for_insert() {
         result3.is_ok(),
         "INSERT after DELETE must succeed: {result3:?}"
     );
+
+    // The memory promises are settled; lift the limit so reading the row back is
+    // not itself a budget question.
+    accountant
+        .set_budget(Some(MEASUREMENT_BUDGET))
+        .expect("raising the live limit back to the ceiling must succeed");
 
     // Verify the row actually exists with correct value.
     let select = db
@@ -525,37 +573,34 @@ fn m11_set_above_startup_ceiling_rejected() {
 // ---------------------------------------------------------------------------
 #[test]
 fn m12_open_with_config_wires_accountant() {
+    const NAME: &str = "a long enough string to exceed sixty four bytes of budget for sure";
     let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("m12.db");
-    let accountant = Arc::new(MemoryAccountant::with_budget(4096)); // tight but fits DDL
 
+    let measured = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
+    let (schema_bytes, row_bytes) = measure_schema_and_row(
+        &Database::open_with_config(
+            tmp.path().join("m12-measurement.db"),
+            Arc::new(contextdb_engine::plugin::CorePlugin),
+            measured.clone(),
+        )
+        .unwrap(),
+        &measured,
+        NAME,
+    );
+
+    // Enough for the schema and less than one row, so only the accountant the
+    // caller supplied can be what refuses the INSERT.
+    let accountant = Arc::new(MemoryAccountant::with_budget(schema_bytes + row_bytes / 2));
     let db = Database::open_with_config(
-        &db_path,
+        tmp.path().join("m12.db"),
         Arc::new(contextdb_engine::plugin::CorePlugin),
         accountant,
     )
     .unwrap();
 
-    db.execute(
-        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
-        &empty(),
-    )
-    .unwrap();
+    db.execute(ITEMS_SCHEMA, &empty()).unwrap();
 
-    // INSERT with 64-byte budget should fail.
-    let result = db.execute(
-        "INSERT INTO items (id, name) VALUES ($id, $name)",
-        &make_params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            (
-                "name",
-                Value::Text(
-                    "a long enough string to exceed sixty four bytes of budget for sure"
-                        .to_string(),
-                ),
-            ),
-        ]),
-    );
+    let result = db.execute(ITEMS_INSERT, &items_row(NAME));
     assert!(
         result.is_err(),
         "INSERT must fail with tight budget via open_with_config"

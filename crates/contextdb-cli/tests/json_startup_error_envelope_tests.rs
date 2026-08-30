@@ -159,11 +159,17 @@ fn json_database_open_failure_emits_error_envelope() {
         envelope["error"]["class"].is_string(),
         "main.rs must never eprintln! plain text here regardless of --json, got: {envelope}\nfull stderr:\n{stderr}"
     );
-    assert!(
-        envelope["error"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("open")),
+    // The branchable part of the answer is the stable kind, not the prose:
+    // a store that is not there refuses with `store_not_found`, and the
+    // message beside it is for a person and is free to be reworded.
+    assert_eq!(
+        envelope["error"]["detail"]["kind"],
+        serde_json::json!("store_not_found"),
         "got: {envelope}"
+    );
+    assert!(
+        envelope["error"]["message"].as_str().is_some(),
+        "the refusal carries human prose alongside the stable fields, got: {envelope}"
     );
 }
 

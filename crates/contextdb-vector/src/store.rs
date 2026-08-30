@@ -6,22 +6,22 @@ use contextdb_core::{
 use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 thread_local! {
-    static HELD_MAINTENANCE_LOCKS: RefCell<Vec<(usize, VectorIndexRef)>> = const { RefCell::new(Vec::new()) };
-    static HELD_BULK_READ_LOCKS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    static HELD_BULK_WRITE_LOCKS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static HELD_MAINTENANCE_LOCKS: RefCell<Vec<(StoreId, VectorIndexRef)>> = const { RefCell::new(Vec::new()) };
+    static HELD_BULK_READ_LOCKS: RefCell<Vec<StoreId>> = const { RefCell::new(Vec::new()) };
+    static HELD_BULK_WRITE_LOCKS: RefCell<Vec<StoreId>> = const { RefCell::new(Vec::new()) };
 }
 
 struct MaintenanceStackGuard {
-    store_id: usize,
+    store_id: StoreId,
     index: VectorIndexRef,
 }
 
 impl MaintenanceStackGuard {
-    fn new(store_id: usize, index: &VectorIndexRef) -> Self {
+    fn new(store_id: StoreId, index: &VectorIndexRef) -> Self {
         HELD_MAINTENANCE_LOCKS.with(|held| held.borrow_mut().push((store_id, index.clone())));
         Self {
             store_id,
@@ -40,11 +40,11 @@ impl Drop for MaintenanceStackGuard {
 }
 
 struct BulkReadStackGuard {
-    store_id: usize,
+    store_id: StoreId,
 }
 
 impl BulkReadStackGuard {
-    fn new(store_id: usize) -> Self {
+    fn new(store_id: StoreId) -> Self {
         HELD_BULK_READ_LOCKS.with(|held| held.borrow_mut().push(store_id));
         Self { store_id }
     }
@@ -60,11 +60,11 @@ impl Drop for BulkReadStackGuard {
 }
 
 struct BulkWriteStackGuard {
-    store_id: usize,
+    store_id: StoreId,
 }
 
 impl BulkWriteStackGuard {
-    fn new(store_id: usize) -> Self {
+    fn new(store_id: StoreId) -> Self {
         HELD_BULK_WRITE_LOCKS.with(|held| held.borrow_mut().push(store_id));
         Self { store_id }
     }
@@ -77,6 +77,18 @@ impl Drop for BulkWriteStackGuard {
             debug_assert_eq!(popped, Some(self.store_id));
         });
     }
+}
+
+/// What the bounded HNSW gate needs to know about an index's stored entries.
+/// `newer_than_snapshot` answers the same question a `max_tx` comparison does —
+/// whether any entry carries a transaction later than the reading snapshot —
+/// and `live_count` is the visible-entry count the eligibility thresholds
+/// compare against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundedIndexEligibility {
+    pub entry_count: usize,
+    pub live_count: usize,
+    pub newer_than_snapshot: bool,
 }
 
 pub struct IndexState {
@@ -125,6 +137,64 @@ impl IndexState {
             .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
             .max()
             .unwrap_or_default()
+    }
+
+    /// Answer the bounded HNSW eligibility question in one charged pass rather
+    /// than the three full iterations `entry_count`, `max_tx` and
+    /// `vector_count` would take. The control runs before the entry lock is
+    /// acquired and once per inspected entry, so a spent work budget or a
+    /// cancelled request stops the scan where it stands instead of reading
+    /// every stored entry first. The pass stops as soon as one entry is newer
+    /// than the snapshot, because that alone makes the graph ineligible.
+    pub(crate) fn bounded_hnsw_eligibility<E>(
+        &self,
+        snapshot_tx: TxId,
+        mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<BoundedIndexEligibility, E>
+    where
+        E: From<Error>,
+    {
+        before_source_entry()?;
+        let entries = self.vectors.read();
+        let entry_count = entries.len();
+        let mut live_count = 0usize;
+        let mut position = 0usize;
+        while position < entries.len() {
+            before_source_entry()?;
+            let entry = entries.get(position).ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded vector eligibility position changed".to_string(),
+                ))
+            })?;
+            position = position.checked_add(1).ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded vector eligibility position overflow".to_string(),
+                ))
+            })?;
+            if entry.created_tx > snapshot_tx
+                || entry
+                    .deleted_tx
+                    .is_some_and(|deleted_tx| deleted_tx > snapshot_tx)
+            {
+                return Ok(BoundedIndexEligibility {
+                    entry_count,
+                    live_count,
+                    newer_than_snapshot: true,
+                });
+            }
+            if entry.deleted_tx.is_none() {
+                live_count = live_count.checked_add(1).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded vector live-entry count overflow".to_string(),
+                    ))
+                })?;
+            }
+        }
+        Ok(BoundedIndexEligibility {
+            entry_count,
+            live_count,
+            newer_than_snapshot: false,
+        })
     }
 
     pub fn byte_count(&self) -> usize {
@@ -336,12 +406,33 @@ struct PendingVectorChangesRef<'a> {
     moves: Vec<&'a (VectorIndexRef, RowId, RowId, TxId)>,
 }
 
+/// Identity of one vector store, handed out at construction and never reused.
+///
+/// The re-entrancy guards below ask "is this store's lock already held on this
+/// thread?", and the answer has to be about a STORE. A raw address is not an
+/// identity: a dropped store frees its address for the next one, so two stores
+/// that never met can carry the same number and one can be mistaken for the
+/// other -- which decides that a lock is held when it is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct StoreId(u64);
+
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
+impl StoreId {
+    fn next() -> Self {
+        Self(NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 pub struct VectorStore {
+    id: StoreId,
     registry: RwLock<HashMap<VectorIndexRef, Arc<IndexState>>>,
     build_mutex: Mutex<()>,
     bulk_gate: RwLock<()>,
     #[cfg(feature = "test-seams")]
     pause_registry: crate::test_seam::PauseRegistry,
+    #[cfg(feature = "test-seams")]
+    graph_candidate_caps: crate::test_seam::GraphCandidateCapRegistry,
 }
 
 /// A fully constructed vector registry.  Received-schema staging creates this
@@ -375,13 +466,25 @@ impl Default for VectorStore {
 }
 
 impl VectorStore {
+    /// This store's identity. Two stores never share one, including a store
+    /// constructed at an address a dropped store used to occupy -- which is
+    /// the whole reason the identity is not the address.
+    #[doc(hidden)]
+    #[cfg(feature = "test-seams")]
+    pub fn store_identity_for_test(&self) -> u64 {
+        self.id.0
+    }
+
     pub fn new(_legacy_hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>) -> Self {
         Self {
+            id: StoreId::next(),
             registry: RwLock::new(HashMap::new()),
             build_mutex: Mutex::new(()),
             bulk_gate: RwLock::new(()),
             #[cfg(feature = "test-seams")]
             pause_registry: crate::test_seam::PauseRegistry::default(),
+            #[cfg(feature = "test-seams")]
+            graph_candidate_caps: crate::test_seam::GraphCandidateCapRegistry::default(),
         }
     }
 
@@ -485,6 +588,11 @@ impl VectorStore {
         &self.pause_registry
     }
 
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn graph_candidate_caps(&self) -> &crate::test_seam::GraphCandidateCapRegistry {
+        &self.graph_candidate_caps
+    }
+
     pub fn register_index(
         &self,
         index: VectorIndexRef,
@@ -500,7 +608,7 @@ impl VectorStore {
                     .clone()
             };
             let _index_guard = state.maintenance.lock();
-            let _stack_guard = MaintenanceStackGuard::new(self as *const Self as usize, &index);
+            let _stack_guard = MaintenanceStackGuard::new(self.id, &index);
         });
     }
 
@@ -515,7 +623,7 @@ impl VectorStore {
         index: &VectorIndexRef,
         f: impl FnOnce() -> R,
     ) -> R {
-        let store_id = self as *const Self as usize;
+        let store_id = self.id;
         let already_held = HELD_MAINTENANCE_LOCKS.with(|held| {
             held.borrow()
                 .iter()
@@ -559,7 +667,7 @@ impl VectorStore {
     }
 
     pub(crate) fn with_bulk_read<R>(&self, f: impl FnOnce() -> R) -> R {
-        let store_id = self as *const Self as usize;
+        let store_id = self.id;
         let already_held = HELD_BULK_READ_LOCKS.with(|held| held.borrow().contains(&store_id))
             || HELD_BULK_WRITE_LOCKS.with(|held| held.borrow().contains(&store_id));
         if already_held {
@@ -572,7 +680,7 @@ impl VectorStore {
     }
 
     fn with_bulk_maintenance<R>(&self, f: impl FnOnce() -> R) -> R {
-        let store_id = self as *const Self as usize;
+        let store_id = self.id;
         let already_held = HELD_BULK_WRITE_LOCKS.with(|held| held.borrow().contains(&store_id));
         if already_held {
             return f();

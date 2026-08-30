@@ -71,7 +71,7 @@ fn f58b_query_operators_work_through_cli() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(
         &temp_db_file(&tmp, "f58b.db"),
-        &[],
+        &["--write"],
         "\
 CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, category TEXT, reading REAL);\n\
 INSERT INTO sensors (id, name, category, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'alice', 'a', 1.0);\n\
@@ -98,7 +98,7 @@ fn f58c_ddl_constraints_enforced_through_cli() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(
         &temp_db_file(&tmp, "f58c.db"),
-        &[],
+        &["--write"],
         "\
 CREATE TABLE immutable_rows (id UUID PRIMARY KEY, name TEXT) IMMUTABLE;\n\
 INSERT INTO immutable_rows (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'x');\n\
@@ -523,11 +523,6 @@ fn f82_composite_unique_duplicate_is_refused() {
 #[test]
 fn graph_01_incoming_edge_direction() {
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
-        &empty_params(),
-    )
-    .expect("create entities");
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
@@ -553,11 +548,6 @@ fn graph_01_incoming_edge_direction() {
 #[test]
 fn graph_02_bidirectional_edge_match() {
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
-        &empty_params(),
-    )
-    .expect("create entities");
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
@@ -583,11 +573,6 @@ fn graph_02_bidirectional_edge_match() {
 #[test]
 fn f83_node_property_filtering_in_graph_table_where() {
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
-        &empty_params(),
-    )
-    .expect("create entities");
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     setup_graph_entities(&db, &[a, b]);
@@ -640,7 +625,7 @@ fn f88_begin_commit_atomicity() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(
         &temp_db_file(&tmp, "f88.db"),
-        &[],
+        &["--write"],
         "CREATE TABLE t (id UUID PRIMARY KEY);\nBEGIN;\nINSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000001');\nINSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000002');\nCOMMIT;\nSELECT COUNT(*) FROM t;\n.quit\n",
     );
     assert!(output.status.success());
@@ -653,7 +638,7 @@ fn f89_rollback_discards_changes() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(
         &temp_db_file(&tmp, "f89.db"),
-        &[],
+        &["--write"],
         "CREATE TABLE t (id UUID PRIMARY KEY);\nBEGIN;\nINSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000001');\nROLLBACK;\nSELECT COUNT(*) FROM t;\n.quit\n",
     );
     assert!(output.status.success());
@@ -1195,11 +1180,6 @@ fn f104_on_conflict_do_update_works_with_vector_columns() {
 #[test]
 fn f107_graph_edge_deletion_cascades_or_is_explicit() {
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
-        &empty_params(),
-    )
-    .expect("create entities");
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
@@ -2504,11 +2484,6 @@ fn f122_decision_staleness_check() {
 #[test]
 fn f123_relationship_idempotency() {
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
-        &empty_params(),
-    )
-    .expect("create entities");
 
     let a = Uuid::from_u128(1);
     let b = Uuid::from_u128(2);

@@ -1,6 +1,6 @@
 # Architecture
 
-contextdb is a 10-crate Rust workspace. This document covers the crate structure, subsystem design, key traits, and extension points.
+contextdb is an eleven-crate Rust workspace. This document covers the crate structure, subsystem design, key traits, and extension points.
 
 ---
 
@@ -14,6 +14,7 @@ contextdb-tx            MVCC transaction manager, WriteSet, WriteSetApplicator t
     ├── contextdb-relational    Row storage, scan, insert, upsert, delete
     ├── contextdb-graph         Adjacency index, bounded BFS, DAG enforcement
     └── contextdb-vector        Cosine similarity, brute-force + HNSW auto-switch
+            └── contextdb-hnsw  Vendored third-party HNSW index (see below)
             │
 contextdb-parser        pest grammar → AST (SQL + GRAPH_TABLE + vector extensions)
     │
@@ -26,6 +27,13 @@ contextdb-engine        Database struct — wires all subsystems, plugin API, su
 ```
 
 Dependencies flow downward. `contextdb-engine` owns the `Database` struct and is the crate applications depend on.
+
+`contextdb-hnsw` is the eleventh crate and the one exception to "in-house surface": it is a
+**vendored third-party crate** — the upstream `hnsw_rs` 0.3.4 HNSW implementation, carried here
+under its own upstream authorship and its `MIT OR Apache-2.0` licence, with deterministic seeded
+builds on top. Treat it as vendored dependency code: `contextdb-vector` is where a change to how
+contextdb *uses* an HNSW index belongs, and a change inside `contextdb-hnsw` itself is a change to
+vendored upstream code, to be made deliberately and kept minimal.
 
 ---
 
@@ -86,34 +94,83 @@ audio, or policy embeddings with different dimensions and quantization choices.
 
 ## Store Ownership & Concurrency
 
-A database file is opened by exactly one owner at a time. A second open of the
-same path — whether from another thread in the same process or from a separate
-process — returns `Error::DatabaseLocked`. This is enforced at two layers: an
-in-process open registry and an on-disk PID lock backing an OS file lock. There
-is no read-only, shared, or replica open; single-writer ownership is a deliberate
-guarantee of the substrate, not a missing feature.
+**Writing** a database file is owned by exactly one process at a time. A second
+writable open of the same path — whether from another thread in the same process
+or from a separate process — returns `Error::DatabaseLocked`. This is enforced at
+two layers: an in-process open registry and an on-disk PID lock backing an OS
+file lock. Single-writer ownership is a deliberate guarantee of the substrate,
+not a missing feature.
 
-This is the standard embedded-database model — the same shape as SQLite, LMDB, or
-redb: the application that needs the data **owns the handle for its lifetime** and
-routes every read and write through that owner. Two consequences for anyone
+**Reading** is a separate door that does not take the write lock. A read session
+(`ReadSession` in Rust, `contextdb <path>` without `--write` on the CLI) resolves
+one of two routes when it opens, and never changes route mid-session:
+
+- **Owner route** — a live process owns the store, so the reader is served that
+  owner's committed state over an authenticated local channel. The reader never
+  attaches to the file, and the owner's declared ceilings and deadlines govern
+  what it may ask for.
+- **File route** — nobody owns the store, so the reader reads the committed
+  snapshot from the file directly and leaves every byte of the store folder
+  unchanged. Several direct readers coexist on one store.
+
+The two directions see each other. A writable open of a store a writer already
+owns is refused with `held_by_writer`, and a writable open while direct readers
+are still hydrating is refused with `held_by_readers` — a reader takes a hold
+beside the store for exactly as long as it is hydrating, precisely so a starting
+writer waits rather than tearing the file out from under it, and publishes a
+best-effort record of itself so that refusal can name who to go and look at. A direct read that finds committed state a writable open
+would have to mend refuses with `direct_read_requires_writer` instead of serving
+something the file cannot back.
+
+This is still the standard embedded-database model — the same shape as SQLite,
+LMDB, or redb: the application that mutates the data **owns the handle for its
+lifetime**, and every write goes through that owner. Two consequences for anyone
 embedding contextdb:
 
-- **A long-running service answers its own queries.** If a process holds the
-  database open (for example a daemon that ingests and records events), a
-  *second* command that wants to read that data must ask the running owner — it
-  cannot independently re-open the file while the owner holds it. Expose the read
-  through the owning process (an in-process call, or a small local request to the
-  running service); do not start a competing opener.
+- **A long-running service answers its own writes and can be read beside.** A
+  process that holds the database open serves its own reads in-process; a
+  *second* command that wants that data opens a read session, which reaches the
+  running owner over its channel. What a second process must never do is start a
+  competing *writable* opener.
 - **Never keep a shadow copy.** Working around the lock by mirroring the data
   into a second file or an in-memory side-store outside the owner is an
   anti-pattern: it creates a second source of truth, drifts from the real one,
   and defeats the integrity that single-writer ownership exists to provide. The
-  fix for "I can't open it from over here" is always "route through the owner,"
+  fix for "I can't open it from over here" is "read it through a read session,"
   never "keep my own copy."
 
-If concurrent multi-process access is ever genuinely required, that is a substrate
-feature request (a read-only or shared open surface), not something to emulate in
-the consuming application.
+### The three read doors, and why the owner-only one never falls back
+
+`ReadSession::open` (and `ReadSession::open_with_options`, which carries the caller's own limits
+and deadlines) resolves either route: the live owner's channel when a process owns the store, the
+committed file when none does.
+
+Some questions only a running owner can answer — what the process is doing, whether it is serving
+yet, anything asked of the process rather than of the data — and the committed file has no answer
+to give. `ReadSession::open_owner_only` is the door for those: it takes the owner route when a
+process owns the store, and when none does it says plainly that the owner is not running
+(`owner_not_running`) instead of falling back to the file. A writer that has claimed the store
+but has not yet published whether it is serving is never reported absent: the caller waits for
+that writer's own answer inside the deadlines it declared, and if the answer does not come in
+time it is told the store is owned and not serving (`owner_not_serving`) — never that nobody
+owns it.
+
+It never opens the store's file at all, and that is the point of it. Reading the committed image
+publishes a reader that a writer starting beside it must wait for, so a readiness probe that fell
+through to the file would stand in the way of the very process it is waiting for; and a file that
+cannot be read directly would answer with the file's condition instead of the plain fact that
+nobody owns the store. A caller that wants the committed rows when there is no owner opens an
+ordinary session instead. The exported signatures and a runnable four-line example are in
+[`docs/getting-started.md`](getting-started.md#reading-a-store-from-a-second-process).
+
+A refused read arrives as `Error::ReadFailure`. Its `kind()` is the stable classification a
+program branches on and its `detail()` carries the machine-readable specifics of that
+classification; the sentence a person reads stays in the error's `Display` and its wording is free
+to change. A store somebody holds for writing refuses with the `HeldByWriter` kind and a
+`ReadFailureDetail::HeldByWriter` detail that names the store in `store_path` and the holding
+process in `process_id` — filled in whenever that writer has published a record about itself, and
+`None` when it has not, so a caller can tell "held by process 4213" from "held, by someone who did
+not say who". Reading the process id out of the prose is never necessary.
 
 ---
 
@@ -137,8 +194,8 @@ The callback-active contract is deliberately split by concurrency domain:
   the callback body is misuse
 - callback tx-bound handles remain isolated to their runner thread
 - cron same-DB Class B keeps the immediate typed cron callback-active error
-- a same-DB trigger wait that exceeds `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS`
-  returns the typed trigger callback-active error and emits one warning
+- a same-DB trigger wait that exceeds the deadlock guard's timeout returns the
+  typed trigger callback-active error and emits one warning
 
 Waiters do not hold the public-operation read guard while parked. That lets
 `close()` acquire the write barrier after the active callback exits; a parked
@@ -165,9 +222,9 @@ trigger_name=<name> waited_ms=<milliseconds> surface=<begin|commit|rollback|appl
 ```
 
 Interpretation: no warning means normal wait-and-proceed contention; a warning
-means the callback did not finish within the guard budget. The default guard is
-60 seconds. Override with `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS`; values below
-5 seconds can false-positive under legitimate deep cascades.
+means the callback did not finish within the guard budget. The guard is a fixed
+60-second default and is not configurable via environment variable — the
+environment is not a behavior surface on this stack (see [CLI Reference](cli.md)).
 
 ---
 
@@ -293,8 +350,8 @@ Fan-out to multiple subscribers. Dead channels are cleaned up automatically. Gra
 
 ## Memory Limit On Edge Devices
 
-`SET MEMORY_LIMIT`, `SHOW MEMORY_LIMIT`, and the `CONTEXTDB_MEMORY_LIMIT` /
-`--memory-limit` startup option all feed the same global memory accountant.
+`SET MEMORY_LIMIT`, `SHOW MEMORY_LIMIT`, and the `--memory-limit` startup option all
+feed the same global memory accountant.
 Vector operations attribute allocations with tags such as
 `vector_insert@evidence.vector_text` and `build_hnsw@evidence.vector_vision` so
 operators can identify the offending index from errors.
@@ -744,11 +801,11 @@ A corrupt or truncated store is detected on open and surfaced as
 leaving the caller to guess:
 
 ```bash
-contextdb repair ./my.db   # read-only: reports what is salvageable/diagnosable, never modifies the store
+contextdb diagnose ./my.db   # read-only: reports what is salvageable/diagnosable, never modifies the store
 contextdb reset ./my.db --force   # destructive: recreates a fresh, empty current-format store at the same path
 ```
 
-`repair` reads the store's format marker and top-level schema layout through a
+`diagnose` reads the store's format marker and top-level schema layout through a
 read-only handle and reports its diagnosis (current-format and readable,
 legacy-format, or corrupt/truncated with the underlying reason) — it never
 opens the store read-write and never writes to the path, so running it is
@@ -793,15 +850,15 @@ budget. Embedding callers use the durable
 `Database::set_memory_limit(Some(bytes))`; its setting survives reopen and
 remains runtime-configurable. A process that needs a non-raisable startup
 ceiling uses `contextdb_engine::database::open_with_startup_limits` (or
-`open_memory_with_startup_limit`). The CLI's `--memory-limit` and
-`CONTEXTDB_MEMORY_LIMIT` use that same startup path. Budget exceeded →
+`open_memory_with_startup_limit`). The CLI's `--memory-limit` uses that same
+startup path. Budget exceeded →
 operations return `MemoryBudgetExceeded`. The raw mutable accountant is an
 engine implementation detail and is not attachable or reachable through the
 normal public API.
 
 File-backed databases also support a persisted disk budget:
 
-- startup ceiling/default via `--disk-limit` or `CONTEXTDB_DISK_LIMIT`
+- startup ceiling/default via `--disk-limit`
 - runtime control via `SET DISK_LIMIT` / `SHOW DISK_LIMIT`
 - persisted live config in the redb file so reopen preserves the limit
 

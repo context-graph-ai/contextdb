@@ -1,14 +1,188 @@
-use crate::formatter::{DEFAULT_ROW_CAP, format_query_result_capped, format_query_result_json};
+use crate::command_registry::{
+    MetaCommandAuthorization, authorize_meta_command_before_dispatch, canonical_help_signatures,
+};
+use crate::formatter::format_query_result_with_empty_headers;
 use crate::json_output::{self, ErrorClass};
-use contextdb_core::{Error, TableMeta};
-use contextdb_engine::Database;
+use contextdb_core::Error;
+use contextdb_core::read_contract::{
+    OwnerReadCancellation, OwnerServingState, ReadFailure, ReadFailureDetail, ReadFailureKind,
+    ReadFailureLimit, ReadLimits,
+};
+use contextdb_engine::{Database, MetadataBody, MetadataRequest, ReadCursor, ReadSession};
 use contextdb_server::exit_codes::{EXIT_ERROR, EXIT_INTERRUPTED_PUSH_UNCONFIRMED, EXIT_OK};
 use contextdb_server::{SyncClient, SyncPlugin};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal};
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// What this session may do to the store, and what it reads through.
+///
+/// A reading session holds ONLY the bounded read view. There is no database
+/// handle behind it to reach around, which is what makes "never creates,
+/// never changes a byte" a property of the session's SHAPE rather than a rule
+/// every handler has to remember. A writing session holds both, and its own
+/// SELECTs still go through the bounded view, so a writer's reads are bounded
+/// exactly like anyone else's.
+pub enum Session {
+    Reading {
+        reader: ReadSession,
+        /// The store this session was pointed at. `.owner status` asks the
+        /// path about its owner rather than the session, because it resolves
+        /// no route and must answer even when there is no owner to route to.
+        path: PathBuf,
+    },
+    Writing {
+        database: Arc<Database>,
+        reader: ReadSession,
+    },
+}
+
+impl Session {
+    /// Build a writing session over an already-open database, with the bounded
+    /// read view its own reads will go through.
+    pub fn writing(database: Arc<Database>, limits: ReadLimits) -> contextdb_core::Result<Self> {
+        let reader = database.read_session(limits)?;
+        Ok(Self::Writing { database, reader })
+    }
+
+    /// Adopt an already-selected read route as a reading session.
+    pub fn reading(reader: ReadSession, path: PathBuf) -> Self {
+        Self::Reading { reader, path }
+    }
+
+    /// The bounded view every read in this session goes through, whichever
+    /// mode it is in.
+    pub(crate) fn reader(&self) -> &ReadSession {
+        match self {
+            Self::Reading { reader, .. } => reader,
+            Self::Writing { reader, .. } => reader,
+        }
+    }
+
+    /// The store path a reading session was pointed at. A writing session is
+    /// its own owner and answers about itself, so it needs none.
+    fn read_path(&self) -> Option<&Path> {
+        match self {
+            Self::Reading { path, .. } => Some(path.as_path()),
+            Self::Writing { .. } => None,
+        }
+    }
+
+    /// The live database, when this session has one. A reading session has
+    /// none, and that is the point.
+    pub(crate) fn database(&self) -> Option<&Arc<Database>> {
+        match self {
+            Self::Reading { .. } => None,
+            Self::Writing { database, .. } => Some(database),
+        }
+    }
+
+    pub(crate) fn writes_permitted(&self) -> bool {
+        self.database().is_some()
+    }
+}
+
+/// The cancellation token of the statement this session is running, if any.
+///
+/// Ctrl-C at a terminal cancels THAT statement and nothing else: the session,
+/// its route, and any open cursor all survive. A session with no terminal has
+/// no holder at all, so an interrupt there keeps its ordinary meaning and ends
+/// the process.
+#[derive(Default)]
+pub(crate) struct RunningStatement {
+    token: Mutex<Option<OwnerReadCancellation>>,
+}
+
+impl RunningStatement {
+    /// Announce the statement about to run, and take it back when it is done.
+    /// The guard clears the slot even if the statement panics, so a later
+    /// interrupt can never cancel a statement that already finished.
+    fn running(&self, token: &OwnerReadCancellation) -> RunningStatementGuard<'_> {
+        if let Ok(mut slot) = self.token.lock() {
+            *slot = Some(token.clone());
+        }
+        RunningStatementGuard { holder: self }
+    }
+
+    fn cancel(&self) {
+        if let Ok(slot) = self.token.lock()
+            && let Some(token) = slot.as_ref()
+        {
+            token.cancel();
+        }
+    }
+}
+
+struct RunningStatementGuard<'a> {
+    holder: &'a RunningStatement,
+}
+
+impl Drop for RunningStatementGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.holder.token.lock() {
+            *slot = None;
+        }
+    }
+}
+
+/// Turn the interrupt a terminal sends into a cancellation of whatever
+/// statement is running, instead of the end of the process.
+///
+/// Installed ONLY for an interactive session. While the prompt is reading, the
+/// line editor holds the terminal and answers Ctrl-C itself by discarding the
+/// typed line; while a statement is running the terminal is back in its
+/// ordinary mode, so the same keystroke arrives here as a signal and cancels
+/// the statement through the read-cancellation seam. A session with no
+/// terminal never installs this, so an interrupt there still ends the process.
+#[cfg(unix)]
+fn install_statement_interrupt(running: Arc<RunningStatement>) {
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(async move {
+            let Ok(mut interrupts) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            else {
+                return;
+            };
+            while interrupts.recv().await.is_some() {
+                running.cancel();
+            }
+        });
+    });
+}
+
+#[cfg(not(unix))]
+fn install_statement_interrupt(_running: Arc<RunningStatement>) {}
+
+/// The one cursor a session may hold, and what a later request to it means.
+///
+/// Draining a cursor frees the slot for the next `.cursor open` but does NOT
+/// throw the cursor away: a fetch-until-empty loop asks where it left off, and
+/// it left off at the end, so the drained cursor keeps answering one empty
+/// success page. Closing it explicitly is a different thing entirely — that
+/// cursor is gone, and asking for it again is a refusal.
+#[derive(Default)]
+enum CursorSlot {
+    /// Never opened in this session.
+    #[default]
+    Absent,
+    /// Open with more to give.
+    Open(ReadCursor),
+    /// Exhausted; still answers empty success pages, and no longer occupies
+    /// the session's one cursor slot.
+    Drained(ReadCursor),
+    /// Explicitly closed. Asking for it again is `cursor_not_found`.
+    Closed,
+}
 
 /// Where a line came from: an interactive terminal or a script. The only
 /// framing difference between the two is the line number a script can cite and
@@ -19,15 +193,18 @@ pub struct InputContext {
     pub interactive: bool,
     pub script_line: Option<usize>,
     pub output: OutputOptions,
+    /// Whether this session was opened with `--write`. A session that was not
+    /// may read the store but never change it, and that answer is given before
+    /// dispatch rather than by whichever handler happens to notice.
+    pub store_writes_permitted: bool,
 }
 
-/// How query results are rendered. `--json` emits a JSON array of row objects
-/// (uncapped); otherwise the human table is capped at [`DEFAULT_ROW_CAP`] rows
-/// unless `all` (the `--all` flag) is set.
+/// How results are rendered. `--json` publishes machine documents; otherwise
+/// the human table is printed. Rendering is all this decides: a result is
+/// complete or it is refused, and neither rendering has a ceiling of its own.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OutputOptions {
     pub json: bool,
-    pub all: bool,
 }
 
 impl OutputOptions {
@@ -55,6 +232,37 @@ impl OutputOptions {
             json_output::print_notice(class, message);
         } else {
             eprintln!("{message}");
+        }
+    }
+
+    /// Report a read refusal on stderr: the `{"error":{…,"detail":{…}}}`
+    /// document under `--json`, the human line otherwise.
+    ///
+    /// The stable `class` and `detail.kind` come from the refusal itself, so
+    /// the CLI can never classify a refusal differently from the engine that
+    /// produced it.
+    pub fn report_read_failure(&self, failure: &ReadFailure, line: Option<usize>) {
+        self.report_read_failure_on_route(failure, line, None);
+    }
+
+    /// The same report, told by a session that knows which route it read on —
+    /// so a crossed ceiling can name the setting that would actually move it.
+    pub(crate) fn report_read_failure_on_route(
+        &self,
+        failure: &ReadFailure,
+        line: Option<usize>,
+        route: Option<contextdb_core::read_contract::ReadRoute>,
+    ) {
+        let message = read_failure_message(failure, route);
+        if self.json {
+            json_output::print_error_with_detail(
+                ErrorClass::from(failure.class()),
+                &message,
+                line,
+                Some(&json_output::read_failure_detail_document(failure)),
+            );
+        } else {
+            eprintln!("Error: {message}");
         }
     }
 
@@ -89,6 +297,23 @@ pub struct SessionState {
     /// same reason `psql` and `sqlite3` leave an interactive session at 0. A
     /// scripted run has nobody watching, so there every error fails the run.
     pub interactive: bool,
+    /// The session's one cursor.
+    cursor: CursorSlot,
+    /// The SELECT that cursor is paging. A refusal the engine raises against
+    /// the cursor knows the ceiling but never saw the statement, so the
+    /// session that did keeps it here to complete the refusal's remedy.
+    cursor_statement: Option<String>,
+    /// Where a running statement announces itself so an interrupt can reach
+    /// it. `None` when nobody is at a terminal to press Ctrl-C.
+    interrupts: Option<Arc<RunningStatement>>,
+    /// Whether this session has already said how it reads. The route is chosen
+    /// once and never changes, so saying it twice would suggest it might have.
+    route_reported: bool,
+    /// Whether this session has an open write transaction. The CLI issues
+    /// every `BEGIN`/`COMMIT`/`ROLLBACK` itself, so it knows; a cursor may not
+    /// open across one, because cursor state must never mix committed and
+    /// uncommitted rows.
+    transaction_open: bool,
 }
 
 /// Collapse a finished session's state to a process exit code: a definitive
@@ -139,8 +364,159 @@ fn json_output_mode() -> bool {
     *JSON_OUTPUT_MODE.get().unwrap_or(&false)
 }
 
+/// The refusal in words, plus the next action it teaches.
+///
+/// The engine states WHAT stopped the read; naming the command or flag that
+/// resolves it is the CLI's job, because the answer is spelled in command-line
+/// vocabulary the engine does not own. A refusal whose own detail already
+/// carries its remedy — a crossed ceiling names both escapes, route-aware —
+/// says it once and is not given a second ending here.
+fn read_failure_message(
+    failure: &ReadFailure,
+    route: Option<contextdb_core::read_contract::ReadRoute>,
+) -> String {
+    // A crossed ceiling has two ways out, and which one is HONEST depends on
+    // the route. Reading a file directly, the caller owns its own ceilings and
+    // may raise them for a deliberate one-shot export. Reading through an
+    // owner, those same flags cannot raise owner policy — offering them would
+    // be a lie — so the refusal names the writer-side setting instead. The
+    // cursor is the in-session escape either way, and the refusal's own detail
+    // already carries it copy-ready.
+    if failure.kind() == ReadFailureKind::OwnerLimitExceeded {
+        let raise = match route {
+            Some(contextdb_core::read_contract::ReadRoute::File) => Some(
+                "raise --read-result-rows / --read-result-bytes for a deliberate one-shot export",
+            ),
+            Some(contextdb_core::read_contract::ReadRoute::Owner) => Some(
+                "the ceiling is the owner's, and a reader cannot raise it: change \
+                 --owner-read-result-rows / --owner-read-result-bytes on the writer",
+            ),
+            None => None,
+        };
+        return match raise {
+            Some(raise) => format!("{failure}; {raise}"),
+            None => failure.to_string(),
+        };
+    }
+    let recovery = match failure.kind() {
+        ReadFailureKind::WriteRequiresFlag => Some("rerun with --write"),
+        ReadFailureKind::StoreNotFound => Some("--write creates it"),
+        ReadFailureKind::HeldByWriter => {
+            Some("drop --write: a read session reaches the live owner's channel")
+        }
+        ReadFailureKind::HeldByReaders => Some("retry once they finish hydrating"),
+        ReadFailureKind::OwnerNotRunning => Some("this session reads the committed file directly"),
+        ReadFailureKind::OwnerNotServing => {
+            Some("close the writer and rerun, or start it without --no-owner-reads")
+        }
+        ReadFailureKind::OwnerUserMismatch => Some("run as the user whose process owns the store"),
+        ReadFailureKind::OwnerMismatch | ReadFailureKind::OwnerDisconnected => {
+            Some("start a new invocation to route afresh")
+        }
+        ReadFailureKind::OwnerAtCapacity => Some(
+            "retry, close another inspecting session, or raise the writer's \
+             --owner-read-concurrency",
+        ),
+        ReadFailureKind::OwnerTimeout => Some("retry, or raise --read-owner-response-ms"),
+        ReadFailureKind::InvalidChannelData | ReadFailureKind::LocalProtocolMismatch => {
+            Some("the owner process and this client must be the same release")
+        }
+        ReadFailureKind::CursorExpired => Some("reopen it with `.cursor open <SELECT>`"),
+        ReadFailureKind::CursorNotFound => Some("open one with `.cursor open <SELECT>`"),
+        ReadFailureKind::CursorAlreadyOpen => Some("close it with `.cursor close` first"),
+        ReadFailureKind::CursorTransactionActive => {
+            Some("commit or roll back the transaction first")
+        }
+        ReadFailureKind::CursorInvalidStatement => {
+            Some("`.cursor open` takes exactly one read-only SELECT")
+        }
+        ReadFailureKind::DirectReadRequiresWriter => {
+            Some("close every holder and rerun with --write")
+        }
+        ReadFailureKind::InvalidContinuation => Some("start the listing again without --continue"),
+        ReadFailureKind::OperationAlreadyCompleted | ReadFailureKind::OwnerLimitExceeded => None,
+        // The refusal already names the inspection it could not answer and the
+        // route that answers it, so a second sentence here would only repeat it.
+        ReadFailureKind::OwnerRouteUnsupported => None,
+        // Nothing on this command line declares an identity to read as, so a
+        // session refused for declaring one was opened by an embedder. The
+        // refusal already names the identity it declared and the one the
+        // writer reads as, and there is no flag here to point at.
+        ReadFailureKind::DeclaredPrincipalRefused => None,
+    };
+    match recovery {
+        Some(recovery) => format!("{failure}; {recovery}"),
+        None => failure.to_string(),
+    }
+}
+
+/// Add to a crossed-ceiling refusal the two things only the CLI knows: the
+/// statement that was refused, and the copy-ready command that pages it.
+///
+/// An agent that is handed back its own statement can re-issue it; one that is
+/// handed a printed instruction can run it exactly as printed. Neither is
+/// something the engine can supply — it never saw the command line, and the
+/// cursor is CLI vocabulary — so the session that does know fills them in. A
+/// refusal that already carries them is left alone.
+fn refusal_naming_the_statement(failure: &ReadFailure, sql: &str) -> ReadFailure {
+    let ReadFailureDetail::OwnerLimitExceeded(detail) = failure.detail() else {
+        return failure.clone();
+    };
+    if detail.statement.is_some() {
+        return failure.clone();
+    }
+    let statement = sql.trim().trim_end_matches(';').trim().to_owned();
+    ReadFailure::owner_limit_exceeded(contextdb_core::read_contract::OwnerLimitExceededDetail {
+        limit: detail.limit,
+        value: detail.value,
+        required: detail.required.clone(),
+        statement: Some(contextdb_core::read_contract::StatementRemedy {
+            remedy_command: format!(".cursor open {statement}"),
+            statement,
+        }),
+    })
+}
+
+/// The refusal a session that may not write answers a writing statement or
+/// command with. It carries no further detail: the kind IS the whole answer.
+fn write_requires_flag() -> ReadFailure {
+    ReadFailure::new(ReadFailureKind::WriteRequiresFlag, ReadFailureDetail::None)
+        .expect("a write refusal carries no specialized detail")
+}
+
+/// Whether this statement would change the store, decided by the parser's own
+/// classification rather than by a keyword list kept here — the same
+/// classification a live owner applies when it answers a read, so the two
+/// surfaces can never disagree about what a write is.
+///
+/// Input that parses as nothing is NOT a write. It is a parse error, reported
+/// identically in read and write sessions, so a typo never arrives dressed as
+/// a permission problem.
+#[allow(dead_code)]
+fn statement_writes(sql: &str) -> bool {
+    match contextdb_parser::parse(sql) {
+        Ok(statement) => {
+            contextdb_parser::statement_effect(&statement)
+                != contextdb_parser::StatementEffect::Read
+        }
+        Err(_) => false,
+    }
+}
+
+/// What an interactive session announces about itself at startup, and the
+/// prompt it then wears. Neither exists when nobody is watching a terminal.
+const READ_SESSION_BANNER: &str = "read-only session — pass --write to mutate";
+const WRITE_SESSION_BANNER: &str = "write session — mutations are enabled";
+const READ_SESSION_PROMPT: &str = "contextdb(ro)> ";
+const WRITE_SESSION_PROMPT: &str = "contextdb> ";
+
+/// What `.sync status` answers in a session that cannot write. It reports THIS
+/// process's sync state, and says so, so nobody reads it as the store's.
+const READ_SESSION_SYNC_STATUS: &str = "no sync in this session — this reports the CLI session \
+     only, not the store; a live owner's sync state belongs to that owner process.";
+
 pub fn run(
-    db: Arc<Database>,
+    session: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     sync_plugin: Option<&SyncPlugin>,
@@ -149,12 +525,18 @@ pub fn run(
     let _ = JSON_OUTPUT_MODE.set(output.json);
     let interactive = std::io::stdin().is_terminal();
     if interactive {
-        eprintln!("ContextDB v{}", env!("CARGO_PKG_VERSION"));
-        eprintln!("Enter .help for usage hints.");
-        return run_interactive(&db, sync_client, rt, sync_plugin, output);
+        eprintln!(
+            "{}",
+            if session.writes_permitted() {
+                WRITE_SESSION_BANNER
+            } else {
+                READ_SESSION_BANNER
+            }
+        );
+        return run_interactive(session, sync_client, rt, sync_plugin, output);
     }
 
-    run_scripted(&db, sync_client, rt, sync_plugin, output)
+    run_scripted(session, sync_client, rt, sync_plugin, output)
 }
 
 /// One whole SQL statement gathered from the input, with the input line it
@@ -378,24 +760,30 @@ pub fn interactive_readline_filter(line: &str, statement_open: bool) -> Option<&
 }
 
 fn run_interactive(
-    db: &Database,
+    session_handle: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     sync_plugin: Option<&SyncPlugin>,
     output: OutputOptions,
 ) -> i32 {
+    let store_writes_permitted = session_handle.writes_permitted();
     let mut rl = DefaultEditor::new().expect("failed to initialize readline");
+    let running = Arc::new(RunningStatement::default());
+    install_statement_interrupt(Arc::clone(&running));
     let mut session = SessionState {
         interactive: true,
+        interrupts: Some(running),
         ..SessionState::default()
     };
     let mut pending = StatementBuffer::default();
 
     loop {
-        let prompt = if pending.is_empty() {
-            "contextdb> "
-        } else {
+        let prompt = if !pending.is_empty() {
             "      ...> "
+        } else if store_writes_permitted {
+            WRITE_SESSION_PROMPT
+        } else {
+            READ_SESSION_PROMPT
         };
         let readline = rl.readline(prompt);
         match readline {
@@ -409,7 +797,7 @@ fn run_interactive(
                     let _ = rl.add_history_entry(trimmed);
                 }
                 if !feed_line(
-                    db,
+                    session_handle,
                     sync_client,
                     rt,
                     fed,
@@ -417,6 +805,7 @@ fn run_interactive(
                         interactive: true,
                         script_line: None,
                         output,
+                        store_writes_permitted,
                     },
                     sync_plugin,
                     &mut session,
@@ -425,7 +814,14 @@ fn run_interactive(
                     break;
                 }
             }
-            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+            // Ctrl-C at an idle prompt discards what was typed and ends
+            // nothing — the statement in progress, if any, was already
+            // cancelled by the signal handler. Ctrl-D ends the session.
+            Err(ReadlineError::Interrupted) => {
+                pending = StatementBuffer::default();
+                continue;
+            }
+            Err(ReadlineError::Eof) => break,
             Err(_) => break,
         }
     }
@@ -438,12 +834,13 @@ fn run_interactive(
 }
 
 fn run_scripted(
-    db: &Database,
+    session_handle: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     sync_plugin: Option<&SyncPlugin>,
     output: OutputOptions,
 ) -> i32 {
+    let store_writes_permitted = session_handle.writes_permitted();
     let mut session = SessionState::default();
     let mut pending = StatementBuffer::default();
     let stdin = std::io::stdin();
@@ -454,7 +851,7 @@ fn run_scripted(
             Err(_) => break,
         };
         if !feed_line(
-            db,
+            session_handle,
             sync_client,
             rt,
             &line,
@@ -462,6 +859,7 @@ fn run_scripted(
                 interactive: false,
                 script_line: Some(line_idx + 1),
                 output,
+                store_writes_permitted,
             },
             sync_plugin,
             &mut session,
@@ -475,12 +873,13 @@ fn run_scripted(
     // End of input closes the last statement even without a trailing `;`.
     if !stopped && let Some(statement) = pending.take_remaining() {
         run_statement(
-            db,
+            session_handle,
             statement,
             InputContext {
                 interactive: false,
                 script_line: None,
                 output,
+                store_writes_permitted,
             },
             &mut session,
         );
@@ -499,7 +898,7 @@ fn run_scripted(
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub fn feed_line(
-    db: &Database,
+    session_handle: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     line: &str,
@@ -512,7 +911,7 @@ pub fn feed_line(
         LineRouting::Skip => return true,
         LineRouting::Meta => {
             return process_meta_line(
-                db,
+                session_handle,
                 sync_client,
                 rt,
                 line.trim(),
@@ -526,7 +925,7 @@ pub fn feed_line(
 
     pending.push_line(line, input.script_line);
     while let Some(statement) = pending.take_terminated() {
-        run_statement(db, statement, input, session);
+        run_statement(session_handle, statement, input, session);
     }
     true
 }
@@ -534,7 +933,7 @@ pub fn feed_line(
 /// Run one gathered statement, echoing scripted INSERTs as before. A parse
 /// error is placed at the line the statement started on.
 fn run_statement(
-    db: &Database,
+    session_handle: &Session,
     statement: PendingStatement,
     input: InputContext,
     session: &mut SessionState,
@@ -553,14 +952,14 @@ fn run_statement(
     if !input.interactive && !input.output.json && upper.starts_with("INSERT") {
         println!("{sql}");
     }
-    if !execute_sql(db, sql, input, session.trace_enabled) {
+    if !execute_sql(session_handle, sql, input, session) {
         session.had_error = true;
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn process_meta_line(
-    db: &Database,
+    session_handle: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     line: &str,
@@ -568,7 +967,34 @@ fn process_meta_line(
     sync_plugin: Option<&SyncPlugin>,
     session: &mut SessionState,
 ) -> bool {
-    if line.starts_with(".sync") || line.starts_with("\\sync") {
+    // The authorization answer comes FIRST, before any command-specific
+    // dispatch. A command that writes to the store is refused here even when
+    // its handler would have been a no-op, so the refusal is what a session
+    // without `--write` observes rather than whatever the handler happened to
+    // do.
+    if let Some(MetaCommandAuthorization::RefuseStoreWrite(_)) =
+        authorize_meta_command_before_dispatch(line, input.store_writes_permitted)
+    {
+        input
+            .output
+            .report_read_failure(&write_requires_flag(), input.script_line);
+        session.had_error = true;
+        return true;
+    }
+    // A session that cannot write has no sync of its own to report, and the
+    // store's sync state is not this session's to speak for. Saying both is
+    // what keeps the answer from being read as the store's health.
+    if !input.store_writes_permitted
+        && line.split_whitespace().collect::<Vec<_>>() == [".sync", "status"]
+    {
+        report_success(
+            READ_SESSION_SYNC_STATUS,
+            &json_output::read_session_sync_status_document(READ_SESSION_SYNC_STATUS),
+            input.output,
+        );
+        return true;
+    }
+    if line.starts_with(".sync") {
         let mut parts = line.splitn(2, ' ');
         let _cmd = parts.next();
         let rest = parts.next().unwrap_or("").trim();
@@ -590,11 +1016,19 @@ fn process_meta_line(
             session.had_error = true;
         }
     } else if is_explain_command(line) {
-        if !handle_explain_command(db, line, input) {
+        if !handle_explain_command(session_handle, line, input) {
             session.had_error = true;
         }
     } else {
-        let outcome = handle_meta_command(db, sync_client, rt, line, input, sync_plugin);
+        let outcome = handle_meta_command(
+            session_handle,
+            sync_client,
+            rt,
+            line,
+            input,
+            sync_plugin,
+            session,
+        );
         if !outcome.ok {
             session.had_error = true;
         }
@@ -690,18 +1124,21 @@ impl MetaCommandOutcome {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_meta_command(
-    db: &Database,
+    session_handle: &Session,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     line: &str,
     input: InputContext,
     sync_plugin: Option<&SyncPlugin>,
+    session: &mut SessionState,
 ) -> MetaCommandOutcome {
     let mut parts = line.splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("").trim();
 
     match cmd {
+        ".cursor" => return handle_cursor_command(session_handle, rest, input, session),
+        ".owner" => return handle_owner_command(session_handle, rest, input),
         ".quit" | ".exit" | "\\q" => return MetaCommandOutcome::quit(),
         ".help" | "\\?" => {
             // Help is prose for a human, and there is no machine contract worth
@@ -719,14 +1156,16 @@ pub(crate) fn handle_meta_command(
             }
         }
         ".tables" | "\\dt" => {
-            let names = db.table_names();
-            if input.output.json {
-                json_output::print_document(&json_output::tables_document(names));
-            } else {
-                for t in names {
-                    println!("{t}");
-                }
-            }
+            let Ok(continuation) = paged_metadata_continuation(rest) else {
+                return refuse_continuation(".tables", input);
+            };
+            return answer_metadata(
+                session_handle,
+                MetadataRequest::Tables,
+                continuation,
+                input,
+                session,
+            );
         }
         ".schema" | "\\d" => {
             if rest.is_empty() {
@@ -736,107 +1175,112 @@ pub(crate) fn handle_meta_command(
                     input,
                 );
                 return MetaCommandOutcome::failed();
-            } else if let Some(meta) = db.table_meta(rest) {
-                if input.output.json {
-                    json_output::print_document(&json_output::table_meta_document(rest, &meta));
-                } else {
-                    print_table_meta(rest, &meta);
-                }
-            } else {
-                report_failure(ErrorClass::Sql, &format!("Table not found: {rest}"), input);
+            }
+            return answer_metadata(
+                session_handle,
+                MetadataRequest::Schema {
+                    table: rest.to_owned(),
+                },
+                None,
+                input,
+                session,
+            );
+        }
+        ".maintenance" => {
+            if rest == "status" {
+                return answer_metadata(
+                    session_handle,
+                    MetadataRequest::MaintenanceStatus,
+                    None,
+                    input,
+                    session,
+                );
+            }
+            // Running a cycle and compacting CHANGE the store, so they are the
+            // live database's to do; only a writing session ever reaches here,
+            // because the authorization seam refused the others already.
+            let Some(db) = session_handle.database() else {
+                input
+                    .output
+                    .report_read_failure(&write_requires_flag(), input.script_line);
                 return MetaCommandOutcome::failed();
+            };
+            match rest {
+                "run" => match db.run_maintenance_cycle() {
+                    Ok(report) => {
+                        if input.output.json {
+                            json_output::print_document(&json_output::maintenance_report_document(
+                                &report,
+                            ));
+                        } else {
+                            println!(
+                                "pruned_rows={} rows_deferred_for_readers={} \
+                                 currency_pruned_versions={} \
+                                 pruned_trigger_audit_rows={} auto_compact_ran={}",
+                                report.pruning.pruned_rows,
+                                report.pruning.rows_deferred_for_readers,
+                                report.currency.pruned_versions,
+                                report.pruned_trigger_audit_rows,
+                                report.compaction.ran,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        report_failure(ErrorClass::of(&err), &err.to_string(), input);
+                        return MetaCommandOutcome::failed();
+                    }
+                },
+                "compact" => match db.compact_now() {
+                    Ok(report) => {
+                        if input.output.json {
+                            json_output::print_document(&json_output::compaction_report_document(
+                                &report,
+                            ));
+                        } else {
+                            println!(
+                                "ran={} duration_micros={} bytes_before={:?} bytes_after={:?} \
+                                 file_shrank={} fragmentation_before={}",
+                                report.ran,
+                                report.duration_micros,
+                                report.bytes_before,
+                                report.bytes_after,
+                                report.file_shrank,
+                                report.fragmentation_before,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        report_failure(ErrorClass::of(&err), &err.to_string(), input);
+                        return MetaCommandOutcome::failed();
+                    }
+                },
+                _ => {
+                    report_failure(
+                        ErrorClass::Usage,
+                        "Usage: .maintenance status | .maintenance run | .maintenance compact",
+                        input,
+                    );
+                    return MetaCommandOutcome::failed();
+                }
             }
         }
-        ".maintenance" => match rest {
-            "status" => {
-                let status = db.maintenance_status();
-                if input.output.json {
-                    json_output::print_document(&json_output::maintenance_status_document(&status));
-                } else {
-                    println!(
-                        "running={} retention_enabled={} currency_compaction_enabled={} \
-                             active_maintenance_loops={} policy={}",
-                        status.running,
-                        status.retention_enabled,
-                        status.currency_compaction_enabled,
-                        status.active_maintenance_loops,
-                        json_output::maintenance_policy_wire_word(status.policy),
-                    );
-                }
-            }
-            "run" => match db.run_maintenance_cycle() {
-                Ok(report) => {
-                    if input.output.json {
-                        json_output::print_document(&json_output::maintenance_report_document(
-                            &report,
-                        ));
-                    } else {
-                        println!(
-                            "pruned_rows={} currency_pruned_versions={} \
-                                 pruned_trigger_audit_rows={} auto_compact_ran={}",
-                            report.pruning.pruned_rows,
-                            report.currency.pruned_versions,
-                            report.pruned_trigger_audit_rows,
-                            report.compaction.ran,
-                        );
-                    }
-                }
-                Err(err) => {
-                    report_failure(ErrorClass::of(&err), &err.to_string(), input);
-                    return MetaCommandOutcome::failed();
-                }
-            },
-            "compact" => match db.compact_now() {
-                Ok(report) => {
-                    if input.output.json {
-                        json_output::print_document(&json_output::compaction_report_document(
-                            &report,
-                        ));
-                    } else {
-                        println!(
-                            "ran={} duration_micros={} bytes_before={:?} bytes_after={:?} \
-                                 file_shrank={} fragmentation_before={}",
-                            report.ran,
-                            report.duration_micros,
-                            report.bytes_before,
-                            report.bytes_after,
-                            report.file_shrank,
-                            report.fragmentation_before,
-                        );
-                    }
-                }
-                Err(err) => {
-                    report_failure(ErrorClass::of(&err), &err.to_string(), input);
-                    return MetaCommandOutcome::failed();
-                }
-            },
-            _ => {
-                report_failure(
-                    ErrorClass::Usage,
-                    "Usage: .maintenance status | .maintenance run | .maintenance compact",
-                    input,
-                );
-                return MetaCommandOutcome::failed();
-            }
-        },
-        ".events" => match rest {
-            "status" => {
-                let event_bus = db.event_bus_status();
-                let schedules = db.cron_status();
-                if input.output.json {
-                    json_output::print_document(&json_output::events_status_document(
-                        &event_bus, &schedules,
-                    ));
-                } else {
-                    print_events_status(&event_bus, &schedules);
-                }
-            }
-            _ => {
+        ".events" => {
+            let Some(tail) = rest.strip_prefix("status") else {
                 report_failure(ErrorClass::Usage, "Usage: .events status", input);
                 return MetaCommandOutcome::failed();
-            }
-        },
-        ".sync" | "\\sync" => {
+            };
+            let Ok(continuation) = paged_metadata_continuation(tail.trim()) else {
+                return refuse_continuation(".events status", input);
+            };
+            return answer_metadata(
+                session_handle,
+                MetadataRequest::EventsStatus,
+                continuation,
+                input,
+                session,
+            );
+        }
+        ".sync" => {
             let outcome = handle_sync_command(sync_client, rt, rest, sync_plugin);
             if !outcome.ok {
                 report_failure(outcome.class, &outcome.message, input);
@@ -845,9 +1289,12 @@ pub(crate) fn handle_meta_command(
             report_success(&outcome.message, &outcome.json, input.output);
         }
         _ => {
+            // The whole line, not just the first word: someone who typed a
+            // removed spelling with its argument reads back exactly what they
+            // typed, and a proof that a spelling is gone can look for it.
             report_failure(
                 ErrorClass::Usage,
-                &format!("Unknown command: {cmd}. Type \\? for help."),
+                &format!("Unknown command: {}. Type \\? for help.", line.trim()),
                 input,
             );
             return MetaCommandOutcome::failed();
@@ -857,20 +1304,615 @@ pub(crate) fn handle_meta_command(
     MetaCommandOutcome::done()
 }
 
+/// Tells the person what a still-running read has done, and no more often
+/// than they asked to hear it.
+///
+/// The engine reports as it advances; WHETHER that is worth saying is this
+/// side's decision, because the threshold is a flag the caller set. So the
+/// first report is withheld until the read has been going longer than the
+/// threshold, and one line is printed per threshold after that — a read that
+/// finishes quickly says nothing at all, which is the point.
+pub struct ReadProgressReporter {
+    output: OutputOptions,
+    threshold: std::time::Duration,
+    started: std::time::Instant,
+    last_said: Mutex<Option<std::time::Instant>>,
+}
+
+impl ReadProgressReporter {
+    pub fn new(output: OutputOptions, threshold_ms: u64) -> Self {
+        Self {
+            output,
+            threshold: std::time::Duration::from_millis(threshold_ms),
+            started: std::time::Instant::now(),
+            last_said: Mutex::new(None),
+        }
+    }
+
+    /// Whether enough time has passed since the last thing said to say another.
+    fn due(&self, now: std::time::Instant) -> bool {
+        let Ok(mut last) = self.last_said.lock() else {
+            return false;
+        };
+        let since = match *last {
+            Some(previous) => now.duration_since(previous),
+            None => now.duration_since(self.started),
+        };
+        if since < self.threshold {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
+
+impl contextdb_engine::ReadProgressObserver for ReadProgressReporter {
+    fn progress(&self, progress: contextdb_engine::ReadProgress) {
+        let now = std::time::Instant::now();
+        if !self.due(now) {
+            return;
+        }
+        let document = match progress.phase {
+            contextdb_engine::ReadPhase::Hydrating => {
+                json_output::hydration_notice_document(progress.loaded_bytes, progress.total_bytes)
+            }
+            contextdb_engine::ReadPhase::Executing => {
+                json_output::statement_progress_notice_document(
+                    progress.active_ms,
+                    progress.rows,
+                    progress.bytes,
+                )
+            }
+        };
+        if self.output.json {
+            json_output::print_stderr_document(&document);
+        } else if let Some(message) = document
+            .get("notice")
+            .and_then(|notice| notice.get("message"))
+            .and_then(|message| message.as_str())
+        {
+            eprintln!("{message}");
+        }
+    }
+}
+
+/// Say once, at the first store-reading command, HOW this session reads.
+///
+/// Only a session that CHOSE a route has one to report. A writing session is
+/// the owner: it reads its own live state in its own process, with no file-or-
+/// owner decision behind it and therefore nothing to announce. `.help`,
+/// `.trace`, `.quit`, `.exit`, `.sync status` and `.owner status` read no rows,
+/// so none of them reaches here.
+fn note_read_route(session_handle: &Session, input: InputContext, session: &mut SessionState) {
+    if session.route_reported {
+        return;
+    }
+    let Session::Reading { reader, .. } = session_handle else {
+        return;
+    };
+    session.route_reported = true;
+    let document = json_output::read_route_notice_document(reader.route(), reader.snapshot_at());
+    if input.output.json {
+        json_output::print_stderr_document(&document);
+    } else if let Some(message) = document
+        .get("notice")
+        .and_then(|notice| notice.get("message"))
+        .and_then(|message| message.as_str())
+    {
+        eprintln!("{message}");
+    }
+}
+
+/// Ask the store about itself through the one metadata door, and publish what
+/// it answers.
+///
+/// Every route goes through here. The door answers the same body whether it
+/// was projected from a committed file, from the writer's own live state in
+/// this process, or from an owner over a channel — so `.tables` and `.schema`
+/// cannot say different things about the same store depending on how the
+/// session happened to reach it.
+fn answer_metadata(
+    session_handle: &Session,
+    request: MetadataRequest,
+    continuation: Option<&str>,
+    input: InputContext,
+    session: &mut SessionState,
+) -> MetaCommandOutcome {
+    note_read_route(session_handle, input, session);
+    match session_handle.reader().metadata(request, continuation) {
+        Ok(answer) => {
+            publish_metadata(&answer, input);
+            MetaCommandOutcome::done()
+        }
+        Err(error) => {
+            report_error(&error, input);
+            MetaCommandOutcome::failed()
+        }
+    }
+}
+
+/// One metadata answer, rendered for whoever is reading.
+fn publish_metadata(answer: &contextdb_engine::MetadataAnswer, input: InputContext) {
+    let json = input.output.json;
+    match &answer.body {
+        MetadataBody::Tables { items, has_more } => {
+            let continuation = answer.continuation.as_deref();
+            if json {
+                json_output::print_document(&json_output::tables_document(
+                    items.clone(),
+                    *has_more,
+                    continuation,
+                ));
+            } else {
+                for name in items {
+                    println!("{name}");
+                }
+                println!("has_more: {has_more}");
+                // The follow-up is printed as a command, not described as one,
+                // so the instruction is executable exactly as it appears.
+                if let Some(token) = continuation {
+                    println!(".tables --continue {token}");
+                }
+            }
+        }
+        MetadataBody::EventsStatus {
+            status,
+            has_more,
+            continuation,
+        } => {
+            // The continuation rides beside the answer on the route that pages;
+            // where it rides inside the body instead, that is still the same
+            // continuation, and a caller must never see two different answers.
+            let resume = answer.continuation.as_deref().or(continuation.as_deref());
+            if json {
+                json_output::print_document(&json_output::events_status_body_document(
+                    status, *has_more, resume,
+                ));
+            } else {
+                print_direct_events_status(status);
+                println!("has_more: {has_more}");
+                if let Some(token) = resume {
+                    println!(".events status --continue {token}");
+                }
+            }
+        }
+        MetadataBody::Schema { schema } => {
+            if json {
+                json_output::print_document(&json_output::schema_document(schema));
+            } else {
+                print!("{}", schema.ddl);
+                if !schema.ddl.ends_with('\n') {
+                    println!();
+                }
+            }
+        }
+        MetadataBody::MaintenanceStatus { status } => {
+            if json {
+                json_output::print_document(&json_output::maintenance_status_body_document(status));
+            } else {
+                println!(
+                    "running={} retention_enabled={} currency_compaction_enabled={} \
+                     active_maintenance_loops={} policy={}",
+                    status.running,
+                    status.retention_enabled,
+                    status.currency_compaction_enabled,
+                    status.active_maintenance_loops,
+                    status.policy,
+                );
+            }
+        }
+        MetadataBody::Explain {
+            physical_plan,
+            index,
+            ..
+        } => {
+            if json {
+                json_output::print_document(&json_output::static_plan_document(physical_plan));
+            } else {
+                println!("{physical_plan}");
+                if let Some(index) = index {
+                    println!("index: {index}");
+                }
+            }
+        }
+        // The committed image state is not a command anyone can type; the CLI
+        // never asks for it, so there is nothing here to render.
+        MetadataBody::ImageState { .. } => {}
+    }
+}
+
+/// The argument tail of a paged metadata command: the continuation it was
+/// given, if any.
+///
+/// A malformed tail is refused as the misuse it is rather than being read as a
+/// fresh listing, because a caller that believes it is resuming and is in fact
+/// starting over reads the inventory twice and never knows.
+fn paged_metadata_continuation(rest: &str) -> std::result::Result<Option<&str>, ()> {
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let token = rest.strip_prefix("--continue ").ok_or(())?.trim();
+    if token.is_empty() {
+        Err(())
+    } else {
+        Ok(Some(token))
+    }
+}
+
+/// Refuse a continuation the command cannot use.
+///
+/// A malformed `--continue` is caller error, not an empty listing: a caller
+/// that believes it is resuming and is in fact starting over reads the whole
+/// inventory twice and never learns it did.
+fn refuse_continuation(command: &str, input: InputContext) -> MetaCommandOutcome {
+    let failure = ReadFailure::invalid_continuation(format!(
+        "{command} resumes only with the continuation it issued"
+    ));
+    input
+        .output
+        .report_read_failure(&failure, input.script_line);
+    MetaCommandOutcome::failed()
+}
+
+/// `.owner status` — the file-backed process owner's state, as control data.
+///
+/// It resolves no row-reading route: it describes the owner, it does not
+/// establish a way to read rows, and it stays answerable when every reader
+/// slot is occupied. A writing session is its own owner and answers about
+/// itself; an inspecting session asks the store's path, which answers whether
+/// or not anyone owns it.
+fn handle_owner_command(
+    session_handle: &Session,
+    rest: &str,
+    input: InputContext,
+) -> MetaCommandOutcome {
+    if rest != "status" {
+        report_failure(ErrorClass::Usage, "Usage: .owner status", input);
+        return MetaCommandOutcome::failed();
+    }
+    let owned = match session_handle.database() {
+        Some(database) => Some(contextdb_engine::OwnerReport {
+            status: database.owner_read_status(),
+            // A writer answering about itself reports its state; the serving
+            // detail is what the CHANNEL computes, and this session is not
+            // talking to one.
+            serving: None,
+        }),
+        None => {
+            let path = session_handle
+                .read_path()
+                .expect("a session with no database was pointed at a path");
+            match ReadSession::owner_report_in_runtime_dir(
+                path,
+                session_handle.reader().options(),
+                session_handle.reader().runtime_dir(),
+            ) {
+                Ok(report) => Some(report),
+                // Nobody owning the store is the ANSWER to `.owner status`, not
+                // a failure to get one: an idle store reports that it has no
+                // process owner, and that report succeeds.
+                Err(Error::ReadFailure(failure))
+                    if failure.kind() == ReadFailureKind::OwnerNotRunning =>
+                {
+                    None
+                }
+                Err(error) => {
+                    report_error(&error, input);
+                    return MetaCommandOutcome::failed();
+                }
+            }
+        }
+    };
+    let document = match &owned {
+        Some(report) => json_output::owner_report_document(report),
+        None => json_output::owner_not_running_document(),
+    };
+    if input.output.json {
+        json_output::print_document(&document);
+    } else {
+        let state = match &owned {
+            Some(report) => json_output::owner_serving_state_wire_word(report.status.state),
+            None => "not_running",
+        };
+        println!("owner: {state}");
+    }
+    // An owner that was expected to serve and cannot is a failed report, not a
+    // successful one: a script that reads the state must also be able to read
+    // it off the exit code.
+    if owned
+        .as_ref()
+        .is_some_and(|report| report.status.state == OwnerServingState::NotServing)
+    {
+        return MetaCommandOutcome::failed();
+    }
+    MetaCommandOutcome::done()
+}
+
+/// `.cursor open` / `.cursor fetch` / `.cursor close` — the one cursor a
+/// session may hold.
+fn handle_cursor_command(
+    session_handle: &Session,
+    rest: &str,
+    input: InputContext,
+    session: &mut SessionState,
+) -> MetaCommandOutcome {
+    let mut parts = rest.splitn(2, ' ');
+    let verb = parts.next().unwrap_or("");
+    let argument = parts.next().unwrap_or("").trim();
+    match verb {
+        "open" => cursor_open(session_handle, argument, input, session),
+        "fetch" => cursor_fetch(session_handle, argument, input, session),
+        "close" => cursor_close(input, session),
+        _ => {
+            report_failure(
+                ErrorClass::Usage,
+                "Usage: .cursor open <SELECT> | .cursor fetch [rows] | .cursor close",
+                input,
+            );
+            MetaCommandOutcome::failed()
+        }
+    }
+}
+
+/// Refuse a cursor request, and say so in the words the refusal itself carries.
+fn refuse_cursor(kind: ReadFailureKind, input: InputContext) -> MetaCommandOutcome {
+    let failure = ReadFailure::new(kind, ReadFailureDetail::None)
+        .expect("every cursor refusal used here carries no specialized detail");
+    input
+        .output
+        .report_read_failure(&failure, input.script_line);
+    MetaCommandOutcome::failed()
+}
+
+/// Publish one page and record what the cursor became. A page that exhausted
+/// the read frees the session's cursor slot without throwing the cursor away,
+/// so the next fetch still answers where it left off — at the end.
+fn publish_cursor_page(
+    page: &contextdb_core::read_contract::CursorPage,
+    cursor: ReadCursor,
+    input: InputContext,
+    session: &mut SessionState,
+) -> MetaCommandOutcome {
+    session.cursor = if page.has_more {
+        CursorSlot::Open(cursor)
+    } else {
+        CursorSlot::Drained(cursor)
+    };
+    if input.output.json {
+        json_output::print_document(&json_output::cursor_page_document(page));
+    } else {
+        for row in &page.rows {
+            let cells: Vec<String> = row.iter().map(crate::formatter::render_value).collect();
+            println!("{}", cells.join(" | "));
+        }
+        println!("({} rows, has_more: {})", page.rows.len(), page.has_more);
+    }
+    MetaCommandOutcome::done()
+}
+
+fn cursor_open(
+    session_handle: &Session,
+    argument: &str,
+    input: InputContext,
+    session: &mut SessionState,
+) -> MetaCommandOutcome {
+    if matches!(session.cursor, CursorSlot::Open(_)) {
+        return refuse_cursor(ReadFailureKind::CursorAlreadyOpen, input);
+    }
+    if argument.is_empty() {
+        report_failure(ErrorClass::Usage, "Usage: .cursor open <SELECT>", input);
+        return MetaCommandOutcome::failed();
+    }
+    // Cursor state must never mix committed and uncommitted rows, so it may
+    // not open across a transaction — and refusing must leave that
+    // transaction exactly as it found it.
+    if session.transaction_open {
+        return refuse_cursor(ReadFailureKind::CursorTransactionActive, input);
+    }
+    // Exactly one read-only SELECT. A write handed to the cursor is refused AS
+    // a write, so the user is told the one thing that would let it through;
+    // anything else is command misuse and never executes.
+    match contextdb_parser::parse(argument) {
+        Ok(statement) => {
+            if contextdb_parser::statement_effect(&statement)
+                != contextdb_parser::StatementEffect::Read
+            {
+                return refuse_cursor(ReadFailureKind::WriteRequiresFlag, input);
+            }
+            if !matches!(statement, contextdb_parser::Statement::Select(_)) {
+                return refuse_cursor(ReadFailureKind::CursorInvalidStatement, input);
+            }
+        }
+        Err(_) => return refuse_cursor(ReadFailureKind::CursorInvalidStatement, input),
+    }
+    note_read_route(session_handle, input, session);
+    match session_handle
+        .reader()
+        .open_cursor(argument, &HashMap::new())
+    {
+        Ok(cursor) => {
+            let page = cursor.first_page().clone();
+            session.cursor_statement =
+                Some(argument.trim().trim_end_matches(';').trim().to_owned());
+            publish_cursor_page(&page, cursor, input, session)
+        }
+        Err(error) => {
+            report_error(&error, input);
+            MetaCommandOutcome::failed()
+        }
+    }
+}
+
+fn cursor_fetch(
+    session_handle: &Session,
+    argument: &str,
+    input: InputContext,
+    session: &mut SessionState,
+) -> MetaCommandOutcome {
+    let rows = if argument.is_empty() {
+        None
+    } else {
+        match argument.parse::<usize>().ok().and_then(NonZeroUsize::new) {
+            Some(rows) => Some(rows),
+            None => {
+                report_failure(
+                    ErrorClass::Usage,
+                    "Usage: .cursor fetch [rows], where rows is a positive whole number",
+                    input,
+                );
+                return MetaCommandOutcome::failed();
+            }
+        }
+    };
+    let mut cursor = match std::mem::take(&mut session.cursor) {
+        CursorSlot::Open(cursor) | CursorSlot::Drained(cursor) => cursor,
+        // A cursor that never existed and one this session explicitly closed
+        // are the same answer: there is nothing here to fetch from. That is
+        // distinct from a DRAINED cursor, which answers an empty success page.
+        CursorSlot::Absent | CursorSlot::Closed => {
+            session.cursor = CursorSlot::Closed;
+            return refuse_cursor(ReadFailureKind::CursorNotFound, input);
+        }
+    };
+    let cancellation = OwnerReadCancellation::new();
+    let fetched = {
+        let _running = session
+            .interrupts
+            .as_ref()
+            .map(|holder| holder.running(&cancellation));
+        cursor.fetch_with_cancellation(rows, &cancellation)
+    };
+    match fetched {
+        Ok(page) => publish_cursor_page(&page, cursor, input, session),
+        // A cancelled fetch leaves the cursor exactly where it was, so the
+        // next fetch resumes with nothing repeated or skipped.
+        Err(Error::ReadCancelled) => {
+            session.cursor = CursorSlot::Open(cursor);
+            input
+                .output
+                .report_notice(ErrorClass::Io, "cursor fetch cancelled");
+            MetaCommandOutcome::done()
+        }
+        Err(error) => {
+            // The slot must say what is actually there. A refusal the cursor
+            // survived leaves it open for the next fetch; a refusal that ENDED
+            // the read -- a crossed ceiling gives its retained bytes back and
+            // unpins its snapshot rather than waiting for a caller to remember
+            // to close it -- leaves nothing, and a slot that went on claiming
+            // it would answer `cursor_already_open` to the next `.cursor open`
+            // while every fetch and close said the cursor was gone. That is a
+            // session with no cursor and no way to get one, so the slot is
+            // freed instead: exactly the state an explicit close leaves, from
+            // which `.cursor open` works.
+            session.cursor = if cursor.is_live() {
+                CursorSlot::Open(cursor)
+            } else {
+                CursorSlot::Closed
+            };
+            report_cursor_error(session_handle, &error, input, session);
+            MetaCommandOutcome::failed()
+        }
+    }
+}
+
+/// Report a refused fetch the way the ordinary read surface reports one.
+///
+/// A crossed ceiling names a different way out on each route -- a direct reader
+/// owns its own ceilings, a reader through an owner does not -- so the refusal
+/// is told by a session that knows which route it read on. Reporting it
+/// route-blind here would hand a cursor user the bare ceiling and no step to
+/// take, while the same refusal on an ordinary SELECT names one.
+fn report_cursor_error(
+    session_handle: &Session,
+    error: &Error,
+    input: InputContext,
+    session: &SessionState,
+) {
+    if let Error::ReadFailure(failure) = error
+        && failure.kind() == ReadFailureKind::OwnerLimitExceeded
+    {
+        // A count above the row ceiling refused the REQUEST, and the ceiling
+        // it names IS the count this cursor will serve. So the remedy is that
+        // exact fetch, not a flag change: the cursor is still open and the
+        // read has not moved. Raising `--read-*` is the escape for the
+        // TERMINAL ceilings, and offering it here would send the caller to
+        // restart a session they never lost.
+        if let ReadFailureDetail::OwnerLimitExceeded(detail) = failure.detail()
+            && detail.limit == ReadFailureLimit::ResultRows
+        {
+            let remedied = ReadFailure::owner_limit_exceeded(
+                contextdb_core::read_contract::OwnerLimitExceededDetail {
+                    limit: detail.limit,
+                    value: detail.value,
+                    required: detail.required.clone(),
+                    statement: Some(contextdb_core::read_contract::StatementRemedy {
+                        statement: session.cursor_statement.clone().unwrap_or_default(),
+                        remedy_command: format!(".cursor fetch {}", detail.value),
+                    }),
+                },
+            );
+            input
+                .output
+                .report_read_failure(&remedied, input.script_line);
+            return;
+        }
+        input.output.report_read_failure_on_route(
+            failure,
+            input.script_line,
+            Some(session_handle.reader().route()),
+        );
+        return;
+    }
+    report_error(error, input);
+}
+
+fn cursor_close(input: InputContext, session: &mut SessionState) -> MetaCommandOutcome {
+    let slot = std::mem::take(&mut session.cursor);
+    session.cursor = CursorSlot::Closed;
+    let outcome = match slot {
+        // Closing past the end is a no-op success, so a fetch-until-empty loop
+        // that ends with a close always exits clean.
+        CursorSlot::Absent | CursorSlot::Closed | CursorSlot::Drained(_) => Ok(()),
+        CursorSlot::Open(cursor) => cursor.close(),
+    };
+    match outcome {
+        Ok(()) => {
+            if input.output.json {
+                json_output::print_document(&json_output::cursor_closed_document());
+            } else {
+                println!("cursor closed");
+            }
+            MetaCommandOutcome::done()
+        }
+        Err(error) => {
+            report_error(&error, input);
+            MetaCommandOutcome::failed()
+        }
+    }
+}
+
 /// The help text for a topic, one line per entry. Rendering is the caller's
 /// business — stdout for a human, one JSON document on stderr under `--json`.
-fn help_lines(topic: &str) -> Vec<&'static str> {
+///
+/// The general list is GENERATED from the command registry, so `.help` can
+/// neither offer a command the CLI does not have nor omit one it does. The
+/// gloss beside each spelling is prose; the spelling itself is never written
+/// down twice.
+fn help_lines(topic: &str) -> Vec<String> {
     if topic.eq_ignore_ascii_case("vector") {
-        return vec![
+        return [
             "VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')",
             "SHOW VECTOR_INDEXES",
             "ORDER BY embedding <=> [0.1, 0.2, 0.3] LIMIT 5",
             "ORDER BY embedding <=> ROW_VECTOR('table', 'embedding', $key) LIMIT 5",
             "Vector errors include LegacyVectorStoreDetected, StoreCorrupted, VectorIndexDimensionMismatch, UnknownVectorIndex, PersistedRowVectorRowMissing, and PersistedRowVectorCellNull",
-        ];
+        ]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect();
     }
     if topic.eq_ignore_ascii_case("propagate") {
-        return vec![
+        return [
             "PROPAGATE ON EDGE <edge_type> INCOMING|OUTGOING|BOTH STATE <state> SET <state>",
             "  [MAX DEPTH n] [ABORT ON FAILURE]",
             "PROPAGATE ON STATE <state> EXCLUDE VECTOR",
@@ -888,33 +1930,72 @@ fn help_lines(topic: &str) -> Vec<&'static str> {
             "    PROPAGATE ON STATE invalidated EXCLUDE VECTOR",
             "    PROPAGATE ON STATE superseded EXCLUDE VECTOR",
             "See docs/query-language.md for the full grammar.",
-        ];
+        ]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect();
     }
-    vec![
-        ".help / \\?          Show this message",
-        ".help vector        Show vector index syntax and errors",
-        ".help propagate     Show PROPAGATE DDL grammar and a worked example",
-        ".quit/.exit / \\q    Exit REPL",
-        ".tables / \\dt       List tables",
-        ".schema / \\d <tbl>  Show table schema and constraints",
-        ".explain <sql>      Show execution plan",
-        ".trace on|off       Toggle one-line execution traces",
-        ".sync status              Show sync connection info",
-        ".sync push                Push local changes to server",
-        "                          exit codes: 0 = pushed; 1 = failed; 3 = interrupted after sending, outcome unconfirmed, re-push is safe",
-        ".sync pull                Pull remote changes from server",
-        ".sync reconnect           Reconnect to the sync endpoint",
-        ".sync destination         Move retained-data delivery to the connected hub",
-        ".sync auto [on|off]       Toggle auto-sync after DML",
-        ".events status            List event types/sinks/routes/schedules and their counters",
-    ]
+    canonical_help_signatures()
+        .into_iter()
+        .map(|spelling| {
+            let gloss = command_gloss(spelling);
+            // A toggle is shown the way it is typed; the registry keeps the
+            // bare spelling it dispatches on.
+            let shown = crate::command_registry::help_signature(spelling);
+            if gloss.is_empty() {
+                shown.to_owned()
+            } else {
+                format!("{shown:<22}{gloss}")
+            }
+        })
+        .collect()
+}
+
+/// What each published spelling is for, in one line a person can act on.
+///
+/// A spelling with no gloss still appears in `.help` — it is a command the CLI
+/// has, and hiding it because nobody wrote a sentence would make the discovery
+/// surface lie.
+fn command_gloss(spelling: &str) -> &'static str {
+    match spelling {
+        ".tables" => "List table names; a large listing resumes with --continue.",
+        ".schema" => "Show a table's full declared contract.",
+        ".explain" => "Show a statement's execution plan; never applies a write.",
+        ".events status" => "Bounded, resumable event/sink/route/schedule health.",
+        ".maintenance status" => "One complete bounded maintenance-state response.",
+        ".cursor open" => "Page a result larger than an ordinary ceiling.",
+        ".cursor fetch" => "Next page; omit the count to use the declared page size.",
+        ".cursor close" => "Release this session's cursor.",
+        ".maintenance run" => "Run one cleanup cycle. Needs --write.",
+        ".maintenance compact" => "Reclaim file space. Needs --write.",
+        ".sync push" => "Push local changes to the server. Needs --write.",
+        ".sync pull" => "Pull remote changes from the server. Needs --write.",
+        ".sync reconnect" => "Reconnect to the sync endpoint. Needs --write.",
+        ".sync destination" => "Move retained-data delivery to the connected hub. Needs --write.",
+        ".sync auto" => "Toggle auto-sync after DML. Needs --write.",
+        ".owner status" => "The file-backed owner's policy and state; works at capacity.",
+        ".help" => "Show this message. `.help vector` / `.help propagate` show grammar.",
+        ".trace" => "Toggle one-line execution traces.",
+        ".quit" | ".exit" => "End the session.",
+        ".sync status" => "This CLI session's own sync state, not the store's.",
+        "\\dt" => "Alias for .tables.",
+        "\\d" => "Alias for .schema.",
+        "\\q" => "Alias for .quit.",
+        "\\?" => "Alias for .help.",
+        "migrate" => "Bring a legacy-format store forward in place.",
+        "reset" => "Recreate a wedged or corrupt store. Needs --force.",
+        "diagnose" => "Report a store's format and layout, read-only.",
+        "snapshot" => "Publish a purge-fenced backup artifact.",
+        "inspect" => "Read durable key and media state from an artifact or file.",
+        "purge" => "Force-gated whole-table authoritative erasure.",
+        _ => "",
+    }
 }
 
 fn is_trace_command(line: &str) -> bool {
-    matches!(
-        line.split_whitespace().next(),
-        Some(".trace") | Some("\\trace")
-    )
+    // `\trace` is not a spelling. The conventional aliases the contract keeps
+    // are the psql-shaped ones the registry publishes, and this is not one.
+    matches!(line.split_whitespace().next(), Some(".trace"))
 }
 
 fn is_explain_command(line: &str) -> bool {
@@ -958,49 +2039,83 @@ fn handle_trace_command(line: &str, input: InputContext, trace_enabled: &mut boo
     true
 }
 
-fn handle_explain_command(db: &Database, line: &str, input: InputContext) -> bool {
+fn handle_explain_command(session_handle: &Session, line: &str, input: InputContext) -> bool {
     let rest = line.strip_prefix(".explain").unwrap_or("").trim();
     if rest.is_empty() {
         report_failure(ErrorClass::Usage, "Usage: .explain <sql>", input);
         return false;
     }
 
-    if input.output.json {
-        // The same rule the human path applies through `explain_output`: only a
-        // read-only statement may be RUN to collect a runtime trace. Anything
-        // else is planned statically — `.explain DELETE FROM t` answers what it
-        // WOULD do, and must never do it.
-        if !explain_can_use_runtime_trace(rest) {
-            return match db.explain(rest) {
+    // Only a read-only statement may be RUN to collect a real runtime route.
+    // Anything that would write is planned instead — `.explain DELETE FROM t`
+    // answers what it WOULD do and must never do it — and the plan says
+    // plainly that no statement was run to produce it.
+    if !explain_can_use_runtime_trace(rest) {
+        // A writing session plans a write against its own live database. The
+        // bounded read view will not plan one — it accepts read-only plans by
+        // design — so asking it would turn "here is what this WOULD do" into a
+        // refusal, which is not what `.explain` promises.
+        if let Some(database) = session_handle.database() {
+            return match database.explain(rest) {
                 Ok(plan) => {
-                    json_output::print_document(&json_output::static_plan_document(&plan));
+                    if input.output.json {
+                        json_output::print_document(&json_output::static_plan_document(&plan));
+                    } else {
+                        print!("{plan}");
+                        if !plan.ends_with('\n') {
+                            println!();
+                        }
+                    }
                     true
                 }
-                Err(e) => {
-                    report_error(&e, input);
+                Err(error) => {
+                    report_error(&error, input);
                     false
                 }
             };
         }
-        return match db.execute(rest, &HashMap::new()) {
-            Ok(result) => {
-                json_output::print_document(&json_output::explain_document(&result));
+        return match session_handle.reader().metadata(
+            MetadataRequest::Explain {
+                sql: rest.to_owned(),
+            },
+            None,
+        ) {
+            Ok(answer) => {
+                let MetadataBody::Explain { physical_plan, .. } = &answer.body else {
+                    report_error(&Error::ReadSessionNotImplemented, input);
+                    return false;
+                };
+                if input.output.json {
+                    json_output::print_document(&json_output::static_plan_document(physical_plan));
+                } else {
+                    println!("{physical_plan}");
+                }
                 true
             }
-            Err(e) => {
-                report_error(&e, input);
+            Err(error) => {
+                report_error(&error, input);
                 false
             }
         };
     }
 
-    match explain_output(db, rest) {
-        Ok(plan) => {
-            print!("{}", plan);
+    match session_handle.reader().execute(rest, &HashMap::new()) {
+        Ok(result) => {
+            if input.output.json {
+                json_output::print_document(&json_output::explain_document(&result));
+            } else {
+                // The same shape `.explain` gives for a statement it could
+                // only plan: an operator asking about a route gets one answer,
+                // whether or not the statement was run to produce it.
+                print!(
+                    "{}",
+                    contextdb_engine::cli_render::render_explain_trace(&result.trace)
+                );
+            }
             true
         }
-        Err(e) => {
-            eprintln!("Error: {}", e);
+        Err(error) => {
+            report_error(&error, input);
             false
         }
     }
@@ -1009,6 +2124,12 @@ fn handle_explain_command(db: &Database, line: &str, input: InputContext) -> boo
 /// Report an engine error: the `{"error":{...}}` envelope on stderr under
 /// `--json`, the human `Error: ...` line on stderr otherwise. Never stdout.
 fn report_error(error: &Error, input: InputContext) {
+    // A read refusal carries its own class and typed detail; rendering it as a
+    // bare message would throw away the fields a script branches on.
+    if let Error::ReadFailure(failure) = error {
+        input.output.report_read_failure(failure, input.script_line);
+        return;
+    }
     let flattened = error.to_string().replace('\n', " ");
     if input.output.json {
         json_output::print_error(ErrorClass::of(error), &flattened, input.script_line);
@@ -1018,19 +2139,6 @@ fn report_error(error: &Error, input: InputContext) {
         eprintln!("Error: line {line}: {flattened}");
     } else {
         eprintln!("Error: {flattened}");
-    }
-}
-
-fn explain_output(db: &Database, sql: &str) -> contextdb_core::Result<String> {
-    if explain_can_use_runtime_trace(sql) {
-        contextdb_engine::cli_render::render_explain(db, sql, &HashMap::new())
-    } else {
-        db.explain(sql).map(|mut plan| {
-            if !plan.ends_with('\n') {
-                plan.push('\n');
-            }
-            plan
-        })
     }
 }
 
@@ -1132,7 +2240,20 @@ fn run_sync_command(
     unconfirmed_push: &mut bool,
 ) -> SyncCommandOutcome {
     let parts: Vec<&str> = args.split_whitespace().collect();
-    let sub = parts.first().copied().unwrap_or("status");
+    // `.sync` alone names no operation, and the command registry classifies the
+    // bare spelling Invalid exactly like `.events`, `.maintenance`, `.cursor`,
+    // and `.owner`. Reading it as one of the operations -- silently, as a
+    // status query -- would make the registry and the session disagree about
+    // what the word means, so it is answered as a usage error that lists the
+    // operations that do exist.
+    let Some(sub) = parts.first().copied() else {
+        return SyncCommandOutcome::failed(
+            ErrorClass::Usage,
+            "Usage: .sync status | .sync push | .sync pull | .sync reconnect | \
+             .sync destination <hub> | .sync auto on|off"
+                .to_string(),
+        );
+    };
 
     if !matches!(
         sub,
@@ -1437,66 +2558,57 @@ fn auto_sync_json(enabled: bool) -> serde_json::Value {
     serde_json::json!({ "sync_auto": { "configured": true, "enabled": enabled } })
 }
 
-fn print_table_meta(table: &str, meta: &TableMeta) {
-    print!(
-        "{}",
-        contextdb_engine::cli_render::render_table_meta(table, meta)
-    );
-}
-
-/// Human-readable rendering of `.events status`: every declared event type,
-/// sink (with delivery metrics), route, and schedule (with fire counts).
-fn print_events_status(
-    event_bus: &contextdb_engine::EventBusStatus,
-    schedules: &[contextdb_engine::CronScheduleStatus],
-) {
+/// Human rendering of `.events status`: every declared event type, sink (with
+/// its delivery counters), route, and schedule (with its fire count).
+fn print_direct_events_status(status: &contextdb_engine::DirectEventsStatus) {
     println!("Event types:");
-    if event_bus.event_types.is_empty() {
+    if status.event_types.is_empty() {
         println!("  (none)");
     }
-    for event_type in &event_bus.event_types {
+    for event_type in &status.event_types {
         println!(
             "  {} WHEN {} ON {}",
             event_type.name, event_type.trigger, event_type.table
         );
     }
     println!("Sinks:");
-    if event_bus.sinks.is_empty() {
+    if status.sinks.is_empty() {
         println!("  (none)");
     }
-    for sink in &event_bus.sinks {
+    for sink in &status.sinks {
         println!(
             "  {} TYPE {} registered={} delivered={} queued={} retried={} \
              permanent_failures={} examined={}",
             sink.name,
             sink.sink_type,
             sink.callback_registered,
-            sink.metrics.delivered,
-            sink.metrics.queued,
-            sink.metrics.retried,
-            sink.metrics.permanent_failures,
-            sink.metrics.examined,
+            sink.delivered,
+            sink.queued,
+            sink.retried,
+            sink.permanent_failures,
+            sink.examined,
         );
     }
     println!("Routes:");
-    if event_bus.routes.is_empty() {
+    if status.routes.is_empty() {
         println!("  (none)");
     }
-    for route in &event_bus.routes {
+    for route in &status.routes {
         println!(
             "  {} EVENT {} TO {}",
             route.name, route.event_type, route.sink
         );
     }
     println!("Schedules:");
-    if schedules.is_empty() {
+    if status.schedules.is_empty() {
         println!("  (none)");
     }
-    for schedule in schedules {
+    for schedule in &status.schedules {
         println!(
-            "  {} EVERY {} TX ({}) registered={} fired={} next_fire_at_ms={} last_fire_at_ms={:?}",
+            "  {} EVERY {} TX ({}) registered={} fired={} next_fire_at_ms={} \
+             last_fire_at_ms={:?}",
             schedule.name,
-            schedule.every_text,
+            schedule.every,
             schedule.callback,
             schedule.callback_registered,
             schedule.fire_count,
@@ -1583,12 +2695,62 @@ fn settle_cli_registered_sinks(db: &Database) {
     }
 }
 
-fn execute_sql(db: &Database, sql: &str, input: InputContext, trace_enabled: bool) -> bool {
+fn execute_sql(
+    session_handle: &Session,
+    sql: &str,
+    input: InputContext,
+    session: &mut SessionState,
+) -> bool {
     let output = input.output;
-    match db.execute(sql, &HashMap::new()) {
+    let statement = contextdb_parser::parse(sql).ok();
+    let writes = statement.as_ref().is_some_and(|statement| {
+        contextdb_parser::statement_effect(statement) != contextdb_parser::StatementEffect::Read
+    });
+    // The answer comes BEFORE execution. A session that may not write must not
+    // reach the store with a mutating statement at all, so nothing partial can
+    // be left behind by a statement that was never allowed to run.
+    if writes && !session_handle.writes_permitted() {
+        output.report_read_failure(&write_requires_flag(), input.script_line);
+        return false;
+    }
+
+    note_read_route(session_handle, input, session);
+    let cancellation = OwnerReadCancellation::new();
+    let executed = match session_handle.database() {
+        // A write has one door, and it is the live database.
+        Some(database) if writes => database.execute(sql, &HashMap::new()),
+        // Every read takes the bounded door, including a writer's own read
+        // inside the transaction it opened itself — reading your own
+        // uncommitted rows and staying under a ceiling are not in tension, so
+        // a writer's SELECTs are bounded exactly like anyone else's. Input
+        // that parses as nothing takes this door too, so a parse error reads
+        // identically in both kinds of session.
+        _ => {
+            let _running = session
+                .interrupts
+                .as_ref()
+                .map(|holder| holder.running(&cancellation));
+            session_handle
+                .reader()
+                .execute_with_cancellation(sql, &HashMap::new(), &cancellation)
+        }
+    };
+
+    match executed {
         Ok(result) => {
-            register_cli_defaults_for_statement(db, sql);
-            settle_cli_registered_sinks(db);
+            if let Some(database) = session_handle.database() {
+                register_cli_defaults_for_statement(database, sql);
+                settle_cli_registered_sinks(database);
+            }
+            if let Some(statement) = &statement {
+                session.transaction_open = match statement {
+                    contextdb_parser::Statement::Begin => true,
+                    contextdb_parser::Statement::Commit | contextdb_parser::Statement::Rollback => {
+                        false
+                    }
+                    _ => session.transaction_open,
+                };
+            }
             if result.columns.is_empty() {
                 if output.json {
                     // A non-query statement: a small JSON status object so the
@@ -1601,22 +2763,22 @@ fn execute_sql(db: &Database, sql: &str, input: InputContext, trace_enabled: boo
                     println!("ok (rows_affected={})", result.rows_affected);
                 }
             } else if output.json {
-                // Query result as a JSON array of row objects — uncapped.
-                println!("{}", format_query_result_json(&result));
+                json_output::print_document(&json_output::result_document(&result));
             } else {
                 let show_empty_headers = sql
                     .trim()
                     .trim_end_matches(';')
                     .eq_ignore_ascii_case("SHOW VECTOR_INDEXES");
-                let cap = if output.all {
-                    None
-                } else {
-                    Some(DEFAULT_ROW_CAP)
-                };
-                let formatted = format_query_result_capped(&result, cap, show_empty_headers);
-                println!("{formatted}");
+                let formatted = format_query_result_with_empty_headers(&result, show_empty_headers);
+                if !formatted.is_empty() {
+                    println!("{formatted}");
+                }
+                // One footer, and it is the last thing a successful ordinary
+                // result prints. There is no other decoration: a result is
+                // complete or it is refused.
+                println!("({} rows)", result.rows.len());
             }
-            if trace_enabled {
+            if session.trace_enabled {
                 if output.json {
                     // The trace is diagnostics about a result, not the result:
                     // on stdout it would corrupt the JSON Lines stream a
@@ -1633,6 +2795,23 @@ fn execute_sql(db: &Database, sql: &str, input: InputContext, trace_enabled: boo
                 }
             }
             true
+        }
+        // Cancelling is what the person asked for, not a failure of the run:
+        // the statement publishes nothing, the session carries on, and the
+        // exit code says nothing went wrong.
+        Err(Error::ReadCancelled) => {
+            output.report_notice(ErrorClass::Io, "statement cancelled");
+            true
+        }
+        Err(Error::ReadFailure(failure))
+            if failure.kind() == ReadFailureKind::OwnerLimitExceeded =>
+        {
+            output.report_read_failure_on_route(
+                &refusal_naming_the_statement(&failure, sql),
+                input.script_line,
+                Some(session_handle.reader().route()),
+            );
+            false
         }
         Err(e) => {
             // Every error goes to stderr and fails the run. The session still
@@ -1651,6 +2830,13 @@ mod tests {
     use super::*;
     use contextdb_parser::{Statement, parse};
 
+    /// A writing session over a throwaway in-memory database — what these
+    /// fixtures drive, and the mode `:memory:` always has.
+    fn writing_session(database: &Arc<Database>) -> Session {
+        Session::writing(Arc::clone(database), ReadLimits::default())
+            .expect("a live database opens its own bounded read view")
+    }
+
     /// A scripted, human-output context — what the meta-command tests below
     /// drive, so they exercise the same path a piped session takes.
     fn scripted_input() -> InputContext {
@@ -1658,40 +2844,57 @@ mod tests {
             interactive: false,
             script_line: None,
             output: OutputOptions::default(),
+            store_writes_permitted: true,
         }
     }
 
     #[test]
     fn maintenance_status_reports_a_database_with_nothing_declared() {
-        let db = Database::open_memory();
+        let db = Arc::new(Database::open_memory());
         let outcome = handle_meta_command(
-            &db,
+            &writing_session(&db),
             None,
             None,
             ".maintenance status",
             scripted_input(),
             None,
+            &mut SessionState::default(),
         );
         assert!(outcome.keep_going && outcome.ok);
     }
 
     #[test]
     fn maintenance_run_drives_one_cycle_on_demand() {
-        let db = Database::open_memory();
+        let db = Arc::new(Database::open_memory());
         db.execute(
             "CREATE TABLE t (id INTEGER PRIMARY KEY) RETAIN 1 HOURS",
             &HashMap::new(),
         )
         .unwrap();
-        let outcome =
-            handle_meta_command(&db, None, None, ".maintenance run", scripted_input(), None);
+        let outcome = handle_meta_command(
+            &writing_session(&db),
+            None,
+            None,
+            ".maintenance run",
+            scripted_input(),
+            None,
+            &mut SessionState::default(),
+        );
         assert!(outcome.keep_going && outcome.ok);
     }
 
     #[test]
     fn maintenance_with_no_subcommand_is_a_usage_error() {
-        let db = Database::open_memory();
-        let outcome = handle_meta_command(&db, None, None, ".maintenance", scripted_input(), None);
+        let db = Arc::new(Database::open_memory());
+        let outcome = handle_meta_command(
+            &writing_session(&db),
+            None,
+            None,
+            ".maintenance",
+            scripted_input(),
+            None,
+            &mut SessionState::default(),
+        );
         assert!(outcome.keep_going && !outcome.ok);
     }
 
@@ -1713,7 +2916,7 @@ mod tests {
         // see what's registered and whether it has ever delivered/fired. No
         // such introspection meta-command exists yet, so `.events status`
         // falls through to the generic "Unknown command" usage error.
-        let db = Database::open_memory();
+        let db = Arc::new(Database::open_memory());
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &HashMap::new())
             .unwrap();
         db.execute("CREATE EVENT TYPE t_ins WHEN INSERT ON t", &HashMap::new())
@@ -1723,8 +2926,15 @@ mod tests {
         db.execute("CREATE ROUTE r EVENT t_ins TO s", &HashMap::new())
             .unwrap();
 
-        let outcome =
-            handle_meta_command(&db, None, None, ".events status", scripted_input(), None);
+        let outcome = handle_meta_command(
+            &writing_session(&db),
+            None,
+            None,
+            ".events status",
+            scripted_input(),
+            None,
+            &mut SessionState::default(),
+        );
         assert!(
             outcome.ok,
             "an operator must be able to list registered event types/sinks/routes/\
@@ -1784,12 +2994,13 @@ mod tests {
     /// call for every line), not raw `db.execute`. Panics if any line makes
     /// the session quit or if any statement reports an error, since none of
     /// these fixtures are expected to fail.
-    fn drive_lines(db: &Database, lines: &[&str]) {
+    fn drive_lines(db: &Arc<Database>, lines: &[&str]) {
+        let session_handle = writing_session(db);
         let mut session = SessionState::default();
         let mut pending = StatementBuffer::default();
         for line in lines {
             let keep_going = feed_line(
-                db,
+                &session_handle,
                 None,
                 None,
                 line,
@@ -1818,7 +3029,7 @@ mod tests {
         // its own default callback — the engine's queue-until-registered
         // contract (acceptance t5_26) stays intact, and delivery becomes
         // observable through the CLI alone.
-        let db = Database::open_memory();
+        let db = Arc::new(Database::open_memory());
         drive_lines(
             &db,
             &[
@@ -1858,7 +3069,7 @@ mod tests {
         // `cron_run_due_now_for_test`'s own return value, which only counts
         // fires from this one call and misses a tickler fire that already
         // landed first.
-        let db = Database::open_memory();
+        let db = Arc::new(Database::open_memory());
         drive_lines(
             &db,
             &[
@@ -1895,26 +3106,61 @@ mod tests {
 
     #[test]
     fn test_backslash_dt() {
-        let db = Database::open_memory();
+        let db = Arc::new(Database::open_memory());
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
             .unwrap();
-        assert!(handle_meta_command(&db, None, None, "\\dt", scripted_input(), None).keep_going);
+        assert!(
+            handle_meta_command(
+                &writing_session(&db),
+                None,
+                None,
+                "\\dt",
+                scripted_input(),
+                None,
+                &mut SessionState::default(),
+            )
+            .keep_going
+        );
     }
 
     // B1: Existing \dt works with new handle_meta_command signature
     #[test]
     fn b1_existing_dt_works_with_new_signature() {
-        let db = Database::open_memory();
+        let db = Arc::new(Database::open_memory());
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
             .unwrap();
         // Pass None for sync_client and rt — existing commands must work without sync
-        let dt = handle_meta_command(&db, None, None, "\\dt", scripted_input(), None);
+        let dt = handle_meta_command(
+            &writing_session(&db),
+            None,
+            None,
+            "\\dt",
+            scripted_input(),
+            None,
+            &mut SessionState::default(),
+        );
         assert!(dt.keep_going && dt.ok);
         // Also verify .tables works
-        let tables = handle_meta_command(&db, None, None, ".tables", scripted_input(), None);
+        let tables = handle_meta_command(
+            &writing_session(&db),
+            None,
+            None,
+            ".tables",
+            scripted_input(),
+            None,
+            &mut SessionState::default(),
+        );
         assert!(tables.keep_going && tables.ok);
         // .quit ends the session, successfully
-        let quit = handle_meta_command(&db, None, None, ".quit", scripted_input(), None);
+        let quit = handle_meta_command(
+            &writing_session(&db),
+            None,
+            None,
+            ".quit",
+            scripted_input(),
+            None,
+            &mut SessionState::default(),
+        );
         assert!(!quit.keep_going && quit.ok);
     }
 
@@ -1982,7 +3228,7 @@ mod tests {
 
     #[test]
     fn rt2_repl_schema_display_round_trip_parse() {
-        let db = Database::open_memory();
+        let db = Arc::new(Database::open_memory());
         db.execute(
             "CREATE TABLE repl_rt_sm (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: pending -> [done])",
             &HashMap::new(),
@@ -2001,7 +3247,7 @@ mod tests {
     #[test]
     fn schema_render_includes_retain_and_propagate_round_trip() {
         let make_db = || {
-            let db = Database::open_memory();
+            let db = Arc::new(Database::open_memory());
             db.execute(
                 "CREATE TABLE intentions (id UUID PRIMARY KEY, status TEXT)",
                 &HashMap::new(),
@@ -2199,6 +3445,7 @@ mod tests {
             had_unconfirmed_push: unconfirmed_push,
             trace_enabled: false,
             interactive: false,
+            ..SessionState::default()
         };
         let code = session_exit_code(&session);
         assert_eq!(
@@ -2216,14 +3463,14 @@ mod tests {
     #[test]
     fn interactive_session_errors_do_not_set_the_process_exit_code() {
         for (interactive, expected) in [(true, EXIT_OK), (false, EXIT_ERROR)] {
-            let db = Database::open_memory();
+            let db = Arc::new(Database::open_memory());
             let mut session = SessionState {
                 interactive,
                 ..SessionState::default()
             };
             let mut pending = StatementBuffer::default();
             feed_line(
-                &db,
+                &writing_session(&db),
                 None,
                 None,
                 "SELET * FROM nothing;",
@@ -2231,6 +3478,7 @@ mod tests {
                     interactive,
                     script_line: Some(1),
                     output: OutputOptions::default(),
+                    store_writes_permitted: true,
                 },
                 None,
                 &mut session,
@@ -2254,6 +3502,7 @@ mod tests {
             had_unconfirmed_push: true,
             trace_enabled: false,
             interactive: true,
+            ..SessionState::default()
         };
         assert_eq!(
             session_exit_code(&session),
@@ -2276,6 +3525,7 @@ mod tests {
             had_unconfirmed_push: true,
             trace_enabled: false,
             interactive: false,
+            ..SessionState::default()
         };
         assert_eq!(
             session_exit_code(&unconfirmed),
@@ -2288,6 +3538,7 @@ mod tests {
             had_unconfirmed_push: true,
             trace_enabled: false,
             interactive: false,
+            ..SessionState::default()
         };
         assert_eq!(
             session_exit_code(&errored),

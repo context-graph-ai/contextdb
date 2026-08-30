@@ -120,6 +120,79 @@ impl PauseRegistry {
     }
 }
 
+/// How many candidates an already-built HNSW graph hands one search back.
+///
+/// A live index whose graph returns fewer usable candidates than the caller
+/// asked for is an ordinary regime: on a large graph the search reaches only
+/// part of it, and rows retired since the graph was built drop out of what it
+/// returns. Reaching that regime for real needs tens of thousands of vectors
+/// or a writer racing the reader, neither of which a test can pin. This cap
+/// reproduces it on a small index by handing the search a shortened candidate
+/// list.
+///
+/// The cap changes nothing else: the graph, the stored vectors, the scoring
+/// and the ranking are untouched, and it applies to every search of the capped
+/// index while armed, so both read routes see the identical candidate list and
+/// neither is told what the right answer is.
+#[derive(Debug, Default)]
+pub(crate) struct GraphCandidateCapSlot {
+    cap: Mutex<Option<usize>>,
+}
+
+impl GraphCandidateCapSlot {
+    fn cap(&self) -> Option<usize> {
+        *self.cap.lock()
+    }
+
+    fn set(&self, cap: Option<usize>) {
+        *self.cap.lock() = cap;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct GraphCandidateCapRegistry {
+    slots: Mutex<HashMap<VectorIndexRef, Arc<GraphCandidateCapSlot>>>,
+}
+
+impl GraphCandidateCapRegistry {
+    /// Shorten the candidate list an armed index's graph just produced. Only
+    /// the length changes: the allocation the caller already charged for is
+    /// kept, so memory accounting stays exactly what the search reported.
+    pub(crate) fn cap_graph_candidates(
+        &self,
+        index: &VectorIndexRef,
+        candidates: &mut Vec<(RowId, f32)>,
+    ) {
+        let slot = {
+            let slots = self.slots.lock();
+            slots.get(index).cloned()
+        };
+        if let Some(cap) = slot.and_then(|slot| slot.cap()) {
+            candidates.truncate(cap);
+        }
+    }
+
+    fn slot(&self, index: &VectorIndexRef) -> Arc<GraphCandidateCapSlot> {
+        self.slots
+            .lock()
+            .entry(index.clone())
+            .or_insert_with(|| Arc::new(GraphCandidateCapSlot::default()))
+            .clone()
+    }
+}
+
+/// Restores the index's unshortened graph candidates when dropped, so a capped
+/// index cannot leak its cap into a later search.
+pub struct GraphCandidateCapHandle {
+    slot: Arc<GraphCandidateCapSlot>,
+}
+
+impl Drop for GraphCandidateCapHandle {
+    fn drop(&mut self) {
+        self.slot.set(None);
+    }
+}
+
 pub fn estimate_hnsw_final_bytes_for_test(
     entry_count: usize,
     dimension: usize,
@@ -202,6 +275,18 @@ impl VectorStore {
             .clone();
         let generation = slot.arm();
         MaintenancePauseHandle { slot, generation }
+    }
+
+    /// Cap how many candidates the index's graph hands each search back,
+    /// until the returned handle is dropped.
+    pub fn cap_graph_candidates_for_test(
+        &self,
+        index: &VectorIndexRef,
+        cap: usize,
+    ) -> GraphCandidateCapHandle {
+        let slot = self.graph_candidate_caps().slot(index);
+        slot.set(Some(cap));
+        GraphCandidateCapHandle { slot }
     }
 
     pub fn maybe_pause_ddl_for_test(&self, index: &VectorIndexRef) {

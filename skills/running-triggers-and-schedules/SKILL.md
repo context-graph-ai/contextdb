@@ -38,8 +38,8 @@ the contract, not a missing feature; this skill teaches both halves.
 2. Trigger it: run the `INSERT` (or `UPDATE`) the event type watches for.
 3. Validate with `.events status` — the sink's `delivered` counter must have incremented by
    exactly the number of matching statements you ran.
-4. **If `delivered` stays `0` in a `:memory:` session**, check `event_type`/`table`/`trigger` in
-   `.events status`'s `event_types` array against what you declared — a mismatched table name or
+4. **If `delivered` stays `0` in a `:memory:` session**, check `name`/`table`/`trigger` on
+   `.events status`'s `kind:"event_type"` items against what you declared — a mismatched table name or
    trigger verb (`INSERT` vs `UPDATE`) is the most common miss, not a broken sink.
 
 ### Worked example 1 — an invalidation fires a route, `--json`
@@ -61,7 +61,7 @@ SQL
 {"rows_affected":0}
 {"rows_affected":0}
 {"rows_affected":1}
-{"events":{"event_types":[{"name":"inv_match","table":"invalidations","trigger":"INSERT"}],"routes":[{"event_type":"inv_match","name":"inv_to_slack","sink":"slack"}],"schedules":[],"sinks":[{"callback_registered":true,"delivered":1,"examined":1,"name":"slack","permanent_failures":0,"queued":0,"retried":0,"type":"CALLBACK"}]}}
+{"events_status":{"continuation":null,"has_more":false,"items":[{"kind":"event_type","name":"inv_match","table":"invalidations","trigger":"INSERT"},{"callback_registered":true,"delivered":1,"examined":1,"kind":"sink","name":"slack","permanent_failures":0,"queued":0,"retried":0,"type":"CALLBACK"},{"event_type":"inv_match","kind":"route","name":"inv_to_slack","sink":"slack"}]}}
 ```
 
 `callback_registered:true` and `delivered:1` together are the proof — the CLI's `:memory:` default
@@ -84,6 +84,17 @@ SQL
 ```
 
 ```text
+ok (rows_affected=0)
+ok (rows_affected=0)
+ok (rows_affected=0)
+ok (rows_affected=0)
+ok (rows_affected=0)
+INSERT INTO invalidations (id, reason) VALUES ('11111111-1111-1111-1111-111111111111', 'first');
+ok (rows_affected=1)
+INSERT INTO invalidations (id, reason) VALUES ('22222222-2222-2222-2222-222222222222', 'second');
+ok (rows_affected=1)
+INSERT INTO other (id) VALUES ('33333333-3333-3333-3333-333333333333');
+ok (rows_affected=1)
 Event types:
   inv_match WHEN INSERT ON invalidations
 Sinks:
@@ -92,10 +103,15 @@ Routes:
   inv_to_slack EVENT inv_match TO slack
 Schedules:
   (none)
+has_more: false
 ```
 
 `examined=2, delivered=2` — the insert into `other` correctly produced no event at all (it isn't
 watched by `inv_match`), so it doesn't even count as examined-and-skipped.
+
+The echoed `INSERT ...` lines above each acknowledgement are the CLI's scripted-input affordance:
+in piped, non-`--json` mode it echoes `INSERT` statements before acknowledging them, and echoes
+nothing for `CREATE`/`UPDATE`/`SELECT`. Under `--json` there is no echo at all.
 
 ## Recipe 2 — a schedule that fires on its own
 
@@ -123,11 +139,15 @@ Sinks:
 Routes:
   (none)
 Schedules:
-  heartbeat EVERY 200 MILLISECONDS TX (heartbeat_cb) registered=true fired=4 next_fire_at_ms=1785985880032 last_fire_at_ms=Some(1785985894766)
+  heartbeat EVERY 200 MILLISECONDS TX (heartbeat_cb) registered=true fired=4 next_fire_at_ms=1788021562626 last_fire_at_ms=Some(1788021562426)
+has_more: false
 ```
 
 ~1 second at a 200ms period gives `fired=4` — consistent, not exact, since scheduling has jitter;
-validate `fired > 0` and increasing, not an exact count.
+validate `fired > 0` and increasing, not an exact count. The two timestamps are milliseconds since
+the Unix epoch and always differ by one period: `next_fire_at_ms` is `last_fire_at_ms` plus the
+declared interval, so a sample where `next` precedes `last` is a transcript stitched from two runs,
+not something this command emits.
 
 ### Worked example 2 — the same schedule, `--json`
 
@@ -138,7 +158,7 @@ validate `fired > 0` and increasing, not an exact count.
 
 ```json
 {"rows_affected":0}
-{"events":{"event_types":[],"routes":[],"schedules":[{"callback":"heartbeat_cb","callback_registered":true,"every":"200 MILLISECONDS","fire_count":4,"last_fire_at_ms":1785985899370,"name":"heartbeat","next_fire_at_ms":1785985899570}],"sinks":[]}}
+{"events_status":{"continuation":null,"has_more":false,"items":[{"callback":"heartbeat_cb","callback_registered":true,"every":"200 MILLISECONDS","fire_count":4,"kind":"schedule","last_fire_at_ms":1785985899370,"name":"heartbeat","next_fire_at_ms":1785985899570}]}}
 ```
 
 ## Recipe 3 — the file-backed store: durable queueing, then real delivery
@@ -161,7 +181,7 @@ validate `fired > 0` and increasing, not an exact count.
 ### Worked example 1 — durable queueing, observed and confirmed to survive a restart
 
 ```bash
-contextdb ./events.db --json <<'SQL'
+contextdb ./events.db --write --json <<'SQL'
 CREATE TABLE invalidations (id UUID PRIMARY KEY, reason TEXT);
 CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations;
 CREATE SINK slack TYPE callback;
@@ -177,7 +197,7 @@ SQL
 {"rows_affected":0}
 {"rows_affected":0}
 {"rows_affected":1}
-{"events":{"event_types":[{"name":"inv_match","table":"invalidations","trigger":"INSERT"}],"routes":[{"event_type":"inv_match","name":"inv_to_slack","sink":"slack"}],"schedules":[],"sinks":[{"callback_registered":false,"delivered":0,"examined":0,"name":"slack","permanent_failures":0,"queued":1,"retried":0,"type":"CALLBACK"}]}}
+{"events_status":{"continuation":null,"has_more":false,"items":[{"kind":"event_type","name":"inv_match","table":"invalidations","trigger":"INSERT"},{"callback_registered":false,"delivered":0,"examined":0,"kind":"sink","name":"slack","permanent_failures":0,"queued":1,"retried":0,"type":"CALLBACK"},{"event_type":"inv_match","kind":"route","name":"inv_to_slack","sink":"slack"}]}}
 ```
 
 `callback_registered:false, delivered:0, queued:1` — this is the queued-not-delivered state, and it
@@ -188,8 +208,13 @@ echo ".events status" | contextdb ./events.db --json
 ```
 
 ```json
-{"events":{"event_types":[{"name":"inv_match","table":"invalidations","trigger":"INSERT"}],"routes":[{"event_type":"inv_match","name":"inv_to_slack","sink":"slack"}],"schedules":[],"sinks":[{"callback_registered":false,"delivered":0,"examined":0,"name":"slack","permanent_failures":0,"queued":1,"retried":0,"type":"CALLBACK"}]}}
+{"notice":{"class":"io","detail":{"kind":"read_route","route":"file","snapshot_at":"2026-08-30T02:41:07Z"},"message":"reading the committed snapshot taken at 2026-08-30T02:41:07Z"}}
+{"events_status":{"continuation":null,"has_more":false,"items":[{"kind":"event_type","name":"inv_match","table":"invalidations","trigger":"INSERT"},{"callback_registered":false,"delivered":0,"examined":0,"kind":"sink","name":"slack","permanent_failures":0,"queued":1,"retried":0,"type":"CALLBACK"},{"event_type":"inv_match","kind":"route","name":"inv_to_slack","sink":"slack"}]}}
 ```
+
+Both lines are shown because both reach the terminal. The first is the read-route notice every
+read-only session prints, carrying its own timestamp; it goes to **stderr**, so a stdout-only
+capture — or a `2>/dev/null` — sees just the `events_status` document.
 
 A **fresh process**, same file — `queued:1` survived. This is the durability the contract promises.
 
@@ -198,7 +223,17 @@ A **fresh process**, same file — `queued:1` survived. This is the durability t
 This is the pattern that makes a file-backed store actually deliver, adapted from the shipped test
 suite's own round-trip proof (`crates/contextdb-engine/tests/checkpoint_export_tests.rs`,
 `register_sink`/`register_cron_callback` call sites) — not hand-invented, since the CLI has no verb
-for this and there's no way to execute it from a shell recipe:
+for this and there's no way to execute it from a shell recipe.
+
+This half is a Rust program of your own, not the CLI, so your crate needs the dependencies —
+`contextdb-engine` does not re-export `contextdb-core` or `uuid`:
+
+```toml
+[dependencies]
+contextdb-engine = "1.0.0"
+contextdb-core = "1.0.0"
+uuid = { version = "1", features = ["v4"] }
+```
 
 ```rust
 use contextdb_engine::Database;
@@ -231,16 +266,27 @@ real file.
 
 ## Recipe 4 — `.events status` field reference
 
-Run `.events status --json` and read this shape:
+Run `.events status` in a `--json` session and read this shape — one bounded page whose `items`
+are tagged by `kind`, so a consumer filters rather than indexing four parallel arrays:
 
 ```json
-{"events":{
-  "event_types":[{"name":"...","table":"...","trigger":"INSERT|UPDATE"}],
-  "sinks":[{"name":"...","type":"CALLBACK","callback_registered":true,"examined":N,"delivered":N,"queued":N,"retried":N,"permanent_failures":N}],
-  "routes":[{"name":"...","event_type":"...","sink":"..."}],
-  "schedules":[{"name":"...","every":"...","callback":"...","callback_registered":true,"fire_count":N,"last_fire_at_ms":N,"next_fire_at_ms":N}]
+{"events_status":{
+  "items":[
+    {"kind":"event_type","name":"...","table":"...","trigger":"INSERT|UPDATE"},
+    {"kind":"sink","name":"...","type":"CALLBACK","callback_registered":true,"examined":N,"delivered":N,"queued":N,"retried":N,"permanent_failures":N},
+    {"kind":"route","name":"...","event_type":"...","sink":"..."},
+    {"kind":"schedule","name":"...","every":"...","callback":"...","callback_registered":true,"fire_count":N,"last_fire_at_ms":N,"next_fire_at_ms":N}
+  ],
+  "has_more":false,
+  "continuation":null
 }}
 ```
+
+`items` is a page, not the whole world: it carries as many complete items as fit the declared
+`result_bytes`, and `continuation` is a string exactly when `has_more` is true. Resume with
+`.events status --continue <continuation>` — that continuation is accepted only by
+`.events status`. Pick one kind out with `jq`, e.g.
+`jq '.events_status.items[] | select(.kind == "sink")'`.
 
 - `examined` — every write that matched the event type's table+trigger, whether or not it was
   ultimately delivered.

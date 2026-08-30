@@ -18,7 +18,7 @@ fn f28_scripted_usage_via_stdin_pipe() {
         "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'hello');\nSELECT * FROM t;\n.quit\n",
     )
     .expect("write commands.sql");
-    let output = run_cli_script_from_file(&db_path, &[], &script_path);
+    let output = run_cli_script_from_file(&db_path, &["--write"], &script_path);
     assert!(output.status.success());
     assert!(output_string(&output.stdout).contains("hello"));
 }
@@ -33,7 +33,13 @@ async fn f29_sync_status_shows_meaningful_info_when_connected() {
     let mut server = spawn_server(&server_path, "f29", &sync.bind_spec);
     let output = run_cli_script(
         &db_path,
-        &["--tenant-id", "f29", "--sync-endpoint", &sync.ticket],
+        &[
+            "--write",
+            "--tenant-id",
+            "f29",
+            "--sync-endpoint",
+            &sync.ticket,
+        ],
         ".sync status\n.quit\n",
     );
     stop_child(&mut server);
@@ -52,6 +58,7 @@ fn f30_sync_status_when_endpoint_is_unreachable() {
     let output = run_cli_script(
         &db_path,
         &[
+            "--write",
             "--tenant-id",
             "f30",
             "--sync-endpoint",
@@ -71,7 +78,11 @@ fn f30_sync_status_when_endpoint_is_unreachable() {
 #[test]
 fn f31_unknown_commands_produce_helpful_errors() {
     let tmp = TempDir::new().expect("tempdir");
-    let output = run_cli_script(&temp_db_file(&tmp, "f31.db"), &[], ".bogus\n.quit\n");
+    let output = run_cli_script(
+        &temp_db_file(&tmp, "f31.db"),
+        &["--write"],
+        ".bogus\n.quit\n",
+    );
     assert!(
         !output.status.success(),
         "an unknown command must fail the run"
@@ -94,7 +105,7 @@ fn f31b_cli_works_without_sync_flags_graceful_degradation() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(
         &temp_db_file(&tmp, "f31b.db"),
-        &[],
+        &["--write"],
         "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'ok');\nSELECT * FROM t;\n.quit\n",
     );
     assert!(output.status.success());
@@ -111,7 +122,11 @@ fn f31b_cli_works_without_sync_flags_graceful_degradation() {
 #[test]
 fn f31c_sync_push_without_sync_config_gives_helpful_error() {
     let tmp = TempDir::new().expect("tempdir");
-    let output = run_cli_script(&temp_db_file(&tmp, "f31c.db"), &[], ".sync push\n.quit\n");
+    let output = run_cli_script(
+        &temp_db_file(&tmp, "f31c.db"),
+        &["--write"],
+        ".sync push\n.quit\n",
+    );
     assert!(
         !output.status.success(),
         "a sync ACTION with no sync configured must fail the run"
@@ -131,7 +146,7 @@ fn f31c_sync_status_without_sync_config_still_succeeds() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(
         &temp_db_file(&tmp, "f31c-status.db"),
-        &[],
+        &["--write"],
         ".sync status\n.quit\n",
     );
     assert!(
@@ -151,17 +166,17 @@ fn f31d_cli_exit_codes_are_reliable_for_scripting() {
     let tmp = TempDir::new().expect("tempdir");
     let good = run_cli_script(
         &temp_db_file(&tmp, "f31d-good.db"),
-        &[],
+        &["--write"],
         "CREATE TABLE t (id UUID PRIMARY KEY);\nSELECT * FROM t;\n.quit\n",
     );
     let parse_error = run_cli_script(
         &temp_db_file(&tmp, "f31d-parse.db"),
-        &[],
+        &["--write"],
         "SELET * FROM t;\n.quit\n",
     );
     let missing_table = run_cli_script(
         &temp_db_file(&tmp, "f31d-missing.db"),
-        &[],
+        &["--write"],
         "SELECT * FROM nonexistent;\n.quit\n",
     );
     assert!(good.status.success());
@@ -175,7 +190,7 @@ fn f31e_errors_go_to_stderr_results_to_stdout() {
     let tmp = TempDir::new().expect("tempdir");
     let invalid = run_cli_script(
         &temp_db_file(&tmp, "f31e-invalid.db"),
-        &[],
+        &["--write"],
         "SELET * FROM t;\n.quit\n",
     );
     assert!(output_string(&invalid.stdout).trim().is_empty());
@@ -183,7 +198,7 @@ fn f31e_errors_go_to_stderr_results_to_stdout() {
 
     let valid = run_cli_script(
         &temp_db_file(&tmp, "f31e-valid.db"),
-        &[],
+        &["--write"],
         "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'ok');\nSELECT * FROM t;\n.quit\n",
     );
     assert!(output_string(&valid.stderr).trim().is_empty());
@@ -198,7 +213,7 @@ fn f31f_permission_denied_on_db_path_gives_clear_error() {
     fs::create_dir_all(&denied_dir).expect("create denied dir");
     fs::set_permissions(&denied_dir, fs::Permissions::from_mode(0o555)).expect("chmod denied dir");
     let db_path = denied_dir.join("db.sqlite");
-    let output = run_cli_script(&db_path, &[], ".quit\n");
+    let output = run_cli_script(&db_path, &["--write"], ".quit\n");
     assert!(!output.status.success());
     let stderr = output_string(&output.stderr).to_lowercase();
     assert!(stderr.contains("permission denied") || stderr.contains("failed to open database"));
@@ -210,7 +225,7 @@ fn f31g_select_output_format_is_parseable() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(
         &temp_db_file(&tmp, "f31g.db"),
-        &[],
+        &["--write"],
         "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT, val REAL);\nINSERT INTO t (id, name, val) VALUES ('00000000-0000-0000-0000-000000000001', 'alpha', 1.5);\nSELECT * FROM t;\n.quit\n",
     );
     let stdout = output_string(&output.stdout);
@@ -226,7 +241,7 @@ fn f31h_bfs_depth_exceeded_routes_to_stderr_and_nonzero_exit() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(
         &temp_db_file(&tmp, "f31h.db"),
-        &[],
+        &["--write"],
         "SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,11}(b) COLUMNS (b.id AS b_id));\n.quit\n",
     );
     assert!(
@@ -287,7 +302,7 @@ fn ct01_default_cli_output_for_graph_query_has_no_trace_line() {
     let db_path = temp_db_file(&tmp, "ct01.db");
     let output = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         &graph_trace_fixture_script(graph_trace_default_ordered_query()),
     );
     assert!(output.status.success());
@@ -316,7 +331,8 @@ ok (rows_affected=1)\n\
 +--------------------------------------+\n\
 | 00000000-0000-0000-0000-000000000002 |\n\
 | 00000000-0000-0000-0000-000000000003 |\n\
-+--------------------------------------+\n";
++--------------------------------------+\n\
+(2 rows)\n";
     assert_eq!(stdout, expected);
     assert!(
         !stdout.lines().any(|line| line.starts_with("trace: ")),
@@ -330,7 +346,7 @@ fn ct02_trace_on_graph_pinned_match_reports_adjacency_probe_rows_examined() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "ct02.db");
     let script = graph_trace_fixture_script(&format!(".trace on\n{}", graph_trace_default_query()));
-    let output = run_cli_script(&db_path, &[], &script);
+    let output = run_cli_script(&db_path, &["--write"], &script);
     assert!(output.status.success());
     let stdout = output_string(&output.stdout);
     assert!(
@@ -346,7 +362,7 @@ fn ct03_trace_on_unpinned_graph_match_reports_edges_scan() {
     let db_path = temp_db_file(&tmp, "ct03.db");
     let script =
         graph_trace_fixture_script(&format!(".trace on\n{}", graph_trace_unpinned_query()));
-    let output = run_cli_script(&db_path, &[], &script);
+    let output = run_cli_script(&db_path, &["--write"], &script);
     assert!(output.status.success());
     let stdout = output_string(&output.stdout);
     assert!(
@@ -368,7 +384,7 @@ INSERT INTO things (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'm
 .trace on\n\
 SELECT id FROM things WHERE name = 'hit';\n\
 .quit\n";
-    let output = run_cli_script(&db_path, &[], script);
+    let output = run_cli_script(&db_path, &["--write"], script);
     assert!(output.status.success());
     let stdout = output_string(&output.stdout);
     assert!(
@@ -387,7 +403,7 @@ fn ct05_trace_off_disables_subsequent_trace_lines() {
         graph_trace_default_query(),
         graph_trace_default_query()
     ));
-    let output = run_cli_script(&db_path, &[], &script);
+    let output = run_cli_script(&db_path, &["--write"], &script);
     assert!(output.status.success());
     let stdout = output_string(&output.stdout);
     assert_eq!(
@@ -405,7 +421,7 @@ fn ct05_trace_off_disables_subsequent_trace_lines() {
 fn ct06_help_lists_trace_command() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "ct06.db");
-    let output = run_cli_script(&db_path, &[], ".help\n.quit\n");
+    let output = run_cli_script(&db_path, &["--write"], ".help\n.quit\n");
     assert!(output.status.success());
     let stdout = output_string(&output.stdout);
     assert!(
@@ -420,7 +436,11 @@ fn ct07_scripted_plan_error_exits_nonzero_without_panic() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "ct07.db");
     let bad_query = "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS (b.bogus AS t))";
-    let output = run_cli_script(&db_path, &[], &graph_trace_fixture_script(bad_query));
+    let output = run_cli_script(
+        &db_path,
+        &["--write"],
+        &graph_trace_fixture_script(bad_query),
+    );
     assert!(
         !output.status.success(),
         "plan errors must fail scripted CLI sessions"
@@ -441,7 +461,7 @@ fn ct07_scripted_plan_error_exits_nonzero_without_panic() {
 fn ct08_scripted_parse_error_still_exits_nonzero() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "ct08.db");
-    let output = run_cli_script(&db_path, &[], "SELET * FROM things\n.quit\n");
+    let output = run_cli_script(&db_path, &["--write"], "SELET * FROM things\n.quit\n");
     assert!(!output.status.success());
     let combined = cli_output(&output).to_lowercase();
     assert!(
@@ -457,7 +477,7 @@ fn ct09_scripted_explain_parse_error_exits_nonzero() {
     let db_path = temp_db_file(&tmp, "ct09.db");
     let output = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         "CREATE TABLE t (id UUID PRIMARY KEY);\n.explain SELET * FROM t\n.quit\n",
     );
     assert!(
@@ -484,7 +504,7 @@ fn ct10_trace_on_sorted_graph_query_reports_adjacency_probe_not_sort_only() {
         ".trace on\n{}",
         graph_trace_default_ordered_query()
     ));
-    let output = run_cli_script(&db_path, &[], &script);
+    let output = run_cli_script(&db_path, &["--write"], &script);
     assert!(output.status.success());
     let stdout = output_string(&output.stdout);
     assert!(
@@ -502,7 +522,7 @@ fn ct10_trace_on_sorted_graph_query_reports_adjacency_probe_not_sort_only() {
 fn ct11_scripted_explain_without_sql_exits_nonzero() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "ct11.db");
-    let output = run_cli_script(&db_path, &[], ".explain\n.quit\n");
+    let output = run_cli_script(&db_path, &["--write"], ".explain\n.quit\n");
     assert!(
         !output.status.success(),
         ".explain without SQL must fail scripted CLI sessions"
@@ -520,7 +540,7 @@ fn ct12_scripted_explain_shows_runtime_index_trace() {
     let db_path = temp_db_file(&tmp, "ct12.db");
     let output = run_cli_script(
         &db_path,
-        &[],
+        &["--write"],
         "CREATE TABLE t (id UUID PRIMARY KEY, a INTEGER);\n\
          CREATE INDEX idx_a ON t (a);\n\
          INSERT INTO t (id, a) VALUES ('00000000-0000-0000-0000-000000000001', 7);\n\
@@ -570,7 +590,7 @@ fn f116_cli_renders_legacy_vector_store_error_with_actionable_guidance() {
         .join("legacy_vector_store_v0_3_4.db");
     std::fs::copy(&fixture, &legacy_path).expect("copy fixture");
 
-    let output = run_cli_script(&legacy_path, &[], ".quit\n");
+    let output = run_cli_script(&legacy_path, &["--write"], ".quit\n");
     assert!(
         !output.status.success(),
         "CLI must exit non-zero on legacy detection"
@@ -603,7 +623,7 @@ fn f117_cli_renders_dimension_mismatch_with_index_identity() {
     let script = "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4));\n\
                   INSERT INTO evidence VALUES ('11111111-1111-1111-1111-111111111111', [0.1, 0.2, 0.3, 0.4, 0.5]);\n\
                   .quit\n";
-    let output = run_cli_script(&db_path, &[], script);
+    let output = run_cli_script(&db_path, &["--write"], script);
     assert!(
         !output.status.success(),
         "CLI must exit non-zero for vector dimension mismatch"
@@ -643,7 +663,7 @@ fn f118_cli_renders_unknown_vector_index_error() {
     let script = "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4));\n\
                   SELECT id FROM evidence ORDER BY vector_unknown <=> '[0,0,0,0]' LIMIT 1;\n\
                   .quit\n";
-    let output = run_cli_script(&db_path, &[], script);
+    let output = run_cli_script(&db_path, &["--write"], script);
     assert!(
         !output.status.success(),
         "CLI must exit non-zero for unknown vector index"
@@ -676,7 +696,7 @@ fn f117b_cli_renders_memory_budget_exceeded_with_index_tag() {
          ('11111111-1111-1111-1111-111111111111', [{vector_literal}]);\n\
          .quit\n"
     );
-    let output = run_cli_script(&db_path, &[], &script);
+    let output = run_cli_script(&db_path, &["--write"], &script);
     assert!(
         !output.status.success(),
         "CLI must exit non-zero for vector memory budget exhaustion"
@@ -707,7 +727,7 @@ fn f117c_cli_renders_parse_error_with_positional_hint() {
                   CREATE TABLE bad (id UUID PRIMARY KEY, v VECTOR(4) WITH (quantization = 'NOPE'));\n\
                   CREATE TABLE good2 (id UUID PRIMARY KEY);\n\
                   .quit\n";
-    let output = run_cli_script(&db_path, &[], script);
+    let output = run_cli_script(&db_path, &["--write"], script);
     assert!(
         !output.status.success(),
         "CLI must exit non-zero for parse errors"
@@ -1046,7 +1066,7 @@ fn f119_readme_two_vector_walkthrough_through_cli() {
                   SHOW VECTOR_INDEXES;\n\
                   SELECT id FROM evidence ORDER BY vector_text <=> '[1,0,0,0]' LIMIT 1;\n\
                   .quit\n";
-    let output = run_cli_script(&db_path, &[], script);
+    let output = run_cli_script(&db_path, &["--write"], script);
     assert!(
         output.status.success(),
         "CLI must succeed on README walkthrough; stderr: {}",

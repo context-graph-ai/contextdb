@@ -1,5 +1,5 @@
 //! `contextdb-cli reset` (explicit destructive flag, recreates a
-//! wedged/corrupt root) and `contextdb-cli repair` (reports what is
+//! wedged/corrupt root) and `contextdb-cli diagnose` (reports what is
 //! salvageable, conservative — never modifies).
 //!
 //! `make_truncated_store` reproduces the same real corruption shape as
@@ -67,33 +67,33 @@ fn run(
 }
 
 // ---------------------------------------------------------------------------
-// repair: conservative, reports salvageability, never modifies.
+// diagnose: conservative, reports salvageability, never modifies.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn repair_reports_salvageability_without_modifying_the_corrupt_store() {
-    let dir = scratch_dir("repair");
+fn diagnose_reports_salvageability_without_modifying_the_corrupt_store() {
+    let dir = scratch_dir("diagnose");
     let db_path = dir.path().join("corrupt.db");
     make_truncated_store(&db_path);
     let before = read_bytes(&db_path);
 
-    let (_status, stdout, stderr) = run("repair", &[], &db_path);
+    let (_status, stdout, stderr) = run("diagnose", &[], &db_path);
 
     assert_eq!(
         read_bytes(&db_path),
         before,
-        "repair is conservative: it must NEVER modify the store it inspects"
+        "diagnose is conservative: it must NEVER modify the store it inspects"
     );
     let combined = format!("{stdout}{stderr}");
     assert!(
         combined.contains("corrupt.db"),
-        "repair's report must name the file it inspected. combined output:\n{combined}"
+        "diagnose's report must name the file it inspected. combined output:\n{combined}"
     );
     assert!(
         combined.to_lowercase().contains("salvage")
             || combined.to_lowercase().contains("corrupt")
             || combined.to_lowercase().contains("truncat"),
-        "repair's report must classify what it found (salvageable / corrupt / truncated), \
+        "diagnose's report must classify what it found (salvageable / corrupt / truncated), \
          not just fail generically. combined output:\n{combined}"
     );
 }

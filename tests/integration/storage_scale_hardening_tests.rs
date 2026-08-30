@@ -1705,13 +1705,8 @@ fn ssh_c1_alter_drop_column_cascade_cleans_storage() {
     let path = tmp.path().join("drop_column.redb");
     {
         let db = Database::open(&path).unwrap();
-        exec(
-            &db,
-            "CREATE TABLE t (id UUID PRIMARY KEY, col INTEGER, col2 INTEGER)",
-        );
-        exec(&db, "CREATE INDEX idx_a ON t (col)");
-        exec(&db, "CREATE INDEX idx_ab ON t (col, col2)");
         seed_t_for_identity(&db);
+        exec(&db, "CREATE INDEX idx_ab ON t (col, col2)");
         let before = db.__introspect_indexes_total_entries();
         exec(&db, "ALTER TABLE t DROP COLUMN col CASCADE");
         let after = db.__introspect_indexes_total_entries();

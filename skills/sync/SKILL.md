@@ -58,43 +58,18 @@ server still also prints the same ticket and dial command to stdout, so redirect
 above) or you've recreated the exact log-hazard this section warns about. **The ticket is sensitive
 bearer enrollment material, not a public identifier** — anyone who obtains it can enroll and sync
 with this hub until the hub's identity changes, so keep `./hub.ticket` (and any other file or log a
-ticket lands in) out of version control and restrict its file permissions. Two other modes, when
-that shape doesn't fit:
+ticket lands in) out of version control and restrict its file permissions.
 
-```bash
-# One JSON object with the ticket and a ready-to-paste dial command; then serves.
-contextdb-server --db-path ./hub.db --tenant-id demo --json
-# {"dial_command":"contextdb <client-db-path> --sync-endpoint endpointab... --tenant-id demo",
-#  "endpoint":"474cc91e...","enrollment_ticket":"endpointab...","tenant_id":"demo"}
-
-# Print the bare ticket and EXIT without serving — for reading an existing hub's identity.
-contextdb-server --db-path ./hub.db --tenant-id demo --show-ticket
-```
-
-With no flags it prints the ticket plus the dial command as two plain lines, at any log level.
-
-**Tenant.** `--tenant-id` is a sync namespace: every client and the hub sharing the same tenant id
-replicate with each other. It is *not* the same axis as a context id, which scopes which rows are
-visible inside one store. One tenant owns many contexts.
-
-**Restart durability.** The hub keeps its identity in `<db-path>.fabric-identity.key` next to the
-database (here `hub.db.fabric-identity.key`) and remembers its chosen port in
-`<identity-file>.port`, so already-issued tickets keep working across restarts. **Back that key up
-like a credential and never commit it** — losing it changes the node's identity and invalidates
-every ticket. Add `*.fabric-identity.key` and its `.port` sibling to `.gitignore`.
-
-**If a ticket leaks, rotate it** the same way: remove the fabric identity key and restart the hub.
-That changes the hub's identity and invalidates every ticket issued under the old one, including
-the leaked one — there is no per-ticket revocation, since the ticket carries no separate identity
-of its own. Binding to a different port does **not** rotate identity or revoke enrollment — the
-identity loads exclusively from the key file — so it is not a substitute for re-keying.
+Two other hub-start modes, what a tenant is and is not, and how hub identity survives a restart
+(and how to rotate it after a leak) are in [Depth](#depth) — none of them is needed to finish the
+checklist.
 
 ## 2. Enroll an edge and push
 
 Each edge gets its own database file and the same ticket.
 
 ```bash
-contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-a.db --write --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
 CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);
 INSERT INTO items (id, name) VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'from edge A');
 .sync push
@@ -102,8 +77,14 @@ SQL
 ```
 
 ```text
+ok (rows_affected=0)
+INSERT INTO items (id, name) VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'from edge A');
+ok (rows_affected=1)
 Pushed: 1 applied, 0 skipped, 0 conflicts
 ```
+
+Piped, non-`--json` sessions echo each `INSERT`'s own text before running it — that second line is
+the CLI, not your shell. [`docs/cli.md`](../../docs/cli.md#non-interactive-mode) owns that contract.
 
 The `CREATE TABLE` replicates too — edge B's schema is created on pull — but DDL does not add to
 the row tally, so the count reads `1`, not `2`.
@@ -115,7 +96,7 @@ than the ticket you pasted. That is expected, not a bug.
 ## 3. Pull it onto another edge
 
 ```bash
-contextdb ./edge-b.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-b.db --write --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
 .sync pull
 SELECT id, name FROM items;
 SQL
@@ -128,6 +109,7 @@ Pulled: 1 applied, 0 skipped, 0 conflicts
 +--------------------------------------+-------------+
 | aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa | from edge A |
 +--------------------------------------+-------------+
+(1 rows)
 ```
 
 Push from edge B and pull on edge A for the other direction; both edges then hold the same rows,
@@ -136,24 +118,26 @@ converged through the hub.
 ### Worked example 2 — the other direction, machine-readable
 
 ```bash
-contextdb ./edge-b.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-b.db --write --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
 INSERT INTO items (id, name) VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'from edge B');
 .sync push
 SQL
 ```
 
 ```text
+INSERT INTO items (id, name) VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'from edge B');
+ok (rows_affected=1)
 Pushed: 1 applied, 0 skipped, 0 conflicts
 ```
 
 ```bash
 printf '.sync pull\nSELECT id, name FROM items ORDER BY name;\n' \
-  | contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" --json
+  | contextdb ./edge-a.db --write --tenant-id demo --sync-endpoint "$TICKET" --json
 ```
 
 ```json
 {"sync_pull":{"applied_rows":1,"conflicts":[],"outcome":"applied","pull_pages_read":1,"pull_pages_read_this_pull":1,"skipped_rows":0}}
-[{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","name":"from edge A"},{"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","name":"from edge B"}]
+{"result":{"columns":["id","name"],"rows":[{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","name":"from edge A"},{"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","name":"from edge B"}]}}
 ```
 
 Validate: both edges now read 2 rows. **If a pull reports `applied_rows:0` and you expected a
@@ -163,18 +147,23 @@ waiting for may not have been pushed from its origin edge yet.
 ## 4. Check state
 
 ```bash
-printf '.sync status\n' | contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" --json
+printf '.sync status\n' | contextdb ./edge-a.db --write --tenant-id demo --sync-endpoint "$TICKET" --json
 ```
 ```json
-{"sync":{"configured":true,"tenant":"demo","endpoint":"iroh:?to=...","transport":"connected","database_lsn":42,"push_watermark":40,"pull_watermark":38,"committed_txid":17,"pull_pages_read":1,"pull_in_progress":false}}
+{"sync":{"configured":true,"tenant":"demo","endpoint":"iroh:?to=...","transport":"connected","database_lsn":42,"push_watermark":40,"pull_watermark":38,"committed_txid":17,"pull_pages_read":0,"pull_in_progress":false}}
 ```
 
 An **LSN** is a position in the change log. The push and pull watermarks say how far each direction
 has progressed — the instrument for diagnosing lag. They arrive as JSON numbers, so you can compare
-them without parsing. `pull_pages_read` is a cumulative, monotonically increasing count of pages
-this client has read across every pull it has issued — a script polling it twice tells a genuinely
-working catch-up rescan from a stuck one, distinct from the watermark, which by contract only moves
-once a pull fully completes. `pull_in_progress` turns `true` only while a pull issued through this
+them without parsing. `pull_pages_read` counts pages read across every pull issued through **one client handle** —
+one `SyncClient`, which for the CLI means one process. It starts at `0` when the handle is
+created and is never persisted, so a fresh `contextdb …` invocation reports `0` again no matter
+how much that store has pulled before. Poll it **within a single session** (or a single embedded
+handle) and a rising count tells a genuinely working catch-up rescan from a stuck one, distinct
+from the watermark, which by contract only moves once a pull fully completes. Comparing the value
+across two separate invocations is meaningless — it would read a healthy edge as stuck. To judge
+liveness across invocations, compare `push_watermark` / `pull_watermark` instead, which are
+durable store state. `pull_in_progress` turns `true` only while a pull issued through this
 same `SyncClient` handle is actively running; a single CLI session blocks for the whole duration of
 its own `.sync pull` (one statement at a time, one process), so running `.sync status` before and
 after a pull in the same session only ever observes before/after, never `true` mid-pull — that
@@ -207,7 +196,7 @@ nothing and refused nothing, so it is counted **nowhere** — not applied, not s
 conflict. The everyday case is pulling right after you pushed:
 
 ```bash
-contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-a.db --write --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
 .sync push
 .sync pull
 SQL
@@ -236,7 +225,7 @@ outcome is unknown, not failed. It does **not** mean declined, and it does not m
 **Re-pushing is safe and idempotent** — the next `.sync push` reconciles cleanly.
 
 ```bash
-printf '.sync push\n' | contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" --json
+printf '.sync push\n' | contextdb ./edge-a.db --write --tenant-id demo --sync-endpoint "$TICKET" --json
 case $? in
   0) echo "pushed" ;;
   1) echo 'push failed definitively — inspect the error envelope on stderr (class: sync)' ;;
@@ -274,22 +263,26 @@ assemble it turn-by-turn from the push/pull pattern above.
 ### Worked example — hub, two edges, delete, restart
 
 ```bash
-contextdb-server --db-path ./hub2.db --tenant-id lifecycle --ticket-file ./hub.ticket &
+contextdb-server --db-path ./hub2.db --tenant-id lifecycle --ticket-file ./hub.ticket \
+  > ./hub2.log 2>&1 &
 until [ -s ./hub.ticket ]; do sleep 0.2; done
 TICKET="$(cat ./hub.ticket)"
 
-contextdb ./edge-x.db --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-x.db --write --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
 CREATE TABLE records (id UUID PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST;
 INSERT INTO records (id, body) VALUES ('cccccccc-3333-4ccc-8ccc-cccccccccccc', 'will be deleted');
 .sync push
 SQL
 ```
 ```text
+ok (rows_affected=0)
+INSERT INTO records (id, body) VALUES ('cccccccc-3333-4ccc-8ccc-cccccccccccc', 'will be deleted');
+ok (rows_affected=1)
 Pushed: 1 applied, 0 skipped, 0 conflicts
 ```
 
 ```bash
-contextdb ./edge-y.db --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-y.db --write --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
 .sync pull
 SELECT COUNT(*) AS n FROM records;
 SQL
@@ -301,20 +294,22 @@ Pulled: 1 applied, 0 skipped, 0 conflicts
 +---+
 | 1 |
 +---+
+(1 rows)
 ```
 
 ```bash
-contextdb ./edge-x.db --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-x.db --write --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
 DELETE FROM records WHERE id = 'cccccccc-3333-4ccc-8ccc-cccccccccccc';
 .sync push
 SQL
 ```
 ```text
+ok (rows_affected=1)
 Pushed: 1 applied, 0 skipped, 0 conflicts
 ```
 
 ```bash
-contextdb ./edge-y.db --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-y.db --write --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
 .sync pull
 SELECT COUNT(*) AS n FROM records;
 SQL
@@ -326,16 +321,17 @@ Pulled: 1 applied, 0 skipped, 0 conflicts
 +---+
 | 0 |
 +---+
+(1 rows)
 ```
 
 Now the restart — a **fresh process**, same file:
 
 ```bash
 echo "SELECT COUNT(*) AS n FROM records;" \
-  | contextdb ./edge-y.db --tenant-id lifecycle --sync-endpoint "$TICKET" --json
+  | contextdb ./edge-y.db --write --tenant-id lifecycle --sync-endpoint "$TICKET" --json
 ```
 ```json
-[{"n":0}]
+{"result":{"columns":["n"],"rows":[{"n":0}]}}
 ```
 
 The delete survived the restart — `n` is `0`, which is what step 5 validates. **The same fresh
@@ -345,11 +341,7 @@ which the hub already converged on as deleted; nothing to do."}}`. This is the C
 final-push-on-exit (§6) re-offering the tombstone edge Y just pulled; the hub's replay guard still
 refuses the re-offer internally, but the CLI now recognizes that specific refusal as benign
 convergence (both sides already agree on the delete) and reports it as a notice rather than a
-failure — exit code stays `0`. Confirmed live against tip debug binaries
-(`target/debug/contextdb`); if you observe exit `1` with a `strict received row ... replays a
-lineage terminated by an accepted delete` **error** instead of this notice, you're on an older
-binary that predates this fix — the data is still correct either way (`n` is genuinely `0`), only
-the exit code differs.
+failure — exit code stays `0`.
 
 ### Contrast: the same sequence under the default `KEEP FIRST` (what NOT to declare here)
 
@@ -360,6 +352,7 @@ Pulled: 0 applied, 1 skipped, 0 conflicts
 +---+
 | 1 |
 +---+
+(1 rows)
 ```
 
 Same commands, only the table's conflict policy differs (`KEEP FIRST`, the default, instead of
@@ -389,7 +382,7 @@ Two independent axes, both per table.
 | `SYNC CONFLICT KEEP LATEST` | the later accepted value replaces it |
 
 ```bash
-contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-a.db --write --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
 CREATE TABLE audit_log (id UUID PRIMARY KEY, entry TEXT) IMMUTABLE SYNC OFF;
 CREATE TABLE items (id UUID PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST;
 SQL
@@ -408,7 +401,7 @@ leaves this machine; the refusal names both fixes if you meet it.
 ## Auto-sync
 
 `.sync auto on` makes INSERT/UPDATE/DELETE trigger a debounced background push (500ms by default,
-tunable with `--sync-debounce-ms` / `CONTEXTDB_SYNC_DEBOUNCE_MS`). A failed background push is
+tunable with `--sync-debounce-ms`). A failed background push is
 reported on stderr and retried, never silently dropped. On exit the CLI always performs a final
 push regardless of the auto-sync setting — which is why exit `3` can surface from a session that
 never typed `.sync push`.
@@ -416,9 +409,9 @@ never typed `.sync push`.
 ## Local-only mode
 
 With no `--tenant-id`, sync is not configured. `.sync status` and `.sync auto` **answer** the
-question and exit `0`; the action subcommands (`push`, `pull`, `reconnect`, `destination`,
-`direction`, `policy`) print to stderr and exit `1` — because the action did not happen, and a
-scripted `push && shutdown` must never read "not configured" as "pushed".
+question and exit `0`; the action subcommands (`push`, `pull`, `reconnect`, `destination`) print
+to stderr and exit `1` — because the action did not happen, and a scripted `push && shutdown` must
+never read "not configured" as "pushed".
 
 ## Crossing networks
 
@@ -433,12 +426,19 @@ feature.**
 contextdb-server --db-path ./hub.db --tenant-id demo --sync-endpoint "iroh:?identity=./hub.db.fabric-identity.key&relay=n0" --ticket-file ./hub.ticket
 ```
 
-Address lookup is separately opt-in, so a ticket survives an IP change:
+Address lookup is separately opt-in, so a ticket survives an IP change. `lookup=mdns` is also a
+build-time opt-in and is **off in the released binaries** — a default build refuses it with
+`lookup=mdns needs a build with the \`mdns\` cargo feature`. Build both sides with it first:
+
+```bash
+cargo build --release -p contextdb-server --features mdns
+cargo build --release -p contextdb-cli --features contextdb-engine/mdns
+```
 
 ```bash
 # hub and edges on one LAN, immune to DHCP changes, still zero external infrastructure
 contextdb-server --db-path ./hub.db --tenant-id prod --sync-endpoint "iroh:?identity=./hub.db.fabric-identity.key&lookup=mdns"
-contextdb ./edge.db --tenant-id prod --sync-endpoint "iroh:?to=$TICKET&lookup=mdns"
+contextdb ./edge.db --write --tenant-id prod --sync-endpoint "iroh:?to=$TICKET&lookup=mdns"
 ```
 
 `publish=` announces this node's addresses (`n0` or a self-hosted pkarr relay); `lookup=` resolves
@@ -449,9 +449,49 @@ A typo in an endpoint spec errors loudly and names the accepted parameters.
 
 ## Depth
 
-- Full flag, meta-command and document reference: [`docs/cli.md`](../../docs/cli.md#sync-commands)
+### Other hub-start modes
+
+```bash
+# One JSON object with the ticket and a ready-to-paste dial command; then serves.
+contextdb-server --db-path ./hub.db --tenant-id demo --json
+# {"dial_command":"contextdb <client-db-path> --write --sync-endpoint endpointab... --tenant-id demo",
+#  "endpoint":"474cc91e...","enrollment_ticket":"endpointab...","tenant_id":"demo"}
+
+# Print the bare ticket and EXIT without serving — for reading an existing hub's identity.
+contextdb-server --db-path ./hub.db --tenant-id demo --show-ticket
+```
+
+With no flags it prints the ticket plus the dial command as two plain lines, at any log level.
+Redirect stdout/stderr to a file rather than leaving them attached to your shell — run a bare `&`
+verbatim over ssh and the unredirected output both leaks the ticket into whatever is capturing the
+session and holds the ssh session open.
+
+### Tenant is not context
+
+`--tenant-id` is a sync namespace: every client and the hub sharing the same tenant id replicate
+with each other. It is *not* the same axis as a context id, which scopes which rows are visible
+inside one store. One tenant owns many contexts.
+
+### Hub identity, restarts, and ticket rotation
+
+The hub keeps its identity in `<db-path>.fabric-identity.key` next to the database (here
+`hub.db.fabric-identity.key`) and remembers its chosen port in `<identity-file>.port`, so
+already-issued tickets keep working across restarts. **Back that key up like a credential and never
+commit it** — losing it changes the node's identity and invalidates every ticket. Add
+`*.fabric-identity.key` and its `.port` sibling to `.gitignore`.
+
+**If a ticket leaks, rotate it** the same way: remove the fabric identity key and restart the hub.
+That changes the hub's identity and invalidates every ticket issued under the old one, including
+the leaked one — there is no per-ticket revocation, since the ticket carries no separate identity
+of its own. Binding to a different port does **not** rotate identity or revoke enrollment — the
+identity loads exclusively from the key file — so it is not a substitute for re-keying.
+
+### Reference
+
+
+- Full flag, meta-command and document reference: [`docs/cli.md`](../../docs/cli.md#sync-commands-write-sessions)
 - Protocol, watermarks, conflict semantics, tenants vs contexts: [`docs/architecture.md`](../../docs/architecture.md#sync)
-- Two-machine walkthrough: [`docs/getting-started.md`](../../docs/getting-started.md#sync-across-two-machines)
+- Two-machine walkthrough: [`docs/sync-two-machines.md`](../../docs/sync-two-machines.md)
 
 ## Next
 

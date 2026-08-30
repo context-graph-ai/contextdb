@@ -475,7 +475,7 @@ CREATE ROUTE inv_to_audit EVENT inv_match TO audit;
 INSERT INTO invalidations (id, severity, reason) VALUES ('00000000-0000-0000-0000-000000000001', 'warning', 'queue-me');
 DELETE FROM invalidations WHERE id = '00000000-0000-0000-0000-000000000001';
 ";
-    let out = run_cli_script(&path, &[], script);
+    let out = run_cli_script(&path, &["--write"], script);
     assert!(
         out.status.success(),
         "child process should seed queued event; stderr={}",
@@ -1147,7 +1147,7 @@ INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-00000000
 DELETE FROM secrets WHERE id = '00000000-0000-0000-0000-000000000001';
 DELETE FROM secrets WHERE id = '00000000-0000-0000-0000-000000000002';
 ";
-    let out = run_cli_script(&path, &[], script);
+    let out = run_cli_script(&path, &["--write"], script);
     assert!(
         out.status.success(),
         "child process should seed durable ACL events; stderr={}",
@@ -1255,7 +1255,7 @@ INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-00000000
 DROP TABLE secrets;
 DROP TABLE acl_grants;
 ";
-    let out = run_cli_script(&path, &[], script);
+    let out = run_cli_script(&path, &["--write"], script);
     assert!(
         out.status.success(),
         "child process should seed durable ACL event and drop source schema; stderr={}",
@@ -1306,7 +1306,7 @@ INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000
 INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'granted', '00000000-0000-0000-0000-00000000000a');
 INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000002', 'denied', '00000000-0000-0000-0000-00000000000b');
 ";
-    let out = run_cli_script(&path, &[], script);
+    let out = run_cli_script(&path, &["--write"], script);
     assert!(
         out.status.success(),
         "child process should seed durable ACL events; stderr={}",
@@ -2361,7 +2361,7 @@ CREATE ROUTE r EVENT inv_match TO slack;
 INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000001', 'warning', '00000000-0000-0000-0000-00000000000a');
 INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000002', 'warning', '00000000-0000-0000-0000-00000000000b');
 ";
-    let out = run_cli_script(&path, &[], script);
+    let out = run_cli_script(&path, &["--write"], script);
     assert!(
         out.status.success(),
         "child process should seed durable scoped events; stderr={}",

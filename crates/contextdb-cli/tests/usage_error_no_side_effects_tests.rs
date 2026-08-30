@@ -78,14 +78,19 @@ fn usage_error_before_sync_endpoint_check_does_not_create_the_database() {
 
 // (c) Positive control — a VALID invocation still creates the
 // database. Pins that the contract in the test above must not stop a normal run
-// from creating a fresh file.
+// from creating a fresh file. Creation is what `--write` authorizes: a bare
+// path reads, and reading a store that is not there refuses without creating
+// anything.
 #[test]
 fn valid_invocation_still_creates_the_database() {
     let dir = unique_temp_dir("cli-valid");
     let db_path = dir.join("valid.db");
     assert!(!db_path.exists(), "the path must start out absent");
 
-    let (code, stdout, stderr) = run_cli(&[db_path.to_str().expect("utf8 path")], ".quit\n");
+    let (code, stdout, stderr) = run_cli(
+        &[db_path.to_str().expect("utf8 path"), "--write"],
+        ".quit\n",
+    );
     assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         db_path.exists(),
