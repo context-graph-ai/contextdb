@@ -129,6 +129,9 @@ Every meta-command emits a document whose top-level key names its payload:
 | `.cursor close` | `{"cursor":{"closed":true}}` |
 | `.owner status` | `{"owner":{"state":…,…}}` (see [Owner Inspection](#owner-inspection-owner-status)) |
 | `.trace on\|off` | `{"trace":"on"}` / `{"trace":"off"}` |
+| `.sync policy [FOR table]` | `{"result":{"columns":[…],"rows":[{…}]}}` — persisted tenant policy |
+| `.sync bindings` | `{"result":{"columns":[…],"rows":[{…}]}}` — persisted authenticated bindings |
+| `.sync outcomes FOR table [WHERE ...] [LIMIT n OFFSET m]` | `{"result":{"columns":[…],"rows":[{…}]}}` — durable unit outcomes |
 | `.sync status` (read session) | `{"sync_status":{"message":"no sync in this session — …"}}` <!-- enforced by: read_cli_journeys_session_shape::read_mode_sync_status_reports_the_session_and_disclaims_the_store --> |
 | `.sync push` / `.sync pull` / `.sync reconnect` / `.sync destination` / `.sync auto` (write session) | The shipped sync documents (`{"sync":…}`, `{"sync_push":…}`, `{"sync_pull":…}`, …) |
 | `.help` | `{"help":["line", …]}`, on stderr |
@@ -690,3 +693,18 @@ teaching its recovery: <!-- enforced by: read_cli_journeys_machine_surface::ever
 | `direct_read_requires_writer` | io | Safe decode found state needing a corrective writable open; close holders, rerun with `--write`. |
 | `operation_already_completed` | io | The local-channel operation had already produced its outcome before this poll reached it — an internal race guard, not a condition a caller triggers by any documented action. |
 | `owner_route_unsupported` | io | The requested inspection kind is not implemented over the live owner's channel (today: image-state metadata); the refusal names the kind and says a direct file session answers it once no writer holds the store. |
+
+
+### Custody metadata as JSON Lines
+
+`contextdb --json database.db` accepts `.sync policy`, `.sync bindings`, and
+`.sync outcomes FOR events` in an ordinary read session. Each answer uses the existing
+`{"result":{"columns":[...],"rows":[{...}]}}` JSON Lines envelope. Policies expose effective clauses,
+version and digest; bindings add authenticated tenant and peer identities; outcomes expose root
+reference, unit digest, verdict, cause, identities, acceptance position, and conflicts. These reads
+need no `--tenant-id`, do not connect to a hub, and change no journal or watermark. A Context-,
+scope-label-, or principal-constrained handle receives the typed inspection refusal.
+
+Use `--write` for `DECLARE TENANT TABLE POLICY`, `DISCARD`, or `PURGE`. The policy and erasure SQL
+contracts, including node-local predicate delivery and transaction-local discard, are in
+[the query language reference](query-language.md#tenant-policy-and-event-custody).

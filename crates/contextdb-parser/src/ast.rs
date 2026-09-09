@@ -7,6 +7,7 @@ pub enum Statement {
     DropIndex(DropIndex),
     Insert(Insert),
     Purge(Purge),
+    Discard(Discard),
     Delete(Delete),
     Update(Update),
     Select(SelectStatement),
@@ -19,6 +20,12 @@ pub enum Statement {
     ShowDiskLimit,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
+    DeclareTenantTablePolicy(DeclareTenantTablePolicy),
+    ShowTenantTablePolicy {
+        table: Option<String>,
+    },
+    ShowSyncBindings,
+    ShowDeliveryOutcomes(ShowDeliveryOutcomes),
     CreateSchedule {
         name: String,
         every: String,
@@ -346,6 +353,28 @@ pub struct CreateTable {
     /// `None` means it named no policy, and the engine applies
     /// [`contextdb_core::DEFAULT_HISTORY_POLICY`] (keep every version).
     pub history: Option<contextdb_core::HistoryPolicy>,
+    pub delivery_manifest_tables: Option<Vec<String>>,
+    pub edge_discard: Option<contextdb_core::EdgeDiscardMode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeclareTenantTablePolicy {
+    pub table: String,
+    pub immutable: bool,
+    pub retain: Option<RetainOption>,
+    pub sync_direction: Option<contextdb_core::SyncDirection>,
+    pub conflict_policy: Option<contextdb_core::ConflictPolicy>,
+    pub history: Option<contextdb_core::HistoryPolicy>,
+    pub delivery_manifest_tables: Option<Vec<String>>,
+    pub edge_discard: Option<contextdb_core::EdgeDiscardMode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShowDeliveryOutcomes {
+    pub table: String,
+    pub where_clause: Option<Expr>,
+    pub limit: Option<u64>,
+    pub offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,6 +547,16 @@ pub struct Delete {
 
 #[derive(Debug, Clone)]
 pub struct Purge {
+    pub selections: Vec<ErasureSelection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Discard {
+    pub selections: Vec<ErasureSelection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ErasureSelection {
     pub table: String,
     pub where_clause: Option<Expr>,
 }

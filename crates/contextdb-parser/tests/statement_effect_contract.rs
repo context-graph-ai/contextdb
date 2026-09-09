@@ -1,7 +1,8 @@
 use contextdb_parser::{Statement, StatementEffect, parse, statement_effect};
 use std::collections::HashSet;
 
-const STATEMENT_VARIANT_COUNT: usize = 27;
+// Statements 1/17b/19: custody adds two writes and three metadata reads.
+const STATEMENT_VARIANT_COUNT: usize = 32;
 
 fn statement_variant(statement: &Statement) -> &'static str {
     match statement {
@@ -12,6 +13,11 @@ fn statement_variant(statement: &Statement) -> &'static str {
         Statement::DropIndex(_) => "DROP INDEX",
         Statement::Insert(_) => "INSERT",
         Statement::Purge(_) => "PURGE",
+        Statement::Discard(_) => "DISCARD",
+        Statement::DeclareTenantTablePolicy(_) => "DECLARE TENANT TABLE POLICY",
+        Statement::ShowTenantTablePolicy { .. } => "SHOW TENANT TABLE POLICY",
+        Statement::ShowSyncBindings => "SHOW SYNC BINDINGS",
+        Statement::ShowDeliveryOutcomes(_) => "SHOW DELIVERY OUTCOMES",
         Statement::Delete(_) => "DELETE",
         Statement::Update(_) => "UPDATE",
         Statement::Select(_) => "SELECT",
@@ -36,8 +42,33 @@ fn statement_variant(statement: &Statement) -> &'static str {
 }
 
 #[test]
-fn statement_effect_marks_only_the_five_inspection_variants_as_reads() {
+fn statement_effect_marks_only_the_eight_inspection_variants_as_reads() {
     let cases = [
+        (
+            "DISCARD",
+            "DISCARD FROM entries WHERE id = $id",
+            StatementEffect::Write,
+        ),
+        (
+            "DECLARE TENANT TABLE POLICY",
+            "DECLARE TENANT TABLE POLICY entries SYNC PUSH ONLY",
+            StatementEffect::Write,
+        ),
+        (
+            "SHOW TENANT TABLE POLICY",
+            "SHOW TENANT TABLE POLICY",
+            StatementEffect::Read,
+        ),
+        (
+            "SHOW SYNC BINDINGS",
+            "SHOW SYNC BINDINGS",
+            StatementEffect::Read,
+        ),
+        (
+            "SHOW DELIVERY OUTCOMES",
+            "SHOW DELIVERY OUTCOMES FOR entries",
+            StatementEffect::Read,
+        ),
         (
             "CREATE TABLE",
             "CREATE TABLE entries (id UUID PRIMARY KEY)",
@@ -194,12 +225,12 @@ fn statement_effect_marks_only_the_five_inspection_variants_as_reads() {
         .filter(|(_, expected_effect, _)| *expected_effect == StatementEffect::Read)
         .count();
     assert_eq!(
-        declared_read_count, 5,
-        "exactly five current Statement variants are declared reads"
+        declared_read_count, 8,
+        "exactly eight current Statement variants are declared reads"
     );
     assert_eq!(
         parsed_cases.len() - declared_read_count,
-        22,
+        24,
         "every other current Statement variant is declared a write"
     );
 

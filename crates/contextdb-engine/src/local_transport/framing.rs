@@ -169,12 +169,27 @@ pub struct LocalRequestEnvelope {
     pub request: LocalRequest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LocalMetadataRequest {
-    Tables { continuation: Option<String> },
-    Schema { table: String },
-    EventsStatus { continuation: Option<String> },
+    Tables {
+        continuation: Option<String>,
+    },
+    Schema {
+        table: String,
+    },
+    EventsStatus {
+        continuation: Option<String>,
+    },
     MaintenanceStatus,
+    DeliveryStatus {
+        root_table: String,
+        continuation: Option<String>,
+    },
+    DeliveryOutcome {
+        root_table: String,
+        root_key: crate::sync_types::NaturalKey,
+        continuation: Option<String>,
+    },
 }
 
 /// Everything a reader can say. All of it is read-only, and all of it is the
@@ -513,7 +528,7 @@ impl LocalEngineFailure {
 /// The operation that selected a response also selects the only legal
 /// response shape. A failure is legal for every expectation; all successful
 /// variants must match exactly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LocalResponseExpectation {
     OrdinaryResult,
     CursorOpen,
@@ -532,7 +547,7 @@ pub enum LocalInboundMessage {
     Response(LocalResponse),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LocalInboundKind {
     Handshake,
     Request,
@@ -2572,7 +2587,7 @@ fn preflight_request(bytes: &[u8], memory_ceiling: u64) -> Result<(), LocalTrans
             }
         }
         3 => wire.fixed(16)?,
-        4 => match wire.enumeration(3)? {
+        4 => match wire.enumeration(5)? {
             0 | 2 => {
                 if wire.option()? {
                     wire.string()?;
@@ -2580,6 +2595,21 @@ fn preflight_request(bytes: &[u8], memory_ceiling: u64) -> Result<(), LocalTrans
             }
             1 => wire.string()?,
             3 => {}
+            4 => {
+                wire.string()?;
+                if wire.option()? {
+                    wire.string()?;
+                }
+            }
+            5 => {
+                wire.string()?;
+                wire.string()?;
+                wire.value()?;
+                wire.string_value_map()?;
+                if wire.option()? {
+                    wire.string()?;
+                }
+            }
             _ => unreachable!("bounded metadata-request discriminant"),
         },
         6 => {}
@@ -2912,7 +2942,9 @@ fn validate_response(
                         }
                     }
                     LocalMetadataRequest::Schema { .. }
-                    | LocalMetadataRequest::MaintenanceStatus => {}
+                    | LocalMetadataRequest::MaintenanceStatus
+                    | LocalMetadataRequest::DeliveryStatus { .. }
+                    | LocalMetadataRequest::DeliveryOutcome { .. } => {}
                 }
             }
         }

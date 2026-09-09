@@ -1408,3 +1408,105 @@ programmatic trace. Multi-hop or variable-length traversals report `GraphBfs`.
 | `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_`, `__unique_`, or `__fk_` (reserved for auto-indexes) |
 | `UniqueViolation { table, column }` | A duplicate value on a `UNIQUE` column, or a duplicate tuple on a table-level `UNIQUE (col, ...)` (`column` names every column of the constraint); also a `PRIMARY KEY` duplicate |
 | `ColumnTypeMismatch { table, column, expected, actual }` | A value that is not an embedding, the text spelling of one, or a permitted `NULL` was written into a `VECTOR(n)` column (see [Column Types](#column-types)) |
+
+
+## Tenant policy and event custody
+
+The authoritative hub declares application policy before an edge installs the tables:
+
+```sql
+DECLARE TENANT TABLE POLICY events
+  SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE
+  DELIVERY MANIFEST OVER event_anchors
+  EDGE DISCARD AFTER OUTCOME;
+DECLARE TENANT TABLE POLICY event_anchors
+  SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE;
+SHOW TENANT TABLE POLICY FOR events;
+```
+
+Declarations contain existing sync, conflict, retention, and history options, plus the manifest
+member-table list and edge-discard mode. They create no application table. Before the first binding,
+replacement advances the declaration version and canonical digest. After binding, `TenantPolicyBound`
+refuses replacement. A sync edge receives `DeclareRequiresAuthoritativeHub` naming its registered hub.
+A standalone declaration is attached to the tenant when that store starts serving its hub.
+
+The edge calls `SyncClient::bind_application_table_policy` with an
+`ApplicationTablePolicyExpectation`. Matching policy returns an authenticated, persisted binding;
+a missing table or differing clause is refused without installing authority. Bound names must match
+at local `CREATE TABLE` / `ALTER TABLE` and at arriving DDL. An explicitly declared local policy is
+preserved against a differing arriving declaration; unrelated tables continue syncing.
+
+Create the root and member tables with the matching clauses. Each member must declare a foreign key
+to the root. In the same transaction that inserts those rows, call
+`Database::register_delivery_manifest(tx, DeliveryManifest { root_table, root_key, members })`, then
+commit. The member list may be empty. A member outside the transaction, a wrong root reference, or
+incomplete membership refuses the registration and aborts the transaction. The engine hashes every
+committed application column, including bookkeeping columns. Keep machine-specific bookkeeping in
+another table if equivalent imports must have identical content.
+
+On a mutable manifested table, an `UPDATE` or `DELETE` retires the current manifest ownership in
+the same commit. A surviving rewritten root without a new registration receives a per-unit
+`manifest_required` outcome while other units continue; a deleted root is no longer eligible.
+Registering the rewritten root again in its writing transaction creates a new pending unit.
+
+Before registering a manifest, construct `SyncClient` or `SyncServer` on the same
+`Database` handle in this process to load its authenticated identity. It need not be
+connected. Repeat this preparation after reopening in another process. Without it,
+registration returns `SchemaInvalid`: `delivery registration requires an authenticated sync identity`.
+Construct the sync component first, then retry registration.
+
+A unit's rows and terminal outcome share the hub commit. `accepted` means the entire unit was stored;
+`equivalent` means its whole-unit digest matches the incumbent; `refused` is terminal and carries its
+cause and the complete keep-first diagnostic. Fetch the registered edge's outcomes with
+`SyncClient::fetch_delivery_outcomes(since)` to recover a lost acknowledgement. The continuation is
+opaque. `Database::delivery_outcome` reads one root's answer; `delivery_status` derives eligible,
+accepted, equivalent, refused, and pending counts. A watermark alone never grants delivery credit.
+`SYNC OFF` status is disabled with zero eligible units. An observed change of hub incarnation or
+registered hub returns old credit to pending and preserves local rows.
+
+```sql
+SHOW SYNC BINDINGS;
+SHOW DELIVERY OUTCOMES FOR events WHERE outcome = 'refused' LIMIT 20 OFFSET 0;
+DISCARD FROM events WHERE session_ref = $session,
+             event_anchors WHERE session_ref = $session;
+```
+
+The three custody `SHOW` statements require an unconstrained admin handle. They read metadata only,
+including keys, identities, digests, positions, and conflict causes; they do not include row bodies or
+advance sync state.
+
+`DISCARD` erases only this node's selected copies. It is legal inside `BEGIN` and rolls back with the
+transaction, including selected rows inserted or updated earlier in that transaction. Push-only
+and `SYNC OFF` tables are eligible; a hub must use `PURGE`. Only bound tables have a hub-declared discard mode;
+an eligible unbound table proceeds. The persisted binding governs the answer offline:
+`NEVER` refuses before selection, `AFTER OUTCOME` refuses if a selected owning unit is pending, and
+`ALWAYS` proceeds and reports pending units under the root table. Silence means `AFTER OUTCOME`.
+Each listed table reports `table`, `rows_affected`, `survivors`, and `pending_units`. A refusal or failed
+commit leaves every table unchanged. Discard removes local custody records and leaves no tombstone and creates no fleet
+frontier. Re-import starts a new local unit; a hub retaining identical content can answer `equivalent`.
+
+`PURGE FROM table WHERE ..., other_table WHERE ...` prepares every selection before one durable
+boundary and returns each table's affected count and survivor report, including zero matches.
+The single-table form preserves its existing result: the affected count and, when nonempty,
+`blob_hash` / `remaining_job_id` survivor rows. It
+remains standalone and authoritative: it is refused in a transaction and on an enrolled edge.
+For each listed `SYNC OFF` table, the ordinary authoritative purge unit carries that table's
+self-contained `WHERE` predicate and bound parameter values. Each edge selects its own matching
+rows, including independently generated keys, within the same atomic erasure as the other listed
+tables. This instruction is delivered even when the hub matches no local row. A subquery in any
+listed node-local predicate is refused with `SubqueryNotSupported` before any table is selected;
+subqueries on the other listed tables retain the existing single-table behavior. No foreign key
+or column correspondence is inferred.
+
+The purge journal may retain these predicates and selection values as erasure instructions, just
+as it retains purged keys. This explicit privacy exception does not permit retaining erased row
+bodies. Repeating an applied instruction is idempotent and preserves fresh rows created after its
+first application. An all-empty purge containing only key-based selections writes nothing.
+Application-table survivor lists are empty: ordinary columns have no engine blob-reference value
+type; the work-ledger blob reference surface owns nonempty blob-survivor reports.
+
+Declarations and bindings report `TenantPolicyNotDeclared`, `TenantPolicyMismatch`,
+`TenantPolicyBound`, `TableBindingMismatch`, or `DeclaredPolicyPreserved` as appropriate.
+Manifest registration reports `ManifestRequired`, `ManifestIncomplete`, or
+`ManifestMemberOutsideTransaction`. Discard eligibility and mode failures are `DiscardNotEligible`,
+`DiscardNotOnHub`, and `EdgeDiscardDenied`; they name tables, modes, and counts, never row content.

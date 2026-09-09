@@ -810,6 +810,7 @@ impl Database {
             terminal_refusal_scans: self.terminal_refusal_scans.clone(),
             accepted_sync_row_authors: self.accepted_sync_row_authors.clone(),
             received_schema_stages: self.received_schema_stages.clone(),
+            local_erasure_stages: self.local_erasure_stages.clone(),
             pending_local_schema_stages: self.pending_local_schema_stages.clone(),
             local_schema_stages: self.local_schema_stages.clone(),
             capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
@@ -869,6 +870,10 @@ impl Database {
             in_memory_sync_progress: self.in_memory_sync_progress.clone(),
             in_memory_applied_push_watermarks: self.in_memory_applied_push_watermarks.clone(),
             sync_incarnations: self.sync_incarnations.clone(),
+            // Statements 1/3/7: derived handles share the authenticated runtime.
+            custody_runtime: self.custody_runtime.clone(),
+            custody_cache: self.custody_cache.clone(),
+            custody_metadata: self.custody_metadata.clone(),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             limit_update_lock: self.limit_update_lock.clone(),

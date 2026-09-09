@@ -22,7 +22,9 @@ pub fn parse(input: &str) -> Result<Statement> {
     if contains_keyword_sequence_outside_strings(sql, &["GROUP", "BY"]) {
         return Err(Error::ParseError("GROUP BY is not supported".to_string()));
     }
-    if contains_token_outside_strings(sql, "OVER") {
+    if contains_token_outside_strings(sql, "OVER")
+        && !contains_keyword_sequence_outside_strings(sql, &["DELIVERY", "MANIFEST", "OVER"])
+    {
         return Err(Error::WindowFunctionNotSupported);
     }
     if contains_where_match_operator(sql) {
@@ -57,7 +59,21 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::create_route_stmt => build_create_route(inner)?,
         Rule::drop_route_stmt => build_drop_route(inner)?,
         Rule::insert_stmt => Statement::Insert(build_insert(inner)?),
+        Rule::declare_tenant_table_policy_stmt => {
+            Statement::DeclareTenantTablePolicy(build_declare_tenant_table_policy(inner)?)
+        }
+        Rule::show_tenant_table_policy_stmt => Statement::ShowTenantTablePolicy {
+            table: inner
+                .into_inner()
+                .find(|part| part.as_rule() == Rule::identifier)
+                .map(|part| parse_identifier(part.as_str())),
+        },
+        Rule::show_sync_bindings_stmt => Statement::ShowSyncBindings,
+        Rule::show_delivery_outcomes_stmt => {
+            Statement::ShowDeliveryOutcomes(build_show_delivery_outcomes(inner)?)
+        }
         Rule::purge_stmt => Statement::Purge(build_purge(inner)?),
+        Rule::discard_stmt => Statement::Discard(build_discard(inner)?),
         Rule::delete_stmt => Statement::Delete(build_delete(inner)?),
         Rule::update_stmt => Statement::Update(build_update(inner)?),
         Rule::select_stmt => Statement::Select(build_select(inner)?),
@@ -1090,6 +1106,8 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut sync_direction = None;
     let mut conflict_policy = None;
     let mut history = None;
+    let mut delivery_manifest_tables = None;
+    let mut edge_discard = None;
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -1202,6 +1220,23 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                             return Err(Error::ParseError("duplicate HISTORY clause".to_string()));
                         }
                         history = Some(build_history_option(opt)?);
+                    }
+                    Rule::delivery_manifest_option => {
+                        if delivery_manifest_tables.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate DELIVERY MANIFEST clause".to_string(),
+                            ));
+                        }
+                        delivery_manifest_tables = Some(build_identifier_list(opt)?);
+                    }
+
+                    Rule::edge_discard_option => {
+                        if edge_discard.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate EDGE DISCARD clause".to_string(),
+                            ));
+                        }
+                        edge_discard = Some(build_edge_discard_option(opt)?);
                     }
                     other => return Err(unexpected_rule(other, "build_create_table.table_option")),
                 }
@@ -1335,6 +1370,153 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         sync_direction,
         conflict_policy,
         history,
+        delivery_manifest_tables,
+        edge_discard,
+    })
+}
+
+fn build_identifier_list(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    for part in pair.into_inner() {
+        if part.as_rule() == Rule::identifier {
+            let value = parse_identifier(part.as_str());
+            if values.iter().any(|existing| existing == &value) {
+                return Err(Error::ParseError(format!(
+                    "duplicate resolved identifier '{value}'"
+                )));
+            }
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+fn build_edge_discard_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::EdgeDiscardMode> {
+    let spelling = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("EDGE DISCARD missing mode".to_string()))?;
+    match spelling.as_rule() {
+        Rule::edge_discard_never => Ok(contextdb_core::EdgeDiscardMode::Never),
+        Rule::edge_discard_after_outcome => Ok(contextdb_core::EdgeDiscardMode::AfterOutcome),
+        Rule::edge_discard_always => Ok(contextdb_core::EdgeDiscardMode::Always),
+        other => Err(unexpected_rule(other, "build_edge_discard_option")),
+    }
+}
+
+fn build_declare_tenant_table_policy(pair: Pair<'_, Rule>) -> Result<DeclareTenantTablePolicy> {
+    let mut table = None;
+    let mut immutable = false;
+    let mut retain = None;
+    let mut sync_direction = None;
+    let mut conflict_policy = None;
+    let mut history = None;
+    let mut delivery_manifest_tables = None;
+    let mut edge_discard = None;
+
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::identifier if table.is_none() => table = Some(parse_identifier(part.as_str())),
+            Rule::tenant_policy_option => {
+                let option = part
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::ParseError("invalid tenant policy option".to_string()))?;
+                match option.as_rule() {
+                    Rule::immutable_option if !immutable => immutable = true,
+                    Rule::immutable_option => {
+                        return Err(Error::ParseError("duplicate IMMUTABLE clause".to_string()));
+                    }
+                    Rule::retain_option if retain.is_none() => {
+                        retain = Some(build_retain_option(option)?)
+                    }
+                    Rule::retain_option => {
+                        return Err(Error::ParseError("duplicate RETAIN clause".to_string()));
+                    }
+                    Rule::sync_direction_option if sync_direction.is_none() => {
+                        sync_direction = Some(build_sync_direction_option(option)?)
+                    }
+                    Rule::sync_direction_option => {
+                        return Err(Error::ParseError(
+                            "duplicate sync direction clause".to_string(),
+                        ));
+                    }
+                    Rule::sync_conflict_option if conflict_policy.is_none() => {
+                        conflict_policy = Some(build_sync_conflict_option(option)?)
+                    }
+                    Rule::sync_conflict_option => {
+                        return Err(Error::ParseError(
+                            "duplicate SYNC CONFLICT clause".to_string(),
+                        ));
+                    }
+                    Rule::history_option if history.is_none() => {
+                        history = Some(build_history_option(option)?)
+                    }
+                    Rule::history_option => {
+                        return Err(Error::ParseError("duplicate HISTORY clause".to_string()));
+                    }
+                    Rule::delivery_manifest_option if delivery_manifest_tables.is_none() => {
+                        delivery_manifest_tables = Some(build_identifier_list(option)?)
+                    }
+                    Rule::delivery_manifest_option => {
+                        return Err(Error::ParseError(
+                            "duplicate DELIVERY MANIFEST clause".to_string(),
+                        ));
+                    }
+                    Rule::edge_discard_option if edge_discard.is_none() => {
+                        edge_discard = Some(build_edge_discard_option(option)?)
+                    }
+                    Rule::edge_discard_option => {
+                        return Err(Error::ParseError(
+                            "duplicate EDGE DISCARD clause".to_string(),
+                        ));
+                    }
+                    other => {
+                        return Err(unexpected_rule(other, "build_declare_tenant_table_policy"));
+                    }
+                }
+            }
+            other => return Err(unexpected_rule(other, "build_declare_tenant_table_policy")),
+        }
+    }
+
+    Ok(DeclareTenantTablePolicy {
+        table: table.ok_or_else(|| Error::ParseError("policy missing table".to_string()))?,
+        immutable,
+        retain,
+        sync_direction,
+        conflict_policy,
+        history,
+        delivery_manifest_tables,
+        edge_discard,
+    })
+}
+
+fn build_show_delivery_outcomes(pair: Pair<'_, Rule>) -> Result<ShowDeliveryOutcomes> {
+    let mut table = None;
+    let mut where_clause = None;
+    let mut limit = None;
+    let mut offset = 0;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::identifier => table = Some(parse_identifier(part.as_str())),
+            Rule::where_clause => where_clause = Some(build_where_clause(part)?),
+            Rule::limit_clause => limit = Some(build_limit_clause(part)?),
+            Rule::offset_clause => {
+                let value = part
+                    .into_inner()
+                    .find(|inner| inner.as_rule() == Rule::integer)
+                    .ok_or_else(|| Error::ParseError("OFFSET missing value".to_string()))?;
+                offset = parse_u64(value.as_str(), "invalid OFFSET value")?;
+            }
+            other => return Err(unexpected_rule(other, "build_show_delivery_outcomes")),
+        }
+    }
+    Ok(ShowDeliveryOutcomes {
+        table: table.ok_or_else(|| Error::ParseError("outcomes missing table".to_string()))?,
+        where_clause,
+        limit,
+        offset,
     })
 }
 
@@ -2620,21 +2802,41 @@ fn build_delete(pair: Pair<'_, Rule>) -> Result<Delete> {
 }
 
 fn build_purge(pair: Pair<'_, Rule>) -> Result<Purge> {
-    let mut table = None;
-    let mut where_clause = None;
-
-    for p in pair.into_inner() {
-        match p.as_rule() {
-            Rule::identifier => table = Some(parse_identifier(p.as_str())),
-            Rule::where_clause => where_clause = Some(build_where_clause(p)?),
-            other => return Err(unexpected_rule(other, "build_purge")),
-        }
-    }
-
     Ok(Purge {
-        table: table.ok_or_else(|| Error::ParseError("PURGE missing table".to_string()))?,
-        where_clause,
+        selections: build_erasure_selections(pair)?,
     })
+}
+
+fn build_discard(pair: Pair<'_, Rule>) -> Result<Discard> {
+    Ok(Discard {
+        selections: build_erasure_selections(pair)?,
+    })
+}
+
+fn build_erasure_selections(pair: Pair<'_, Rule>) -> Result<Vec<ErasureSelection>> {
+    let mut selections = Vec::new();
+    for selection in pair.into_inner() {
+        if selection.as_rule() != Rule::erasure_selection {
+            return Err(unexpected_rule(
+                selection.as_rule(),
+                "build_erasure_selections",
+            ));
+        }
+        let mut table = None;
+        let mut where_clause = None;
+        for part in selection.into_inner() {
+            match part.as_rule() {
+                Rule::identifier => table = Some(parse_identifier(part.as_str())),
+                Rule::where_clause => where_clause = Some(build_where_clause(part)?),
+                other => return Err(unexpected_rule(other, "build_erasure_selection")),
+            }
+        }
+        selections.push(ErasureSelection {
+            table: table.ok_or_else(|| Error::ParseError("erasure missing table".to_string()))?,
+            where_clause,
+        });
+    }
+    Ok(selections)
 }
 
 fn build_update(pair: Pair<'_, Rule>) -> Result<Update> {

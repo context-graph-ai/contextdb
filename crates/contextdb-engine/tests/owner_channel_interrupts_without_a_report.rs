@@ -16,13 +16,18 @@ use contextdb_core::read_contract::{
     ReadClientTimeouts, ReadLimits, ReadRoute,
 };
 use contextdb_core::{Error, Value};
+use contextdb_engine::read_session::{
+    ReadKernelCancellationEvent, ReadKernelSource, ReadKernelSourceEvent, ReadKernelTestObserver,
+    ReadSessionOperation,
+};
 use contextdb_engine::{
     Database, DatabaseOpenOptions, OwnerReadConfig, ReadProgress, ReadProgressObserver,
     ReadSession, ReadSessionOptions,
 };
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -53,7 +58,12 @@ fn roomy_limits() -> ReadLimits {
     }
 }
 
-fn live_owner(path: &Path, runtime_dir: std::path::PathBuf) -> Database {
+// Existing read cancellation contract: a caller can synchronize a live fetch.
+fn live_owner(
+    path: &Path,
+    runtime_dir: std::path::PathBuf,
+    observer: Option<Arc<dyn ReadKernelTestObserver>>,
+) -> Database {
     let options = DatabaseOpenOptions {
         owner_reads: OwnerReadConfig {
             limits: OwnerReadLimits {
@@ -68,6 +78,7 @@ fn live_owner(path: &Path, runtime_dir: std::path::PathBuf) -> Database {
             handler: None,
             ..OwnerReadConfig::default()
         },
+        test_kernel_observer: observer,
         ..DatabaseOpenOptions::default()
     };
     let owner = Database::open_with_options(path, options).expect("start the writable owner");
@@ -140,6 +151,7 @@ fn owner_active_readers(path: &Path, runtime_root: &Path) -> u64 {
 struct CancelWhenArmed {
     armed: Mutex<Option<OwnerReadCancellation>>,
     heard: Mutex<Vec<ReadProgress>>,
+    fetch_gate: Arc<Barrier>,
 }
 
 impl CancelWhenArmed {
@@ -147,6 +159,7 @@ impl CancelWhenArmed {
         Self {
             armed: Mutex::new(None),
             heard: Mutex::new(Vec::new()),
+            fetch_gate: Arc::new(Barrier::new(2)),
         }
     }
 
@@ -172,12 +185,58 @@ impl ReadProgressObserver for CancelWhenArmed {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cancellation) = armed.as_ref() {
-            self.heard
+            let mut heard = self
+                .heard
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(progress);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if heard.is_empty() {
+                self.fetch_gate.wait();
+            }
+            heard.push(progress);
             cancellation.cancel();
         }
+    }
+}
+
+// Existing read cancellation contract: keep the fetch executing until the real
+// progress callback's cancellation has reached the owner's existing listener.
+struct FetchCancellationGate {
+    progress: Arc<Barrier>,
+    parked: AtomicBool,
+    observed: AtomicBool,
+}
+
+impl ReadKernelTestObserver for FetchCancellationGate {
+    fn before_source_touch(
+        &self,
+        event: ReadKernelSourceEvent,
+        cancellation: OwnerReadCancellation,
+    ) {
+        if event.operation == ReadSessionOperation::CursorFetch
+            && event.source == ReadKernelSource::TableRow
+            && event.completed_items == 1_000
+            && !self.parked.swap(true, Ordering::SeqCst)
+        {
+            assert_eq!(event.route, ReadRoute::Owner);
+            let (sent, received) = std::sync::mpsc::channel();
+            let _listener = cancellation.tell_on_cancel(move || {
+                let _ = sent.send(());
+            });
+            self.progress.wait();
+            received
+                .recv()
+                .expect("cancellation reaches the executing owner");
+        }
+    }
+
+    fn cancellation_observed(
+        &self,
+        event: ReadKernelCancellationEvent,
+        cancellation: OwnerReadCancellation,
+    ) {
+        assert_eq!(event.operation, ReadSessionOperation::CursorFetch);
+        assert!(cancellation.is_cancelled());
+        self.observed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -186,7 +245,7 @@ fn a_statement_cancelled_before_it_is_sent_is_refused_without_reaching_the_owner
     let directory = tempfile::TempDir::new().expect("task-scoped directory");
     let path = directory.path().join("pre-cancelled.db");
     let runtime_root = secure_runtime_root(&directory, "pre-cancelled-runtime");
-    let owner = live_owner(&path, runtime_root.clone());
+    let owner = live_owner(&path, runtime_root.clone(), None);
     seed(&owner);
 
     let reader = ReadSession::with_runtime_directory_for_test(&runtime_root, || {
@@ -272,10 +331,15 @@ fn a_cursor_fetch_that_walks_the_store_reports_and_can_be_stopped_from_inside_th
     let directory = tempfile::TempDir::new().expect("task-scoped directory");
     let path = directory.path().join("fetch-cancel.db");
     let runtime_root = secure_runtime_root(&directory, "fetch-cancel-runtime");
-    let owner = live_owner(&path, runtime_root.clone());
+    let observer = Arc::new(CancelWhenArmed::new());
+    let gate = Arc::new(FetchCancellationGate {
+        progress: observer.fetch_gate.clone(),
+        parked: AtomicBool::new(false),
+        observed: AtomicBool::new(false),
+    });
+    let owner = live_owner(&path, runtime_root.clone(), Some(gate.clone()));
     seed(&owner);
 
-    let observer = Arc::new(CancelWhenArmed::new());
     let reader = ReadSession::with_runtime_directory_for_test(&runtime_root, || {
         ReadSession::open_with_progress(
             &path,
@@ -306,6 +370,8 @@ fn a_cursor_fetch_that_walks_the_store_reports_and_can_be_stopped_from_inside_th
     let cancellation = OwnerReadCancellation::new();
     observer.arm(cancellation.clone());
     let refused = cursor.fetch_with_cancellation(None, &cancellation);
+    assert!(gate.parked.load(Ordering::SeqCst));
+    assert!(gate.observed.load(Ordering::SeqCst));
     assert!(
         matches!(refused, Err(Error::ReadCancelled)),
         "cancelling a cursor fetch from inside the observer, over the owner channel, yields \

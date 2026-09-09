@@ -345,6 +345,11 @@ Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/
 | `contextdb-server` | Sync server and client (dial-by-key transport, conflict resolution) |
 | `contextdb-cli` | Interactive CLI REPL |
 
+Tenant-governed event tables bind hub policy, register root/member delivery manifests in their
+write transaction, and inspect durable per-unit outcomes. See
+[the custody SQL and API guide](docs/query-language.md#tenant-policy-and-event-custody) for whole-row
+hashing, discard modes, and atomic fleet erasure.
+
 ## Building
 
 ```bash

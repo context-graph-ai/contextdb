@@ -319,6 +319,23 @@ impl OwnerServiceSpec {
     }
 
     #[cfg(feature = "test-seams")]
+    fn metadata_probe(
+        &self,
+        limits: ReadLimits,
+        cancellation: OwnerReadCancellation,
+    ) -> Option<Arc<dyn BoundedExecutionProbe>> {
+        if let Some(watcher) = self.database.kernel_observer_for_test() {
+            Some(crate::read_session::owner_route_kernel_probe(
+                &watcher,
+                crate::read_session::ReadSessionOperation::Metadata,
+                &cancellation,
+            ))
+        } else {
+            self.bounded_probe(OwnerBoundedOperation::Execute, limits, cancellation)
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
     fn bounded_probe(
         &self,
         operation: OwnerBoundedOperation,
@@ -1524,7 +1541,7 @@ impl OwnerReadService {
                 let _ = (connection, lease);
                 unreachable!("cursor fetch/close bypass new slot admission")
             }
-            LocalRequest::Metadata { request } => self.metadata_response(request, lease),
+            LocalRequest::Metadata { request } => self.metadata_response(&reading, request, lease),
             LocalRequest::Explain { statement, params } => {
                 // A write is PLANNED here, never run, so explaining one is
                 // not a write and is not refused as one. Only running it
@@ -1565,8 +1582,7 @@ impl OwnerReadService {
                     Arc::clone(&self.spec.clock),
                     connection.cancellation().clone(),
                     #[cfg(feature = "test-seams")]
-                    self.spec.bounded_probe(
-                        OwnerBoundedOperation::Execute,
+                    self.spec.metadata_probe(
                         connection.effective_limits(),
                         connection.cancellation().clone(),
                     ),
@@ -1979,10 +1995,26 @@ impl OwnerReadService {
 
     fn metadata_response(
         &self,
+        reading: &Database,
         request: LocalMetadataRequest,
         lease: RequestLease,
     ) -> OwnerReadScaffoldResult<Vec<LocalResponse>> {
-        let prepared = self.prepare_metadata(request, lease.effective_limits())?;
+        let prepare = || {
+            self.prepare_metadata(
+                reading,
+                request,
+                lease.effective_limits(),
+                lease.cancellation(),
+            )
+        };
+        #[cfg(feature = "test-seams")]
+        let prepared = crate::read_session::with_session_kernel_probe(
+            self.spec
+                .metadata_probe(lease.effective_limits(), lease.cancellation().clone()),
+            prepare,
+        )?;
+        #[cfg(not(feature = "test-seams"))]
+        let prepared = prepare()?;
         let payload = match prepared {
             PreparedOwnerMetadata::CanonicalPage(page) => {
                 encode_metadata_page(&page).map_err(|_| {
@@ -2008,12 +2040,43 @@ impl OwnerReadService {
     /// though the inventory itself moved between pages.
     fn prepare_metadata(
         &self,
+        reading: &Database,
         request: LocalMetadataRequest,
         effective_limits: ReadLimits,
+        _cancellation: &OwnerReadCancellation,
     ) -> OwnerReadScaffoldResult<PreparedOwnerMetadata> {
         match request {
+            LocalMetadataRequest::DeliveryStatus { root_table, .. } => {
+                let body = crate::custody::inspection::metadata(
+                    reading,
+                    crate::direct_file_reader::DirectMetadataRequest::DeliveryStatus { root_table },
+                )
+                .map_err(OwnerReadScaffoldError::Database)?;
+                let payload = crate::read_contract::encode_metadata_body(&body).map_err(|_| {
+                    OwnerReadScaffoldError::unimplemented("custody metadata encoding")
+                })?;
+                Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
+            }
+            LocalMetadataRequest::DeliveryOutcome {
+                root_table,
+                root_key,
+                ..
+            } => {
+                let body = crate::custody::inspection::metadata(
+                    reading,
+                    crate::direct_file_reader::DirectMetadataRequest::DeliveryOutcome {
+                        root_table,
+                        root_key,
+                    },
+                )
+                .map_err(OwnerReadScaffoldError::Database)?;
+                let payload = crate::read_contract::encode_metadata_body(&body).map_err(|_| {
+                    OwnerReadScaffoldError::unimplemented("custody metadata encoding")
+                })?;
+                Ok(PreparedOwnerMetadata::CanonicalComplete(payload))
+            }
             LocalMetadataRequest::Tables { continuation } => {
-                let items = crate::metadata_page::table_items(self.spec.database.table_names());
+                let items = crate::metadata_page::table_items(reading.table_names());
                 Ok(PreparedOwnerMetadata::CanonicalPage(
                     crate::metadata_page::continuation_page(
                         MetadataPageVocabulary::Tables,
@@ -2026,7 +2089,7 @@ impl OwnerReadService {
                 ))
             }
             LocalMetadataRequest::Schema { table } => {
-                let meta = self.spec.database.table_meta(&table).ok_or_else(|| {
+                let meta = reading.table_meta(&table).ok_or_else(|| {
                     OwnerReadScaffoldError::Database(contextdb_core::Error::TableNotFound(
                         table.clone(),
                     ))
@@ -2041,8 +2104,8 @@ impl OwnerReadService {
             }
             LocalMetadataRequest::EventsStatus { continuation } => {
                 let items = crate::metadata_page::event_status_items(
-                    &self.spec.database.event_bus_status(),
-                    &self.spec.database.cron_status(),
+                    &reading.event_bus_status(),
+                    &reading.cron_status(),
                 );
                 Ok(PreparedOwnerMetadata::CanonicalPage(
                     crate::metadata_page::continuation_page(
@@ -2056,7 +2119,7 @@ impl OwnerReadService {
                 ))
             }
             LocalMetadataRequest::MaintenanceStatus => {
-                let status = self.spec.database.maintenance_status();
+                let status = reading.maintenance_status();
                 let payload = crate::read_contract::encode_metadata_body(
                     &crate::direct_file_reader::DirectMetadataBody::MaintenanceStatus {
                         status: crate::direct_file_reader::DirectMaintenanceStatus {

@@ -20,6 +20,7 @@ fi
 [[ -x "$cli" ]] || { printf 'FAIL installed contextdb CLI is missing\n' >&2; exit 2; }
 [[ -x "$driver" ]] || { printf 'FAIL installed smoke verifier is missing\n' >&2; exit 2; }
 [[ -x "$server" ]] || { printf 'FAIL installed contextdb server is missing\n' >&2; exit 2; }
+command -v python3 >/dev/null 2>&1 || { printf 'FAIL installed smoke requires python3 for JSON receipt validation\n' >&2; exit 2; }
 
 work="$(mktemp -d)"
 hub_pid=""
@@ -220,7 +221,8 @@ help="$($cli --help 2>&1)"
 [[ "$help" != *"ServerWins"* && "$help" != *"EdgeWins"* && "$help" != *"LatestWins"* && "$help" != *"InsertIfNotExists"* ]] \
   || fail "ordinary CLI hides role-mechanic policy names"
 pass "ordinary CLI hides verifier and role-mechanic policy controls"
-for removed_command in policy direction; do
+# .sync policy is now the custody metadata read, verified against the hub below.
+for removed_command in direction; do
   removed_store="$work/removed-$removed_command.db"
   # Whether a session still knows a command is a question about that session's
   # vocabulary, so it has to be asked of a store the session can open. A path
@@ -630,5 +632,34 @@ for fixture in fitting-dependency ordinary; do
     || fail "$fixture advanced to its exact confirmed source position"
   pass "$fixture advanced to its exact confirmed source position"
 done
+
+printf 'CHECK fixed installed nine-step custody journey\n'
+if "$timeout_bin" 600 "$driver" custody --root "$work/custody" --cli "$cli" \
+    >"$work/custody.log" 2>"$work/custody.stderr"; then
+  :
+else
+  custody_exit=$?
+  cat "$work/custody.log" "$work/custody.stderr" >&2
+  fail "fixed custody journey exited ${custody_exit}"
+fi
+# JSON object key order is not a receipt contract. Reject missing, duplicated,
+# out-of-order or extra assertions without matching serialized byte adjacency.
+python3 - "$work/custody.log" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        events = [json.loads(line) for line in stream if line.strip()]
+    assertions = [event["assertion"] for event in events
+                  if event.get("event") == "custody_assertion"]
+    if any(type(value) is not int for value in assertions) or assertions != list(range(1, 10)):
+        raise ValueError(f"expected assertions 1 through 9 exactly once, got {assertions!r}")
+except (OSError, ValueError, KeyError, AttributeError) as error:
+    print(f"FAIL fixed custody receipt: {error}", file=sys.stderr)
+    sys.exit(1)
+for assertion in assertions:
+    print(f"PASS fixed custody assertion {assertion} completed")
+PY
 
 printf 'PASS installed release authenticated schema and oversized durability smoke\n'

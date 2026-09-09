@@ -1,9 +1,13 @@
 // Canonical authenticated-sync implementation. The server-path mirror is
 // intentionally byte-identical and audited by `sync_source_mirror_tests`.
+pub use crate::custody_types::ApplicationTablePolicyExpectation;
+use crate::custody_types::{
+    AuthenticatedTenantPolicyBinding, DeliveryOutcome, DeliveryOutcomeCursor,
+};
 use crate::protocol::{
     DependencyCompletePullResponse, MessageType, PullRequest, PullResponse, PushRequest,
-    PushResponse, SyncStatusRequest, SyncStatusResponse, WireChangeSet, WirePurgeChange,
-    WirePushError, decode, encode, row_payload_bytes,
+    PushResponse, SyncStatusResponse, WireChangeSet, WirePurgeChange, WirePushError, decode,
+    encode, row_payload_bytes,
 };
 use crate::subjects::{pull_subject, push_subject, status_subject};
 use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
@@ -207,58 +211,71 @@ fn take_validated_ordinary_purges(
         if purge.table.is_empty() {
             return Err(malformed_purge_page("purge table is empty"));
         }
-        if purge.table_generation == 0 {
-            return Err(malformed_purge_page(format!(
-                "purge table {} has generation zero",
-                purge.table
-            )));
-        }
-        if purge.natural_key.column.is_empty()
-            || purge
+        // Statement 17a: local predicates carry their own durable instruction identity.
+        if let Some(bytes) = &purge.node_local_predicate {
+            crate::database::purge_predicate::NodeLocalPredicate::decode(bytes)?;
+            if purge.table_generation != 0
+                || !purge.purged_lineage_roots.is_empty()
+                || !purge.natural_key.column.is_empty()
+            {
+                return Err(malformed_purge_page(
+                    "node-local instruction mixed with row-key evidence",
+                ));
+            }
+        } else {
+            if purge.table_generation == 0 {
+                return Err(malformed_purge_page(format!(
+                    "purge table {} has generation zero",
+                    purge.table
+                )));
+            }
+            if purge.natural_key.column.is_empty()
+                || purge
+                    .natural_key
+                    .rest
+                    .iter()
+                    .any(|(column, _)| column.is_empty())
+            {
+                return Err(malformed_purge_page(format!(
+                    "purge table {} has an empty natural-key column",
+                    purge.table
+                )));
+            }
+            let mut key_columns = BTreeSet::new();
+            key_columns.insert(purge.natural_key.column.as_str());
+            if purge
                 .natural_key
                 .rest
                 .iter()
-                .any(|(column, _)| column.is_empty())
-        {
-            return Err(malformed_purge_page(format!(
-                "purge table {} has an empty natural-key column",
-                purge.table
-            )));
-        }
-        let mut key_columns = BTreeSet::new();
-        key_columns.insert(purge.natural_key.column.as_str());
-        if purge
-            .natural_key
-            .rest
-            .iter()
-            .any(|(column, _)| !key_columns.insert(column.as_str()))
-        {
-            return Err(malformed_purge_page(format!(
-                "purge table {} repeats a natural-key column",
-                purge.table
-            )));
-        }
-        if purge.purged_lineage_roots.is_empty()
-            || purge
+                .any(|(column, _)| !key_columns.insert(column.as_str()))
+            {
+                return Err(malformed_purge_page(format!(
+                    "purge table {} repeats a natural-key column",
+                    purge.table
+                )));
+            }
+            if purge.purged_lineage_roots.is_empty()
+                || purge
+                    .purged_lineage_roots
+                    .iter()
+                    .any(|root| root.is_empty())
+            {
+                return Err(malformed_purge_page(format!(
+                    "purge table {} has no complete lineage-root evidence",
+                    purge.table
+                )));
+            }
+            let mut unique_roots = BTreeSet::new();
+            if purge
                 .purged_lineage_roots
                 .iter()
-                .any(|root| root.is_empty())
-        {
-            return Err(malformed_purge_page(format!(
-                "purge table {} has no complete lineage-root evidence",
-                purge.table
-            )));
-        }
-        let mut unique_roots = BTreeSet::new();
-        if purge
-            .purged_lineage_roots
-            .iter()
-            .any(|root| !unique_roots.insert(root.as_str()))
-        {
-            return Err(malformed_purge_page(format!(
-                "purge table {} repeats lineage-root evidence",
-                purge.table
-            )));
+                .any(|root| !unique_roots.insert(root.as_str()))
+            {
+                return Err(malformed_purge_page(format!(
+                    "purge table {} repeats lineage-root evidence",
+                    purge.table
+                )));
+            }
         }
         if purge.purge_frontier == Lsn(0) {
             return Err(malformed_purge_page(format!(
@@ -298,6 +315,7 @@ fn take_validated_ordinary_purges(
             table_generation: purge.table_generation,
             natural_key: purge.natural_key.clone().into(),
             purged_lineage_roots: purge.purged_lineage_roots.clone(),
+            node_local_predicate: purge.node_local_predicate.clone(),
         });
         seen.push(purge);
     }
@@ -338,6 +356,491 @@ impl std::fmt::Debug for SyncClient {
 }
 
 impl SyncClient {
+    /// Bind the expected table clauses to this authenticated hub before installing their DDL.
+    ///
+    /// Matching declarations return a persisted binding. Missing or differing clauses return
+    /// typed policy errors without replacing authority. Repeating the same binding is a no-op;
+    /// a changed hub or incarnation revokes old delivery credit while preserving local rows.
+    pub async fn bind_application_table_policy(
+        &self,
+        expectation: ApplicationTablePolicyExpectation,
+    ) -> contextdb_core::Result<AuthenticatedTenantPolicyBinding> {
+        use crate::protocol::*;
+        let hub = self
+            .transport
+            .peer_node_id()
+            .ok_or_else(|| Error::SyncError("authenticated hub required".into()))?;
+        if self
+            .db
+            .retention_sync_peer()
+            .is_some_and(|registered| registered != hub)
+        {
+            return Err(Error::SyncError(
+                "policy request destination is not the registered hub".into(),
+            ));
+        }
+        // The comparison phase can fail without spending a durable incarnation or writing a binding.
+        let request = BindApplicationTablePolicyRequest {
+            format: 1,
+            tenant_id: self.tenant_id.as_str().into(),
+            edge_incarnation: self
+                .db
+                .existing_sync_incarnation(&self.tenant_id)?
+                .unwrap_or_else(Incarnation::mint),
+            request_nonce: *uuid::Uuid::new_v4().as_bytes(),
+            expectation,
+        };
+        let bytes = encode_named(MessageType::BindApplicationTablePolicyRequest, &request)
+            .map_err(|e| Error::SyncError(e.to_string()))?;
+        let response = self
+            .transport
+            .request(
+                &crate::subjects::binding_subject(self.tenant_id.as_str()),
+                bytes,
+                SYNC_TIMEOUT,
+            )
+            .await
+            .map_err(|e| Error::SyncError(e.to_string()))?;
+        let envelope = decode(&response).map_err(|e| Error::SyncError(e.to_string()))?;
+        if envelope.message_type != MessageType::BindApplicationTablePolicyResponse {
+            return Err(crate::custody::canonical::invalid());
+        }
+        let response: BindApplicationTablePolicyResponse = rmp_serde::from_slice(&envelope.payload)
+            .map_err(|e| Error::SyncError(e.to_string()))?;
+        match response {
+            BindApplicationTablePolicyResponse::Error(failure)
+                if failure.format == 1 && failure.request_nonce == request.request_nonce =>
+            {
+                Err(match failure.error {
+                    BindPolicyError::TenantPolicyMismatch { table, clause } => {
+                        Error::TenantPolicyMismatch { table, clause }
+                    }
+                    BindPolicyError::TenantPolicyNotDeclared { table } => {
+                        Error::TenantPolicyNotDeclared { table }
+                    }
+                    BindPolicyError::Operational { message } => Error::SyncError(message),
+                })
+            }
+            BindApplicationTablePolicyResponse::Success(reply) => {
+                let edge = self
+                    .transport
+                    .local_node_id()
+                    .ok_or_else(crate::custody::canonical::invalid)?;
+                if reply.format != 1
+                    || reply.request_nonce != request.request_nonce
+                    || reply.hub_node_id != hub
+                    || reply.tenant_id != request.tenant_id
+                    || reply.edge_node_id != edge
+                    || reply.edge_incarnation != request.edge_incarnation
+                {
+                    return Err(crate::custody::canonical::invalid());
+                }
+                let packet: crate::custody::preparation::SignedBindingPacket =
+                    rmp_serde::from_slice(&reply.binding)
+                        .map_err(|_| crate::custody::canonical::invalid())?;
+                if packet.binding.namespace.hub_incarnation != reply.hub_incarnation {
+                    return Err(crate::custody::canonical::invalid());
+                }
+                self.db.with_authoritative_hub_reply(&hub, |db| {
+                    crate::custody::preparation::admit_binding(
+                        db,
+                        &self.tenant_id,
+                        &hub,
+                        &edge,
+                        &packet,
+                    )
+                })?;
+                Ok(crate::custody::policy::binding_projection(&packet.binding))
+            }
+            _ => Err(crate::custody::canonical::invalid()),
+        }
+    }
+
+    /// Fetch and persist this authenticated edge's complete terminal outcome continuation.
+    ///
+    /// `None` starts at the beginning; a cursor returned by an outcome resumes after that exact
+    /// outcome, including others at the same acceptance position. The cursor is opaque and scoped
+    /// to tenant, both nodes and incarnations. Readback never reapplies application rows.
+    pub async fn fetch_delivery_outcomes(
+        &self,
+        since: Option<DeliveryOutcomeCursor>,
+    ) -> contextdb_core::Result<Vec<DeliveryOutcome>> {
+        use crate::protocol::*;
+        let request = FetchDeliveryOutcomesRequest {
+            format: 1,
+            tenant_id: self.tenant_id.as_str().into(),
+            edge_incarnation: self
+                .db
+                .existing_sync_incarnation(&self.tenant_id)?
+                .unwrap_or_else(Incarnation::mint),
+            request_nonce: *uuid::Uuid::new_v4().as_bytes(),
+            since: since
+                .map(|cursor| rmp_serde::to_vec_named(&cursor))
+                .transpose()
+                .map_err(|e| Error::SyncError(e.to_string()))?,
+        };
+        let bytes = encode_named(MessageType::FetchDeliveryOutcomesRequest, &request)
+            .map_err(|e| Error::SyncError(e.to_string()))?;
+        let response = self
+            .transport
+            .request(
+                &crate::subjects::delivery_outcomes_subject(self.tenant_id.as_str()),
+                bytes,
+                SYNC_TIMEOUT,
+            )
+            .await
+            .map_err(|e| Error::SyncError(e.to_string()))?;
+        let envelope = decode(&response).map_err(|e| Error::SyncError(e.to_string()))?;
+        if envelope.message_type != MessageType::FetchDeliveryOutcomesResponse {
+            return Err(crate::custody::canonical::invalid());
+        }
+        let response: FetchDeliveryOutcomesResponse = rmp_serde::from_slice(&envelope.payload)
+            .map_err(|e| Error::SyncError(e.to_string()))?;
+        if response.format != 1 || response.request_nonce != request.request_nonce {
+            return Err(crate::custody::canonical::invalid());
+        }
+        if let Some(error) = response.error {
+            return Err(Error::SyncError(error));
+        }
+        let hub = self
+            .hub_node_id()
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        let edge = self
+            .transport
+            .local_node_id()
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        if response.hub_node_id != hub
+            || response.edge_node_id != edge
+            || response.tenant_id != self.tenant_id.as_str()
+            || response.edge_incarnation != request.edge_incarnation
+        {
+            return Err(crate::custody::canonical::invalid());
+        }
+        let page = response
+            .result
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        self.db.with_authoritative_hub_reply(&hub, |db| {
+            let packets = page
+                .outcomes
+                .iter()
+                .map(crate::custody::delivery::read_packet)
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::custody::preparation::admit_terminals(
+                db,
+                &self.tenant_id,
+                &hub,
+                &edge,
+                &packets,
+            )?;
+            Ok(packets
+                .iter()
+                .map(|packet| crate::custody::inspection::projection(&packet.record, &packet.block))
+                .collect())
+        })
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub async fn __seed_application_table_policy_binding_for_test(
+        &self,
+        expectation: ApplicationTablePolicyExpectation,
+    ) -> contextdb_core::Result<()> {
+        let hub_node_id = self.transport.peer_node_id().ok_or_else(|| {
+            Error::SyncError("fixture binding requires an authenticated hub".to_string())
+        })?;
+        let edge_node_id = self.transport.local_node_id().ok_or_else(|| {
+            Error::SyncError("fixture binding requires an authenticated edge".to_string())
+        })?;
+        self.bind_authenticated_hub()?;
+        let request = crate::custody::fixtures::FixtureBindingRequest {
+            tenant_id: self.tenant_id.clone(),
+            edge_incarnation: self.db.sync_incarnation(&self.tenant_id)?,
+            expectation,
+        };
+        let bytes = rmp_serde::to_vec_named(&request)
+            .map_err(|error| Error::SyncError(error.to_string()))?;
+        let response = self
+            .transport
+            .request(
+                &crate::custody::fixtures::fixture_binding_subject(&self.tenant_id),
+                bytes,
+                SYNC_TIMEOUT,
+            )
+            .await
+            .map_err(|error| Error::SyncError(error.to_string()))?;
+        let binding: std::result::Result<crate::custody::fixtures::FixtureSignedBinding, String> =
+            rmp_serde::from_slice(&response)
+                .map_err(|error| Error::SyncError(error.to_string()))?;
+        let binding = binding.map_err(Error::SyncError)?;
+        crate::custody::fixtures::install_fixture_binding(
+            &self.db,
+            &self.tenant_id,
+            &hub_node_id,
+            &edge_node_id,
+            &binding,
+        )
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __stage_delivery_manifest_for_test(
+        &self,
+        tx: contextdb_core::TxId,
+        manifest: crate::custody_types::DeliveryManifest<'_>,
+    ) -> contextdb_core::Result<()> {
+        let edge_node_id = self.transport.local_node_id().ok_or_else(|| {
+            Error::SyncError("fixture manifest requires an authenticated edge".to_string())
+        })?;
+        let signer = self.lineage_signer.as_ref().ok_or_else(|| {
+            Error::SyncError("fixture manifest requires the edge signing key".to_string())
+        })?;
+        self.db.stage_delivery_registration(
+            tx,
+            crate::custody::preparation::SourceRegistration {
+                tenant: self.tenant_id.clone(),
+                edge: edge_node_id,
+                root: crate::custody::records::RowRef {
+                    table: manifest.root_table.into(),
+                    key: manifest.root_key,
+                },
+                members: manifest
+                    .members
+                    .into_iter()
+                    .map(|(table, key)| crate::custody::records::RowRef {
+                        table: table.into(),
+                        key,
+                    })
+                    .collect(),
+                signer: signer.clone(),
+            },
+        )
+    }
+
+    /// Statement 10: preserve the ordinary sibling's actual committed lineage in an adversarial request.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __ordinary_push_request_for_test(
+        &self,
+    ) -> contextdb_core::Result<crate::protocol::PushRequest> {
+        let (mut changes, _, _) = self.db.checked_changes_since_with_arrivals(Lsn(0))?;
+        changes.ddl.clear();
+        changes.ddl_lsn.clear();
+        let signer = self
+            .lineage_signer
+            .as_ref()
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        let node = self
+            .transport
+            .local_node_id()
+            .ok_or_else(crate::custody::canonical::invalid)?;
+        let incarnation = self.db.sync_incarnation(&self.tenant_id)?;
+        let lineages = self.db.outbound_row_lineages(
+            &changes,
+            &self.tenant_id,
+            &node,
+            incarnation,
+            signer.as_ref(),
+        )?;
+        Ok(crate::protocol::PushRequest {
+            changeset: crate::protocol::wire_changeset_with_arrivals_and_lineages(
+                changes,
+                &HashMap::new(),
+                &lineages,
+            ),
+            incarnation,
+        })
+    }
+
+    /// Statements 9/10/11: construct ordinary push input from committed prerequisites.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __delivery_push_request_for_test(
+        &self,
+        table: &str,
+        key: &crate::sync_types::NaturalKey,
+    ) -> contextdb_core::Result<crate::protocol::PushRequest> {
+        let signer = self
+            .lineage_signer
+            .as_ref()
+            .ok_or_else(|| Error::SyncError("authenticated source signer required".into()))?;
+        crate::custody::fixtures::manifested_request(&self.db, &self.tenant_id, table, key, signer)
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub async fn __seed_delivery_outcome_for_test(
+        &self,
+        root_table: &str,
+        root_key: &crate::sync_types::NaturalKey,
+        kind: crate::custody_types::DeliveryOutcomeKind,
+        cause: Option<&str>,
+    ) -> contextdb_core::Result<()> {
+        self.seed_delivery_outcome_for_test(root_table, root_key, kind, cause, true)
+            .await
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub async fn __seed_hub_delivery_outcome_for_test(
+        &self,
+        root_table: &str,
+        root_key: &crate::sync_types::NaturalKey,
+        kind: crate::custody_types::DeliveryOutcomeKind,
+        cause: Option<&str>,
+    ) -> contextdb_core::Result<()> {
+        self.seed_delivery_outcome_for_test(root_table, root_key, kind, cause, false)
+            .await
+    }
+
+    /// Reconcile progress for a real hub-committed manifest whose terminal has
+    /// not been admitted locally. The ordinary lost-acknowledgement path checks
+    /// the authenticated hub's actual applied frontier and pulls exact ordering
+    /// before advancing progress; this seam neither sets a watermark directly
+    /// nor installs a delivery outcome.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub async fn __reconcile_manifest_push_progress_for_test(
+        &self,
+        root_table: &str,
+        root_key: &crate::sync_types::NaturalKey,
+    ) -> contextdb_core::Result<()> {
+        let hub = self.transport.peer_node_id().ok_or_else(|| {
+            Error::SyncError("progress reconciliation requires an authenticated hub".into())
+        })?;
+        let manifest =
+            crate::custody::preparation::current_manifest(&self.db, root_table, root_key)?
+                .ok_or_else(|| Error::ManifestRequired {
+                    table: root_table.into(),
+                })?;
+        let rows = crate::custody::fixtures::manifest_rows(&self.db, &manifest)?;
+        self.finish_interrupted_push(
+            Error::SyncError("the terminal acknowledgement was not admitted".into()),
+            manifest.seal.source.0,
+            Some(&hub),
+            rows.len() as u64,
+            row_payload_bytes(&rows),
+            manifest.seal.source.0,
+            manifest.edge_incarnation,
+            rows.iter().any(|row| row.deleted),
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-seams")]
+    async fn seed_delivery_outcome_for_test(
+        &self,
+        root_table: &str,
+        root_key: &crate::sync_types::NaturalKey,
+        kind: crate::custody_types::DeliveryOutcomeKind,
+        cause: Option<&str>,
+        install_on_edge: bool,
+    ) -> contextdb_core::Result<()> {
+        let hub_node_id = self.transport.peer_node_id().ok_or_else(|| {
+            Error::SyncError("fixture outcome requires an authenticated hub".to_string())
+        })?;
+        let edge_node_id = self.transport.local_node_id().ok_or_else(|| {
+            Error::SyncError("fixture outcome requires an authenticated edge".to_string())
+        })?;
+        let manifest =
+            crate::custody::preparation::current_manifest(&self.db, root_table, root_key)?
+                .ok_or_else(|| Error::ManifestRequired {
+                    table: root_table.into(),
+                })?;
+        let rows = crate::custody::fixtures::manifest_rows(&self.db, &manifest)?;
+        let request = crate::custody::fixtures::FixtureOutcomeRequest {
+            tenant_id: self.tenant_id.clone(),
+            edge_incarnation: self.db.sync_incarnation(&self.tenant_id)?,
+            manifest,
+            rows,
+            kind: match kind {
+                crate::custody_types::DeliveryOutcomeKind::Accepted => 0,
+                crate::custody_types::DeliveryOutcomeKind::Equivalent => 1,
+                crate::custody_types::DeliveryOutcomeKind::Refused => 2,
+            },
+            cause: cause.map(str::to_string),
+        };
+        let bytes = rmp_serde::to_vec_named(&request)
+            .map_err(|error| Error::SyncError(error.to_string()))?;
+        let response = self
+            .transport
+            .request(
+                &crate::custody::fixtures::fixture_outcome_subject(&self.tenant_id),
+                bytes,
+                SYNC_TIMEOUT,
+            )
+            .await
+            .map_err(|error| Error::SyncError(error.to_string()))?;
+        let outcome: std::result::Result<crate::custody::fixtures::FixtureSignedOutcome, String> =
+            rmp_serde::from_slice(&response)
+                .map_err(|error| Error::SyncError(error.to_string()))?;
+        let outcome = outcome.map_err(Error::SyncError)?;
+        if !install_on_edge {
+            return Ok(());
+        }
+        crate::custody::fixtures::install_fixture_outcome(
+            &self.db,
+            &self.tenant_id,
+            &hub_node_id,
+            &edge_node_id,
+            &outcome,
+        )
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub async fn __seed_hub_delivery_batch_for_test(
+        &self,
+        table: &str,
+    ) -> contextdb_core::Result<usize> {
+        self.__seed_hub_delivery_roots_for_test(table, None).await
+    }
+
+    // Statement 15 fixture: arrange a selected receipt cohort in one actual commit.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub async fn __seed_hub_delivery_roots_for_test(
+        &self,
+        table: &str,
+        roots: Option<&[crate::sync_types::NaturalKey]>,
+    ) -> contextdb_core::Result<usize> {
+        use crate::custody::{preparation::TerminalInput, records::Record};
+        let records = self.db.custody_records()?;
+        let mut requests = Vec::new();
+        for record in &records {
+            let Record::Manifest(manifest) = record else {
+                continue;
+            };
+            if manifest.seal.root.table != table || !records.iter().any(|r| matches!(r, Record::Root { life, submission } if *life == manifest.root_life && *submission == manifest.id)) { continue; }
+            if roots.is_some_and(|keys| !keys.contains(&manifest.seal.root.key)) {
+                continue;
+            }
+            requests.push(TerminalInput {
+                tenant_id: self.tenant_id.clone(),
+                edge_incarnation: manifest.edge_incarnation,
+                rows: crate::custody::fixtures::manifest_rows(&self.db, manifest)?,
+                manifest: manifest.as_ref().clone(),
+                kind: 0,
+                cause: None,
+            });
+        }
+        let count = requests.len();
+        let bytes =
+            rmp_serde::to_vec_named(&requests).map_err(|e| Error::SyncError(e.to_string()))?;
+        let response = self
+            .transport
+            .request(
+                &crate::custody::fixtures::fixture_outcome_batch_subject(&self.tenant_id),
+                bytes,
+                SYNC_TIMEOUT,
+            )
+            .await
+            .map_err(|e| Error::SyncError(e.to_string()))?;
+        let result: std::result::Result<(), String> =
+            rmp_serde::from_slice(&response).map_err(|e| Error::SyncError(e.to_string()))?;
+        result.map_err(Error::SyncError)?;
+        Ok(count)
+    }
+
     pub fn new(db: Arc<Database>, endpoint: &str, tenant_id: TenantId) -> Self {
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_sync_client_start();
@@ -370,6 +873,10 @@ impl SyncClient {
                     .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
             "tenant_id must be non-empty and alphanumeric (hyphens and underscores allowed): {tenant_id}"
         );
+        // Statements 3/7: registration uses the authenticated source identity.
+        if let (Some(node), Some(signer)) = (transport.local_node_id(), &lineage_signer) {
+            db.set_custody_runtime(tenant_id.clone(), node, signer.clone());
+        }
         let (push_watermark, pull_watermark) = db
             .persisted_sync_watermarks(&tenant_id)
             .unwrap_or_else(|err| {
@@ -608,12 +1115,15 @@ impl SyncClient {
                 .append_destination_reupload_deletes(changes, through)?,
             None => changes,
         };
-        Ok(match reupload_epoch {
-            Some((through, _)) => {
-                drop_rows_that_arrived_by_sync_after(&self.db, changes, Some(through))
-            }
-            None => drop_rows_that_arrived_by_sync(&self.db, changes),
-        })
+        crate::custody::delivery::pending_changes(
+            &self.db,
+            match reupload_epoch {
+                Some((through, _)) => {
+                    drop_rows_that_arrived_by_sync_after(&self.db, changes, Some(through))
+                }
+                None => drop_rows_that_arrived_by_sync(&self.db, changes),
+            },
+        )
     }
 
     fn destination_reupload_epoch(&self) -> Result<Option<(Lsn, uuid::Uuid)>, Error> {
@@ -624,32 +1134,132 @@ impl SyncClient {
             .destination_reupload_epoch(&self.tenant_id, &hub_node_id)
     }
 
-    /// Stale-restore probe: best-effort, bounded status exchange on the
-    /// dedicated per-tenant status subject. The request carries this edge's
-    /// incarnation so the hub answers with the record for THIS life of the edge.
-    /// Every failure mode (no responder, timeout, transport status reply,
-    /// malformed payload) yields `None`, and the caller proceeds exactly as
-    /// today.
-    async fn fetch_sync_status(&self, incarnation: Incarnation) -> Option<SyncStatusResponse> {
-        let encoded = encode(
-            MessageType::StatusRequest,
-            &SyncStatusRequest { incarnation },
-        )
-        .ok()?;
-        let reply = self
-            .transport
-            .request_single_reply(
-                &status_subject(self.tenant_id.as_str()),
-                encoded,
-                STATUS_REQUEST_TIMEOUT,
-            )
-            .await
-            .ok()?;
-        let envelope = decode(&reply).ok()?;
-        if !matches!(envelope.message_type, MessageType::StatusResponse) {
-            return None;
+    /// Statements 14/15: authenticated restore verification in one bounded
+    /// status exchange. Failure to verify held receipts is an error, never credit.
+    /// An ordinary unbound peer without custody retains its best-effort status probe.
+    async fn fetch_sync_status(
+        &self,
+        incarnation: Incarnation,
+    ) -> Result<Option<SyncStatusResponse>, Error> {
+        let Some(hub) = self.hub_node_id() else {
+            return Ok(None);
+        };
+        let edge = self.transport.local_node_id();
+        let probe = if let Some(edge) = &edge {
+            crate::custody::incarnation::probe(&self.db, &self.tenant_id, &hub, edge, incarnation)?
+        } else {
+            // Statements 13/15: ordinary unidentified transports keep lost-ack
+            // status reconciliation; a bound custody edge must identify itself.
+            if self.db.custody_authority()?.iter().any(|record| {
+                matches!(record,
+                    crate::custody::records::Record::Binding(binding)
+                        if binding.namespace.tenant == self.tenant_id
+                            && binding.namespace.hub_node == hub
+                )
+            }) {
+                return Err(Error::SyncError(
+                    "restore status requires authenticated edge identity".into(),
+                ));
+            }
+            crate::custody::incarnation::StatusProbe {
+                incarnation,
+                checkpoint: None,
+            }
+        };
+        let verification_required = probe.checkpoint.is_some();
+        let mut last = None;
+        for encoded in probe.pages()? {
+            let exchange = async {
+                let reply = self
+                    .transport
+                    .request_single_reply(
+                        &status_subject(self.tenant_id.as_str()),
+                        encoded,
+                        STATUS_REQUEST_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|_| Error::SyncError("restore status exchange failed".into()))?;
+                let envelope = decode(&reply)
+                    .map_err(|_| Error::SyncError("invalid restore status response".into()))?;
+                if !matches!(envelope.message_type, MessageType::StatusResponse) {
+                    return Err(Error::SyncError(
+                        "unexpected restore status response".into(),
+                    ));
+                }
+                rmp_serde::from_slice::<SyncStatusResponse>(&envelope.payload)
+                    .map_err(|_| Error::SyncError("invalid restore status response".into()))
+            }
+            .await;
+            let status = match exchange {
+                Ok(status) => status,
+                Err(error) if verification_required => return Err(error),
+                Err(_) => return Ok(None),
+            };
+            if verification_required && status.hub_incarnation.is_none() {
+                return Err(Error::SyncError(
+                    "restore status omitted hub incarnation".into(),
+                ));
+            }
+            if let Some(current) = status.hub_incarnation {
+                let records = self.db.custody_authority()?;
+                if let Some(binding) = records.iter().find_map(|r| match r {
+                    crate::custody::records::Record::Binding(b)
+                        if b.namespace.tenant == self.tenant_id
+                            && b.namespace.hub_node == hub
+                            && Some(b.namespace.edge_node.as_str()) == edge.as_deref() =>
+                    {
+                        Some(b)
+                    }
+                    _ => None,
+                }) && binding.namespace.hub_incarnation != current
+                {
+                    let expectation = ApplicationTablePolicyExpectation {
+                        tables: binding
+                            .tables
+                            .iter()
+                            .map(|p| (p.table.clone(), p.policy.clone()))
+                            .collect(),
+                    };
+                    self.bind_application_table_policy(expectation).await?;
+                }
+            }
+            last = Some(status);
         }
-        rmp_serde::from_slice(&envelope.payload).ok()
+        Ok(last)
+    }
+
+    fn decode_push_reply(&self, reply: &[u8]) -> Result<ApplyResult, PushReplyError> {
+        let envelope = decode(reply)
+            .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
+        let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
+            .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
+        // Statement 13: an ordinary reply carries no custody admission obligation.
+        if !response.outcomes.is_empty() {
+            let hub = self
+                .hub_node_id()
+                .ok_or_else(|| PushReplyError::Terminal(crate::custody::canonical::invalid()))?;
+            let edge = self
+                .transport
+                .local_node_id()
+                .ok_or_else(|| PushReplyError::Terminal(crate::custody::canonical::invalid()))?;
+            self.db
+                .with_authoritative_hub_reply(&hub, |db| {
+                    let packets = response
+                        .outcomes
+                        .iter()
+                        .map(crate::custody::delivery::read_packet)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    crate::custody::preparation::admit_terminals(
+                        db,
+                        &self.tenant_id,
+                        &hub,
+                        &edge,
+                        &packets,
+                    )
+                })
+                .map_err(PushReplyError::Terminal)?;
+        }
+        decode_push_response(reply)
     }
 
     async fn request_push_once(&self, encoded: Vec<u8>) -> Result<ApplyResult, PushRequestError> {
@@ -666,7 +1276,8 @@ impl SyncClient {
                     "single-attempt push failed: {err}"
                 )))
             })?;
-        decode_push_response(&reply).map_err(PushReplyError::into_request_error)
+        self.decode_push_reply(&reply)
+            .map_err(PushReplyError::into_request_error)
     }
 
     async fn request_push(&self, encoded: Vec<u8>) -> Result<ApplyResult, PushRequestError> {
@@ -701,7 +1312,7 @@ impl SyncClient {
                 )
                 .await
             {
-                Ok(reply) => match decode_push_response(&reply) {
+                Ok(reply) => match self.decode_push_reply(&reply) {
                     Ok(result) => {
                         push_result = Some(result);
                         break;
@@ -840,7 +1451,7 @@ impl SyncClient {
         let mut local = self.push_watermark.load(Ordering::SeqCst);
         let pre_push_server_watermark = self
             .fetch_sync_status(incarnation)
-            .await
+            .await?
             .and_then(|status| status.applied_push_watermark);
         if let Some(server_applied) = pre_push_server_watermark
             && server_applied < local
@@ -993,6 +1604,8 @@ impl SyncClient {
             None => drop_rows_that_arrived_by_sync(&self.db, changeset),
         };
 
+        let changeset = crate::custody::delivery::pending_changes(&self.db, changeset)?;
+
         // The greatest LSN this push actually TRANSMITS, taken PRE-send from the
         // changeset computed under the directions read above. A lost-ack
         // reconciliation must bound the hub's answer by this — recomputing it
@@ -1141,7 +1754,7 @@ impl SyncClient {
             ddl_provenance,
         } in prepared_batches
         {
-            let request = PushRequest {
+            let mut request = PushRequest {
                 changeset:
                     crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
                         batch.clone(),
@@ -1151,6 +1764,12 @@ impl SyncClient {
                     ),
                 incarnation,
             };
+            // Statement 9: the existing ordinary push and oversized staging
+            // paths carry manifests beside the actual application rows.
+            if let Some(signer) = &self.lineage_signer {
+                request.changeset.manifests =
+                    crate::custody::delivery::attach(&self.db, &self.tenant_id, &batch, signer)?;
+            }
             let message_type = if dependency_complete {
                 MessageType::DependencyCompletePushRequest
             } else {
@@ -1273,7 +1892,14 @@ impl SyncClient {
                     ordinary_refused_rows.push(batch.rows[row_index].clone());
                 }
             }
+            let custody_envelope = !request.changeset.manifests.is_empty()
+                || batch.rows.iter().any(|row| {
+                    self.db
+                        .table_meta(&row.table)
+                        .is_some_and(|meta| meta.delivery_manifest_tables.is_some())
+                });
             if dependency_complete
+                && !custody_envelope
                 && !refused_indexes.is_empty()
                 && refused_indexes.len() != batch.rows.len()
             {
@@ -1428,6 +2054,15 @@ impl SyncClient {
         let confirmed = self
             .fetch_sync_status(incarnation)
             .await
+            // Statements 13/15: failed verification cannot confirm a transmitted
+            // batch, and must preserve the existing indeterminate-push contract.
+            .map_err(|verification_err| Error::SyncPushUnconfirmed {
+                detail: format!(
+                    "the hub did not acknowledge the push ({transport_err}); status verification \
+                     failed ({verification_err}); the data may or may not have committed — run \
+                     the push again to reconcile"
+                ),
+            })?
             .and_then(|status| status.applied_push_watermark)
             .is_some_and(|server_applied| {
                 server_applied >= batch_max_lsn && server_applied <= transmitted_ceiling
@@ -1593,7 +2228,7 @@ impl SyncClient {
             .sync_incarnation(&self.tenant_id)
             .map_err(|err| Error::SyncError(err.to_string()))?;
         if probe_status
-            && let Some(status) = self.fetch_sync_status(incarnation).await
+            && let Some(status) = self.fetch_sync_status(incarnation).await?
             && let Some(server_lsn) = status.server_current_lsn
             && server_lsn < local
         {

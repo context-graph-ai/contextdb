@@ -4,6 +4,16 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
+- **Added.** `DECLARE TENANT TABLE POLICY` persists versioned hub policy and freezes it at
+  binding. Transactional delivery manifests cover the complete root/member rows with BLAKE3;
+  ordinary push returns durable `accepted`, `equivalent`, or `refused` outcomes, and authenticated
+  outcome fetch recovers lost acknowledgements. `SHOW` and `.sync policy/bindings/outcomes`
+  inspect metadata; `DISCARD` enforces the bound `NEVER`, `AFTER OUTCOME`, or `ALWAYS` mode in the
+  ordinary local transaction. Multi-table `PURGE` commits one selected erasure boundary.
+  A listed `SYNC OFF` table delivers its self-contained predicate and bound values so each edge
+  erases its own matching keys atomically; subqueries on those tables are refused before selection.
+  Custody joins the shared v7 vocabulary; protocol and ALPN constants are unchanged.
+
 - **Behavior change.** A bare `CREATE TABLE` naming a table that already exists is now refused
   instead of silently replacing that table's schema — the old behavior dropped the values in
   every column the new declaration omitted. `CREATE TABLE IF NOT EXISTS` is the spelling that

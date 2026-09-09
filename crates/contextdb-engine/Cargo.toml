@@ -92,7 +92,7 @@ nix = { version = "0.30.1", features = ["fs", "mount", "poll", "socket", "user"]
 
 [dev-dependencies]
 contextdb-server = { path = "../contextdb-server", features = ["in-process-test-seams"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 num_cpus = "1.16"
 criterion = { version = "0.8", features = ["html_reports"] }
 regex = "1"
@@ -374,3 +374,43 @@ path = "../../benches/trigger_throughput.rs"
 name = "version_cleanup_scaling"
 harness = false
 path = "../../benches/version_cleanup_scaling.rs"
+
+[[test]]
+name = "tenant_table_policy_contract"
+path = "tests/tenant_table_policy_contract.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "delivery_manifest_contract"
+path = "tests/delivery_manifest_contract.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "delivery_outcome_contract"
+path = "tests/delivery_outcome_contract.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_purge_and_discard_contract"
+path = "tests/custody_purge_and_discard_contract.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_inspection_contract"
+path = "tests/custody_inspection_contract.rs"
+required-features = ["test-seams", "iroh"]
+
+[[test]]
+name = "custody_protocol_contract"
+path = "tests/custody_protocol_contract.rs"
+required-features = ["test-seams", "iroh"]
+
+# Documentation recipe uses the ordinary authenticated transport (statements 1/3/7/13/14).
+[[example]]
+name = "event_custody"
+required-features = ["iroh"]
+
+# Statements 9/11/14/15: receipt for ordinary Iroh delivery cost at scale.
+[[example]]
+name = "custody_scale"
+required-features = ["iroh", "test-seams"]

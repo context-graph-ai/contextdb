@@ -296,6 +296,15 @@ fn resolve_aliases(path: &[String], aliases: &BTreeMap<String, Vec<String>>) -> 
 }
 
 fn forbidden_dependency(path: &[String]) -> bool {
+    // Statement 19: the exact key value crosses the typed metadata request boundary.
+    // Qualified constructors and every other sync subsystem path remain forbidden.
+    if path
+        .iter()
+        .map(String::as_str)
+        .eq(["crate", "sync_types", "NaturalKey"])
+    {
+        return false;
+    }
     let forbidden_modules = [
         "companion",
         "companion_lock",
@@ -439,6 +448,12 @@ fn cargo_dependency_entries(manifest: &toml::Value) -> Vec<CargoDependencyEntry>
 
 #[test]
 fn local_channel_source_recursively_excludes_storage_companion_remote_and_async_dependencies() {
+    assert!(forbidden_dependency(&[
+        "crate".into(),
+        "sync_types".into(),
+        "NaturalKey".into(),
+        "single".into(),
+    ]));
     let source_root = engine_root().join("src/local_transport");
     let manifest: toml::Value = fs::read_to_string(engine_root().join("Cargo.toml"))
         .expect("read engine manifest")

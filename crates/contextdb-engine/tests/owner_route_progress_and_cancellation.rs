@@ -17,13 +17,18 @@ use contextdb_core::read_contract::{
     ReadClientTimeouts, ReadLimits, ReadRoute,
 };
 use contextdb_core::{Error, Value};
+use contextdb_engine::read_session::{
+    ReadKernelCancellationEvent, ReadKernelSource, ReadKernelSourceEvent, ReadKernelTestObserver,
+    ReadSessionOperation,
+};
 use contextdb_engine::{
     Database, DatabaseOpenOptions, OwnerReadConfig, ReadPhase, ReadProgress, ReadProgressObserver,
     ReadSession, ReadSessionOptions,
 };
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -201,6 +206,7 @@ impl ReadProgressObserver for CancelOnFirstReport {
 struct ArmableCancelOnReport {
     armed: Mutex<Option<OwnerReadCancellation>>,
     reports_while_armed: Mutex<Vec<ReadProgress>>,
+    fetch_gate: Arc<Barrier>,
 }
 
 impl ArmableCancelOnReport {
@@ -208,6 +214,7 @@ impl ArmableCancelOnReport {
         Self {
             armed: Mutex::new(None),
             reports_while_armed: Mutex::new(Vec::new()),
+            fetch_gate: Arc::new(Barrier::new(2)),
         }
     }
 
@@ -233,12 +240,58 @@ impl ReadProgressObserver for ArmableCancelOnReport {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cancellation) = armed.as_ref() {
-            self.reports_while_armed
+            let mut reports = self
+                .reports_while_armed
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(progress);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if reports.is_empty() {
+                self.fetch_gate.wait();
+            }
+            reports.push(progress);
             cancellation.cancel();
         }
+    }
+}
+
+// Existing read cancellation contract: the owner remains inside the fetch when
+// its caller cancels from a real progress frame, independent of thread scheduling.
+struct FetchCancellationGate {
+    progress: Arc<Barrier>,
+    parked: AtomicBool,
+    observed: AtomicBool,
+}
+
+impl ReadKernelTestObserver for FetchCancellationGate {
+    fn before_source_touch(
+        &self,
+        event: ReadKernelSourceEvent,
+        cancellation: OwnerReadCancellation,
+    ) {
+        if event.operation == ReadSessionOperation::CursorFetch
+            && event.source == ReadKernelSource::TableRow
+            && event.completed_items == 1_000
+            && !self.parked.swap(true, Ordering::SeqCst)
+        {
+            assert_eq!(event.route, ReadRoute::Owner);
+            let (sent, received) = std::sync::mpsc::channel();
+            let _listener = cancellation.tell_on_cancel(move || {
+                let _ = sent.send(());
+            });
+            self.progress.wait();
+            received
+                .recv()
+                .expect("the observer's cancellation reaches the executing owner");
+        }
+    }
+
+    fn cancellation_observed(
+        &self,
+        event: ReadKernelCancellationEvent,
+        cancellation: OwnerReadCancellation,
+    ) {
+        assert_eq!(event.operation, ReadSessionOperation::CursorFetch);
+        assert!(cancellation.is_cancelled());
+        self.observed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -425,10 +478,16 @@ fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_c
     let path = directory.path().join("owner-cancel-cursor.db");
     let runtime_root = secure_runtime_root(&directory, "owner-cancel-cursor-runtime");
 
-    let owner = live_owner(&path, runtime_root.clone());
-    seed_progress_rows(&owner);
-
     let observer = Arc::new(ArmableCancelOnReport::new());
+    let gate = Arc::new(FetchCancellationGate {
+        progress: observer.fetch_gate.clone(),
+        parked: AtomicBool::new(false),
+        observed: AtomicBool::new(false),
+    });
+    let mut options = roomy_owner_options(runtime_root.clone());
+    options.test_kernel_observer = Some(gate.clone());
+    let owner = Database::open_with_options(&path, options).expect("start the observed owner");
+    seed_progress_rows(&owner);
     let reader = ReadSession::with_runtime_directory_for_test(&runtime_root, || {
         ReadSession::open_with_progress(
             &path,
@@ -442,10 +501,9 @@ fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_c
     // ordered answer would be collected and sorted while the cursor is
     // OPENED, leaving the fetch nothing to walk. The observer is not armed
     // yet, so whatever progress opening the cursor reports is inert. The
-    // fetch below then has to walk past over two thousand hay rows to reach
-    // the second needle -- work enough to cross the reporting interval, and
-    // it is armed for exactly that call, so its own report is the one that
-    // cancels it.
+    // fetch crosses a progress interval, then parks at the kernel seam until
+    // cancellation arrives over the channel. Its observer waits for that park
+    // before cancelling, so a completed page cannot win the scheduling race.
     let mut cursor = reader
         .open_cursor(
             "SELECT id FROM owner_progress_rows WHERE marker = $marker",
@@ -459,6 +517,14 @@ fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_c
     let cancellation = OwnerReadCancellation::new();
     observer.arm(cancellation.clone());
     let refused = cursor.fetch_with_cancellation(None, &cancellation);
+    assert!(
+        gate.parked.load(Ordering::SeqCst),
+        "the fetch reached the kernel gate"
+    );
+    assert!(
+        gate.observed.load(Ordering::SeqCst),
+        "the kernel observed cancellation before answering"
+    );
     assert!(
         matches!(refused, Err(Error::ReadCancelled)),
         "cancelling a cursor fetch from inside the observer, over the owner channel, yields \

@@ -55,6 +55,10 @@ fn sample_meta(history_policy: Option<HistoryPolicy>) -> TableMeta {
         primary_key_columns: Vec::new(),
         conflict_policy: Some(ConflictPolicy::KEEP_LATEST),
         history_policy,
+        // Statements 1/17b: current metadata includes absent custody declarations;
+        // the historical payload structs below retain their exact old shape.
+        delivery_manifest_tables: None,
+        edge_discard: None,
     }
 }
 

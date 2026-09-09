@@ -19,7 +19,10 @@ pub fn statement_effect(statement: &Statement) -> StatementEffect {
         | Statement::ShowMemoryLimit
         | Statement::ShowDiskLimit
         | Statement::ShowSyncConflictPolicy
-        | Statement::ShowVectorIndexes => StatementEffect::Read,
+        | Statement::ShowVectorIndexes
+        | Statement::ShowTenantTablePolicy { .. }
+        | Statement::ShowSyncBindings
+        | Statement::ShowDeliveryOutcomes(_) => StatementEffect::Read,
 
         // This match intentionally stays exhaustive. A future parser variant
         // must make its store effect explicit at the same time it is added.
@@ -30,6 +33,8 @@ pub fn statement_effect(statement: &Statement) -> StatementEffect {
         | Statement::DropIndex(_)
         | Statement::Insert(_)
         | Statement::Purge(_)
+        | Statement::Discard(_)
+        | Statement::DeclareTenantTablePolicy(_)
         | Statement::Delete(_)
         | Statement::Update(_)
         | Statement::Begin

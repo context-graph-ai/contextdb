@@ -1142,7 +1142,7 @@ pub struct RefusalCause {
     pub natural_key: NaturalKey,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Conflict {
     pub natural_key: NaturalKey,
     #[cfg(feature = "test-seams")]

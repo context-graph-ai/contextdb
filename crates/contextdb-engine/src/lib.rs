@@ -1,7 +1,9 @@
 //! The embeddable storage engine: an in-process database with a SQL-like
-//! executor, versioned rows, triggers, and sync-changeset production. This
-//! crate has no network dependency — [`sync`] only tracks and packages
-//! changes for a transport to move; `contextdb-server` is what dials out.
+//! executor, versioned rows, triggers, and sync-changeset production.
+//! This crate owns the real authenticated `SyncClient` and `SyncServer` when sync orchestration is
+//! enabled; the server executable re-exports that implementation. Delivery manifests are registered
+//! in the row transaction, and the hub commits each unit with its signed outcome. Tenant policy and
+//! outcome inspection use engine metadata. Local discard shares the ordinary transaction boundary.
 //!
 //! # Example
 //!
@@ -53,6 +55,7 @@ mod blob_repository;
 pub mod blob_store;
 pub mod cli_render;
 pub mod composite_store;
+pub mod custody_types;
 pub mod database;
 #[cfg(not(feature = "test-seams"))]
 mod direct_file_reader;
@@ -127,9 +130,15 @@ pub mod transport;
 
 #[cfg(feature = "iroh")]
 pub use blob_store::{BlobStore, ResolveError};
+pub use contextdb_core::EdgeDiscardMode;
 pub use contextdb_core::read_contract::{
     CursorPage, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus, OwnerRequestHandler,
     OwnerServiceTimeouts, ReadClientTimeouts, ReadLimits, ReadRoute,
+};
+pub use custody_types::{
+    ApplicationTablePolicy, ApplicationTablePolicyExpectation, AuthenticatedTenantPolicyBinding,
+    BoundTablePolicy, DeliveryManifest, DeliveryOutcome, DeliveryOutcomeCursor,
+    DeliveryOutcomeKind, DeliveryStatusCounts, RetentionDeclaration,
 };
 #[doc(hidden)]
 pub use database::CommitStageStats;
@@ -181,3 +190,5 @@ pub use sync_types::{
     ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RowChange, SyncAdoption,
     SyncDirection, VectorChange, natural_key_columns_for_meta,
 };
+
+pub(crate) mod custody;

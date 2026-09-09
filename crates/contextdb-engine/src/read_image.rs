@@ -915,6 +915,18 @@ pub(crate) fn write_metadata_body(
     body: &DirectMetadataBody,
 ) {
     match body {
+        DirectMetadataBody::DeliveryStatus { counts, has_more } => {
+            bytes
+                .tag(6)
+                .flag(*has_more)
+                .text(&serde_json::to_string(counts).expect("finite custody counts serialize"));
+        }
+        DirectMetadataBody::DeliveryOutcome { outcome, has_more } => {
+            bytes
+                .tag(7)
+                .flag(*has_more)
+                .text(&serde_json::to_string(outcome).expect("custody projection serializes"));
+        }
         DirectMetadataBody::Tables { items, has_more } => {
             bytes.tag(0).count(items.len() as u64);
             for item in items {
@@ -1076,6 +1088,24 @@ pub(crate) fn read_metadata_body(
         5 => Ok(DirectMetadataBody::ImageState {
             state: read_image_state(bytes)?,
         }),
+        6 => {
+            let has_more = bytes.flag()?;
+            let counts: Option<crate::DeliveryStatusCounts> =
+                serde_json::from_str(&bytes.text()?).map_err(|_| invalid_metadata_payload())?;
+            if has_more == counts.is_some() {
+                return Err(invalid_metadata_payload());
+            }
+            Ok(DirectMetadataBody::DeliveryStatus { counts, has_more })
+        }
+        7 => {
+            let has_more = bytes.flag()?;
+            let outcome = crate::custody_types::decode_outcome_projection(&bytes.text()?)
+                .map_err(|_| invalid_metadata_payload())?;
+            if has_more && outcome.is_some() {
+                return Err(invalid_metadata_payload());
+            }
+            Ok(DirectMetadataBody::DeliveryOutcome { outcome, has_more })
+        }
         _ => Err(invalid_metadata_payload()),
     }
 }
@@ -1768,6 +1798,7 @@ pub(crate) fn project_metadata_from_database(
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     continuation: Option<&str>,
+    cancellation: &OwnerReadCancellation,
 ) -> std::result::Result<(DirectMetadataBody, Option<String>), DirectFileReaderError> {
     // An inventory is bounded a page at a time by the pager below. Everything
     // else arrives whole, so whether it fits is decided once it is built.
@@ -1777,6 +1808,11 @@ pub(crate) fn project_metadata_from_database(
     );
     let mut resume_at = None;
     let body = match request {
+        request @ (DirectMetadataRequest::DeliveryStatus { .. }
+        | DirectMetadataRequest::DeliveryOutcome { .. }) => {
+            crate::custody::inspection::metadata(database, request)
+                .map_err(|e| DirectFileReaderError::Engine(e.to_string()))?
+        }
         DirectMetadataRequest::Tables => {
             let page = paged(
                 MetadataPageVocabulary::Tables,
@@ -1800,7 +1836,7 @@ pub(crate) fn project_metadata_from_database(
             }
         }
         DirectMetadataRequest::Explain { sql } => {
-            explained_statement(database, sql, limits, Arc::clone(&clock))?
+            explained_statement(database, sql, limits, Arc::clone(&clock), cancellation)?
         }
         DirectMetadataRequest::EventsStatus => {
             let page = paged(
@@ -1879,6 +1915,7 @@ pub(crate) fn project_metadata(
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     continuation: Option<&str>,
+    cancellation: &OwnerReadCancellation,
 ) -> std::result::Result<DirectMetadataResponse, DirectFileReaderError> {
     let arrives_whole = !matches!(
         request,
@@ -1886,6 +1923,10 @@ pub(crate) fn project_metadata(
     );
     let mut resume_at = None;
     let body = match request {
+        request @ (DirectMetadataRequest::DeliveryStatus { .. }
+        | DirectMetadataRequest::DeliveryOutcome { .. }) => target
+            .delivery_metadata(request)
+            .map_err(|e| DirectFileReaderError::Engine(e.to_string()))?,
         DirectMetadataRequest::Tables => {
             // Cut by the same pager the owner uses, so an inventory read from
             // the file breaks at exactly the places it breaks over a channel.
@@ -1922,7 +1963,7 @@ pub(crate) fn project_metadata(
             DirectMetadataBody::Schema { schema }
         }
         DirectMetadataRequest::Explain { sql } => {
-            explained_statement(target, sql, limits, Arc::clone(&clock))?
+            explained_statement(target, sql, limits, Arc::clone(&clock), cancellation)?
         }
         DirectMetadataRequest::EventsStatus => {
             let page = paged(
@@ -1991,6 +2032,7 @@ pub(crate) fn explained_statement(
     sql: String,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
+    cancellation: &OwnerReadCancellation,
 ) -> std::result::Result<DirectMetadataBody, DirectFileReaderError> {
     let statement = contextdb_parser::parse(&sql)
         .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
@@ -2004,7 +2046,6 @@ pub(crate) fn explained_statement(
             sql,
         });
     }
-    let cancellation = OwnerReadCancellation::new();
     // An explain request carries a statement, not the values a caller would
     // run it with, and the engine's plan can depend on those values -- an
     // index seek needs something to seek to. Every parameter the statement
@@ -2013,7 +2054,7 @@ pub(crate) fn explained_statement(
     // the engine's own rather than a second description of what it might have
     // chosen.
     let params = explain_bindings(target, &sql);
-    let answered = target.read_query(&sql, &params, limits, clock, &cancellation)?;
+    let answered = target.read_query(&sql, &params, limits, clock, cancellation)?;
     Ok(DirectMetadataBody::Explain {
         physical_plan: answered.0.trace.physical_plan.to_owned(),
         index: answered.0.trace.index_used.clone(),

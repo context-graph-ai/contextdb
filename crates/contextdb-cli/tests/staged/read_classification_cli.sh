@@ -75,6 +75,10 @@ readonly -a META_COMMAND_DECLARATIONS=(
     'StoreRead|.cursor open'
     'StoreRead|.cursor fetch'
     'StoreRead|.cursor close'
+    # Statement 19: the three custody inspections are canonical metadata reads.
+    'StoreRead|.sync policy'
+    'StoreRead|.sync bindings'
+    'StoreRead|.sync outcomes'
     'StoreWrite|.maintenance run'
     'StoreWrite|.maintenance compact'
     'StoreWrite|.sync push'
@@ -940,13 +944,13 @@ if ! jq -e -s \
     (.[0].events_status | keys) == ["continuation", "has_more", "items"] and
     (.[0].events_status.items | type == "array" and length >= 4) and
     all(.[0].events_status.items[]; type == "object") and
-    ([.[0].events_status.items[].name] | sort) as $names |
-    ($names | index($schedule)) and
-    ($names | index($event)) and
-    ($names | index($sink)) and
-    ($names | index($route)) and
-    .[0].events_status.has_more == false and
-    .[0].events_status.continuation == null
+    (([.[0].events_status.items[].name] | sort) as $names |
+        (($names | index($schedule)) and
+        ($names | index($event)) and
+        ($names | index($sink)) and
+        ($names | index($route)) and
+        .[0].events_status.has_more == false and
+        .[0].events_status.continuation == null))
 ' "$output_dir/events-status-bounded-page.stdout" >/dev/null; then
     fail_journey \
         'events-status-bounded-page' \
@@ -968,6 +972,38 @@ printf '%s\n' \
         'the fixture with no maintenance declarations must seed successfully' \
         "$output_dir/maintenance-empty-seed.stdout" \
         "$output_dir/maintenance-empty-seed.stderr"
+
+# Statement 19: include the declared custody reads in this exact CLI inventory.
+# This empty fixture checks read classification, shape, and SQL/meta parity;
+# nonempty custody metadata is exercised by the custody inspection contract.
+for inspection in policy bindings outcomes; do
+    command=".sync $inspection"
+    case "$inspection" in
+        policy) statement='SHOW TENANT TABLE POLICY'; input="$command" ;;
+        bindings) statement='SHOW SYNC BINDINGS'; input="$command" ;;
+        outcomes)
+            statement="SHOW DELIVERY OUTCOMES FOR $read_entries_table"
+            input="$command FOR $read_entries_table"
+            ;;
+    esac
+    journey="custody-inspection-$inspection"
+    expect_read_success "$journey" "$input"
+    expect_read_success "$journey-sql" "$statement"
+    if ! cmp -s "$output_dir/$journey.stdout" "$output_dir/$journey-sql.stdout" \
+        || ! jq -e -s '
+            length == 1 and
+            (.[0] | keys) == ["result"] and
+            (.[0].result | keys) == ["columns", "rows"] and
+            (.[0].result.columns | type == "array" and length > 0 and all(.[]; type == "string")) and
+            .[0].result.rows == []
+        ' "$output_dir/$journey.stdout" >/dev/null; then
+        fail_journey "$journey" \
+            'the custody meta-command must match its SQL inspection with an empty metadata result' \
+            "$output_dir/$journey.stdout" "$output_dir/$journey.stderr" \
+            "$output_dir/$journey.before.manifest" "$output_dir/$journey.after.manifest"
+    fi
+    exercised_store_read_commands["$command"]=present
+done
 
 expect_read_success 'maintenance-status-complete-object' '.maintenance status'
 expect_read_success \

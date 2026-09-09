@@ -392,14 +392,27 @@ pub struct DirectQuery {
 }
 
 /// Metadata operations projected from the owned committed image.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DirectMetadataRequest {
+    DeliveryStatus {
+        root_table: String,
+    },
+    DeliveryOutcome {
+        root_table: String,
+        root_key: crate::sync_types::NaturalKey,
+    },
     Tables,
-    Schema { table: String },
-    Explain { sql: String },
+    Schema {
+        table: String,
+    },
+    Explain {
+        sql: String,
+    },
     EventsStatus,
     MaintenanceStatus,
-    ImageState { kind: DirectImageMetadataKind },
+    ImageState {
+        kind: DirectImageMetadataKind,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +431,14 @@ pub enum DirectImageState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DirectMetadataBody {
+    DeliveryStatus {
+        counts: Option<crate::DeliveryStatusCounts>,
+        has_more: bool,
+    },
+    DeliveryOutcome {
+        outcome: Option<crate::DeliveryOutcome>,
+        has_more: bool,
+    },
     Tables {
         items: Vec<String>,
         has_more: bool,
@@ -1037,12 +1058,22 @@ impl DirectFileReader {
         request: DirectMetadataRequest,
         continuation: Option<&str>,
     ) -> Result<DirectMetadataResponse, DirectFileReaderError> {
+        self.metadata_from_with_cancellation(request, continuation, &OwnerReadCancellation::new())
+    }
+
+    pub(crate) fn metadata_from_with_cancellation(
+        &self,
+        request: DirectMetadataRequest,
+        continuation: Option<&str>,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<DirectMetadataResponse, DirectFileReaderError> {
         self.target.read_metadata(
             request,
             &self.image,
             self.limits,
             Arc::clone(&self.clock),
             continuation,
+            cancellation,
         )
     }
 

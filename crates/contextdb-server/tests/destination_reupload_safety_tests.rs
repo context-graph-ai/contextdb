@@ -422,6 +422,8 @@ impl ClientTransport for PauseAfterPushReply {
                     &SyncStatusResponse {
                         applied_push_watermark: Some(self.status_frontier),
                         server_current_lsn: Some(self.status_frontier),
+                        // Statement 13: ordinary lost-ack fixtures have no custody binding.
+                        hub_incarnation: None,
                     },
                 )
                 .map_err(|error| TransportError::Other(error.to_string()));
@@ -438,6 +440,8 @@ impl ClientTransport for PauseAfterPushReply {
                         }),
                         error: None,
                         application_error: None,
+                        // Statement 13: ordinary response lane compile prerequisite.
+                        ..Default::default()
                     },
                 )
                 .map_err(|error| TransportError::Other(error.to_string()))?;

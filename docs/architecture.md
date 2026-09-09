@@ -455,12 +455,49 @@ Dial-by-key means clients reach the server through its cryptographic identity, n
 
 The server is just a contextdb instance running SyncServer. Self-host it, or point your client databases at a hosted server — the client binary and database files don't change, only the enrollment ticket they dial. Managed hosting is coming soon — [join the waitlist](https://contextdb.tech).
 
+### Manifests and outcomes
+
+The engine's private `custody` modules own canonical policy, manifest, signed outcome, and
+incarnation records in the existing config-value journal. `SyncClient` and `SyncServer` in
+`contextdb-engine` perform authenticated bind, ordinary manifested push, status, and outcome fetch;
+`contextdb-server` re-exports them. Row/outcome acceptance shares the production Redb transaction.
+Local `DISCARD` stages a physical erasure projection in the ordinary write transaction and publishes
+it with the ordinary writes only after durable success. It reuses the authoritative purge's physical
+erasure writer and failure boundary but creates no fleet frontier.
+
+Custody does not maintain a per-commit history chain or inspect its journal on unrelated writes.
+The owned immutable metadata cache is invalidated at custody commits and erasure. Admin `SHOW`
+uses that metadata; scoped delivery reads use the existing root visibility and read-route budgets.
+
+Every application column contributes to the canonical BLAKE3 row and unit digests; local bookkeeping
+belongs outside those rows when identical imports must compare equivalent. One durable terminal
+outcome shares the unit's commit. Outcome fetch returns every outcome after the supplied acceptance position,
+including every outcome sharing one position. Watermarks never substitute for receipts.
+The journal grows with retained units and is erased with them, not reclaimed by ordinary delivery.
+On mutable tables, updating or deleting a manifested row retires its current manifest ownership in
+the row commit while retaining signed history and terminal outcomes for inspection. A replacement
+root without a newly registered manifest receives `manifest_required`; unrelated units keep syncing.
+Deletes follow the table's ordinary conflict policy and are never reoffered as live manifested rows.
+Delivery counts include current manifest owners only; re-registration creates a new pending unit.
+
+An ordinary status request carries one hub-signed prefix checkpoint. The hub checks that prefix
+against its committed image; unrelated writes and purges cannot conceal a lost accepted prefix.
+A current image retains its incarnation. An older image rotates it, including a declared snapshot
+from before the first binding, and the edge automatically rebinds and returns old credit to pending.
+Missing policy declarations still require the operator to declare them. Verification failure is
+reported to the caller.
+A listed node-local purge predicate and bound values travel as permitted journal erasure instructions;
+each edge selects and erases its own keys within the same applied boundary.
+
 ### Components
 
 - `SyncClient` — runs on each participant. Pushes local changes to server, pulls remote changes.
 - `SyncServer` — runs on the central server. Receives pushes, serves pulls.
 
 Both communicate over per-tenant sync channels: `sync.{tenant_id}.push` / `sync.{tenant_id}.pull`.
+Custody adds `BindApplicationTablePolicyRequest` and `FetchDeliveryOutcomesRequest`. Manifests and
+outcomes travel on ordinary push/reply; ordinary status carries the hub incarnation and verifies
+one signed prefix checkpoint. There is no separate purge or authority-exchange request kind.
 
 ### Change Tracking
 
@@ -581,7 +618,15 @@ participates.
 
 Schema changes (CREATE TABLE, ALTER TABLE, DROP TABLE) are synced alongside data. Constraints (PRIMARY KEY, NOT NULL, UNIQUE, single-column and composite FOREIGN KEY, STATE MACHINE, DAG) are preserved across sync.
 
+Hub declarations persist before an application table exists. The first authenticated binding
+freezes each declared policy. Bound local and arriving DDL must match the binding; arriving DDL
+cannot overwrite an explicitly declared local policy. A per-table refusal leaves unrelated tables
+available for sync.
+
 ### Tenants and Contexts
+
+A tenant's application-table policy is declared at its authoritative hub and bound independently
+of enrollment. The binding names the tenant, hub identity and database incarnation.
 
 Two identifiers look similar but sit on different axes; don't conflate them. A
 `TenantId` (`contextdb_core::TenantId`) is a sync-surface identity — the

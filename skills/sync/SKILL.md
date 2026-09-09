@@ -11,7 +11,8 @@ repo: `cargo build --release -p contextdb-cli -p contextdb-server`. Other instal
 
 Every contextdb instance is a full read-write database that works offline. Sync moves **logical
 changesets** — not WAL pages — between edges through one hub, with per-table conflict resolution.
-Knowledge captured on any machine becomes available on all of them.
+Each table's declared direction decides where its rows travel; push-only application rows remain
+at their source edge and hub.
 
 There is **no broker**. An edge reaches the hub by dialing the hub's own cryptographic identity
 (dial-by-key), carried in an *enrollment ticket* the hub prints. The edge dials outbound, so a hub
@@ -39,7 +40,8 @@ service.
 
 ## 1. Start the hub
 
-The hub only serves. You don't type SQL at it — your data lives on the edges that dial in.
+The server serves authenticated sync. Declare tenant table policy with the CLI on the hub store
+before starting it; application data then arrives from its enrolled edges.
 
 ```bash
 rm -f ./hub.ticket
@@ -499,3 +501,57 @@ identity loads exclusively from the key file — so it is not a substitute for r
 - Open a database, run SQL, read `--json` → [`skills/using-contextdb/SKILL.md`](../using-contextdb/SKILL.md)
 - Distribute jobs and blobs over this same hub → [`skills/work-fabric/SKILL.md`](../work-fabric/SKILL.md)
 - Tell a healthy pull from a stuck one, purge, back up before a destructive op → [`skills/operating-a-store/SKILL.md`](../operating-a-store/SKILL.md)
+
+## Tenant policy and unit custody
+
+Enrollment authenticates the hub. A separate binding authenticates the table clauses before an
+edge creates those tables. From the repository root, with release binaries on `PATH`, use a fresh
+directory (the example deliberately creates new tables):
+
+```bash
+mkdir custody-demo
+contextdb --write custody-demo/hub.db <<'SQL'
+DECLARE TENANT TABLE POLICY records SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST DELIVERY MANIFEST OVER record_parts;
+DECLARE TENANT TABLE POLICY record_parts SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST;
+SQL
+contextdb-server --db-path custody-demo/hub.db --tenant-id custody-demo --ticket-file custody-demo/hub.ticket > custody-demo/hub.log 2>&1 &
+custody_demo_hub_pid=$!
+until [ -s custody-demo/hub.ticket ]; do
+  kill -0 "$custody_demo_hub_pid" || exit 1
+  sleep 0.2
+done
+cargo run --quiet --release -p contextdb-engine --features iroh --example event_custody -- custody-demo/edge.db custody-demo/hub.ticket
+kill "$custody_demo_hub_pid"
+wait "$custody_demo_hub_pid" || true
+```
+
+The example's exact output is:
+
+```text
+accepted=1 pending=0 read_back=1
+```
+
+[`event_custody.rs`](../../crates/contextdb-engine/examples/event_custody.rs) calls
+`bind_application_table_policy`, creates matching DDL, registers an empty-member manifest inside
+the row's transaction, pushes, fetches its outcomes, and reads local status. The same registration
+accepts explicit member references when those rows are written in that transaction. Every
+application column contributes to the BLAKE3 digest; put local bookkeeping in a separate table.
+
+Before manifest registration, construct `SyncClient` or `SyncServer` on the same
+`Database` handle in this process. Construction loads the authenticated identity;
+no live connection is needed. Repeat it after reopening in another process.
+Without this preparation, registration returns `SchemaInvalid` with
+`delivery registration requires an authenticated sync identity`. Construct the sync
+component first, then retry registration.
+
+A mismatched `SYNC CONFLICT` expectation returns `TenantPolicyMismatch` naming the table and
+`conflict` clause. It means the application's expectation and hub declaration disagree;
+no mismatched binding or table is installed. Inspect `.sync policy` and correct the expectation or,
+before the first binding, the declaration. Once bound, that declaration is frozen.
+
+A watermark is not a custody receipt. Fetching outcomes recovers lost acknowledgements without
+reapplying rows; `accepted`, `equivalent`, and `refused` all end the pending obligation. A restored
+hub that lost accepted history revokes old credit automatically on the next status exchange.
+Use `.sync outcomes FOR records` for metadata-only diagnosis. `DISCARD` obeys the persisted bound
+mode offline and leaves no tombstone; authoritative multi-table `PURGE` also carries listed
+node-local predicates so each edge erases its own independently keyed rows atomically.

@@ -31,6 +31,17 @@ pub enum RetainUnit {
     Days,
 }
 
+/// When an edge may erase a locally retained delivery unit without creating a
+/// fleet-wide deletion. This is table policy, so the persisted schema and the
+/// public policy projection share one closed vocabulary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EdgeDiscardMode {
+    Never,
+    #[default]
+    AfterOutcome,
+    Always,
+}
+
 impl RetainUnit {
     pub fn seconds_multiplier(self) -> u64 {
         match self {
@@ -262,6 +273,12 @@ pub struct TableMeta {
     /// the default so `.schema` renders back exactly what was written.
     #[serde(default)]
     pub history_policy: Option<HistoryPolicy>,
+    /// Ordered manifest member tables when this table owns delivery units.
+    #[serde(default)]
+    pub delivery_manifest_tables: Option<Vec<String>>,
+    /// Explicit spelling, when present; the effective default is AFTER OUTCOME.
+    #[serde(default)]
+    pub edge_discard: Option<EdgeDiscardMode>,
 }
 
 /// Whether a decode error on a trailing, defaultable field is genuinely "the
@@ -401,6 +418,10 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     decode_tail_field::<_, Option<ConflictPolicy>>(&mut seq, &mut tail_exhausted)?;
                 let history_policy =
                     decode_tail_field::<_, Option<HistoryPolicy>>(&mut seq, &mut tail_exhausted)?;
+                let delivery_manifest_tables =
+                    decode_tail_field::<_, Option<Vec<String>>>(&mut seq, &mut tail_exhausted)?;
+                let edge_discard =
+                    decode_tail_field::<_, Option<EdgeDiscardMode>>(&mut seq, &mut tail_exhausted)?;
                 Ok(TableMeta {
                     columns,
                     immutable,
@@ -419,6 +440,8 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     primary_key_columns,
                     conflict_policy,
                     history_policy,
+                    delivery_manifest_tables,
+                    edge_discard,
                 })
             }
 
@@ -443,6 +466,8 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 let mut primary_key_columns: Option<Vec<String>> = None;
                 let mut conflict_policy: Option<Option<ConflictPolicy>> = None;
                 let mut history_policy: Option<Option<HistoryPolicy>> = None;
+                let mut delivery_manifest_tables: Option<Option<Vec<String>>> = None;
+                let mut edge_discard: Option<Option<EdgeDiscardMode>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -465,6 +490,10 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                         "primary_key_columns" => primary_key_columns = Some(map.next_value()?),
                         "conflict_policy" => conflict_policy = Some(map.next_value()?),
                         "history_policy" => history_policy = Some(map.next_value()?),
+                        "delivery_manifest_tables" => {
+                            delivery_manifest_tables = Some(map.next_value()?)
+                        }
+                        "edge_discard" => edge_discard = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -490,6 +519,8 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     primary_key_columns: primary_key_columns.unwrap_or_default(),
                     conflict_policy: conflict_policy.unwrap_or_default(),
                     history_policy: history_policy.unwrap_or_default(),
+                    delivery_manifest_tables: delivery_manifest_tables.unwrap_or_default(),
+                    edge_discard: edge_discard.unwrap_or_default(),
                 })
             }
         }
@@ -512,6 +543,8 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
             "primary_key_columns",
             "conflict_policy",
             "history_policy",
+            "delivery_manifest_tables",
+            "edge_discard",
         ];
         deserializer.deserialize_struct("TableMeta", FIELDS, TableMetaVisitor)
     }

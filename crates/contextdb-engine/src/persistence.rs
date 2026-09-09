@@ -19,6 +19,9 @@ use contextdb_core::{
 };
 use contextdb_relational::store::SyncSourceKind;
 use contextdb_tx::WriteSet;
+// Statements 7/11/13/15: custody-only checked key reads.
+mod custody_records;
+
 use redb::{
     Key as RedbKey, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
     TableHandle, Value as RedbValue,
@@ -7048,7 +7051,7 @@ thread_local! {
     static RECEIVED_SCHEMA_PRE_COMMIT_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! {
     /// One-shot failure at the received-schema side-effect checkpoint. The
     /// checkpoint is after the complete core image has been assembled in the
@@ -7060,6 +7063,7 @@ thread_local! {
     /// removal and lifecycle write, immediately before its sole Redb commit.
     /// The write transaction must roll back every copy class together.
     static AUTHORITATIVE_PURGE_PRE_COMMIT_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ERASURE_FIRST_TABLE_FAULT: std::cell::Cell<(bool,bool)> = const { std::cell::Cell::new((false,false)) };
 }
 
 /// Arm the one-shot test injection seam: the NEXT `compact()` call on THIS
@@ -7102,14 +7106,42 @@ pub(crate) fn arm_authoritative_purge_point_remove_persistence_failure_for_test(
     AUTHORITATIVE_PURGE_PRE_COMMIT_FAULT.with(|fault| fault.set(true));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 fn take_authoritative_purge_point_remove_persistence_failure_for_test() -> bool {
     AUTHORITATIVE_PURGE_PRE_COMMIT_FAULT.with(|fault| fault.replace(false))
 }
 
+#[cfg(feature = "test-seams")]
+pub(crate) fn arm_erasure_first_table_fault_for_test() {
+    ERASURE_FIRST_TABLE_FAULT.with(|state| state.set((true, false)));
+}
+#[cfg(feature = "test-seams")]
+pub(crate) fn erasure_first_table_fault_reached_for_test() -> bool {
+    ERASURE_FIRST_TABLE_FAULT.with(|state| state.get().1)
+}
+#[cfg(feature = "test-seams")]
+fn erasure_first_table_staged_for_test() -> Result<()> {
+    let armed = ERASURE_FIRST_TABLE_FAULT.with(|state| {
+        let (armed, reached) = state.get();
+        if armed {
+            state.set((false, true));
+        } else {
+            state.set((false, reached));
+        }
+        armed
+    });
+    if armed {
+        Err(Error::Other(
+            "storage error: erasure first table staged fault injected".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const FORMAT_METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
-const CONFIG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
+pub(crate) const CONFIG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
 const CHANGE_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("change_log");
 const DDL_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ddl_log");
 const COMMIT_INDEX_TABLE: TableDefinition<u64, u64> = TableDefinition::new("commit_index");
@@ -7371,6 +7403,7 @@ pub(crate) struct FlushDataSnapshots {
 }
 
 pub(crate) struct FlushDataOptions<'a> {
+    pub(crate) local_erasure: Option<&'a AuthoritativePurgePersistenceProjection>,
     pub(crate) sink_events: &'a [PreparedSinkEvent],
     pub(crate) trigger_audits: &'a [(u64, TriggerAuditEntry)],
     pub(crate) schema_ddl: SchemaDdlPersistence<'a>,
@@ -7701,6 +7734,8 @@ impl From<LegacyTableMetaV1> for TableMeta {
             primary_key_columns: Vec::new(),
             conflict_policy: None,
             history_policy: None,
+            delivery_manifest_tables: None,
+            edge_discard: None,
         }
     }
 }
@@ -8699,6 +8734,7 @@ impl RedbPersistence {
             ws,
             change_log,
             FlushDataOptions {
+                local_erasure: None,
                 sink_events: &[],
                 trigger_audits: &[],
                 schema_ddl: SchemaDdlPersistence {
@@ -9199,10 +9235,15 @@ impl RedbPersistence {
                 }
             }
 
-            if !ws.config_writes.is_empty() {
+            if !ws.config_writes.is_empty() || !ws.config_deletes.is_empty() {
                 let mut config_table = write_txn
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
+                for key in &ws.config_deletes {
+                    config_table
+                        .remove(key.as_str())
+                        .map_err(Self::storage_error)?;
+                }
                 for (key, encoded) in &ws.config_writes {
                     let encoded = if ws.config_max_u64_keys.iter().any(|max_key| max_key == key) {
                         let incoming = Self::decode::<u64>(encoded)?;
@@ -9222,6 +9263,18 @@ impl RedbPersistence {
                 }
             }
 
+            if let Some(erasure) = options.local_erasure {
+                Self::apply_local_erasure(&write_txn, erasure)?;
+            }
+            // Statement 11: failure is reached after the unit and its outcome are staged.
+            #[cfg(feature = "test-seams")]
+            if ws
+                .config_writes
+                .iter()
+                .any(|(key, _)| key.starts_with("delivery_hub_outcome.v1."))
+            {
+                crate::custody::durability::before_custody_commit(&write_txn)?;
+            }
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -9440,7 +9493,10 @@ impl RedbPersistence {
                 let mut config = write_txn
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
-                for (key, value) in &stage.config_values {
+                for key in &ws.config_deletes {
+                    config.remove(key.as_str()).map_err(Self::storage_error)?;
+                }
+                for (key, value) in stage.config_values.iter().chain(&ws.config_writes) {
                     let value = if stage
                         .config_max_u64_keys
                         .iter()
@@ -9598,6 +9654,15 @@ impl RedbPersistence {
                     "injected received-schema Redb pre-commit failure".to_string(),
                 ));
             }
+            // Statement 11: failure is reached after the unit and its outcome are staged.
+            #[cfg(feature = "test-seams")]
+            if ws
+                .config_writes
+                .iter()
+                .any(|(key, _)| key.starts_with("delivery_hub_outcome.v1."))
+            {
+                crate::custody::durability::before_custody_commit(&write_txn)?;
+            }
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -9652,7 +9717,12 @@ impl RedbPersistence {
                 let mut config_table = write_txn
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
-                for (key, encoded) in &stage.config_values {
+                for key in &ws.config_deletes {
+                    config_table
+                        .remove(key.as_str())
+                        .map_err(Self::storage_error)?;
+                }
+                for (key, encoded) in stage.config_values.iter().chain(&ws.config_writes) {
                     config_table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -11200,204 +11270,240 @@ impl RedbPersistence {
     ) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            Self::apply_local_erasure(&write_txn, projection)?;
+            write_txn.commit().map_err(Self::storage_error)
+        })
+    }
 
-            // A selected change-log occurrence is identified by its full
-            // value inside its LSN group.  Read and re-densify only touched
-            // groups so earlier scoped maintenance cannot leave an orphaned
-            // or mis-indexed survivor.
-            let mut selected_by_lsn = BTreeMap::<Lsn, Vec<ChangeLogEntry>>::new();
-            for entry in &projection.change_log_entries {
-                selected_by_lsn
-                    .entry(entry.lsn())
-                    .or_default()
-                    .push(entry.clone());
-            }
-            if !selected_by_lsn.is_empty() {
-                let mut table = write_txn
-                    .open_table(CHANGE_LOG_TABLE)
-                    .map_err(Self::storage_error)?;
-                let mut key_buf = String::with_capacity(Self::change_log_entry_key_len());
-                for (lsn, mut witnesses) in selected_by_lsn {
-                    let prefix = format!("{:020}:", lsn.0);
-                    let existing = {
-                        let mut entries = Vec::new();
-                        for entry in table
-                            .range(prefix.as_str()..)
-                            .map_err(Self::storage_error)?
-                        {
-                            let (key, value) = entry.map_err(Self::storage_error)?;
-                            if !key.value().starts_with(prefix.as_str()) {
-                                break;
-                            }
-                            entries.push((key.value().to_string(), value.value().to_vec()));
+    // Statements 17/17a/17b: both erasure verbs share the exact physical writer and fault boundary.
+    fn apply_local_erasure(
+        write_txn: &redb::WriteTransaction,
+        projection: &AuthoritativePurgePersistenceProjection,
+    ) -> Result<()> {
+        // A selected change-log occurrence is identified by its full
+        // value inside its LSN group.  Read and re-densify only touched
+        // groups so earlier scoped maintenance cannot leave an orphaned
+        // or mis-indexed survivor.
+        let mut selected_by_lsn = BTreeMap::<Lsn, Vec<ChangeLogEntry>>::new();
+        for entry in &projection.change_log_entries {
+            selected_by_lsn
+                .entry(entry.lsn())
+                .or_default()
+                .push(entry.clone());
+        }
+        if !selected_by_lsn.is_empty() {
+            let mut table = write_txn
+                .open_table(CHANGE_LOG_TABLE)
+                .map_err(Self::storage_error)?;
+            let mut key_buf = String::with_capacity(Self::change_log_entry_key_len());
+            for (lsn, mut witnesses) in selected_by_lsn {
+                let prefix = format!("{:020}:", lsn.0);
+                let existing = {
+                    let mut entries = Vec::new();
+                    for entry in table
+                        .range(prefix.as_str()..)
+                        .map_err(Self::storage_error)?
+                    {
+                        let (key, value) = entry.map_err(Self::storage_error)?;
+                        if !key.value().starts_with(prefix.as_str()) {
+                            break;
                         }
-                        entries
-                    };
-                    let mut survivors = Vec::with_capacity(existing.len());
-                    for (key, bytes) in existing {
-                        let decoded: ChangeLogEntry = Self::decode(&bytes)?;
-                        if let Some(position) = witnesses.iter().position(|wanted| *wanted == decoded)
-                        {
-                            witnesses.remove(position);
-                        } else {
-                            survivors.push(bytes);
-                        }
-                        table.remove(key.as_str()).map_err(Self::storage_error)?;
+                        entries.push((key.value().to_string(), value.value().to_vec()));
                     }
-                    if !witnesses.is_empty() {
-                        return Err(Error::SyncError(
-                            "authoritative purge change-log witness is missing from its LSN group"
+                    entries
+                };
+                let mut survivors = Vec::with_capacity(existing.len());
+                for (key, bytes) in existing {
+                    let decoded: ChangeLogEntry = Self::decode(&bytes)?;
+                    if let Some(position) = witnesses.iter().position(|wanted| *wanted == decoded) {
+                        witnesses.remove(position);
+                    } else {
+                        survivors.push(bytes);
+                    }
+                    table.remove(key.as_str()).map_err(Self::storage_error)?;
+                }
+                if !witnesses.is_empty() {
+                    return Err(Error::SyncError(
+                        "authoritative purge change-log witness is missing from its LSN group"
+                            .to_string(),
+                    ));
+                }
+                for (index, bytes) in survivors.into_iter().enumerate() {
+                    Self::write_change_log_entry_key(lsn, index, &mut key_buf);
+                    table
+                        .insert(key_buf.as_str(), bytes.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+        }
+
+        let mut relational_tables: HashMap<String, redb::Table<'_, &[u8], &[u8]>> = HashMap::new();
+        #[cfg(feature = "test-seams")]
+        let first_table_end = projection.row_versions.first().and_then(|first| {
+            projection
+                .row_versions
+                .iter()
+                .rposition(|row| row.0 == first.0)
+        });
+        #[allow(
+            clippy::unused_enumerate_index,
+            reason = "The index identifies the actual destructive fault boundary with test-seams"
+        )]
+        for (_row_index, (table, row_id, created_tx, lsn)) in
+            projection.row_versions.iter().enumerate()
+        {
+            if !relational_tables.contains_key(table) {
+                let name = Self::rel_table_name(table);
+                let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
+                relational_tables.insert(
+                    table.clone(),
+                    write_txn
+                        .open_table(definition)
+                        .map_err(Self::storage_error)?,
+                );
+            }
+            let key = Self::rel_row_key_from_parts(*row_id, *created_tx, *lsn);
+            let removed = relational_tables
+                .get_mut(table)
+                .expect("opened relational table")
+                .remove(key.as_slice())
+                .map_err(Self::storage_error)?;
+            if removed.is_none() {
+                return Err(Error::SyncError(
+                        "authoritative purge selected relational version disappeared before durable commit"
+                            .to_string(),
+                    ));
+            }
+            #[cfg(feature = "test-seams")]
+            if Some(_row_index) == first_table_end {
+                erasure_first_table_staged_for_test()?;
+            }
+        }
+        drop(relational_tables);
+
+        if !projection.source_provenance.is_empty() {
+            let mut lsns = write_txn
+                .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
+                .map_err(Self::storage_error)?;
+            let mut kinds = write_txn
+                .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
+                .map_err(Self::storage_error)?;
+            for (table, row_id, expected_lsn, expected_kind) in &projection.source_provenance {
+                let key = Self::sync_row_source_lsn_key(table, *row_id);
+                let lsn = lsns
+                    .get(key.as_slice())
+                    .map_err(Self::storage_error)?
+                    .map(|value| value.value());
+                let kind = kinds
+                    .get(key.as_slice())
+                    .map_err(Self::storage_error)?
+                    .map(|value| value.value());
+                if lsn != Some(expected_lsn.0) || kind != Some(*expected_kind) {
+                    return Err(Error::SyncError(
+                            "authoritative purge source-provenance witness changed before durable commit"
                                 .to_string(),
                         ));
-                    }
-                    for (index, bytes) in survivors.into_iter().enumerate() {
-                        Self::write_change_log_entry_key(lsn, index, &mut key_buf);
-                        table
-                            .insert(key_buf.as_str(), bytes.as_slice())
-                            .map_err(Self::storage_error)?;
-                    }
                 }
+                lsns.remove(key.as_slice()).map_err(Self::storage_error)?;
+                kinds.remove(key.as_slice()).map_err(Self::storage_error)?;
             }
+        }
 
-            let mut relational_tables: HashMap<String, redb::Table<'_, &[u8], &[u8]>> =
-                HashMap::new();
-            for (table, row_id, created_tx, lsn) in &projection.row_versions {
-                if !relational_tables.contains_key(table) {
-                    let name = Self::rel_table_name(table);
-                    let definition: TableDefinition<&[u8], &[u8]> =
-                        TableDefinition::new(name.as_str());
-                    relational_tables.insert(
-                        table.clone(),
-                        write_txn.open_table(definition).map_err(Self::storage_error)?,
-                    );
-                }
-                let key = Self::rel_row_key_from_parts(*row_id, *created_tx, *lsn);
-                let removed = relational_tables
-                    .get_mut(table)
-                    .expect("opened relational table")
+        if !projection.vectors.is_empty() {
+            let mut vectors = write_txn
+                .open_table(VECTORS_TABLE)
+                .map_err(Self::storage_error)?;
+            for entry in &projection.vectors {
+                let key = Self::vector_key(entry);
+                let removed = vectors
                     .remove(key.as_slice())
                     .map_err(Self::storage_error)?;
                 if removed.is_none() {
                     return Err(Error::SyncError(
-                        "authoritative purge selected relational version disappeared before durable commit"
-                            .to_string(),
-                    ));
-                }
-            }
-            drop(relational_tables);
-
-            if !projection.source_provenance.is_empty() {
-                let mut lsns = write_txn
-                    .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
-                    .map_err(Self::storage_error)?;
-                let mut kinds = write_txn
-                    .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
-                    .map_err(Self::storage_error)?;
-                for (table, row_id, expected_lsn, expected_kind) in &projection.source_provenance {
-                    let key = Self::sync_row_source_lsn_key(table, *row_id);
-                    let lsn = lsns
-                        .get(key.as_slice())
-                        .map_err(Self::storage_error)?
-                        .map(|value| value.value());
-                    let kind = kinds
-                        .get(key.as_slice())
-                        .map_err(Self::storage_error)?
-                        .map(|value| value.value());
-                    if lsn != Some(expected_lsn.0) || kind != Some(*expected_kind) {
-                        return Err(Error::SyncError(
-                            "authoritative purge source-provenance witness changed before durable commit"
-                                .to_string(),
-                        ));
-                    }
-                    lsns.remove(key.as_slice()).map_err(Self::storage_error)?;
-                    kinds.remove(key.as_slice()).map_err(Self::storage_error)?;
-                }
-            }
-
-            if !projection.vectors.is_empty() {
-                let mut vectors = write_txn.open_table(VECTORS_TABLE).map_err(Self::storage_error)?;
-                for entry in &projection.vectors {
-                    let key = Self::vector_key(entry);
-                    let removed = vectors.remove(key.as_slice()).map_err(Self::storage_error)?;
-                    if removed.is_none() {
-                        return Err(Error::SyncError(
                             "authoritative purge selected vector occurrence disappeared before durable commit"
                                 .to_string(),
                         ));
-                    }
                 }
             }
+        }
 
-            if !projection.graph_entries.is_empty() {
-                let mut forward = write_txn.open_table(GRAPH_FWD_TABLE).map_err(Self::storage_error)?;
-                let mut reverse = write_txn.open_table(GRAPH_REV_TABLE).map_err(Self::storage_error)?;
-                for entry in &projection.graph_entries {
-                    let forward_key = Self::graph_fwd_key(entry);
-                    let reverse_key = Self::graph_rev_key(entry);
-                    let removed_forward = forward
-                        .remove(forward_key.as_slice())
-                        .map_err(Self::storage_error)?;
-                    let removed_reverse = reverse
-                        .remove(reverse_key.as_slice())
-                        .map_err(Self::storage_error)?;
-                    if removed_forward.is_none() || removed_reverse.is_none() {
-                        return Err(Error::SyncError(
+        if !projection.graph_entries.is_empty() {
+            let mut forward = write_txn
+                .open_table(GRAPH_FWD_TABLE)
+                .map_err(Self::storage_error)?;
+            let mut reverse = write_txn
+                .open_table(GRAPH_REV_TABLE)
+                .map_err(Self::storage_error)?;
+            for entry in &projection.graph_entries {
+                let forward_key = Self::graph_fwd_key(entry);
+                let reverse_key = Self::graph_rev_key(entry);
+                let removed_forward = forward
+                    .remove(forward_key.as_slice())
+                    .map_err(Self::storage_error)?;
+                let removed_reverse = reverse
+                    .remove(reverse_key.as_slice())
+                    .map_err(Self::storage_error)?;
+                if removed_forward.is_none() || removed_reverse.is_none() {
+                    return Err(Error::SyncError(
                             "authoritative purge selected graph occurrence disappeared before durable commit"
                                 .to_string(),
                         ));
-                    }
                 }
             }
+        }
 
-            for (sink, queue_id, expected_bytes) in &projection.sink_entries {
-                let name = Self::sink_queue_table_name(sink);
-                let definition: TableDefinition<u64, &[u8]> = TableDefinition::new(name.as_str());
-                let mut queue = write_txn.open_table(definition).map_err(Self::storage_error)?;
-                let bytes = queue
-                    .get(*queue_id)
-                    .map_err(Self::storage_error)?
-                    .map(|value| value.value().to_vec());
-                if bytes.as_deref() != Some(expected_bytes.as_slice()) {
-                    return Err(Error::SyncError(
+        for (sink, queue_id, expected_bytes) in &projection.sink_entries {
+            let name = Self::sink_queue_table_name(sink);
+            let definition: TableDefinition<u64, &[u8]> = TableDefinition::new(name.as_str());
+            let mut queue = write_txn
+                .open_table(definition)
+                .map_err(Self::storage_error)?;
+            let bytes = queue
+                .get(*queue_id)
+                .map_err(Self::storage_error)?
+                .map(|value| value.value().to_vec());
+            if bytes.as_deref() != Some(expected_bytes.as_slice()) {
+                return Err(Error::SyncError(
                         "authoritative purge selected sink occurrence disappeared before durable commit"
                             .to_string(),
                     ));
-                }
-                queue.remove(*queue_id).map_err(Self::storage_error)?;
             }
+            queue.remove(*queue_id).map_err(Self::storage_error)?;
+        }
 
-            {
-                let mut config = write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
-                for key in &projection.config_keys_removed {
-                    config.remove(key.as_str()).map_err(Self::storage_error)?;
-                }
-                for (key, bytes) in &projection.lifecycle_records {
-                    config
-                        .insert(key.as_str(), bytes.as_slice())
-                        .map_err(Self::storage_error)?;
-                }
-                for (key, bytes) in &projection.purge_delivery_items {
-                    let previous = config
-                        .insert(key.as_str(), bytes.as_slice())
-                        .map_err(Self::storage_error)?;
-                    if previous.is_some() {
-                        return Err(Error::SyncError(format!(
-                            "authoritative purge delivery journal collision at {key}"
-                        )));
-                    }
+        {
+            let mut config = write_txn
+                .open_table(CONFIG_TABLE)
+                .map_err(Self::storage_error)?;
+            for key in &projection.config_keys_removed {
+                config.remove(key.as_str()).map_err(Self::storage_error)?;
+            }
+            for (key, bytes) in &projection.lifecycle_records {
+                config
+                    .insert(key.as_str(), bytes.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            for (key, bytes) in &projection.purge_delivery_items {
+                let previous = config
+                    .insert(key.as_str(), bytes.as_slice())
+                    .map_err(Self::storage_error)?;
+                if previous.is_some() {
+                    return Err(Error::SyncError(format!(
+                        "authoritative purge delivery journal collision at {key}"
+                    )));
                 }
             }
+        }
 
-            apply_authoritative_purge_in_write(&write_txn, &projection.blob_purge)?;
+        apply_authoritative_purge_in_write(write_txn, &projection.blob_purge)?;
 
-            #[cfg(test)]
-            if take_authoritative_purge_point_remove_persistence_failure_for_test() {
-                return Err(Error::Other(
-                    "authoritative purge point-remove persistence failure injected".to_string(),
-                ));
-            }
-            write_txn.commit().map_err(Self::storage_error)
-        })
+        #[cfg(any(test, feature = "test-seams"))]
+        if take_authoritative_purge_point_remove_persistence_failure_for_test() {
+            return Err(Error::Other(
+                "authoritative purge point-remove persistence failure injected".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Remove exactly the named vectors and edges, in ONE redb write

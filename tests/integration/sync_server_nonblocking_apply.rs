@@ -395,6 +395,8 @@ impl CapturingSignedPushTransport {
                     ),
                     error: None,
                     application_error: None,
+                    // Statement 13: ordinary response lane compile prerequisite.
+                    ..Default::default()
                 },
             )
             .map_err(|err| TransportError::Other(format!("encode captured push reply: {err}")))

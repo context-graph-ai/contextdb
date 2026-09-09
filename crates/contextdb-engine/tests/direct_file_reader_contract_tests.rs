@@ -1984,6 +1984,7 @@ fn legal_direct_dependency(path: &[String]) -> bool {
                 | "Value"
                 | "Vec"
                 | "VectorIndexRef"
+                | "allow"
                 | "bool"
                 | "breadcrumb_path"
                 | "cancellation"
@@ -2117,7 +2118,10 @@ fn legal_direct_dependency(path: &[String]) -> bool {
                 | "fmt"
         );
     }
-    if path_equals(path, &["crate", "QueryResult"])
+    // Statement 19: exact data-only custody results, not their constructors or services.
+    if path_equals(path, &["crate", "DeliveryOutcome"])
+        || path_equals(path, &["crate", "DeliveryStatusCounts"])
+        || path_equals(path, &["crate", "QueryResult"])
         || path_equals(path, &["crate", "persistence", "load_read_image"])
         || path_equals(path, &["crate", "executor", "ReadExecutionTarget"])
     {
@@ -2125,6 +2129,7 @@ fn legal_direct_dependency(path: &[String]) -> bool {
     }
     if path.get(1).is_some_and(|part| part == "sync_types") {
         return [
+            &["crate", "sync_types", "NaturalKey"][..],
             &["crate", "sync_types", "DdlChange"][..],
             &["crate", "sync_types", "EdgeChange"][..],
             &["crate", "sync_types", "RowChange"][..],
@@ -2757,6 +2762,21 @@ fn assert_no_writable_subsystems(counters: &DirectReaderCounters) {
 
 #[test]
 fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
+    // Statement 19: inspecting custody data does not open a constructor or writer escape.
+    for forbidden in [
+        &["crate", "DeliveryOutcome", "new"][..],
+        &["crate", "DeliveryStatusCounts", "default"][..],
+        &["crate", "sync_types", "NaturalKey", "single"][..],
+        &["crate", "Database", "open"][..],
+        &["crate", "SyncClient", "new"][..],
+    ] {
+        assert!(!legal_direct_dependency(
+            &forbidden
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>()
+        ));
+    }
     let files = direct_module_files();
     let mut loader_calls = 0;
     for source in &files {

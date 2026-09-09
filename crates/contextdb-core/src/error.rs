@@ -251,6 +251,37 @@ pub enum Error {
     PlanError(String),
     #[error("sync error: {0}")]
     SyncError(String),
+    #[error("tenant table policy is not declared for {table}")]
+    TenantPolicyNotDeclared { table: String },
+    #[error("tenant table policy for {table} differs at {clause}")]
+    TenantPolicyMismatch { table: String, clause: String },
+    #[error("tenant table policy for {table} is already bound")]
+    TenantPolicyBound { table: String },
+    #[error("table {table} differs from its authenticated binding at {clause}")]
+    TableBindingMismatch { table: String, clause: String },
+    #[error("the explicit local policy for {table} is preserved at {clause}")]
+    DeclaredPolicyPreserved { table: String, clause: String },
+    #[error("delivery manifest required for root table {table}")]
+    ManifestRequired { table: String },
+    #[error("delivery manifest is incomplete for root table {table}")]
+    ManifestIncomplete { table: String },
+    #[error("delivery manifest member from {table} was not written in this transaction")]
+    ManifestMemberOutsideTransaction { table: String },
+    #[error("tenant table policy declarations must originate at authoritative hub {hub_node_id}")]
+    DeclareRequiresAuthoritativeHub { hub_node_id: String },
+    #[error("DISCARD is not eligible for {table} with sync direction {direction}")]
+    DiscardNotEligible { table: String, direction: String },
+    #[error("DISCARD is not permitted on a hub; use PURGE")]
+    DiscardNotOnHub,
+    #[error(
+        "edge discard denied by hub {hub_node_id} for {table} in mode {mode:?}: {pending_count} pending unit(s)"
+    )]
+    EdgeDiscardDenied {
+        hub_node_id: String,
+        table: String,
+        mode: crate::EdgeDiscardMode,
+        pending_count: u64,
+    },
     #[error("PURGE must originate at authoritative hub {hub_node_id}; run PURGE there")]
     PurgeRequiresAuthoritativeHub { hub_node_id: String },
     /// A push re-offered a row the hub already knows was deleted -- the SAME

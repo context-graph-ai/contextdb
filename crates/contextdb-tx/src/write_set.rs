@@ -30,6 +30,8 @@ pub struct WriteSet {
     /// Engine-owned durable metadata written in the same storage transaction
     /// as this write set. Sync uses this for authenticated applied receipts.
     pub config_writes: Vec<(String, Vec<u8>)>,
+    /// Engine-owned metadata removed atomically with the same rows and replacement records.
+    pub config_deletes: Vec<String>,
     /// Config keys whose `u64` payload is a monotonic frontier. Persistence
     /// compares and raises these inside the write transaction so concurrent
     /// authenticated sync applies cannot publish an older receipt last.
@@ -57,6 +59,7 @@ impl WriteSet {
             && self.vector_deletes.is_empty()
             && self.vector_moves.is_empty()
             && self.config_writes.is_empty()
+            && self.config_deletes.is_empty()
             && self.sync_source_provenance_marks.is_empty()
             && !self.requires_commit_lsn
     }

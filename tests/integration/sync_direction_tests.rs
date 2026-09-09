@@ -21,7 +21,12 @@
 use contextdb_core::{Error, Lsn, Value};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -691,71 +696,98 @@ fn c1d_declared_directions_travel_through_the_real_changeset_on_create() {
 /// A direction CHANGED after the table existed travels too — the `ALTER` a
 /// operator runs when they move an installation, carried on the emitted
 /// `AlterTable` rather than only in local metadata.
-#[test]
-fn c1d_an_altered_direction_travels_through_the_real_changeset() {
-    let source = Database::open_memory();
+// Statement 6: authenticated arrival provenance distinguishes an adopted source
+// declaration from one authored locally. Both changes use the ordinary push API.
+async fn receive_changed_policy(source: Arc<Database>, alter: &str) -> String {
+    let receiver = Arc::new(Database::open_memory());
+    let fabric = InProcessBroker::new();
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let tenant = contextdb_core::TenantId::from("direction-declaration");
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            receiver.clone(),
+            fabric.server_as(&hub_identity.node_id()),
+            tenant.clone(),
+            hub_identity.node_id(),
+            hub_identity,
+        ),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn({
+        let server = server.clone();
+        let stop = stop.clone();
+        async move { server.run_until(stop).await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+            tenant.as_str(),
+        )),
+    )
+    .await
+    .expect("ordinary sync status route is ready");
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        source.clone(),
+        fabric.client_as(&edge_identity.node_id()),
+        tenant,
+        edge_identity,
+    );
+    let initial = client
+        .push()
+        .await
+        .expect("receiver adopts the original definition");
+    assert!(initial.conflicts.is_empty());
+    assert_renders_exactly_direction(&render(&receiver, "windows"), "SYNC TWO WAY");
+    let before_alter = source.current_lsn();
+    source
+        .execute(alter, &p())
+        .expect("source changes its declaration");
+    assert!(
+        source.changes_since(before_alter).ddl.iter().any(
+            |change| matches!(change, DdlChange::AlterTable { name, .. } if name == "windows")
+        ),
+        "the source's real changeset must carry the altered table"
+    );
+    let changed = client
+        .push()
+        .await
+        .expect("receiver adopts changed source declaration");
+    assert!(changed.conflicts.is_empty(), "{changed:?}");
+    let rendered = render(&receiver, "windows");
+    client.shutdown().await;
+    stop.store(true, Ordering::SeqCst);
+    task.await.expect("sync server stops cleanly");
+    rendered
+}
+
+#[tokio::test]
+async fn c1d_an_altered_direction_travels_through_the_real_changeset() {
+    let source = Arc::new(Database::open_memory());
     source
         .execute(
             "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) SYNC TWO WAY",
             &p(),
         )
         .expect("create");
-
-    let receiver = Database::open_memory();
-    receiver
-        .apply_changes(
-            source.changes_since(Lsn(0)),
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
-        )
-        .expect("the receiver takes the original definition");
-    assert_renders_exactly_direction(&render(&receiver, "windows"), "SYNC TWO WAY");
-
-    let before_alter = source.current_lsn();
-    source
-        .execute("ALTER TABLE windows SET SYNC PULL ONLY", &p())
-        .expect("the direction changes on the writing machine");
-    receiver
-        .apply_changes(
-            source.changes_since(before_alter),
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
-        )
-        .expect("the receiver must accept the changed direction");
-
-    assert_renders_exactly_direction(&render(&receiver, "windows"), "SYNC PULL ONLY");
+    let rendered = receive_changed_policy(source, "ALTER TABLE windows SET SYNC PULL ONLY").await;
+    assert_renders_exactly_direction(&rendered, "SYNC PULL ONLY");
 }
 
 /// Declaring retention by `ALTER` on a two-way table travels as an `AlterTable`
 /// and arrives still two-way. This is the door where the local projection used
 /// to force push-only — and where it used to bail out of projecting at all.
-#[test]
-fn c1b_an_altered_retention_travels_and_leaves_the_direction_alone() {
-    let source = Database::open_memory();
+#[tokio::test]
+async fn c1b_an_altered_retention_travels_and_leaves_the_direction_alone() {
+    let source = Arc::new(Database::open_memory());
     source
         .execute(
             "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) SYNC TWO WAY",
             &p(),
         )
         .expect("create");
-    let receiver = Database::open_memory();
-    receiver
-        .apply_changes(
-            source.changes_since(Lsn(0)),
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
-        )
-        .expect("the receiver takes the original definition");
-
-    let before_alter = source.current_lsn();
-    source
-        .execute("ALTER TABLE windows SET RETAIN 48 HOURS SYNC SAFE", &p())
-        .expect("retention is declared on the writing machine");
-    receiver
-        .apply_changes(
-            source.changes_since(before_alter),
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
-        )
-        .expect("the receiver must accept the retention declaration");
-
-    let rendered = render(&receiver, "windows");
+    let rendered =
+        receive_changed_policy(source, "ALTER TABLE windows SET RETAIN 48 HOURS SYNC SAFE").await;
     assert!(
         rendered.contains("RETAIN 48 HOURS SYNC SAFE"),
         "the retention window must travel, got:\n{rendered}"

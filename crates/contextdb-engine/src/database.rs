@@ -1,9 +1,20 @@
+// Statements 7/11/13/15/17: custody-only persistence seam.
+#[cfg(feature = "sync-orchestration")]
+pub(crate) mod custody_pull;
+mod custody_remainder;
+mod custody_store;
+// Statements 12/16: compare held units even before their first custody outcome.
+mod custody_incumbent;
+pub(crate) mod discard;
+// Statement 17a: self-contained selections for node-local purge delivery.
+pub(crate) mod purge_predicate;
 use crate::blob_repository::BlobRepository;
 use crate::composite_store::{
     ApplyPhasePause, ChangeLogEntry, ChangeLogLsnRefcounts, ChangeLogTableIndex, CompositeStore,
     build_received_schema_change_log_entries, publish_prepared_change_log_entries,
     record_change_log_entries,
 };
+pub use crate::custody_types::{DeliveryManifest, DeliveryOutcome};
 #[cfg(feature = "test-seams")]
 use crate::executor::bounded_read_test_support::{ExecutionProbe, TestSourceTouch, TestWorkSource};
 use crate::executor::{apply_on_conflict_updates, execute_plan, validate_plan_columns};
@@ -3418,7 +3429,7 @@ impl DdlProvenanceSource {
         }
     }
 
-    fn historical(changes: &ChangeSet) -> Self {
+    pub(crate) fn historical(changes: &ChangeSet) -> Self {
         Self::capture(DdlProvenanceKind::Historical, changes)
     }
 
@@ -3635,6 +3646,7 @@ impl ReceivedSchemaMemoryMirrors {
 /// only memory replacement after that durability succeeds.
 #[allow(dead_code)]
 pub(crate) struct ReceivedSchemaStage {
+    custody_memory: Option<custody_store::CustodyDelta>,
     source_order: Vec<ReceivedSchemaOrderEntry>,
     relational: PreparedRelationalPublication,
     graph: PreparedGraphPublication,
@@ -3670,6 +3682,8 @@ pub(crate) struct ReceivedSchemaStage {
 }
 
 pub(crate) type ReceivedSchemaStageRegistry = Arc<Mutex<HashMap<Lsn, ReceivedSchemaStage>>>;
+
+type PreparedDeliveryLineages = HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage>;
 
 type DdlGenerationKey = (Lsn, u32);
 type DdlGenerationValue = (Option<String>, Option<u64>);
@@ -4275,6 +4289,8 @@ pub enum ReadExecutionConvergenceEvent {
         completed_items: u64,
     },
     PullKernelDrained,
+    /// The eager executor is about to enter the shared relational scan source.
+    EagerRowSourceTouch,
 }
 
 #[cfg(feature = "test-seams")]
@@ -5098,6 +5114,7 @@ pub(crate) struct AuthoritativePurgeDeliveryItem {
     pub(crate) table_generation: u64,
     pub(crate) natural_key: NaturalKey,
     pub(crate) purged_lineage_roots: Vec<String>,
+    pub(crate) node_local_predicate: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5235,8 +5252,9 @@ impl IncomingPurgeFrontierAdoption {
 
 #[derive(Default)]
 struct IncomingAuthoritativePurgePlan {
-    selections: BTreeMap<(Lsn, String), Vec<AuthoritativePurgeSelection>>,
-    frontier_adoptions: BTreeMap<(Lsn, String), Vec<IncomingPurgeFrontierAdoption>>,
+    selections: BTreeMap<Lsn, Vec<AuthoritativePurgeSelection>>,
+    frontier_adoptions: BTreeMap<Lsn, Vec<IncomingPurgeFrontierAdoption>>,
+    instruction_receipts: BTreeMap<Lsn, Vec<String>>,
 }
 
 impl AuthoritativePurgeLifecycleTemplate {
@@ -6026,6 +6044,7 @@ pub struct Database {
     /// handles share this exact map because the transaction manager assigns
     /// the LSN and invokes callbacks through the shared database state.
     received_schema_stages: Arc<Mutex<HashMap<Lsn, ReceivedSchemaStage>>>,
+    local_erasure_stages: discard::StageRegistry,
     /// The explicit SQL-transaction half is keyed by TxId until the commit
     /// manager assigns its one LSN; PersistentCompositeStore consumes the
     /// resulting LSN-keyed stage in that same Redb write transaction.
@@ -6163,6 +6182,10 @@ pub struct Database {
     /// file-backed databases (so a plain reopen loads the same one) and by this
     /// cache alone for in-memory databases (each open is a fresh life).
     sync_incarnations: Arc<Mutex<HashMap<String, Incarnation>>>,
+    // Statements 1/3/7: no public authority setter.
+    custody_runtime: Arc<Mutex<Option<crate::custody::policy::Runtime>>>,
+    custody_cache: Arc<Mutex<Option<crate::custody::store::Store>>>,
+    custody_metadata: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     pending_event_bus_ddl: Mutex<HashMap<TxId, Vec<DdlChange>>>,
     pending_commit_metadata: Mutex<HashMap<TxId, PendingCommitMetadata>>,
     limit_update_lock: Arc<Mutex<()>>,
@@ -7255,6 +7278,8 @@ pub(crate) struct DeleteReleaseBytes {
 
 #[derive(Debug, Default, Clone)]
 struct PendingCommitMetadata {
+    discard_selections: Vec<AuthoritativePurgeSelection>,
+    delivery_registrations: Vec<crate::custody::preparation::SourceRegistration>,
     conditional_update_guards: Vec<PendingConditionalUpdateGuard>,
     sync_lineage_guards: Vec<PendingSyncLineageGuard>,
     upsert_intents: Vec<PendingUpsertIntent>,
@@ -7845,6 +7870,152 @@ fn closed_database_error() -> Error {
 }
 
 impl Database {
+    pub(crate) fn custody_runtime(&self) -> Option<crate::custody::policy::Runtime> {
+        self.custody_runtime.lock().clone()
+    }
+    pub(crate) fn set_custody_runtime(
+        &self,
+        tenant: TenantId,
+        node: String,
+        signer: crate::custody::preparation::LineageSigner,
+    ) {
+        *self.custody_runtime.lock() = Some(crate::custody::policy::Runtime {
+            tenant,
+            node,
+            signer,
+        });
+    }
+
+    pub(crate) fn stage_delivery_registration(
+        &self,
+        tx: TxId,
+        registration: crate::custody::preparation::SourceRegistration,
+    ) -> Result<()> {
+        // Statements 7/8: a rejected registration aborts the writing transaction.
+        let validated = self.tx_mgr.with_write_set(tx, |ws| {
+            crate::custody::preparation::validate_registration(self, ws, &registration)?;
+            ws.requires_commit_lsn = true;
+            Ok(())
+        })?;
+        if let Err(error) = validated {
+            self.rollback(tx)?;
+            return Err(error);
+        }
+        self.pending_commit_metadata
+            .lock()
+            .entry(tx)
+            .or_default()
+            .delivery_registrations
+            .push(registration);
+        Ok(())
+    }
+
+    pub(crate) fn commit_delivery_prepared(
+        &self,
+        tx: TxId,
+        prepare: &mut crate::custody::preparation::CommitPreparation<'_>,
+    ) -> Result<()> {
+        self.tx_mgr
+            .with_write_set(tx, |ws| ws.requires_commit_lsn = true)?;
+        self.commit_with_source_and_sync_ddl_and_trigger_audit_projection(
+            tx,
+            CommitSource::User,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            Some(prepare),
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn rotate_custody_incarnation(
+        &self,
+        tenant: &TenantId,
+        hub: &str,
+        previous: Incarnation,
+        next: Incarnation,
+    ) -> Result<()> {
+        use crate::custody::{canonical::*, preparation::*, records::*};
+        let runtime = self.custody_runtime().ok_or_else(invalid)?;
+        if runtime.tenant != *tenant || runtime.node != hub || self.retention_sync_peer().is_some()
+        {
+            return Err(invalid());
+        }
+        let signer = runtime.signer;
+        let tx = self.begin()?;
+        let mut installed = false;
+        self.commit_delivery_prepared(tx, &mut |db, ws| {
+            if db.existing_sync_incarnation(tenant)? != Some(previous) {
+                return Ok(Vec::new());
+            }
+            let state = StateRecord {
+                state: StateRef {
+                    logical_store_id: uuid::Uuid::new_v4(),
+                    incarnation: next,
+                    birth_id: uuid::Uuid::new_v4(),
+                    token: random_digest(),
+                },
+                parent: None,
+                sequence: 0,
+                retirement_root: crate::custody::authority::empty_history_root(),
+            };
+            let old = db.custody_records()?;
+            let mut bindings = old
+                .iter()
+                .filter_map(|r| match r {
+                    Record::Binding(b)
+                        if b.namespace.tenant == *tenant
+                            && b.namespace.hub_node == hub
+                            && b.namespace.hub_incarnation == previous =>
+                    {
+                        Some(b.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            // Statement 15: a declared snapshot can predate every binding.
+            // The authenticated hub runtime already owns the tenant and identity.
+            let mut records = state_records(db, state.clone(), tenant, hub)?;
+            for b in &mut bindings {
+                b.namespace.hub_incarnation = next;
+                b.issuance_state = state.state.clone();
+                b.issuance_source = (ws.commit_lsn.ok_or_else(invalid)?, 0);
+                b.signature = signer(&b.bytes()?)?;
+                records.push(Record::Binding(b.clone()));
+            }
+            ws.config_writes.push((
+                tenant.config_key("sync_incarnation"),
+                RedbPersistence::encode_config_value(&next.to_hex())?,
+            ));
+            installed = true;
+            Ok(records)
+        })?;
+        if installed {
+            self.sync_incarnations
+                .lock()
+                .insert(tenant.as_str().into(), next);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_delivery_metadata<F>(&self, prepare: F) -> Result<()>
+    where
+        F: FnOnce(Lsn) -> Result<Vec<crate::custody::records::Record>>,
+    {
+        let tx = self.begin()?;
+        let mut prepare = Some(prepare);
+        self.commit_delivery_prepared(tx, &mut |_, ws| {
+            prepare
+                .take()
+                .ok_or_else(crate::custody::canonical::invalid)?(
+                ws.commit_lsn
+                    .ok_or_else(crate::custody::canonical::invalid)?,
+            )
+        })
+    }
+
     /// A snapshot-in-time read of "is this handle closed right now" — reads
     /// the SAME two atomics `open_operation` checks, but takes NO lock and
     /// holds nothing: unlike `open_operation`'s guard, this cannot be held
@@ -9366,6 +9537,7 @@ impl Database {
         change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         received_schema_stages: ReceivedSchemaStageRegistry,
+        local_erasure_stages: discard::StageRegistry,
         pending_local_schema_stages: Arc<Mutex<HashMap<TxId, PendingLocalSchemaStage>>>,
         local_schema_stages: LocalSchemaStageRegistry,
         persistence: Option<Arc<RedbPersistence>>,
@@ -9396,6 +9568,7 @@ impl Database {
             terminal_refusal_scans: Arc::new(RwLock::new(HashMap::new())),
             accepted_sync_row_authors: Arc::new(RwLock::new(HashMap::new())),
             received_schema_stages,
+            local_erasure_stages,
             pending_local_schema_stages,
             local_schema_stages,
             capture_detached_sync_write_set: Arc::new(AtomicBool::new(false)),
@@ -9456,6 +9629,9 @@ impl Database {
             in_memory_sync_progress: Arc::new(Mutex::new(InMemorySyncProgressState::default())),
             in_memory_applied_push_watermarks: Arc::new(Mutex::new(HashMap::new())),
             sync_incarnations: Arc::new(Mutex::new(HashMap::new())),
+            custody_runtime: Arc::new(Mutex::new(None)),
+            custody_cache: Arc::new(Mutex::new(None)),
+            custody_metadata: Arc::new(Mutex::new(BTreeMap::new())),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             limit_update_lock: Arc::new(Mutex::new(())),
@@ -10321,6 +10497,7 @@ impl Database {
             terminal_refusal_scans: self.terminal_refusal_scans.clone(),
             accepted_sync_row_authors: self.accepted_sync_row_authors.clone(),
             received_schema_stages: self.received_schema_stages.clone(),
+            local_erasure_stages: self.local_erasure_stages.clone(),
             pending_local_schema_stages: self.pending_local_schema_stages.clone(),
             local_schema_stages: self.local_schema_stages.clone(),
             capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
@@ -10384,6 +10561,9 @@ impl Database {
             in_memory_sync_progress: self.in_memory_sync_progress.clone(),
             in_memory_applied_push_watermarks: self.in_memory_applied_push_watermarks.clone(),
             sync_incarnations: self.sync_incarnations.clone(),
+            custody_runtime: self.custody_runtime.clone(),
+            custody_cache: self.custody_cache.clone(),
+            custody_metadata: self.custody_metadata.clone(),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             limit_update_lock: self.limit_update_lock.clone(),
@@ -10738,6 +10918,7 @@ impl Database {
             accountant.clone(),
             apply_phase_pause.clone(),
         );
+        let local_erasure_stages = composite.local_erasure_stages.clone();
         let event_bus = Arc::new(EventBusState::new());
         let trigger = Arc::new(TriggerState::new());
         let persistent = PersistentCompositeStore::new(
@@ -10769,6 +10950,7 @@ impl Database {
             change_log_lsn_refcounts,
             ddl_log,
             received_schema_stages,
+            local_erasure_stages,
             pending_local_schema_stages,
             local_schema_stages,
             Some(persistence),
@@ -11001,7 +11183,7 @@ impl Database {
         let pending_local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
-        let store: DynStore = Box::new(CompositeStore::new_with_apply_phase_pause(
+        let composite = CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
             graph.clone(),
             vector.clone(),
@@ -11011,7 +11193,9 @@ impl Database {
             ddl_log.clone(),
             accountant.clone(),
             apply_phase_pause.clone(),
-        ));
+        );
+        let local_erasure_stages = composite.local_erasure_stages.clone();
+        let store: DynStore = Box::new(composite);
         let tx_mgr = Arc::new(TransactionManager::new_with_counters_and_commit_index(
             store,
             TxId(max_tx.0.saturating_add(1)),
@@ -11033,6 +11217,7 @@ impl Database {
             change_log_lsn_refcounts,
             ddl_log,
             received_schema_stages,
+            local_erasure_stages,
             pending_local_schema_stages,
             local_schema_stages,
             None,
@@ -11046,6 +11231,13 @@ impl Database {
             event_bus,
             trigger,
         );
+        // Statements 14/19: the sealed read image retains its durable destination,
+        // so bindings and scoped custody credit agree with the live database.
+        *db.retention_sync_peer.lock() = startup
+            .config_values
+            .get(RETENTION_SYNC_PEER_CONFIG_KEY)
+            .map(|bytes| RedbPersistence::decode_config_value_exact::<String>(bytes))
+            .transpose()?;
         db.committed_image_startup = Some(startup);
         // This handle has no persistence to stat, so the length the reader
         // measured of the file it read this image out of travels with the
@@ -11084,7 +11276,7 @@ impl Database {
         let local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
         let trigger = Arc::new(TriggerState::new());
-        let store: DynStore = Box::new(CompositeStore::new_with_apply_phase_pause(
+        let composite = CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
             graph.clone(),
             vector.clone(),
@@ -11094,7 +11286,9 @@ impl Database {
             ddl_log.clone(),
             accountant.clone(),
             apply_phase_pause.clone(),
-        ));
+        );
+        let local_erasure_stages = composite.local_erasure_stages.clone();
+        let store: DynStore = Box::new(composite);
         let tx_mgr = Arc::new(TransactionManager::new(store));
         let event_bus = Arc::new(EventBusState::new());
         let blob_repository = BlobRepository::ephemeral()?;
@@ -11110,6 +11304,7 @@ impl Database {
             change_log_lsn_refcounts,
             ddl_log,
             received_schema_stages,
+            local_erasure_stages,
             pending_local_schema_stages,
             local_schema_stages,
             None,
@@ -12466,7 +12661,10 @@ impl Database {
         preopened_autocommit_tx: Option<TxId>,
     ) -> Result<QueryResult> {
         match plan {
-            PhysicalPlan::Insert(_) | PhysicalPlan::Delete(_) | PhysicalPlan::Update(_) => {
+            PhysicalPlan::Insert(_)
+            | PhysicalPlan::Delete(_)
+            | PhysicalPlan::Update(_)
+            | PhysicalPlan::Discard(_) => {
                 let tx = match preopened_autocommit_tx {
                     Some(tx) => tx,
                     None => self.begin_for_public_autocommit_write()?,
@@ -12581,6 +12779,12 @@ impl Database {
             // the kernel reports here is the engine's own error, carried out
             // unchanged.
             Err(crate::executor::BoundedExecutionError::Engine(error)) => Err(error),
+            // Statement 19: an admin-scope refusal remains typed on this uncapped door.
+            Err(crate::executor::BoundedExecutionError::Refused(failure))
+                if failure.kind() == ReadFailureKind::ConstrainedHandleInspectionRefused =>
+            {
+                Err(Error::ReadFailure(failure))
+            }
             Err(other) => Err(Error::Other(format!(
                 "uncapped read could not be answered: {other:?}"
             ))),
@@ -13128,6 +13332,7 @@ impl Database {
             None,
             None,
             false,
+            None,
         )
     }
 
@@ -13141,7 +13346,28 @@ impl Database {
         sync_pull_trigger_audit_projection: Option<&BTreeMap<String, TriggerDeclaration>>,
         sync_tombstones: Option<&[AcceptedSyncTombstone]>,
         sync_trigger_derived_rows_are_local: bool,
+        mut delivery_prepare: Option<&mut crate::custody::preparation::CommitPreparation<'_>>,
     ) -> Result<CommitValidationOutcome> {
+        let discard_selections = self
+            .pending_commit_metadata
+            .lock()
+            .get(&tx)
+            .map(|m| m.discard_selections.clone())
+            .unwrap_or_default();
+        let mut discard_drain = if discard_selections.is_empty() {
+            None
+        } else {
+            Some(self.event_bus.begin_authoritative_purge_queue_drain()?)
+        };
+        let discard_hashes = self.authoritative_purge_selected_blob_hashes(&discard_selections)?;
+        let discard_blob_guard = if discard_selections.is_empty() {
+            None
+        } else {
+            Some(
+                self.blob_repository
+                    .acquire_exclusive_sorted(&discard_hashes)?,
+            )
+        };
         let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
         let sync_pull_pre_trigger_creation_keys = std::cell::RefCell::new(HashSet::<String>::new());
         let sync_pull_pre_trigger_rows = std::cell::RefCell::new(HashSet::<(String, RowId)>::new());
@@ -13156,6 +13382,7 @@ impl Database {
             std::cell::RefCell::new(None::<event_bus::QueueMutationLease>);
         let mut committed_trigger_audit_entries = Vec::new();
         let in_memory_lineage_delta = std::cell::RefCell::new(None);
+        let prepared_delivery_memory = std::cell::RefCell::new(None);
         let committed_graph_arrivals =
             std::cell::RefCell::new(Vec::<(GraphIdentity, DurableGraphArrival)>::new());
         let validation_noop_count = std::cell::Cell::new(0_u64);
@@ -13169,6 +13396,23 @@ impl Database {
             match self.tx_mgr.commit_with_lsn_active_prepare_and_applied_mut(
                 tx,
                 |lsn, visibility_tx| {
+                    // Statement 17b: transaction-local absence is never an ordinary DELETE event.
+                    if !discard_selections.is_empty() {
+                        self.tx_mgr.with_write_set(tx, |ws| {
+                            ws.relational_deletes.retain(|(table, id, _)| {
+                                !discard_selections
+                                    .iter()
+                                    .any(|s| s.table == *table && s.local_row_id == *id)
+                            });
+                            for selected in &discard_selections {
+                                ws.config_deletes.push(Self::durable_row_lineage_config_key(
+                                    &selected.table,
+                                    &selected.natural_key,
+                                    selected.table_generation,
+                                ));
+                            }
+                        })?;
+                    }
                     self.prepare_and_register_local_schema_stage(tx, visibility_tx, lsn)?;
                     // This observes the canonical staged write set before
                     // conditional-update revalidation can discard a stale
@@ -13334,6 +13578,31 @@ impl Database {
                             self.stage_trigger_ddl_for_commit(lsn, trigger_ddl, trigger_ddl_start)?;
                         }
                         self.plugin.pre_commit(ws, source)?;
+                        let registrations = self
+                            .pending_commit_metadata
+                            .lock()
+                            .get(&tx)
+                            .map(|m| m.delivery_registrations.clone())
+                            .unwrap_or_default();
+                        for registration in registrations {
+                            for record in registration.prepare(self, ws)? {
+                                record.verify()?;
+                                ws.config_writes.push((
+                                    record.key()?,
+                                    crate::custody::records::encode(&record)?,
+                                ));
+                            }
+                        }
+                        if let Some(prepare) = delivery_prepare.as_mut() {
+                            for record in prepare(self, ws)? {
+                                record.verify()?;
+                                ws.config_writes.push((
+                                    record.key()?,
+                                    crate::custody::records::encode(&record)?,
+                                ));
+                            }
+                        }
+                        *prepared_delivery_memory.borrow_mut() = self.prepare_custody_commit(ws)?;
                         #[cfg(feature = "test-seams")]
                         let projection_started = Instant::now();
                         let prepared_sink_events = self
@@ -13396,6 +13665,17 @@ impl Database {
                         }
                         *delete_release_bytes.borrow_mut() =
                             self.delete_release_bytes_for_write_set(ws);
+                        if let Some(drain) = discard_drain.take() {
+                            drop(pending_sink_queue_mutation.borrow_mut().take());
+                            self.prepare_discard_commit(
+                                ws,
+                                &discard_selections,
+                                drain.freeze_for_commit_locked_purge(),
+                                discard_blob_guard.as_ref().expect("discard hash fence"),
+                            )?;
+                            *prepared_delivery_memory.borrow_mut() =
+                                self.prepare_custody_commit(ws)?;
+                        }
                         if self.persistence.is_none() {
                             *in_memory_lineage_delta.borrow_mut() =
                                 Some(Self::prepare_in_memory_lineage_delta(&ws.config_writes)?);
@@ -13418,6 +13698,10 @@ impl Database {
                     if !ws.is_empty() {
                         if let Some(stage) = self.take_local_schema_stage(lsn) {
                             self.publish_local_schema_stage(stage);
+                        }
+                        // Statements 7/11/13: publish only the admitted custody keys.
+                        if let Some(delta) = prepared_delivery_memory.borrow_mut().take() {
+                            self.publish_custody_delta(delta);
                         }
                         if let Some(delta) = in_memory_lineage_delta.borrow_mut().take() {
                             self.publish_in_memory_lineage_delta(delta);
@@ -13496,6 +13780,7 @@ impl Database {
                         // removes it on its own flush error.
                         let _ = self.take_received_schema_stage(lsn);
                         let _ = self.take_local_schema_stage(lsn);
+                        self.local_erasure_stages.lock().remove(&lsn);
                         let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
                         self.discard_staged_event_bus_ddl_commit(lsn);
                         self.discard_staged_trigger_ddl_commit(lsn);
@@ -13815,7 +14100,10 @@ impl Database {
         if let Some(tx) = tx
             && matches!(
                 plan,
-                PhysicalPlan::Insert(_) | PhysicalPlan::Delete(_) | PhysicalPlan::Update(_)
+                PhysicalPlan::Insert(_)
+                    | PhysicalPlan::Delete(_)
+                    | PhysicalPlan::Update(_)
+                    | PhysicalPlan::Discard(_)
             )
             && self.pending_local_schema_stages.lock().contains_key(&tx)
         {
@@ -15988,6 +16276,25 @@ impl Database {
         validated_lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         inputs: ReceivedSchemaAdjudicationInputs<'_>,
     ) -> Result<ReceivedSchemaStage> {
+        self.prepare_received_schema_stage_with_delivery(
+            local_lsn,
+            changes,
+            received,
+            validated_lineages,
+            inputs,
+            None,
+        )
+    }
+
+    fn prepare_received_schema_stage_with_delivery(
+        &self,
+        local_lsn: Lsn,
+        changes: &ChangeSet,
+        received: &crate::protocol::ReceivedDdlContext,
+        validated_lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
+        inputs: ReceivedSchemaAdjudicationInputs<'_>,
+        delivery_prepare: Option<&mut crate::custody::preparation::CommitPreparation<'_>>,
+    ) -> Result<ReceivedSchemaStage> {
         let (source_order, mut persistence) =
             plan_received_schema_source_order(local_lsn, &changes.ddl, &changes.ddl_lsn, received)?;
         let local_ddl_log_before_extension = self.ddl_log.read().clone();
@@ -16038,6 +16345,7 @@ impl Database {
             inputs.hub_local_author,
             validated_lineages,
             true,
+            None,
         )?;
         let mut finalized_write_set = working
             .detached_sync_write_set
@@ -16060,6 +16368,23 @@ impl Database {
             inputs.receiver_tx,
             &fallback_arrival_tombstones,
         )?;
+        if let Some(prepare) = delivery_prepare {
+            // The detached image supplies final schema/rows; custody authority
+            // remains the receiver's current committed view until publication.
+            *working.sync_incarnations.lock() = self.sync_incarnations.lock().clone();
+            *working.custody_metadata.lock() = self
+                .custody_records()?
+                .into_iter()
+                .map(|record| Ok((record.key()?, crate::custody::records::encode(&record)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            for record in prepare(&working, &mut finalized_write_set)? {
+                record.verify()?;
+                finalized_write_set
+                    .config_writes
+                    .push((record.key()?, crate::custody::records::encode(&record)?));
+            }
+        }
+        let custody_memory = self.prepare_custody_commit(&mut finalized_write_set)?;
         let in_memory_lineage_delta = if self.persistence.is_none() {
             Self::prepare_in_memory_lineage_delta(&finalized_write_set.config_writes)?
         } else {
@@ -16361,6 +16686,7 @@ impl Database {
             structurally_dropped_tables: structurally_dropped_tables.clone(),
         };
         Ok(ReceivedSchemaStage {
+            custody_memory,
             source_order,
             relational,
             graph,
@@ -16407,6 +16733,10 @@ impl Database {
     /// the matching Redb transaction started.
     #[allow(dead_code)]
     fn publish_received_schema_stage(&self, mut stage: ReceivedSchemaStage) {
+        // Statements 9/11: the schema/unit boundary publishes the same metadata delta.
+        if let Some(delta) = stage.custody_memory.take() {
+            self.publish_custody_delta(delta);
+        }
         #[cfg(test)]
         if take_received_schema_pre_publish_pause_armed_here_for_test() {
             received_schema_pre_publish_pause_for_test().maybe_pause();
@@ -16500,6 +16830,7 @@ impl Database {
         dependency_complete: bool,
         terminal_refusal_context: Option<&TerminalRefusalPullContext>,
         hub_local_author: Option<&str>,
+        mut delivery_prepare: Option<&mut crate::custody::preparation::CommitPreparation<'_>>,
         apply_preflight: F,
         after_stage_registration: G,
     ) -> Result<crate::protocol::WireApplyResult>
@@ -16530,7 +16861,7 @@ impl Database {
             .commit_with_lsn_active_prepare_and_applied_mut(
                 tx,
                 |lsn, receiver_tx| {
-                    let stage = self.prepare_received_schema_stage_with_adjudication(
+                    let stage = self.prepare_received_schema_stage_with_delivery(
                         lsn,
                         changes,
                         received,
@@ -16545,6 +16876,7 @@ impl Database {
                             hub_local_author,
                             receiver_tx,
                         },
+                        delivery_prepare.take(),
                     )?;
                     self.register_received_schema_stage(lsn, stage);
                     after_stage_registration()?;
@@ -16621,6 +16953,7 @@ impl Database {
             dependency_complete,
             None,
             None,
+            None,
             || Ok(()),
             || {
                 if fail_after_stage_registration {
@@ -16682,7 +17015,7 @@ impl Database {
         .map_err(|err| Error::SyncError(format!("cannot encode lineage attestation: {err}")))
     }
 
-    fn verify_lineage_attestation(
+    pub(crate) fn verify_lineage_attestation(
         tenant_id: &TenantId,
         table: &str,
         natural_key: &NaturalKey,
@@ -16810,6 +17143,123 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_delivery_row_lineages(
+        &self,
+        ws: &mut WriteSet,
+        changes: &ChangeSet,
+        tenant: &TenantId,
+        node: &str,
+        incarnation: Incarnation,
+        signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
+    ) -> Result<PreparedDeliveryLineages> {
+        let mut result = HashMap::new();
+        let state = self.lineage_state_lock.lock();
+        for change in &changes.rows {
+            let meta = self
+                .table_meta(&change.table)
+                .ok_or_else(crate::custody::canonical::invalid)?;
+            let row = ws
+                .relational_inserts
+                .iter()
+                .find_map(|(table, row)| {
+                    (*table == change.table
+                        && natural_key_from_row_values(&meta, &row.values).as_ref()
+                            == Some(&change.natural_key))
+                    .then_some(row.clone())
+                })
+                .ok_or_else(crate::custody::canonical::invalid)?;
+            let generation = self.durable_lineage_table_generation(&change.table)?;
+            let sidecar_key = Self::durable_row_lineage_config_key(
+                &change.table,
+                &change.natural_key,
+                generation,
+            );
+            let creation_key = Self::durable_unbound_creation_config_key(
+                &change.table,
+                &change.natural_key,
+                generation,
+                row.row_id,
+            );
+            let creation: Option<DurableUnboundCreationLineage> = ws
+                .config_writes
+                .iter()
+                .rev()
+                .find(|(k, _)| k == &creation_key)
+                .map(|(_, bytes)| RedbPersistence::decode_config_value(bytes))
+                .transpose()?;
+            // Statements 6/14: offline roots still get their real transaction's creator evidence.
+            let creation = creation.or_else(|| {
+                (meta.sync_direction == Some(contextdb_core::SyncDirection::None)).then(|| {
+                    DurableUnboundCreationLineage {
+                        table: change.table.clone(),
+                        natural_key: change.natural_key.clone(),
+                        table_generation: generation,
+                        local_row_id: row.row_id,
+                        creation_lsn: ws.commit_lsn,
+                    }
+                })
+            });
+            let sidecar = if let Some(creation) = creation {
+                if creation.creation_lsn != ws.commit_lsn
+                    || creation.local_row_id != row.row_id
+                    || creation.table_generation != generation
+                {
+                    return Err(crate::custody::canonical::invalid());
+                }
+                let lsn = creation
+                    .creation_lsn
+                    .ok_or_else(crate::custody::canonical::invalid)?;
+                let mut sidecar = DurableRowLineageSidecar {
+                    author_node_id: node.into(),
+                    author_database_incarnation: incarnation,
+                    author_local_mutation_position: lsn,
+                    table_generation: generation,
+                    lineage_root: format!("author:{}:{}:{}", node, incarnation.to_hex(), lsn.0),
+                    lineage_attestation: Vec::new(),
+                    local_row_id: Some(row.row_id),
+                    locally_created: true,
+                };
+                sidecar.lineage_attestation = signer(&Self::lineage_attestation_bytes(
+                    tenant,
+                    &change.table,
+                    &change.natural_key,
+                    generation,
+                    node,
+                    incarnation,
+                    lsn,
+                    &sidecar.lineage_root,
+                )?)?;
+                ws.config_writes
+                    .push((sidecar_key, RedbPersistence::encode_config_value(&sidecar)?));
+                sidecar
+            } else {
+                self.load_row_lineage_sidecar(&state, &sidecar_key)?
+                    .filter(|s| s.local_row_id == Some(row.row_id))
+                    .ok_or_else(crate::custody::canonical::invalid)?
+            };
+            let lineage = crate::protocol::WireRowLineage {
+                table_generation: sidecar.table_generation,
+                author_node_id: sidecar.author_node_id,
+                author_database_incarnation: sidecar.author_database_incarnation,
+                author_local_mutation_position: sidecar.author_local_mutation_position,
+                lineage_root: sidecar.lineage_root,
+                attestation: sidecar.lineage_attestation,
+            };
+            Self::verify_lineage_attestation(tenant, &change.table, &change.natural_key, &lineage)?;
+            result.insert(
+                (
+                    change.table.clone(),
+                    rmp_serde::to_vec(&change.natural_key)
+                        .map_err(|_| crate::custody::canonical::invalid())?,
+                    change.lsn,
+                ),
+                lineage,
+            );
+        }
+        Ok(result)
     }
 
     fn staged_unbound_creation_lineage(
@@ -17096,7 +17546,7 @@ impl Database {
         }))
     }
 
-    fn durable_lineage_table_generation(&self, table: &str) -> Result<u64> {
+    pub(crate) fn durable_lineage_table_generation(&self, table: &str) -> Result<u64> {
         if let Some(persistence) = &self.persistence {
             return persistence
                 .load_config_value::<u64>(&Self::durable_lineage_table_generation_key(table))?
@@ -17928,6 +18378,9 @@ impl Database {
         changes: ChangeSet,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
     ) -> Result<PurgedLineageRefusal> {
+        // Statement 17: the purge journal retains every known source lineage,
+        // while the local lifecycle record names the materialized incumbent.
+        let purged_copies = self.authoritative_purge_delivery_items_since(Lsn(0))?;
         let projected_meta = self.projected_sync_table_meta(&changes.ddl);
         let policies = Self::declared_sync_policies(true);
         let mut retained_rows = Vec::with_capacity(changes.rows.len());
@@ -17955,7 +18408,12 @@ impl Database {
                 lineage.table_generation,
             )?;
             let creator_incarnation = lineage.author_database_incarnation.to_hex();
-            let matches_purged_lineage = record.is_some_and(|record| {
+            let matches_purged_lineage = purged_copies.iter().any(|item| {
+                item.table == row.table
+                    && item.natural_key == row.natural_key
+                    && item.table_generation == lineage.table_generation
+                    && item.purged_lineage_roots.contains(&lineage.lineage_root)
+            }) || record.is_some_and(|record| {
                 record.delete_obligation == DurableDeleteObligation::Purged
                     && record.table == row.table
                     && record.natural_key == row.natural_key
@@ -20361,10 +20819,12 @@ impl Database {
             let mut pending = self.pending_commit_metadata.lock();
             let entry = pending.entry(origin_tx).or_default();
             PendingCommitMetadata {
+                discard_selections: entry.discard_selections.clone(),
                 conditional_update_guards: std::mem::take(&mut entry.conditional_update_guards),
                 sync_lineage_guards: std::mem::take(&mut entry.sync_lineage_guards),
                 upsert_intents: std::mem::take(&mut entry.upsert_intents),
                 vector_schema_epochs: entry.vector_schema_epochs.clone(),
+                delivery_registrations: Vec::new(),
             }
         };
         let snapshot = self.snapshot();
@@ -23570,6 +24030,8 @@ impl Database {
 
     pub fn scan(&self, table: &str, snapshot: SnapshotId) -> Result<Vec<VersionedRow>> {
         let _operation = self.open_operation()?;
+        #[cfg(feature = "test-seams")]
+        observe_read_execution_convergence(ReadExecutionConvergenceEvent::EagerRowSourceTouch);
         let rows = self.relational.scan(table, snapshot)?;
         let mut rows = self.filter_rows_for_read(table, rows, snapshot)?;
         self.supplement_quantized_vectors(table, snapshot, &mut rows);
@@ -23582,6 +24044,8 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
     ) -> Result<Vec<VersionedRow>> {
+        #[cfg(feature = "test-seams")]
+        observe_read_execution_convergence(ReadExecutionConvergenceEvent::EagerRowSourceTouch);
         let mut rows = self.relational.scan_with_tx(Some(tx), table, snapshot)?;
         self.supplement_quantized_vectors(table, snapshot, &mut rows);
         Ok(rows)
@@ -26125,12 +26589,7 @@ impl Database {
         &self,
         selections: &[AuthoritativePurgeSelection],
     ) -> Result<BTreeSet<[u8; 32]>> {
-        let Some(selection) = selections.first() else {
-            return Err(Error::SyncError(
-                "authoritative purge batch has no selected rows".to_string(),
-            ));
-        };
-        if selection.table != "work_jobs" {
+        if !selections.iter().any(|s| s.table == "work_jobs") {
             return Ok(BTreeSet::new());
         }
         let snapshot = self.snapshot_for_read();
@@ -26142,7 +26601,7 @@ impl Database {
             .cloned()
             .unwrap_or_default();
         let mut hashes = BTreeSet::new();
-        for selected in selections {
+        for selected in selections.iter().filter(|s| s.table == "work_jobs") {
             let mut visible = rows
                 .iter()
                 .filter(|row| row.row_id == selected.local_row_id && row.visible_at(snapshot));
@@ -26189,15 +26648,12 @@ impl Database {
         retain_all_on_malformed_survivor: bool,
     ) -> Result<AuthoritativePurgeBlobReferences> {
         let selected_hashes = self.authoritative_purge_selected_blob_hashes(selections)?;
-        if selected_hashes.is_empty()
-            || selections
-                .first()
-                .is_none_or(|selection| selection.table != "work_jobs")
-        {
+        if selected_hashes.is_empty() {
             return Ok((selected_hashes, BTreeSet::new()));
         }
         let selected_row_ids = selections
             .iter()
+            .filter(|s| s.table == "work_jobs")
             .map(|selection| selection.local_row_id)
             .collect::<HashSet<_>>();
         let snapshot = self.snapshot_for_read();
@@ -26251,31 +26707,31 @@ impl Database {
         &self,
         selections: &[AuthoritativePurgeSelection],
         queue_mutation_token: event_bus::AuthoritativePurgeQueueMutationToken,
-        report_requested: bool,
+        report_shape: crate::custody::erasure::PurgeReportShape,
     ) -> Result<AuthoritativePurgePreparedSet> {
+        use crate::custody::erasure::PurgeReportShape;
+        let report_requested = report_shape != PurgeReportShape::None;
         let _operation = self.open_operation()?;
-        let selection = selections.first().ok_or_else(|| {
-            Error::SyncError("authoritative purge batch has no selected rows".to_string())
-        })?;
-        if selections
-            .iter()
-            .any(|candidate| candidate.table != selection.table)
-        {
-            return Err(Error::SyncError(
-                "authoritative purge batch must select one table".to_string(),
-            ));
-        }
-        let mut selected_by_row_id = HashMap::with_capacity(selections.len());
+        // Statement 17a: an explicit node-local instruction may have no hub rows.
+
+        // Statements 17/17a/17b: ownership is a (table,row) pair throughout one union.
+        let mut selected_by_table = BTreeMap::<String, HashSet<RowId>>::new();
         for candidate in selections {
-            if selected_by_row_id
-                .insert(candidate.local_row_id, candidate)
-                .is_some()
+            if !selected_by_table
+                .entry(candidate.table.clone())
+                .or_default()
+                .insert(candidate.local_row_id)
             {
                 return Err(Error::SyncError(
-                    "authoritative purge batch selected one pinned row twice".to_string(),
+                    "erasure selected one pinned row twice".into(),
                 ));
             }
         }
+        let selected = |table: &str, row_id: &RowId| {
+            selected_by_table
+                .get(table)
+                .is_some_and(|ids| ids.contains(row_id))
+        };
         let lifecycle_templates = selections
             .iter()
             .map(|candidate| {
@@ -26285,47 +26741,44 @@ impl Database {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let selected_row_ids = selected_by_row_id.keys().copied().collect::<HashSet<_>>();
         let prepared_snapshot = self.snapshot();
-        let selected_table_rows = self
-            .relational_store
-            .tables
-            .read()
-            .get(&selection.table)
-            .cloned()
-            .unwrap_or_default();
-        let row_versions = selected_table_rows
-            .iter()
-            .filter_map(|row| {
-                selected_by_row_id.get(&row.row_id).map(|candidate| {
-                    AuthoritativePurgeRowVersionKey {
-                        table: candidate.table.clone(),
-                        table_generation: candidate.table_generation,
-                        key: candidate.natural_key.pairs(),
-                        lineage_root: candidate.lineage_root.clone(),
-                        row_id: row.row_id,
-                        created_tx: row.created_tx,
-                        lsn: row.lsn,
-                    }
-                })
+        let all_rows = self.relational_store.tables.read();
+        let selected_table_rows = selected_by_table
+            .keys()
+            .map(|table| {
+                (
+                    table.clone(),
+                    all_rows.get(table).cloned().unwrap_or_default(),
+                )
             })
-            .collect::<Vec<_>>();
-        let row_ids_with_versions = row_versions
-            .iter()
-            .map(|row| row.row_id)
-            .collect::<HashSet<_>>();
-        if row_ids_with_versions != selected_row_ids {
-            return Err(Error::SyncError(
-                "authoritative purge batch lost a pinned local row".to_string(),
-            ));
+            .collect::<BTreeMap<_, _>>();
+        drop(all_rows);
+        let mut row_versions = Vec::new();
+        let mut selected_versions = Vec::new();
+        for candidate in selections {
+            let mut found = false;
+            for row in &selected_table_rows[&candidate.table] {
+                if row.row_id != candidate.local_row_id {
+                    continue;
+                }
+                found = true;
+                row_versions.push(AuthoritativePurgeRowVersionKey {
+                    table: candidate.table.clone(),
+                    table_generation: candidate.table_generation,
+                    key: candidate.natural_key.pairs(),
+                    lineage_root: candidate.lineage_root.clone(),
+                    row_id: row.row_id,
+                    created_tx: row.created_tx,
+                    lsn: row.lsn,
+                });
+                selected_versions.push(row);
+            }
+            if !found {
+                return Err(Error::SyncError("erasure lost a pinned row".into()));
+            }
         }
-        // Every historical edge-row version is an independent ownership
-        // witness.  Keep this as a vector, not a set: two selected versions
-        // can legitimately name identical edge coordinates and must consume
-        // two adjacency occurrences without touching an unrelated third.
-        let selected_edge_variants = selected_table_rows
+        let selected_edge_variants = selected_versions
             .iter()
-            .filter(|row| selected_row_ids.contains(&row.row_id))
             .filter_map(|row| {
                 Some((
                     row.values.get("source_id")?.as_uuid().copied()?,
@@ -26434,13 +26887,12 @@ impl Database {
             .enumerate()
             .filter_map(|(position, entry)| match entry {
                 ChangeLogEntry::RowInsert { table, row_id, .. }
-                | ChangeLogEntry::RowDelete { table, row_id, .. } => (table == &selection.table
-                    && selected_row_ids.contains(row_id))
-                .then_some(position),
+                | ChangeLogEntry::RowDelete { table, row_id, .. } => {
+                    selected(table, row_id).then_some(position)
+                }
                 ChangeLogEntry::VectorInsert { index, row_id, .. }
                 | ChangeLogEntry::VectorDelete { index, row_id, .. } => {
-                    (index.table == selection.table && selected_row_ids.contains(row_id))
-                        .then_some(position)
+                    selected(&index.table, row_id).then_some(position)
                 }
                 ChangeLogEntry::EdgeInsert {
                     source,
@@ -26500,13 +26952,14 @@ impl Database {
             .vector_store
             .all_entries()
             .into_iter()
-            .filter(|entry| {
-                entry.index.table == selection.table && selected_row_ids.contains(&entry.row_id)
-            })
+            .filter(|entry| selected(&entry.index.table, &entry.row_id))
             .collect::<Vec<_>>();
 
-        let disk_source_provenance =
-            self.authoritative_purge_disk_source_provenance(&selection.table, &selected_row_ids)?;
+        let mut disk_source_provenance = Vec::new();
+        for (table, ids) in &selected_by_table {
+            disk_source_provenance
+                .extend(self.authoritative_purge_disk_source_provenance(table, ids)?);
+        }
         let lineage_config_owners = selections
             .iter()
             .zip(lifecycle_templates)
@@ -26553,64 +27006,81 @@ impl Database {
             .prepare_authoritative_purge_queue_replacement(
                 queue_mutation_token,
                 durable_sink_names,
-                &selection.table,
-                &selected_row_ids,
+                &selected_by_table,
             );
         let sink_names = event_bus.authoritative_purge_sink_names().clone();
-        let durable_sink_entries = self.authoritative_purge_durable_sink_entries(
-            &selection.table,
-            &selected_row_ids,
-            &sink_names,
-        )?;
-        let affected_table_rows = selected_table_rows
-            .iter()
-            .filter(|row| !selected_row_ids.contains(&row.row_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let survivor_report = Self::prepare_authoritative_purge_survivor_report(
-            report_requested,
-            &selection.table,
-            &selected_row_ids,
-            &selected_table_rows,
-            &affected_table_rows,
-            prepared_snapshot,
-        )?;
+        let mut durable_sink_entries = Vec::new();
+        let mut survivor_report = QueryResult::empty();
+        if report_shape == PurgeReportShape::PerTable {
+            survivor_report.columns =
+                vec!["table".into(), "rows_affected".into(), "survivors".into()];
+        }
+        let mut projections = Vec::new();
+        let mut affected_rows = BTreeMap::new();
         let source_sidecars = self
             .authoritative_purge_all_memory_source_provenance()
             .into_iter()
-            .filter(|(table, row_id, _, _)| {
-                table != &selection.table || !selected_row_ids.contains(row_id)
-            })
+            .filter(|(table, row_id, _, _)| !selected(table, row_id))
             .map(|(table, row_id, lsn, kind)| ((table, row_id), (lsn, kind)))
             .collect::<HashMap<_, _>>();
-        let table_meta = self.table_meta(&selection.table).ok_or_else(|| {
-            Error::SyncError("authoritative purge selected table metadata disappeared".to_string())
-        })?;
-        let selected_table_sources = source_sidecars
-            .iter()
-            .filter(|((table, _), _)| table == &selection.table)
-            .map(|((_, row_id), (lsn, kind))| {
-                let kind = match *kind {
-                    0 => contextdb_relational::store::SyncSourceKind::Pulled,
-                    1 => contextdb_relational::store::SyncSourceKind::AcceptedLocal,
-                    2 => contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
-                    _ => unreachable!("sync source kind inventory is closed"),
-                };
-                (*row_id, *lsn, kind)
-            })
-            .collect::<Vec<_>>();
-        let relational_projection: TableProjection = RelationalStore::with_sync_sources(
-            RelationalStore::table_projection(
-                selection.table.clone(),
-                table_meta,
-                affected_table_rows.clone(),
-            ),
-            selected_table_sources,
-        );
-        let relational = self.relational_store.prepare_received_schema_publication(
-            vec![relational_projection],
-            std::iter::empty::<String>(),
-        );
+        for (table, ids) in &selected_by_table {
+            durable_sink_entries.extend(self.authoritative_purge_durable_sink_entries(
+                table,
+                ids,
+                &sink_names,
+            )?);
+            let before = &selected_table_rows[table];
+            let after = before
+                .iter()
+                .filter(|row| !ids.contains(&row.row_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let report = Self::prepare_authoritative_purge_survivor_report(
+                report_requested,
+                table,
+                ids,
+                before,
+                &after,
+                prepared_snapshot,
+            )?;
+            if report_shape == PurgeReportShape::PerTable {
+                survivor_report.rows.push(vec![
+                    Value::Text(table.clone()),
+                    Value::Int64(ids.len() as i64),
+                    Value::Json(
+                        serde_json::to_value(&report.rows)
+                            .map_err(|e| Error::Other(e.to_string()))?,
+                    ),
+                ]);
+            } else if report_shape == PurgeReportShape::Single {
+                // Statement 17a preserves the established single-table report.
+                survivor_report = report;
+            }
+            let meta = self
+                .table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            let sources = source_sidecars
+                .iter()
+                .filter(|((name, _), _)| name == table)
+                .map(|((_, row_id), (lsn, kind))| {
+                    let kind = match *kind {
+                        0 => contextdb_relational::store::SyncSourceKind::Pulled,
+                        1 => contextdb_relational::store::SyncSourceKind::AcceptedLocal,
+                        2 => contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
+                        _ => unreachable!("closed source kind"),
+                    };
+                    (*row_id, *lsn, kind)
+                })
+                .collect::<Vec<_>>();
+            projections.push(RelationalStore::with_sync_sources(
+                RelationalStore::table_projection(table.clone(), meta, after.clone()),
+                sources,
+            ));
+            affected_rows.insert(table.clone(), after);
+        }
+        let relational = self
+            .relational_store
+            .prepare_received_schema_publication(projections, std::iter::empty::<String>());
         let replacement_change_log = change_log
             .into_iter()
             .enumerate()
@@ -26631,9 +27101,7 @@ impl Database {
             .vector_store
             .all_entries()
             .into_iter()
-            .filter(|entry| {
-                entry.index.table != selection.table || !selected_row_ids.contains(&entry.row_id)
-            })
+            .filter(|entry| !selected(&entry.index.table, &entry.row_id))
             .collect::<Vec<_>>();
         let vector_schemas = self
             .vector_store
@@ -26692,7 +27160,7 @@ impl Database {
                 bytes.saturating_add(quantization.storage_bytes(entry.vector.len()))
             });
         let mut replacement_rows = old_rows.clone();
-        replacement_rows.insert(selection.table.clone(), affected_table_rows.clone());
+        replacement_rows.extend(affected_rows);
         let old_bytes = Self::received_schema_replacement_bytes(
             &old_tables,
             &old_rows,
@@ -26742,32 +27210,57 @@ impl Database {
 
     /// Resolve the exact visible row lives selected by one public `PURGE` and
     /// pass their same-table union to the one durable destruction boundary.
-    pub(crate) fn commit_authoritative_purge_batch(
+    pub(crate) fn commit_authoritative_purge_tables(
         &self,
-        table: &str,
-        matched: &[(NaturalKey, RowId)],
+        tables: &[(String, Vec<(NaturalKey, RowId)>)],
+        node_local: &[(String, Vec<u8>)],
     ) -> Result<QueryResult> {
-        let mut pinned_rows = HashSet::with_capacity(matched.len());
-        let mut selections = Vec::with_capacity(matched.len());
-        for (natural_key, expected_row_id) in matched {
-            if !pinned_rows.insert(*expected_row_id) {
-                continue;
+        let mut selections = Vec::new();
+        for (table, matched) in tables {
+            for (key, row_id) in matched {
+                let selection = self.resolve_authoritative_purge_selection(table, key)?;
+                if selection.local_row_id != *row_id {
+                    return Err(Error::SyncError(
+                        "erasure row changed after selection".into(),
+                    ));
+                }
+                selections.push(selection);
             }
-            let selection = self.resolve_authoritative_purge_selection(table, natural_key)?;
-            if selection.local_row_id != *expected_row_id {
-                return Err(Error::SyncError(
-                    "authoritative purge row changed after predicate selection".to_string(),
-                ));
+        }
+        let mut result = if selections.is_empty() && node_local.is_empty() {
+            let mut result = QueryResult::empty();
+            if tables.len() > 1 {
+                result.columns = vec!["table".into(), "rows_affected".into(), "survivors".into()];
             }
-            selections.push(selection);
+            result
+        } else {
+            self.commit_authoritative_purge_kernel_batch(
+                &selections,
+                &[],
+                true,
+                if tables.len() == 1 {
+                    crate::custody::erasure::PurgeReportShape::Single
+                } else {
+                    crate::custody::erasure::PurgeReportShape::PerTable
+                },
+                purge_predicate::Instructions {
+                    outgoing: node_local,
+                    applied: &[],
+                },
+            )?
+            .survivor_report
+        };
+        for (table, rows) in tables {
+            if rows.is_empty() && tables.len() > 1 {
+                result.rows.push(vec![
+                    Value::Text(table.clone()),
+                    Value::Int64(0),
+                    Value::Json(serde_json::json!([])),
+                ]);
+            }
         }
-        if selections.is_empty() {
-            return Err(Error::SyncError(
-                "authoritative purge batch has no pinned rows".to_string(),
-            ));
-        }
-        self.commit_authoritative_purge_kernel_batch(&selections, &[], true, true)
-            .map(|outcome| outcome.survivor_report)
+        result.rows_affected = selections.len() as u64;
+        Ok(result)
     }
 
     fn authoritative_purge_delivery_key(frontier: Lsn, ordinal: u32) -> String {
@@ -26808,6 +27301,10 @@ impl Database {
         &self,
         item: &AuthoritativePurgeDeliveryItem,
     ) -> Result<bool> {
+        // Statement 17a: node-local table generations are intentionally independent.
+        if item.node_local_predicate.is_some() {
+            return Ok(false);
+        }
         Ok(self.durable_lineage_table_generation(&item.table)? != item.table_generation)
     }
 
@@ -26817,6 +27314,30 @@ impl Database {
     ) -> Result<IncomingAuthoritativePurgePlan> {
         let mut plan = IncomingAuthoritativePurgePlan::default();
         for item in items {
+            if let Some(bytes) = &item.node_local_predicate {
+                let instruction = purge_predicate::NodeLocalPredicate::decode(bytes)?;
+                let key = instruction.receipt_key();
+                if self
+                    .persistence
+                    .as_ref()
+                    .map(|p| p.load_config_value::<bool>(&key))
+                    .transpose()?
+                    .flatten()
+                    == Some(true)
+                {
+                    continue;
+                }
+                plan.selections
+                    .entry(item.frontier)
+                    .or_default()
+                    .extend(instruction.select(self, &item.table)?);
+                plan.instruction_receipts
+                    .entry(item.frontier)
+                    .or_default()
+                    .push(key);
+                continue;
+            }
+
             let existing = self.durable_lineage_record_at_generation(
                 &item.table,
                 &item.natural_key,
@@ -26828,8 +27349,7 @@ impl Database {
                 if record.table != item.table
                     || record.natural_key != item.natural_key
                     || record.table_generation != item.table_generation
-                    || item.purged_lineage_roots.as_slice()
-                        != std::slice::from_ref(&record.lineage_root)
+                    || !item.purged_lineage_roots.contains(&record.lineage_root)
                 {
                     return Err(Error::SyncError(
                         "authoritative purge delivery does not match the durable purged root"
@@ -26851,8 +27371,7 @@ impl Database {
                 let selection =
                     self.resolve_authoritative_purge_selection(&item.table, &item.natural_key)?;
                 if selection.table_generation != item.table_generation
-                    || item.purged_lineage_roots.as_slice()
-                        != std::slice::from_ref(&selection.lineage_root)
+                    || !item.purged_lineage_roots.contains(&selection.lineage_root)
                 {
                     return Err(Error::SyncError(
                         "authoritative purge delivery does not match immutable local lineage evidence"
@@ -26860,20 +27379,22 @@ impl Database {
                     ));
                 }
                 plan.selections
-                    .entry((item.frontier, item.table.clone()))
+                    .entry(item.frontier)
                     .or_default()
                     .push(selection);
                 continue;
             }
-            let lineage_root = item
-                .purged_lineage_roots
-                .as_slice()
-                .first()
-                .filter(|_| item.purged_lineage_roots.len() == 1)
+            // Statement 17: retain this node's known creator if present; an
+            // empty node can adopt the first authenticated purged creator.
+            let lineage_root = existing
+                .as_ref()
+                .map(|record| &record.lineage_root)
+                .or_else(|| item.purged_lineage_roots.first())
+                .filter(|root| item.purged_lineage_roots.contains(root))
                 .cloned()
                 .ok_or_else(|| {
                     Error::SyncError(
-                        "authoritative purge frontier adoption requires exactly one lineage root"
+                        "authoritative purge frontier adoption requires matching lineage evidence"
                             .to_string(),
                     )
                 })?;
@@ -26897,7 +27418,7 @@ impl Database {
             // touched. The final local frontier is supplied at commit.
             let _ = adoption.at_frontier(Lsn(1))?;
             plan.frontier_adoptions
-                .entry((item.frontier, item.table.clone()))
+                .entry(item.frontier)
                 .or_default()
                 .push(adoption);
         }
@@ -26920,19 +27441,25 @@ impl Database {
             .selections
             .keys()
             .chain(plan.frontier_adoptions.keys())
+            .chain(plan.instruction_receipts.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
         for group in std::mem::take(&mut groups) {
             let selections = plan.selections.remove(&group).unwrap_or_default();
             let adoptions = plan.frontier_adoptions.remove(&group).unwrap_or_default();
-            if selections.is_empty() {
+            let receipts = plan.instruction_receipts.remove(&group).unwrap_or_default();
+            if selections.is_empty() && receipts.is_empty() {
                 self.commit_incoming_purge_frontier_adoptions(&adoptions)?;
             } else {
                 let _ = self.commit_authoritative_purge_kernel_batch(
                     &selections,
                     &adoptions,
                     false,
-                    false,
+                    crate::custody::erasure::PurgeReportShape::None,
+                    purge_predicate::Instructions {
+                        outgoing: &[],
+                        applied: &receipts,
+                    },
                 )?;
             }
         }
@@ -26990,7 +27517,8 @@ impl Database {
             std::slice::from_ref(selection),
             &[],
             true,
-            false,
+            crate::custody::erasure::PurgeReportShape::None,
+            Default::default(),
         )
         .map(|outcome| outcome.frontier)
     }
@@ -27003,7 +27531,8 @@ impl Database {
         selections: &[AuthoritativePurgeSelection],
         frontier_adoptions: &[IncomingPurgeFrontierAdoption],
         journal_outbound_delivery: bool,
-        report_requested: bool,
+        report_shape: crate::custody::erasure::PurgeReportShape,
+        instructions: purge_predicate::Instructions<'_>,
     ) -> Result<AuthoritativePurgeKernelOutcome> {
         let _operation = self.open_operation()?;
         let Some(persistence) = self.persistence.as_ref() else {
@@ -27049,7 +27578,7 @@ impl Database {
                 let prepared = self.prepare_authoritative_purge_set_batch(
                     selections,
                     queue_mutation_token,
-                    report_requested,
+                    report_shape,
                 )?;
 
                 // This is the last fallible in-memory preparation.  Its Drop
@@ -27082,26 +27611,60 @@ impl Database {
                             .map(|bytes| (key, bytes, lifecycle))
                     }))
                     .collect::<Result<Vec<_>>>()?;
+                // Statement 17a: key selections and node-local instructions share one frontier.
                 let purge_delivery_items = if journal_outbound_delivery {
-                    selections
+                    let keyed = selections
                         .iter()
-                        .enumerate()
-                        .map(|(ordinal, selection)| {
-                            let ordinal = u32::try_from(ordinal).map_err(|_| {
-                                Error::SyncError(
-                                    "authoritative purge batch has too many delivery items"
-                                        .to_string(),
-                                )
-                            })?;
-                            let item = AuthoritativePurgeDeliveryItem {
+                        .filter(|s| {
+                            !instructions
+                                .outgoing
+                                .iter()
+                                .any(|(table, _)| table == &s.table)
+                        })
+                        .map(|selection| {
+                            Ok(AuthoritativePurgeDeliveryItem {
                                 frontier,
-                                ordinal,
+                                ordinal: 0,
                                 table: selection.table.clone(),
                                 table_generation: selection.table_generation,
                                 natural_key: selection.natural_key.clone(),
-                                purged_lineage_roots: vec![selection.lineage_root.clone()],
-                            };
-                            let key = Self::authoritative_purge_delivery_key(frontier, ordinal);
+                                // Statement 17: carry all known copies on the existing purge lane.
+                                purged_lineage_roots: crate::custody::erasure::lineage_roots(
+                                    self,
+                                    &selection.table,
+                                    &selection.natural_key,
+                                    selection.table_generation,
+                                    &selection.lineage_root,
+                                )?,
+                                node_local_predicate: None,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let local = instructions.outgoing.iter().map(|(table, predicate)| {
+                        AuthoritativePurgeDeliveryItem {
+                            frontier,
+                            ordinal: 0,
+                            table: table.clone(),
+                            table_generation: 0,
+                            natural_key: NaturalKey {
+                                column: String::new(),
+                                value: Value::Null,
+                                rest: Vec::new(),
+                            },
+                            purged_lineage_roots: Vec::new(),
+                            node_local_predicate: Some(predicate.clone()),
+                        }
+                    });
+                    keyed
+                        .into_iter()
+                        .chain(local)
+                        .enumerate()
+                        .map(|(ordinal, mut item)| {
+                            item.ordinal = u32::try_from(ordinal).map_err(|_| {
+                                Error::SyncError("authoritative purge has too many items".into())
+                            })?;
+                            let key =
+                                Self::authoritative_purge_delivery_key(frontier, item.ordinal);
                             RedbPersistence::encode_config_value(&item).map(|bytes| (key, bytes))
                         })
                         .collect::<Result<Vec<_>>>()?
@@ -27159,10 +27722,31 @@ impl Database {
                             ]
                         })
                         .chain(prepared.graph_arrival_config_keys.iter().cloned())
+                        .chain(crate::custody::erasure::metadata_keys(
+                            self,
+                            &selections
+                                .iter()
+                                .map(|s| crate::custody::records::RowRef {
+                                    table: s.table.clone(),
+                                    key: s.natural_key.clone(),
+                                })
+                                .collect::<Vec<_>>(),
+                        )?)
                         .collect(),
                     lifecycle_records: lifecycle_records
                         .into_iter()
                         .map(|(key, bytes, _)| (key, bytes))
+                        // Statement 17a: applying an instruction and its one-time receipt is atomic.
+                        .chain(
+                            instructions
+                                .applied
+                                .iter()
+                                .map(|key| {
+                                    RedbPersistence::encode_config_value(&true)
+                                        .map(|bytes| (key.clone(), bytes))
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                        )
                         .collect(),
                     purge_delivery_items,
                     blob_purge,
@@ -27174,6 +27758,7 @@ impl Database {
                 };
 
                 persistence.commit_authoritative_purge(&persistence_projection)?;
+                *self.custody_cache.lock() = None;
 
                 // Durability succeeded.  Every operation below is a direct,
                 // prebuilt replacement; do not add validation, persistence,
@@ -30863,6 +31448,18 @@ impl Database {
                 config_values.extend(self.export_event_bus_config_values()?);
                 config_values.extend(self.export_trigger_config_values()?);
                 artifact.flush_encoded_config_values(config_values)?;
+                let custody = self
+                    .custody_metadata
+                    .lock()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>();
+                artifact.flush_encoded_config_values(
+                    custody
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.clone()))
+                        .collect(),
+                )?;
             }
         }
 
@@ -32402,6 +32999,22 @@ impl Database {
                 .pull_cursor = Some((source, watermark));
         }
         Ok(())
+    }
+
+    pub(crate) fn existing_sync_incarnation(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<Incarnation>> {
+        if let Some(incarnation) = self.sync_incarnations.lock().get(tenant.as_str()).copied() {
+            return Ok(Some(incarnation));
+        }
+        self.persistence
+            .as_ref()
+            .map(|p| p.load_config_value::<String>(&tenant.config_key("sync_incarnation")))
+            .transpose()?
+            .flatten()
+            .map(|s| Incarnation::from_hex(&s).ok_or_else(crate::custody::canonical::invalid))
+            .transpose()
     }
 
     sync_test_seam! {
@@ -35781,7 +36394,7 @@ impl Database {
     /// source state, rather than replaying historical parent versions, so an
     /// update made after a child was first committed cannot make the receiver
     /// observe the stale parent value.
-    pub(crate) fn dependency_complete_outbound_units(
+    pub(crate) fn ordinary_dependency_complete_outbound_units(
         &self,
         changes: ChangeSet,
         confirmed_frontier: Lsn,
@@ -36483,7 +37096,7 @@ impl Database {
     /// Return the durable raw DDL history rather than the ephemeral in-memory
     /// log when this database has persistence. A forced log gap must not turn
     /// old received schema into unprovable synthetic output after a move.
-    fn durable_ddl_history_for_provenance(&self) -> Result<Vec<(Lsn, DdlChange)>> {
+    pub(crate) fn durable_ddl_history_for_provenance(&self) -> Result<Vec<(Lsn, DdlChange)>> {
         if let Some(persistence) = &self.persistence {
             persistence.load_ddl_log()
         } else {
@@ -36755,6 +37368,22 @@ impl Database {
         source: &DdlProvenanceSource,
         destination_frontier: Option<Lsn>,
     ) -> Result<ChangeSet> {
+        // Statement 15: after restore verification regresses an edge's push
+        // frontier, an ordinary pull may have restated the hub's complete
+        // schema as a synthetic snapshot. If durable arrival evidence proves
+        // that the current snapshot is exactly that received schema, suppress
+        // it just like historical received DDL rather than refusing the rows
+        // that still need to be reoffered.
+        if destination_frontier.is_none()
+            && source.is_synthetic_snapshot()
+            && !self.received_ddl_arrivals.read().is_empty()
+            && self
+                .synthetic_snapshot_matches_held_received_schema(&changes.ddl, self.current_lsn())?
+        {
+            changes.ddl.clear();
+            changes.ddl_lsn.clear();
+            return Ok(changes);
+        }
         let entries = source.surviving_entries(&changes)?;
         let arrivals =
             self.received_ddl_arrival_marks(source, &changes.ddl, destination_frontier)?;
@@ -36800,7 +37429,6 @@ impl Database {
     /// public `ChangeSet`/`DdlChange` API.  Normal history reads immutable
     /// sidecars; the synthetic full snapshot has no historical DDL entry, so
     /// it deliberately reads the current authoritative generation instead.
-    #[cfg(feature = "sync-orchestration")]
     pub(crate) fn outbound_ddl_provenance(
         &self,
         changes: &ChangeSet,
@@ -37722,77 +38350,79 @@ impl Database {
     }
 
     sync_test_seam! {
-    /// Engine-internal apply primitive. Authenticated orchestration is
-    /// co-located in this crate so no downstream feature can reopen it.
-    ///
-    /// It carries no apply role, so it never adopts: a caller that has not
-    /// said which leg it is serving must not be handed the pull leg's
-    /// hub-adoption, which would let a pushed value displace the value already
-    /// held. Every production pull states its role through the sync client's
-    /// own entry point.
-    fn apply_changes(
-        &self,
-        changes: ChangeSet,
-        policies: &ConflictPolicies,
-    ) -> Result<ApplyResult> {
-        self.apply_changes_impl(
-            changes,
-            policies,
-            &HashMap::new(),
-            SyncAdoption::Continuing,
-            SyncApplyRole::HubPushApply,
-            None,
-            false,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            false,
-        )
-    }
-    }
+        /// Engine-internal apply primitive. Authenticated orchestration is
+        /// co-located in this crate so no downstream feature can reopen it.
+        ///
+        /// It carries no apply role, so it never adopts: a caller that has not
+        /// said which leg it is serving must not be handed the pull leg's
+        /// hub-adoption, which would let a pushed value displace the value already
+        /// held. Every production pull states its role through the sync client's
+        /// own entry point.
+        fn apply_changes(
+            &self,
+            changes: ChangeSet,
+            policies: &ConflictPolicies,
+        ) -> Result<ApplyResult> {
+            self.apply_changes_impl(
+                changes,
+                policies,
+                &HashMap::new(),
+                SyncAdoption::Continuing,
+                SyncApplyRole::HubPushApply,
+                None,
+                false,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                false,
+                None,
+    )
+        }
+        }
 
     sync_test_seam! {
-    #[cfg(any(test, feature = "test-seams"))]
-    /// Apply a synced changeset carrying explicit per-row arrival positions —
-    /// each row's ordering position on the node that ACCEPTED it, keyed by the
-    /// row's own `.lsn` (see [`Self::resolve_incoming_arrival`]). This is the
-    /// entry point the sync transport (`contextdb-server`) calls; every other
-    /// caller keeps using [`Self::apply_changes`], which is unaffected (an
-    /// empty `arrivals` map is the legacy behavior: each row's own `.lsn` IS
-    /// its arrival, exactly as before this concept existed).
-    ///
-    /// `adoption` distinguishes a continuing pull from the full re-fetch a
-    /// client issues right after its cursor's source changed — see
-    /// [`SyncAdoption`] for why the two arbitrate differently under
-    /// `ConflictPolicy::LatestWins`.
-    /// Engine-internal synced apply primitive. The public sync façade has no
-    /// way to supply either policy maps or progress state.
-    fn apply_synced_changes(
-        &self,
-        changes: ChangeSet,
-        policies: &ConflictPolicies,
-        arrivals: &HashMap<Lsn, Option<Lsn>>,
-        adoption: SyncAdoption,
-    ) -> Result<ApplyResult> {
-        self.apply_changes_impl(
-            changes,
-            policies,
-            arrivals,
-            adoption,
-            SyncApplyRole::HubPushApply,
-            None,
-            false,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            false,
-        )
-    }
-    }
+        #[cfg(any(test, feature = "test-seams"))]
+        /// Apply a synced changeset carrying explicit per-row arrival positions —
+        /// each row's ordering position on the node that ACCEPTED it, keyed by the
+        /// row's own `.lsn` (see [`Self::resolve_incoming_arrival`]). This is the
+        /// entry point the sync transport (`contextdb-server`) calls; every other
+        /// caller keeps using [`Self::apply_changes`], which is unaffected (an
+        /// empty `arrivals` map is the legacy behavior: each row's own `.lsn` IS
+        /// its arrival, exactly as before this concept existed).
+        ///
+        /// `adoption` distinguishes a continuing pull from the full re-fetch a
+        /// client issues right after its cursor's source changed — see
+        /// [`SyncAdoption`] for why the two arbitrate differently under
+        /// `ConflictPolicy::LatestWins`.
+        /// Engine-internal synced apply primitive. The public sync façade has no
+        /// way to supply either policy maps or progress state.
+        fn apply_synced_changes(
+            &self,
+            changes: ChangeSet,
+            policies: &ConflictPolicies,
+            arrivals: &HashMap<Lsn, Option<Lsn>>,
+            adoption: SyncAdoption,
+        ) -> Result<ApplyResult> {
+            self.apply_changes_impl(
+                changes,
+                policies,
+                arrivals,
+                adoption,
+                SyncApplyRole::HubPushApply,
+                None,
+                false,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                false,
+                None,
+    )
+        }
+        }
 
     /// The hub applying a pushed unit it cannot receipt — an unidentified peer
     /// carries no node identity to receipt against. It is still a PUSH: the
@@ -37912,51 +38542,53 @@ impl Database {
             Some(tenant_id),
             received_ddl,
             schema_publication_held,
+            None,
         )
     }
 
     sync_test_seam! {
-    #[cfg(any(test, feature = "test-seams"))]
-    /// Engine-internal authenticated push apply primitive.
-    fn apply_synced_changes_with_receipt(
-        &self,
-        changes: ChangeSet,
-        policies: &ConflictPolicies,
-        arrivals: &HashMap<Lsn, Option<Lsn>>,
-        adoption: SyncAdoption,
-        receipt: SyncApplyReceipt,
-    ) -> Result<ApplyResult> {
-        let result =
-            self.apply_changes_impl(
-                changes,
-                policies,
-                arrivals,
-                adoption,
-                SyncApplyRole::HubPushApply,
-                Some(receipt.clone()),
-                receipt.dependency_complete,
-                None,
-                None,
-                &[],
-                None,
-                None,
-                false,
-            )?;
-        if self.persistence.is_none() {
-            let key = Self::applied_push_watermark_node_incarnation_key(
-                &receipt.tenant_id,
-                &receipt.node_id,
-                receipt.incarnation,
-            );
-            self.in_memory_applied_push_watermarks
-                .lock()
-                .entry(key)
-                .and_modify(|current| *current = (*current).max(receipt.source_lsn))
-                .or_insert(receipt.source_lsn);
+        #[cfg(any(test, feature = "test-seams"))]
+        /// Engine-internal authenticated push apply primitive.
+        fn apply_synced_changes_with_receipt(
+            &self,
+            changes: ChangeSet,
+            policies: &ConflictPolicies,
+            arrivals: &HashMap<Lsn, Option<Lsn>>,
+            adoption: SyncAdoption,
+            receipt: SyncApplyReceipt,
+        ) -> Result<ApplyResult> {
+            let result =
+                self.apply_changes_impl(
+                    changes,
+                    policies,
+                    arrivals,
+                    adoption,
+                    SyncApplyRole::HubPushApply,
+                    Some(receipt.clone()),
+                    receipt.dependency_complete,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    false,
+                    None,
+    )?;
+            if self.persistence.is_none() {
+                let key = Self::applied_push_watermark_node_incarnation_key(
+                    &receipt.tenant_id,
+                    &receipt.node_id,
+                    receipt.incarnation,
+                );
+                self.in_memory_applied_push_watermarks
+                    .lock()
+                    .entry(key)
+                    .and_modify(|current| *current = (*current).max(receipt.source_lsn))
+                    .or_insert(receipt.source_lsn);
+            }
+            Ok(result)
         }
-        Ok(result)
-    }
-    }
+        }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_authenticated_received_changes_with_receipt_and_lineages(
@@ -37998,6 +38630,7 @@ impl Database {
             Some(&receipt.tenant_id),
             received_ddl,
             false,
+            None,
         );
         let result = match applied {
             Ok(mut result) => {
@@ -38039,6 +38672,43 @@ impl Database {
         Ok(result)
     }
 
+    pub(crate) fn apply_delivery_prepared(
+        &self,
+        changes: ChangeSet,
+        mut receipt: SyncApplyReceipt,
+        hub: &str,
+        lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
+        received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
+        prepare: &mut crate::custody::preparation::CommitPreparation<'_>,
+    ) -> Result<ApplyResult> {
+        // Statements 9/11/14: preserve normal authenticated apply metadata, but
+        // hold progress until the custody batch has adjudicated every sibling.
+        receipt.source_lsn = self
+            .persisted_sync_applied_push_watermark_for_node_incarnation(
+                &receipt.tenant_id,
+                &receipt.node_id,
+                receipt.incarnation,
+            )?
+            .unwrap_or(Lsn(0));
+        let result = self.apply_changes_impl(
+            changes,
+            &Self::declared_sync_policies(true),
+            &HashMap::new(),
+            SyncAdoption::Continuing,
+            SyncApplyRole::HubPushApply,
+            Some(receipt.clone()),
+            true,
+            None,
+            Some(hub),
+            lineages,
+            Some(&receipt.tenant_id),
+            received_ddl,
+            false,
+            Some(prepare),
+        )?;
+        Ok(result)
+    }
+
     fn validate_authenticated_received_plugin_output(
         expected: &ChangeSet,
         actual: &ChangeSet,
@@ -38073,6 +38743,162 @@ impl Database {
         Ok(())
     }
 
+    // Statements 5/6: use authenticated arrival provenance to distinguish this
+    // node's own declaration from policy it merely adopted and relays.
+    fn locally_declared_custody_policy(&self, table: &str) -> bool {
+        let arrivals = self.received_ddl_arrivals.read();
+        let mut ordinals = HashMap::<Lsn, u32>::new();
+        self.ddl_log.read().iter().any(|(lsn, change)| {
+            let ordinal = ordinals.entry(*lsn).or_default();
+            let received = arrivals.contains_key(&(*lsn, *ordinal));
+            *ordinal += 1;
+            if received {
+                return false;
+            }
+            let (
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            ) = match change {
+                DdlChange::CreateTable {
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                }
+                | DdlChange::AlterTable {
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                } => (
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                ),
+                _ => return false,
+            };
+            if name != table {
+                return false;
+            }
+            let m = rough_sync_table_meta(
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            );
+            m.sync_direction.is_some()
+                || m.conflict_policy.is_some()
+                || m.immutable
+                || m.default_ttl_seconds.is_some()
+                || m.history_policy.is_some()
+                || m.delivery_manifest_tables.is_some()
+                || m.edge_discard.is_some()
+        })
+    }
+
+    fn arriving_policy_refusals(&self, changes: &ChangeSet) -> Result<HashMap<String, Conflict>> {
+        let mut refused = HashMap::new();
+        for change in &changes.ddl {
+            let (
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            ) = match change {
+                DdlChange::CreateTable {
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                }
+                | DdlChange::AlterTable {
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                } => (
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                ),
+                _ => continue,
+            };
+            let incoming = rough_sync_table_meta(
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            );
+            let mut refusal = crate::custody::policy::check_binding(self, name, &incoming)
+                .and_then(|()| crate::custody::policy::check_declared(self, name, &incoming))
+                .err();
+            if refusal.is_none() {
+                // Statement 6: preserve installer-owned DDL guards and silent-clause
+                // merge after binding/declaration admission, using the existing owners.
+                let installer_owned = crate::executor::ENGINE_OWNED_LEDGER_TABLES
+                    .contains(&name.as_str())
+                    || crate::executor::is_hub_refereed_sync_conflict_table(name);
+                if !installer_owned
+                    && self.locally_declared_custody_policy(name)
+                    && let Some(local) = self.table_meta(name)
+                    && let Some(clause) = crate::custody::policy::differing_clause(
+                        &crate::custody::policy::from_meta(&local),
+                        &crate::custody::policy::from_meta(&incoming),
+                    )
+                {
+                    // The existing invalid-policy preflights must still refuse an
+                    // impossible promise before this table is filtered from apply.
+                    let projected = HashMap::from([(name.clone(), local)]);
+                    refuse_undeliverable_promise_sync_ddl(&projected, change)?;
+                    refuse_keyless_sync_safe_sync_ddl(&projected, change)?;
+                    refuse_reclaimed_history_sync_ddl(change)?;
+                    refusal = Some(Error::DeclaredPolicyPreserved {
+                        table: name.clone(),
+                        clause: clause.into(),
+                    });
+                }
+            }
+            if let Some(error) = refusal {
+                refused.insert(
+                    name.clone(),
+                    Conflict {
+                        natural_key: NaturalKey::single("table".into(), Value::Text(name.clone())),
+                        resolution: ConflictPolicy::ServerWins,
+                        reason: Some(error.to_string()),
+                        table: None,
+                        mutation_kind: None,
+                        winning_author_node_id: None,
+                        hub_acceptance_position: None,
+                        refusal_cause: None,
+                    },
+                );
+            }
+        }
+        Ok(refused)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn apply_changes_impl(
         &self,
@@ -38089,6 +38915,7 @@ impl Database {
         lineage_tenant: Option<&TenantId>,
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         schema_publication_held: bool,
+        delivery_prepare: Option<&mut crate::custody::preparation::CommitPreparation<'_>>,
     ) -> Result<ApplyResult> {
         // Received table DDL is serialized with SQL statements too. It does
         // not inherit the permissive local callback path: malformed or
@@ -38174,6 +39001,53 @@ impl Database {
             ));
         }
 
+        // Statements 5/6: refuse only the affected table after authentication,
+        // preserving each retained DDL entry's original signed occurrence.
+        let refused = self.arriving_policy_refusals(&changes)?;
+        let keep = changes
+            .ddl
+            .iter()
+            .map(|ddl| match ddl {
+                DdlChange::CreateTable { name, .. }
+                | DdlChange::AlterTable { name, .. }
+                | DdlChange::DropTable { name } => !refused.contains_key(name),
+                _ => true,
+            })
+            .collect::<Vec<_>>();
+        let filtered_received = received_ddl.map(|context| {
+            let mut context = context.clone();
+            context.entries = context
+                .entries
+                .into_iter()
+                .zip(&keep)
+                .filter_map(|(entry, keep)| keep.then_some(entry))
+                .collect();
+            context
+        });
+        let received_ddl = filtered_received.as_ref();
+        changes.ddl = changes
+            .ddl
+            .into_iter()
+            .zip(&keep)
+            .filter_map(|(ddl, keep)| keep.then_some(ddl))
+            .collect();
+        changes.ddl_lsn = changes
+            .ddl_lsn
+            .into_iter()
+            .zip(&keep)
+            .filter_map(|(lsn, keep)| keep.then_some(lsn))
+            .collect();
+        changes.rows.retain(|row| !refused.contains_key(&row.table));
+        changes
+            .vectors
+            .retain(|vector| !refused.contains_key(&vector.index.table));
+        let add_refusals = |mut result: ApplyResult| {
+            let mut conflicts = refused.values().cloned().collect::<Vec<_>>();
+            conflicts.sort_by(|a, b| a.reason.cmp(&b.reason));
+            result.conflicts.extend(conflicts);
+            result
+        };
+
         let preflight_fresh_creator_deletes = self.authenticated_fresh_creator_deletes(
             &changes.rows,
             arrivals,
@@ -38195,6 +39069,7 @@ impl Database {
                     dependency_complete,
                     terminal_refusal_context,
                     hub_local_author,
+                    delivery_prepare,
                     || {
                         self.check_disk_budget("sync_pull")?;
                         self.preflight_sync_apply_memory(&changes, policies)?;
@@ -38223,7 +39098,8 @@ impl Database {
                     },
                     || Ok(()),
                 )
-                .map(Into::into);
+                .map(Into::into)
+                .map(add_refusals);
         }
 
         self.check_disk_budget("sync_pull")?;
@@ -38253,6 +39129,9 @@ impl Database {
         let _sync_trigger_gate = self.enter_sync_apply_trigger_gate_bypass();
 
         let lsn_groups = changes.clone().split_by_data_lsn();
+        if delivery_prepare.is_some() && !dependency_complete {
+            return Err(crate::custody::canonical::invalid());
+        }
         if lsn_groups.len() > 1 && !dependency_complete {
             if receipt.is_some() {
                 return Err(Error::SyncError(
@@ -38278,13 +39157,14 @@ impl Database {
                     None,
                     lineages,
                     lineage_tenant.is_some(),
+                    None,
                 )?;
                 total.applied_rows += result.applied_rows;
                 total.skipped_rows += result.skipped_rows;
                 total.conflicts.extend(result.conflicts);
                 total.new_lsn = result.new_lsn;
             }
-            return Ok(total);
+            return Ok(add_refusals(total));
         }
 
         self.apply_changes_single_lsn_group(
@@ -38306,7 +39186,9 @@ impl Database {
             hub_local_author,
             lineages,
             lineage_tenant.is_some(),
+            delivery_prepare,
         )
+        .map(add_refusals)
     }
 
     fn validate_public_changeset_ddl_lsn(changes: &ChangeSet) -> Result<()> {
@@ -38487,6 +39369,7 @@ impl Database {
         hub_local_author: Option<&str>,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         stage_verified_lineages: bool,
+        delivery_prepare: Option<&mut crate::custody::preparation::CommitPreparation<'_>>,
     ) -> Result<ApplyResult> {
         let mut tx = self.begin()?;
         let _local_schema_bypass = self.enter_sync_apply_local_schema_bypass(tx);
@@ -40768,6 +41651,7 @@ impl Database {
             terminal_refusal_context,
             terminal_marker_clears,
             hub_local_author.is_some(),
+            delivery_prepare,
         )?;
         let committed_lsn = self.current_lsn();
         result.new_lsn = committed_lsn;
@@ -40791,6 +41675,7 @@ impl Database {
         terminal_refusal_context: Option<&TerminalRefusalPullContext>,
         terminal_marker_clears: Vec<(String, NaturalKey)>,
         sync_trigger_derived_rows_are_local: bool,
+        delivery_prepare: Option<&mut crate::custody::preparation::CommitPreparation<'_>>,
     ) -> Result<()> {
         // The transaction-manager callback publishes accepted delete
         // provenance while it still holds the commit lock, after relational
@@ -40803,6 +41688,7 @@ impl Database {
             sync_pull_trigger_audit_projection,
             Some(accepted_sync_tombstones),
             sync_trigger_derived_rows_are_local,
+            delivery_prepare,
         )?;
         if !accepted_author_entries.is_empty() {
             self.accepted_sync_row_authors.write().extend(
@@ -41013,7 +41899,7 @@ impl Database {
         }
     }
 
-    fn dependency_unit_refusal_conflicts(
+    pub(crate) fn dependency_unit_refusal_conflicts(
         &self,
         rows: &[RowChange],
         policies: &ConflictPolicies,
@@ -41261,6 +42147,26 @@ impl Database {
 
     /// The visible row carrying a whole sync identity, matched on every key
     /// column — the composite-aware sibling of [`Self::row_id_for_natural_key`].
+    // Statement 19 and existing row scopes: metadata follows the root's visibility.
+    pub(crate) fn delivery_root_visible(&self, table: &str, key: &NaturalKey) -> Result<bool> {
+        if self.access_is_admin() {
+            return Ok(true);
+        }
+        let snapshot = self.snapshot_for_read();
+        if self.table_meta(table).is_none() {
+            return Ok(false);
+        }
+        // Statements 14/19: inspect the named root through its covering key
+        // index; scoped metadata must not scan application rows per receipt.
+        let Some(row) = self.visible_row_by_natural_key(table, key, snapshot, &HashSet::new())?
+        else {
+            return Ok(false);
+        };
+        Ok(!self
+            .filter_rows_for_read(table, vec![row], snapshot)?
+            .is_empty())
+    }
+
     fn row_id_for_natural_key_full(
         &self,
         table: &str,
@@ -44329,7 +45235,7 @@ fn ddl_change_from_create_table(ct: &CreateTable) -> DdlChange {
     }
 }
 
-fn ddl_change_from_meta(name: &str, meta: &TableMeta) -> DdlChange {
+pub(crate) fn ddl_change_from_meta(name: &str, meta: &TableMeta) -> DdlChange {
     ddl_change_from_meta_excluding(name, meta, &HashSet::new())
 }
 
@@ -45460,7 +46366,39 @@ fn rough_sync_table_meta(
         history_policy: constraints
             .iter()
             .find_map(|constraint| constraint_declares_history_policy(constraint)),
+        delivery_manifest_tables: None,
+        edge_discard: None,
     };
+    // Statements 5/6: decode policy clauses with the same grammar as DECLARE.
+    for constraint in constraints {
+        if let Ok(contextdb_parser::Statement::DeclareTenantTablePolicy(p)) =
+            contextdb_parser::parse(&format!(
+                "DECLARE TENANT TABLE POLICY __incoming_policy {constraint}"
+            ))
+        {
+            if p.sync_direction.is_some() {
+                meta.sync_direction = p.sync_direction;
+            }
+            if p.conflict_policy.is_some() {
+                meta.conflict_policy = p.conflict_policy;
+            }
+            meta.immutable |= p.immutable;
+            if let Some(r) = p.retain {
+                meta.default_ttl_seconds = Some(r.duration_seconds);
+                meta.retain_declared_unit = Some(r.declared_unit);
+                meta.sync_safe = r.sync_safe;
+            }
+            if p.history.is_some() {
+                meta.history_policy = p.history;
+            }
+            if p.delivery_manifest_tables.is_some() {
+                meta.delivery_manifest_tables = p.delivery_manifest_tables;
+            }
+            if p.edge_discard.is_some() {
+                meta.edge_discard = p.edge_discard;
+            }
+        }
+    }
     meta.indexes = crate::executor::auto_indexes_for_table_meta(&meta);
     meta
 }
@@ -45730,6 +46668,27 @@ fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {
 
 fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
     let mut constraints = Vec::new();
+    // Statements 5/6/18: preserve declared custody policy in schema transport and inspection.
+    if let Some(tables) = &meta.delivery_manifest_tables {
+        constraints.push(format!(
+            "DELIVERY MANIFEST OVER {}",
+            tables
+                .iter()
+                .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(mode) = meta.edge_discard {
+        constraints.push(format!(
+            "EDGE DISCARD {}",
+            match mode {
+                contextdb_core::EdgeDiscardMode::Never => "NEVER",
+                contextdb_core::EdgeDiscardMode::AfterOutcome => "AFTER OUTCOME",
+                contextdb_core::EdgeDiscardMode::Always => "ALWAYS",
+            }
+        ));
+    }
 
     if meta.immutable {
         constraints.push("IMMUTABLE".to_string());
@@ -45879,6 +46838,27 @@ fn retain_clause_from_meta(meta: &TableMeta, ttl_seconds: u64) -> String {
 
 pub(crate) fn retain_and_propagate_clauses_from_meta(meta: &TableMeta) -> Vec<String> {
     let mut clauses = Vec::new();
+    // Statements 5/6/18: preserve declared custody policy in schema transport and inspection.
+    if let Some(tables) = &meta.delivery_manifest_tables {
+        clauses.push(format!(
+            "DELIVERY MANIFEST OVER {}",
+            tables
+                .iter()
+                .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(mode) = meta.edge_discard {
+        clauses.push(format!(
+            "EDGE DISCARD {}",
+            match mode {
+                contextdb_core::EdgeDiscardMode::Never => "NEVER",
+                contextdb_core::EdgeDiscardMode::AfterOutcome => "AFTER OUTCOME",
+                contextdb_core::EdgeDiscardMode::Always => "ALWAYS",
+            }
+        ));
+    }
 
     if let Some(ttl_seconds) = meta.default_ttl_seconds {
         clauses.push(retain_clause_from_meta(meta, ttl_seconds));

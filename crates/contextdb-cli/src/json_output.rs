@@ -142,6 +142,9 @@ pub(crate) fn read_failure_kind_wire_word(kind: ReadFailureKind) -> &'static str
         ReadFailureKind::OperationAlreadyCompleted => "operation_already_completed",
         ReadFailureKind::OwnerRouteUnsupported => "owner_route_unsupported",
         ReadFailureKind::DeclaredPrincipalRefused => "declared_principal_refused",
+        ReadFailureKind::ConstrainedHandleInspectionRefused => {
+            "constrained_handle_inspection_refused"
+        }
     }
 }
 

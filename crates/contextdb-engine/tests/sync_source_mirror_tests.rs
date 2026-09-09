@@ -281,7 +281,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .find("let schema_read = db.enter_outbound_sync_schema_read();")
         .expect("pull enters outbound schema lease");
     let server_extract = server[server_enter..]
-        .find("db.checked_changes_since_with_arrivals(request.since_lsn)?")
+        .find("db.checked_changes_since_with_arrivals(scan_since)?")
         .map(|offset| server_enter + offset)
         .expect("pull extracts under lease");
     let server_provenance = server[server_extract..]

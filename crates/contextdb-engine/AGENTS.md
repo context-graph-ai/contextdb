@@ -83,3 +83,17 @@ Rules that hold across all of it:
 
 The user-facing contract these modules implement is `docs/cli.md`; when behavior and that page
 disagree, one of them is a bug, and which one is a product question, not a local decision.
+
+## Tenant policy and event custody
+
+`custody/policy.rs` and `custody/preparation.rs` own hub declarations, authenticated bindings, and
+the shared row/metadata commit preparation. `custody/canonical.rs` owns whole-row BLAKE3 encoding;
+`custody/delivery.rs`, `records.rs`, and `inspection.rs` own manifests, terminal outcomes, and reads.
+`custody/incarnation.rs` verifies restore witnesses on ordinary status. Physical erasure lives in
+`database.rs`, `database/discard.rs`, and `database/purge_predicate.rs`; no unrelated persistence
+opening carries a custody fault seam. SQL admin inspection uses the existing read kernel and budgets.
+
+Change wire vocabulary in the engine's `protocol.rs` and `subjects.rs`; the server re-exports it.
+Only bind and outcome-fetch add request kinds. Run the server transport-boundary and exact source
+mirror audits whenever wire-carrying code changes; the transport and staging mirror files must
+remain byte-identical. Keep protocol/ALPN constants on the shared integration train.

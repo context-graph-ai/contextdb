@@ -7,9 +7,12 @@
 //! (print and exit) so the test never depends on a long-lived socket.
 
 use std::process::{Command, Stdio};
+use tempfile::tempdir;
 
 #[test]
 fn show_ticket_json_emits_structured_object() {
+    let root = tempdir().expect("temporary ticket directory");
+    let ticket_file = root.path().join("enrollment.ticket");
     let out = Command::new(env!("CARGO_BIN_EXE_contextdb-server"))
         .args([
             "--db-path",
@@ -18,6 +21,8 @@ fn show_ticket_json_emits_structured_object() {
             "acme",
             "--show-ticket",
             "--json",
+            "--ticket-file",
+            ticket_file.to_str().expect("UTF-8 temporary path"),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -46,6 +51,11 @@ fn show_ticket_json_emits_structured_object() {
         .and_then(|t| t.as_str())
         .unwrap_or_default();
     assert!(!ticket.is_empty(), "enrollment_ticket must be present: {v}");
+    assert_eq!(
+        std::fs::read_to_string(&ticket_file).expect("ticket file exists"),
+        ticket,
+        "ticket-only JSON output keeps the requested ticket-file publication"
+    );
 
     assert_eq!(
         v.get("tenant_id").and_then(|t| t.as_str()),

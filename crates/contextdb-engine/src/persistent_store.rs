@@ -57,6 +57,7 @@ impl WriteSetApplicator for PersistentCompositeStore {
                     ws,
                     &stage.change_log_entries,
                     FlushDataOptions {
+                        local_erasure: None,
                         sink_events: &stage.sink_events,
                         trigger_audits: &stage.trigger_audits,
                         schema_ddl: SchemaDdlPersistence {
@@ -104,10 +105,13 @@ impl WriteSetApplicator for PersistentCompositeStore {
             Some(&table_meta),
             deleted_rows.as_ref(),
         );
+        let erasure_stages = self.inner.local_erasure_stages.lock();
+        let erasure = ws.commit_lsn.and_then(|lsn| erasure_stages.get(&lsn));
         self.persistence.flush_data_with_logs_and_sink_events(
             ws,
             &log_entries,
             FlushDataOptions {
+                local_erasure: erasure.map(|stage| &stage.durable),
                 sink_events: sink_events.as_deref().map(Vec::as_slice).unwrap_or(&[]),
                 trigger_audits: &trigger_audits,
                 schema_ddl: SchemaDdlPersistence {
@@ -122,6 +126,7 @@ impl WriteSetApplicator for PersistentCompositeStore {
                 received_schema: None,
             },
         )?;
+        drop(erasure_stages);
         self.inner.apply_exact_with_log_entries(ws, log_entries)
     }
 

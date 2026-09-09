@@ -258,15 +258,18 @@ impl EventBusState {
         &self,
         queue_mutation_token: AuthoritativePurgeQueueMutationToken,
         durable_sink_names: BTreeSet<String>,
-        table: &str,
-        row_ids: &HashSet<RowId>,
+        selections: &BTreeMap<String, HashSet<RowId>>,
     ) -> PreparedAuthoritativePurgeEventBusPublication {
         let mut sink_names = durable_sink_names;
         sink_names.extend(self.queues.lock().keys().cloned());
         let mut queues = self.queues.lock().clone();
         for sink in &sink_names {
             let entries = queues.entry(sink.clone()).or_default();
-            entries.retain(|entry| entry.event.table != table || !row_ids.contains(&entry.row_id));
+            entries.retain(|entry| {
+                !selections
+                    .get(&entry.event.table)
+                    .is_some_and(|ids| ids.contains(&entry.row_id))
+            });
         }
         PreparedAuthoritativePurgeEventBusPublication {
             queues,

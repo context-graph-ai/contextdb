@@ -349,6 +349,10 @@ impl RequestContext {
         }
         let first_observation = !state.telemetry.cancellation_observed;
         state.telemetry.cancellation_observed = true;
+        #[allow(
+            unused_variables,
+            reason = "The same production measurement also feeds the optional read probe"
+        )]
         let completed = state.telemetry.work_units;
         drop(state);
         #[cfg(not(feature = "test-seams"))]
@@ -399,6 +403,10 @@ impl RequestContext {
         if let Some(cancelled) = self.pending_failure() {
             return Err(cancelled);
         }
+        #[allow(
+            unused_variables,
+            reason = "The same production measurement also feeds the optional read probe"
+        )]
         let (completed_work, completed_source, started_ms) = {
             let state = self.state();
             if state.telemetry.work_units >= self.limits.work {
@@ -476,6 +484,10 @@ impl RequestContext {
         if let Some(cancelled) = self.pending_failure() {
             return Err(cancelled);
         }
+        #[allow(
+            unused_variables,
+            reason = "The same production measurement also feeds the optional read probe"
+        )]
         let (completed_work, started_ms) = {
             let state = self.state();
             if state.telemetry.work_units >= self.limits.work {
@@ -530,6 +542,10 @@ impl RequestContext {
         self.check_final_boundary()?;
         let requested_u64 = u64::try_from(requested)
             .map_err(|_| Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory))?;
+        #[allow(
+            unused_variables,
+            reason = "The same production measurement also feeds the optional read probe"
+        )]
         let held = {
             let state = self.state();
             let held = u64::try_from(state.memory.bytes())
@@ -549,6 +565,10 @@ impl RequestContext {
         if let Some(probe) = self.probe() {
             probe.before_temporary_reservation(source, requested_u64, held);
         }
+        #[allow(
+            unused_variables,
+            reason = "The same production measurement also feeds the optional read probe"
+        )]
         let held_after = {
             let mut state = self.state();
             // Named, so a store-budget refusal tells the operator WHICH part of
@@ -7001,7 +7021,10 @@ fn ensure_supported_plan(plan: &PhysicalPlan) -> std::result::Result<(), Bounded
         PhysicalPlan::ShowMemoryLimit
         | PhysicalPlan::ShowDiskLimit
         | PhysicalPlan::ShowSyncConflictPolicy
-        | PhysicalPlan::ShowVectorIndexes => Ok(()),
+        | PhysicalPlan::ShowVectorIndexes
+        | PhysicalPlan::ShowTenantTablePolicy { .. }
+        | PhysicalPlan::ShowSyncBindings
+        | PhysicalPlan::ShowDeliveryOutcomes(_) => Ok(()),
         PhysicalPlan::Pipeline(plans) => {
             for plan in plans {
                 ensure_supported_plan(plan)?;
@@ -7196,7 +7219,10 @@ fn build_kernel_with_ctes<'plan>(
         PhysicalPlan::ShowMemoryLimit
         | PhysicalPlan::ShowDiskLimit
         | PhysicalPlan::ShowSyncConflictPolicy
-        | PhysicalPlan::ShowVectorIndexes => build_store_state(db, plan, context),
+        | PhysicalPlan::ShowVectorIndexes
+        | PhysicalPlan::ShowTenantTablePolicy { .. }
+        | PhysicalPlan::ShowSyncBindings
+        | PhysicalPlan::ShowDeliveryOutcomes(_) => build_store_state(db, plan, context),
         PhysicalPlan::Project { input, columns } => {
             let input =
                 build_kernel_with_ctes(db, input, Arc::clone(&params), snapshot, ctes, context)?;

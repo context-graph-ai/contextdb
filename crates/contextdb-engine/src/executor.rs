@@ -198,6 +198,11 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// session has to be able to run them, which is why they arrive here
     /// rather than being refused as "not a SELECT". A target with no engine
     /// state to describe keeps the old refusal.
+    fn delivery_metadata(
+        &self,
+        request: crate::direct_file_reader::DirectMetadataRequest,
+    ) -> Result<crate::direct_file_reader::DirectMetadataBody>;
+
     fn store_state_answer(&self, plan: &PhysicalPlan) -> Result<QueryResult> {
         let _ = plan;
         Err(Error::PlanError(
@@ -740,6 +745,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         continuation: Option<&str>,
+        cancellation: &OwnerReadCancellation,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectMetadataResponse,
         crate::direct_file_reader::DirectFileReaderError,
@@ -921,6 +927,13 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
         Database::bounded_read_accountant(self)
+    }
+
+    fn delivery_metadata(
+        &self,
+        request: crate::direct_file_reader::DirectMetadataRequest,
+    ) -> Result<crate::direct_file_reader::DirectMetadataBody> {
+        crate::custody::inspection::metadata(self, request)
     }
 
     fn store_state_answer(&self, plan: &PhysicalPlan) -> Result<QueryResult> {
@@ -1609,11 +1622,20 @@ impl ReadExecutionTarget for Database {
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         continuation: Option<&str>,
+        cancellation: &OwnerReadCancellation,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectMetadataResponse,
         crate::direct_file_reader::DirectFileReaderError,
     > {
-        crate::read_image::project_metadata(self, request, image, limits, clock, continuation)
+        crate::read_image::project_metadata(
+            self,
+            request,
+            image,
+            limits,
+            clock,
+            continuation,
+            cancellation,
+        )
     }
 }
 
@@ -1975,6 +1997,23 @@ fn execute_plan_once(
     tx: Option<TxId>,
 ) -> Result<QueryResult> {
     match plan {
+        // Statements 1/2/4/19: the SQL doors read and write the canonical authority journal.
+        PhysicalPlan::DeclareTenantTablePolicy(p) => {
+            crate::custody::policy::declare(db, &p.declaration)
+        }
+        PhysicalPlan::ShowTenantTablePolicy { table } => {
+            crate::custody::policy::show_policy(db, table.as_deref())
+        }
+        PhysicalPlan::ShowSyncBindings => crate::custody::policy::show_bindings(db),
+        PhysicalPlan::ShowDeliveryOutcomes(p) => crate::custody::inspection::show(
+            db,
+            &p.query.table,
+            p.query.where_clause.as_ref(),
+            p.query.limit.map(|n| n as usize),
+            p.query.offset as usize,
+            params,
+        ),
+        PhysicalPlan::Discard(p) => exec_discard(db, p, params, tx),
         PhysicalPlan::CreateTable(p) => {
             require_admin_for_create_table(db)?;
             db.check_disk_budget("CREATE TABLE")?;
@@ -2144,6 +2183,8 @@ fn execute_plan_once(
                 primary_key_columns: p.primary_key_columns.clone(),
                 conflict_policy: p.conflict_policy,
                 history_policy: p.history,
+                delivery_manifest_tables: p.delivery_manifest_tables.clone(),
+                edge_discard: p.edge_discard,
             };
             // The policy half of the reserved-name door (the column-shape
             // half already ran above): an EXPLICIT axis this local CREATE
@@ -2152,6 +2193,8 @@ fn execute_plan_once(
             // sync-apply doors judge the identical question -- silence is
             // still tolerated (a legacy pre-declaration root, or this file's
             // own reconcile-heal tests, construct exactly that shape).
+            // Statement 5: validate before publishing any local CREATE.
+            crate::custody::policy::check_binding(db, &p.name, &meta)?;
             refuse_engine_owned_policy_axes(&p.name, &meta)?;
             // The narrower SYNC-CONFLICT-only counterpart of the axis door
             // above, for the five hub-refereed work-ledger tables that door
@@ -2985,6 +3028,8 @@ fn execute_plan_once(
                 }
             }
             if let Some((old_meta, projected_meta)) = metadata_only_projection {
+                // Statement 5: ALTER must retain every bound clause.
+                crate::custody::policy::check_binding(db, &p.table, &projected_meta)?;
                 db.allocate_ddl_lsn(|lsn| {
                     db.table_meta(&p.table)
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
@@ -4634,6 +4679,60 @@ fn exec_insert(
     Ok(QueryResult::empty_with_affected(rows_affected))
 }
 
+// Statement 17b: mode and direction refusal precede all selection sources.
+fn exec_discard(
+    db: &Database,
+    p: &contextdb_planner::DiscardPlan,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+) -> Result<QueryResult> {
+    let txid = tx.ok_or_else(|| Error::Other("missing transaction for discard".into()))?;
+    let mut names = BTreeSet::new();
+    for selection in &p.selections {
+        if !names.insert(&selection.table) {
+            return Err(Error::SchemaInvalid {
+                reason: format!("table {} is listed twice", selection.table),
+            });
+        }
+        db.discard_policy(&selection.table)?;
+        let meta = db
+            .table_meta(&selection.table)
+            .ok_or_else(|| Error::TableNotFound(selection.table.clone()))?;
+        if meta.natural_key_column.is_none()
+            && meta.primary_key_columns.is_empty()
+            && !meta.columns.iter().any(|c| c.primary_key)
+        {
+            return Err(Error::NotSyncEligible(selection.table.clone()));
+        }
+    }
+    let snapshot = db.snapshot_for_read();
+    let mut tables = Vec::new();
+    for selection in &p.selections {
+        let rows = db.scan_in_tx_raw(txid, &selection.table, snapshot)?;
+        let rows = db.filter_rows_for_read(&selection.table, rows, snapshot)?;
+        let predicate = selection
+            .where_clause
+            .as_ref()
+            .map(|e| resolve_in_subqueries(db, e, params, tx))
+            .transpose()?;
+        let matched = filter_rows_by_predicate(rows, predicate.as_ref(), params)?;
+        let meta = db
+            .table_meta(&selection.table)
+            .ok_or_else(|| Error::TableNotFound(selection.table.clone()))?;
+        let mut pinned = Vec::new();
+        for row in matched {
+            db.assert_row_write_allowed(&selection.table, row.row_id, &row.values, snapshot)?;
+            pinned.push((
+                natural_key_from_row_values(&meta, &row.values)
+                    .ok_or_else(|| Error::NotSyncEligible(selection.table.clone()))?,
+                row.row_id,
+            ));
+        }
+        tables.push((selection.table.clone(), pinned));
+    }
+    db.stage_discard(txid, &tables)
+}
+
 fn exec_purge(
     db: &Database,
     p: &PurgePlan,
@@ -4649,35 +4748,61 @@ fn exec_purge(
         return Err(Error::PurgeRequiresStandaloneExecution);
     }
 
+    // Statement 17a: every table is validated before any selection source runs.
+    let mut names = BTreeSet::new();
+    let mut node_local = Vec::new();
+    for selection in &p.selections {
+        if !names.insert(&selection.table) {
+            return Err(Error::SchemaInvalid {
+                reason: format!("table {} is listed twice", selection.table),
+            });
+        }
+        let meta = db
+            .table_meta(&selection.table)
+            .ok_or_else(|| Error::TableNotFound(selection.table.clone()))?;
+        if effective_sync_direction(&meta) == SyncDirection::None {
+            node_local.push((
+                selection.table.clone(),
+                crate::database::purge_predicate::NodeLocalPredicate::capture(
+                    selection.where_clause.as_ref(),
+                    params,
+                )?,
+            ));
+        }
+        if meta.natural_key_column.is_none()
+            && meta.primary_key_columns.is_empty()
+            && !meta.columns.iter().any(|c| c.primary_key)
+        {
+            return Err(Error::SchemaInvalid {
+                reason: format!("table {} has no declared erasure key", selection.table),
+            });
+        }
+    }
     let snapshot = db.snapshot_for_read();
-    let rows = db.scan(&p.table, snapshot)?;
-    let resolved_where = p
-        .where_clause
-        .as_ref()
-        .map(|expr| resolve_in_subqueries(db, expr, params, None))
-        .transpose()?;
-    let matched = filter_rows_by_predicate(rows, resolved_where.as_ref(), params)?;
-    for row in &matched {
-        db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
+    let mut tables = Vec::new();
+    for selection in &p.selections {
+        let rows = db.scan(&selection.table, snapshot)?;
+        let resolved = selection
+            .where_clause
+            .as_ref()
+            .map(|expr| resolve_in_subqueries(db, expr, params, None))
+            .transpose()?;
+        let matched = filter_rows_by_predicate(rows, resolved.as_ref(), params)?;
+        let meta = db
+            .table_meta(&selection.table)
+            .ok_or_else(|| Error::TableNotFound(selection.table.clone()))?;
+        let mut pinned = Vec::new();
+        for row in matched {
+            db.assert_row_write_allowed(&selection.table, row.row_id, &row.values, snapshot)?;
+            pinned.push((
+                natural_key_from_row_values(&meta, &row.values)
+                    .ok_or_else(|| Error::NotSyncEligible(selection.table.clone()))?,
+                row.row_id,
+            ));
+        }
+        tables.push((selection.table.clone(), pinned));
     }
-    if matched.is_empty() {
-        return Ok(QueryResult::empty_with_affected(0));
-    }
-
-    let meta = db
-        .table_meta(&p.table)
-        .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
-    let pinned = matched
-        .iter()
-        .map(|row| {
-            natural_key_from_row_values(&meta, &row.values)
-                .map(|key| (key, row.row_id))
-                .ok_or_else(|| Error::NotSyncEligible(p.table.clone()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut result = db.commit_authoritative_purge_batch(&p.table, &pinned)?;
-    result.rows_affected = matched.len() as u64;
-    Ok(result)
+    db.commit_authoritative_purge_tables(&tables, &node_local)
 }
 
 fn exec_delete(
@@ -5410,8 +5535,17 @@ pub(crate) fn validate_plan_columns(db: &Database, plan: &PhysicalPlan) -> Resul
             filter: Some(predicate),
         } => validate_predicate_columns(db, table, alias.as_deref(), predicate)?,
         PhysicalPlan::Purge(p) => {
-            if let Some(predicate) = &p.where_clause {
-                validate_predicate_columns(db, &p.table, None, predicate)?;
+            for selection in &p.selections {
+                if let Some(predicate) = &selection.where_clause {
+                    validate_predicate_columns(db, &selection.table, None, predicate)?;
+                }
+            }
+        }
+        PhysicalPlan::Discard(p) => {
+            for selection in &p.selections {
+                if let Some(predicate) = &selection.where_clause {
+                    validate_predicate_columns(db, &selection.table, None, predicate)?;
+                }
             }
         }
         PhysicalPlan::Delete(p) => {
@@ -8150,7 +8284,7 @@ pub(crate) fn row_matches(
 /// throw the `Err` away via `.unwrap_or(false)`, so a predicate that failed
 /// to evaluate silently excluded every row it touched instead of failing the
 /// statement.
-fn filter_rows_by_predicate(
+pub(crate) fn filter_rows_by_predicate(
     rows: Vec<VersionedRow>,
     predicate: Option<&Expr>,
     params: &HashMap<String, Value>,
@@ -11683,6 +11817,10 @@ fn refuse_engine_owned_reserved_name_shape(
         // `refuse_hub_refereed_ledger_sync_conflict_mismatch`, not here.
         conflict_policy: _,
         history: _,
+        // Custody policy axes are judged with the other policy fields after
+        // projection; they are not part of the reserved table's column shape.
+        delivery_manifest_tables: _,
+        edge_discard: _,
     } = plan;
     refuse_reserved_name_table_shape(
         name,
@@ -13167,6 +13305,13 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         self.store.quantized_vector_columns(table)
     }
 
+    fn delivery_metadata(
+        &self,
+        request: crate::direct_file_reader::DirectMetadataRequest,
+    ) -> Result<crate::direct_file_reader::DirectMetadataBody> {
+        self.store.delivery_metadata(request)
+    }
+
     fn store_state_answer(&self, plan: &PhysicalPlan) -> Result<QueryResult> {
         self.store.store_state_answer(plan)
     }
@@ -13755,12 +13900,13 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         continuation: Option<&str>,
+        cancellation: &OwnerReadCancellation,
     ) -> std::result::Result<
         crate::direct_file_reader::DirectMetadataResponse,
         crate::direct_file_reader::DirectFileReaderError,
     > {
         self.store
-            .read_metadata(request, image, limits, clock, continuation)
+            .read_metadata(request, image, limits, clock, continuation, cancellation)
     }
 }
 

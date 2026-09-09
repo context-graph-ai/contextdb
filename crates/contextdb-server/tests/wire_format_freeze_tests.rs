@@ -57,6 +57,8 @@ fn nonempty_schema_provenance_round_trips_and_validates() {
         vectors: Vec::new(),
         ddl_provenance: vec![provenance],
         purges: Vec::new(),
+        // Statement 9: ordinary manifest lane compile prerequisite.
+        manifests: Vec::new(),
     };
     validate_wire_ddl_provenance(&wire).unwrap();
     let bytes = rmp_serde::to_vec(&wire).unwrap();
@@ -85,6 +87,8 @@ fn schema_provenance_rejects_missing_source_lsn_before_ordinal_lookup() {
                 .unwrap(),
         }],
         purges: Vec::new(),
+        // Statement 9: ordinary manifest lane compile prerequisite.
+        manifests: Vec::new(),
     };
 
     let error = validate_wire_ddl_provenance(&wire)
@@ -126,6 +130,8 @@ fn filtered_schema_entry_keeps_its_original_nonzero_ordinal() {
             .unwrap(),
         }],
         purges: Vec::new(),
+        // Statement 9: ordinary manifest lane compile prerequisite.
+        manifests: Vec::new(),
     };
 
     validate_wire_ddl_provenance(&wire)
@@ -172,6 +178,8 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
             edges: Vec::new(),
             vectors: Vec::new(),
             purges: Vec::new(),
+            // Statement 9: ordinary manifest lane compile prerequisite.
+            manifests: Vec::new(),
         },
         incarnation: Incarnation::default(),
     };
@@ -211,6 +219,8 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
         }),
         error: None,
         application_error: None,
+        // Statement 13: ordinary response lane compile prerequisite.
+        ..Default::default()
     };
     let push_response_bytes = encode(MessageType::PushResponse, &push_response).unwrap();
     assert_eq!(
@@ -231,6 +241,8 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
         application_error: Some(WirePushError::PurgeRequiresAuthoritativeHub {
             hub_node_id: "cd".repeat(32),
         }),
+        // Statement 13: ordinary response lane compile prerequisite.
+        ..Default::default()
     };
     let authority_error_bytes = encode(MessageType::PushResponse, &authority_error).unwrap();
     assert_eq!(

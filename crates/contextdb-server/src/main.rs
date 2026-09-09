@@ -288,9 +288,53 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         )?)
     };
     report_owner_read_startup(&db);
-    // Bind eagerly so the enrollment ticket is
-    // available up front (logged, and written to --ticket-file when asked).
+    // Bind eagerly so the enrollment ticket is available up front. Binding is
+    // the point at which endpoint information becomes real; readiness is a
+    // separate later requirement for serving sync requests.
     let endpoint = bind_sync_endpoint(&endpoint_spec, resource_policy).await?;
+    if args.show_ticket {
+        publish_ticket(&args, &endpoint)?;
+        endpoint.close().await;
+        return Ok(());
+    }
+    // Statement 11: retain publication ordering through the established constructor.
+    let server = publish_then_activate(&args, db, &endpoint, |db, endpoint, tenant| {
+        Ok(SyncServer::new(db, endpoint, tenant))
+    })?;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        signal_shutdown.store(true, Ordering::SeqCst);
+    });
+    server.run_until(shutdown).await;
+    server.db().close()?;
+    Ok(())
+}
+
+/// Publish the bearer ticket as soon as binding succeeds. A later readiness
+/// refusal still has to leave the operator with this endpoint information;
+/// publication itself remains fallible, so a failed file or output channel is
+/// never presented as a completed publication.
+fn publish_ticket(args: &Args, endpoint: &IrohServer) -> Result<(), Box<dyn std::error::Error>> {
+    publish_ticket_with(args, endpoint, |line| {
+        println!("{line}");
+        Ok(())
+    })
+}
+
+/// This callback is private testability for the activation-order regression.
+/// It observes the exact publication bytes without adding a server option or
+/// changing the runtime's public output contract.
+fn publish_ticket_with<F>(
+    args: &Args,
+    endpoint: &IrohServer,
+    mut write_stdout: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(&str) -> std::io::Result<()>,
+{
     let ticket = endpoint.ticket();
     tracing::info!(
         ticket = %ticket,
@@ -318,40 +362,65 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             "dial_command": dial_command,
             "endpoint": endpoint.node_id().to_string(),
         });
-        println!(
-            "{}",
-            serde_json::to_string(&obj).expect("serialize enrollment object")
-        );
+        write_stdout(&serde_json::to_string(&obj).expect("serialize enrollment object"))?;
     } else if args.show_ticket {
         // Bare ticket on stdout: script-friendly capture (non-JSON).
-        println!("{ticket}");
+        write_stdout(&ticket.to_string())?;
     } else {
         // The enrollment ticket is product surface, not logging: print it
         // unconditionally so the documented "copy the ticket" flow works at
         // any log level.
-        println!("enrollment ticket: {ticket}");
-        println!("To connect a client, run:");
-        println!("  {dial_command}");
+        write_stdout(&format!("enrollment ticket: {ticket}"))?;
+        write_stdout("To connect a client, run:")?;
+        write_stdout(&format!("  {dial_command}"))?;
     }
-    if args.show_ticket {
-        endpoint.close().await;
-        return Ok(());
-    }
-    let server = SyncServer::new(
-        db,
-        &endpoint,
-        contextdb_core::TenantId::from(args.tenant_id.as_str()),
-    );
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let signal_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        signal_shutdown.store(true, Ordering::SeqCst);
-    });
-    server.run_until(shutdown).await;
-    server.db().close()?;
     Ok(())
+}
+
+/// Keep the ordering between externally visible ticket publication and the
+/// fallible activation door explicit and unit-testable without exposing any
+/// runtime control. A failed activator produces no server value, so no serving
+/// loop or authority handler can be started by this binary.
+fn publish_then_activate<F>(
+    args: &Args,
+    db: Arc<Database>,
+    endpoint: &IrohServer,
+    activate: F,
+) -> Result<SyncServer, Box<dyn std::error::Error>>
+where
+    F: FnOnce(
+        Arc<Database>,
+        &IrohServer,
+        contextdb_core::TenantId,
+    ) -> contextdb_core::Result<SyncServer>,
+{
+    publish_then_activate_with(args, db, endpoint, activate, |line| {
+        println!("{line}");
+        Ok(())
+    })
+}
+
+fn publish_then_activate_with<F, W>(
+    args: &Args,
+    db: Arc<Database>,
+    endpoint: &IrohServer,
+    activate: F,
+    write_stdout: W,
+) -> Result<SyncServer, Box<dyn std::error::Error>>
+where
+    F: FnOnce(
+        Arc<Database>,
+        &IrohServer,
+        contextdb_core::TenantId,
+    ) -> contextdb_core::Result<SyncServer>,
+    W: FnMut(&str) -> std::io::Result<()>,
+{
+    publish_ticket_with(args, endpoint, write_stdout)?;
+    Ok(activate(
+        db,
+        endpoint,
+        contextdb_core::TenantId::from(args.tenant_id.as_str()),
+    )?)
 }
 
 async fn wait_for_shutdown_signal() {
@@ -479,5 +548,71 @@ mod tests {
             !identity.exists(),
             "invalid typed policy must fail before identity creation"
         );
+    }
+
+    #[tokio::test]
+    async fn a_bound_ticket_is_published_before_readiness_failure_and_no_server_is_returned() {
+        let root = tempfile::tempdir().expect("temporary ticket directory");
+        let identity = root.path().join("server.identity");
+        let ticket_file = root.path().join("enrollment.ticket");
+        let endpoint_spec = format!("iroh:?identity={}", identity.display());
+        let args = Args::try_parse_from([
+            "contextdb-server",
+            "--db-path",
+            ":memory:",
+            "--tenant-id",
+            "acme",
+            "--sync-endpoint",
+            &endpoint_spec,
+            "--ticket-file",
+            ticket_file.to_str().expect("UTF-8 temporary path"),
+            "--json",
+        ])
+        .expect("valid server arguments");
+        let endpoint = bind_sync_endpoint(&endpoint_spec, ServerResourcePolicy::default())
+            .await
+            .expect("endpoint binds before readiness");
+        let expected_ticket = endpoint.ticket().to_string();
+
+        let mut published = Vec::new();
+        let result = publish_then_activate_with(
+            &args,
+            Arc::new(Database::open_memory()),
+            &endpoint,
+            |_, _, _| {
+                Err(contextdb_core::Error::SyncError(
+                    "forced readiness failure".to_string(),
+                ))
+            },
+            |line| {
+                published.push(line.to_string());
+                Ok(())
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "a failed readiness check must still make startup fail"
+        );
+        assert_eq!(
+            published.len(),
+            1,
+            "JSON ticket publication writes exactly one line"
+        );
+        let output: serde_json::Value =
+            serde_json::from_str(&published[0]).expect("published ticket line is structured JSON");
+        assert_eq!(
+            output
+                .get("enrollment_ticket")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_ticket.as_str()),
+            "the requested machine-readable ticket reaches stdout before readiness fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ticket_file).expect("ticket file published before readiness"),
+            expected_ticket,
+            "the requested ticket file survives a subsequent readiness failure"
+        );
+        endpoint.close().await;
     }
 }

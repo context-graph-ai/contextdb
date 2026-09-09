@@ -319,6 +319,7 @@ fn deadline_operation<'a, T: Send + 'a>(
 
 macro_rules! deadline_operation {
     ($name:ident, $stage:ident) => {
+        #[allow(dead_code, reason = "Every declared deadline stage retains the same operation wrapper across feature configurations")]
         pub fn $name<'a, T: Send + 'a>(
             clock: &'a dyn DeadlineClock,
             deadline_ms: u64,

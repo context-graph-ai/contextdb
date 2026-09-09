@@ -442,6 +442,7 @@ fn inbound_work_job_purge_ignores_malformed_unrelated_survivor_input_refs() {
         .resolve_authoritative_purge_selection("work_jobs", &selected_key)
         .expect("resolve local selected work-job lineage for inbound purge");
     let delivery = AuthoritativePurgeDeliveryItem {
+        node_local_predicate: None,
         frontier: Lsn(fixture.db.current_lsn().0.saturating_add(1)),
         ordinal: 0,
         table: "work_jobs".to_string(),

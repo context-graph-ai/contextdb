@@ -23,7 +23,12 @@ stmt = _{
     | create_route_stmt
     | drop_route_stmt
     | insert_stmt
+    | declare_tenant_table_policy_stmt
+    | show_tenant_table_policy_stmt
+    | show_sync_bindings_stmt
+    | show_delivery_outcomes_stmt
     | purge_stmt
+    | discard_stmt
     | delete_stmt
     | update_stmt
     | show_sync_conflict_policy
@@ -37,6 +42,15 @@ stmt = _{
 
 show_sync_conflict_policy = { ^"SHOW" ~ ^"SYNC_CONFLICT_POLICY" }
 show_vector_indexes_stmt = { ^"SHOW" ~ ^"VECTOR_INDEXES" }
+show_tenant_table_policy_stmt = { ^"SHOW" ~ ^"TENANT" ~ ^"TABLE" ~ ^"POLICY" ~ (^"FOR" ~ identifier)? }
+show_sync_bindings_stmt = { ^"SHOW" ~ ^"SYNC" ~ ^"BINDINGS" }
+show_delivery_outcomes_stmt = {
+    ^"SHOW" ~ ^"DELIVERY" ~ ^"OUTCOMES" ~ ^"FOR" ~ identifier
+    ~ where_clause?
+    ~ limit_clause?
+    ~ offset_clause?
+}
+offset_clause = { ^"OFFSET" ~ integer }
 set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "'" ~ memory_limit_value ~ "'" }
 show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
 memory_limit_value = { ^"none" | size_with_unit }
@@ -259,7 +273,26 @@ table_option = {
     | history_option
     | sync_direction_option
     | sync_conflict_option
+    | delivery_manifest_option
+    | edge_discard_option
 }
+tenant_policy_option = {
+    immutable_option
+    | retain_option
+    | history_option
+    | sync_direction_option
+    | sync_conflict_option
+    | delivery_manifest_option
+    | edge_discard_option
+}
+declare_tenant_table_policy_stmt = {
+    ^"DECLARE" ~ ^"TENANT" ~ ^"TABLE" ~ ^"POLICY" ~ identifier ~ tenant_policy_option*
+}
+delivery_manifest_option = { ^"DELIVERY" ~ ^"MANIFEST" ~ ^"OVER" ~ identifier ~ ("," ~ identifier)* }
+edge_discard_option = { ^"EDGE" ~ ^"DISCARD" ~ (edge_discard_never | edge_discard_after_outcome | edge_discard_always) }
+edge_discard_never = { ^"NEVER" }
+edge_discard_after_outcome = { ^"AFTER" ~ ^"OUTCOME" }
+edge_discard_always = { ^"ALWAYS" }
 retain_option = { ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 retain_unit = { ^"SECONDS" | ^"MINUTES" | ^"HOURS" | ^"DAYS" }
 // How much of each live row's version history this table keeps. RETAIN says
@@ -416,7 +449,9 @@ on_conflict_clause = {
 }
 assignment = { identifier ~ "=" ~ expr }
 
-purge_stmt = { ^"PURGE" ~ ^"FROM" ~ identifier ~ where_clause? }
+purge_stmt = { ^"PURGE" ~ ^"FROM" ~ erasure_selection ~ ("," ~ erasure_selection)* }
+discard_stmt = { ^"DISCARD" ~ ^"FROM" ~ erasure_selection ~ ("," ~ erasure_selection)* }
+erasure_selection = { identifier ~ where_clause? }
 
 delete_stmt = { ^"DELETE" ~ ^"FROM" ~ identifier ~ where_clause? }
 

@@ -129,6 +129,18 @@ pub(crate) static META_COMMANDS: &[CommandDeclaration] = &[
         effect: CommandEffect::StoreWrite,
     },
     CommandDeclaration {
+        spelling: ".sync policy",
+        effect: CommandEffect::StoreRead,
+    },
+    CommandDeclaration {
+        spelling: ".sync bindings",
+        effect: CommandEffect::StoreRead,
+    },
+    CommandDeclaration {
+        spelling: ".sync outcomes",
+        effect: CommandEffect::StoreRead,
+    },
+    CommandDeclaration {
         spelling: ".sync push",
         effect: CommandEffect::StoreWrite,
     },
@@ -339,6 +351,19 @@ fn invocation_arguments<'a>(line: &'a str, spelling: &str) -> Option<&'a str> {
 fn invocation_is_valid(declaration: &CommandDeclaration, arguments: &str) -> bool {
     match declaration.spelling {
         ".schema" | ".explain" | ".cursor open" => !arguments.is_empty(),
+        ".sync policy" => {
+            arguments.is_empty()
+                || arguments
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                    .first()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("FOR"))
+        }
+        ".sync outcomes" => arguments
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("FOR")),
         ".tables" | ".events status" => continuation_arguments_are_valid(arguments),
         ".cursor fetch" => {
             arguments.is_empty()
@@ -355,6 +380,7 @@ fn invocation_is_valid(declaration: &CommandDeclaration, arguments: &str) -> boo
         | ".sync push"
         | ".sync pull"
         | ".sync reconnect"
+        | ".sync bindings"
         | ".owner status"
         | ".quit"
         | ".exit"
@@ -432,6 +458,19 @@ mod contract_tests {
         CommandDeclaration {
             spelling: ".maintenance compact",
             effect: CommandEffect::StoreWrite,
+        },
+        // Statement 19: the three custody inspections are canonical store reads.
+        CommandDeclaration {
+            spelling: ".sync policy",
+            effect: CommandEffect::StoreRead,
+        },
+        CommandDeclaration {
+            spelling: ".sync bindings",
+            effect: CommandEffect::StoreRead,
+        },
+        CommandDeclaration {
+            spelling: ".sync outcomes",
+            effect: CommandEffect::StoreRead,
         },
         CommandDeclaration {
             spelling: ".sync push",
@@ -592,6 +631,9 @@ mod contract_tests {
             (".cursor close", CommandEffect::StoreRead),
             (".maintenance run", CommandEffect::StoreWrite),
             (".maintenance compact", CommandEffect::StoreWrite),
+            (".sync policy", CommandEffect::StoreRead),
+            (".sync bindings", CommandEffect::StoreRead),
+            (".sync outcomes FOR entries", CommandEffect::StoreRead),
             (".sync push", CommandEffect::StoreWrite),
             (".sync pull", CommandEffect::StoreWrite),
             (".sync reconnect", CommandEffect::StoreWrite),
@@ -665,6 +707,9 @@ mod contract_tests {
             ".cursor close",
             ".maintenance run",
             ".maintenance compact",
+            ".sync policy",
+            ".sync bindings",
+            ".sync outcomes FOR entries",
             ".sync push",
             ".sync pull",
             ".sync reconnect",
@@ -733,6 +778,7 @@ mod contract_tests {
                 ".explain" => ".explain DELETE FROM entries",
                 ".cursor open" => ".cursor open SELECT * FROM entries",
                 ".cursor fetch" => ".cursor fetch 25",
+                ".sync outcomes" => ".sync outcomes FOR entries",
                 ".sync destination" => ".sync destination hub",
                 ".sync auto" => ".sync auto on",
                 ".help" => ".help vector",

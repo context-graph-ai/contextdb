@@ -1469,6 +1469,8 @@ fn stable_read_failure_vocabulary_round_trips_every_legal_shape() {
             ReadFailureKind::OperationAlreadyCompleted,
             ReadFailureKind::OwnerRouteUnsupported,
             ReadFailureKind::DeclaredPrincipalRefused,
+            // Statement 19: constrained custody inspection is an explicit read refusal.
+            ReadFailureKind::ConstrainedHandleInspectionRefused,
         ]
     );
     for kind in ReadFailureKind::ALL {

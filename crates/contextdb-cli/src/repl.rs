@@ -443,6 +443,7 @@ fn read_failure_message(
         // refusal already names the identity it declared and the one the
         // writer reads as, and there is no flag here to point at.
         ReadFailureKind::DeclaredPrincipalRefused => None,
+        ReadFailureKind::ConstrainedHandleInspectionRefused => None,
     };
     match recovery {
         Some(recovery) => format!("{failure}; {recovery}"),
@@ -957,6 +958,23 @@ fn run_statement(
     }
 }
 
+fn custody_inspection_sql(line: &str) -> Option<String> {
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    match words.as_slice() {
+        [command, "policy"] if *command == ".sync" => Some("SHOW TENANT TABLE POLICY".to_string()),
+        [command, "policy", for_word, table]
+            if *command == ".sync" && for_word.eq_ignore_ascii_case("FOR") =>
+        {
+            Some(format!("SHOW TENANT TABLE POLICY FOR {table}"))
+        }
+        [command, "bindings"] if *command == ".sync" => Some("SHOW SYNC BINDINGS".to_string()),
+        [command, "outcomes", rest @ ..] if *command == ".sync" && !rest.is_empty() => {
+            Some(format!("SHOW DELIVERY OUTCOMES {}", rest.join(" ")))
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_meta_line(
     session_handle: &Session,
@@ -979,6 +997,12 @@ fn process_meta_line(
             .output
             .report_read_failure(&write_requires_flag(), input.script_line);
         session.had_error = true;
+        return true;
+    }
+    if let Some(sql) = custody_inspection_sql(line) {
+        if !execute_sql(session_handle, &sql, input, session) {
+            session.had_error = true;
+        }
         return true;
     }
     // A session that cannot write has no sync of its own to report, and the
@@ -1518,6 +1542,14 @@ fn publish_metadata(answer: &contextdb_engine::MetadataAnswer, input: InputConte
         // The committed image state is not a command anyone can type; the CLI
         // never asks for it, so there is nothing here to render.
         MetadataBody::ImageState { .. } => {}
+        MetadataBody::DeliveryStatus { counts, has_more } => println!(
+            "{}",
+            serde_json::json!({"counts": counts, "has_more": has_more})
+        ),
+        MetadataBody::DeliveryOutcome { outcome, has_more } => println!(
+            "{}",
+            serde_json::json!({"outcome": outcome, "has_more": has_more})
+        ),
     }
 }
 

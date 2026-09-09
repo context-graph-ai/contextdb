@@ -13,6 +13,7 @@ pub enum PhysicalPlan {
     DropIndex(DropIndexPlan),
     Insert(InsertPlan),
     Purge(PurgePlan),
+    Discard(DiscardPlan),
     Delete(DeletePlan),
     Update(UpdatePlan),
     Scan {
@@ -94,6 +95,12 @@ pub enum PhysicalPlan {
     ShowDiskLimit,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
+    DeclareTenantTablePolicy(DeclareTenantTablePolicyPlan),
+    ShowTenantTablePolicy {
+        table: Option<String>,
+    },
+    ShowSyncBindings,
+    ShowDeliveryOutcomes(ShowDeliveryOutcomesPlan),
 }
 
 impl PhysicalPlan {
@@ -147,7 +154,8 @@ impl PhysicalPlan {
             PhysicalPlan::Scan { table, .. } => format!("Scan(table={})", table),
             PhysicalPlan::AlterTable(p) => format!("AlterTable(table={})", p.table),
             PhysicalPlan::Insert(p) => format!("Insert(table={})", p.table),
-            PhysicalPlan::Purge(p) => format!("Purge(table={})", p.table),
+            PhysicalPlan::Purge(p) => format!("Purge(selections={})", p.selections.len()),
+            PhysicalPlan::Discard(p) => format!("Discard(selections={})", p.selections.len()),
             PhysicalPlan::Delete(p) => format!("Delete(table={})", p.table),
             PhysicalPlan::Update(p) => format!("Update(table={})", p.table),
             PhysicalPlan::Pipeline(plans) => plans
@@ -229,6 +237,8 @@ pub struct CreateTablePlan {
     pub sync_direction: Option<contextdb_core::SyncDirection>,
     pub conflict_policy: Option<contextdb_core::ConflictPolicy>,
     pub history: Option<contextdb_core::HistoryPolicy>,
+    pub delivery_manifest_tables: Option<Vec<String>>,
+    pub edge_discard: Option<contextdb_core::EdgeDiscardMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -273,8 +283,28 @@ pub struct DeletePlan {
 
 #[derive(Debug, Clone)]
 pub struct PurgePlan {
+    pub selections: Vec<ErasureSelectionPlan>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscardPlan {
+    pub selections: Vec<ErasureSelectionPlan>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ErasureSelectionPlan {
     pub table: String,
     pub where_clause: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeclareTenantTablePolicyPlan {
+    pub declaration: contextdb_parser::ast::DeclareTenantTablePolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShowDeliveryOutcomesPlan {
+    pub query: contextdb_parser::ast::ShowDeliveryOutcomes,
 }
 
 #[derive(Debug, Clone)]

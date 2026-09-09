@@ -207,6 +207,8 @@ fn the_v6_wire_fields_exist_and_round_trip() {
 fn protocol_v6_purge_instruction_and_typed_authority_error_round_trip() {
     let changeset = WireChangeSet {
         purges: vec![contextdb_server::protocol::WirePurgeChange {
+            // Statement 18: unchanged key-only instruction has no local predicate.
+            node_local_predicate: None,
             table: "notes".to_string(),
             table_generation: 3,
             natural_key: WireNaturalKey {
@@ -235,6 +237,8 @@ fn protocol_v6_purge_instruction_and_typed_authority_error_round_trip() {
                 hub_node_id: "authoritative-hub".to_string(),
             },
         ),
+        // Statement 13: ordinary response lane compile prerequisite.
+        ..Default::default()
     };
     let response_bytes = rmp_serde::to_vec(&response).expect("PushResponse encode");
     let response_back: contextdb_server::protocol::PushResponse =

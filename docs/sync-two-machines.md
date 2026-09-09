@@ -85,3 +85,30 @@ Both edges now hold the same two rows, converged through the hub. `.sync status`
 ## Restart durability
 
 The hub keeps its identity in `<db-path>.fabric-identity.key` next to the database file (here, `hub.db.fabric-identity.key`). Restarting the hub reuses that key, so the same ticket — and every edge already pinned to it — keeps working. Back this file up like a credential; never commit it to source control.
+
+
+## Manifested application units
+
+The enrollment ticket authenticates the hub; application-table policy is bound separately.
+First declare it with `contextdb --write hub.db`; then call the edge's
+`SyncClient::bind_application_table_policy` before creating those tables. The
+[complete runnable recipe](../skills/sync/SKILL.md#tenant-policy-and-unit-custody) includes both steps.
+
+For tenant-governed event tables, declare policy on the hub, bind it through the edge's authenticated
+`SyncClient`, and install matching DDL before recording units. Register each manifest in its root's
+write transaction. Manifests use the ordinary push and its existing oversized-unit staging transport.
+A durable outcome, rather than a push watermark, ends that unit's pending obligation; fetch recovers
+lost acknowledgements without applying rows again. Refused rows stay on the edge and their diagnostic
+keys identify them.
+
+An ordinary status exchange verifies one hub-signed prefix checkpoint against the hub image.
+A failed verification is an error. A restored image that lost acknowledged custody receives a new
+incarnation; unrelated writes or later purges cannot mask that loss. This also works with a declared
+snapshot taken before the first binding: the edge automatically rebinds, old outcomes become pending,
+and unchanged local rows are offered again. Missing declarations remain a typed policy refusal.
+Reopening the current image preserves its incarnation and valid credit.
+
+See [tenant policy and event custody](query-language.md#tenant-policy-and-event-custody) for the SQL,
+local-discard modes, metadata inspection, and atomic purge delivery to independently keyed
+node-local tables. Operator-held backups from before a purge remain outside the engine's erasure reach: restore
+one only with the documented re-purge recovery.

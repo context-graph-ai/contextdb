@@ -225,6 +225,7 @@ pub(crate) fn publish_prepared_change_log_entries(
 }
 
 pub struct CompositeStore {
+    pub(crate) local_erasure_stages: crate::database::discard::StageRegistry,
     pub relational: Arc<RelationalStore>,
     pub graph: Arc<GraphStore>,
     pub vector: Arc<VectorStore>,
@@ -346,6 +347,7 @@ impl CompositeStore {
         apply_phase_pause: Arc<ApplyPhasePause>,
     ) -> Self {
         Self {
+            local_erasure_stages: Arc::new(Mutex::new(HashMap::new())),
             relational,
             graph,
             vector,
@@ -516,6 +518,13 @@ impl CompositeStore {
         ws: &WriteSet,
         log_entries: Vec<ChangeLogEntry>,
     ) -> Result<()> {
+        // Statement 17b: erase the old image after durable success, before ordinary writes publish.
+        let erasure = ws
+            .commit_lsn
+            .and_then(|lsn| self.local_erasure_stages.lock().remove(&lsn));
+        if let Some(stage) = erasure {
+            (stage.publish)();
+        }
         if ws.relational_deletes.is_empty() || ws.relational_inserts.is_empty() {
             self.relational.apply_deletes_ref(&ws.relational_deletes);
             self.relational.apply_inserts_ref(&ws.relational_inserts);

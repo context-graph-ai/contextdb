@@ -83,8 +83,14 @@ fn assert_no_role_mechanic_words(rendered: &str, surface: &str) {
 fn removed_sync_commands_are_unknown_and_role_mechanic_words_are_absent() {
     let (help, help_err) = run_cli(".help\n.quit\n", false);
     let help_text = format!("{help}\n{help_err}");
+    // Statement 19: policy inspection is available; per-session policy overrides stay refused.
+    for inspection in [".sync policy", ".sync bindings", ".sync outcomes"] {
+        assert!(
+            help_text.contains(inspection),
+            "CLI help must expose the declared custody inspection {inspection}: {help_text}"
+        );
+    }
     for forbidden in [
-        ".sync policy",
         ".sync direction",
         "InsertIfNotExists",
         "ServerWins",

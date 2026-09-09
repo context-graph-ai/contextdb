@@ -183,6 +183,7 @@ mod route_observation {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadSessionOperation {
         Execute,
+        Metadata,
         CursorOpen,
         CursorFetch,
     }
@@ -1466,7 +1467,7 @@ impl Drop for SessionKernelProbeGuard {
 /// the kernel itself picks it up, for exactly the span of one operation, and
 /// is restored even if that operation panics.
 #[cfg(feature = "test-seams")]
-fn with_session_kernel_probe<T>(
+pub(crate) fn with_session_kernel_probe<T>(
     probe: Option<Arc<dyn crate::executor::BoundedExecutionProbe>>,
     operation: impl FnOnce() -> T,
 ) -> T {
@@ -1989,6 +1990,8 @@ impl ReadSession {
         mismatch: Option<OwnerHandshakeMismatchForTest>,
         progress: Option<Arc<dyn ReadProgressObserver>>,
     ) -> Result<Self> {
+        #[cfg(not(feature = "test-seams"))]
+        let _ = (&session_observer, &kernel_observer);
         options
             .limits
             .validate()
@@ -2308,7 +2311,14 @@ impl ReadSession {
         }
         with_progress_observer(self.progress.as_ref(), || {
             with_route_source_counter(&self.resources, || {
-                self.metadata_within_route(request, continuation)
+                let cancellation = OwnerReadCancellation::new();
+                #[cfg(feature = "test-seams")]
+                return with_session_kernel_probe(
+                    self.kernel_probe(ReadSessionOperation::Metadata, &cancellation),
+                    || self.metadata_within_route(request, continuation, &cancellation),
+                );
+                #[cfg(not(feature = "test-seams"))]
+                self.metadata_within_route(request, continuation, &cancellation)
             })
         })
     }
@@ -2317,6 +2327,7 @@ impl ReadSession {
         &self,
         request: MetadataRequest,
         continuation: Option<&str>,
+        cancellation: &OwnerReadCancellation,
     ) -> Result<MetadataAnswer> {
         match self.state.as_ref() {
             ReadSessionState::LiveDatabase(database) => {
@@ -2329,6 +2340,7 @@ impl ReadSession {
                     self.options.limits,
                     self.session_clock(),
                     continuation,
+                    cancellation,
                 )
                 .map(|(body, continuation)| MetadataAnswer { body, continuation })
                 .map_err(|error| direct_error(Path::new(""), error))
@@ -2337,14 +2349,14 @@ impl ReadSession {
             // holds, through the direct reader's own door, so this route says
             // exactly what a direct reader says.
             ReadSessionState::DirectFile(reader) => reader
-                .metadata_from(request, continuation)
+                .metadata_from_with_cancellation(request, continuation, cancellation)
                 .map(|answered| MetadataAnswer {
                     body: answered.body,
                     continuation: answered.continuation,
                 })
                 .map_err(|error| direct_error(Path::new(""), error)),
             ReadSessionState::OwnerChannel(owner) => {
-                self.owner_metadata(owner, request, continuation)
+                self.owner_metadata(owner, request, continuation, cancellation)
             }
         }
     }
@@ -2361,9 +2373,24 @@ impl ReadSession {
         owner: &OwnerRoute,
         request: MetadataRequest,
         continuation: Option<&str>,
+        cancellation: &OwnerReadCancellation,
     ) -> Result<MetadataAnswer> {
         let limits = self.options.limits;
         let local = match &request {
+            MetadataRequest::DeliveryStatus { root_table } => {
+                crate::local_transport::LocalMetadataRequest::DeliveryStatus {
+                    root_table: root_table.clone(),
+                    continuation: continuation.map(str::to_owned),
+                }
+            }
+            MetadataRequest::DeliveryOutcome {
+                root_table,
+                root_key,
+            } => crate::local_transport::LocalMetadataRequest::DeliveryOutcome {
+                root_table: root_table.clone(),
+                root_key: root_key.clone(),
+                continuation: continuation.map(str::to_owned),
+            },
             MetadataRequest::Tables => crate::local_transport::LocalMetadataRequest::Tables {
                 continuation: continuation.map(str::to_owned),
             },
@@ -2383,7 +2410,7 @@ impl ReadSession {
             // Explaining a statement is the owner planning it, not an
             // inventory it keeps, so it travels as its own request.
             MetadataRequest::Explain { sql } => {
-                return self.owner_explain(owner, sql.clone());
+                return self.owner_explain(owner, sql.clone(), cancellation);
             }
             // The local protocol carries no request for the state of a
             // committed image, because an owner is not one.
@@ -2394,22 +2421,27 @@ impl ReadSession {
         let responses = owner.ask(
             limits,
             crate::local_transport::LocalRequest::Metadata { request: local },
-            None,
+            Some(cancellation),
             #[cfg(feature = "test-seams")]
             self.observer.as_ref(),
         )?;
-        let payload = published_metadata_payload(responses)?;
+        let payload = published_metadata_payload(responses, limits.memory)?;
         promoted_metadata_answer(&request, &payload, limits)
     }
 
-    fn owner_explain(&self, owner: &OwnerRoute, sql: String) -> Result<MetadataAnswer> {
+    fn owner_explain(
+        &self,
+        owner: &OwnerRoute,
+        sql: String,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<MetadataAnswer> {
         let answered = owner.ask(
             self.options.limits,
             crate::local_transport::LocalRequest::Explain {
                 statement: sql,
                 params: std::collections::BTreeMap::new(),
             },
-            None,
+            Some(cancellation),
             #[cfg(feature = "test-seams")]
             self.observer.as_ref(),
         )?;
@@ -3061,6 +3093,8 @@ fn metadata_kind_name(request: &MetadataRequest) -> &'static str {
         MetadataRequest::EventsStatus => "the event inventory",
         MetadataRequest::MaintenanceStatus => "the maintenance status",
         MetadataRequest::ImageState { .. } => "the committed image state",
+        MetadataRequest::DeliveryStatus { .. } => "delivery status",
+        MetadataRequest::DeliveryOutcome { .. } => "a delivery outcome",
     }
 }
 
@@ -3083,6 +3117,7 @@ fn published_explain_payload(
 /// The owner's metadata reply, or the reason there is not one.
 fn published_metadata_payload(
     responses: Vec<crate::local_transport::LocalResponse>,
+    memory_ceiling: u64,
 ) -> Result<Vec<u8>> {
     for response in responses {
         match response {
@@ -3091,6 +3126,9 @@ fn published_metadata_payload(
             }
             crate::local_transport::LocalResponse::Failure { failure } => {
                 return Err(Error::ReadFailure(failure));
+            }
+            crate::local_transport::LocalResponse::EngineFailure { failure } => {
+                return Err(failure.into_error(memory_ceiling));
             }
             _ => {}
         }
@@ -3111,7 +3149,10 @@ fn promoted_metadata_answer(
     limits: ReadLimits,
 ) -> Result<MetadataAnswer> {
     match request {
-        MetadataRequest::Schema { .. } | MetadataRequest::MaintenanceStatus => {
+        MetadataRequest::Schema { .. }
+        | MetadataRequest::MaintenanceStatus
+        | MetadataRequest::DeliveryStatus { .. }
+        | MetadataRequest::DeliveryOutcome { .. } => {
             let body = crate::read_contract::decode_metadata_body(payload)
                 .map_err(|error| Error::Other(error.to_string()))?;
             Ok(MetadataAnswer {

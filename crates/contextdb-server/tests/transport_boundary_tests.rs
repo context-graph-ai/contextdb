@@ -583,9 +583,15 @@ fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
             "use contextdb_engine::sync_types::{ChangeSet, DdlChange};\n",
             1,
         ),
+        // Statement 20: exact public custody types used by the fixed nine journeys.
+        (
+            "use contextdb_engine::sync_client::ApplicationTablePolicyExpectation;\n",
+            1,
+        ),
+        ("use contextdb_engine::sync_types::NaturalKey;\n", 1),
         (smoke_transport_import.as_str(), 1),
         (
-            "use contextdb_engine::{Database, SyncClient, SyncServer};\n",
+            "use contextdb_engine::{Database, DeliveryManifest, DeliveryOutcomeKind, SyncClient, SyncServer};\n",
             1,
         ),
     ] {
@@ -601,6 +607,19 @@ fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
     // its negative-shape proofs may orchestrate. Do not add general engine
     // names here.
     for (authorized_use, expected_count) in [
+        // Statement 20: fixed custody verifier opens and public projections, never apply logic.
+        ("Database::open(&edge_path)", 2),
+        ("Database::open(&restored_path)", 1),
+        ("let db = Database::open_memory();", 1),
+        ("fn custody_client(db: &Arc<Database>", 1),
+        ("contextdb_engine::AuthenticatedTenantPolicyBinding", 1),
+        ("contextdb_engine::DeliveryStatusCounts", 1),
+        ("contextdb_engine::DeliveryOutcome", 5),
+        (
+            "// 2. Database::execute accepts exactly one statement. Sending the CLI's",
+            1,
+        ),
+        ("\"Database::execute is not a CLI statement stream\"", 1),
         ("fn on_sync_pull(&self, changes: &mut ChangeSet)", 1),
         // The three fixed smoke subcommands plus the two stopped-hub crash
         // verifier phases open the caller-selected database argument. Do not
@@ -878,6 +897,8 @@ async fn ip_01_push_pull_converges_over_fake() {
                 result: Some(expected_result),
                 error: None,
                 application_error: None,
+                // Statement 13: ordinary response lane compile prerequisite.
+                ..Default::default()
             },
             &format!("acceptance-stamped push group {idx}"),
         );

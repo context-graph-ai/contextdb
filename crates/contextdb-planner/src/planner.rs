@@ -26,6 +26,8 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             sync_direction: ct.sync_direction,
             conflict_policy: ct.conflict_policy,
             history: ct.history,
+            delivery_manifest_tables: ct.delivery_manifest_tables.clone(),
+            edge_discard: ct.edge_discard,
         })),
         Statement::AlterTable(at) => Ok(PhysicalPlan::AlterTable(AlterTablePlan {
             table: at.table.clone(),
@@ -55,8 +57,24 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             on_conflict: i.on_conflict.clone().map(Into::into),
         })),
         Statement::Purge(p) => Ok(PhysicalPlan::Purge(PurgePlan {
-            table: p.table.clone(),
-            where_clause: p.where_clause.clone(),
+            selections: p
+                .selections
+                .iter()
+                .map(|selection| ErasureSelectionPlan {
+                    table: selection.table.clone(),
+                    where_clause: selection.where_clause.clone(),
+                })
+                .collect(),
+        })),
+        Statement::Discard(p) => Ok(PhysicalPlan::Discard(DiscardPlan {
+            selections: p
+                .selections
+                .iter()
+                .map(|selection| ErasureSelectionPlan {
+                    table: selection.table.clone(),
+                    where_clause: selection.where_clause.clone(),
+                })
+                .collect(),
         })),
         Statement::Delete(d) => Ok(PhysicalPlan::Delete(DeletePlan {
             table: d.table.clone(),
@@ -74,6 +92,20 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         Statement::ShowDiskLimit => Ok(PhysicalPlan::ShowDiskLimit),
         Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
         Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
+        Statement::DeclareTenantTablePolicy(declaration) => Ok(
+            PhysicalPlan::DeclareTenantTablePolicy(DeclareTenantTablePolicyPlan {
+                declaration: declaration.clone(),
+            }),
+        ),
+        Statement::ShowTenantTablePolicy { table } => Ok(PhysicalPlan::ShowTenantTablePolicy {
+            table: table.clone(),
+        }),
+        Statement::ShowSyncBindings => Ok(PhysicalPlan::ShowSyncBindings),
+        Statement::ShowDeliveryOutcomes(query) => Ok(PhysicalPlan::ShowDeliveryOutcomes(
+            ShowDeliveryOutcomesPlan {
+                query: query.clone(),
+            },
+        )),
         Statement::CreateSchedule { .. }
         | Statement::DropSchedule { .. }
         | Statement::CreateTrigger { .. }

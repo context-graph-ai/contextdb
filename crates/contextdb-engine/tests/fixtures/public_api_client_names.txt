@@ -19,3 +19,5 @@ tenant_id
 endpoint
 connected_hub_node_id
 change_destination
+bind_application_table_policy
+fetch_delivery_outcomes

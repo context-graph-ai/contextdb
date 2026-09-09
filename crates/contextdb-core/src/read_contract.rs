@@ -670,10 +670,13 @@ pub enum ReadFailureKind {
     /// grants open up, which is strictly more than it declared. The session is
     /// refused instead, and the reader is told which declaration was refused.
     DeclaredPrincipalRefused,
+    /// Administrative custody inspection is unavailable through a constrained
+    /// application-row handle because the answer is a whole metadata block.
+    ConstrainedHandleInspectionRefused,
 }
 
 impl ReadFailureKind {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::WriteRequiresFlag,
         Self::HeldByWriter,
         Self::HeldByReaders,
@@ -698,6 +701,7 @@ impl ReadFailureKind {
         Self::OperationAlreadyCompleted,
         Self::OwnerRouteUnsupported,
         Self::DeclaredPrincipalRefused,
+        Self::ConstrainedHandleInspectionRefused,
     ];
 
     pub const fn class(self) -> ReadFailureClass {
@@ -724,6 +728,7 @@ impl ReadFailureKind {
             | Self::CursorNotFound
             | Self::DirectReadRequiresWriter
             | Self::DeclaredPrincipalRefused
+            | Self::ConstrainedHandleInspectionRefused
             | Self::StoreNotFound => ReadFailureClass::Io,
         }
     }
@@ -1031,6 +1036,9 @@ impl ReadFailureKind {
             Self::DeclaredPrincipalRefused => {
                 "the writer serving this store reads as a different principal than this session \
                  declared"
+            }
+            Self::ConstrainedHandleInspectionRefused => {
+                "this constrained handle cannot inspect the whole custody metadata block"
             }
         }
     }

@@ -2,6 +2,7 @@ use crate::error::SyncError;
 use contextdb_core::{
     CompositeForeignKey, Incarnation, Lsn, RowId, SingleColumnForeignKey, Value, VectorIndexRef,
 };
+use contextdb_engine::ApplicationTablePolicyExpectation;
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RefusalCause, RowChange,
     VectorChange,
@@ -47,6 +48,11 @@ pub enum MessageType {
     /// to the status subject; old clients never send the request).
     StatusRequest,
     StatusResponse,
+    // Statements 9/13: manifested units use the existing push request and response.
+    BindApplicationTablePolicyRequest,
+    BindApplicationTablePolicyResponse,
+    FetchDeliveryOutcomesRequest,
+    FetchDeliveryOutcomesResponse,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -59,12 +65,44 @@ pub struct PushRequest {
     pub incarnation: Incarnation,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct PushResponse {
     pub result: Option<WireApplyResult>,
     pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Statements 9/13: optional slots precede the ordinary outcome lane.
+    #[serde(default)]
     pub application_error: Option<WirePushError>,
+    #[serde(default)]
+    pub outcomes: Vec<WireDeliveryOutcome>,
+    #[serde(default)]
+    pub hub_incarnation: Option<Incarnation>,
+}
+
+// Statements 9/13/15: populate ordinary response lanes without shifting optional slots.
+impl Serialize for PushResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let has_outcomes = !self.outcomes.is_empty() || self.hub_incarnation.is_some();
+        let has_application_error = self.application_error.is_some() || has_outcomes;
+        let mut value = serializer.serialize_struct(
+            "PushResponse",
+            2 + usize::from(has_application_error)
+                + usize::from(has_outcomes)
+                + usize::from(self.hub_incarnation.is_some()),
+        )?;
+        value.serialize_field("result", &self.result)?;
+        value.serialize_field("error", &self.error)?;
+        if has_application_error {
+            value.serialize_field("application_error", &self.application_error)?;
+        }
+        if has_outcomes {
+            value.serialize_field("outcomes", &self.outcomes)?;
+        }
+        if self.hub_incarnation.is_some() {
+            value.serialize_field("hub_incarnation", &self.hub_incarnation)?;
+        }
+        value.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -164,7 +202,7 @@ pub struct ChunkAck {
     pub reply_inbox: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct WireChangeSet {
     pub ddl: Vec<WireDdlChange>,
     pub ddl_lsn: Vec<Lsn>,
@@ -180,8 +218,37 @@ pub struct WireChangeSet {
     /// Deliberate fleet-removal instructions are a distinct wire category.
     /// This slice carries and refuses edge-originated instructions; no apply
     /// path is enabled here.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // Statement 9: purges keep their slot when the following manifests lane is populated.
+    #[serde(default)]
     pub purges: Vec<WirePurgeChange>,
+    #[serde(default)]
+    pub manifests: Vec<WireDeliveryManifest>,
+}
+
+// Statement 9: only populated new lanes extend ordinary changesets. An empty purge slot
+// still precedes manifests, so positional encoding cannot mistake manifests for purges.
+impl Serialize for WireChangeSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let has_purges = !self.purges.is_empty() || !self.manifests.is_empty();
+        let mut value = serializer.serialize_struct(
+            "WireChangeSet",
+            6 + usize::from(has_purges) + usize::from(!self.manifests.is_empty()),
+        )?;
+        value.serialize_field("ddl", &self.ddl)?;
+        value.serialize_field("ddl_lsn", &self.ddl_lsn)?;
+        value.serialize_field("rows", &self.rows)?;
+        value.serialize_field("edges", &self.edges)?;
+        value.serialize_field("vectors", &self.vectors)?;
+        value.serialize_field("ddl_provenance", &self.ddl_provenance)?;
+        if has_purges {
+            value.serialize_field("purges", &self.purges)?;
+        }
+        if !self.manifests.is_empty() {
+            value.serialize_field("manifests", &self.manifests)?;
+        }
+        value.end()
+    }
 }
 
 /// The authenticated sender's immutable account of one DDL entry.  `table`
@@ -391,6 +458,9 @@ pub struct WirePurgeChange {
     pub natural_key: WireNaturalKey,
     pub purged_lineage_roots: Vec<String>,
     pub purge_frontier: Lsn,
+    /// Statement 17a: opaque self-contained selection for a listed node-local table.
+    #[serde(default)]
+    pub node_local_predicate: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -456,6 +526,18 @@ pub fn encode<T: Serialize>(msg_type: MessageType, msg: &T) -> Result<Vec<u8>, S
     rmp_serde::to_vec(&envelope).map_err(|e| SyncError::Serde(e.to_string()))
 }
 
+/// Encode an additive custody payload as a named MessagePack map inside the
+/// unchanged protocol envelope.
+pub fn encode_named<T: Serialize>(msg_type: MessageType, msg: &T) -> Result<Vec<u8>, SyncError> {
+    let payload = rmp_serde::to_vec_named(msg).map_err(|e| SyncError::Serde(e.to_string()))?;
+    let envelope = Envelope {
+        version: PROTOCOL_VERSION,
+        message_type: msg_type,
+        payload,
+    };
+    rmp_serde::to_vec(&envelope).map_err(|e| SyncError::Serde(e.to_string()))
+}
+
 pub fn decode(data: &[u8]) -> Result<Envelope, SyncError> {
     let envelope: Envelope =
         rmp_serde::from_slice(data).map_err(|e| SyncError::Serde(e.to_string()))?;
@@ -475,6 +557,8 @@ impl From<ChangeSet> for WireChangeSet {
             ddl_lsn: value.ddl_lsn,
             ddl_provenance: Vec::new(),
             purges: Vec::new(),
+            // Statement 9: ordinary unmanifested changes start with an empty lane.
+            manifests: Vec::new(),
             rows: value.rows.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
             vectors: value.vectors.into_iter().map(Into::into).collect(),
@@ -486,6 +570,12 @@ impl TryFrom<WireChangeSet> for ChangeSet {
     type Error = SyncError;
 
     fn try_from(value: WireChangeSet) -> Result<Self, Self::Error> {
+        // Statements 9/10: row-only conversion must never discard unverified manifests.
+        if !value.manifests.is_empty() {
+            return Err(SyncError::Protocol(
+                "delivery manifest verification is not implemented".to_string(),
+            ));
+        }
         if !value.purges.is_empty() {
             return Err(SyncError::Protocol(
                 "PURGE instructions cannot be converted through ordinary row apply".to_string(),
@@ -1080,7 +1170,182 @@ pub struct SyncStatusResponse {
     /// The server's current LSN clock (contract item 4, pull-side resume).
     #[serde(default)]
     pub server_current_lsn: Option<Lsn>,
+    // Statement 15: ordinary status reports the current custody authority.
+    #[serde(default)]
+    pub hub_incarnation: Option<Incarnation>,
 }
+// Statement 9: manifests live directly in the ordinary changeset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireDeliveryManifest {
+    #[serde(with = "serde_bytes")]
+    pub submission_id: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub seal: Vec<u8>,
+    pub life_evidence: Vec<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
+    pub materialization_projection: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub policy_evidence: Vec<u8>,
+    pub retained_slots: Vec<Vec<u8>>,
+    pub erased_slot_count: u64,
+    #[serde(with = "serde_bytes")]
+    pub submission_signature: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub disclosure: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub disclosure_signature: Vec<u8>,
+    #[serde(deserialize_with = "required_custody_field")]
+    pub erasure_authorization: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "test-seams")]
+impl WireDeliveryManifest {
+    /// Inspect the canonical seal without treating inspection as authentication.
+    #[doc(hidden)]
+    pub fn root_table_for_test(&self) -> Option<&str> {
+        crate::custody::decoder::SealView::read(&self.seal)
+            .ok()
+            .map(|s| s.root_table)
+    }
+
+    #[doc(hidden)]
+    pub fn member_count_for_test(&self) -> Option<u64> {
+        crate::custody::decoder::SealView::read(&self.seal)
+            .ok()
+            .map(|s| s.member_count)
+    }
+
+    #[doc(hidden)]
+    pub fn unit_digest_for_test(&self) -> Option<[u8; 32]> {
+        crate::custody::decoder::SealView::read(&self.seal)
+            .ok()
+            .map(|s| s.unit_digest)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireDeliveryOutcome {
+    #[serde(with = "serde_bytes")]
+    pub lookup_submission: Vec<u8>,
+    pub lookup_seal_digest: [u8; 32],
+    pub lookup_origin_life_digest: [u8; 32],
+    #[serde(with = "serde_bytes")]
+    pub lookup_source: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub signed_core: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub diagnostic_body: Vec<u8>,
+}
+
+#[cfg(feature = "test-seams")]
+impl WireDeliveryOutcome {
+    /// Inspect the canonical core without treating inspection as authentication.
+    #[doc(hidden)]
+    pub fn outcome_for_test(&self) -> Option<&str> {
+        crate::custody::decoder::TerminalView::read(&self.signed_core)
+            .ok()
+            .map(|s| s.kind)
+    }
+
+    #[doc(hidden)]
+    pub fn cause_for_test(&self) -> Option<&str> {
+        crate::custody::decoder::TerminalView::read(&self.signed_core)
+            .ok()
+            .and_then(|s| s.cause)
+    }
+}
+
+// Statements 9/13: no separate delivery push request, wrapper, or result.
+fn required_custody_field<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer)
+}
+
+macro_rules! custody_request {
+    ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            pub format: u8,
+            pub tenant_id: String,
+            pub edge_incarnation: Incarnation,
+            pub request_nonce: [u8; 16],
+            $(#[serde(deserialize_with = "required_custody_field")] pub $field: $ty,)*
+        }
+    };
+}
+
+macro_rules! custody_response {
+    ($name:ident, $result:ty) => {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            pub format: u8,
+            pub request_nonce: [u8; 16],
+            pub hub_node_id: String,
+            pub hub_incarnation: Incarnation,
+            pub tenant_id: String,
+            pub edge_node_id: String,
+            pub edge_incarnation: Incarnation,
+            #[serde(deserialize_with = "required_custody_field")]
+            pub result: Option<$result>,
+            #[serde(deserialize_with = "required_custody_field")]
+            pub error: Option<String>,
+        }
+    };
+}
+
+custody_request!(BindApplicationTablePolicyRequest {
+    expectation: ApplicationTablePolicyExpectation,
+});
+/// A failed comparison and progress response carry no authority at all.
+/// Closed branches prevent a decoder from silently ignoring an injected scope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BindApplicationTablePolicyResponse {
+    Error(BindPolicyFailure),
+    Success(BindPolicySuccess),
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindPolicyFailure {
+    pub format: u8,
+    pub request_nonce: [u8; 16],
+    pub error: BindPolicyError,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum BindPolicyError {
+    TenantPolicyMismatch { table: String, clause: String },
+    TenantPolicyNotDeclared { table: String },
+    Operational { message: String },
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindPolicySuccess {
+    pub format: u8,
+    pub request_nonce: [u8; 16],
+    pub hub_node_id: String,
+    pub hub_incarnation: Incarnation,
+    pub tenant_id: String,
+    pub edge_node_id: String,
+    pub edge_incarnation: Incarnation,
+    pub binding: Vec<u8>,
+}
+custody_request!(FetchDeliveryOutcomesRequest {
+    since: Option<Vec<u8>>,
+});
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryOutcomePage {
+    pub outcomes: Vec<WireDeliveryOutcome>,
+}
+custody_response!(FetchDeliveryOutcomesResponse, DeliveryOutcomePage);
 
 /// The payload bytes a set of row changes carries: each row's own values,
 /// serialized. Table names, natural keys, the protocol envelope and transport

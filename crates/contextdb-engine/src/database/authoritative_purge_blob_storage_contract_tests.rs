@@ -98,6 +98,7 @@ fn incoming_purge_atomically_destroys_present_rows_and_adopts_absent_roots() {
     for noncanonical_root in noncanonical_absent_roots {
         let invalid_items = vec![
             AuthoritativePurgeDeliveryItem {
+                node_local_predicate: None,
                 frontier: Lsn(20),
                 ordinal: 0,
                 table: "notes".to_string(),
@@ -106,6 +107,7 @@ fn incoming_purge_atomically_destroys_present_rows_and_adopts_absent_roots() {
                 purged_lineage_roots: vec![present.lineage_root.clone()],
             },
             AuthoritativePurgeDeliveryItem {
+                node_local_predicate: None,
                 frontier: Lsn(20),
                 ordinal: 1,
                 table: "notes".to_string(),
@@ -127,6 +129,7 @@ fn incoming_purge_atomically_destroys_present_rows_and_adopts_absent_roots() {
     }
     let items = vec![
         AuthoritativePurgeDeliveryItem {
+            node_local_predicate: None,
             frontier: Lsn(20),
             ordinal: 0,
             table: "notes".to_string(),
@@ -135,6 +138,7 @@ fn incoming_purge_atomically_destroys_present_rows_and_adopts_absent_roots() {
             purged_lineage_roots: vec![present.lineage_root.clone()],
         },
         AuthoritativePurgeDeliveryItem {
+            node_local_predicate: None,
             frontier: Lsn(20),
             ordinal: 1,
             table: "notes".to_string(),
