@@ -43,6 +43,11 @@ Earlier versions: see git tags.
   maintenance cycle (including the engine-owned background worker) used to stop with
   "called `Option::unwrap()` on a `None` value"; the emptied partition now serves no rows and
   accepts new ones.
+- **Fixed.** A `PURGE` that selects a row written again at a previously purged key erases it
+  instead of failing with "authoritative purge lifecycle record no longer proves the selected
+  lineage root", on the hub, on node-local tables, and on edges applying the hub's later purge.
+  Each purged life of a key keeps its own permanent tombstone when a later life of that key is
+  purged, deleted, or discarded, and a new write at a purged key is accepted after reopen.
 - **Fixed.** Full-schema sync restores preserve authored `CONTEXT_ID`, `SCOPE_LABEL`, and
   `SCOPE_LABEL_READ ... WRITE ...` declarations, so restored peers enforce the same Context and
   scope rules. Rendered `.schema` now preserves those declarations too. Authenticated original DDL

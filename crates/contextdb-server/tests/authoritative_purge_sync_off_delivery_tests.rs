@@ -1,7 +1,9 @@
 //! An authoritative purge reaches a sync-off edge while ordinary rows stay local.
 
-use contextdb_core::{SyncDirection, TenantId, Value};
+use contextdb_core::{Lsn, SyncDirection, TenantId, Value};
 use contextdb_engine::Database;
+use contextdb_engine::database::AuthoritativePurgeRootClassification;
+use contextdb_engine::sync_types::NaturalKey;
 use contextdb_server::transport::iroh::IrohServer;
 use contextdb_server::{FabricIdentity, SyncClient, SyncServer, peer_dial_spec};
 use std::collections::HashMap;
@@ -313,6 +315,84 @@ async fn authoritative_purge_reaches_sync_off_edge_while_ordinary_rows_stay_loca
         body(&hub.db, edge_control_id),
         None,
         "the edge-local control row remains absent at the hub"
+    );
+
+    // A new edge-local life at the purged key is erased by the next instruction
+    // that selects it, and the first life keeps its tombstone.
+    let first_state = edge.durable_deletion_state_for_test(TABLE, &Value::Uuid(selected_id));
+    let edge_first_frontier = first_state
+        .purge_frontier
+        .expect("the edge frontier exists")
+        .parse::<u64>()
+        .expect("the edge frontier is an LSN");
+    let generation = first_state
+        .table_generation
+        .expect("the purged key keeps its lineage lifecycle");
+    let selected_key = NaturalKey::single("id".to_string(), Value::Uuid(selected_id));
+    insert(&edge, selected_id, "new edge-local life");
+    let repeated = hub
+        .db
+        .execute(
+            "PURGE FROM sync_off_notes WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
+        )
+        .expect("the hub issues the node-local instruction again");
+    assert_eq!(
+        repeated.rows_affected, 0,
+        "the hub holds no row at that key"
+    );
+    within(client.pull_default())
+        .await
+        .expect("sync-off edge applies the repeated instruction to its new life");
+    assert_eq!(
+        body(&edge, selected_id),
+        None,
+        "the repeated instruction erases the new edge-local life"
+    );
+    let second_state = edge.durable_deletion_state_for_test(TABLE, &Value::Uuid(selected_id));
+    let second_root = second_state
+        .lineage_root
+        .expect("the second purge names the new life's root");
+    assert_ne!(
+        second_root, hub_root,
+        "the new edge-local write is a new lineage"
+    );
+    let second_frontier = second_state
+        .purge_frontier
+        .expect("the second purge has a permanent frontier")
+        .parse::<u64>()
+        .expect("the second frontier is an LSN");
+    assert!(second_frontier > edge_first_frontier);
+    assert_eq!(
+        edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &hub_root
+        ),
+        AuthoritativePurgeRootClassification::Purged {
+            permanent_frontier: Lsn(edge_first_frontier)
+        },
+        "the first life keeps its tombstone"
+    );
+    assert_eq!(
+        edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &second_root
+        ),
+        AuthoritativePurgeRootClassification::Purged {
+            permanent_frontier: Lsn(second_frontier)
+        }
+    );
+    assert_eq!(
+        body(&edge, survivor_id).as_deref(),
+        Some("unrelated hub survivor")
+    );
+    assert_eq!(
+        body(&edge, edge_control_id).as_deref(),
+        Some("edge-local control row")
     );
 
     within(client.shutdown()).await;

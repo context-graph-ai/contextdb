@@ -1713,6 +1713,19 @@ first application. An all-empty purge containing only key-based selections write
 Application-table survivor lists are empty: ordinary columns have no engine blob-reference value
 type; the work-ledger blob reference surface owns nonempty blob-survivor reports.
 
+A purge tombstone bans the purged lineage, never the key. A row written at a purged key after the
+purge is new data: a later `PURGE` that selects it erases it like any other row, on the hub, on a
+node-local table, and on every edge that applies the hub's purges, including an edge that learns
+several purges of one key in a single pull. Every purged life of the key stays permanently refused,
+with its own frontier, after reopen and after a later life of the key is deleted, discarded, or
+purged.
+<!-- enforced by: crates/contextdb-engine/tests/custody_purge_and_discard_contract.rs::a_purge_erases_a_row_written_again_at_a_purged_key_and_every_purged_life_stays_refused -->
+<!-- enforced by: crates/contextdb-engine/tests/custody_purge_and_discard_contract.rs::a_purged_key_accepts_a_new_write_after_reopen_and_every_purged_life_stays_refused -->
+<!-- enforced by: crates/contextdb-engine/tests/custody_purge_and_discard_contract.rs::an_ordinary_delete_of_a_later_life_keeps_the_purged_life_refused -->
+<!-- enforced by: crates/contextdb-server/tests/authoritative_purge_fresh_same_key_lineage_tests.rs::fresh_same_key_insert_after_authoritative_purge_starts_new_lineage_and_syncs -->
+<!-- enforced by: crates/contextdb-server/tests/authoritative_purge_fresh_same_key_lineage_tests.rs::deleting_a_new_same_key_life_keeps_the_purged_life_refused_on_hub_and_edge -->
+<!-- enforced by: crates/contextdb-server/tests/authoritative_purge_sync_off_delivery_tests.rs::authoritative_purge_reaches_sync_off_edge_while_ordinary_rows_stay_local -->
+
 Declarations and bindings report `TenantPolicyNotDeclared`, `TenantPolicyMismatch`,
 `TenantPolicyBound`, `TableBindingMismatch`, or `DeclaredPolicyPreserved` as appropriate.
 Manifest registration reports `ManifestRequired`, `ManifestIncomplete`, or

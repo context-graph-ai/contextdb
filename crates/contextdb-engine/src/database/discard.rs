@@ -275,8 +275,12 @@ impl Database {
                 owner.row_sidecar_key.clone(),
                 owner.creation_lineage_key.clone(),
                 owner.accepted_author_key.clone(),
-                owner.lifecycle_record_key.clone(),
             ]);
+            // A record of an earlier life at the key, such as a purge
+            // tombstone or an owed delete, is not the discarded life's.
+            if owner.lifecycle_record_is_selected_life {
+                keys.push(owner.lifecycle_record_key.clone());
+            }
         }
         keys.extend(prepared.graph_arrival_config_keys.iter().cloned());
         // Discarded sidecars cannot be rewritten by earlier work in this transaction.
@@ -317,7 +321,9 @@ impl Database {
             lineage
                 .unbound_creations
                 .remove(&owner.creation_lineage_key);
-            lineage.records.remove(&owner.lifecycle_record_key);
+            if owner.lifecycle_record_is_selected_life {
+                lineage.records.remove(&owner.lifecycle_record_key);
+            }
         }
         let publication = prepared.publication_replacements;
         let mut memory = PreparedMemorySwap::prepare(

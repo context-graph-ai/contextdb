@@ -74,6 +74,7 @@ count, never raise it) and `timestamp_audit.rs` beside it.
 | Server sync and transport sources are byte-exact engine mirrors | `tests/sync_source_mirror_tests.rs::server_sync_sources_are_exact_engine_audit_mirrors` |
 | A failed synced commit publishes neither row nor receipt | `tests/sync_receipt_atomicity_tests.rs::failed_synced_commit_publishes_neither_row_nor_authenticated_receipt` |
 | Engine-owned ledger tables refuse local conflict-policy declarations | `tests/show_sync_conflict_policy_tests.rs::engine_owned_work_ledger_arbitration_refuses_a_local_declaration_attempt` |
+| A purged lineage stays refused after a same-key rewrite and reopen | `tests/custody_purge_and_discard_contract.rs::a_purge_erases_a_row_written_again_at_a_purged_key_and_every_purged_life_stays_refused` |
 | `PURGE` runs only standalone; `DISCARD` is refused on a hub-bound node | `src/database/authoritative_purge_public_contract_tests.rs::public_purge_requires_standalone_execution_without_invalidating_transactions`, `tests/custody_purge_and_discard_contract.rs::edge_discard_follows_declared_modes_and_one_local_transaction_boundary` |
 | An incoming sync row cannot revive a row its tombstone deleted | unguarded — no test drives the tombstone check on sync apply directly |
 | Every function `eval_function` accepts is also in the ORDER BY allowlist | unguarded — the two lists are hand-synced |

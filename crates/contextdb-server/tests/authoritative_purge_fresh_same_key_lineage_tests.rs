@@ -1,4 +1,4 @@
-use contextdb_core::{TenantId, Value};
+use contextdb_core::{Lsn, TenantId, Value};
 use contextdb_engine::Database;
 use contextdb_engine::database::AuthoritativePurgeRootClassification;
 use contextdb_engine::sync_types::NaturalKey;
@@ -48,6 +48,48 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
         Value::Text(body) => body.clone(),
         value => panic!("notes.body must be TEXT, got {value:?}"),
     })
+}
+
+fn purge_frontier_of(db: &Database, id: Uuid) -> u64 {
+    db.durable_deletion_state_for_test(TABLE, &Value::Uuid(id))
+        .purge_frontier
+        .expect("the purged key carries a permanent frontier")
+        .parse::<u64>()
+        .expect("the permanent frontier is an LSN")
+}
+
+fn purged_at(frontier: u64) -> AuthoritativePurgeRootClassification {
+    AuthoritativePurgeRootClassification::Purged {
+        permanent_frontier: Lsn(frontier),
+    }
+}
+
+fn permanent_frontier(classification: AuthoritativePurgeRootClassification) -> u64 {
+    match classification {
+        AuthoritativePurgeRootClassification::Purged { permanent_frontier } => permanent_frontier.0,
+        AuthoritativePurgeRootClassification::NotPurged => {
+            panic!("the purged lineage root must stay permanently refused")
+        }
+    }
+}
+
+fn open_edge(
+    root: &Path,
+    name: &str,
+    hub_ticket: &str,
+    tenant: &str,
+) -> (Arc<Database>, SyncClient) {
+    let identity = root.join(format!("{name}.db.fabric-identity.key"));
+    FabricIdentity::load_or_generate(&identity)
+        .expect("persist stable authenticated edge identity");
+    let db =
+        Arc::new(Database::open(root.join(format!("{name}.db"))).expect("open file-backed edge"));
+    let client = SyncClient::new(
+        db.clone(),
+        &peer_dial_spec(hub_ticket, &identity),
+        TenantId::from(tenant),
+    );
+    (db, client)
 }
 
 struct Hub {
@@ -131,6 +173,16 @@ async fn fresh_same_key_insert_after_authoritative_purge_starts_new_lineage_and_
         Some("unrelated hub survivor"),
         "baseline pull preserves the unrelated survivor"
     );
+    // A second edge holds the first life and stays offline until both purges exist.
+    let (holding_edge, holding_client) =
+        open_edge(root.path(), "holding-edge", &hub.ticket, tenant);
+    within(holding_client.pull_default())
+        .await
+        .expect("the holding edge receives the first life");
+    assert_eq!(
+        body(&holding_edge, selected_id).as_deref(),
+        Some("selected hub row")
+    );
     let old_hub_sidecar = hub
         .db
         .authoritative_purge_current_live_row_sidecar_for_test(TABLE, &selected_key)
@@ -147,6 +199,7 @@ async fn fresh_same_key_insert_after_authoritative_purge_starts_new_lineage_and_
             &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
         )
         .expect("public authoritative purge removes the selected row");
+    let hub_first_frontier = purge_frontier_of(&hub.db, selected_id);
     within(client.pull_default())
         .await
         .expect("edge receives the authoritative purge before any new write");
@@ -307,6 +360,236 @@ async fn fresh_same_key_insert_after_authoritative_purge_starts_new_lineage_and_
     assert_eq!(
         body(&edge, survivor_id).as_deref(),
         Some("unrelated hub survivor")
+    );
+    let edge_first_frontier = edge_purge_frontier
+        .parse::<u64>()
+        .expect("the edge frontier is an LSN");
+
+    // The new life at the purged key is purged like any other row.
+    let second_purge = hub
+        .db
+        .execute(
+            "PURGE FROM notes WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
+        )
+        .expect("the hub purges the new life at the purged key");
+    assert_eq!(second_purge.rows_affected, 1);
+    assert_eq!(body(&hub.db, selected_id), None);
+    assert_eq!(
+        hub.db
+            .durable_deletion_state_for_test(TABLE, &Value::Uuid(selected_id))
+            .lineage_root
+            .as_deref(),
+        Some(fresh_root.as_str())
+    );
+    let hub_second_frontier = purge_frontier_of(&hub.db, selected_id);
+    assert!(hub_second_frontier > hub_first_frontier);
+    let generation = fresh_hub_sidecar.table_generation;
+    assert_eq!(
+        hub.db.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &old_root
+        ),
+        purged_at(hub_first_frontier),
+        "the hub keeps the first life's tombstone"
+    );
+    assert_eq!(
+        hub.db.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &fresh_root
+        ),
+        purged_at(hub_second_frontier)
+    );
+
+    within(client.pull_default())
+        .await
+        .expect("the edge applies the second purge of the same key");
+    assert_eq!(body(&edge, selected_id), None, "the new life is erased");
+    let edge_second_frontier = purge_frontier_of(&edge, selected_id);
+    assert!(edge_second_frontier > edge_first_frontier);
+    assert_eq!(
+        edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &old_root
+        ),
+        purged_at(edge_first_frontier),
+        "the edge keeps the first life's tombstone"
+    );
+    assert_eq!(
+        edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &fresh_root
+        ),
+        purged_at(edge_second_frontier)
+    );
+    assert_eq!(
+        body(&edge, survivor_id).as_deref(),
+        Some("unrelated hub survivor")
+    );
+
+    // The holding edge learns both purges in one pull while it still holds the first life.
+    within(holding_client.pull_default())
+        .await
+        .expect("an edge holding the first life applies both purges in one pull");
+    assert_eq!(body(&holding_edge, selected_id), None);
+    assert_eq!(
+        body(&holding_edge, survivor_id).as_deref(),
+        Some("unrelated hub survivor")
+    );
+    let holding_first =
+        permanent_frontier(holding_edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &old_root,
+        ));
+    let holding_second = purge_frontier_of(&holding_edge, selected_id);
+    assert!(holding_second > holding_first);
+    assert_eq!(
+        holding_edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &fresh_root
+        ),
+        purged_at(holding_second)
+    );
+
+    // A blank edge learns both purges in one pull and keeps both tombstones.
+    let (blank_edge, blank_client) = open_edge(root.path(), "blank-edge", &hub.ticket, tenant);
+    within(blank_client.pull_default())
+        .await
+        .expect("a blank edge applies both purges of one key in one pull");
+    assert_eq!(body(&blank_edge, selected_id), None);
+    let blank_first = permanent_frontier(blank_edge.classify_authoritative_purge_root_for_test(
+        TABLE,
+        generation,
+        &selected_key,
+        &old_root,
+    ));
+    let blank_second = purge_frontier_of(&blank_edge, selected_id);
+    assert_eq!(
+        blank_edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &fresh_root
+        ),
+        purged_at(blank_second)
+    );
+    assert!(blank_second > blank_first);
+    within(blank_client.pull_default())
+        .await
+        .expect("repeating the delivered purges is idempotent");
+    assert_eq!(
+        blank_edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &old_root
+        ),
+        purged_at(blank_first)
+    );
+    assert_eq!(
+        blank_edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &fresh_root
+        ),
+        purged_at(blank_second)
+    );
+    assert_eq!(
+        body(&blank_edge, survivor_id).as_deref(),
+        Some("unrelated hub survivor")
+    );
+
+    within(blank_client.shutdown()).await;
+    within(holding_client.shutdown()).await;
+    within(client.shutdown()).await;
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn deleting_a_new_same_key_life_keeps_the_purged_life_refused_on_hub_and_edge() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let tenant = "delete-after-authoritative-purge";
+    let selected_id = Uuid::from_u128(0x0c3e_7a51_92d4_4f1b_a6e8_31c0_5d27_1001);
+    let selected_key = NaturalKey::single("id".to_string(), Value::Uuid(selected_id));
+    let hub = start_hub(root.path(), tenant).await;
+    insert(&hub.db, selected_id, "selected hub row");
+    let (edge, client) = open_edge(root.path(), "edge", &hub.ticket, tenant);
+    within(client.pull_default())
+        .await
+        .expect("baseline pull installs the hub schema and row");
+    let old_root = hub
+        .db
+        .authoritative_purge_current_live_row_sidecar_for_test(TABLE, &selected_key)
+        .expect("hub exposes the selected live lineage before purge")
+        .lineage_root;
+    hub.db
+        .execute(
+            "PURGE FROM notes WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
+        )
+        .expect("the hub purges the first life");
+    let hub_frontier = purge_frontier_of(&hub.db, selected_id);
+    let generation = hub
+        .db
+        .durable_deletion_state_for_test(TABLE, &Value::Uuid(selected_id))
+        .table_generation
+        .expect("the purged key keeps its lineage lifecycle");
+    within(client.pull_default())
+        .await
+        .expect("the edge applies the purge");
+    let edge_frontier = purge_frontier_of(&edge, selected_id);
+
+    insert(&edge, selected_id, "fresh edge same-key row");
+    within(client.push())
+        .await
+        .expect("the new life reaches the hub");
+    assert_eq!(
+        body(&hub.db, selected_id).as_deref(),
+        Some("fresh edge same-key row")
+    );
+
+    hub.db
+        .execute(
+            "DELETE FROM notes WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
+        )
+        .expect("the hub deletes the new life");
+    assert_eq!(
+        hub.db.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &old_root
+        ),
+        purged_at(hub_frontier),
+        "the hub's delete of a later life keeps the purged life's tombstone"
+    );
+    within(client.pull_default())
+        .await
+        .expect("the edge learns the hub delete of the new life");
+    assert_eq!(body(&edge, selected_id), None);
+    assert_eq!(
+        edge.classify_authoritative_purge_root_for_test(
+            TABLE,
+            generation,
+            &selected_key,
+            &old_root
+        ),
+        purged_at(edge_frontier),
+        "a learned delete of a later life keeps the edge's purged-life tombstone"
     );
 
     within(client.shutdown()).await;

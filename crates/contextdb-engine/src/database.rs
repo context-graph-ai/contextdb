@@ -4169,6 +4169,66 @@ struct DurableLineageRecord {
     purge_frontier: Option<String>,
 }
 
+/// What reopen must restore from lifecycle records and purged-life history:
+/// no LSN is issued at or below a permanent frontier, and no RowId is issued
+/// again after the row that held it was physically erased.
+#[derive(Default)]
+struct DurableLineageRecoveryBounds {
+    purge_frontier_max_lsn: Lsn,
+    max_row_id: RowId,
+}
+
+impl DurableLineageRecoveryBounds {
+    fn admit(&mut self, key: &str, bytes: &[u8]) -> Result<()> {
+        let record = RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes)?;
+        let is_history = key.starts_with(Database::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX);
+        let expected_key = if is_history {
+            Database::durable_purged_lineage_history_key(&record)
+        } else {
+            Database::durable_lineage_config_key(
+                &record.table,
+                &record.natural_key,
+                record.table_generation,
+            )
+        };
+        if key != expected_key {
+            return Err(Error::SyncError(
+                "durable lineage lifecycle key disagrees with its canonical record".to_string(),
+            ));
+        }
+        match (record.delete_obligation, record.purge_frontier.as_deref()) {
+            (DurableDeleteObligation::Purged, Some(frontier)) => {
+                let frontier = frontier.parse::<u64>().map_err(|_| {
+                    Error::SyncError(
+                        "durable lineage purge frontier is not a valid LSN".to_string(),
+                    )
+                })?;
+                self.purge_frontier_max_lsn = self.purge_frontier_max_lsn.max(Lsn(frontier));
+            }
+            (DurableDeleteObligation::Purged, None) => {
+                return Err(Error::SyncError(
+                    "durable purged lineage is missing its permanent frontier".to_string(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(Error::SyncError(
+                    "non-purged durable lineage carries a purge frontier".to_string(),
+                ));
+            }
+            (_, None) if is_history => {
+                return Err(Error::SyncError(
+                    "durable purged-lineage history holds a non-purged record".to_string(),
+                ));
+            }
+            (_, None) => {}
+        }
+        if let Some(row_id) = record.local_row_id {
+            self.max_row_id = self.max_row_id.max(row_id);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DurablePendingDelete {
     row: RowChange,
@@ -4297,6 +4357,8 @@ struct InMemoryLineageState {
     unbound_creations: HashMap<String, DurableUnboundCreationLineage>,
     row_sidecars: HashMap<String, DurableRowLineageSidecar>,
     records: HashMap<String, DurableLineageRecord>,
+    /// Ordered so one key's purged lives are read as a key range.
+    purged_history: BTreeMap<String, DurableLineageRecord>,
     push_outcomes: HashMap<String, DurableSyncPushOutcome>,
 }
 
@@ -4308,6 +4370,7 @@ struct InMemoryLineageDelta {
     unbound_creations: HashMap<String, DurableUnboundCreationLineage>,
     row_sidecars: HashMap<String, DurableRowLineageSidecar>,
     records: HashMap<String, DurableLineageRecord>,
+    purged_history: HashMap<String, DurableLineageRecord>,
     push_outcomes: HashMap<String, DurableSyncPushOutcome>,
 }
 
@@ -5725,6 +5788,9 @@ struct AuthoritativePurgeLineageConfigOwners {
     accepted_author_key: String,
     accepted_author_memory_key: (String, Vec<u8>),
     lifecycle_record_key: String,
+    /// Whether the key's lifecycle record describes the selected life rather
+    /// than an earlier deleted or purged life at the same key.
+    lifecycle_record_is_selected_life: bool,
     lifecycle_template: AuthoritativePurgeLifecycleTemplate,
 }
 
@@ -14450,45 +14516,22 @@ impl Database {
             .map(|(lsn, _)| *lsn)
             .max()
             .unwrap_or(Lsn(0));
-        let purge_frontier_max_lsn = persistence
-            .load_config_values_with_prefix::<DurableLineageRecord>(
-                Self::DURABLE_LINEAGE_CONFIG_PREFIX,
-            )?
-            .into_iter()
-            .try_fold(Lsn(0), |maximum, (key, record)| {
-                let expected_key = Self::durable_lineage_config_key(
-                    &record.table,
-                    &record.natural_key,
-                    record.table_generation,
-                );
-                if key != expected_key {
-                    return Err(Error::SyncError(
-                        "durable lineage lifecycle key disagrees with its canonical record"
-                            .to_string(),
-                    ));
-                }
-                match (record.delete_obligation, record.purge_frontier.as_deref()) {
-                    (DurableDeleteObligation::Purged, Some(frontier)) => {
-                        let frontier = frontier.parse::<u64>().map_err(|_| {
-                            Error::SyncError(
-                                "durable lineage purge frontier is not a valid LSN".to_string(),
-                            )
-                        })?;
-                        Ok(maximum.max(Lsn(frontier)))
-                    }
-                    (DurableDeleteObligation::Purged, None) => Err(Error::SyncError(
-                        "durable purged lineage is missing its permanent frontier".to_string(),
-                    )),
-                    (_, Some(_)) => Err(Error::SyncError(
-                        "non-purged durable lineage carries a purge frontier".to_string(),
-                    )),
-                    (_, None) => Ok(maximum),
-                }
-            })?;
+        let mut lineage_bounds = DurableLineageRecoveryBounds::default();
+        for (key, bytes) in
+            persistence
+                .load_config_values_raw_with_prefix(Self::DURABLE_LINEAGE_CONFIG_PREFIX)?
+                .into_iter()
+                .chain(persistence.load_config_values_raw_with_prefix(
+                    Self::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX,
+                )?)
+        {
+            lineage_bounds.admit(&key, &bytes)?;
+        }
+        let max_row_id = max_row_id.max(lineage_bounds.max_row_id);
         let max_lsn = max_lsn_across_all(&relational, &graph, &vector)
             .max(commit_index_max_lsn)
             .max(ddl_max_lsn)
-            .max(purge_frontier_max_lsn);
+            .max(lineage_bounds.purge_frontier_max_lsn);
         relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
 
         let (initial_table_index, initial_lsn_refcounts) =
@@ -14737,50 +14780,19 @@ impl Database {
             .map(|(lsn, _)| *lsn)
             .max()
             .unwrap_or(Lsn(0));
-        let mut purge_frontier_max_lsn = Lsn(0);
+        let mut lineage_bounds = DurableLineageRecoveryBounds::default();
         for (key, bytes) in &config_values {
-            if !key.starts_with(Self::DURABLE_LINEAGE_CONFIG_PREFIX) {
-                continue;
-            }
-            let record = crate::persistence::RedbPersistence::decode_config_value::<
-                DurableLineageRecord,
-            >(bytes)?;
-            let expected_key = Self::durable_lineage_config_key(
-                &record.table,
-                &record.natural_key,
-                record.table_generation,
-            );
-            if *key != expected_key {
-                return Err(Error::SyncError(
-                    "durable lineage lifecycle key disagrees with its canonical record".to_string(),
-                ));
-            }
-            match (record.delete_obligation, record.purge_frontier.as_deref()) {
-                (DurableDeleteObligation::Purged, Some(frontier)) => {
-                    let frontier = frontier.parse::<u64>().map_err(|_| {
-                        Error::SyncError(
-                            "durable lineage purge frontier is not a valid LSN".to_string(),
-                        )
-                    })?;
-                    purge_frontier_max_lsn = purge_frontier_max_lsn.max(Lsn(frontier));
-                }
-                (DurableDeleteObligation::Purged, None) => {
-                    return Err(Error::SyncError(
-                        "durable purged lineage is missing its permanent frontier".to_string(),
-                    ));
-                }
-                (_, Some(_)) => {
-                    return Err(Error::SyncError(
-                        "non-purged durable lineage carries a purge frontier".to_string(),
-                    ));
-                }
-                (_, None) => {}
+            if key.starts_with(Self::DURABLE_LINEAGE_CONFIG_PREFIX)
+                || key.starts_with(Self::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX)
+            {
+                lineage_bounds.admit(key, bytes)?;
             }
         }
+        let max_row_id = max_row_id.max(lineage_bounds.max_row_id);
         let max_lsn = max_lsn_across_all(&relational, &graph, &vector)
             .max(commit_index_max_lsn)
             .max(ddl_max_lsn)
-            .max(purge_frontier_max_lsn);
+            .max(lineage_bounds.purge_frontier_max_lsn);
         register_loaded_dormant_vector_generations(
             &vector,
             vector_generation_catalog,
@@ -19563,6 +19575,157 @@ impl Database {
 
     const DURABLE_LINEAGE_CONFIG_PREFIX: &'static str = "sync_lineage.v1.record.";
 
+    /// A key's lifecycle record describes its current life. When a later life
+    /// replaces a purged record there, the purged life keeps its permanent
+    /// tombstone under this prefix, one entry per purged lineage root, written
+    /// in the same durable write as the replacement.
+    const DURABLE_PURGED_LINEAGE_HISTORY_PREFIX: &'static str = "sync_lineage.v1.purged.";
+
+    /// The `{generation}.{identity}` component shared by a key's lifecycle
+    /// record, row sidecar, and purged-life history.
+    fn durable_lineage_key_suffix(
+        table: &str,
+        natural_key: &NaturalKey,
+        generation: u64,
+    ) -> String {
+        format!(
+            "{generation:016x}.{}",
+            Self::hex_component(&sync_identity_key(table, natural_key))
+        )
+    }
+
+    fn durable_purged_lineage_history_key(record: &DurableLineageRecord) -> String {
+        format!(
+            "{}{}.{}",
+            Self::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX,
+            Self::durable_lineage_key_suffix(
+                &record.table,
+                &record.natural_key,
+                record.table_generation
+            ),
+            blake3::hash(record.lineage_root.as_bytes()).to_hex()
+        )
+    }
+
+    /// Every purged life of the key whose lifecycle suffix is `suffix`: the
+    /// current record when it is purged, then every earlier purged life.
+    fn purged_lineage_records_for_suffix(
+        &self,
+        state: &InMemoryLineageState,
+        suffix: &str,
+    ) -> Result<Vec<DurableLineageRecord>> {
+        let mut records = self
+            .load_lineage_record(
+                state,
+                &format!("{}{suffix}", Self::DURABLE_LINEAGE_CONFIG_PREFIX),
+            )?
+            .filter(|record| record.delete_obligation == DurableDeleteObligation::Purged)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let prefix = format!("{}{suffix}.", Self::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX);
+        match &self.persistence {
+            Some(persistence) => records.extend(
+                persistence
+                    .load_config_values_with_prefix::<DurableLineageRecord>(&prefix)?
+                    .into_iter()
+                    .map(|(_, record)| record),
+            ),
+            None => records.extend(
+                state
+                    .purged_history
+                    .range(prefix.clone()..)
+                    .take_while(|(key, _)| key.starts_with(&prefix))
+                    .map(|(_, record)| record.clone()),
+            ),
+        }
+        Ok(records)
+    }
+
+    fn purged_lineage_records(
+        &self,
+        state: &InMemoryLineageState,
+        table: &str,
+        natural_key: &NaturalKey,
+        generation: u64,
+    ) -> Result<Vec<DurableLineageRecord>> {
+        self.purged_lineage_records_for_suffix(
+            state,
+            &Self::durable_lineage_key_suffix(table, natural_key, generation),
+        )
+    }
+
+    fn purged_lineage_records_at_generation(
+        &self,
+        table: &str,
+        natural_key: &NaturalKey,
+        generation: u64,
+    ) -> Result<Vec<DurableLineageRecord>> {
+        let state = self.lineage_state_lock.lock();
+        self.purged_lineage_records(&state, table, natural_key, generation)
+    }
+
+    /// Every purged life that a later life has displaced from its key's
+    /// lifecycle record.
+    fn list_purged_lineage_history(
+        &self,
+        state: &InMemoryLineageState,
+    ) -> Result<Vec<DurableLineageRecord>> {
+        match &self.persistence {
+            Some(persistence) => Ok(persistence
+                .load_config_values_with_prefix::<DurableLineageRecord>(
+                    Self::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX,
+                )?
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect()),
+            None => Ok(state.purged_history.values().cloned().collect()),
+        }
+    }
+
+    /// For lifecycle writes applied in order, return the permanent history
+    /// entry of every purged record a write replaces with another life. The
+    /// caller persists these entries in the same durable write, so a purged
+    /// life's tombstone is never overwritten.
+    fn purged_lives_displaced_by(
+        &self,
+        writes: &[(String, DurableLineageRecord)],
+    ) -> Result<Vec<(String, DurableLineageRecord)>> {
+        let state = self.lineage_state_lock.lock();
+        let mut current = HashMap::<&str, DurableLineageRecord>::new();
+        let mut displaced = Vec::new();
+        for (key, incoming) in writes {
+            let slot = match current.get(key.as_str()) {
+                Some(record) => Some(record.clone()),
+                None => self.load_lineage_record(&state, key)?,
+            };
+            if let Some(slot) = slot
+                && slot.delete_obligation == DurableDeleteObligation::Purged
+                && slot.lineage_root != incoming.lineage_root
+            {
+                displaced.push((Self::durable_purged_lineage_history_key(&slot), slot));
+            }
+            current.insert(key.as_str(), incoming.clone());
+        }
+        Ok(displaced)
+    }
+
+    fn encoded_purged_lives_displaced_by(
+        &self,
+        writes: &[(String, Vec<u8>, DurableLineageRecord)],
+    ) -> Result<Vec<(String, Vec<u8>, DurableLineageRecord)>> {
+        self.purged_lives_displaced_by(
+            &writes
+                .iter()
+                .map(|(key, _, record)| (key.clone(), record.clone()))
+                .collect::<Vec<_>>(),
+        )?
+        .into_iter()
+        .map(|(key, record)| {
+            RedbPersistence::encode_config_value(&record).map(|bytes| (key, bytes, record))
+        })
+        .collect()
+    }
+
     fn load_unbound_creation_lineage(
         &self,
         state: &InMemoryLineageState,
@@ -19746,6 +19909,10 @@ impl Database {
                 delta
                     .records
                     .insert(key.clone(), RedbPersistence::decode_config_value(value)?);
+            } else if key.starts_with(Self::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX) {
+                delta
+                    .purged_history
+                    .insert(key.clone(), RedbPersistence::decode_config_value(value)?);
             }
         }
         Ok(delta)
@@ -19759,6 +19926,7 @@ impl Database {
         state.unbound_creations.extend(delta.unbound_creations);
         state.row_sidecars.extend(delta.row_sidecars);
         state.records.extend(delta.records);
+        state.purged_history.extend(delta.purged_history);
         state.push_outcomes.extend(delta.push_outcomes);
     }
 
@@ -19788,9 +19956,9 @@ impl Database {
         generation: u64,
     ) -> String {
         format!(
-            "{}{generation:016x}.{}",
+            "{}{}",
             Self::DURABLE_LINEAGE_CONFIG_PREFIX,
-            Self::hex_component(&sync_identity_key(table, natural_key))
+            Self::durable_lineage_key_suffix(table, natural_key, generation)
         )
     }
 
@@ -21698,6 +21866,22 @@ impl Database {
             }
             *encoded = RedbPersistence::encode_config_value(&record)?;
         }
+        // A later life's delete may replace an earlier life's purged record.
+        // The commit mutex is held, so the durable record read here is the
+        // one this write replaces; its tombstone commits in the same write.
+        let lifecycle_writes = ws
+            .config_writes
+            .iter()
+            .filter(|(key, _)| key.starts_with(Self::DURABLE_LINEAGE_CONFIG_PREFIX))
+            .map(|(key, encoded)| {
+                RedbPersistence::decode_config_value::<DurableLineageRecord>(encoded)
+                    .map(|record| (key.clone(), record))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (key, record) in self.purged_lives_displaced_by(&lifecycle_writes)? {
+            ws.config_writes
+                .push((key, RedbPersistence::encode_config_value(&record)?));
+        }
         Ok(())
     }
 
@@ -22978,7 +23162,7 @@ impl Database {
                 )));
             }
             let lineage = &matching[0].3;
-            let record = self.durable_lineage_record_at_generation(
+            let purged_lives = self.purged_lineage_records_at_generation(
                 &row.table,
                 &row.natural_key,
                 lineage.table_generation,
@@ -22989,7 +23173,7 @@ impl Database {
                     && item.natural_key == row.natural_key
                     && item.table_generation == lineage.table_generation
                     && item.purged_lineage_roots.contains(&lineage.lineage_root)
-            }) || record.is_some_and(|record| {
+            }) || purged_lives.iter().any(|record| {
                 record.delete_obligation == DurableDeleteObligation::Purged
                     && record.table == row.table
                     && record.natural_key == row.natural_key
@@ -23133,13 +23317,13 @@ impl Database {
             if lineage.table_generation >= current_generation {
                 continue;
             }
-            let record = self.durable_lineage_record_at_generation(
+            let purged_lives = self.purged_lineage_records_at_generation(
                 &row.table,
                 &row.natural_key,
                 lineage.table_generation,
             )?;
             let creator_incarnation = lineage.author_database_incarnation.to_hex();
-            let purged_lineage = record.is_some_and(|record| {
+            let purged_lineage = purged_lives.iter().any(|record| {
                 record.delete_obligation == DurableDeleteObligation::Purged
                     && record.lineage_root == lineage.lineage_root
                     && record.author_node_id.as_deref() == Some(lineage.author_node_id.as_str())
@@ -27314,59 +27498,62 @@ impl Database {
                 continue;
             };
             let generation = self.durable_lineage_table_generation(table)?;
-            let Some(record) =
-                self.durable_lineage_record_at_generation(table, &natural_key, generation)?
-            else {
+            let purged_lives =
+                self.purged_lineage_records_at_generation(table, &natural_key, generation)?;
+            if purged_lives.is_empty() {
                 continue;
-            };
-            let Some(frontier) = record
-                .purge_frontier
-                .as_deref()
-                .and_then(|frontier| frontier.parse::<u64>().ok())
-            else {
-                continue;
-            };
+            }
             let sidecar_key = Self::durable_row_lineage_config_key(table, &natural_key, generation);
             if let Some((_, encoded)) = ws.config_writes.iter().find(|(key, _)| key == &sidecar_key)
             {
                 let incoming: DurableRowLineageSidecar =
                     RedbPersistence::decode_config_value(encoded)?;
-                Self::reject_if_incoming_lineage_matches_purged(
-                    &record,
-                    table,
-                    &natural_key,
-                    incoming.table_generation,
-                    &incoming.lineage_root,
-                    &incoming.author_node_id,
-                    &incoming.author_database_incarnation.to_hex(),
-                    incoming.author_local_mutation_position.0,
-                )?;
+                for record in &purged_lives {
+                    Self::reject_if_incoming_lineage_matches_purged(
+                        record,
+                        table,
+                        &natural_key,
+                        incoming.table_generation,
+                        &incoming.lineage_root,
+                        &incoming.author_node_id,
+                        &incoming.author_database_incarnation.to_hex(),
+                        incoming.author_local_mutation_position.0,
+                    )?;
+                }
                 // Authenticated ancestry is the discriminator for this staged
                 // sync row. A different creator root is a fresh lineage even
                 // if adjudication began while the old local RowId was visible.
                 continue;
             }
-            if record.local_row_id == Some(row.row_id) {
-                return Err(Error::PurgeCausalityFence {
-                    table: table.clone(),
-                    key: natural_key.pairs(),
-                    lineage_root: record.lineage_root,
-                    frontier: Lsn(frontier),
-                });
+            for record in purged_lives {
+                if record.local_row_id != Some(row.row_id) {
+                    continue;
+                }
+                if let Some(frontier) = record
+                    .purge_frontier
+                    .as_deref()
+                    .and_then(|frontier| frontier.parse::<u64>().ok())
+                {
+                    return Err(Error::PurgeCausalityFence {
+                        table: table.clone(),
+                        key: natural_key.pairs(),
+                        lineage_root: record.lineage_root,
+                        frontier: Lsn(frontier),
+                    });
+                }
             }
         }
         for (key, encoded) in &ws.config_writes {
             if let Some(suffix) = key.strip_prefix("sync_row_lineage.v1.") {
                 let incoming: DurableRowLineageSidecar =
                     RedbPersistence::decode_config_value(encoded)?;
-                let lifecycle_key = format!("{}{suffix}", Self::DURABLE_LINEAGE_CONFIG_PREFIX);
-                let current = {
+                let purged_lives = {
                     let lineage_state = self.lineage_state_lock.lock();
-                    self.load_lineage_record(&lineage_state, &lifecycle_key)?
+                    self.purged_lineage_records_for_suffix(&lineage_state, suffix)?
                 };
-                if let Some(current) = current {
+                for current in &purged_lives {
                     Self::reject_if_incoming_lineage_matches_purged(
-                        &current,
+                        current,
                         &current.table,
                         &current.natural_key,
                         incoming.table_generation,
@@ -27378,15 +27565,15 @@ impl Database {
                 }
                 continue;
             }
-            if key.starts_with(Self::DURABLE_LINEAGE_CONFIG_PREFIX) {
+            if let Some(suffix) = key.strip_prefix(Self::DURABLE_LINEAGE_CONFIG_PREFIX) {
                 let incoming: DurableLineageRecord = RedbPersistence::decode_config_value(encoded)?;
-                let current = {
+                let purged_lives = {
                     let lineage_state = self.lineage_state_lock.lock();
-                    self.load_lineage_record(&lineage_state, key)?
+                    self.purged_lineage_records_for_suffix(&lineage_state, suffix)?
                 };
-                if let Some(current) = current {
+                for current in &purged_lives {
                     Self::reject_if_incoming_lineage_matches_purged(
-                        &current,
+                        current,
                         &incoming.table,
                         &incoming.natural_key,
                         incoming.table_generation,
@@ -31865,6 +32052,8 @@ impl Database {
                     && record.natural_key == *natural_key
                     && record.table_generation == table_generation
                     && record.local_row_id == Some(local_row_id)
+                    // A purged life is never the creation witness of a live row.
+                    && record.delete_obligation != DurableDeleteObligation::Purged
             })
         {
             record.lineage_root
@@ -31886,6 +32075,13 @@ impl Database {
     /// copies.  A natural key is not enough: a delete/reinsert race may have
     /// created another life at the same key, so every durable witness must
     /// still name the pinned local RowId and the same lineage root.
+    ///
+    /// The key's lifecycle record may instead describe an earlier life: one
+    /// deleted or purged before the pinned row was written. Such a record
+    /// names another lineage root and another row, is not evidence about the
+    /// selected life, and is returned as `lifecycle: None`. The pinned row is
+    /// still visible, so no committed delete or purge can describe it; a
+    /// record naming its row or its root must agree with it exactly.
     fn validate_authoritative_purge_selection(
         &self,
         selection: &AuthoritativePurgeSelection,
@@ -31918,7 +32114,12 @@ impl Database {
         let state = self.lineage_state_lock.lock();
         let sidecar = self.load_row_lineage_sidecar(&state, &row_sidecar_key)?;
         let creation = self.load_unbound_creation_lineage(&state, &creation_lineage_key)?;
-        let lifecycle = self.load_lineage_record(&state, &lifecycle_record_key)?;
+        let lifecycle = self
+            .load_lineage_record(&state, &lifecycle_record_key)?
+            .filter(|record| {
+                record.lineage_root == selection.lineage_root
+                    || record.local_row_id == Some(selection.local_row_id)
+            });
 
         if sidecar.is_none() && creation.is_none() && lifecycle.is_none() {
             return Err(Error::SyncError(
@@ -32345,6 +32546,7 @@ impl Database {
                 self.validate_authoritative_purge_selection(candidate)
                     .and_then(|witness| {
                         Self::authoritative_purge_lifecycle_template(candidate, &witness)
+                            .map(|template| (template, witness.lifecycle.is_some()))
                     })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -32616,35 +32818,38 @@ impl Database {
             .iter()
             .zip(lifecycle_templates)
             .map(
-                |(candidate, lifecycle_template)| AuthoritativePurgeLineageConfigOwners {
-                    row_sidecar_key: Self::durable_row_lineage_config_key(
-                        &candidate.table,
-                        &candidate.natural_key,
-                        candidate.table_generation,
-                    ),
-                    creation_lineage_key: Self::durable_unbound_creation_config_key(
-                        &candidate.table,
-                        &candidate.natural_key,
-                        candidate.table_generation,
-                        candidate.local_row_id,
-                    ),
-                    accepted_author_key: format!(
-                        "sync_row_author.{}",
-                        Self::hex_component(&sync_identity_key(
+                |(candidate, (lifecycle_template, lifecycle_record_is_selected_life))| {
+                    AuthoritativePurgeLineageConfigOwners {
+                        row_sidecar_key: Self::durable_row_lineage_config_key(
                             &candidate.table,
-                            &candidate.natural_key
-                        ))
-                    ),
-                    accepted_author_memory_key: (
-                        candidate.table.clone(),
-                        sync_identity_key(&candidate.table, &candidate.natural_key),
-                    ),
-                    lifecycle_record_key: Self::durable_lineage_config_key(
-                        &candidate.table,
-                        &candidate.natural_key,
-                        candidate.table_generation,
-                    ),
-                    lifecycle_template,
+                            &candidate.natural_key,
+                            candidate.table_generation,
+                        ),
+                        creation_lineage_key: Self::durable_unbound_creation_config_key(
+                            &candidate.table,
+                            &candidate.natural_key,
+                            candidate.table_generation,
+                            candidate.local_row_id,
+                        ),
+                        accepted_author_key: format!(
+                            "sync_row_author.{}",
+                            Self::hex_component(&sync_identity_key(
+                                &candidate.table,
+                                &candidate.natural_key
+                            ))
+                        ),
+                        accepted_author_memory_key: (
+                            candidate.table.clone(),
+                            sync_identity_key(&candidate.table, &candidate.natural_key),
+                        ),
+                        lifecycle_record_key: Self::durable_lineage_config_key(
+                            &candidate.table,
+                            &candidate.natural_key,
+                            candidate.table_generation,
+                        ),
+                        lifecycle_record_is_selected_life,
+                        lifecycle_template,
+                    }
                 },
             )
             .collect::<Vec<_>>();
@@ -33119,20 +33324,44 @@ impl Database {
                 item.table_generation,
             )?;
             if let Some(record) = existing.as_ref()
-                && record.delete_obligation == DurableDeleteObligation::Purged
-            {
-                if record.table != item.table
+                && (record.table != item.table
                     || record.natural_key != item.natural_key
-                    || record.table_generation != item.table_generation
-                    || !item.purged_lineage_roots.contains(&record.lineage_root)
-                {
-                    return Err(Error::SyncError(
-                        "authoritative purge delivery does not match the durable purged root"
-                            .to_string(),
-                    ));
-                }
+                    || record.table_generation != item.table_generation)
+            {
+                return Err(Error::SyncError(
+                    "authoritative purge delivery does not match the durable lineage record"
+                        .to_string(),
+                ));
+            }
+            // Re-delivery of a purge this node already applied is idempotent,
+            // whichever life the key holds now.
+            if self
+                .purged_lineage_records_at_generation(
+                    &item.table,
+                    &item.natural_key,
+                    item.table_generation,
+                )?
+                .iter()
+                .any(|record| item.purged_lineage_roots.contains(&record.lineage_root))
+            {
                 continue;
             }
+            // A record naming none of the purged roots belongs to an earlier
+            // life at the key. A purged one moves to its permanent history at
+            // commit; an accepted delete is superseded. A delete this edge
+            // still owes its hub must reach the hub before the purge applies.
+            let existing = match existing {
+                Some(record) if !item.purged_lineage_roots.contains(&record.lineage_root) => {
+                    if record.delete_obligation == DurableDeleteObligation::Pending {
+                        return Err(Error::SyncError(
+                            "authoritative purge waits for the pending delete of an earlier life at the same key"
+                                .to_string(),
+                        ));
+                    }
+                    None
+                }
+                other => other,
+            };
             let current_generation = self.durable_lineage_table_generation(&item.table).ok();
             let current_row_exists = current_generation == Some(item.table_generation)
                 && self
@@ -33142,9 +33371,30 @@ impl Database {
                         self.snapshot_for_read(),
                     )
                     .is_some();
+            let mut current_selection = None;
             if current_row_exists {
                 let selection =
                     self.resolve_authoritative_purge_selection(&item.table, &item.natural_key)?;
+                // The visible row may be an earlier life that an earlier purge
+                // in this same delivery erases first; this purge then only
+                // records its frontier after it.
+                let erased_earlier_in_delivery = selection.table_generation
+                    == item.table_generation
+                    && items.iter().any(|earlier| {
+                        earlier.frontier < item.frontier
+                            && earlier.node_local_predicate.is_none()
+                            && earlier.table == item.table
+                            && earlier.natural_key == item.natural_key
+                            && earlier.table_generation == item.table_generation
+                            && earlier
+                                .purged_lineage_roots
+                                .contains(&selection.lineage_root)
+                    });
+                if !erased_earlier_in_delivery {
+                    current_selection = Some(selection);
+                }
+            }
+            if let Some(selection) = current_selection {
                 if selection.table_generation != item.table_generation
                     || !item.purged_lineage_roots.contains(&selection.lineage_root)
                 {
@@ -33267,13 +33517,20 @@ impl Database {
                     Ok((key, bytes, record))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let purged_history = self.encoded_purged_lives_displaced_by(&records)?;
             let mut replacement = self.lineage_state_lock.lock().clone();
             for (key, _, record) in &records {
                 replacement.records.insert(key.clone(), record.clone());
             }
+            for (key, _, record) in &purged_history {
+                replacement
+                    .purged_history
+                    .insert(key.clone(), record.clone());
+            }
             persistence.flush_encoded_config_values(
-                records
+                purged_history
                     .iter()
+                    .chain(&records)
                     .map(|(key, bytes, _)| (key.as_str(), bytes.clone()))
                     .collect(),
             )?;
@@ -33395,6 +33652,10 @@ impl Database {
                             .map(|bytes| (key, bytes, lifecycle))
                     }))
                     .collect::<Result<Vec<_>>>()?;
+                // Read under the commit mutex: an earlier life's purged record
+                // at a selected key moves to its permanent history entry in
+                // this same write instead of being overwritten.
+                let purged_history = self.encoded_purged_lives_displaced_by(&lifecycle_records)?;
                 // Key selections and node-local instructions share one frontier.
                 let purge_delivery_items = if journal_outbound_delivery {
                     let keyed = selections
@@ -33482,6 +33743,11 @@ impl Database {
                     for (key, _, lifecycle) in &lifecycle_records {
                         replacement.records.insert(key.clone(), lifecycle.clone());
                     }
+                    for (key, _, lifecycle) in &purged_history {
+                        replacement
+                            .purged_history
+                            .insert(key.clone(), lifecycle.clone());
+                    }
                     replacement
                 };
                 let persistence_projection = AuthoritativePurgePersistenceProjection {
@@ -33519,8 +33785,9 @@ impl Database {
                                 .collect::<Vec<_>>(),
                         )?)
                         .collect(),
-                    lifecycle_records: lifecycle_records
+                    lifecycle_records: purged_history
                         .into_iter()
+                        .chain(lifecycle_records)
                         .map(|(key, bytes, _)| (key, bytes))
                         // Applying an instruction and its one-time receipt is atomic.
                         .chain(
@@ -33845,12 +34112,13 @@ impl Database {
         let _operation = self.assert_open_operation();
         let state = self.lineage_state_lock.lock();
         let record = self
-            .load_lineage_record(
-                &state,
-                &Self::durable_lineage_config_key(table, natural_key, table_generation),
-            )
+            .purged_lineage_records(&state, table, natural_key, table_generation)
             .ok()
-            .flatten();
+            .and_then(|records| {
+                records
+                    .into_iter()
+                    .find(|record| record.lineage_root == lineage_root)
+            });
         match record.and_then(|record| {
             (record.table == table
                 && record.natural_key == *natural_key
@@ -37445,6 +37713,7 @@ impl Database {
             .list_lineage_records(&state)?
             .into_iter()
             .map(|(_, record)| record)
+            .chain(self.list_purged_lineage_history(&state)?)
             .find(|record| {
                 record.delete_obligation == DurableDeleteObligation::Purged
                     && record

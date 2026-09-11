@@ -1896,3 +1896,253 @@ fn discard_transaction_writes() {
         vec![vec![Value::Text("new life".into())]]
     );
 }
+
+// A purge tombstone bans the purged lineage, never the key. A write
+// to a purged key after the purge is a new life that PURGE erases like any
+// other, while every earlier purged life stays permanently provable.
+const REPEATED_KEY: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001);
+
+fn repeated_key_params() -> HashMap<String, Value> {
+    HashMap::from([("id".to_string(), Value::Uuid(REPEATED_KEY))])
+}
+
+fn insert_repeated_key(db: &Database, table: &str) {
+    db.execute(
+        &format!("INSERT INTO {table} (id, batch) VALUES ($id, 'a')"),
+        &repeated_key_params(),
+    )
+    .expect("a write to a purged key is a new life and is accepted");
+    assert_eq!(
+        db.execute(
+            &format!("SELECT batch FROM {table} WHERE id = $id"),
+            &repeated_key_params(),
+        )
+        .expect("read the repeated key")
+        .rows,
+        vec![vec![text("a")]],
+        "the new life at the purged key is visible"
+    );
+}
+
+fn purge_batch_a(db: &Database, table: &str) -> u64 {
+    db.execute(&format!("PURGE FROM {table} WHERE batch = 'a'"), &p())
+        .expect("a standalone PURGE of the batch commits")
+        .rows_affected
+}
+
+/// The lineage root and permanent frontier the key's current lifecycle names.
+fn current_purged_life(db: &Database, table: &str) -> (String, u64) {
+    let state = db.durable_deletion_state_for_test(table, &Value::Uuid(REPEATED_KEY));
+    let root = state
+        .lineage_root
+        .expect("the purged key names the purged lineage root");
+    let frontier = state
+        .purge_frontier
+        .expect("the purged key carries a permanent frontier")
+        .parse::<u64>()
+        .expect("the permanent frontier is an LSN");
+    (root, frontier)
+}
+
+fn classify_repeated_key_root(
+    db: &Database,
+    table: &str,
+    root: &str,
+) -> contextdb_engine::database::AuthoritativePurgeRootClassification {
+    let generation = db
+        .durable_deletion_state_for_test(table, &Value::Uuid(REPEATED_KEY))
+        .table_generation
+        .expect("the key keeps its lineage lifecycle");
+    db.classify_authoritative_purge_root_for_test(table, generation, &key_of(REPEATED_KEY), root)
+}
+
+fn purged_at(frontier: u64) -> contextdb_engine::database::AuthoritativePurgeRootClassification {
+    contextdb_engine::database::AuthoritativePurgeRootClassification::Purged {
+        permanent_frontier: contextdb_core::Lsn(frontier),
+    }
+}
+
+fn row_total(db: &Database, table: &str) -> usize {
+    db.execute(&format!("SELECT id FROM {table}"), &p())
+        .expect("count the table")
+        .rows
+        .len()
+}
+
+#[test]
+fn a_purge_erases_a_row_written_again_at_a_purged_key_and_every_purged_life_stays_refused() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let db = Database::open(root.path().join("repeated-key.db")).expect("open the store");
+    db.execute(
+        "CREATE TABLE records (id UUID PRIMARY KEY, batch TEXT NOT NULL) SYNC OFF",
+        &p(),
+    )
+    .expect("declare the node-local table");
+
+    insert_repeated_key(&db, "records");
+    assert_eq!(
+        purge_batch_a(&db, "records"),
+        1,
+        "the first PURGE erases one row"
+    );
+    let (first_root, first_frontier) = current_purged_life(&db, "records");
+
+    insert_repeated_key(&db, "records");
+    assert_eq!(
+        purge_batch_a(&db, "records"),
+        1,
+        "the second PURGE erases the row written after the first purge"
+    );
+    assert_eq!(row_total(&db, "records"), 0, "no life of the key survives");
+    let (second_root, second_frontier) = current_purged_life(&db, "records");
+    assert_ne!(
+        second_root, first_root,
+        "the new write started a new lineage"
+    );
+    assert!(second_frontier > first_frontier);
+    assert_eq!(
+        classify_repeated_key_root(&db, "records", &first_root),
+        purged_at(first_frontier),
+        "the first life keeps its own permanent tombstone"
+    );
+    assert_eq!(
+        classify_repeated_key_root(&db, "records", &second_root),
+        purged_at(second_frontier)
+    );
+
+    // A local DISCARD of a later life leaves every fleet tombstone in place.
+    insert_repeated_key(&db, "records");
+    assert_eq!(
+        db.execute("DISCARD FROM records WHERE batch = 'a'", &p())
+            .expect("DISCARD of a later life at a purged key commits")
+            .rows_affected,
+        1
+    );
+    assert_eq!(row_total(&db, "records"), 0);
+    assert_eq!(
+        classify_repeated_key_root(&db, "records", &first_root),
+        purged_at(first_frontier)
+    );
+    assert_eq!(
+        classify_repeated_key_root(&db, "records", &second_root),
+        purged_at(second_frontier)
+    );
+
+    insert_repeated_key(&db, "records");
+    assert_eq!(purge_batch_a(&db, "records"), 1);
+    let (third_root, third_frontier) = current_purged_life(&db, "records");
+    assert!(third_root != first_root && third_root != second_root);
+    for (root, frontier) in [
+        (&first_root, first_frontier),
+        (&second_root, second_frontier),
+        (&third_root, third_frontier),
+    ] {
+        assert_eq!(
+            classify_repeated_key_root(&db, "records", root),
+            purged_at(frontier)
+        );
+    }
+
+    assert_eq!(
+        purge_batch_a(&db, "records"),
+        0,
+        "a PURGE that selects nothing erases nothing"
+    );
+    for (root, frontier) in [
+        (&first_root, first_frontier),
+        (&second_root, second_frontier),
+        (&third_root, third_frontier),
+    ] {
+        assert_eq!(
+            classify_repeated_key_root(&db, "records", root),
+            purged_at(frontier)
+        );
+    }
+    db.export_snapshot(root.path().join("repeated-key.export.db"))
+        .expect("a snapshot taken after every purge publishes");
+}
+
+#[test]
+fn a_purged_key_accepts_a_new_write_after_reopen_and_every_purged_life_stays_refused() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let path = root.path().join("reopened-key.db");
+    let db = Database::open(&path).expect("open the store");
+    db.execute(
+        "CREATE TABLE records (id UUID PRIMARY KEY, batch TEXT NOT NULL) SYNC OFF",
+        &p(),
+    )
+    .expect("declare the node-local table");
+    insert_repeated_key(&db, "records");
+    assert_eq!(purge_batch_a(&db, "records"), 1);
+    let (first_root, first_frontier) = current_purged_life(&db, "records");
+    drop(db);
+
+    let db = Database::open(&path).expect("reopen the store");
+    assert_eq!(
+        classify_repeated_key_root(&db, "records", &first_root),
+        purged_at(first_frontier),
+        "the permanent tombstone survives reopen"
+    );
+    insert_repeated_key(&db, "records");
+    assert_eq!(purge_batch_a(&db, "records"), 1);
+    let (second_root, second_frontier) = current_purged_life(&db, "records");
+    assert_ne!(second_root, first_root);
+    drop(db);
+
+    let db = Database::open(&path).expect("reopen the store again");
+    assert_eq!(
+        classify_repeated_key_root(&db, "records", &first_root),
+        purged_at(first_frontier)
+    );
+    assert_eq!(
+        classify_repeated_key_root(&db, "records", &second_root),
+        purged_at(second_frontier)
+    );
+    insert_repeated_key(&db, "records");
+    assert_eq!(purge_batch_a(&db, "records"), 1);
+    assert_eq!(row_total(&db, "records"), 0);
+}
+
+#[test]
+fn an_ordinary_delete_of_a_later_life_keeps_the_purged_life_refused() {
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let db = Database::open(root.path().join("deleted-key.db")).expect("open the store");
+    db.execute(
+        "CREATE TABLE shared_records (id UUID PRIMARY KEY, batch TEXT NOT NULL) \
+         SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+        &p(),
+    )
+    .expect("declare the synchronized table");
+    insert_repeated_key(&db, "shared_records");
+    assert_eq!(purge_batch_a(&db, "shared_records"), 1);
+    let (first_root, first_frontier) = current_purged_life(&db, "shared_records");
+
+    insert_repeated_key(&db, "shared_records");
+    assert_eq!(
+        db.execute(
+            "DELETE FROM shared_records WHERE id = $id",
+            &repeated_key_params()
+        )
+        .expect("an ordinary delete of the new life commits")
+        .rows_affected,
+        1
+    );
+    assert_eq!(
+        classify_repeated_key_root(&db, "shared_records", &first_root),
+        purged_at(first_frontier),
+        "a later life's delete never replaces the purged life's tombstone"
+    );
+
+    insert_repeated_key(&db, "shared_records");
+    assert_eq!(purge_batch_a(&db, "shared_records"), 1);
+    let (third_root, third_frontier) = current_purged_life(&db, "shared_records");
+    assert_ne!(third_root, first_root);
+    assert_eq!(
+        classify_repeated_key_root(&db, "shared_records", &first_root),
+        purged_at(first_frontier)
+    );
+    assert_eq!(
+        classify_repeated_key_root(&db, "shared_records", &third_root),
+        purged_at(third_frontier)
+    );
+}
