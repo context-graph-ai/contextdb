@@ -1805,3 +1805,213 @@ async fn c9_a_lost_ack_push_the_hub_cannot_confirm_records_nothing() {
 
     hub.stop().await;
 }
+
+#[tokio::test]
+async fn lost_refusal_reply_keeps_original_diagnostics_after_a_newer_hub_edit() {
+    let (_clock, _guard) = MockClock::install(T0);
+    let broker = InProcessBroker::new();
+    let hub = start_hub(&broker);
+    let winner = open_edge(None);
+    insert_windows(&winner, 1..2);
+    within(edge_client(&winner, &broker, "winner").push())
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loser.db");
+    let loser = open_edge(Some(&path));
+    within(edge_client(&loser, &broker, "loser").push())
+        .await
+        .unwrap();
+    loser
+        .execute(
+            "INSERT INTO windows (id, body) VALUES (1, 'refused-value')",
+            &p(),
+        )
+        .unwrap();
+    let identity = fixture_identity("loser");
+    let edited = Arc::new(AtomicBool::new(false));
+    let editing_hub = hub.db.clone();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        loser.clone(),
+        Arc::new(LoseAckAfterApply {
+            inner: broker.client_as(&identity.node_id()),
+            push_subject: push_subject(TENANT),
+            status_subject: status_subject(TENANT),
+            confirmable: true,
+            fail_reconciliation_pull: false,
+            after_push_apply: Some(Arc::new(move || {
+                if !edited.swap(true, Ordering::SeqCst) {
+                    editing_hub
+                        .execute("ALTER TABLE windows SET SYNC CONFLICT KEEP LATEST", &p())
+                        .unwrap();
+                    editing_hub
+                        .execute(
+                            "UPDATE windows SET body = 'newer-hub-value' WHERE id = 1",
+                            &p(),
+                        )
+                        .unwrap();
+                }
+            })),
+        }),
+        TenantId::from(TENANT),
+        identity,
+    );
+    let result = within(client.push()).await.unwrap();
+    assert_eq!(result.applied_rows, 0);
+    assert_eq!(result.skipped_rows, 1);
+    assert_eq!(result.conflicts.len(), 1);
+    let diagnostic = &result.conflicts[0];
+    assert_eq!(diagnostic.table.as_deref(), Some("windows"));
+    assert_eq!(diagnostic.mutation_kind.as_deref(), Some("edit"));
+    assert_eq!(
+        diagnostic.winning_author_node_id.as_deref(),
+        Some(fixture_node_id("winner").as_str())
+    );
+    assert!(diagnostic.hub_acceptance_position.is_some());
+    assert!(!client.has_pending_push_changes().unwrap());
+    assert_eq!(
+        loser
+            .execute("SELECT body FROM windows", &p())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("refused-value".to_string())]],
+        "push-only content never arrives by pull"
+    );
+    drop(client);
+    drop(loser);
+    let reopened = open_edge(Some(&path));
+    let resumed = edge_client(&reopened, &broker, "loser");
+    assert!(!resumed.has_pending_push_changes().unwrap());
+    within(resumed.push()).await.unwrap();
+    assert_eq!(
+        hub.db
+            .execute("SELECT body FROM windows", &p())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("newer-hub-value".to_string())]]
+    );
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn accepted_delete_replay_retires_only_its_adjudicated_work_across_reopen() {
+    let (_clock, _guard) = MockClock::install(T0);
+    let broker = InProcessBroker::new();
+    let hub = start_hub(&broker);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stale.db");
+    let source = open_edge(Some(&path));
+    hub.db
+        .execute("ALTER TABLE notes SET SYNC CONFLICT KEEP LATEST", &p())
+        .unwrap();
+    source
+        .execute("ALTER TABLE notes SET SYNC CONFLICT KEEP LATEST", &p())
+        .unwrap();
+    insert_notes(&source, 1..2);
+    within(edge_client(&source, &broker, "stale-author").push())
+        .await
+        .unwrap();
+    let deleter = open_edge(None);
+    let deleting = edge_client(&deleter, &broker, "deleting-edge");
+    within(deleting.pull_default()).await.unwrap();
+    deleter
+        .execute("DELETE FROM notes WHERE id = 1", &p())
+        .unwrap();
+    within(deleting.push()).await.unwrap();
+    assert_eq!(row_count(&hub.db, "notes"), 0);
+    let tx = source.begin().unwrap();
+    source
+        .execute_in_tx(
+            tx,
+            "UPDATE notes SET body = 'stale-replay' WHERE id = 1",
+            &p(),
+        )
+        .unwrap();
+    source
+        .execute_in_tx(
+            tx,
+            "INSERT INTO notes (id, body) VALUES (3, 'same-unit-sibling')",
+            &p(),
+        )
+        .unwrap();
+    source.commit(tx).unwrap();
+    let stale_lsn = source.current_lsn();
+    let identity = fixture_identity("stale-author");
+    let newer_source = source.clone();
+    let inserted = Arc::new(AtomicBool::new(false));
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        source.clone(),
+        Arc::new(LoseAckAfterApply {
+            inner: broker.client_as(&identity.node_id()),
+            push_subject: push_subject(TENANT),
+            status_subject: status_subject(TENANT),
+            confirmable: true,
+            fail_reconciliation_pull: false,
+            after_push_apply: Some(Arc::new(move || {
+                if !inserted.swap(true, Ordering::SeqCst) {
+                    insert_notes(&newer_source, 2..3);
+                }
+            })),
+        }),
+        TenantId::from(TENANT),
+        identity,
+    );
+    let result = within(client.push()).await.unwrap();
+    assert_eq!(result.applied_rows, 0);
+    assert_eq!(result.skipped_rows, 2);
+    assert_eq!(
+        result.conflicts.len(),
+        2,
+        "every refused member receives a terminal diagnostic"
+    );
+    let diagnostic = result
+        .conflicts
+        .iter()
+        .find(|conflict| {
+            conflict.natural_key
+                == contextdb_engine::sync_types::NaturalKey::single(
+                    "id".to_string(),
+                    Value::Int64(1),
+                )
+        })
+        .unwrap();
+    for conflict in &result.conflicts {
+        assert_eq!(
+            conflict.refusal_cause.as_ref().unwrap().natural_key,
+            diagnostic.natural_key
+        );
+        assert!(conflict.winning_author_node_id.is_none());
+        assert!(conflict.hub_acceptance_position.is_none());
+    }
+    assert_eq!(
+        diagnostic.reason.as_deref(),
+        Some("replays_accepted_delete")
+    );
+    assert_eq!(diagnostic.table.as_deref(), Some("notes"));
+    assert_eq!(diagnostic.mutation_kind.as_deref(), Some("edit"));
+    assert!(diagnostic.winning_author_node_id.is_none());
+    assert!(diagnostic.hub_acceptance_position.is_none());
+    assert_eq!(diagnostic.refusal_cause.as_ref().unwrap().table, "notes");
+    assert_eq!(client.push_watermark(), stale_lsn);
+    assert_eq!(
+        client.pending_push_change_count().unwrap(),
+        1,
+        "later local work is still owed"
+    );
+    drop(client);
+    drop(source);
+    let reopened = open_edge(Some(&path));
+    let resumed = edge_client(&reopened, &broker, "stale-author");
+    assert_eq!(resumed.pending_push_change_count().unwrap(), 1);
+    let result = within(resumed.push()).await.unwrap();
+    assert!(
+        result.conflicts.is_empty(),
+        "the terminal replay is never rebuilt as pending work"
+    );
+    assert!(!resumed.has_pending_push_changes().unwrap());
+    assert_eq!(
+        hub.db.execute("SELECT id FROM notes", &p()).unwrap().rows,
+        vec![vec![Value::Int64(2)]]
+    );
+    hub.stop().await;
+}

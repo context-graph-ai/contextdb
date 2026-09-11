@@ -45,6 +45,11 @@ const RSN_FIXTURE_TIMING: &str = "fixture timing";
 /// pure line shift must not trip the audit.
 const SLEEP_RATCHET: &[(&str, usize, &str)] = &[
     (
+        "crates/contextdb-redb/tests/basic_tests.rs",
+        1,
+        "upstream redb 4.1.0 write-transaction blocking regression; the maintained upstream suite stays byte-identical, including this one synchronization sleep",
+    ),
+    (
         "crates/contextdb-engine/tests/checkpoint_export_tests.rs",
         6,
         RSN_SYNC_BARRIER,
@@ -284,6 +289,49 @@ fn is_src_file(path: &str) -> bool {
     path.ends_with(".rs") && path.starts_with("crates/") && path.contains("/src/")
 }
 
+/// Return the bodies of cfg(test) modules rather than everything after the
+/// first module. Source files may place ordinary production items between
+/// test modules, so the old suffix-based scan could classify production clock
+/// reads as test-estate debt.
+fn test_module_regions(content: &str) -> Vec<&str> {
+    let mut regions = Vec::new();
+    let mut search_from = 0;
+    while let Some(marker_offset) = content[search_from..].find("#[cfg(test)]") {
+        let marker = search_from + marker_offset;
+        let rest = content[marker + "#[cfg(test)]".len()..].trim_start();
+        if !(rest.starts_with("mod ") || rest.starts_with("pub mod ")) {
+            search_from = marker + "#[cfg(test)]".len();
+            continue;
+        }
+        let Some(open_relative) = rest.find('{') else {
+            search_from = marker + "#[cfg(test)]".len();
+            continue;
+        };
+        let open = marker + "#[cfg(test)]".len() + rest[..open_relative].len();
+        let mut depth = 0usize;
+        let mut close = None;
+        for (offset, byte) in content.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            break;
+        };
+        regions.push(&content[marker..close]);
+        search_from = close;
+    }
+    regions
+}
+
 /// Every baseline entry must carry a non-empty reason: an entry with an empty
 /// third field defeats the point of the (path, count, reason) shape and fails
 /// the audit outright, rather than silently degrading to an unexplained
@@ -352,18 +400,9 @@ fn test_estate_audit_no_new_sleeps_or_raw_clock_reads() {
             let Ok(content) = std::fs::read_to_string(entry.path()) else {
                 continue;
             };
-            // The region opens at a cfg(test) MODULE — the attribute followed
-            // (whitespace-tolerantly) by a mod declaration — not at any lone
-            // cfg(test) item like a test-only accessor.
-            let region_start = content
-                .match_indices("#[cfg(test)]")
-                .filter_map(|(idx, marker)| {
-                    let rest = content[idx + marker.len()..].trim_start();
-                    (rest.starts_with("mod ") || rest.starts_with("pub mod ")).then_some(idx)
-                })
-                .min();
-            if let Some(idx) = region_start {
-                let test_region = &content[idx..];
+            // Audit each cfg(test) MODULE body, not the suffix after the first
+            // one. Production items can follow an earlier test module.
+            for test_region in test_module_regions(&content) {
                 let sleeps = count_occurrences(test_region, SLEEP_NEEDLES);
                 let allowed = src_sleep_ratchet.get(rel.as_str()).copied().unwrap_or(0);
                 if sleeps > allowed {

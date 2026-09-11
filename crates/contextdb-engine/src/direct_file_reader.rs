@@ -22,15 +22,9 @@ use uuid::Uuid;
 /// Inputs controlled by route assembly rather than by a file opener.
 #[derive(Clone)]
 pub struct DirectReaderConfig {
+    pub memory_limit: Option<usize>,
     pub limits: ReadLimits,
     pub clock: Arc<dyn DeadlineClock>,
-    /// The runtime ROOT route assembly resolved for this deployment -- where
-    /// this store's owner CHANNEL is bound and dialled. It is not where this
-    /// reader writes itself down: that note goes in the default per-user
-    /// runtime location, because the writer it will refuse is started by
-    /// somebody else, very likely with no runtime flag at all, and looks
-    /// there.
-    pub runtime_directory: PathBuf,
     /// The contexts this session declared it reads inside, if it declared any.
     pub contexts: Option<BTreeSet<ContextId>>,
     /// The scope labels this session declared it reads under, if it declared
@@ -41,22 +35,14 @@ pub struct DirectReaderConfig {
 }
 
 impl DirectReaderConfig {
-    /// A reader told the runtime ROOT this deployment resolved for its owner
-    /// channel. See [`Self::runtime_directory`] for where a reader's own
-    /// breadcrumb goes instead.
-    ///
     /// The reader this builds declares nothing and therefore reads the whole
     /// committed image, which is what a direct read has always done. A caller
     /// that narrows says so with [`Self::declaring`].
-    pub fn new(
-        limits: ReadLimits,
-        clock: Arc<dyn DeadlineClock>,
-        runtime_directory: PathBuf,
-    ) -> Self {
+    pub fn new(limits: ReadLimits, clock: Arc<dyn DeadlineClock>) -> Self {
         Self {
+            memory_limit: None,
             limits,
             clock,
-            runtime_directory,
             contexts: None,
             scope_labels: None,
             principal: None,
@@ -191,6 +177,15 @@ pub struct DirectSchemaColumn {
     pub default: Option<String>,
     pub references: Option<DirectColumnReference>,
     pub quantization: Option<DirectVectorQuantization>,
+    /// Ordered local vector-partition key columns. Empty for an
+    /// unpartitioned or non-vector column.
+    pub partition_key_columns: Vec<String>,
+    /// Effective local partition cap; absent for an unpartitioned or
+    /// non-vector column.
+    pub max_partitions: Option<u32>,
+    /// Durable route default for a vector column. Non-vector columns retain
+    /// AUTO as an inert value so this owned schema shape stays total.
+    pub search_mode: contextdb_core::VectorSearchMode,
     pub rank: Option<DirectRankPolicy>,
     pub scope_label: Option<DirectScopeLabelKind>,
     /// The grant table and grant column a column declared `ACL REFERENCES`
@@ -385,6 +380,7 @@ pub struct DirectOwnedImage {
 }
 
 /// A complete ordinary result and its route-neutral encoding.
+#[allow(dead_code)]
 pub struct DirectQuery {
     pub result: QueryResult,
     pub canonical_bytes: Vec<u8>,
@@ -405,8 +401,14 @@ pub enum DirectMetadataRequest {
     Schema {
         table: String,
     },
+    /// Plan a statement against the caller's own binding without running
+    /// it. The binding travels with the statement: a partition scope resolves
+    /// only after its key binds, so an explain that left the binding behind
+    /// would describe a scope the caller never named. Values inform route
+    /// selection only and are never echoed back.
     Explain {
         sql: String,
+        params: HashMap<String, Value>,
     },
     EventsStatus,
     MaintenanceStatus,
@@ -450,6 +452,7 @@ pub enum DirectMetadataBody {
         sql: String,
         physical_plan: String,
         index: Option<String>,
+        vector_search: Option<crate::database::VectorSearchDisclosure>,
     },
     EventsStatus {
         status: DirectEventsStatus,
@@ -493,20 +496,22 @@ pub struct DirectCursorOpen {
 /// to return later empty-success pages; it retains no image or memory charge.
 struct DirectCursorSnapshotRetention {
     _image: Arc<DirectOwnedImage>,
+    _image_memory: Arc<crate::read_image_memory::ImageMemory>,
 }
 
 struct DirectCursorMemoryReservation {
     _retained_bytes: usize,
 }
 
+/// Dropping these releases the cursor's image and memory charge.
 struct DirectCursorOwnedResources {
-    snapshot: Arc<DirectCursorSnapshotRetention>,
-    memory: Arc<DirectCursorMemoryReservation>,
+    _snapshot: Arc<DirectCursorSnapshotRetention>,
+    _memory: Arc<DirectCursorMemoryReservation>,
 }
 
 enum DirectCursorState {
     Active {
-        resources: DirectCursorOwnedResources,
+        _resources: DirectCursorOwnedResources,
         load: Arc<dyn crate::executor::ReadExecutionTarget>,
         clock: Arc<dyn DeadlineClock>,
         _opened_at_ms: u64,
@@ -646,12 +651,8 @@ pub struct DirectReaderCounters {
 pub enum DirectReaderPrerequisite {
     PersistenceLoadReadImage,
     PersistenceSealedReleaseReceipt,
-    BackendNeutralReadExecutionTarget,
-    SubsystemStartObservation,
-    CancellationObservation,
-    OwnedImageObservation,
     VerifiedImageIdentityObservation,
-    RouteNeutralMetadataEncoding,
+    #[allow(dead_code)]
     CursorResourceObservation,
 }
 
@@ -682,6 +683,7 @@ pub enum DirectFileReaderError {
     CorruptStore(DirectStoreDiagnostic, String),
     DirectReadRequiresWriter {
         failure: ReadFailure,
+        #[allow(dead_code)]
         cause: DirectRepairRequiredCause,
     },
     CursorUnavailable(DirectCursorUnavailable),
@@ -706,23 +708,15 @@ pub enum DirectFileReaderError {
     /// a route that must report the same fault the same way whichever way it
     /// reached the store picks the typed answer up there.
     Engine(String),
-}
-
-impl DirectFileReaderError {
-    pub fn read_failure(&self) -> Option<&ReadFailure> {
-        match self {
-            Self::DirectReadRequiresWriter { failure, .. }
-            | Self::StoreNotFound { failure }
-            | Self::ReadFailure(failure) => Some(failure),
-            Self::MissingPrerequisite(_)
-            | Self::LegacyLayout(..)
-            | Self::CorruptStore(..)
-            | Self::CursorUnavailable(_)
-            | Self::Contended { .. }
-            | Self::Engine(_)
-            | Self::Cancelled => None,
-        }
-    }
+    /// Startup admission failed before a target existed to retain the error.
+    MemoryBudget {
+        subsystem: String,
+        operation: String,
+        requested_bytes: usize,
+        available_bytes: usize,
+        budget_limit_bytes: usize,
+        hint: String,
+    },
 }
 
 impl fmt::Display for DirectFileReaderError {
@@ -764,6 +758,17 @@ impl fmt::Display for DirectFileReaderError {
             Self::Cancelled => formatter.write_str("direct read was cancelled"),
             Self::ReadFailure(failure) => write!(formatter, "direct read failed: {failure:?}"),
             Self::Engine(reason) => write!(formatter, "direct read failed: {reason}"),
+            Self::MemoryBudget {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            } => write!(
+                formatter,
+                "memory budget exceeded: {subsystem}/{operation} requested {requested_bytes} bytes, {available_bytes} available of {budget_limit_bytes} budget. Hint: {hint}"
+            ),
         }
     }
 }
@@ -777,7 +782,9 @@ pub struct DirectFileReader {
     target: Arc<dyn crate::executor::ReadExecutionTarget>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
+    #[allow(dead_code)]
     verified_digest: DirectTypedImageDigest,
+    image_memory: Arc<crate::read_image_memory::ImageMemory>,
 }
 
 /// Privately constructible proof that target construction, owned-image
@@ -789,6 +796,7 @@ struct BackendTargetConstructionReceipt {
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     verified_digest: DirectTypedImageDigest,
+    image_memory: Arc<crate::read_image_memory::ImageMemory>,
 }
 
 impl BackendTargetConstructionReceipt {
@@ -799,6 +807,7 @@ impl BackendTargetConstructionReceipt {
             ));
         }
         Ok(DirectFileReader {
+            image_memory: self.image_memory,
             image: self.image,
             target: self.target,
             limits: self.limits,
@@ -813,15 +822,14 @@ fn construct_backend_neutral_target(
     config: DirectReaderConfig,
 ) -> Result<BackendTargetConstructionReceipt, DirectFileReaderError> {
     let limits = config.limits;
-    let constructed = pending_image
-        .into_committed_image(
-            limits,
-            config.contexts,
-            config.scope_labels,
-            config.principal,
-        )
-        .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
+    let constructed = pending_image.into_committed_image(
+        config.memory_limit,
+        config.contexts,
+        config.scope_labels,
+        config.principal,
+    )?;
     Ok(BackendTargetConstructionReceipt {
+        image_memory: constructed.memory,
         target: constructed.target,
         image: constructed.image,
         limits,
@@ -888,6 +896,7 @@ fn consume_released_persistence_load(
     handoff_to_backend_neutral_reader(pending_image, release_receipt, config, observation)
 }
 
+#[allow(dead_code)]
 fn execute_on_backend_neutral_target(
     reader: &DirectFileReader,
     sql: &str,
@@ -931,11 +940,12 @@ fn open_cursor_on_backend_neutral_target(
             state: match constructed.2 {
                 Some(request) => DirectCursorState::Exhausted { request },
                 None => DirectCursorState::Active {
-                    resources: DirectCursorOwnedResources {
-                        snapshot: Arc::new(DirectCursorSnapshotRetention {
+                    _resources: DirectCursorOwnedResources {
+                        _snapshot: Arc::new(DirectCursorSnapshotRetention {
                             _image: Arc::clone(&reader.image),
+                            _image_memory: Arc::clone(&reader.image_memory),
                         }),
-                        memory: Arc::new(DirectCursorMemoryReservation {
+                        _memory: Arc::new(DirectCursorMemoryReservation {
                             _retained_bytes: constructed.1.canonical_bytes.len(),
                         }),
                     },
@@ -1014,11 +1024,12 @@ impl DirectFileReader {
         config: DirectReaderConfig,
         observation: HydrationObservation,
     ) -> Result<Self, DirectFileReaderError> {
-        let load = crate::persistence::load_read_image(path)
+        let load = crate::persistence::load_read_image_with_memory(path, config.memory_limit)
             .map_err(|error| error.into_direct_reader_error())?;
         consume_released_persistence_load(load, config, observation)
     }
 
+    #[allow(dead_code)]
     pub fn execute(
         &self,
         sql: &str,
@@ -1028,6 +1039,7 @@ impl DirectFileReader {
         self.execute_with_cancellation(sql, params, &cancellation)
     }
 
+    #[allow(dead_code)]
     pub fn execute_with_cancellation(
         &self,
         sql: &str,
@@ -1038,6 +1050,7 @@ impl DirectFileReader {
     }
 
     /// Answer one metadata question from the beginning.
+    #[allow(dead_code)]
     pub fn metadata(
         &self,
         request: DirectMetadataRequest,
@@ -1077,6 +1090,7 @@ impl DirectFileReader {
         )
     }
 
+    #[allow(dead_code)]
     pub fn open_cursor(
         &self,
         sql: &str,
@@ -1099,6 +1113,7 @@ impl DirectFileReader {
 }
 
 impl DirectCursor {
+    #[allow(dead_code)]
     pub fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
@@ -1266,6 +1281,21 @@ pub mod test_seams {
             .collect())
     }
 
+    pub fn image_memory_for_test(
+        reader: &DirectFileReader,
+    ) -> (
+        crate::memory_accounting::MemoryUsage,
+        usize,
+        std::sync::Weak<dyn Send + Sync>,
+    ) {
+        let erased: Arc<dyn Send + Sync> = reader.image_memory.clone();
+        (
+            reader.image_memory.accountant.usage(),
+            reader.image_memory.held(),
+            Arc::downgrade(&erased),
+        )
+    }
+
     pub fn owned_image_for_test(
         reader: &DirectFileReader,
     ) -> Result<DirectOwnedImage, DirectFileReaderError> {
@@ -1328,10 +1358,12 @@ pub mod test_seams {
         cursor: &DirectCursor,
     ) -> Result<DirectCursorResourceWitness, DirectFileReaderError> {
         match &cursor.state {
-            super::DirectCursorState::Active { resources, .. } => Ok(DirectCursorResourceWitness {
-                snapshot: Arc::downgrade(&resources.snapshot),
-                memory: Arc::downgrade(&resources.memory),
-            }),
+            super::DirectCursorState::Active { _resources, .. } => {
+                Ok(DirectCursorResourceWitness {
+                    snapshot: Arc::downgrade(&_resources._snapshot),
+                    memory: Arc::downgrade(&_resources._memory),
+                })
+            }
             super::DirectCursorState::Exhausted { .. } | super::DirectCursorState::Closed => {
                 Err(DirectFileReaderError::MissingPrerequisite(
                     DirectReaderPrerequisite::CursorResourceObservation,
@@ -1373,8 +1405,6 @@ mod no_test_seams_contract {
         let token = &seed[..20];
         let table = format!("no_feature_{token}");
         let path = root.path().join(format!("store_{token}.db"));
-        let runtime = root.path().join(format!("runtime_{token}"));
-        std::fs::create_dir(&runtime).expect("create no-feature runtime directory");
 
         let database = crate::Database::open(&path).expect("seed no-feature store");
         database
@@ -1413,7 +1443,7 @@ mod no_test_seams_contract {
         };
         let reader = DirectFileReader::open(
             &path,
-            DirectReaderConfig::new(limits, Arc::new(ManualClock), runtime),
+            DirectReaderConfig::new(limits, Arc::new(ManualClock)),
         )
         .expect("production cfg hydrates the direct image");
         let result = reader

@@ -1,7 +1,7 @@
 use super::common::*;
 use contextdb_core::{Error, Value};
 use contextdb_core::{Lsn, RowId};
-use contextdb_engine::Database;
+use contextdb_engine::{Database, MaintenancePolicy};
 use contextdb_parser::parse;
 use std::fs;
 use tempfile::TempDir;
@@ -1257,8 +1257,15 @@ fn f105_public_type_documentation_api_surface_check() {
         fs::read_to_string(workspace_root().join("crates/contextdb-engine/src/database.rs"))
             .expect("read database source");
     assert!(lib.contains(
-        "CascadeReport, Database, ExportReport, IndexCandidate, QueryResult, QueryTrace,"
+        "CascadeReport, Database, ExplainOutput, ExportReport, IndexCandidate, QueryResult, QueryTrace,"
     ));
+    assert!(lib.contains(
+        "VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,"
+    ));
+    assert!(lib.contains(
+        "VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute, VectorSearchScopeShape,"
+    ));
+    assert!(lib.contains("VectorSearchTailState,"));
     assert!(database.contains("pub fn open("));
     assert!(database.contains("pub fn open_memory("));
     assert!(database.contains("pub fn execute("));
@@ -1280,6 +1287,7 @@ fn f113_explain_shows_graph_bfs_operator_for_graph_traversal() {
 #[test]
 fn f114_explain_shows_hnsw_search_operator_for_vector_ann_query() {
     let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         "CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(3))",
         &empty_params(),
@@ -1288,6 +1296,24 @@ fn f114_explain_shows_hnsw_search_operator_for_vector_ann_query() {
     for _ in 0..1000 {
         insert_embedding(&db, Uuid::new_v4(), vec![1.0, 0.0, 0.0]);
     }
+    for _ in 0..32 {
+        if db.__debug_vector_hnsw_len(contextdb_core::VectorIndexRef::new(
+            "embeddings",
+            "embedding",
+        )) == Some(1_000)
+        {
+            break;
+        }
+        db.run_maintenance_cycle()
+            .expect("one finite caller-driven maintenance cycle succeeds");
+    }
+    assert_eq!(
+        db.__debug_vector_hnsw_len(contextdb_core::VectorIndexRef::new(
+            "embeddings",
+            "embedding",
+        )),
+        Some(1_000)
+    );
     let explain = db
         .explain("SELECT * FROM embeddings ORDER BY embedding <=> $query LIMIT 10")
         .expect("vector explain");

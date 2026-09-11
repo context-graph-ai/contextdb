@@ -80,7 +80,7 @@ struct ErasureTableResult {
     survivors: serde_json::Value,
 }
 
-/// Statements 17a/17b: presentation is replaceable. This adapter recognizes
+/// Presentation is replaceable. This adapter recognizes
 /// today's labels only to recover the per-table erasure facts the contract
 /// owns; a future representation can replace this decoder without changing
 /// the assertions below.
@@ -432,7 +432,7 @@ fn outcome_words(db: &Database) -> Vec<String> {
 
 // ---------------------------------------------------------------------------
 
-// Statement 17: Purge erases manifests and outcomes with their lineage, while fresh same-key creation succeeds.
+// Purge erases manifests and outcomes with their lineage, while fresh same-key creation succeeds.
 #[tokio::test]
 async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_fresh_same_key_row_starts_a_new_unit()
  {
@@ -485,7 +485,7 @@ async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_f
     edge.commit(tx)
         .expect("commit rows and delivery metadata atomically");
 
-    // Statement 17 preparation uses a complete ordinary push: the backup must
+    // Purge preparation uses a complete ordinary push: the backup must
     // contain a real batch bookmark, not a fixture's premature per-unit receipt.
     let delivered = within(client.push())
         .await
@@ -511,7 +511,7 @@ async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_f
         2,
         "canonical acceptance materialized both real units"
     );
-    // Statement 17: a distinct equivalent writer owns a different immutable
+    // A distinct equivalent writer owns a different immutable
     // creator lineage for the same root and must receive the same erasure.
     let equivalent_edge = open_edge(root.path(), "equivalent-edge");
     let equivalent_identity = root.path().join("equivalent-edge.db.fabric-identity.key");
@@ -744,7 +744,7 @@ async fn purging_a_root_erases_its_manifest_and_outcomes_on_hub_and_edge_and_a_f
     hub.stop().await;
 }
 
-// Statement 17a: Multi-table purge selects and erases as one durable boundary at both hub and edge.
+// Multi-table purge selects and erases as one durable boundary at both hub and edge.
 #[tokio::test]
 async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_is_refused_before_selection_when_illegal()
  {
@@ -859,7 +859,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
         other => panic!("a table that is not erasable is refused before selection, got {other:?}"),
     }
 
-    // Statement 17a: refuse a node-local subquery before the first table scans.
+    // Refuse a node-local subquery before the first table scans.
     let (result, selections) = observe_selection(&hub.db, || {
         hub.db.execute(
         "PURGE FROM records WHERE batch_ref = $batch, record_extracts WHERE records_id IN (SELECT id FROM records)",
@@ -927,7 +927,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
          exactly what it held before"
     );
 
-    // Statement 17a: PURGE reports affected rows and survivors per table.
+    // PURGE reports affected rows and survivors per table.
     let listed = reopened
         .execute(&list, &selected_params)
         .expect("the boundary completes");
@@ -959,7 +959,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
                 },
             ),
         ]),
-        "Statement 17a: every selected table reports its affected count and survivors"
+        "every selected table reports its affected count and survivors"
     );
     assert_eq!(
         listed.rows_affected, 3,
@@ -987,7 +987,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
     assert_eq!(mixed["records"].affected, 1);
     assert_eq!(
         mixed["record_parts"].affected, 0,
-        "Statement 17a: the listed zero-match table remains present with zero affected rows"
+        "the listed zero-match table remains present with zero affected rows"
     );
     assert_eq!(mixed_rows_affected, 1);
 
@@ -1044,7 +1044,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
             row_count(&edge, "record_extracts", "selected"),
         ),
         (0, 0, 0),
-        "Statement 17a: delivery erases every listed selection, including the SYNC OFF derived row"
+        "delivery erases every listed selection, including the SYNC OFF derived row"
     );
     let after_delivery = whole_store(&edge);
     within(client.pull_default())
@@ -1056,7 +1056,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
         "asking again restores nothing and erases nothing further"
     );
 
-    // Statement 17a: zero hub matches must still deliver the explicit local selection.
+    // Zero hub matches must still deliver the explicit local selection.
     write_derived_row(&edge, "edge-only", Uuid::new_v4());
     let zero = reopened
         .execute(
@@ -1070,7 +1070,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
         .expect("zero-match hub instruction reaches the edge");
     assert_eq!(row_count(&edge, "record_extracts", "edge-only"), 0);
 
-    // Statement 17a: deliberately replay the actual ordinary purge plane after fresh creation.
+    // Deliberately replay the actual ordinary purge plane after fresh creation.
     write_derived_row(&edge, "selected", selected);
     within(client.shutdown()).await;
     edge.persist_sync_pull_watermark(&TenantId::from(tenant), contextdb_core::Lsn(0))
@@ -1095,7 +1095,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
     within(task).await.expect("the restarted hub stops cleanly");
 }
 
-// Statement 17b: Declared discard modes govern one local transaction, with no fleet tombstone.
+// Declared discard modes govern one local transaction, with no fleet tombstone.
 #[tokio::test]
 async fn edge_discard_follows_declared_modes_and_one_local_transaction_boundary() {
     discard_never().await;
@@ -1124,7 +1124,7 @@ async fn discard_never() {
             TenantId::from(tenant),
         );
         bind_edge(&edge, &client, ROOT_CLAUSES_NEVER).await;
-        // Statement 17b: an unbound push-only name is eligible even on this enrolled edge.
+        // An unbound push-only name is eligible even on this enrolled edge.
         edge.execute(
             "CREATE TABLE unbound_notes (id INTEGER PRIMARY KEY, body TEXT) SYNC PUSH ONLY",
             &p(),
@@ -1229,7 +1229,7 @@ async fn discard_after_outcome() {
             &peer_dial_spec(&hub.ticket, &identity),
             TenantId::from(tenant),
         );
-        // Statement 17b: establish actual durable hub authority through the public binding.
+        // Establish actual durable hub authority through the public binding.
         within(
             client.bind_application_table_policy(
                 ApplicationTablePolicyExpectation::new()
@@ -1356,7 +1356,7 @@ async fn discard_after_outcome() {
                     },
                 ),
             ]),
-            "Statement 17b: every selected table reports affected rows, survivors, and no pending unit"
+            "every selected table reports affected rows, survivors, and no pending unit"
         );
         assert_eq!(
             (
@@ -1408,7 +1408,7 @@ async fn discard_after_outcome() {
         );
         assert_eq!(whole_store(&hub.db), hub_before);
         within(client.shutdown()).await;
-        // Statement 17b: durable hub authority survives closing the server and handle.
+        // Durable hub authority survives closing the server and handle.
         let hub_metadata = hub.db.__delivery_metadata_bytes_for_test().unwrap();
         let hub_rows = whole_store(&hub.db);
         hub.stop().await;
@@ -1736,7 +1736,7 @@ async fn discard_always() {
                     },
                 ),
             ]),
-            "Statement 17b: each selected table reports its affected rows, survivors, and its real pending count"
+            "each selected table reports its affected rows, survivors, and its real pending count"
         );
         assert_eq!(
             row_count(&reopened, "records", "unanswered"),
@@ -1830,7 +1830,7 @@ async fn discard_persistence_failure() {
     hub.stop().await;
 }
 
-// Statement 17b: insert/update followed by DISCARD is one ordinary transaction.
+// Insert/update followed by DISCARD is one ordinary transaction.
 fn discard_transaction_writes() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("transaction-discard.db");

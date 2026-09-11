@@ -1,4 +1,4 @@
-//! Statements 7/11/13/15/17: incremental metadata admission and publication.
+//! Incremental metadata admission and publication.
 use super::*;
 use crate::custody::{records::*, store::Store};
 
@@ -9,7 +9,7 @@ pub(crate) struct CustodyDelta {
 }
 
 impl Database {
-    // Statement 9/root 27: the existing outbound builder delegates manifested membership.
+    // The existing outbound builder delegates manifested membership.
     pub(crate) fn dependency_complete_outbound_units(
         &self,
         changes: ChangeSet,
@@ -104,7 +104,7 @@ impl Database {
         f(cache.as_mut().expect("loaded custody metadata"))
     }
 
-    /// Statements 11/14/15: measurement only; no mutation or production API.
+    /// Measurement only; no mutation or production API.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __custody_metadata_work_for_test(&self) -> Result<(u64, u64, u64)> {
@@ -196,7 +196,7 @@ impl Database {
     pub(crate) fn custody_pending_manifests(&self) -> Result<Vec<Record>> {
         self.with_custody_store(|store| Ok(store.pending()))
     }
-    // Statements 9/10/14: only complete adjudication may publish a batch bookmark.
+    // Only complete adjudication may publish a batch bookmark.
     pub(crate) fn finish_custody_push(&self, receipt: &SyncApplyReceipt) -> Result<()> {
         self.commit_sync_apply_receipt_only(receipt)?;
         if self.persistence.is_none() {
@@ -213,7 +213,7 @@ impl Database {
         }
         Ok(())
     }
-    // Statements 9/10/14: retain ordinary arbitration, provenance and diagnostics
+    // Retain ordinary arbitration, provenance and diagnostics
     // while holding its receipt at the already-adjudicated batch frontier.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_custody_remainder(
@@ -231,7 +231,7 @@ impl Database {
         let frontier = self
             .persisted_sync_applied_push_watermark_for_node_incarnation(tenant, edge, incarnation)?
             .unwrap_or(Lsn(0));
-        self.apply_authenticated_received_changes_with_receipt_and_lineages(
+        self.apply_authenticated_received_changes_with_outcome(
             changes,
             arrivals,
             SyncAdoption::Continuing,
@@ -245,6 +245,7 @@ impl Database {
             Some(hub),
             lineages,
             ddl,
+            None,
         )
     }
     pub(crate) fn custody_row(
@@ -259,7 +260,7 @@ impl Database {
         )
     }
 
-    // Statements 7/9/10/14: a replacement or deletion ends ownership of the
+    // A replacement or deletion ends ownership of the
     // previous committed manifest. Preserve its signed history and terminals;
     // current rows require a registration from their own writing transaction.
     fn retire_changed_custody_roots(&self, ws: &mut WriteSet) -> Result<()> {

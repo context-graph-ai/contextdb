@@ -25,11 +25,26 @@ fn cargo_lock() -> &'static Mutex<()> {
 
 fn cargo_fixture(path: &Path, command: &str, feature: Option<&str>, args: &[&str]) -> Output {
     let _serial = cargo_lock().lock().expect("fixture cargo lock");
-    let target = engine_root()
-        .ancestors()
-        .nth(2)
-        .expect("contextdb root")
-        .join("target/public-api-surface-fixture");
+    // An explicit `CARGO_TARGET_DIR` always wins, so a caller that isolates
+    // its builds keeps the nested fixture build in that same directory. An
+    // ordinary contributor or CI running `cargo test --workspace` with neither
+    // variable exported falls back to the dedicated nested-build directory
+    // beside the source tree.
+    let target = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(target_root) => {
+            let target_root = PathBuf::from(target_root);
+            assert!(
+                target_root.is_absolute(),
+                "CARGO_TARGET_DIR must be an absolute path"
+            );
+            target_root
+        }
+        None => engine_root()
+            .ancestors()
+            .nth(2)
+            .expect("contextdb root")
+            .join("target/public-api-surface-fixture"),
+    };
     let mut cargo = Command::new("cargo");
     cargo
         .arg(command)

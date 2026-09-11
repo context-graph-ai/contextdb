@@ -13,7 +13,7 @@ contextdb-tx            MVCC transaction manager, WriteSet, WriteSetApplicator t
     │
     ├── contextdb-relational    Row storage, scan, insert, upsert, delete
     ├── contextdb-graph         Adjacency index, bounded BFS, DAG enforcement
-    └── contextdb-vector        Cosine similarity, brute-force + HNSW auto-switch
+    └── contextdb-vector        Partitioned maintained search, durable base/change/tail generations
             └── contextdb-hnsw  Vendored third-party HNSW index (see below)
             │
 contextdb-parser        pest grammar → AST (SQL + GRAPH_TABLE + vector extensions)
@@ -34,6 +34,18 @@ under its own upstream authorship and its `MIT OR Apache-2.0` licence, with dete
 builds on top. Treat it as vendored dependency code: `contextdb-vector` is where a change to how
 contextdb *uses* an HNSW index belongs, and a change inside `contextdb-hnsw` itself is a change to
 vendored upstream code, to be made deliberately and kept minimal.
+
+The engine depends on the maintained **`contextdb-redb`** package (library name `redb`) at
+`crates/contextdb-redb`, based on upstream redb 4.1.0
+(crates.io checksum `8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839`, upstream
+revision `6ed1f981ba4deab0b2adbdd7bccb46ec409b2191`). It retains the upstream `MIT OR Apache-2.0`
+licence. The crate remains outside the workspace so its complete upstream integration suite runs
+from its own locked manifest in CI. Its provenance, fork delta, upgrade procedure, and upstream
+contribution path are maintained in `crates/contextdb-redb/MAINTENANCE.md`. Distribution requires
+publishing this package before the engine, formatting/linting/testing its standalone manifest, and
+building the unpacked engine against the unpacked fork with `scripts/verify-packaged-engine.sh`.
+The tag publication job must depend on those checks for the same commit. An upstream proposal
+remains part of maintenance; no upstream acceptance is claimed.
 
 ---
 
@@ -68,14 +80,25 @@ audio, or policy embeddings with different dimensions and quantization choices.
 - `VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` per column
 - SQ8/SQ4 columns keep quantized live payloads and quantized HNSW payloads;
   f32 is reconstructed only at API/materialization boundaries
-- Below ~1000 vectors: brute-force exact scan
-- F32 at/above ~1000 vectors: HNSW (via `hnsw_rs`) with overfetch + exact reranking
-- SQ8/SQ4 through 5000 vectors: exact scan to preserve self-recall; larger
-  quantized indexes use HNSW
-- Pre-filtered search: WHERE clause narrows candidates before scoring
-- HNSW is built lazily per index; a search against one vector column does not
-  build sibling indexes
-- OOM during HNSW build falls back to brute-force via `catch_unwind`
+- A two-level local registry: `(table, column)` identifies a vector index and a typed declared
+  partition key identifies one local search layout. The unpartitioned column has one empty key.
+  This is a search layout only, never an authorization boundary, tenant, or sync direction.
+  <!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::partition_scope_does_not_weaken_context_scope_or_principal_filters, vector_partition_sync_inspection_contract::partitioned_sync_derives_receiver_membership_without_changing_owner_pairing -->
+- A commit updates the durable base/change/tail lifecycle for the affected layout. Inserts enter a
+  fresh searchable tail; deletes and replacements add tombstones. Searches merge the valid base,
+  sealed committed changes, and tail under one MVCC snapshot.
+  <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_search_mode_bounded_contract::old_snapshot_keeps_each_partition_graph_after_a_later_write, vector_tail_transaction_contract::local_tail_admission_refuses_the_complete_transaction_before_durability -->
+- `AUTO_INDEX_AT` and HNSW (`M`, `EF_CONSTRUCTION`, `EF_SEARCH`) are declarable per-column
+  workload policy; silence keeps the compatibility profile. `AUTO` applies its effective threshold
+  to the aggregate allowed set, while `EXACT` and `INDEXED` remain explicit whole-query contracts.
+  The canonical SQL reference defines syntax, defaults, and online effects.
+  <!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_search_mode_bounded_contract::auto_uses_the_aggregate_selected_scope_not_each_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible -->
+- Filtered and broad searches stay bounded. Selected layouts are searched independently with a
+  global candidate heap, then one final top-k; the engine does not load every selected graph at once.
+  <!-- enforced by: vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_search_mode_bounded_contract::filtered_many_partition_search_reuses_partition_local_candidates, vector_lazy_raw_residency_contract::indexed_many_partition_reads_point_load_only_visible_versioned_candidates -->
+- Indexed routes have an acceptance target of at least 95% recall-at-10 against `EXACT` on the
+  same stored column.
+  <!-- enforced by: vector_held_out_native_reference::held_out_unfiltered_native_reference_recovers_the_required_neighbors, vector_serving_merge_contract::held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectivities -->
 
 ---
 
@@ -256,13 +279,46 @@ cache). The applicator owns durability.
 Single-file storage via redb:
 
 - Flush-on-commit: every committed `WriteSet` is written to redb
-- On open: relational rows load into memory with table-local index maintenance,
-  graph adjacency and vector/HNSW indexes rebuild afterward
+- On open: relational rows load with table-local index maintenance. Vector lifecycle metadata opens
+  first; valid base and change graphs and raw-vector pages are loaded or mapped only for the active
+  working set, rather than rebuilding every vector index.
+  <!-- enforced by: vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure, vector_lazy_consumer_restart_contract::point_lookup_after_reopen_loads_only_the_row_partition_and_returns_its_vector -->
 - Crash-safe: redb provides atomic transactions
 - Tables: rows, DDL metadata, graph edges, vector entries, counters
 - Vector entries use one composite-key table keyed by `(table, column, row_id)`.
 - A `metadata` table stores `format_version = "1.0.0"`; missing markers are
   treated as legacy stores, while unreadable markers are reported as corrupt.
+
+### Vector generations, restart, and repair
+
+Vector base generations, committed-change graphs, tombstones, and their checksums are durable local
+state. Publishing a replacement writes temporary state, verifies it, then atomically switches the
+authoritative pointer. A crash therefore leaves either the previous complete generation or the new
+complete generation, never a half-published one. Loaded base and sealed change graphs are immutable:
+inserts go into a fresh mutable tail, and deletes/replacements use snapshot-visible tombstones.
+A deletion does not remove a node from a sealed graph in place. Search excludes invisible versions
+and resolves candidates against the snapshot's authoritative vector. Maintenance publishes a
+replacement that omits obsolete entries; an already-open snapshot keeps its compatible generation
+until it releases its pin.
+<!-- enforced by: vector_generation_quarantine_compaction_lock_contract::later_mutations_publish_a_new_generation_truncate_only_covered_journal_and_replay_the_suffix, vector_resource_maintenance_contract::replacement_refusal_precedes_workspace_and_keeps_the_serving_generation, vector_generation_authoritative_purge_replacement_contract::partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route, vector_generation_quarantine_compaction_lock_contract::pinned_old_snapshot_keeps_its_indexed_generation_until_release_then_reclaims_superseded_bytes, vector_partition_restart_contract::an_open_old_snapshot_and_a_later_historical_snapshot_keep_their_complete_vector_views -->
+
+Restart validates lightweight lifecycle metadata, keeps the last valid generation available, and
+replays only verified changes after that generation into a new mutable tail as needed. It does not
+reconstruct every vector before serving the first query. A corrupt or incompatible newest generation
+is quarantined; a maintained indexed query for that layout refuses until repair, while `AUTO` may use
+exact work only within the active budget. Repair and first build run through maintenance outside the
+query path, so an older valid route and ordinary relational/graph reads remain usable.
+<!-- enforced by: vector_partition_restart_contract::partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuild, vector_lazy_replay_budget_contract::first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_request_ceiling, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors, vector_generation_quarantine_compaction_lock_contract::newer_catalog_format_quarantines_only_that_route, vector_generation_quarantine_compaction_lock_contract::corrupt_journal_quarantines_and_repairs_one_route_while_a_cold_neighbour_builds, vector_generation_quarantine_compaction_lock_contract::caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart, vector_generation_quarantine_compaction_lock_contract::engine_owned_worker_repairs_the_quarantined_route_without_a_caller_cycle -->
+
+Raw vectors, base graphs, change graphs, and compaction workspace are independently accounted for.
+Their pages are mapped or loaded for the active working set and can be evicted when idle; an active
+query pins what it needs. When a declared `MEMORY_LIMIT` cannot admit a selected graph, idle graph
+chains are reclaimed in least-recently-used order only until the complete load fits. Without a
+declared memory limit, loaded graphs remain resident. <!-- enforced by: vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure, vector_resource_maintenance_contract::unlimited_memory_keeps_loaded_graphs_warm_across_search_and_idle_maintenance, vector_resource_maintenance_contract::working_set_releases_other_partitions_before_the_next_selected_load --> Charged bytes are ContextDB's memory-accountant
+view, not a claim about the operating system's physical mapped pages. Disk budget covers durable
+vector and index state before a write is accepted. The memory target is the product declaration
+`SET MEMORY_LIMIT 2G`, exactly 2147483648 bytes. <!-- enforced by: statement_effect_contract::binary_memory_declaration_accepts_quoted_and_unquoted_sizes --> Whole-process RSS, which also covers opening,
+writes, queries, maintenance and replay, is separate from the charged vector/index categories.
 
 ---
 
@@ -298,26 +354,89 @@ let db = Database::open_with_plugin(path, plugin)?;
 
 ## Maintenance (retention + version cleanup)
 
-contextdb starts one background maintenance thread per database, and only when that database declares something to maintain: a `RETAIN` window on some table, `HISTORY CURRENT ONLY` on some table, or a durable trigger with an audit history. It ticks once a minute, does near-zero work when there is nothing to reclaim (a cheap gate reads only the in-memory table map, never the commit lock, before deciding whether a cycle is worth running), and self-starts and self-stops as declarations arrive or leave — no consumer call is required. A database that declares none of the above starts no thread at all, so an embedding consumer (a library caller that never declares `RETAIN` or `HISTORY CURRENT ONLY`) gets no background thread it did not ask for.
+contextdb starts one background maintenance thread per database, under the default engine-owned
+policy, when the database declares something to maintain: a `RETAIN` window, `HISTORY CURRENT ONLY`,
+a durable trigger with audit history, or maintained vector work. It advances a finite batch and does
+near-zero work when nothing is pending. An embedding host may explicitly choose caller-driven
+maintenance instead: then ContextDB starts no hidden thread and each existing
+`Database::run_maintenance_cycle` call (or CLI `.maintenance run`) advances one finite batch.
+Declarations, writes, open, and a first query never wait for every vector to be indexed.
+<!-- enforced by: tests/integration/maintenance_ownership_tests.rs::a_fresh_database_defaults_to_engine_owned_maintenance, tests/integration/maintenance_ownership_tests.rs::caller_driven_spawns_no_thread_however_much_is_declared, vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader -->
 
-One cycle runs two passes, in order: retention (rows past their declared `RETAIN` window) then version cleanup (superseded versions of a table declaring `HISTORY CURRENT ONLY`) — a row that expires this cycle is never version-collapsed first.
+Each cycle advances retention, trigger-audit retention, version cleanup, and maintained vector
+work. The default engine-owned loop polls every 60 seconds; callers can persist a different database
+interval through `SET MAINTENANCE_POLL_INTERVAL`, `Database::set_maintenance_poll_interval`, or the
+CLI's millisecond-only `--maintenance-poll-ms`; omitting the CLI flag uses the database's persisted
+interval. The timer is only the trigger for evaluating work: per-column thresholds decide whether a
+healthy route joins that wake. Each wake samples the finite vector backlog and advances every needy
+partition sequentially within declared memory and work limits, with never-built partitions first.
+There is no separate per-wake partition-count limit; finiteness comes from the fixed sample. A
+per-column `CONSOLIDATION` policy decides when healthy graphs need rebuilding (rules and defaults:
+[Vector Similarity Search](query-language.md#vector-similarity-search)); `CONSOLIDATION NONE`
+suppresses only those threshold rebuilds, never construction, topology replacement, or quarantine
+repair. Graph construction uses an immutable sample outside the short partition publication section, so
+a same-partition write can finish into the newer fresh tail while the sampled generation publishes.
+That write stays searchable and remains pending for a later publication. Retention runs before
+current-only version cleanup, so an expiring row is not first collapsed as history. Initial graph
+construction and repair use this maintenance path exclusively. Caller-driven policy is an open option
+and CLI mode, starts no background worker, and uses the same all-needy cycle when the host calls it.
+<!-- enforced by: vector_partition_declaration_contract::consolidation_and_maintenance_poll_declarations_round_trip_and_reset, vector_resource_maintenance_contract::changing_the_poll_interval_returns_while_engine_maintenance_is_active, read_cli_journeys_invocation::maintenance_flags_require_write_and_configure_the_writer, vector_resource_maintenance_contract::in_memory_maintenance_honours_declared_consolidation_thresholds, vector_resource_maintenance_contract::in_memory_construction_leaves_same_partition_vector_writes_usable, vector_resource_maintenance_contract::failed_partition_does_not_starve_actual_work_and_reports_active_progress -->
+
+A partition-local build refusal is attached to the vector maintenance report alongside successful
+index and partition counts. It does not short-circuit the wake's closing graph reclamation, empty
+partition retirement, automatic-compaction attempt, or cycle stamp; cancellation remains a typed
+interruption and returns immediately.
+<!-- enforced by: vector_resource_maintenance_contract::refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition, vector_resource_maintenance_contract::dropping_a_sampled_vector_column_does_not_abort_cycle_closing -->
 
 **Version cleanup and a held read snapshot.** Every in-flight statement registers its own read snapshot for the call's duration, and a caller that needs to reuse a `SnapshotId` ACROSS separate calls (on a table declaring `HISTORY CURRENT ONLY`) registers it explicitly via `Database::pin_snapshot`, holding the returned guard for as long as the snapshot is still wanted. A version-cleanup pass samples every currently-registered snapshot (not merely the oldest) plus the committed watermark, atomically, once at the start of the pass, and defers any superseded version still visible to ANY of those registered snapshots to a later cycle — a version created between two registered snapshots and superseded after both is protected by the higher one even though the lower one alone would not see it. Protection begins when `pin_snapshot` RETURNS: a pin requested while a removal pass is already mid-flight, for a snapshot at or before that pass's sampled watermark, waits for the pass to finish first (bounded by one pass duration) before registering, so the pin can never return with a false promise of protection the SAME in-flight pass is still free to violate — the next cleanup cycle honors it instead. A pin for a snapshot strictly after the pass's watermark registers immediately: nothing that pass can prune was ever visible to it. Versions a pass already reclaimed before the pin is requested cannot come back; that boundary is unchanged.
 
-**The cost model.** Both passes remove exactly what they reclaim — the row versions, the change-log entries that referenced them, and (version cleanup only) the vector copies attached to a released row version — each in its own bounded, point-removal redb write transaction: row/change-log removal first, then vector/edge removal (only when there is a released vector to reclaim), then commit-index removal, up to three independent transactions per pass. Nothing else in the file is read or rewritten in any of them: a table's surviving rows, an unrelated table's rows, and every vector or edge that is not part of what is being reclaimed stay untouched. Memory only follows once every persisted transaction has succeeded; a failure between transactions leaves persisted state strictly AHEAD of the in-memory snapshot — benign over-retention, never a lost version or a corrupt change-log entry — and the next maintenance cycle re-attempts and completes the same work. Cost is proportional to what is reclaimed, never to the size of the database or to how much unrelated data (vectors, edges, other tables) shares the file. Version cleanup never opens the graph tables at all — edge identity is self-owned (`source`, `target`, `edge_type` plus its own `created_tx`/`lsn`), versioned by no relational row, so cleanup neither needs nor claims edge boundedness; a table that accumulates superseded edge copies needs its own accounting, tracked separately.
+**The cost model.** Version cleanup examines eligible table histories and the affected vector
+columns' partition-directory metadata to select exact version identities; selection does not load
+vector bodies. One redb transaction then removes the selected row versions and change-log entries,
+vector bodies, directory memberships, eligible deletion records, and eligible commit-index entries. Memory
+changes only after that transaction commits. A crash before commit leaves the selected scope intact;
+a crash after commit leaves it durably removed, so retry does not depend on a deleted discovery row.
+Registered readers defer versions they still need. Immutable graphs may still name old versions;
+query merge scores each distinct candidate from its snapshot-visible native vector before ordering
+and applying the limit, even after cleanup leaves only one directory version.
+<!-- enforced by: tests/integration/version_cleanup_scoping_tests.rs::version_cleanup_releases_a_pruned_rows_vector_copy, tests/integration/version_cleanup_scoping_tests.rs::version_cleanup_cost_is_invariant_to_unrelated_vector_ballast, tests/integration/version_cleanup_scoping_tests.rs::a_registered_snapshot_defers_cleanup_instead_of_losing_the_version, vector_serving_merge_contract::current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart -->
 
-**This pass-scoping is separate from — and does not replace — redb's own file compaction; the two are different-shaped costs reported through different receipts.** A scoped pass is O(what it reclaimed); a redb `compact()` rewrites the *whole file* to turn freed pages back into real file-size reduction, so it is never folded into a pass's own timing. Do not assume every prune shrinks the file: redb reuses freed pages in place, so a steady-state cycle usually reclaims bytes without the file getting smaller at all — only a compaction does that. Cross-check any file-shrink claim against a real measurement rather than assuming it from the reclaim numbers; a redb compaction has been observed to *grow* a file in at least one measured case (page reorganization overhead), so "compacted" is not a synonym for "smaller."
+Retention first commits expiry as a visibility boundary: newly opened reads exclude expired rows,
+while already-registered snapshots retain their complete row/vector/graph view. Physical reclamation
+defers versions those readers still need, including vector generations. After the pins are released,
+a later cycle can reclaim them; expiry alone does not promise an immediate fall in resident bytes.
+Retention commits its selected row versions, change-log and source-LSN records, vector
+copies, reclaimable adjacency, reader-deferred adjacency identities, eligible commit-index entries,
+and reclaimable vector generations in one redb transaction. In-memory removal follows that commit.
+Cleanup cost includes selection through the
+eligible histories/directories, membership-prefix checks for selected vectors, and reading and
+rewriting affected change-log LSN groups. It is not proportional only to the number of removed keys.
+Surviving rows and unrelated tables remain untouched. Version cleanup never opens graph tables:
+edge identity is self-owned and is not versioned by a relational row.
+<!-- enforced by: tests/integration/retention_tests.rs::retention_defers_reclaim_without_breaking_vector_search, tests/integration/retention_tests.rs::retention_keeps_rows_an_explicit_snapshot_pin_is_entitled_to, tests/integration/named_vector_indexes_tests.rs::nv_retain_prunes_every_vector_index_for_expired_row -->
 
-Retention keeps its original, self-contained decision: `run_pruning_cycle_checked` samples the dead-space fraction *before* it prunes and, if that pre-prune reading is already at or over the shared threshold, compacts once, synchronously, inside that same call — reported on `PruningReport` (`compacted`, `fragmentation_before`, `file_bytes_before`/`_after`). Currency version cleanup (`compact_currency_versions`) does **not** — it never calls `compact()` itself, at any threshold, because a small file where routine superseded-version debris is a large fraction of it can cross the threshold on *every* cycle, and coupling a scoped O(pruned) pass to an O(whole-file) rewrite on every tick reintroduces the exact per-cycle cost the pass-scoping exists to remove (measured directly by the version-cleanup scaling bench). Compaction for a currency table is instead:
+**File compaction is separate from scoped cleanup.** Retention and version cleanup reclaim only the
+versions they select; redb can reuse those pages, so reclaiming rows does not itself promise a
+smaller file.
 
-- **An explicit operator action** — `Database::compact_now()` (`.maintenance compact` in the CLI): unconditional, on demand, no threshold, no interval gate. Returns a `CompactionReport` (`ran`, `duration_micros`, `bytes_before`/`_after`, `file_shrank`, `fragmentation_before`, `handle_recycled`, `handle_recycle_micros`).
-- **A much rarer automatic path** — `Database::run_maintenance_cycle`'s engine-owned tick checks the threshold *and* a minimum interval (`AUTO_COMPACT_MIN_INTERVAL`, one hour by default) after every scheduled cycle's own passes have already run, outside any commit lock; it fires at most once per interval regardless of how many cycles cross the threshold in between. Its result rides `MaintenanceReport.compaction` — the same `CompactionReport` shape, separate from `currency.redb_compacted` (which now always reads `false`: it describes only what the scoped currency pass itself decided, which is nothing).
+Automatic file compaction has two triggers. A retention pass that actually pruned rows starts a
+sweep when its pre-prune dead-space sample is at least 50%. At the end of a maintenance cycle, a
+new sweep starts when dead space is at least 50% and at least one hour has elapsed since the last
+completed sweep. Both use ContextDB's vendored redb `compact_step` path to relocate at most 64
+pages in one batch. Relocation uses copy-on-write pages and retains old pages behind redb's reader
+fence, so existing and newly opened reads can overlap an active batch. Foreground writes share the
+single writer lock with each finite relocation or free-page transaction; the database handle lock
+is released during relocation. Later maintenance cycles resume the cursor until the sweep completes.
+Completion recycles the handle only when no live storage read transaction owns it; otherwise the
+existing handle stays open. A restart discards the in-process cursor and a later eligible cycle
+starts a new sweep. `MaintenanceReport.compaction` reports the end-of-cycle batch; `handle_recycled`
+and `file_shrank` report observed results, not unconditional recycling or shrink guarantees.
+<!-- enforced by: storage_compaction_online::relocation_batches_preserve_values_with_interleaved_writes_and_restart, storage_compaction_online::automatic_storage_batches_allow_recording_and_readback_before_completion, storage_compaction_online::paused_storage_statistics_allow_a_foreground_commit, tests/integration/compaction_separation_tests.rs::the_automatic_compaction_path_is_interval_gated_not_per_cycle, tests/integration/compaction_separation_tests.rs::compact_now_recycles_the_handle_and_reports_it_honestly -->
 
-**Compaction restores file size AND steady-state write cost.** A file-level redb `compact()` shrinks the file and fully normalizes its on-disk btree, but redb also retains in-process allocator/region bookkeeping sized to the database's historical peak allocation, and a file-level compact does not reset that on its own. So `RedbPersistence::compact` — the one function both the explicit and automatic paths call — closes the store's redb handle and reopens the same file immediately after the file-level compaction finishes, under the same lock that already serializes every other access to the store; no caller can observe an intermediate closed state. This is what `handle_recycled`/`handle_recycle_micros` report, timed separately from the file-level compaction itself. A long-running embedded consumer has no other opportunity to clear that in-process state — it cannot process-restart — so compaction does it on the consumer's behalf every time. On a reopen failure the on-disk file is untouched (nothing more is written to it after the file-level compact finishes) and the store is left closed; a fresh `Database::open` on the same path recovers every row.
-
-A deliberate working-headroom margin between the shrink and the recycle was tried and measured NOT to help: redb's own close-time bookkeeping (`Drop for redb::Database`'s `ensure_allocator_state_table_and_trim`) regrows a maximally-shrunk file to roughly the same final size whether or not a margin was left beforehand, so the margin only cost two extra write transactions for no measured benefit — removed.
-
-**A store under its DECLARED-FROM-THE-START maintenance regime meets the steady-state ceiling immediately, on its very first post-compact cycle** — every measurement of a table that has always had `HISTORY CURRENT ONLY` declared, compacted regularly, shows no elevated window at all. **A RETROFIT root — a table carrying a large amount of history accumulated BEFORE it was ever compacted even once — pays one real, but strictly one-time and single-cycle, elevated cost right after its first compaction**, confirmed directly (the version-cleanup-scaling bench's A2 arm, and its own `run_a2_retrofit_recipe`): the cycle immediately following a retrofit root's first-ever compaction runs measurably slower than the declared-from-the-start regime, but the very NEXT cycle already drops back into the normal few-millisecond range, and a second `compact_now()` run after that real write activity — never a special mechanism, just calling the same explicit operator action again — fully restores the identical regime a declared-from-the-start table has from the start. The honest operational guidance for a retrofit root: run `.maintenance compact` once to reclaim space, expect one elevated cycle immediately after, and run it a second time once some normal write activity has occurred to lock in the restored steady-state cost — this is the ordinary explicit action used twice, not a distinct maintenance mode.
+`Database::compact_now()` (the CLI's `.maintenance compact`) is the explicit alternative. It drains
+the file compaction immediately, without the automatic threshold or interval gate. It is distinct
+from `.maintenance run` and from the scoped cleanup reports.
+<!-- enforced by: tests/integration/compaction_separation_tests.rs::compact_now_is_unconditional_and_reports_a_real_receipt, tests/integration/compaction_separation_tests.rs::currency_cleanup_never_compacts_on_its_own -->
 
 **Eligibility is declared, not named.** A table is version-cleanup-eligible because it declares `HISTORY CURRENT ONLY`, never because of its name. The three built-in fabric tables (`work_capabilities`, `peer_directory`, `work_node_contacts`) declare it in their own `CREATE TABLE` text like any other table would.
 
@@ -356,7 +475,8 @@ Vector operations attribute allocations with tags such as
 `vector_insert@evidence.vector_text` and `build_hnsw@evidence.vector_vision` so
 operators can identify the offending index from errors.
 
-On a 2GB Jetson-class device, prefer SQ8 for high-dimensional evidence:
+The 2 GB edge working-set target guides constrained deployments. For a constrained device, SQ8 can
+reduce the stored vector footprint:
 
 ```sql
 SET MEMORY_LIMIT '1536M';
@@ -367,20 +487,24 @@ CREATE TABLE evidence (
 );
 ```
 
-`SHOW VECTOR_INDEXES` gives structured per-index counts and live vector payload
-byte totals, including any materialized HNSW payload estimate; use it
-instead of parsing memory operation tags.
+`SHOW VECTOR_INDEXES` gives one summary row per vector column,
+including aggregate counts and live vector payload byte totals. `SHOW
+VECTOR_PARTITIONS FOR table.column` supplies the typed-key, per-partition
+lifecycle detail, including each durable generation's state; use those
+surfaces instead of parsing memory operation tags.
+<!-- enforced by: vector_partition_sync_inspection_contract::existing_two_row_sync_keeps_each_vector_with_its_row_and_shows_summary, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms, vector_inspection_explain_truth_contract::vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts -->
 
 ---
 
 ## Sync
 
-The wire protocol is currently `PROTOCOL_VERSION = 6`. The ALPN identifier
-is `contextdb.sync.v6` — it names the transport framing, including the reply-receipt
-byte that lets graceful shutdown prove the dialing peer received a terminal reply
-and the per-publication nonce that prevents identical large replies from sharing
-durable bytes or completion state.
-Payload version skew is caught by the envelope check below, not the ALPN.
+This release emits and accepts sync protocol 7. Vector declarations use that protocol's schema
+vocabulary without changing the vector payload shape. The ALPN identifier remains `contextdb.sync.v6`;
+it names the transport framing, including the reply-receipt byte that lets graceful shutdown prove
+the dialing peer received a terminal reply and the per-publication nonce that prevents identical
+large replies from sharing durable bytes or completion state. Payload version skew is checked by
+the envelope, not the ALPN.
+<!-- enforced by: protocol_version_bump_tests::first_release_accepts_only_protocol_seven, protocol_version_bump_tests::every_noncurrent_envelope_is_rejected_by_encoding_and_decoding -->
 Once shutdown closes admission, the hub finishes sync work it already accepted,
 including the chunk and authenticated completion exchange for an oversized reply.
 New requests are refused. A peer that stops acknowledging replies cannot hold the
@@ -405,26 +529,25 @@ validated chunk refreshes a 30-second inactivity lease. A transfer that resumes
 while the hub is still serving is re-registered after its durable manifest and
 chunk validate; a transfer that was silent for the full lease before shutdown is
 stalled work and is not allowed to reopen admission during drain.
-The server reports the supported protocol version in `contextdb-server --version`
-and in its INFO logs; mismatched envelopes are rejected instead of being
-partially applied.
+When a peer cannot represent a table's declared schema vocabulary, ContextDB holds that table with
+a typed diagnostic naming the table, missing capability, and node to upgrade. Unaffected tables
+continue syncing and the held table resumes after the capability is available.
+<!-- enforced by: vector_schema_mixed_version_compatibility_contract::older_receiver_keeps_ordinary_tables_flowing_then_resumes_the_held_table_after_upgrade, vector_schema_mixed_version_push_compatibility_contract::newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_after_hub_upgrade -->
 
-The completed, not-yet-released version 6 includes
-`WireRowChange.arrival` (the row's ordering position on the node that
-accepted it) and `PullResponse.source` (the serving store's per-tenant
-incarnation), a distinct PURGE instruction lane, a schema-provenance positional
-slot that remains present even when empty, and the structured
-`PurgeRequiresAuthoritativeHub` push refusal. See "Arrival Ordering" and "Pull
-Cursors Are Bound To Their Serving Store" below. Peers using the same v5
-transport framing but different payload versions are refused loudly on push,
-pull, and the dedicated status exchange: no rows move, no watermark advances
-on either side, and the error names the remedy (upgrade both ends) rather than
-just the two version numbers. An older `contextdb.sync.v4` peer cannot negotiate
-the receipt-bearing v5 framing at all; that connection refusal likewise names
-transport-version alignment and upgrading both ends as the remedy. Nothing is
-lost because either refusal happens before a watermark can advance.
+The supported skew window is the current protocol version plus the two immediately previous
+released versions. The current wire retains row arrival ordering, the serving-store incarnation in
+pull responses, the purge instruction lane, schema provenance, and the structured
+authoritative-hub purge refusal.
+<!-- enforced by: protocol_version_bump_tests::current_wire_arrival_and_source_fields_round_trip, protocol_version_bump_tests::current_wire_purge_instruction_and_typed_authority_error_round_trip, schema_provenance_wire_contract::nonempty_schema_provenance_round_trips_and_validates -->
 
 Future work bumps the protocol version whenever it changes sync bytes or sync semantics. SQL, storage, CLI, or maintenance work that leaves sync unchanged does not bump the protocol.
+
+Partitioned vector search leaves the sync message shape unchanged. Partition-key declarations travel
+with ordinary schema DDL; on receipt, ContextDB derives the local layout membership from the row it
+accepted in the same transaction. A key-only update moves each non-NULL vector locally even when no
+new vector payload arrives. This local layout neither authorizes a row nor changes a table's declared
+sync direction.
+<!-- enforced by: vector_partition_sync_inspection_contract::partitioned_sync_derives_receiver_membership_without_changing_owner_pairing, vector_partition_sync_inspection_contract::received_key_only_update_moves_the_unchanged_vector, vector_partition_sync_inspection_contract::every_consolidation_form_keeps_schema_identity_across_sync -->
 
 ### Deployment Topology
 

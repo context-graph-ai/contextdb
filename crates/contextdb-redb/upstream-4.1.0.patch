@@ -1,0 +1,917 @@
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -676,6 +676,51 @@
+         }
+ 
+         Ok(compacted)
++    }
++
++    /// Relocate a bounded page selection using copy-on-write publication.
++    /// Existing read snapshots keep their pages until their guards end.
++    #[doc(hidden)]
++    pub fn compact_step(
++        &self,
++        cursor: &mut crate::CompactionCursor,
++        maximum: usize,
++        admit: impl FnMut(usize) -> io::Result<()>,
++    ) -> Result<crate::CompactionProgress, CompactionError> {
++        let progress = self
++            .begin_write()
++            .map_err(|e| e.into_storage_error())?
++            .compact_step(cursor, maximum, admit)?;
++        for _ in 0..2 {
++            self.begin_write()
++                .map_err(|e| e.into_storage_error())?
++                .commit_compaction_frees()
++                .map_err(|e| e.into_storage_error())?;
++        }
++        Ok(progress)
++    }
++
++    #[doc(hidden)]
++    pub fn has_live_read_transactions(&self) -> bool {
++        self.transaction_tracker
++            .oldest_live_read_transaction()
++            .is_some()
++    }
++
++    #[cfg(feature = "test-seams")]
++    #[doc(hidden)]
++    pub fn write_wait_observer(&self) -> impl Fn() -> bool + Send + Sync + 'static + use<> {
++        let tracker = self.transaction_tracker.clone();
++        move || tracker.has_waiting_write_transactions()
++    }
++
++    #[doc(hidden)]
++    pub fn storage_statistics_snapshot(&self) -> Result<crate::StorageStatisticsSnapshot> {
++        let write = self.begin_write().map_err(|e| e.into_storage_error())?;
++        let read = self.begin_read().map_err(|e| e.into_storage_error())?;
++        let snapshot = write.storage_statistics_snapshot(read)?;
++        write.abort()?;
++        Ok(snapshot)
+     }
+ 
+     #[cfg_attr(not(debug_assertions), expect(dead_code))]
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -79,6 +79,10 @@
+     ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
+     Table, TableStats,
+ };
++#[doc(hidden)]
++pub use transactions::StorageStatisticsSnapshot;
++#[doc(hidden)]
++pub use transactions::{CompactionCursor, CompactionProgress};
+ pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransaction};
+ pub use tree_store::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace, Savepoint};
+ pub use types::{Key, MutInPlaceValue, TypeName, Value};
+@@ -106,3 +110,9 @@
+         tempfile::NamedTempFile::new().unwrap()
+     }
+ }
++
++mod read_admission;
++#[doc(hidden)]
++pub use read_admission::with_read_memory_admission;
++#[doc(hidden)]
++pub use read_admission::{BackendReadObservation, observe_backend_reads};
+--- a/src/multimap_table.rs
++++ b/src/multimap_table.rs
+@@ -212,12 +212,12 @@
+     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+     relocation_map: &HashMap<PageNumber, PageNumber>,
+ ) -> Result<(PageNumber, Checksum)> {
+-    let old_page = mem.get_page(root.0, PageHint::None)?;
+     let mut new_page = if let Some(new_page_number) = relocation_map.get(&root.0) {
+         mem.get_page_mut(*new_page_number)?
+     } else {
+         return Ok(root);
+     };
++    let old_page = mem.get_page(root.0, PageHint::None)?;
+     let new_page_number = new_page.get_page_number();
+     new_page.memory_mut().copy_from_slice(old_page.memory());
+ 
+@@ -348,7 +348,7 @@
+     Ok(root)
+ }
+ 
+-fn parse_subtree_roots<T: Page>(
++pub(crate) fn parse_subtree_roots<T: Page>(
+     page: &T,
+     fixed_key_size: Option<usize>,
+     fixed_value_size: Option<usize>,
+--- /dev/null
++++ b/src/read_admission.rs
+@@ -0,0 +1,63 @@
++//! Operation-scoped admission before allocating a source page. The caller
++//! keeps admitted bytes owned until its read handles have been released.
++use std::{cell::RefCell, io, sync::Arc};
++use std::{marker::PhantomData, rc::Rc};
++type Admission = Arc<dyn Fn(usize) -> io::Result<()> + Send + Sync>;
++thread_local! { static ACTIVE: RefCell<Vec<Admission>> = const { RefCell::new(Vec::new()) }; }
++
++/// Execute synchronous source reads with admission before each cache-miss
++/// allocation. Nested operations restore the enclosing admission on unwind.
++#[doc(hidden)]
++pub fn with_read_memory_admission<R>(admit: Admission, operation: impl FnOnce() -> R) -> R {
++    struct Reset;
++    impl Drop for Reset {
++        fn drop(&mut self) {
++            ACTIVE.with(|active| {
++                active.borrow_mut().pop();
++            });
++        }
++    }
++    ACTIVE.with(|active| active.borrow_mut().push(admit));
++    let _reset = Reset;
++    operation()
++}
++
++pub(crate) fn admit_read_memory(bytes: usize) -> io::Result<()> {
++    ACTIVE.with(|active| match active.borrow().last() {
++        Some(admit) => admit(bytes),
++        None => Ok(()),
++    })
++}
++
++type ReadObserver = Arc<dyn Fn(usize) + Send + Sync>;
++thread_local! { static READ_OBSERVER: RefCell<Option<ReadObserver>> = const { RefCell::new(None) }; }
++
++/// Observe bytes returned by successful backend reads on this thread. Cache
++/// hits contribute zero. This measures storage API I/O, not physical device
++/// traffic: the operating system may satisfy a file read from its page cache.
++#[doc(hidden)]
++pub fn observe_backend_reads(observer: ReadObserver) -> BackendReadObservation {
++    BackendReadObservation {
++        previous: READ_OBSERVER.with(|slot| slot.replace(Some(observer))),
++        _thread: PhantomData,
++    }
++}
++
++#[doc(hidden)]
++pub struct BackendReadObservation {
++    previous: Option<ReadObserver>,
++    _thread: PhantomData<Rc<()>>,
++}
++
++impl Drop for BackendReadObservation {
++    fn drop(&mut self) {
++        READ_OBSERVER.with(|slot| slot.replace(self.previous.take()));
++    }
++}
++
++pub(crate) fn record_backend_read(bytes: usize) {
++    let observer = READ_OBSERVER.with(|slot| slot.borrow().clone());
++    if let Some(observer) = observer {
++        observer(bytes);
++    }
++}
+--- a/src/transaction_tracker.rs
++++ b/src/transaction_tracker.rs
+@@ -80,6 +80,7 @@
+     live_read_transactions: BTreeMap<TransactionId, u64>,
+     next_transaction_id: TransactionId,
+     live_write_transaction: Option<TransactionId>,
++    waiting_write_transactions: usize,
+     valid_savepoints: BTreeMap<SavepointId, TransactionId>,
+     // Non-durable commits that are still in-memory, and waiting for a durable commit to get flushed
+     // We need to make sure that the freed-table does not get processed for these, since they are not durable yet
+@@ -104,6 +105,7 @@
+                 live_read_transactions: Default::default(),
+                 next_transaction_id,
+                 live_write_transaction: None,
++                waiting_write_transactions: 0,
+                 valid_savepoints: Default::default(),
+                 pending_non_durable_commits: Default::default(),
+                 unprocessed_freed_non_durable_commits: Default::default(),
+@@ -115,7 +117,9 @@
+     pub(crate) fn start_write_transaction(&self) -> TransactionId {
+         let mut state = self.state.lock().unwrap();
+         while state.live_write_transaction.is_some() {
++            state.waiting_write_transactions += 1;
+             state = self.live_write_transaction_available.wait(state).unwrap();
++            state.waiting_write_transactions -= 1;
+         }
+         assert!(state.live_write_transaction.is_none());
+         let transaction_id = state.next_transaction_id.increment();
+@@ -124,6 +128,11 @@
+         state.live_write_transaction = Some(transaction_id);
+ 
+         transaction_id
++    }
++
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn has_waiting_write_transactions(&self) -> bool {
++        self.state.lock().unwrap().waiting_write_transactions > 0
+     }
+ 
+     pub(crate) fn end_write_transaction(&self, id: TransactionId) {
+--- a/src/transactions.rs
++++ b/src/transactions.rs
+@@ -31,6 +31,32 @@
+ use std::{panic, thread};
+ 
+ const MAX_PAGES_PER_COMPACTION: usize = 1_000_000;
++
++/// An in-process scheduling position. No storage pages or read transaction
++/// survive a compaction batch, so it is safe to discard this on restart.
++#[doc(hidden)]
++#[derive(Clone, Debug, Default)]
++pub struct CompactionCursor {
++    pub(crate) phase: u8,
++    pub(crate) table: Option<String>,
++    pub(crate) advance_table: bool,
++    pub(crate) position: Vec<usize>,
++    pub(crate) active: bool,
++}
++
++impl CompactionCursor {
++    pub fn is_active(&self) -> bool {
++        self.active
++    }
++}
++
++#[doc(hidden)]
++#[derive(Clone, Copy, Debug, Default)]
++pub struct CompactionProgress {
++    pub pages_examined: usize,
++    pub pages_relocated: usize,
++    pub complete: bool,
++}
+ const NEXT_SAVEPOINT_TABLE: SystemTableDefinition<(), SavepointId> =
+     SystemTableDefinition::new("next_savepoint_id");
+ pub(crate) const SAVEPOINT_TABLE: SystemTableDefinition<SavepointId, SerializedSavepoint> =
+@@ -1823,6 +1849,110 @@
+         Ok(progress)
+     }
+ 
++    /// Publish one bounded relocation transaction. The owned transaction lets
++    /// callers release handle/admission locks before traversing storage pages.
++    /// Old committed pages enter ordinary reader-fenced deferred reclamation.
++    #[doc(hidden)]
++    pub fn compact_step(
++        mut self,
++        cursor: &mut CompactionCursor,
++        maximum: usize,
++        mut admit: impl FnMut(usize) -> std::io::Result<()>,
++    ) -> Result<CompactionProgress, crate::CompactionError> {
++        assert!(maximum > 0);
++        if self.transaction_tracker.any_savepoint_exists() {
++            return Err(crate::CompactionError::EphemeralSavepointExists);
++        }
++        if self.list_persistent_savepoints()?.next().is_some() {
++            return Err(crate::CompactionError::PersistentSavepointExists);
++        }
++        let mut next = cursor.clone();
++        next.active = true;
++        let progress = self.compact_page_batch(&mut next, maximum, &mut admit)?;
++        self.commit_compaction_frees()
++            .map_err(|e| e.into_storage_error())?;
++        *cursor = next;
++        Ok(progress)
++    }
++
++    /// Advance reader-safe reclamation without another page-tree traversal.
++    #[doc(hidden)]
++    pub fn commit_compaction_frees(mut self) -> Result<(), CommitError> {
++        self.set_two_phase_commit(true);
++        self.set_shrink_policy(ShrinkPolicy::Maximum);
++        self.commit()
++    }
++
++    pub(crate) fn compact_page_batch(
++        &mut self,
++        cursor: &mut CompactionCursor,
++        maximum: usize,
++        admit: &mut impl FnMut(usize) -> std::io::Result<()>,
++    ) -> Result<CompactionProgress> {
++        let mut tables = self.tables.lock().unwrap();
++        let mut system_tables = self.system_tables.lock().unwrap();
++        let tree = if cursor.phase < 2 {
++            &mut tables.table_tree
++        } else {
++            &mut system_tables.table_tree
++        };
++        let (target, pages, examined) = tree.compaction_page_batch(cursor, maximum)?;
++        let mut relocation_map = HashMap::new();
++        let pages = pages
++            .into_iter()
++            .map(|p| (p.page_number(), p))
++            .collect::<BTreeMap<_, _>>();
++        for path in pages.into_values().rev() {
++            if relocation_map.contains_key(&path.page_number()) {
++                continue;
++            }
++            let old = self.mem.get_page(path.page_number(), PageHint::None)?;
++            admit(old.memory().len().saturating_add(128))?;
++            let mut new = self.mem.allocate_lowest(old.memory().len())?;
++            let number = new.get_page_number();
++            new.memory_mut()[0] = old.memory()[0];
++            drop(new);
++            if number >= path.page_number() {
++                self.mem.free(number, &mut PageTrackerPolicy::Ignore);
++                continue;
++            }
++            relocation_map.insert(path.page_number(), number);
++            for parent in path.parents() {
++                if relocation_map.contains_key(parent) {
++                    continue;
++                }
++                let old = self.mem.get_page(*parent, PageHint::None)?;
++                admit(old.memory().len().saturating_add(128))?;
++                let mut new = self.mem.allocate_lowest(old.memory().len())?;
++                new.memory_mut()[0] = old.memory()[0];
++                relocation_map.insert(*parent, new.get_page_number());
++            }
++        }
++        // Relocation copies committed pages and puts their old addresses in
++        // the normal deferred-free tree. process_freed_pages uses the oldest
++        // read transaction fence; neither relocation nor subsequent recording
++        // can reuse those addresses until that reader releases its snapshot.
++        tree.relocate_compaction_batch(target.as_deref(), &relocation_map)?;
++        #[cfg(all(test, debug_assertions))]
++        online_relocation_tests::RELOCATIONS.with(|pairs| {
++            pairs
++                .borrow_mut()
++                .extend(relocation_map.iter().map(|(from, to)| (*from, *to)));
++        });
++        let complete = cursor.phase == 4;
++        if complete {
++            // One automatic sweep is finite even while writers create new
++            // relocation opportunities. The next scheduled sweep can reclaim
++            // those pages; explicit whole-file compaction still drains fully.
++            *cursor = CompactionCursor::default();
++        }
++        Ok(CompactionProgress {
++            pages_examined: examined,
++            pages_relocated: relocation_map.len(),
++            complete,
++        })
++    }
++
+     // NOTE: must be called before store_system_freed_pages() during commit, since this can create
+     // more pages freed by the current transaction
+     fn process_freed_pages(&mut self, free_until: TransactionId) -> Result {
+@@ -2037,6 +2167,18 @@
+         })
+     }
+ 
++    pub(crate) fn storage_statistics_snapshot(
++        &self,
++        read: ReadTransaction,
++    ) -> Result<StorageStatisticsSnapshot> {
++        let system = self.system_tables.lock().unwrap().table_tree.stats()?;
++        Ok(StorageStatisticsSnapshot {
++            read,
++            system,
++            free_pages: self.mem.count_free_pages()?,
++        })
++    }
++
+     #[allow(dead_code)]
+     pub(crate) fn print_debug(&self) -> Result {
+         // Flush any pending updates to make sure we get the latest root
+@@ -2107,6 +2249,36 @@
+     tree: TableTree,
+ }
+ 
++/// Application pages follow MVCC; allocator/system pages do not. Capture
++/// only the system's numeric totals under the short writer boundary, then
++/// traverse application data through an ordinary independent read snapshot.
++#[doc(hidden)]
++pub struct StorageStatisticsSnapshot {
++    read: ReadTransaction,
++    system: DatabaseStats,
++    free_pages: u64,
++}
++
++impl StorageStatisticsSnapshot {
++    pub fn stats(&self) -> Result<DatabaseStats> {
++        let data = self.read.tree.stats()?;
++        Ok(DatabaseStats {
++            tree_height: data.tree_height(),
++            allocated_pages: self.system.allocated_pages(),
++            leaf_pages: data.leaf_pages(),
++            branch_pages: data.branch_pages(),
++            stored_leaf_bytes: data.stored_bytes(),
++            metadata_bytes: data.metadata_bytes()
++                + self.system.metadata_bytes
++                + self.system.stored_leaf_bytes,
++            fragmented_bytes: data.fragmented_bytes()
++                + self.system.fragmented_bytes
++                + self.free_pages * self.system.page_size as u64,
++            page_size: self.system.page_size,
++        })
++    }
++}
++
+ impl ReadTransaction {
+     pub(crate) fn new(
+         mem: Arc<TransactionalMemory>,
+@@ -2285,3 +2457,172 @@
+         assert!(write_txn.transaction_id > first_txn_id);
+     }
+ }
++
++#[cfg(all(test, debug_assertions))]
++mod online_relocation_tests {
++    use super::*;
++    use crate::{Database, ReadableDatabase, TableDefinition};
++
++    thread_local! {
++        pub(super) static RELOCATIONS: std::cell::RefCell<Vec<(PageNumber, PageNumber)>> = const { std::cell::RefCell::new(Vec::new()) };
++    }
++
++    #[test]
++    fn live_snapshot_survives_relocated_and_reused_pages() {
++        const VALUES: TableDefinition<u64, &[u8]> = TableDefinition::new("values");
++        const WRITES: TableDefinition<u64, &[u8]> = TableDefinition::new("recording");
++        let file = crate::create_tempfile();
++        let db = Database::create(file.path()).unwrap();
++        let write = db.begin_write().unwrap();
++        let mem = write.mem.clone();
++        {
++            let mut table = write.open_table(VALUES).unwrap();
++            for key in 0..600u64 {
++                table
++                    .insert(key, vec![(key % 251) as u8; 8192].as_slice())
++                    .unwrap();
++            }
++        }
++        write.commit().unwrap();
++        let initially_allocated: HashSet<_> = mem.all_allocated_pages().into_iter().collect();
++        let write = db.begin_write().unwrap();
++        {
++            let mut table = write.open_table(VALUES).unwrap();
++            for key in 0..500 {
++                table.remove(key).unwrap();
++            }
++        }
++        write.commit().unwrap();
++        for _ in 0..3 {
++            db.begin_write().unwrap().commit_compaction_frees().unwrap();
++        }
++        let snapshot = db.begin_read().unwrap();
++        let old_table = snapshot.open_table(VALUES).unwrap();
++        let pinned: HashSet<_> = mem.all_allocated_pages().into_iter().collect();
++        let old_holes: HashSet<_> = initially_allocated.difference(&pinned).copied().collect();
++        assert!(!old_holes.is_empty());
++        let before: HashMap<_, _> = pinned
++            .iter()
++            .map(|page| {
++                (
++                    *page,
++                    mem.get_page(*page, PageHint::None)
++                        .unwrap()
++                        .memory()
++                        .to_vec(),
++                )
++            })
++            .collect();
++        RELOCATIONS.with(|pairs| pairs.borrow_mut().clear());
++        let mut cursor = CompactionCursor::default();
++        let mut relocated = 0;
++        let mut completed = false;
++        for _ in 0..256 {
++            let progress = db
++                .begin_write()
++                .unwrap()
++                .compact_step(&mut cursor, 16, |_| Ok(()))
++                .unwrap();
++            relocated += progress.pages_relocated;
++            // Ordinary recording commits while the original read remains pinned.
++            let write = db.begin_write().unwrap();
++            write
++                .open_table(WRITES)
++                .unwrap()
++                .insert(relocated as u64, &[42u8; 8192][..])
++                .unwrap();
++            write.commit().unwrap();
++            for key in 500..600 {
++                assert_eq!(
++                    old_table.get(key).unwrap().unwrap().value(),
++                    vec![(key % 251) as u8; 8192]
++                );
++            }
++            if progress.complete {
++                completed = true;
++                break;
++            }
++        }
++        assert!(completed && relocated > 0);
++        let pairs = RELOCATIONS.with(|pairs| pairs.borrow().clone());
++        let reused_holes = pairs
++            .iter()
++            .filter(|(_, to)| old_holes.contains(to))
++            .count();
++        assert!(
++            reused_holes > 0,
++            "relocation must actually reuse freed lower pages"
++        );
++        let old_sources: HashSet<_> = pairs
++            .iter()
++            .filter_map(|(from, _)| pinned.contains(from).then_some(*from))
++            .collect();
++        assert!(!old_sources.is_empty());
++        for page in &old_sources {
++            assert!(
++                mem.is_allocated(*page),
++                "live readers retain relocated source pages"
++            );
++            assert_eq!(
++                mem.get_page(*page, PageHint::None).unwrap().memory(),
++                before[page]
++            );
++        }
++        drop(old_table);
++        drop(snapshot);
++        for _ in 0..3 {
++            db.begin_write().unwrap().commit_compaction_frees().unwrap();
++        }
++        let reclaimed = old_sources
++            .iter()
++            .filter(|page| !mem.is_allocated(**page))
++            .count();
++        assert!(
++            reclaimed > 0,
++            "releasing the snapshot must make relocated source pages reusable"
++        );
++        let write = db.begin_write().unwrap();
++        {
++            let mut table = write.open_table(WRITES).unwrap();
++            for key in 10000..10600 {
++                table.insert(key, &[73u8; 8192][..]).unwrap();
++            }
++        }
++        write.commit().unwrap();
++        let source_reuse = old_sources
++            .iter()
++            .filter(|page| {
++                mem.is_allocated(**page)
++                    && mem.get_page(**page, PageHint::None).unwrap().memory() != before[page]
++            })
++            .count();
++        assert!(
++            source_reuse > 0,
++            "recording must actually overwrite released relocation sources"
++        );
++        eprintln!(
++            "relocated={relocated} reused_lower_pages={reused_holes} pinned_sources={} released_sources={reclaimed} reused_sources={source_reuse}",
++            old_sources.len()
++        );
++        drop(mem);
++        drop(db);
++        let db = Database::open(file.path()).unwrap();
++        let read = db.begin_read().unwrap();
++        let table = read.open_table(VALUES).unwrap();
++        for key in 500..600 {
++            assert_eq!(
++                table.get(key).unwrap().unwrap().value(),
++                vec![(key % 251) as u8; 8192]
++            );
++        }
++        assert_eq!(
++            read.open_table(WRITES)
++                .unwrap()
++                .get(10599)
++                .unwrap()
++                .unwrap()
++                .value(),
++            &[73u8; 8192]
++        );
++    }
++}
+--- a/src/tree_store/btree.rs
++++ b/src/tree_store/btree.rs
+@@ -68,7 +68,7 @@
+     root: Option<BtreeHeader>,
+     hint: PageHint,
+     key_width: Option<usize>,
+-    _value_width: Option<usize>,
++    value_width: Option<usize>,
+ }
+ 
+ impl UntypedBtree {
+@@ -84,7 +84,7 @@
+             root,
+             hint,
+             key_width,
+-            _value_width: value_width,
++            value_width,
+         }
+     }
+ 
+@@ -100,6 +100,106 @@
+         Ok(())
+     }
+ 
++    // The continuation is a position in the current tree, never a retained
++    // page identity. A writer may split or merge pages between batches; that
++    // can revisit or skip a position in this sweep, but relocation always
++    // uses paths resolved inside the current write transaction. Later sweeps
++    // revisit the complete tree without retaining an old storage snapshot.
++    pub(crate) fn page_batch(
++        &self,
++        resume: &[usize],
++        maximum: usize,
++        multimap: bool,
++    ) -> Result<(Vec<PagePath>, Option<Vec<usize>>, usize)> {
++        let mut batch = PageBatch {
++            resume,
++            maximum,
++            pages: Vec::new(),
++            next: None,
++            examined: 0,
++        };
++        if let Some(root) = self.root {
++            self.page_batch_helper(
++                PagePath::new_root(root.root),
++                &mut Vec::new(),
++                multimap,
++                &mut batch,
++            )?;
++        }
++        Ok((batch.pages, batch.next, batch.examined))
++    }
++
++    fn page_batch_helper(
++        &self,
++        path: PagePath,
++        position: &mut Vec<usize>,
++        multimap: bool,
++        batch: &mut PageBatch<'_>,
++    ) -> Result<bool> {
++        if position.as_slice() < batch.resume && !batch.resume.starts_with(position) {
++            return Ok(true);
++        }
++        if position.as_slice() >= batch.resume {
++            if batch.pages.len() == batch.maximum {
++                batch.next = Some(position.clone());
++                return Ok(false);
++            }
++            batch.pages.push(path.clone());
++        }
++        batch.examined += 1;
++        let page = self.mem.get_page(path.page_number(), self.hint)?;
++        match page.memory()[0] {
++            BRANCH => {
++                let accessor = BranchAccessor::new(&page, self.key_width);
++                for i in 0..accessor.count_children() {
++                    position.push(i);
++                    let complete = self.page_batch_helper(
++                        path.with_child(accessor.child_page(i).unwrap()),
++                        position,
++                        multimap,
++                        batch,
++                    )?;
++                    position.pop();
++                    if !complete {
++                        return Ok(false);
++                    }
++                }
++            }
++            LEAF if multimap => {
++                for (i, header) in crate::multimap_table::parse_subtree_roots(
++                    &page,
++                    self.key_width,
++                    self.value_width,
++                )
++                .into_iter()
++                .enumerate()
++                {
++                    let subtree = Self::new(
++                        Some(header),
++                        self.mem.clone(),
++                        self.hint,
++                        self.value_width,
++                        Some(0),
++                    );
++                    position.push(i);
++                    let complete = subtree.page_batch_helper(
++                        path.with_child(header.root),
++                        position,
++                        false,
++                        batch,
++                    )?;
++                    position.pop();
++                    if !complete {
++                        return Ok(false);
++                    }
++                }
++            }
++            LEAF => {}
++            _ => unreachable!(),
++        }
++        Ok(true)
++    }
++
+     fn visit_pages_helper<F>(&self, path: PagePath, visitor: &mut F) -> Result
+     where
+         F: FnMut(&PagePath) -> Result,
+@@ -124,6 +224,14 @@
+ 
+         Ok(())
+     }
++}
++
++struct PageBatch<'a> {
++    resume: &'a [usize],
++    maximum: usize,
++    pages: Vec<PagePath>,
++    next: Option<Vec<usize>>,
++    examined: usize,
+ }
+ 
+ pub(crate) struct UntypedBtreeMut {
+@@ -281,12 +389,12 @@
+         page_number: PageNumber,
+         relocation_map: &HashMap<PageNumber, PageNumber>,
+     ) -> Result<Option<(PageNumber, Checksum)>> {
+-        let old_page = self.mem.get_page(page_number, PageHint::None)?;
+         let mut new_page = if let Some(new_page_number) = relocation_map.get(&page_number) {
+             self.mem.get_page_mut(*new_page_number)?
+         } else {
+             return Ok(None);
+         };
++        let old_page = self.mem.get_page(page_number, PageHint::None)?;
+         new_page.memory_mut().copy_from_slice(old_page.memory());
+ 
+         let node_mem = old_page.memory();
+--- a/src/tree_store/page_store/cached_file.rs
++++ b/src/tree_store/page_store/cached_file.rs
+@@ -165,6 +165,8 @@
+         let result = self.file.read(offset, out);
+         if result.is_err() {
+             self.io_failed.store(true, Ordering::Release);
++        } else {
++            crate::read_admission::record_backend_read(out.len());
+         }
+         result.map_err(StorageError::from)
+     }
+@@ -420,6 +422,9 @@
+     // `Vec<u8>` that is then copied into an `Arc`. The buffer is zero-filled
+     // because `StorageBackend::read` takes `&mut [u8]`.
+     fn read_direct_into_arc(&self, offset: u64, len: usize) -> Result<Arc<[u8]>> {
++        // The page and its cache entry must be admitted before allocation,
++        // including a single value larger than the configured cache.
++        crate::read_admission::admit_read_memory(len.saturating_add(128))?;
+         let mut arc = zero_filled_arc(len);
+         self.file.read(offset, Arc::get_mut(&mut arc).unwrap())?;
+         Ok(arc)
+--- a/src/tree_store/page_store/layout.rs
++++ b/src/tree_store/page_store/layout.rs
+@@ -1,10 +1,11 @@
+ use std::ops::Range;
+ 
+ fn round_up_to_multiple_of(value: u64, multiple: u64) -> u64 {
+-    if value % multiple == 0 {
++    let remainder = value % multiple;
++    if remainder == 0 {
+         value
+     } else {
+-        value + multiple - value % multiple
++        value + multiple - remainder
+     }
+ }
+ 
+--- a/src/tree_store/table_tree.rs
++++ b/src/tree_store/table_tree.rs
+@@ -70,6 +70,16 @@
+ }
+ 
+ impl TableTree {
++    pub(crate) fn stats(&self) -> Result<DatabaseStats> {
++        let view = TableTreeMut::new(
++            self.tree.get_root(),
++            self.tree.transaction_guard().clone(),
++            self.mem.clone(),
++            Arc::new(Mutex::new(Vec::new())),
++            Arc::new(Mutex::new(PageTrackerPolicy::Ignore)),
++        );
++        view.stats()
++    }
+     pub(crate) fn new(
+         master_root: Option<BtreeHeader>,
+         page_hint: PageHint,
+@@ -678,6 +688,95 @@
+         Ok(())
+     }
+ 
++    pub(crate) fn compaction_page_batch(
++        &self,
++        cursor: &mut crate::transactions::CompactionCursor,
++        maximum: usize,
++    ) -> Result<(Option<String>, Vec<PagePath>, usize)> {
++        use std::ops::Bound;
++        let target = if cursor.phase.is_multiple_of(2) {
++            None
++        } else {
++            let start = match cursor.table.as_deref() {
++                None => Bound::Unbounded,
++                Some(name) if cursor.advance_table => Bound::Excluded(name),
++                Some(name) => Bound::Included(name),
++            };
++            let entry = self
++                .tree
++                .range::<_, &str>(&(start, Bound::Unbounded))?
++                .next();
++            let Some(entry) = entry else {
++                cursor.phase += 1;
++                cursor.table = None;
++                cursor.advance_table = false;
++                cursor.position.clear();
++                return Ok((None, Vec::new(), 0));
++            };
++            let entry = entry?;
++            let name = entry.key().to_owned();
++            if cursor.table.as_ref() != Some(&name) {
++                cursor.position.clear();
++            }
++            cursor.table = Some(name.clone());
++            cursor.advance_table = false;
++            Some((name, entry.value()))
++        };
++        let (pages, next, examined) = if let Some((_, definition)) = &target {
++            definition.page_batch(self.mem.clone(), &cursor.position, maximum)?
++        } else {
++            let tree = crate::tree_store::UntypedBtree::new(
++                self.tree.get_root(),
++                self.mem.clone(),
++                PageHint::None,
++                <&str as Value>::fixed_width(),
++                InternalTableDefinition::fixed_width(),
++            );
++            tree.page_batch(&cursor.position, maximum, false)?
++        };
++        if let Some(next) = next {
++            cursor.position = next;
++        } else {
++            cursor.position.clear();
++            if target.is_some() {
++                cursor.advance_table = true;
++            } else {
++                cursor.phase += 1;
++            }
++        }
++        Ok((target.map(|(name, _)| name), pages, examined))
++    }
++
++    pub(crate) fn relocate_compaction_batch(
++        &mut self,
++        target: Option<&str>,
++        relocation_map: &HashMap<PageNumber, PageNumber>,
++    ) -> Result {
++        if relocation_map.is_empty() {
++            return Ok(());
++        }
++        if let Some(name) = target {
++            let mut definition = self
++                .tree
++                .get(&name)?
++                .expect("selected table exists")
++                .value();
++            if let Some(root) = definition.relocate_tree(
++                self.mem.clone(),
++                self.freed_pages.clone(),
++                relocation_map,
++            )? {
++                self.pending_table_updates.insert(
++                    name.to_owned(),
++                    (Some(root), definition.get_length(), false),
++                );
++            }
++        } else {
++            self.tree.relocate(relocation_map)?;
++        }
++        Ok(())
++    }
++
+     pub fn stats(&self) -> Result<DatabaseStats> {
+         let master_tree_stats = self.tree.stats()?;
+         let mut max_subtree_height = 0;
+--- a/src/tree_store/table_tree_base.rs
++++ b/src/tree_store/table_tree_base.rs
+@@ -267,6 +267,23 @@
+         }
+     }
+ 
++    pub(crate) fn page_batch(
++        &self,
++        mem: Arc<TransactionalMemory>,
++        resume: &[usize],
++        maximum: usize,
++    ) -> Result<(Vec<PagePath>, Option<Vec<usize>>, usize)> {
++        let multimap = matches!(self, Self::Multimap { .. });
++        let tree = UntypedBtree::new(
++            self.private_get_root(),
++            mem,
++            PageHint::None,
++            self.private_get_fixed_key_size(),
++            self.private_get_fixed_value_size(),
++        );
++        tree.page_batch(resume, maximum, multimap)
++    }
++
+     fn private_get_root(&self) -> Option<BtreeHeader> {
+         match self {
+             InternalTableDefinition::Normal { table_root, .. }

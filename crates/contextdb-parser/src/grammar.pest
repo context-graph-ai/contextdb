@@ -33,10 +33,13 @@ stmt = _{
     | update_stmt
     | show_sync_conflict_policy
     | show_vector_indexes_stmt
+    | show_vector_partitions_stmt
     | set_memory_limit
     | show_memory_limit
     | set_disk_limit
     | show_disk_limit
+    | set_maintenance_poll_interval
+    | show_maintenance_poll_interval
     | select_stmt
 }
 
@@ -51,12 +54,27 @@ show_delivery_outcomes_stmt = {
     ~ offset_clause?
 }
 offset_clause = { ^"OFFSET" ~ integer }
-set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "'" ~ memory_limit_value ~ "'" }
+show_vector_partitions_stmt = {
+    ^"SHOW"
+    ~ ^"VECTOR_PARTITIONS"
+    ~ (^"FOR" ~ show_vector_partitions_target)?
+    ~ show_vector_partitions_paging?
+}
+show_vector_partitions_target = { identifier ~ "." ~ identifier }
+show_vector_partitions_paging = { ^"LIMIT" ~ integer ~ (^"OFFSET" ~ integer)? }
+set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ ("'" ~ memory_limit_value ~ "'" | memory_limit_value) }
 show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
 memory_limit_value = { ^"none" | size_with_unit }
-set_disk_limit = { ^"SET" ~ ^"DISK_LIMIT" ~ "'" ~ disk_limit_value ~ "'" }
+set_disk_limit = { ^"SET" ~ ^"DISK_LIMIT" ~ ("'" ~ disk_limit_value ~ "'" | disk_limit_value) }
 show_disk_limit = { ^"SHOW" ~ ^"DISK_LIMIT" }
 disk_limit_value = { ^"none" | size_with_unit }
+set_maintenance_poll_interval = {
+    ^"SET" ~ ^"MAINTENANCE_POLL_INTERVAL"
+    ~ ("'" ~ maintenance_poll_interval_value ~ "'" | maintenance_poll_interval_value)
+}
+show_maintenance_poll_interval = { ^"SHOW" ~ ^"MAINTENANCE_POLL_INTERVAL" }
+maintenance_poll_interval_value = { integer ~ maintenance_poll_interval_unit }
+maintenance_poll_interval_unit = { ^"MILLISECONDS" | ^"SECONDS" }
 size_with_unit = { ASCII_DIGIT+ ~ ("G" | "M" | "K") }
 
 begin_stmt = { ^"BEGIN" }
@@ -76,6 +94,7 @@ select_core = {
     ~ join_clause*
     ~ where_clause?
     ~ order_by_clause?
+    ~ use_vector_clause?
     ~ use_rank_clause?
     ~ limit_clause?
 }
@@ -86,16 +105,17 @@ star = { "*" }
 select_item = { expr ~ (^"AS" ~ identifier)? }
 
 from_clause = { ^"FROM" ~ from_item ~ ("," ~ from_item)* }
-join_clause = { join_type ~ join_table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | order_by_start | use_rank_start | limit_start | clause_end) }
+join_clause = { join_type ~ join_table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
 join_table_ref = { identifier ~ (^"AS" ~ identifier | identifier ~ &(^"ON"))? }
 join_type = { (^"LEFT" ~ ^"JOIN") | (^"INNER" ~ ^"JOIN") }
 from_item = { graph_table | table_ref }
 table_ref = { identifier ~ ((^"AS")? ~ table_alias)? }
-table_alias = { !(join_type | where_start | order_by_start | use_rank_start | limit_start | clause_end) ~ identifier }
+table_alias = { !(join_type | where_start | order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) ~ identifier }
 
-where_clause = { ^"WHERE" ~ expr ~ &(order_by_start | use_rank_start | limit_start | clause_end) }
+where_clause = { ^"WHERE" ~ expr ~ &(order_by_start | use_vector_start | use_rank_start | limit_start | clause_end) }
 where_start = _{ ^"WHERE" }
 order_by_start = _{ ^"ORDER" ~ ^"BY" }
+use_vector_start = _{ ^"USE" ~ ^"VECTOR" }
 use_rank_start = _{ ^"USE" ~ ^"RANK" }
 limit_start = _{ ^"LIMIT" }
 clause_end = _{ EOI | ";" | ")" | "," }
@@ -108,6 +128,7 @@ cosine_rhs = { row_vector_source | additive_expr }
 row_vector_source = { ^"ROW_VECTOR" ~ "(" ~ string ~ "," ~ string ~ "," ~ row_vector_key ~ ")" }
 row_vector_key = { parameter | bool_lit | float | integer | string }
 
+use_vector_clause = { ^"USE" ~ ^"VECTOR" ~ vector_search_mode }
 use_rank_clause = { ^"USE" ~ ^"RANK" ~ identifier }
 
 limit_clause = { ^"LIMIT" ~ integer }
@@ -174,7 +195,18 @@ foreign_key_table_constraint = {
 }
 
 alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
-alter_action = { add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action | set_history_action | set_sync_conflict_action | set_sync_direction_action }
+alter_action = { alter_column_action | add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action | set_history_action | set_sync_conflict_action | set_sync_direction_action }
+alter_column_action = {
+    ^"ALTER"
+    ~ ^"COLUMN"
+    ~ identifier
+    ~ (alter_column_set_max_partitions | alter_column_set_search_mode | alter_column_set_auto_index_at | alter_column_set_hnsw | alter_column_set_consolidation)
+}
+alter_column_set_max_partitions = { ^"SET" ~ ^"MAX_PARTITIONS" ~ max_partitions_literal }
+alter_column_set_search_mode = { ^"SET" ~ ^"SEARCH_MODE" ~ vector_search_mode }
+alter_column_set_auto_index_at = { ^"SET" ~ ^"AUTO_INDEX_AT" ~ vector_policy_value }
+alter_column_set_hnsw = { ^"SET" ~ ^"HNSW" ~ (^"DEFAULT" | hnsw_options) }
+alter_column_set_consolidation = { ^"SET" ~ ^"CONSOLIDATION" ~ (^"DEFAULT" | consolidation_none | consolidation_options) }
 set_retain_action = { ^"SET" ~ ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 drop_retain_action = { ^"DROP" ~ ^"RETAIN" }
 set_history_action = { ^"SET" ~ history_option }
@@ -201,11 +233,41 @@ data_type = {
     | ^"JSON"
     | ^"TXID"
 }
-vector_type = { ^"VECTOR" ~ "(" ~ integer ~ ")" ~ vector_quantization_clause? }
+vector_type = {
+    ^"VECTOR"
+    ~ "("
+    ~ integer
+    ~ ")"
+    ~ vector_quantization_clause?
+    ~ vector_partition_key_clause?
+    ~ vector_max_partitions_clause?
+    ~ vector_search_mode_clause?
+    ~ vector_auto_index_at_clause?
+    ~ vector_hnsw_clause?
+    ~ vector_consolidation_clause?
+}
 vector_quantization_clause = {
     ^"WITH" ~ "(" ~ ^"quantization" ~ "=" ~ vector_quantization_value ~ ")"
 }
 vector_quantization_value = @{ "'" ~ ("F32" | "SQ8" | "SQ4") ~ "'" }
+vector_partition_key_clause = {
+    ^"PARTITION_KEY" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")"
+}
+vector_max_partitions_clause = { ^"MAX_PARTITIONS" ~ max_partitions_literal }
+vector_search_mode_clause = { ^"SEARCH_MODE" ~ vector_search_mode }
+vector_search_mode = @{ ^"AUTO" | ^"EXACT" | ^"INDEXED" }
+max_partitions_literal = @{ "-"? ~ ASCII_DIGIT+ }
+vector_auto_index_at_clause = { ^"AUTO_INDEX_AT" ~ vector_policy_value }
+vector_hnsw_clause = { ^"HNSW" ~ hnsw_options }
+vector_consolidation_clause = { ^"CONSOLIDATION" ~ (consolidation_none | consolidation_options) }
+consolidation_none = { ^"NONE" }
+hnsw_options = { "(" ~ hnsw_option ~ ("," ~ hnsw_option)* ~ ")" }
+hnsw_option = { hnsw_option_name ~ "=" ~ vector_policy_value }
+hnsw_option_name = @{ ^"M" | ^"EF_CONSTRUCTION" | ^"EF_SEARCH" }
+consolidation_options = { "(" ~ consolidation_option ~ ("," ~ consolidation_option)* ~ ")" }
+consolidation_option = { consolidation_option_name ~ "=" ~ vector_policy_value }
+consolidation_option_name = @{ ^"CHANGE_PERCENT" | ^"TOMBSTONE_PERCENT" }
+vector_policy_value = @{ ^"DEFAULT" | "-"? ~ ASCII_DIGIT+ }
 
 column_constraint = {
     not_null

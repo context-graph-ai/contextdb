@@ -287,8 +287,29 @@ fn maintenance_status_and_explain_keep_their_own_document_keys() {
     );
 
     let docs = outcome.stdout_docs();
-    expect_document(&docs, "maintenance", "`.maintenance status` under --json");
+    let maintenance = expect_document(&docs, "maintenance", "`.maintenance status` under --json");
+    assert_eq!(maintenance["policy"], "engine_owned");
+    assert_eq!(maintenance["running"], false);
+    assert_eq!(maintenance["retention_enabled"], false);
+    assert_eq!(maintenance["currency_compaction_enabled"], false);
+    assert_eq!(maintenance["active_maintenance_loops"], 0);
     expect_document(&docs, "explain", "`.explain` under --json");
+
+    let text = run(&[store.path_str()], ".maintenance status\n");
+    assert_eq!(text.code, Some(0), "{}", text.describe());
+    for field in [
+        "running=false",
+        "retention_enabled=false",
+        "currency_compaction_enabled=false",
+        "active_maintenance_loops=0",
+        "policy=engine_owned",
+    ] {
+        assert!(
+            text.stdout.contains(field),
+            "the text maintenance status is missing {field:?}:\n{}",
+            text.describe()
+        );
+    }
 }
 
 #[test]

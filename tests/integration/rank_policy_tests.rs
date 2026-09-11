@@ -1,6 +1,6 @@
 use contextdb_core::{Error, Lsn, Value, VectorIndexRef};
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
-use contextdb_engine::{Database, SearchResult, SemanticQuery};
+use contextdb_engine::{Database, MaintenancePolicy, SearchResult, SemanticQuery};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -1370,7 +1370,7 @@ fn tie01_cosine_on_equal_rank() {
     );
 }
 
-/// RED: equal rank and cosine ties are broken by internal RowId descending.
+/// Equal rank and cosine ties are broken by internal RowId ascending.
 #[test]
 fn tie02_rowid_on_equal_rank_and_cosine() {
     let db = Database::open_memory();
@@ -1397,7 +1397,7 @@ fn tie02_rowid_on_equal_rank_and_cosine() {
     );
     assert_eq!(
         result_ids(&semantic_results(&db, Some("effective_confidence"), 2)),
-        vec![second, first]
+        vec![first, second]
     );
 }
 
@@ -1754,12 +1754,26 @@ fn hnsw_threshold_999_brute_force_boundary() {
     assert_eq!(db.__rank_policy_eval_count(), 999);
 }
 
-/// RED: HNSW boundary still evaluates the surfaced policy candidates.
+/// At the HNSW boundary the surfaced policy candidates are still evaluated. The maintained (HNSW)
+/// route is built deterministically before the query runs, so the ranked candidate pool this
+/// test measures is always the indexed route's pool, never a result of background-build timing.
 #[test]
 fn hnsw_threshold_1001_hnsw_boundary() {
     let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_policy_schema(&db, "coalesce({confidence}, 0.0)");
     let expected = seed_many_hnsw_frontier_policy(&db, 1001);
+    // A fixed number of finite calls is the public caller-driven operation; this is not a
+    // timing wait.
+    for _ in 0..32 {
+        db.run_maintenance_cycle()
+            .expect("one caller-driven maintenance batch succeeds");
+    }
+    assert_eq!(
+        db.__debug_vector_hnsw_len(VectorIndexRef::new("decisions", "embedding")),
+        Some(1001),
+        "the maintained route must be built and ready before the ranked query runs"
+    );
     let results = semantic_results(&db, Some("effective_confidence"), 10);
     assert_eq!(results.len(), 10);
     assert_eq!(result_ids(&results), expected);
@@ -1770,7 +1784,20 @@ fn hnsw_threshold_1001_hnsw_boundary() {
             .map(|n| 1.0 + n as f32 * 0.01)
             .collect::<Vec<_>>()
     );
-    assert!(db.__rank_policy_eval_count() > 0 && db.__rank_policy_eval_count() < 1001);
+    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert_eq!(db.__rank_policy_eval_count(), 1001);
+    // The compatibility breadth covers this whole small partition. A declared
+    // narrower breadth bounds the rank pool without rebuilding its ready graph.
+    db.execute(
+        "ALTER TABLE decisions ALTER COLUMN embedding SET HNSW (EF_SEARCH = 128)",
+        &empty_params(),
+    )
+    .unwrap();
+    db.__reset_rank_policy_eval_count();
+    let narrowed = semantic_results(&db, Some("effective_confidence"), 10);
+    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert_eq!(result_ids(&narrowed), expected);
+    assert_eq!(db.__rank_policy_eval_count(), 128);
 }
 
 /// REGRESSION GUARD: HNSW with no sort_key remains byte-for-byte raw cosine search.

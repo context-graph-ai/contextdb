@@ -1393,7 +1393,16 @@ fn t21_16_mixed_sync_vector_error_rolls_back_rows() {
 }
 
 #[test]
-fn t21_15_legacy_nonmonotonic_txids_are_repaired_on_reopen() {
+fn t21_15_current_commit_index_damage_is_repaired_on_reopen() {
+    assert_current_commit_index_repair(false);
+}
+
+#[test]
+fn current_nonmonotonic_transaction_ids_are_repaired_on_reopen() {
+    assert_current_commit_index_repair(true);
+}
+
+fn assert_current_commit_index_repair(disorder_ids: bool) {
     use redb::ReadableTable;
     use serde::{Deserialize, Serialize};
 
@@ -1449,7 +1458,7 @@ fn t21_15_legacy_nonmonotonic_txids_are_repaired_on_reopen() {
     }
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let path = tmp.path().join("legacy-nonmonotonic.db");
+    let path = tmp.path().join("current-commit-index-repair.db");
     let first_id = Uuid::from_u128(0x2121);
     let second_id = Uuid::from_u128(0x2122);
     let versioned_id = Uuid::from_u128(0x2123);
@@ -1491,43 +1500,53 @@ fn t21_15_legacy_nonmonotonic_txids_are_repaired_on_reopen() {
 
     let redb_db = redb::Database::open(&path).unwrap();
     let write_txn = redb_db.begin_write().unwrap();
-    let rel_items: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("rel_items");
-    let mut rows = Vec::new();
-    {
-        let table = write_txn.open_table(rel_items).unwrap();
-        for entry in table.iter().unwrap() {
-            let (_, value) = entry.unwrap();
-            let mut row: PersistedVersionedRow = decode(value.value());
-            match row.values.get("label") {
-                Some(PersistedValue::Plain(Value::Text(label))) if label == "first" => {
-                    row.created_tx = contextdb_core::TxId(2);
+    if disorder_ids {
+        let rel_items: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new("rel_items");
+        let mut rows = Vec::new();
+        {
+            let table = write_txn.open_table(rel_items).unwrap();
+            for entry in table.iter().unwrap() {
+                let (_, value) = entry.unwrap();
+                let mut row: PersistedVersionedRow = decode(value.value());
+                match row.values.get("label") {
+                    Some(PersistedValue::Plain(Value::Text(label))) if label == "first" => {
+                        row.created_tx = contextdb_core::TxId(2);
+                    }
+                    Some(PersistedValue::Plain(Value::Text(label))) if label == "second" => {
+                        row.created_tx = contextdb_core::TxId(1);
+                    }
+                    Some(PersistedValue::Plain(Value::Text(label))) if label == "before" => {
+                        row.created_tx = contextdb_core::TxId(4);
+                        row.deleted_tx = Some(contextdb_core::TxId(3));
+                    }
+                    Some(PersistedValue::Plain(Value::Text(label))) if label == "after" => {
+                        row.created_tx = contextdb_core::TxId(3);
+                    }
+                    _ => {}
                 }
-                Some(PersistedValue::Plain(Value::Text(label))) if label == "second" => {
-                    row.created_tx = contextdb_core::TxId(1);
-                }
-                Some(PersistedValue::Plain(Value::Text(label))) if label == "before" => {
-                    row.created_tx = contextdb_core::TxId(4);
-                    row.deleted_tx = Some(contextdb_core::TxId(3));
-                }
-                Some(PersistedValue::Plain(Value::Text(label))) if label == "after" => {
-                    row.created_tx = contextdb_core::TxId(3);
-                }
-                _ => {}
+                rows.push(row);
             }
-            rows.push(row);
         }
-    }
-    write_txn.delete_table(rel_items).unwrap();
-    {
-        let mut table = write_txn.open_table(rel_items).unwrap();
-        for row in &rows {
-            table
-                .insert(row_key(row).as_slice(), encode(row).as_slice())
-                .unwrap();
+        write_txn.delete_table(rel_items).unwrap();
+        {
+            let mut table = write_txn.open_table(rel_items).unwrap();
+            for row in &rows {
+                table
+                    .insert(row_key(row).as_slice(), encode(row).as_slice())
+                    .unwrap();
+            }
         }
     }
     let commit_index: redb::TableDefinition<u64, u64> = redb::TableDefinition::new("commit_index");
-    let _ = write_txn.delete_table(commit_index);
+    let mut index = write_txn.open_table(commit_index).unwrap();
+    for lsn in [first_lsn, second_lsn, before_lsn, after_lsn] {
+        assert!(
+            index.remove(lsn.0).unwrap().is_some(),
+            "fixture must remove the current commit-index entry at {lsn:?}"
+        );
+    }
+    drop(index);
     write_txn.commit().unwrap();
     drop(redb_db);
 
@@ -1539,13 +1558,13 @@ fn t21_15_legacy_nonmonotonic_txids_are_repaired_on_reopen() {
         first_rows
             .iter()
             .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == first_id)),
-        "first LSN snapshot must still see the first row after TxId repair"
+        "first LSN snapshot must still see the first row after commit-index repair"
     );
     assert!(
         !first_rows
             .iter()
             .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == second_id)),
-        "first LSN snapshot must not leak the later lower-Tx row"
+        "first LSN snapshot must not leak the later row after commit-index repair"
     );
     let second_rows = repaired
         .scan("items", repaired.snapshot_at(second_lsn))
@@ -1558,11 +1577,7 @@ fn t21_15_legacy_nonmonotonic_txids_are_repaired_on_reopen() {
             repaired.snapshot_at(before_lsn),
         )
         .unwrap();
-    assert_eq!(
-        before_lookup.rows,
-        vec![vec![Value::Text("before".into())]],
-        "same-row point read at the original insert LSN must use the repaired first version"
-    );
+    assert_eq!(before_lookup.rows, vec![vec![Value::Text("before".into())]]);
     let after_lookup = repaired
         .execute_at_snapshot(
             "SELECT label FROM items WHERE id = $id",
@@ -1570,29 +1585,26 @@ fn t21_15_legacy_nonmonotonic_txids_are_repaired_on_reopen() {
             repaired.snapshot_at(after_lsn),
         )
         .unwrap();
+    assert_eq!(after_lookup.rows, vec![vec![Value::Text("after".into())]]);
     assert_eq!(
-        after_lookup.rows,
-        vec![vec![Value::Text("after".into())]],
-        "same-row point read at the update LSN must use the repaired replacement version"
-    );
-    let repaired_update = repaired
-        .execute(
-            "UPDATE items SET label = 'final' WHERE id = $id",
-            &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
-        )
-        .unwrap();
-    assert_eq!(
-        repaired_update.rows_affected, 1,
+        repaired
+            .execute(
+                "UPDATE items SET label = 'final' WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
+            )
+            .unwrap()
+            .rows_affected,
+        1,
         "post-repair update must target the current live row version"
     );
-    let current_lookup = repaired
-        .execute(
-            "SELECT label FROM items WHERE id = $id",
-            &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
-        )
-        .unwrap();
     assert_eq!(
-        current_lookup.rows,
+        repaired
+            .execute(
+                "SELECT label FROM items WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
+            )
+            .unwrap()
+            .rows,
         vec![vec![Value::Text("final".into())]],
         "post-repair point read must see the updated live version"
     );
@@ -1605,7 +1617,18 @@ fn t21_15_legacy_nonmonotonic_txids_are_repaired_on_reopen() {
             .unwrap()
             .len(),
         2,
-        "TxId repair must be durable"
+        "commit-index repair must remain durable after a second reopen"
+    );
+    assert_eq!(
+        reopened
+            .execute(
+                "SELECT label FROM items WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
+            )
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("final".into())]],
+        "the post-repair update must remain durable after a second reopen"
     );
     reopened.close().unwrap();
 }

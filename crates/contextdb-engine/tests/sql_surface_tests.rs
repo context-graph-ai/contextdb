@@ -8336,25 +8336,22 @@ fn concurrent_distinct_table_sql_updates_yield_correct_vector_recall() {
 #[cfg(feature = "test-seams")]
 #[test]
 fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
-    use contextdb_vector::test_seam::PauseWindow;
-
     let db = Arc::new(Database::open_memory());
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     let ids = seed_two_vector_evidence(&db);
     let text_ref = VectorIndexRef::new("evidence", "vector_text");
     let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
     let vector_store = db.vector_store_for_test();
-    let text_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Build);
+    let text_partition = contextdb_vector::VectorPartitionRef::new(
+        text_ref.clone(),
+        contextdb_core::VectorPartitionKey::unpartitioned(),
+    );
+    let text_pause =
+        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
     let (done_text_tx, done_text_rx) = mpsc::channel();
     let db_text = db.clone();
     thread::spawn(move || {
-        done_text_tx
-            .send(per_index_top_id(
-                &db_text,
-                "evidence",
-                "vector_text",
-                per_index_axis3(0),
-            ))
-            .unwrap();
+        done_text_tx.send(db_text.run_maintenance_cycle()).unwrap();
     });
     assert!(text_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
 
@@ -8384,16 +8381,26 @@ fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
     let vision_hnsw_before_release = vector_store.has_hnsw_index_for(&vision_ref);
     let text_still_paused = done_text_rx.try_recv();
     text_pause.release();
-    let _ = done_text_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).unwrap();
+    done_text_rx
+        .recv_timeout(PER_INDEX_SQL_TIMEOUT)
+        .unwrap()
+        .unwrap();
     let vision_id = match vision_first {
         Ok(id) => id,
         Err(_) => done_vision_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).unwrap(),
     };
 
     assert_eq!(vision_id, target_id);
-    assert!(vision_hnsw_before_release);
+    assert!(
+        !vision_hnsw_before_release,
+        "the concurrent query must not build the sibling graph"
+    );
     assert!(matches!(text_still_paused, Err(TryRecvError::Empty)));
     assert!(vector_store.has_hnsw_index_for(&text_ref));
+    assert!(
+        vector_store.has_hnsw_index_for(&vision_ref),
+        "after the paused text build resumes, the same wake services the needy sibling graph"
+    );
 }
 
 #[cfg(feature = "test-seams")]
@@ -8402,18 +8409,21 @@ fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() 
     use contextdb_vector::test_seam::PauseWindow;
 
     let db = Arc::new(Database::open_memory());
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     seed_two_vector_evidence(&db);
     let text_ref = VectorIndexRef::new("evidence", "vector_text");
     let vector_store = db.vector_store_for_test();
-    let build_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Build);
+    let text_partition = contextdb_vector::VectorPartitionRef::new(
+        text_ref.clone(),
+        contextdb_core::VectorPartitionKey::unpartitioned(),
+    );
+    let build_pause =
+        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
     let (done_build_tx, done_build_rx) = mpsc::channel();
     let db_build = db.clone();
     thread::spawn(move || {
         done_build_tx
-            .send(db_build.execute(
-                "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
-                &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
-            ))
+            .send(db_build.run_maintenance_cycle())
             .unwrap();
     });
     assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
@@ -8431,10 +8441,8 @@ fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() 
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
     build_pause.release();
     let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
-    // Table-changing SQL now waits at the statement-wide schema-publication
-    // gate until the paused search releases its read lease.  Only then can it
-    // enter the vector DDL drain below; do not issue a SQL read while this
-    // writer pause owns that gate.
+    // Table-changing SQL cannot retire a vector state while maintenance owns
+    // that same state. It reaches the DDL pause only after maintenance exits.
     assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
     let ref_present_during_pause = vector_store
         .index_infos()
@@ -8464,19 +8472,22 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
     use contextdb_vector::test_seam::PauseWindow;
 
     let db = Arc::new(Database::open_memory());
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     seed_two_vector_evidence(&db);
     let old_ref = VectorIndexRef::new("evidence", "vector_text");
     let new_ref = VectorIndexRef::new("evidence", "vector_text_v2");
     let vector_store = db.vector_store_for_test();
-    let build_pause = vector_store.arm_maintenance_pause_for_test(&old_ref, PauseWindow::Build);
+    let old_partition = contextdb_vector::VectorPartitionRef::new(
+        old_ref.clone(),
+        contextdb_core::VectorPartitionKey::unpartitioned(),
+    );
+    let build_pause =
+        vector_store.arm_maintenance_progress_pause_for_test(&old_partition, PER_INDEX_SQL_ROWS);
     let (done_build_tx, done_build_rx) = mpsc::channel();
     let db_build = db.clone();
     thread::spawn(move || {
         done_build_tx
-            .send(db_build.execute(
-                "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
-                &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
-            ))
+            .send(db_build.run_maintenance_cycle())
             .unwrap();
     });
     assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
@@ -8504,8 +8515,8 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
     ));
     build_pause.release();
     let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
-    // The paused search holds the statement-wide schema read lease, so the
-    // rename cannot enter this DDL pause until that search completes.
+    // The rename cannot enter this DDL pause until the maintenance-owned
+    // traversal releases the old vector state.
     assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
     let old_ref_present_during_pause = vector_store
         .index_infos()
@@ -9396,20 +9407,23 @@ fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
     use contextdb_vector::test_seam::PauseWindow;
 
     let db = Arc::new(Database::open_memory());
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     seed_two_vector_evidence(&db);
     let text_ref = VectorIndexRef::new("evidence", "vector_text");
     let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
     let table_ref = VectorIndexRef::new("evidence", "*");
     let vector_store = db.vector_store_for_test();
-    let build_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Build);
+    let text_partition = contextdb_vector::VectorPartitionRef::new(
+        text_ref.clone(),
+        contextdb_core::VectorPartitionKey::unpartitioned(),
+    );
+    let build_pause =
+        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
     let (done_build_tx, done_build_rx) = mpsc::channel();
     let db_build = db.clone();
     thread::spawn(move || {
         done_build_tx
-            .send(db_build.execute(
-                "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
-                &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
-            ))
+            .send(db_build.run_maintenance_cycle())
             .unwrap();
     });
     assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
@@ -9427,9 +9441,9 @@ fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
     build_pause.release();
     let _ = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
-    // DROP TABLE likewise cannot pass the statement-wide schema writer gate
-    // while the vector search is paused.  The table-level DDL pause is only
-    // reachable after that read lease is released.
+    // DROP TABLE cannot retire a vector state while maintenance owns that
+    // same state. The table-level DDL pause is reachable only after the
+    // maintenance batch releases it; no query is allowed to start the build.
     assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
     ddl_pause.release();
@@ -10374,6 +10388,7 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
         commit_failed: std::sync::atomic::AtomicUsize::new(0),
     });
     let db = Database::open_memory_with_plugin(counters.clone()).unwrap();
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     let f = prv_seed_hnsw_docs(&db, 1024);
     db.execute("CREATE TRIGGER prv08_tr ON docs WHEN UPDATE", &empty())
         .unwrap();
@@ -10397,12 +10412,9 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     })
     .unwrap();
     db.complete_initialization().unwrap();
-    db.execute(
-        "SELECT id FROM docs ORDER BY embedding <=> $query LIMIT 1",
-        &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
-    )
-    .unwrap();
     let index = VectorIndexRef::new("docs", "embedding");
+    db.run_maintenance_cycle()
+        .expect("caller-driven maintenance builds the graph before the read-only probe");
     let before_hnsw_len = db.__debug_vector_hnsw_len(index.clone());
     let before_hnsw_stats = db.__debug_vector_hnsw_stats(index.clone());
     assert!(
@@ -10875,11 +10887,19 @@ fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
     let vector_search_bytes = 3usize
         .saturating_mul(f.source_vec.len())
         .saturating_mul(std::mem::size_of::<f32>());
-    // The read retains a small amount of its own working set before the
-    // overlay reservation is asked. This slack covers that retention with
-    // headroom, but stays far smaller than the overlay reservation itself,
-    // so the overlay reservation remains the one the budget refuses.
-    const SLACK_BEFORE_OVERLAY: usize = 64;
+    // Candidate-route preflight now reserves the score slots needed to prove
+    // this unindexed filter can still use exact work. Leave enough room for
+    // that transient check while keeping less than one overlay entry, so the
+    // active-transaction overlay remains the reservation the budget refuses.
+    const SLACK_BEFORE_OVERLAY: usize = 192;
+    let one_overlay_entry_bytes = std::mem::size_of::<contextdb_core::VectorEntry>()
+        .saturating_add(std::mem::size_of::<(RowId, Vec<f32>)>())
+        .saturating_add(f.source_vec.len() * std::mem::size_of::<f32>())
+        .saturating_add(64);
+    assert!(
+        SLACK_BEFORE_OVERLAY < one_overlay_entry_bytes,
+        "the fixture must still make the overlay reservation exceed its remaining headroom"
+    );
     accountant
         .set_budget(Some(
             before_budget_probe
@@ -11106,8 +11126,9 @@ fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
 }
 
 #[test]
-fn prv_28_row_vector_explain_matches_filtered_hnsw_runtime_strategy() {
+fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building() {
     let covering_db = Database::open_memory();
+    covering_db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     let f = prv_seed_hnsw_docs(&covering_db, 1000);
     let index = VectorIndexRef::new("docs", "embedding");
     assert_eq!(covering_db.__debug_vector_hnsw_len(index.clone()), None);
@@ -11119,8 +11140,11 @@ fn prv_28_row_vector_explain_matches_filtered_hnsw_runtime_strategy() {
         )
         .unwrap();
     assert!(
-        covering_explain.contains("HNSWSearch"),
-        "filtered EXPLAIN must match runtime HNSW strategy when the effective search width covers the graph: {covering_explain}"
+        covering_explain.contains("VectorSearch")
+            && covering_explain.contains("strategy=BruteForce")
+            && covering_explain.contains("route=exact")
+            && covering_explain.contains("fallback=filtered_route_exact"),
+        "filtered EXPLAIN must describe the read-only exact fallback without inventing a graph: {covering_explain}"
     );
     assert_eq!(
         covering_db.__debug_vector_hnsw_len(index.clone()),
@@ -11136,8 +11160,9 @@ fn prv_28_row_vector_explain_matches_filtered_hnsw_runtime_strategy() {
         )
         .unwrap();
     assert!(
-        covering_result.trace.physical_plan.contains("HNSWSearch"),
-        "filtered graph-covering runtime must use the HNSW path: {:?}",
+        covering_result.trace.physical_plan.contains("VectorSearch")
+            && !covering_result.trace.physical_plan.contains("HNSWSearch"),
+        "a query cannot build HNSW and must use the same exact fallback EXPLAIN predicted: {:?}",
         covering_result.trace.physical_plan
     );
     assert!(
@@ -11145,10 +11170,11 @@ fn prv_28_row_vector_explain_matches_filtered_hnsw_runtime_strategy() {
             .rows
             .iter()
             .all(|row| row.first() != Some(&Value::Uuid(f.source))),
-        "graph-covering HNSW supplement path must preserve the candidate filter"
+        "the exact fallback must preserve the candidate filter"
     );
 
     let fallback_db = Database::open_memory();
+    fallback_db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     let fallback = prv_seed_hnsw_docs(&fallback_db, 5001);
     let fallback_index = VectorIndexRef::new("docs", "embedding");
     assert_eq!(
@@ -11183,7 +11209,7 @@ fn prv_28_row_vector_explain_matches_filtered_hnsw_runtime_strategy() {
     assert!(
         fallback_result.trace.physical_plan.contains("VectorSearch")
             && !fallback_result.trace.physical_plan.contains("HNSWSearch"),
-        "filtered non-covering runtime must use the fallback vector path: {:?}",
+        "a caller-driven query cannot build HNSW and must use the exact fallback: {:?}",
         fallback_result.trace.physical_plan
     );
     assert!(
@@ -11192,6 +11218,43 @@ fn prv_28_row_vector_explain_matches_filtered_hnsw_runtime_strategy() {
             .iter()
             .all(|row| row.first() != Some(&Value::Uuid(fallback.source))),
         "fallback path must preserve the candidate filter"
+    );
+}
+
+#[test]
+fn prv_28b_filtered_indexed_explain_names_specific_or_generic_recovery() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+
+    let simple = db
+        .explain(
+            "SELECT id FROM docs WHERE label = 'near' \
+             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+        )
+        .unwrap();
+    assert!(
+        simple.contains("recovery=CREATE INDEX docs_label_idx ON docs (label)"),
+        "a simple filtered scan must retain its directly executable CREATE INDEX recovery: {simple}"
+    );
+
+    let compound = db
+        .explain(&format!(
+            "SELECT d.id FROM docs d INNER JOIN docs q ON d.id = q.id WHERE q.label = 'near' \
+             ORDER BY d.embedding <=> ROW_VECTOR('docs','embedding','{}') \
+             USE VECTOR INDEXED LIMIT 1",
+            f.source
+        ))
+        .unwrap();
+    assert!(
+        compound.contains("refusal=filtered_route_unavailable")
+            && compound.contains(
+                "recovery=use EXACT or rewrite the filter with a supporting relational index"
+            ),
+        "a compound filtered plan with no derivable index must name the exact-or-rewrite recovery: {compound}"
+    );
+    assert!(
+        !compound.contains("recovery=none"),
+        "the compound refusal must not strand the operator without a recovery: {compound}"
     );
 }
 
@@ -11268,14 +11331,28 @@ fn prv_14_row_vector_query_renders_in_explain_without_vector_bytes() {
         "EXPLAIN must render ROW_VECTOR as a resolved source reference, got {explain}"
     );
     assert!(
-        explain.contains(&f.source.to_string()),
-        "EXPLAIN must render ROW_VECTOR key identity, got {explain}"
+        explain.contains("key=<redacted>"),
+        "EXPLAIN must redact the ROW_VECTOR key identity, got {explain}"
+    );
+    assert!(
+        !explain.contains(&f.source.to_string()),
+        "EXPLAIN must not render the ROW_VECTOR key identity, got {explain}"
     );
     prv_assert_no_source_vector_leak_in_debug(&explain, &f.source_vec);
 }
 
 #[test]
 fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
+    // Seam-interleaved rounds, not a wall-clock race: each round parks one
+    // UPDATE writer INSIDE its commit (after the relational apply, before
+    // vector publication) with `pause_after_relational_apply_for_test`, then
+    // proves the row-vector reader completes DURING that window on the main
+    // thread. The verdict is state, counters, and events -- `current_lsn()`
+    // and the query's own rows -- never elapsed time; the only `Duration` in
+    // this test is `PER_INDEX_SQL_TIMEOUT`, a liveness bound on the seam
+    // being reached at all (the same idiom `multi_ref_tx_mid_apply_state_
+    // invisible_post_commit_state_visible` above already uses), not a bound
+    // on how long the reads take.
     let db = Arc::new(Database::open_memory());
     db.execute(
         "CREATE TABLE sources (id UUID PRIMARY KEY, embedding VECTOR(3))",
@@ -11306,55 +11383,112 @@ fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
     )
     .unwrap();
 
-    let running = Arc::new(AtomicBool::new(true));
-    let mut writers = Vec::new();
-    for (table, id) in [("sources", source), ("docs", doc)] {
+    const ROUNDS: usize = 8;
+    let base_lsn = db.current_lsn();
+    let mut reads_completed_mid_apply = 0u64;
+
+    for round in 0..ROUNDS {
+        let (table, id) = if round.is_multiple_of(2) {
+            ("sources", source)
+        } else {
+            ("docs", doc)
+        };
+        let new_vector = if round.is_multiple_of(2) {
+            vec![1.0, 0.0, 0.0]
+        } else {
+            vec![0.0, 1.0, 0.0]
+        };
+
+        let lsn_before_round = db.current_lsn();
+        assert_eq!(
+            lsn_before_round,
+            Lsn(base_lsn.0 + round as u64),
+            "round {round}: LSN must equal base plus the writer commits of every prior round"
+        );
+
+        let pause = db.pause_after_relational_apply_for_test();
         let db_writer = db.clone();
-        let running_writer = running.clone();
-        writers.push(thread::spawn(move || {
-            let mut tick = 0usize;
-            while running_writer.load(Ordering::SeqCst) {
-                let vector = if tick.is_multiple_of(2) {
-                    vec![1.0, 0.0, 0.0]
-                } else {
-                    vec![0.0, 1.0, 0.0]
-                };
-                db_writer
-                    .execute(
-                        &format!("UPDATE {table} SET embedding = $embedding WHERE id = $id"),
-                        &params(vec![
-                            ("id", Value::Uuid(id)),
-                            ("embedding", Value::Vector(vector)),
-                        ]),
-                    )
-                    .unwrap();
-                tick += 1;
-            }
-        }));
+        let table_owned = table.to_string();
+        let update_vector = new_vector.clone();
+        let writer = thread::spawn(move || {
+            db_writer
+                .execute(
+                    &format!("UPDATE {table_owned} SET embedding = $embedding WHERE id = $id"),
+                    &params(vec![
+                        ("id", Value::Uuid(id)),
+                        ("embedding", Value::Vector(update_vector)),
+                    ]),
+                )
+                .unwrap();
+        });
+
+        assert!(
+            pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT),
+            "round {round}: writer must reach the apply-phase pause seam \
+             (mid-commit, relational applied, vector not yet published)"
+        );
+
+        // The reader runs on the main thread WHILE the writer holds the
+        // commit mutex, parked between relational apply and vector
+        // publication -- the most adversarial reachable moment for a
+        // row-vector read.
+        let read = db
+            .execute(
+                "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('sources','embedding',$source_id) LIMIT 1",
+                &params(vec![("source_id", Value::Uuid(source))]),
+            )
+            .unwrap();
+        assert_eq!(
+            read.rows.len(),
+            1,
+            "round {round}: row-vector read must complete with exactly one row while a writer is parked mid-commit"
+        );
+        assert_eq!(
+            read.rows[0][0],
+            Value::Uuid(doc),
+            "round {round}: row-vector read must resolve the one doc row while a writer is parked mid-commit"
+        );
+        reads_completed_mid_apply += 1;
+        assert_eq!(
+            db.current_lsn(),
+            lsn_before_round,
+            "round {round}: the row-vector read must not itself advance the LSN, \
+             and the parked writer's commit has not published yet"
+        );
+
+        pause.release();
+        writer.join().unwrap();
+
+        assert_eq!(
+            db.current_lsn(),
+            Lsn(lsn_before_round.0 + 1),
+            "round {round}: releasing the parked writer must advance the LSN by exactly one commit"
+        );
+
+        // The new vector is now visible: read the updated column back
+        // directly (state, not inference from ordering, since each table
+        // holds only one row).
+        let readback = db
+            .execute(
+                &format!("SELECT embedding FROM {table} WHERE id = $id"),
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .unwrap();
+        assert_eq!(
+            readback.rows[0][0],
+            Value::Vector(new_vector),
+            "round {round}: the committed vector must be visible immediately after the writer is released"
+        );
     }
 
-    let db_reader = db.clone();
-    let (done_tx, done_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = (|| {
-            for _ in 0..1000 {
-                db_reader.execute(
-                    "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('sources','embedding',$source_id) LIMIT 1",
-                    &params(vec![("source_id", Value::Uuid(source))]),
-                )?;
-            }
-            contextdb_core::Result::<()>::Ok(())
-        })();
-        done_tx.send(result).unwrap();
-    });
-    let done = done_rx.recv_timeout(Duration::from_secs(5));
-    running.store(false, Ordering::SeqCst);
-    for writer in writers {
-        writer.join().unwrap();
-    }
-    assert!(
-        matches!(done, Ok(Ok(()))),
-        "persisted row vector reads must not deadlock or error under concurrent source/ordered writers: {done:?}"
+    assert_eq!(
+        reads_completed_mid_apply, ROUNDS as u64,
+        "every round's row-vector read must have completed while a writer was parked mid-commit"
+    );
+    assert_eq!(
+        db.current_lsn(),
+        Lsn(base_lsn.0 + ROUNDS as u64),
+        "exactly one LSN advance per writer round: per-writer progress, as a counter"
     );
 }
 

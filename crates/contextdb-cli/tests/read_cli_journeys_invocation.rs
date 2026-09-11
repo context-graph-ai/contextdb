@@ -120,6 +120,7 @@ fn a_reading_session_refuses_every_mutating_statement_before_it_executes() {
         "COMMIT;",
         "ROLLBACK;",
         "SET MEMORY_LIMIT '512M';",
+        "SET MAINTENANCE_POLL_INTERVAL 25 MILLISECONDS;",
     ];
 
     for statement in mutations {
@@ -473,5 +474,99 @@ fn a_valid_lowered_configuration_is_accepted() {
         Some(0),
         "lowering one's own ceilings is ordinary declared configuration.\n{}",
         outcome.describe()
+    );
+}
+
+#[test]
+fn maintenance_flags_require_write_and_configure_the_writer() {
+    let store = absent_store();
+    let before = folder_contents(store.folder());
+    for extra in [
+        &["--maintenance", "caller-driven"][..],
+        &["--maintenance-poll-ms", "37"][..],
+    ] {
+        let mut args = vec![store.path_str()];
+        args.extend_from_slice(extra);
+        let refused = run(&args, "");
+        assert_eq!(
+            refused.code,
+            Some(2),
+            "maintenance process policy requires an authorized writer: {extra:?}\n{}",
+            refused.describe()
+        );
+    }
+    let zero = run(
+        &[store.path_str(), "--write", "--maintenance-poll-ms", "0"],
+        "",
+    );
+    assert_eq!(zero.code, Some(2), "{}", zero.describe());
+    assert_eq!(
+        folder_contents(store.folder()),
+        before,
+        "invalid or unauthorized maintenance flags are refused before opening the store"
+    );
+
+    let configured = run(
+        &[
+            store.path_str(),
+            "--write",
+            "--json",
+            "--maintenance",
+            "caller-driven",
+            "--maintenance-poll-ms",
+            "37",
+        ],
+        "SHOW MAINTENANCE_POLL_INTERVAL;\n.maintenance status\n",
+    );
+    assert_eq!(configured.code, Some(0), "{}", configured.describe());
+    let documents = configured.stdout_docs();
+    let result = expect_document(&documents, "result", "maintenance cadence SQL result");
+    assert_eq!(
+        rows_of(&result),
+        vec![serde_json::json!({ "milliseconds": 37 })]
+    );
+    let maintenance = expect_document(&documents, "maintenance", "maintenance process policy");
+    assert_eq!(maintenance["policy"], "caller_driven");
+    assert_eq!(maintenance["running"], false);
+
+    let closed_reader = run(
+        &[store.path_str(), "--json"],
+        "SHOW MAINTENANCE_POLL_INTERVAL;\n",
+    );
+    assert_eq!(closed_reader.code, Some(0), "{}", closed_reader.describe());
+    let result = expect_document(
+        &closed_reader.stdout_docs(),
+        "result",
+        "persisted maintenance cadence through the ordinary closed-file reader",
+    );
+    assert_eq!(
+        rows_of(&result),
+        vec![serde_json::json!({ "milliseconds": 37 })]
+    );
+
+    let reopened_writer = run(
+        &[
+            store.path_str(),
+            "--write",
+            "--json",
+            "--maintenance",
+            "caller-driven",
+        ],
+        "SHOW MAINTENANCE_POLL_INTERVAL;\n",
+    );
+    assert_eq!(
+        reopened_writer.code,
+        Some(0),
+        "{}",
+        reopened_writer.describe()
+    );
+    let result = expect_document(
+        &reopened_writer.stdout_docs(),
+        "result",
+        "persisted maintenance cadence through a reopened writer",
+    );
+    assert_eq!(
+        rows_of(&result),
+        vec![serde_json::json!({ "milliseconds": 37 })]
     );
 }

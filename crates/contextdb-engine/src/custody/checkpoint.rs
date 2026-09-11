@@ -1,4 +1,4 @@
-//! Statements 11/13/15/17: bounded restore evidence on the existing status lane.
+//! Bounded restore evidence on the existing status lane.
 //!
 //! Each per-edge outcome commit appends fresh random entropy to a binary prefix
 //! index. Completed subtree hashes contain no row reference, value, lineage or

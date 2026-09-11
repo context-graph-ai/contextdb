@@ -809,14 +809,19 @@ impl Database {
             terminal_refusal_markers: self.terminal_refusal_markers.clone(),
             terminal_refusal_scans: self.terminal_refusal_scans.clone(),
             accepted_sync_row_authors: self.accepted_sync_row_authors.clone(),
+            sync_push_apply_locks: self.sync_push_apply_locks.clone(),
+            #[cfg(feature = "sync-orchestration")]
+            sync_client_push_locks: self.sync_client_push_locks.clone(),
             received_schema_stages: self.received_schema_stages.clone(),
             local_erasure_stages: self.local_erasure_stages.clone(),
             pending_local_schema_stages: self.pending_local_schema_stages.clone(),
             local_schema_stages: self.local_schema_stages.clone(),
             capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
             detached_sync_write_set: self.detached_sync_write_set.clone(),
+            received_vector_image_pending: self.received_vector_image_pending.clone(),
             persistence: self.persistence.clone(),
             committed_image_startup: self.committed_image_startup.clone(),
+            read_image_memory: self.read_image_memory.clone(),
             blob_repository: self.blob_repository.clone(),
             open_registry_path: Mutex::new(None),
             operation_gate: self.operation_gate.clone(),
@@ -848,6 +853,8 @@ impl Database {
             route_observer: None,
             #[cfg(feature = "test-seams")]
             kernel_observer: None,
+            #[cfg(feature = "test-seams")]
+            snapshot_free_retirement_pass_count: self.snapshot_free_retirement_pass_count.clone(),
             access: AccessConstraints::default(),
             accountant: self.accountant.clone(),
             conflict_policies: RwLock::new(self.conflict_policies.read().clone()),
@@ -870,19 +877,29 @@ impl Database {
             in_memory_sync_progress: self.in_memory_sync_progress.clone(),
             in_memory_applied_push_watermarks: self.in_memory_applied_push_watermarks.clone(),
             sync_incarnations: self.sync_incarnations.clone(),
-            // Statements 1/3/7: derived handles share the authenticated runtime.
+            // Derived handles share the authenticated runtime.
             custody_runtime: self.custody_runtime.clone(),
             custody_cache: self.custody_cache.clone(),
             custody_metadata: self.custody_metadata.clone(),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             limit_update_lock: self.limit_update_lock.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            maintenance_poll_interval_update_pause: self
+                .maintenance_poll_interval_update_pause
+                .clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            maintenance_poll_interval_update_probe: self
+                .maintenance_poll_interval_update_probe
+                .clone(),
             disk_limit: Arc::clone(&self.disk_limit),
             disk_limit_startup_ceiling: Arc::clone(&self.disk_limit_startup_ceiling),
             trigger_audit_retention_secs: self.trigger_audit_retention_secs.clone(),
             snapshot_registry: self.snapshot_registry.clone(),
+            vector_partition_snapshot_stages: self.vector_partition_snapshot_stages.clone(),
             retention_deferred_edge_nodes: self.retention_deferred_edge_nodes.clone(),
             maintenance_caller_driven: self.maintenance_caller_driven.clone(),
+            maintenance_poll_interval_ms: self.maintenance_poll_interval_ms.clone(),
             last_maintenance_cycle_at: self.last_maintenance_cycle_at.clone(),
             caller_driven_backlog_warned_at: self.caller_driven_backlog_warned_at.clone(),
             last_auto_compact_at: self.last_auto_compact_at.clone(),
@@ -891,8 +908,8 @@ impl Database {
             closed: AtomicBool::new(false),
             resource_closed: self.resource_closed.clone(),
             rows_examined: AtomicU64::new(0),
-            last_vector_search_used_hnsw: AtomicBool::new(false),
-            last_vector_search_trace: RwLock::new(None),
+            last_vector_search_used_hnsw: Arc::clone(&self.last_vector_search_used_hnsw),
+            last_vector_search_trace: Arc::clone(&self.last_vector_search_trace),
             statement_cache: RwLock::new(HashMap::new()),
             // The same cache, not a copy of it: a formula registered after this
             // handle was derived is one this handle must still find.

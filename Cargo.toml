@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["crates/contextdb-redb"]
 members = [
     "crates/contextdb-core",
     "crates/contextdb-tx",
@@ -40,7 +41,6 @@ tokio = { version = "1", features = ["full"] }
 rmp-serde = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-redb = "4"
 bincode = { version = "=2.0.1", features = ["serde"] }
 tempfile = "3"
 anndists = "0.1"
@@ -59,3 +59,15 @@ pre-release-replacements = [
 ]
 publish = false
 push = true
+
+# Vector integration proofs construct and traverse production HNSW indexes over
+# fixed large fixtures. Keep test binaries assertion-enabled while compiling
+# only their computational dependencies with the optimizer.
+[profile.test.package.contextdb-vector]
+opt-level = 3
+
+[profile.test.package.contextdb-hnsw]
+opt-level = 3
+
+[profile.test.package.anndists]
+opt-level = 3

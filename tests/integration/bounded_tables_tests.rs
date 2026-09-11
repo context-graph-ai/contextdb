@@ -502,7 +502,37 @@ fn c7_compaction_rides_the_same_fragmentation_threshold_as_the_currency_path() {
          and trip compaction: {report:?}"
     );
     let before = report.file_bytes_before.expect("file size before");
-    let after = report.file_bytes_after.expect("file size after");
+    assert_eq!(
+        report.file_bytes_after,
+        db.disk_file_size(),
+        "the first batch reports its actual intermediate size"
+    );
+    let mut completed = false;
+    for _ in 0..2048 {
+        if !db.__storage_compaction_progress_for_test().0 {
+            completed = true;
+            break;
+        }
+        let cycle = db
+            .run_maintenance_cycle()
+            .expect("advance durable storage maintenance");
+        assert!(
+            cycle.compaction.ran,
+            "an unfinished sweep advances each cycle"
+        );
+        assert_eq!(
+            cycle.compaction.bytes_after,
+            db.disk_file_size(),
+            "every batch reports its actual size"
+        );
+    }
+    assert!(
+        completed,
+        "bounded maintenance finishes reclaiming the pruned store"
+    );
+    let after = db
+        .disk_file_size()
+        .expect("file size after completed compaction");
     assert!(
         after < before,
         "a compacted file must actually shrink ({before} -> {after}): {report:?}"
@@ -1770,6 +1800,7 @@ fn c7_prune_trims_the_commit_index_to_the_surviving_change_log_floor() {
     insert_rows(&db, "windows", 100..104, "still-young");
 
     let (entries_before, _) = db.commit_index_census_for_test();
+    let lsn_before_expiry = db.current_lsn();
     let report = db.run_pruning_cycle_checked().expect("prune cycle");
     assert_eq!(
         report.pruned_rows, 30,
@@ -1789,8 +1820,8 @@ fn c7_prune_trims_the_commit_index_to_the_surviving_change_log_floor() {
     );
     assert_eq!(
         report.pruned_commit_index_entries,
-        (entries_before - entries_after) as u64,
-        "and must report exactly what it trimmed: {report:?}"
+        (entries_before + usize::from(db.current_lsn() > lsn_before_expiry) - entries_after) as u64,
+        "report every removed entry, including the expiry commit created and reclaimed in this pass: {report:?}"
     );
     assert!(
         lowest_retained < surviving_min,

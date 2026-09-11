@@ -1,4 +1,4 @@
-//! Statement 17a: the declared node-local selection travels on the ordinary purge plane.
+//! The declared node-local selection travels on the ordinary purge plane.
 use super::*;
 use contextdb_parser::ast::{BinOp, ColumnRef, Expr, Literal, UnaryOp};
 

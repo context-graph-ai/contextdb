@@ -119,7 +119,7 @@ async fn start_hub_with_policy(
     start_hub_without_policy_seeding(broker, tenant, db, identity).await
 }
 
-// Statement 15: restoring a snapshot must not silently backfill missing declarations.
+// Restoring a snapshot must not silently backfill missing declarations.
 async fn start_hub_without_policy_seeding(
     broker: &InProcessBroker,
     tenant: &str,
@@ -168,7 +168,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> (S
     (client, node_id)
 }
 
-// Statement 14: retain the pending unit locally while observing ordinary traffic
+// Retain the pending unit locally while observing ordinary traffic
 // that the same authenticated edge actually offers to the hub.
 #[derive(Clone, Debug)]
 struct ObservedOutgoingPush {
@@ -177,7 +177,7 @@ struct ObservedOutgoingPush {
     rows: Vec<(String, Option<String>)>,
 }
 
-// Statement 14: this test-only transport removes the pending table's rows from
+// This test-only transport removes the pending table's rows from
 // its particular ordinary pushes; it does not introduce a production selector.
 struct FilterPendingUnitTraffic {
     inner: Arc<dyn ClientTransport>,
@@ -207,7 +207,7 @@ impl FilterPendingUnitTraffic {
         request.changeset.edges.clear();
         request.changeset.vectors.clear();
         request.changeset.purges.clear();
-        // Statement 14 adapter: holding back the real pending unit also holds
+        // Adapter: holding back the real pending unit also holds
         // its now-populated ordinary manifest lane; only unrelated work travels.
         request.changeset.manifests.clear();
         request
@@ -606,7 +606,7 @@ fn echoed_outcomes(broker: &InProcessBroker, from: usize) -> Vec<WireDeliveryOut
         .filter(|exchange| is_push_request(&exchange.request_bytes))
         .flat_map(|exchange| {
             let envelope = decode(&exchange.response_bytes).expect("decode push reply envelope");
-            // Statement 13: outcomes are echoed by the actual ordinary push response.
+            // Outcomes are echoed by the actual ordinary push response.
             assert_eq!(envelope.message_type, MessageType::PushResponse);
             let response: PushResponse =
                 rmp_serde::from_slice(&envelope.payload).expect("decode ordinary push response");
@@ -619,7 +619,7 @@ fn file_backed(root: &Path, name: &str) -> Arc<Database> {
     Arc::new(Database::open(root.join(name)).unwrap_or_else(|err| panic!("open {name}: {err}")))
 }
 
-// Statement 11: The hub commits one durable outcome with its rows; current-image reopen retains receipts.
+// The hub commits one durable outcome with its rows; current-image reopen retains receipts.
 // The durability fault targets this unit across the ordinary receiver's worker thread.
 #[tokio::test(flavor = "current_thread")]
 async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_identities_that_survives_restart_and_restore()
@@ -663,7 +663,7 @@ async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_id
         .commit(tx)
         .expect("commit rows and delivery metadata atomically");
 
-    // Statement 11: Finish binding, status-independent request preparation and source commits
+    // Finish binding, status-independent request preparation and source commits
     // before arming the storage fault. Send only this prepared unit to the real public handler;
     // SyncClient::push's earlier bind/status/preparation writes cannot consume the fault.
     let request = edge
@@ -689,7 +689,7 @@ async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_id
         .__arm_delivery_commit_fault_for_test(ROOT_TABLE, &root_key(root_id), source_digest);
     let failed =
         within(transport.request_single_reply(&subject, bytes, Duration::from_secs(60))).await;
-    // Statement 11: Decode the real failure so a missing target is distinguishable from injection.
+    // Decode the real failure so a missing target is distinguishable from injection.
     let commit_reached = hub.db.__delivery_commit_fault_reached_for_test();
     let failure = match failed {
         Ok(bytes) => {
@@ -706,9 +706,9 @@ async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_id
     };
     assert!(
         commit_reached,
-        "Statement 11: the real unit storage commit must be reached, not a preflight refusal: {failure}"
+        "the real unit storage commit must be reached, not a preflight refusal: {failure}"
     );
-    // Statement 11: reached + caller-visible failure is the guarantee, not storage wording.
+    // Reached + caller-visible failure is the guarantee, not storage wording.
     assert!(
         failure.contains("storage error"),
         "the reached storage fault must be reported to the caller: {failure}"
@@ -719,18 +719,18 @@ async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_id
     assert_eq!(
         whole_unit_rows(&reopened_db),
         before_failure,
-        "Statement 11: neither root nor members survive a failed unit commit"
+        "neither root nor members survive a failed unit commit"
     );
     assert!(
         reopened_db
             .__delivery_prerequisite_wires_for_test()
             .unwrap()
             .is_empty(),
-        "Statement 11: no terminal outcome survives the failed unit commit either"
+        "no terminal outcome survives the failed unit commit either"
     );
     assert_eq!(edge_db.delivery_status(ROOT_TABLE).unwrap().pending, 1);
     let hub = start_hub_with_identity(&broker, tenant, reopened_db, hub_identity).await;
-    // Statement 11: Preserve the successful one-outcome, restart and snapshot flow after failure.
+    // Preserve the successful one-outcome, restart and snapshot flow after failure.
     let mark = broker.recorded_exchanges().len();
     within(edge.push()).await.expect("push the unit");
 
@@ -792,7 +792,7 @@ async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_id
         .expect("the hub serves this edge its own outcomes");
     assert_eq!(served.len(), 1, "the hub holds exactly one verdict for it");
     let position = served[0].hub_acceptance_position();
-    // Statement 11: The durable verdict names the root and members' actual accepting commit,
+    // The durable verdict names the root and members' actual accepting commit,
     // so a successful rows-first/outcome-second commit cannot substitute a later position.
     for table in [ROOT_TABLE, MEMBER_TABLE] {
         let rows = hub.db.scan(table, hub.db.snapshot()).unwrap();
@@ -862,7 +862,7 @@ async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_id
     let _ = restored.stop().await;
 }
 
-// Statement 12: Whole-row and membership equality earns equivalence; differences earn complete refusal.
+// Whole-row and membership equality earns equivalence; differences earn complete refusal.
 #[tokio::test]
 async fn an_identical_repush_is_equivalent_a_differing_digest_is_refused_with_the_keep_first_diagnostic_and_a_memberless_root_is_accepted()
  {
@@ -1116,7 +1116,7 @@ async fn an_identical_repush_is_equivalent_a_differing_digest_is_refused_with_th
     hub_written_incumbents_receive_terminal_outcomes().await;
 }
 
-// Statements 12/16: a hub-local winner needs no earlier custody terminal.
+// A hub-local winner needs no earlier custody terminal.
 async fn hub_written_incumbents_receive_terminal_outcomes() {
     use contextdb_server::transport::iroh::IrohServer;
 
@@ -1319,7 +1319,7 @@ async fn hub_written_incumbents_receive_terminal_outcomes() {
     );
 }
 
-// Statement 13: Push echoes outcomes; lost replies recover completely and only for the asking edge.
+// Push echoes outcomes; lost replies recover completely and only for the asking edge.
 #[tokio::test]
 async fn the_push_response_echoes_outcomes_and_a_lost_acknowledgement_recovers_only_this_edges_outcomes_without_reapplying()
  {
@@ -1491,7 +1491,7 @@ async fn the_push_response_echoes_outcomes_and_a_lost_acknowledgement_recovers_o
     complete_outcome_readback().await;
 }
 
-// Statement 14: Only a durable hub outcome changes pending; counts reconcile and SYNC OFF is disabled.
+// Only a durable hub outcome changes pending; counts reconcile and SYNC OFF is disabled.
 #[tokio::test]
 async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outcome_moves_a_unit_out_of_pending()
  {
@@ -1503,7 +1503,7 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
     let hub = start_hub(&broker, tenant, hub_db.clone()).await;
 
     let edge_db = Arc::new(Database::open_memory());
-    // Statement 14: the pending owner also sends the unrelated keep-first traffic.
+    // The pending owner also sends the unrelated keep-first traffic.
     let edge_identity = Arc::new(FabricIdentity::generate());
     let edge_node_id = edge_identity.node_id();
     let observed_pushes = Arc::new(Mutex::new(Vec::new()));
@@ -1703,9 +1703,12 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
     // The hub's own applied-push frontier for this edge HAS moved past the
     // unanswered unit — the hub applied it and only the answer was lost. A pull
     // and the status confirmation it performs read that frontier. None of them
-    // is a verdict, so none of them may move the unit out of pending. The unit
-    // is deliberately not offered again here: a re-push is a delivery, and the
-    // verdict it earns is proven separately.
+    // is a verdict, so none of them may move the unit out of pending. The
+    // manifested unit is deliberately not offered again here: a re-push is a
+    // delivery, and the verdict it earns is proven separately. Its ordinary
+    // same-transaction sibling remains unacknowledged because the raw request
+    // above bypassed SyncClient's exact-reply admission, so it must be offered
+    // again by the vector-safe ordinary retry path.
     let hub_frontier = hub_db
         .persisted_sync_applied_push_watermark_for_node_incarnation(
             &TenantId::from(tenant),
@@ -1722,7 +1725,7 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
     within(edge.pull_default())
         .await
         .expect("a pull and its status confirmation");
-    // Statement 14: the same pending owner sends unrelated rows and then a
+    // The same pending owner sends unrelated rows and then a
     // real keep-first conflict; the test-only transport holds its unit back.
     filter_traffic.store(true, Ordering::SeqCst);
     let traffic_id = Uuid::new_v4();
@@ -1764,8 +1767,8 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
         .clone();
     assert_eq!(
         observed_pushes.len(),
-        2,
-        "the pending owner actually offered both unrelated ordinary pushes"
+        3,
+        "the pending owner re-offered the unacknowledged sibling and sent both later ordinary pushes"
     );
     assert!(
         observed_pushes.iter().all(|push| {
@@ -1776,7 +1779,7 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
                         .expect("read the pending owner's life")
                 && push.rows.iter().all(|(table, _)| table == "unrelated_rows")
         }),
-        "both observed outgoing payloads belong to the pending owner and omit its unit"
+        "all observed outgoing payloads belong to the pending owner and omit its unit"
     );
     let observed_bodies = observed_pushes
         .iter()
@@ -1784,8 +1787,12 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
         .collect::<BTreeSet<_>>();
     assert_eq!(
         observed_bodies,
-        BTreeSet::from(["different".to_string(), "first".to_string()]),
-        "the same pending owner sent the actual unrelated write and its keep-first conflict"
+        BTreeSet::from([
+            "different".to_string(),
+            "first".to_string(),
+            "same transaction sibling".to_string(),
+        ]),
+        "the same pending owner retried the unacknowledged sibling, then sent the later write and conflict"
     );
     let after_traffic = edge_db
         .delivery_status(ROOT_TABLE)
@@ -1858,7 +1865,7 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
     mutable_manifest_rows_do_not_block_other_units().await;
 }
 
-// Statements 14/19: per-root reads and counts honor context, label and principal together.
+// Per-root reads and counts honor context, label and principal together.
 async fn scoped_custody_reads_follow_visible_roots() {
     use contextdb_core::{ContextId, Principal, ScopeLabel};
     let tenant = "scoped-custody-status";
@@ -1979,7 +1986,7 @@ async fn scoped_custody_reads_follow_visible_roots() {
     let _ = hub.stop().await;
 }
 
-// Statement 15: Old-backup restore and rebind revoke stale credit automatically without changing edge rows.
+// Old-backup restore and rebind revoke stale credit automatically without changing edge rows.
 #[tokio::test]
 async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing_edge_rows() {
     let directory = tempfile::tempdir().unwrap();
@@ -2036,7 +2043,7 @@ async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing
         "every receipt from the previous hub image loses credit before reoffer"
     );
     assert_eq!(whole_unit_rows(&edge_db), before);
-    // Statements 15/19: SHOW also revokes expired credit on both nodes.
+    // SHOW also revokes expired credit on both nodes.
     for db in [&edge_db, &restored_db] {
         assert!(
             db.execute("SHOW DELIVERY OUTCOMES FOR records", &p())
@@ -2058,7 +2065,7 @@ async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing
             .unwrap()
             .is_none()
     );
-    // Statements 4/15/19: inspecting the binding after restore shows the new authority.
+    // Inspecting the binding after restore shows the new authority.
     let bindings = edge_db.execute("SHOW SYNC BINDINGS", &p()).unwrap();
     let life_column = bindings
         .columns
@@ -2116,7 +2123,7 @@ async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing
     let other_db = file_backed(directory.path(), "other.db");
     create_core_tables(&other_db);
     let other = start_hub(&broker, tenant, other_db).await;
-    // Statement 15: Changing the destination must be followed by the actual authenticated bind.
+    // Changing the destination must be followed by the actual authenticated bind.
     edge.change_destination(&other.node_id).unwrap();
     let rebound = within(edge.bind_application_table_policy(core_expectation()))
         .await
@@ -2135,7 +2142,7 @@ async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing
     );
     assert_eq!(whole_unit_rows(&edge_db), before);
     within(edge.shutdown()).await;
-    // Statement 15: The new binding and pending status survive restart without altering any row.
+    // The new binding and pending status survive restart without altering any row.
     drop(edge);
     drop(edge_db);
     let reopened = file_backed(directory.path(), "edge.db");
@@ -2173,7 +2180,7 @@ async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing
     declared_snapshot_before_first_binding_recovers().await;
 }
 
-// Statement 16: Refusal ends resend and leaves the losing rows locatable by the diagnostic key.
+// Refusal ends resend and leaves the losing rows locatable by the diagnostic key.
 #[tokio::test]
 async fn a_refused_unit_is_terminal_the_resend_obligation_ends_status_is_clean_and_the_rows_stay_locatable()
  {
@@ -2368,7 +2375,7 @@ async fn complete_outcome_readback() {
             .windows(2)
             .all(|pair| pair[0].hub_acceptance_position() <= pair[1].hub_acceptance_position())
     );
-    // Statement 13: prove the cohort really shares an acceptance position.
+    // Prove the cohort really shares an acceptance position.
     assert!(
         fetched.iter().all(
             |outcome| outcome.hub_acceptance_position() == fetched[0].hub_acceptance_position()
@@ -2405,7 +2412,7 @@ struct RestoreProbeObservation {
     bytes: usize,
 }
 
-// Statement 15: observe bounded continuation on the real status transport, without a new request.
+// Observe bounded continuation on the real status transport, without a new request.
 struct ObserveRestoreStatus {
     pulls: Arc<std::sync::atomic::AtomicUsize>,
     inner: Arc<dyn ClientTransport>,
@@ -2413,7 +2420,7 @@ struct ObserveRestoreStatus {
     fail: Arc<AtomicBool>,
 }
 impl ObserveRestoreStatus {
-    // Statement 15 adapter: vary only the order of genuine signed ordinary
+    // Adapter: vary only the order of genuine signed ordinary
     // push outcomes; identity, whole-unit digests and public targets are unchanged.
     fn outcome_order(bytes: Vec<u8>) -> Vec<u8> {
         if let Ok(envelope) = decode(&bytes)
@@ -2505,7 +2512,7 @@ impl ClientTransport for ObserveRestoreStatus {
     }
 }
 
-// Statement 15: all recent receipts can be legitimately purged while an older receipt was lost.
+// All recent receipts can be legitimately purged while an older receipt was lost.
 async fn restore_verification_is_bounded_and_covers_purge_gaps() {
     let root = tempfile::tempdir().unwrap();
     let tenant = "restore-purge-gaps";
@@ -2561,9 +2568,7 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
     edge_db.commit(tx).unwrap();
     within(edge.push()).await.unwrap();
     within(edge.fetch_delivery_outcomes(None)).await.unwrap();
-    eprintln!(
-        "Statement 15: arranged all 72 receipts, including the one absent from the old image"
-    );
+    eprintln!("arranged all 72 receipts, including the one absent from the old image");
     let before = whole_unit_rows(&edge_db);
     let incarnation = db.sync_incarnation(&TenantId::from(tenant)).unwrap();
     fail.store(true, Ordering::SeqCst);
@@ -2590,8 +2595,8 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
         probes.iter().all(|p| p.count == 1 && p.bytes < 2048),
         "one signed prefix rather than a receipt replay: {probes:?}"
     );
-    eprintln!("Statement 15 bounded status after 72 outcomes: {probes:?}");
-    // Statement 15: empty pulls retain the public cursor and need one actual
+    eprintln!("bounded status after 72 outcomes: {probes:?}");
+    // Empty pulls retain the public cursor and need one actual
     // pull exchange plus the signed status exchange, including a warm hidden tail.
     within(edge.pull_default()).await.unwrap();
     let public_cursor = edge.pull_watermark();
@@ -2655,7 +2660,7 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
             .unwrap(),
         70
     );
-    // Statement 15: catch up even the custody count on a different branch;
+    // Catch up even the custody count on a different branch;
     // only a committed-prefix proof distinguishes it from the lost image.
     let extra = Uuid::new_v4();
     let tx = stage_unit(&edge_db, extra, "recent", &[]).unwrap();
@@ -2669,9 +2674,7 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
     ))
     .await
     .unwrap();
-    eprintln!(
-        "Statement 15: restored image has all recent receipts, but the second retained receipt is lost"
-    );
+    eprintln!("restored image has all recent receipts, but the second retained receipt is lost");
     restored_db
         .execute("PURGE FROM records WHERE body = 'recent'", &p())
         .unwrap();
@@ -2741,7 +2744,7 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
     restored.stop().await;
 }
 
-// Statements 9/10/14/16: mutable rows use ordinary typed refusal and delete
+// Mutable rows use ordinary typed refusal and delete
 // arbitration, while current manifested siblings and unrelated tables progress.
 async fn mutable_manifest_rows_do_not_block_other_units() {
     let directory = tempfile::tempdir().unwrap();
@@ -2850,7 +2853,7 @@ async fn mutable_manifest_rows_do_not_block_other_units() {
     );
     assert_eq!(edge.pending_push_change_count().unwrap(), 0);
 
-    // Statement 7/14: register the replacement through the writing transaction.
+    // Register the replacement through the writing transaction.
     let tx = edge_db.begin().unwrap();
     edge_db
         .execute_in_tx(
@@ -2880,7 +2883,7 @@ async fn mutable_manifest_rows_do_not_block_other_units() {
             .kind(),
         DeliveryOutcomeKind::Accepted
     );
-    // Statements 14/16: an old terminal must not suppress the established
+    // An old terminal must not suppress the established
     // authenticated fresh-creator delete continuation.
     edge_db
         .execute(
@@ -2927,7 +2930,7 @@ async fn mutable_manifest_rows_do_not_block_other_units() {
     hub.stop().await;
 }
 
-// Statement 15: declarations survive a backup older than every binding; the
+// Declarations survive a backup older than every binding; the
 // ordinary pull learns the rotated incarnation before any unit is reoffered.
 async fn declared_snapshot_before_first_binding_recovers() {
     let directory = tempfile::tempdir().unwrap();

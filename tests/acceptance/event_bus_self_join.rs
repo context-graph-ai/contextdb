@@ -808,14 +808,22 @@ fn t34_04_panic_isolation_counter_exact_and_same_event_delivered_to_sibling() {
         insert_inv(&db, id, false);
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
+    // No test-authored wall-clock deadline or sleep-based synchronization:
+    // wait on the exact settled counters this test asserts below (the
+    // panicking sink's permanent_failures and the sibling's own delivered
+    // count), not on the callback-populated id list, which is written
+    // *before* the engine's post-batch metrics write
+    // (crates/contextdb-engine/src/database/event_bus.rs:2166-2181) and can
+    // therefore race a poll keyed on its length. A genuinely stuck dispatch
+    // surfaces as nextest's own harness slow-timeout, never as a
+    // test-authored elapsed-time assertion.
+    loop {
         let panic_metrics = db.sink_metrics_for_test("s_panic");
-        let count_len = delivered_ids.lock().unwrap().len();
-        if panic_metrics.permanent_failures == 3 && count_len == 3 {
+        let count_metrics = db.sink_metrics_for_test("s_count");
+        if panic_metrics.permanent_failures == 3 && count_metrics.delivered == 3 {
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
     }
 
     let panic_metrics = db.sink_metrics_for_test("s_panic");

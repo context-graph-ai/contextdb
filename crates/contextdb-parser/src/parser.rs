@@ -79,15 +79,83 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::select_stmt => Statement::Select(build_select(inner)?),
         Rule::show_sync_conflict_policy => Statement::ShowSyncConflictPolicy,
         Rule::show_vector_indexes_stmt => Statement::ShowVectorIndexes,
+        Rule::show_vector_partitions_stmt => build_show_vector_partitions(inner)?,
         Rule::set_memory_limit => Statement::SetMemoryLimit(build_set_memory_limit(inner)?),
         Rule::show_memory_limit => Statement::ShowMemoryLimit,
         Rule::set_disk_limit => Statement::SetDiskLimit(build_set_disk_limit(inner)?),
         Rule::show_disk_limit => Statement::ShowDiskLimit,
+        Rule::set_maintenance_poll_interval => {
+            Statement::SetMaintenancePollInterval(build_maintenance_poll_interval(inner)?)
+        }
+        Rule::show_maintenance_poll_interval => Statement::ShowMaintenancePollInterval,
         _ => return Err(Error::ParseError("unsupported statement".to_string())),
     };
 
     validate_statement(&stmt)?;
     Ok(stmt)
+}
+
+fn build_show_vector_partitions(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let mut table = None;
+    let mut column = None;
+    let mut limit = None;
+    let mut offset = None;
+
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::show_vector_partitions_target => {
+                let mut identifiers = part
+                    .into_inner()
+                    .filter(|item| item.as_rule() == Rule::identifier)
+                    .map(|item| parse_identifier(item.as_str()));
+                table = Some(identifiers.next().ok_or_else(|| {
+                    Error::ParseError("SHOW VECTOR_PARTITIONS target missing table".to_string())
+                })?);
+                column = Some(identifiers.next().ok_or_else(|| {
+                    Error::ParseError("SHOW VECTOR_PARTITIONS target missing column".to_string())
+                })?);
+                if identifiers.next().is_some() {
+                    return Err(Error::ParseError(
+                        "SHOW VECTOR_PARTITIONS target has too many identifiers".to_string(),
+                    ));
+                }
+            }
+            Rule::show_vector_partitions_paging => {
+                let mut values = part
+                    .into_inner()
+                    .filter(|item| item.as_rule() == Rule::integer);
+                let limit_value = values.next().ok_or_else(|| {
+                    Error::ParseError("SHOW VECTOR_PARTITIONS missing LIMIT value".to_string())
+                })?;
+                limit = Some(parse_u64(
+                    limit_value.as_str(),
+                    "invalid SHOW VECTOR_PARTITIONS LIMIT value",
+                )?);
+                offset = values
+                    .next()
+                    .map(|value| {
+                        parse_u64(
+                            value.as_str(),
+                            "invalid SHOW VECTOR_PARTITIONS OFFSET value",
+                        )
+                    })
+                    .transpose()?;
+                if values.next().is_some() {
+                    return Err(Error::ParseError(
+                        "SHOW VECTOR_PARTITIONS has too many paging values".to_string(),
+                    ));
+                }
+            }
+            other => return Err(unexpected_rule(other, "build_show_vector_partitions")),
+        }
+    }
+
+    Ok(Statement::ShowVectorPartitions {
+        table,
+        column,
+        limit,
+        offset,
+    })
 }
 
 fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStatement> {
@@ -141,6 +209,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     let mut joins = Vec::new();
     let mut where_clause = None;
     let mut order_by = Vec::new();
+    let mut use_vector = None;
     let mut use_rank = None;
     let mut limit = None;
 
@@ -162,6 +231,9 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
             Rule::order_by_clause => {
                 order_by = build_order_by_clause(p)?;
             }
+            Rule::use_vector_clause => {
+                use_vector = Some(build_use_vector_clause(p)?);
+            }
             Rule::use_rank_clause => {
                 use_rank = Some(build_use_rank_clause(p)?);
             }
@@ -179,6 +251,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
         joins,
         where_clause,
         order_by,
+        use_vector,
         use_rank,
         limit,
     })
@@ -675,11 +748,30 @@ fn build_limit_clause(pair: Pair<'_, Rule>) -> Result<u64> {
     parse_u64(num.as_str(), "invalid LIMIT value")
 }
 
+fn build_use_vector_clause(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
+    let mode = pair
+        .into_inner()
+        .find(|part| part.as_rule() == Rule::vector_search_mode)
+        .ok_or_else(|| Error::ParseError("USE VECTOR missing search mode".to_string()))?;
+    build_vector_search_mode(mode)
+}
+
 fn build_use_rank_clause(pair: Pair<'_, Rule>) -> Result<String> {
     pair.into_inner()
         .find(|p| p.as_rule() == Rule::identifier)
         .map(|p| parse_identifier(p.as_str()))
         .ok_or_else(|| Error::ParseError("USE RANK missing sort key".to_string()))
+}
+
+fn build_vector_search_mode(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
+    match pair.as_str().to_ascii_uppercase().as_str() {
+        "AUTO" => Ok(VectorSearchMode::Auto),
+        "EXACT" => Ok(VectorSearchMode::Exact),
+        "INDEXED" => Ok(VectorSearchMode::Indexed),
+        value => Err(Error::ParseError(format!(
+            "unsupported vector search mode '{value}'"
+        ))),
+    }
 }
 
 fn build_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
@@ -1558,6 +1650,7 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
         .ok_or_else(|| Error::ParseError("missing ALTER TABLE action".to_string()))?;
 
     match action.as_rule() {
+        Rule::alter_column_action => build_alter_column_action(action),
         Rule::add_column_action => {
             let (column, _) = action
                 .into_inner()
@@ -1566,7 +1659,7 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
                     Error::ParseError("ADD COLUMN missing column definition".to_string())
                 })
                 .and_then(build_column_def)?;
-            Ok(AlterAction::AddColumn(column))
+            Ok(AlterAction::AddColumn(Box::new(column)))
         }
         Rule::drop_column_action => {
             let mut column: Option<String> = None;
@@ -1645,6 +1738,128 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     }
 }
 
+fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
+    let mut column = None;
+    let mut max_partitions = None;
+    let mut search_mode = None;
+    let mut auto_index_at = None;
+    let mut hnsw = None;
+    let mut consolidation = None;
+
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::identifier if column.is_none() => {
+                column = Some(parse_identifier(part.as_str()));
+            }
+            Rule::alter_column_set_max_partitions => {
+                let value = part
+                    .into_inner()
+                    .find(|item| item.as_rule() == Rule::max_partitions_literal)
+                    .map(|item| item.as_str().to_string())
+                    .ok_or_else(|| {
+                        Error::ParseError(
+                            "ALTER COLUMN SET MAX_PARTITIONS missing value".to_string(),
+                        )
+                    })?;
+                max_partitions = Some(value);
+            }
+            Rule::alter_column_set_search_mode => {
+                let mode = part
+                    .into_inner()
+                    .find(|item| item.as_rule() == Rule::vector_search_mode)
+                    .ok_or_else(|| {
+                        Error::ParseError("ALTER COLUMN SET SEARCH_MODE missing mode".to_string())
+                    })?;
+                search_mode = Some(build_vector_search_mode(mode)?);
+            }
+            Rule::alter_column_set_auto_index_at => {
+                let value = part
+                    .into_inner()
+                    .find(|item| item.as_rule() == Rule::vector_policy_value)
+                    .ok_or_else(|| {
+                        Error::ParseError(
+                            "ALTER COLUMN SET AUTO_INDEX_AT missing value".to_string(),
+                        )
+                    })?;
+                auto_index_at = Some(match build_vector_policy_value(value) {
+                    VectorPolicyValue::Value(value) => Some(value),
+                    VectorPolicyValue::Default => None,
+                });
+            }
+            Rule::alter_column_set_hnsw => {
+                let text = part.as_str();
+                let options = part
+                    .into_inner()
+                    .find(|item| item.as_rule() == Rule::hnsw_options)
+                    .map(build_vector_hnsw_options)
+                    .transpose()?;
+                if options.is_none() && !text.to_ascii_uppercase().ends_with("DEFAULT") {
+                    return Err(Error::ParseError(
+                        "ALTER COLUMN SET HNSW missing policy or DEFAULT".to_string(),
+                    ));
+                }
+                hnsw = Some(options);
+            }
+            Rule::alter_column_set_consolidation => {
+                let text = part.as_str();
+                let mut disabled = false;
+                let options = part.into_inner().find_map(|item| match item.as_rule() {
+                    Rule::consolidation_none => {
+                        disabled = true;
+                        None
+                    }
+                    Rule::consolidation_options => Some(build_vector_consolidation_options(item)),
+                    _ => None,
+                });
+                let options = options.transpose()?.or_else(|| {
+                    disabled.then_some(VectorConsolidationOptions {
+                        disabled: true,
+                        ..VectorConsolidationOptions::default()
+                    })
+                });
+                if options.is_none() && !text.to_ascii_uppercase().ends_with("DEFAULT") {
+                    return Err(Error::ParseError(
+                        "ALTER COLUMN SET CONSOLIDATION missing policy or DEFAULT".to_string(),
+                    ));
+                }
+                consolidation = Some(options);
+            }
+            other => return Err(unexpected_rule(other, "build_alter_column_action")),
+        }
+    }
+
+    let column =
+        column.ok_or_else(|| Error::ParseError("ALTER COLUMN missing column name".to_string()))?;
+    match (
+        max_partitions,
+        search_mode,
+        auto_index_at,
+        hnsw,
+        consolidation,
+    ) {
+        (Some(max_partitions), None, None, None, None) => Ok(AlterAction::SetVectorMaxPartitions {
+            column,
+            max_partitions,
+        }),
+        (None, Some(search_mode), None, None, None) => Ok(AlterAction::SetVectorSearchMode {
+            column,
+            search_mode,
+        }),
+        (None, None, Some(auto_index_at), None, None) => Ok(AlterAction::SetVectorAutoIndexAt {
+            column,
+            auto_index_at,
+        }),
+        (None, None, None, Some(hnsw), None) => Ok(AlterAction::SetVectorHnsw { column, hnsw }),
+        (None, None, None, None, Some(consolidation)) => Ok(AlterAction::SetVectorConsolidation {
+            column,
+            consolidation,
+        }),
+        _ => Err(Error::ParseError(
+            "ALTER COLUMN requires exactly one SET action".to_string(),
+        )),
+    }
+}
+
 fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMachineDef>)> {
     let mut name = None;
     let mut data_type = None;
@@ -1658,6 +1873,12 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     let mut expires = false;
     let mut immutable_flag = false;
     let mut quantization = VectorQuantization::F32;
+    let mut partition_key_columns = Vec::new();
+    let mut max_partitions = None;
+    let mut search_mode = None;
+    let mut auto_index_at = None;
+    let mut hnsw = VectorHnswOptions::default();
+    let mut consolidation = VectorConsolidationOptions::default();
     let mut rank_policy = None;
     let mut context_id = false;
     let mut scope_label = None;
@@ -1675,7 +1896,14 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                 name = Some(ident);
             }
             Rule::data_type => {
+                let vector_options = vector_column_options_for_data_type(&p)?;
                 quantization = vector_quantization_for_data_type(&p)?;
+                partition_key_columns = vector_options.partition_key_columns;
+                max_partitions = vector_options.max_partitions;
+                search_mode = vector_options.search_mode;
+                auto_index_at = vector_options.auto_index_at;
+                hnsw = vector_options.hnsw;
+                consolidation = vector_options.consolidation;
                 data_type = Some(build_data_type(p)?);
             }
             Rule::column_constraint => {
@@ -1827,6 +2055,12 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             expires,
             immutable: immutable_flag,
             quantization,
+            partition_key_columns,
+            max_partitions,
+            search_mode,
+            auto_index_at,
+            hnsw,
+            consolidation,
             rank_policy,
             context_id,
             scope_label,
@@ -2319,6 +2553,189 @@ fn build_data_type(pair: Pair<'_, Rule>) -> Result<DataType> {
     } else {
         Err(Error::ParseError(format!("unsupported data type: {txt}")))
     }
+}
+
+#[derive(Default)]
+struct ParsedVectorColumnOptions {
+    partition_key_columns: Vec<String>,
+    max_partitions: Option<String>,
+    search_mode: Option<VectorSearchMode>,
+    auto_index_at: Option<String>,
+    hnsw: VectorHnswOptions,
+    consolidation: VectorConsolidationOptions,
+}
+
+fn vector_column_options_for_data_type(pair: &Pair<'_, Rule>) -> Result<ParsedVectorColumnOptions> {
+    let Some(vector_type) = pair
+        .clone()
+        .into_inner()
+        .find(|part| part.as_rule() == Rule::vector_type)
+    else {
+        return Ok(ParsedVectorColumnOptions::default());
+    };
+
+    let mut options = ParsedVectorColumnOptions::default();
+    for part in vector_type.into_inner() {
+        match part.as_rule() {
+            Rule::integer | Rule::vector_quantization_clause => {}
+            Rule::vector_partition_key_clause => {
+                options.partition_key_columns = part
+                    .into_inner()
+                    .filter(|item| item.as_rule() == Rule::identifier)
+                    .map(|item| parse_identifier(item.as_str()))
+                    .collect();
+            }
+            Rule::vector_max_partitions_clause => {
+                options.max_partitions = Some(
+                    part.into_inner()
+                        .find(|item| item.as_rule() == Rule::max_partitions_literal)
+                        .map(|item| item.as_str().to_string())
+                        .ok_or_else(|| {
+                            Error::ParseError("MAX_PARTITIONS missing value".to_string())
+                        })?,
+                );
+            }
+            Rule::vector_search_mode_clause => {
+                let mode = part
+                    .into_inner()
+                    .find(|item| item.as_rule() == Rule::vector_search_mode)
+                    .ok_or_else(|| Error::ParseError("SEARCH_MODE missing mode".to_string()))?;
+                options.search_mode = Some(build_vector_search_mode(mode)?);
+            }
+            Rule::vector_auto_index_at_clause => {
+                let value = part
+                    .into_inner()
+                    .find(|item| item.as_rule() == Rule::vector_policy_value)
+                    .ok_or_else(|| Error::ParseError("AUTO_INDEX_AT missing value".to_string()))?;
+                options.auto_index_at = match build_vector_policy_value(value) {
+                    VectorPolicyValue::Value(value) => Some(value),
+                    VectorPolicyValue::Default => None,
+                };
+            }
+            Rule::vector_hnsw_clause => {
+                let options_pair = part
+                    .into_inner()
+                    .find(|item| item.as_rule() == Rule::hnsw_options)
+                    .ok_or_else(|| Error::ParseError("HNSW missing policy group".to_string()))?;
+                options.hnsw = build_vector_hnsw_options(options_pair)?;
+            }
+            Rule::vector_consolidation_clause => {
+                let declaration = part.into_inner().next().ok_or_else(|| {
+                    Error::ParseError("CONSOLIDATION missing policy group".to_string())
+                })?;
+                options.consolidation = match declaration.as_rule() {
+                    Rule::consolidation_none => VectorConsolidationOptions {
+                        disabled: true,
+                        ..VectorConsolidationOptions::default()
+                    },
+                    Rule::consolidation_options => build_vector_consolidation_options(declaration)?,
+                    other => {
+                        return Err(unexpected_rule(
+                            other,
+                            "vector_column_options_for_data_type.consolidation",
+                        ));
+                    }
+                };
+            }
+            other => {
+                return Err(unexpected_rule(
+                    other,
+                    "vector_column_options_for_data_type",
+                ));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
+fn build_vector_policy_value(pair: Pair<'_, Rule>) -> VectorPolicyValue {
+    if pair.as_str().eq_ignore_ascii_case("DEFAULT") {
+        VectorPolicyValue::Default
+    } else {
+        VectorPolicyValue::Value(pair.as_str().to_owned())
+    }
+}
+
+fn build_vector_hnsw_options(pair: Pair<'_, Rule>) -> Result<VectorHnswOptions> {
+    let mut options = VectorHnswOptions::default();
+    for option in pair.into_inner() {
+        if option.as_rule() != Rule::hnsw_option {
+            return Err(unexpected_rule(
+                option.as_rule(),
+                "build_vector_hnsw_options",
+            ));
+        }
+        let mut parts = option.into_inner();
+        let name = parts
+            .next()
+            .ok_or_else(|| Error::ParseError("HNSW member missing name".to_string()))?;
+        let value = parts
+            .next()
+            .ok_or_else(|| Error::ParseError("HNSW member missing value".to_string()))?;
+        let slot = match name.as_str().to_ascii_uppercase().as_str() {
+            "M" => &mut options.m,
+            "EF_CONSTRUCTION" => &mut options.ef_construction,
+            "EF_SEARCH" => &mut options.ef_search,
+            _ => {
+                return Err(Error::ParseError("unknown HNSW policy member".to_string()));
+            }
+        };
+        if slot.is_some() {
+            return Err(Error::ParseError(format!(
+                "duplicate HNSW policy member {}",
+                name.as_str()
+            )));
+        }
+        *slot = Some(build_vector_policy_value(value));
+    }
+    if options == VectorHnswOptions::default() {
+        return Err(Error::ParseError(
+            "HNSW requires at least one policy member".to_string(),
+        ));
+    }
+    Ok(options)
+}
+
+fn build_vector_consolidation_options(pair: Pair<'_, Rule>) -> Result<VectorConsolidationOptions> {
+    let mut options = VectorConsolidationOptions::default();
+    for option in pair.into_inner() {
+        if option.as_rule() != Rule::consolidation_option {
+            return Err(unexpected_rule(
+                option.as_rule(),
+                "build_vector_consolidation_options",
+            ));
+        }
+        let mut parts = option.into_inner();
+        let name = parts
+            .next()
+            .ok_or_else(|| Error::ParseError("CONSOLIDATION member missing name".to_string()))?;
+        let value = parts
+            .next()
+            .ok_or_else(|| Error::ParseError("CONSOLIDATION member missing value".to_string()))?;
+        let slot = match name.as_str().to_ascii_uppercase().as_str() {
+            "CHANGE_PERCENT" => &mut options.change_percent,
+            "TOMBSTONE_PERCENT" => &mut options.tombstone_percent,
+            _ => {
+                return Err(Error::ParseError(
+                    "unknown CONSOLIDATION policy member".to_string(),
+                ));
+            }
+        };
+        if slot.is_some() {
+            return Err(Error::ParseError(format!(
+                "duplicate CONSOLIDATION policy member {}",
+                name.as_str()
+            )));
+        }
+        *slot = Some(build_vector_policy_value(value));
+    }
+    if options == VectorConsolidationOptions::default() {
+        return Err(Error::ParseError(
+            "CONSOLIDATION requires at least one policy member".to_string(),
+        ));
+    }
+    Ok(options)
 }
 
 fn vector_quantization_for_data_type(pair: &Pair<'_, Rule>) -> Result<VectorQuantization> {
@@ -3332,6 +3749,49 @@ fn build_set_disk_limit(pair: Pair<'_, Rule>) -> Result<SetDiskLimitValue> {
         )?)),
         _ => Ok(SetDiskLimitValue::None),
     }
+}
+
+fn build_maintenance_poll_interval(pair: Pair<'_, Rule>) -> Result<u64> {
+    let mut value = None;
+    let mut multiplier = None;
+    let parts = pair.into_inner().flat_map(|part| {
+        if part.as_rule() == Rule::maintenance_poll_interval_value {
+            part.into_inner().collect::<Vec<_>>()
+        } else {
+            vec![part]
+        }
+    });
+    for part in parts {
+        match part.as_rule() {
+            Rule::integer => {
+                value = Some(part.as_str().parse::<u64>().map_err(|_| {
+                    Error::ParseError(
+                        "MAINTENANCE_POLL_INTERVAL is outside the numeric range".to_string(),
+                    )
+                })?);
+            }
+            Rule::maintenance_poll_interval_unit => {
+                multiplier = Some(if part.as_str().eq_ignore_ascii_case("SECONDS") {
+                    1_000
+                } else {
+                    1
+                });
+            }
+            other => return Err(unexpected_rule(other, "build_maintenance_poll_interval")),
+        }
+    }
+    let value = value.ok_or_else(|| {
+        Error::ParseError("MAINTENANCE_POLL_INTERVAL is missing a value".to_string())
+    })?;
+    let milliseconds = value.checked_mul(multiplier.unwrap_or(1)).ok_or_else(|| {
+        Error::ParseError("MAINTENANCE_POLL_INTERVAL is outside the numeric range".to_string())
+    })?;
+    if milliseconds == 0 {
+        return Err(Error::ParseError(
+            "MAINTENANCE_POLL_INTERVAL must be positive".to_string(),
+        ));
+    }
+    Ok(milliseconds)
 }
 
 fn parse_size_with_unit(text: &str) -> Result<u64> {

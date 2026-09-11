@@ -27,6 +27,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Per-session bounded read policy, owner-client deadlines, and the
 /// visibility this session reads under.
@@ -46,6 +47,10 @@ use std::sync::{Arc, Mutex};
 /// reads exactly what it reads today.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReadSessionOptions {
+    /// Non-raisable session memory ceiling. Bounds the file reader's loaded
+    /// state and combines with `limits.memory` for each read on either route.
+    /// It never changes the store's durable MEMORY_LIMIT declaration.
+    pub memory_limit: Option<usize>,
     pub limits: ReadLimits,
     pub timeouts: ReadClientTimeouts,
     pub contexts: Option<BTreeSet<ContextId>>,
@@ -138,6 +143,11 @@ pub struct DatabaseOpenOptions {
     pub plugin: Arc<dyn DatabasePlugin>,
     pub memory_limit: Option<usize>,
     pub disk_limit: Option<u64>,
+    /// Who drives maintenance for this writable open.
+    pub maintenance_policy: crate::database::MaintenancePolicy,
+    /// Optional database poll interval override. A file-backed override is
+    /// persisted as the database setting used by later opens.
+    pub maintenance_poll_interval: Option<Duration>,
     pub contexts: Option<BTreeSet<ContextId>>,
     pub scope_labels: Option<BTreeSet<ScopeLabel>>,
     pub principal: Option<Principal>,
@@ -157,6 +167,8 @@ impl Default for DatabaseOpenOptions {
             plugin: Arc::new(CorePlugin),
             memory_limit: None,
             disk_limit: None,
+            maintenance_policy: crate::database::MaintenancePolicy::default(),
+            maintenance_poll_interval: None,
             contexts: None,
             scope_labels: None,
             principal: None,
@@ -179,7 +191,9 @@ impl Default for DatabaseOpenOptions {
 mod route_observation {
     use super::*;
 
+    // This vocabulary is exposed only to `test-seams` integration proofs.
     /// The bounded operations whose cancellation identity is observable.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadSessionOperation {
         Execute,
@@ -211,12 +225,14 @@ mod route_observation {
 
     /// Deliberate owner-handshake mismatch used to prove that authentication
     /// failures remain terminal to one route-selection invocation.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum OwnerHandshakeMismatchForTest {
         DatabaseIdentity,
     }
 
     /// Route-assembly events needed by cross-process and no-fallback proofs.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadSessionEvent {
         OwnerResolution {
@@ -271,6 +287,7 @@ mod route_observation {
     /// Concrete production source reached by a bounded read. These values are
     /// emitted only by the adapter implementing the bounded kernel's execution
     /// probe; route selection and backend setup have no callback door for them.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadKernelSource {
         TableRow,
@@ -285,6 +302,7 @@ mod route_observation {
 
     /// Evidence emitted from the bounded source loop, after route and backend
     /// selection and immediately before one real source item is inspected.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReadKernelSourceEvent {
         pub operation: ReadSessionOperation,
@@ -295,6 +313,7 @@ mod route_observation {
 
     /// Evidence emitted by the bounded kernel immediately before it returns its
     /// typed cancellation result.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReadKernelCancellationEvent {
         pub operation: ReadSessionOperation,
@@ -305,6 +324,7 @@ mod route_observation {
     /// A narrow observer for route assembly. Implementations may block at an
     /// event, allowing a test to kill an owner between response frames without a
     /// wall-clock race.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub trait ReadSessionTestObserver: Send + Sync {
         fn observe_event(&self, _event: ReadSessionEvent) {}
     }
@@ -313,6 +333,7 @@ mod route_observation {
     /// supplies this observer to the selected backend; it must never invoke these
     /// methods itself. The cancellation value is the value consumed by that
     /// kernel invocation, not a route-level preflight copy.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub trait ReadKernelTestObserver: Send + Sync {
         fn before_source_touch(
             &self,
@@ -330,6 +351,8 @@ mod route_observation {
 
 // Without the doors these names are the engine's own; with them they are the
 // surface a proof observes through.
+// The production-private façade does not consume every proof export itself.
+#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))]
 #[cfg(not(feature = "test-seams"))]
 pub(crate) use route_observation::{
     OwnerHandshakeMismatchForTest, ReadKernelCancellationEvent, ReadKernelSource,
@@ -598,9 +621,11 @@ pub struct ReadRouteResourceSnapshot {
 #[derive(Default)]
 struct RouteResources {
     channel_identity: Mutex<Option<ChannelAddress>>,
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     owner_services_started: std::sync::atomic::AtomicU64,
     local_channel_operations: std::sync::atomic::AtomicU64,
     direct_backend_opens: std::sync::atomic::AtomicU64,
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     active_owner_slots: std::sync::atomic::AtomicU64,
     active_cursors: std::sync::atomic::AtomicU64,
     /// Real source items THIS route's reads have finished inspecting. Kept per
@@ -775,6 +800,21 @@ fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderE
         | Direct::DirectReadRequiresWriter { failure, .. } => Error::ReadFailure(failure),
         Direct::Cancelled => Error::ReadCancelled,
         Direct::Engine(prose) => Error::Other(prose),
+        Direct::MemoryBudget {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        } => Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        },
         // A store nobody can read is the one answer an operator has to act on,
         // so a reader must not hand them less than a writer does. The direct
         // reader names what it found but has no vocabulary for what to do
@@ -1257,32 +1297,28 @@ fn attempt_route_once(
 
     observe(ReadSessionEvent::BeforeDirectBackendOpen { attempt });
     resources.note_direct_backend_open();
-    let runtime = current_read_user()
+    // Resolve the ONE directory this session resolved for this deployment's
+    // owner CHANNEL. The reader does not keep it -- a reader's breadcrumb goes
+    // in the default per-user runtime location, because the writer that will
+    // be refused by this reader is started by somebody else and looks there.
+    // Resolving it here still matters: a runtime directory this process cannot
+    // use is a refusal a reader is owed before it opens anything.
+    current_read_user()
         .and_then(|owner_user| read_runtime_directory(owner_user, runtime_dir))
         .map_err(|error| RouteOpenRefusal {
             failure: ReadRouteOpenFailure::DirectOpen,
             error,
         })?;
-    // The ROOT of the ONE directory this session resolved for this
-    // deployment's owner CHANNEL. It is not where this reader writes itself
-    // down: a reader's breadcrumb goes in the default per-user runtime
-    // location, because the writer that will be refused by this reader is
-    // started by somebody else and looks there. Resolving it here still
-    // matters -- a runtime directory this process cannot use is a refusal a
-    // reader is owed before it opens anything.
     // The declaration this session opened with travels with the reader, so
     // the committed image it hydrates is narrowed before a single row is
     // answered from it.
-    let config = crate::direct_file_reader::DirectReaderConfig::new(
-        options.limits,
-        read_clock(),
-        runtime.root().to_path_buf(),
-    )
-    .declaring(
-        options.contexts.clone(),
-        options.scope_labels.clone(),
-        options.principal.clone(),
-    );
+    let mut config =
+        crate::direct_file_reader::DirectReaderConfig::new(options.limits, read_clock()).declaring(
+            options.contexts.clone(),
+            options.scope_labels.clone(),
+            options.principal.clone(),
+        );
+    config.memory_limit = options.memory_limit;
     match crate::direct_file_reader::DirectFileReader::open(path, config) {
         Ok(reader) => {
             observe(ReadSessionEvent::DirectBackendOpen);
@@ -1985,13 +2021,21 @@ impl ReadSession {
         options: ReadSessionOptions,
         runtime_dir: Option<PathBuf>,
         requirement: RouteRequirement,
-        session_observer: Option<Arc<dyn ReadSessionTestObserver>>,
-        kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
+        #[cfg_attr(not(feature = "test-seams"), allow(unused_variables))] session_observer: Option<
+            Arc<dyn ReadSessionTestObserver>,
+        >,
+        #[cfg_attr(not(feature = "test-seams"), allow(unused_variables))] kernel_observer: Option<
+            Arc<dyn ReadKernelTestObserver>,
+        >,
         mismatch: Option<OwnerHandshakeMismatchForTest>,
         progress: Option<Arc<dyn ReadProgressObserver>>,
     ) -> Result<Self> {
         #[cfg(not(feature = "test-seams"))]
         let _ = (&session_observer, &kernel_observer);
+        let mut options = options;
+        if let Some(limit) = options.memory_limit {
+            options.limits.memory = options.limits.memory.min(limit as u64);
+        }
         options
             .limits
             .validate()
@@ -2408,9 +2452,11 @@ impl ReadSession {
                 crate::local_transport::LocalMetadataRequest::MaintenanceStatus
             }
             // Explaining a statement is the owner planning it, not an
-            // inventory it keeps, so it travels as its own request.
-            MetadataRequest::Explain { sql } => {
-                return self.owner_explain(owner, sql.clone(), cancellation);
+            // inventory it keeps, so it travels as its own request, and the
+            // caller's binding travels with it: the owner plans the statement
+            // exactly as the file and live routes plan the same request.
+            MetadataRequest::Explain { sql, params } => {
+                return self.owner_explain(owner, sql.clone(), params, cancellation);
             }
             // The local protocol carries no request for the state of a
             // committed image, because an owner is not one.
@@ -2429,17 +2475,25 @@ impl ReadSession {
         promoted_metadata_answer(&request, &payload, limits)
     }
 
+    /// Ask the owner to plan a statement against the caller's own binding
+    /// without running it. The binding travels with the statement: a
+    /// partition scope resolves only after its key binds, so an explain that
+    /// left the binding behind would describe a scope the caller never named.
     fn owner_explain(
         &self,
         owner: &OwnerRoute,
         sql: String,
+        params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<MetadataAnswer> {
         let answered = owner.ask(
             self.options.limits,
             crate::local_transport::LocalRequest::Explain {
                 statement: sql,
-                params: std::collections::BTreeMap::new(),
+                params: params
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
             },
             Some(cancellation),
             #[cfg(feature = "test-seams")]
@@ -3247,6 +3301,20 @@ fn restored_query_result(
             .expect("invalid channel data accepts canonical empty detail"),
         )
     })?;
+    let vector_search = canonical
+        .trace
+        .vector_search
+        .map(crate::database::VectorSearchDisclosure::try_from)
+        .transpose()
+        .map_err(|_| {
+            Error::ReadFailure(
+                contextdb_core::read_contract::ReadFailure::new(
+                    contextdb_core::read_contract::ReadFailureKind::InvalidChannelData,
+                    contextdb_core::read_contract::ReadFailureDetail::None,
+                )
+                .expect("invalid channel data accepts canonical empty detail"),
+            )
+        })?;
     Ok(QueryResult {
         columns: canonical.columns,
         rows: canonical.rows,
@@ -3271,6 +3339,7 @@ fn restored_query_result(
                 .collect(),
             sort_elided: canonical.trace.sort_elided,
             query_vector_source: canonical.trace.query_vector_source,
+            vector_search,
             rows_examined: canonical.trace.rows_examined,
         },
         cascade: None,

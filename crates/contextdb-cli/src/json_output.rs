@@ -324,6 +324,26 @@ pub(crate) fn maintenance_report_document(report: &MaintenanceReport) -> Value {
             "currency_versions_deferred_for_readers": report.currency.versions_deferred_for_readers,
             "currency_redb_compacted": report.currency.redb_compacted,
             "pruned_trigger_audit_rows": report.pruned_trigger_audit_rows,
+            "vector": {
+                "built_indexes": report.vector.built_indexes,
+                "remaining_indexes": report.vector.remaining_indexes,
+                "nonempty_partitions": report.vector.nonempty_partitions,
+                "ready_partitions": report.vector.ready_partitions,
+                "built_partitions": report.vector.built_partitions,
+                "remaining_partitions": report.vector.remaining_partitions,
+                "first_failure": report.vector.first_failure.map(|failure| failure.reason()),
+                "first_failure_details": report.vector.first_failure_details.map(|details| json!({
+                    "reason": details.reason(),
+                    "operation": details.operation,
+                    "requested_bytes": details.requested_bytes,
+                    "available_bytes": details.available_bytes,
+                    "current_bytes": details.current_bytes,
+                    "budget_limit_bytes": details.budget_limit_bytes,
+                    "message": details.message,
+                    "recovery_action": details.recovery_action(),
+                    "recovery_instruction": details.recovery_instruction,
+                })),
+            },
             "compaction": compaction_report_fields(&report.compaction),
         }
     })
@@ -1051,14 +1071,63 @@ pub(crate) fn print_trace(trace: &QueryTrace, rows_examined: u64) {
     eprintln!("{}", json!({ "trace": Value::Object(body) }));
 }
 
-/// `.explain <sql>` for a read-only statement — the plan the engine actually
-/// took, field for field with the human rendering in
-/// `cli_render::render_explain`. `runtime_trace` is `true` because the
-/// statement was run to collect it.
+/// `.explain <sql>` for an ordinary read-only statement: the route the
+/// bounded reader actually took. `runtime_trace` distinguishes this receipt
+/// from passive vector metadata and static write planning.
 pub(crate) fn explain_document(result: &QueryResult) -> Value {
     let mut body = trace_body(&result.trace);
     body.insert("sort_elided".to_string(), json!(result.trace.sort_elided));
+    body.insert(
+        "rows_examined".to_string(),
+        json!(result.trace.rows_examined),
+    );
     body.insert("runtime_trace".to_string(), json!(true));
+    json!({ "explain": Value::Object(body) })
+}
+
+/// `.explain <sql>` from the engine's passive planning result. Vector route
+/// facts remain named data; no renderer text is reparsed to construct JSON.
+pub(crate) fn passive_explain_document(explained: &contextdb_engine::ExplainOutput) -> Value {
+    let mut body = Map::new();
+    body.insert(
+        "physical_plan".to_string(),
+        json!(explained.physical_plan.trim_end()),
+    );
+    body.insert(
+        "index_used".to_string(),
+        explained
+            .index_used
+            .as_ref()
+            .map_or(Value::Null, |index| json!(index)),
+    );
+    body.insert(
+        "predicates_pushed".to_string(),
+        json!(explained.predicates_pushed),
+    );
+    body.insert(
+        "indexes_considered".to_string(),
+        Value::Array(
+            explained
+                .indexes_considered
+                .iter()
+                .map(|candidate| {
+                    json!({
+                        "name": candidate.name,
+                        "rejected_reason": candidate.rejected_reason.as_ref(),
+                    })
+                })
+                .collect(),
+        ),
+    );
+    body.insert("sort_elided".to_string(), json!(explained.sort_elided));
+    body.insert("runtime_trace".to_string(), json!(false));
+    body.insert(
+        "vector_search".to_string(),
+        explained
+            .vector_search
+            .as_ref()
+            .map_or(Value::Null, vector_search_document),
+    );
     json!({ "explain": Value::Object(body) })
 }
 
@@ -1108,7 +1177,46 @@ fn trace_body(trace: &QueryTrace) -> Map<String, Value> {
                 .collect(),
         ),
     );
+    body.insert(
+        "vector_search".to_string(),
+        trace
+            .vector_search
+            .as_ref()
+            .map_or(Value::Null, vector_search_document),
+    );
     body
+}
+
+fn vector_search_document(disclosure: &contextdb_engine::VectorSearchDisclosure) -> Value {
+    json!({
+        "requested_mode": disclosure.requested_mode.to_string(),
+        "resolved_mode": disclosure.resolved_mode.to_string(),
+        "aggregate_allowed_vectors": disclosure.aggregate_allowed_vectors,
+        "effective_auto_index_at": disclosure.effective_auto_index_at,
+        "auto_index_at_source": disclosure.auto_index_at_source,
+        "partition_key_columns": disclosure.partition_key_columns,
+        "scope": disclosure.scope.as_str(),
+        "route": disclosure.route.map(contextdb_engine::VectorSearchRoute::as_str),
+        "layers": {
+            "base": disclosure.base.as_str(),
+            "change": disclosure.change.as_str(),
+            "tail": disclosure.tail.as_str(),
+        },
+        "merge": "global",
+        "residual": disclosure.residual.as_str(),
+        "fallback": disclosure.fallback,
+        "refusal": disclosure.refusal,
+        "recovery": disclosure.recovery,
+        "query_source": disclosure.query_source.as_str(),
+        "partitions": disclosure.partition_hnsw.iter().map(|partition| json!({
+            "partition": partition.partition,
+            "hnsw_m": partition.hnsw_m,
+            "hnsw_ef_construction": partition.hnsw_ef_construction,
+            "hnsw_ef_search": partition.hnsw_ef_search,
+            "ef_search_source": partition.ef_search_source,
+            "policy_revision": partition.policy_revision,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 #[cfg(test)]
@@ -1137,6 +1245,52 @@ mod tests {
             panic!("a schema question is answered with a schema body");
         };
         schema_document(schema)["schema"].clone()
+    }
+
+    #[test]
+    fn maintenance_json_retains_the_failed_budget_and_real_recovery_command() {
+        let db = Database::open_memory();
+        db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+        db.execute(
+            "CREATE TABLE vector_docs (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO vector_docs VALUES (1, '[1,0,0]'), (2, '[0,1,0]')",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let limits = db.execute("SHOW MEMORY_LIMIT", &HashMap::new()).unwrap();
+        let used_column = limits
+            .columns
+            .iter()
+            .position(|column| column == "used")
+            .unwrap();
+        let contextdb_core::Value::Int64(used) = &limits.rows[0][used_column] else {
+            panic!("SHOW MEMORY_LIMIT reports used bytes: {limits:?}");
+        };
+        let used = *used;
+        db.set_memory_limit(Some(usize::try_from(used).unwrap()))
+            .unwrap();
+
+        let report = db.run_maintenance_cycle().unwrap();
+        let document = maintenance_report_document(&report);
+        let detail = &document["maintenance_cycle"]["vector"]["first_failure_details"];
+        assert_eq!(
+            document["maintenance_cycle"]["vector"]["first_failure"],
+            json!("memory_limit")
+        );
+        assert!(detail["requested_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(detail["available_bytes"], json!(0));
+        assert_eq!(detail["budget_limit_bytes"], json!(used));
+        assert_eq!(detail["recovery_action"], json!("raise_memory_limit"));
+        assert!(
+            detail["recovery_instruction"]
+                .as_str()
+                .unwrap()
+                .contains("SET MEMORY_LIMIT")
+        );
     }
 
     /// The envelope's class is the branch an agent makes — retry the hub,

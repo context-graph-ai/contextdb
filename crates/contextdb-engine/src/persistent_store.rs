@@ -5,8 +5,10 @@ use crate::database::{LocalSchemaStageRegistry, ReceivedSchemaStageRegistry};
 use crate::persistence::{
     FlushDataOptions, FlushDataSnapshots, RedbPersistence, SchemaDdlPersistence,
 };
-use contextdb_core::{Result, RowId};
+use contextdb_core::{Result, RowId, SnapshotId};
 use contextdb_tx::{WriteSet, WriteSetApplicator};
+use contextdb_vector::VectorPartitionRef;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub struct PersistentCompositeStore {
@@ -38,8 +40,17 @@ impl PersistentCompositeStore {
     }
 }
 
-impl WriteSetApplicator for PersistentCompositeStore {
-    fn apply(&self, ws: &WriteSet) -> Result<()> {
+impl PersistentCompositeStore {
+    /// Apply one commit using only reclamation evidence captured by Database
+    /// while its snapshot-removal guard is held. Explicit refs remain for the
+    /// low-level prepared-store contract; ordinary commits supply the exact
+    /// registered-snapshot sample staged under this commit's LSN.
+    fn apply_with_vector_reclamation(
+        &self,
+        ws: &WriteSet,
+        reclaimable_partitions: HashSet<VectorPartitionRef>,
+        registered_snapshots: Option<&[SnapshotId]>,
+    ) -> Result<()> {
         if let Some(lsn) = ws.commit_lsn {
             let mut local_stages = self.local_schema_stages.lock();
             if let Some(stage) = local_stages.get(&lsn) {
@@ -67,6 +78,7 @@ impl WriteSetApplicator for PersistentCompositeStore {
                         max_sink_queue_depth: MAX_SINK_QUEUE_DEPTH,
                         snapshots: FlushDataSnapshots::default(),
                         received_schema: Some(&stage.durable_projection),
+                        partition_mutations: None,
                     },
                 );
                 if result.is_err() {
@@ -105,6 +117,24 @@ impl WriteSetApplicator for PersistentCompositeStore {
             Some(&table_meta),
             deleted_rows.as_ref(),
         );
+        let partition_mutations = match registered_snapshots {
+            Some(registered_snapshots) => self
+                .inner
+                .prepare_vector_partition_mutations_with_registered_snapshots(
+                    ws,
+                    &table_meta,
+                    deleted_rows.as_ref(),
+                    registered_snapshots,
+                )?,
+            None => self
+                .inner
+                .prepare_vector_partition_mutations_with_reclaimable_partitions(
+                    ws,
+                    &table_meta,
+                    deleted_rows.as_ref(),
+                    reclaimable_partitions,
+                )?,
+        };
         let erasure_stages = self.inner.local_erasure_stages.lock();
         let erasure = ws.commit_lsn.and_then(|lsn| erasure_stages.get(&lsn));
         self.persistence.flush_data_with_logs_and_sink_events(
@@ -124,10 +154,21 @@ impl WriteSetApplicator for PersistentCompositeStore {
                     deleted_rows,
                 },
                 received_schema: None,
+                partition_mutations: Some(&partition_mutations),
             },
         )?;
         drop(erasure_stages);
-        self.inner.apply_exact_with_log_entries(ws, log_entries)
+        self.inner
+            .apply_exact_with_log_entries(ws, log_entries, partition_mutations)
+    }
+}
+
+impl WriteSetApplicator for PersistentCompositeStore {
+    fn apply(&self, ws: &WriteSet) -> Result<()> {
+        let registered_snapshots = self
+            .inner
+            .take_vector_partition_snapshot_stage(ws.commit_lsn);
+        self.apply_with_vector_reclamation(ws, HashSet::new(), registered_snapshots.as_deref())
     }
 
     fn new_row_id(&self) -> RowId {

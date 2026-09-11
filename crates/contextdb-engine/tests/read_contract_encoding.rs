@@ -3,14 +3,19 @@ use bincode::serde::encode_to_vec;
 use contextdb_core::read_contract::{
     CursorPage, MetadataItem, MetadataPage, MetadataPageVocabulary,
 };
-use contextdb_core::{TxId, Value, VectorIndexRef};
+use contextdb_core::{TxId, Value, VectorIndexRef, VectorSearchMode};
 use contextdb_engine::read_contract::{
     CanonicalCascadeReport, CanonicalIndexCandidate, CanonicalQueryResult, CanonicalQueryTrace,
-    ReadEncodingError, cursor_page_encoded_size, decode_cursor_page, decode_metadata_page,
-    decode_query_result, encode_cursor_page, encode_metadata_page, encode_query_result,
-    metadata_page_encoded_size, query_result_encoded_size,
+    CanonicalVectorPartitionHnswDisclosure, CanonicalVectorSearchDisclosure, ReadEncodingError,
+    cursor_page_encoded_size, decode_cursor_page, decode_metadata_page, decode_query_result,
+    encode_cursor_page, encode_metadata_page, encode_query_result, metadata_page_encoded_size,
+    query_result_encoded_size,
 };
-use contextdb_engine::{CascadeReport, IndexCandidate};
+use contextdb_engine::{
+    CascadeReport, IndexCandidate, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
+    VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
+    VectorSearchScopeShape, VectorSearchTailState,
+};
 pub use contextdb_engine::{QueryResult, QueryTrace};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -57,6 +62,7 @@ fn result_with_every_value_kind() -> QueryResult {
             }],
             sort_elided: true,
             query_vector_source: Some(VectorIndexRef::new("events", "embedding")),
+            vector_search: None,
             rows_examined: 9,
         },
         cascade: Some(CascadeReport {
@@ -77,6 +83,7 @@ fn materially_different_result() -> QueryResult {
             indexes_considered: smallvec::SmallVec::new(),
             sort_elided: false,
             query_vector_source: None,
+            vector_search: None,
             rows_examined: 2,
         },
         cascade: None,
@@ -120,6 +127,7 @@ fn expected_result_with_every_value_kind() -> CanonicalQueryResult {
             }],
             sort_elided: true,
             query_vector_source: Some(VectorIndexRef::new("events", "embedding")),
+            vector_search: None,
             rows_examined: 9,
         },
         cascade: Some(CanonicalCascadeReport {
@@ -140,6 +148,7 @@ fn expected_materially_different_result() -> CanonicalQueryResult {
             indexes_considered: vec![],
             sort_elided: false,
             query_vector_source: None,
+            vector_search: None,
             rows_examined: 2,
         },
         cascade: None,
@@ -297,6 +306,61 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
     trace_flags_expected.trace.query_vector_source =
         Some(VectorIndexRef::new("events", "alternate"));
 
+    let mut vector_trace = rich.clone();
+    let mut vector_trace_expected = rich_expected.clone();
+    vector_trace.trace.vector_search = Some(VectorSearchDisclosure {
+        requested_mode: VectorSearchMode::Auto,
+        resolved_mode: VectorSearchMode::Exact,
+        aggregate_allowed_vectors: Some(3),
+        effective_auto_index_at: 8,
+        auto_index_at_source: "column".to_owned(),
+        partition_key_columns: vec!["scope".to_owned()],
+        scope: VectorSearchScopeShape::One,
+        route: Some(VectorSearchRoute::Exact),
+        base: VectorSearchLayerPresence::Present,
+        change: VectorSearchLayerPresence::Absent,
+        tail: VectorSearchTailState::Present,
+        residual: VectorSearchResidual::Bounded,
+        fallback: Some("below_auto_index_threshold".to_owned()),
+        refusal: None,
+        recovery: None,
+        query_source: VectorQuerySourceDisclosure::RedactedRowKey,
+        partition_hnsw: vec![VectorPartitionHnswDisclosure {
+            partition: "<redacted:1>".to_owned(),
+            hnsw_m: 16,
+            hnsw_ef_construction: 100,
+            hnsw_ef_search: 32,
+            ef_search_source: "column".to_owned(),
+            policy_revision: 3,
+        }],
+    });
+    vector_trace_expected.trace.vector_search = Some(CanonicalVectorSearchDisclosure {
+        requested_mode: "AUTO".to_owned(),
+        resolved_mode: "EXACT".to_owned(),
+        aggregate_allowed_vectors: Some(3),
+        effective_auto_index_at: 8,
+        auto_index_at_source: "column".to_owned(),
+        partition_key_columns: vec!["scope".to_owned()],
+        scope: "one".to_owned(),
+        route: Some("exact".to_owned()),
+        base: "present".to_owned(),
+        change: "absent".to_owned(),
+        tail: "present".to_owned(),
+        residual: "bounded".to_owned(),
+        fallback: Some("below_auto_index_threshold".to_owned()),
+        refusal: None,
+        recovery: None,
+        query_source: "<redacted>".to_owned(),
+        partition_hnsw: vec![CanonicalVectorPartitionHnswDisclosure {
+            partition: "<redacted:1>".to_owned(),
+            hnsw_m: 16,
+            hnsw_ef_construction: 100,
+            hnsw_ef_search: 32,
+            ef_search_source: "column".to_owned(),
+            policy_revision: 3,
+        }],
+    });
+
     let mut more_dropped_indexes = rich.clone();
     let mut more_dropped_indexes_expected = rich_expected.clone();
     more_dropped_indexes
@@ -346,6 +410,11 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
             "trace boolean and vector source",
             trace_flags,
             trace_flags_expected,
+        ),
+        (
+            "bounded redacted vector trace",
+            vector_trace,
+            vector_trace_expected,
         ),
         (
             "cascade dropped-index values and count",
@@ -403,6 +472,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     indexes_considered: smallvec::SmallVec::new(),
                     sort_elided: false,
                     query_vector_source: None,
+                    vector_search: None,
                     rows_examined: 1,
                 },
                 cascade: None,
@@ -418,6 +488,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     indexes_considered: vec![],
                     sort_elided: false,
                     query_vector_source: None,
+                    vector_search: None,
                     rows_examined: 1,
                 },
                 cascade: None,
@@ -438,6 +509,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     indexes_considered: smallvec::SmallVec::new(),
                     sort_elided: true,
                     query_vector_source: None,
+                    vector_search: None,
                     rows_examined: 1,
                 },
                 cascade: None,
@@ -456,6 +528,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     indexes_considered: vec![],
                     sort_elided: true,
                     query_vector_source: None,
+                    vector_search: None,
                     rows_examined: 1,
                 },
                 cascade: None,

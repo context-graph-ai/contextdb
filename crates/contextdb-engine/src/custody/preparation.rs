@@ -134,7 +134,7 @@ pub(crate) fn next_state(db: &Database, incarnation: Incarnation) -> Result<Stat
     if previous.is_some_and(|s| s.state.incarnation != incarnation) {
         return Err(invalid());
     }
-    // Statements 14/15: one immutable identity record per incarnation, not a
+    // One immutable identity record per incarnation, not a
     // history entry for each database write or accepted unit.
     if let Some(previous) = previous {
         return Ok(previous.clone());
@@ -250,7 +250,7 @@ pub(crate) fn binding(db: &Database, edge: &str) -> Result<SignedBinding> {
         .ok_or_else(invalid)
 }
 pub(crate) fn actual_row(db: &Database, r: &RowRef) -> Result<contextdb_core::VersionedRow> {
-    // Statements 7/9/12: indexed natural-key lookup, never a table scan per member.
+    // Indexed natural-key lookup, never a table scan per member.
     db.custody_row(r)?.ok_or_else(|| {
         Error::SyncError(format!(
             "delivery prerequisite row is absent in {}",
@@ -285,7 +285,7 @@ pub(crate) fn actual_policy(db: &Database, table: &str) -> Result<ApplicationTab
         edge_discard: m.edge_discard.unwrap_or_default(),
     })
 }
-// Statements 7/8: registration validates the writing transaction immediately;
+// Registration validates the writing transaction immediately;
 // final preparation repeats it after ordinary commit validation has run.
 pub(crate) fn validate_registration(
     db: &Database,
@@ -519,7 +519,7 @@ pub(crate) fn prepare_manifest(
         r.encode(&mut unit);
         unit.raw(&d);
     }
-    // Statements 6/9/15/17: the unit signs its current schema image at its real commit,
+    // The unit signs its current schema image at its real commit,
     // so a locally retained table needs no replay of a former peer's DDL history.
     let mut schemas = Vec::new();
     let tables = evidence
@@ -725,7 +725,7 @@ fn prepare_terminal_at(
     }
     let conflicts = if request.kind == 2 {
         match request.cause.as_deref() {
-            // Statements 12/16 and root 14: diagnose the actual held rows. A
+            // Diagnose the actual held rows. A
             // terminal's sender can be a relay or an equivalent writer, and a
             // winnerless member must name its conflicting sibling instead.
             Some(cause @ ("unit_digest_mismatch" | "keep_first_refused")) => {
@@ -791,7 +791,7 @@ fn prepare_terminal_at(
         let existing = db.custody_root(&m.seal.root)?;
         let complete_incumbent = existing.iter().filter_map(|r| match r { Record::Terminal { edge: false, record: t } if t.kind != 2 && t.root == m.seal.root && t.unit_digest == m.seal.unit_digest && t.namespace.hub_node == hub => Some(t), _ => None })
             .any(|t| m.rows.iter().zip(&incumbent_lives).all(|(source, (life, digest))| existing.iter().any(|r| matches!(r, Record::MaterializedOwner(o) if o.namespace == t.namespace && o.submission == t.submission && o.incumbent_reference == source.reference && o.incumbent == *life && o.incumbent_row_digest == *digest))));
-        // Statement 12: metadata ownership is unnecessary for a directly held
+        // Metadata ownership is unnecessary for a directly held
         // complete unit. Revalidate that unit inside the terminal commit gate.
         if !complete_incumbent
             && db.custody_incumbent_digest(&m.seal.root)? != Some(m.seal.unit_digest)
@@ -978,7 +978,7 @@ pub(crate) fn commit_binding(
     if request.tenant_id != tenant_id {
         return Err(invalid());
     }
-    // Statements 2/3: compare before minting authority, and repeat without a commit.
+    // Compare before minting authority, and repeat without a commit.
     let records = db.custody_authority()?;
     for (table, expected) in &request.expectation.tables {
         let declared = records
@@ -1147,7 +1147,7 @@ pub(crate) fn admit_binding(
     }
     let tx = db.begin()?;
     db.commit_delivery_prepared(tx, &mut |db, ws| {
-        // Statement 4: the accepted binding and edge incarnation persist together.
+        // The accepted binding and edge incarnation persist together.
         ws.config_writes.push((
             tenant.config_key("sync_incarnation"),
             crate::persistence::RedbPersistence::encode_config_value(
@@ -1207,7 +1207,7 @@ pub(crate) fn admit_binding(
         Ok(records)
     })
 }
-// Statements 9/10: changed application rows have no current registration;
+// Changed application rows have no current registration;
 // malformed or damaged journal records still fail their canonical verification.
 pub(crate) fn current_manifest(
     db: &Database,
@@ -1389,7 +1389,7 @@ pub(crate) fn admit_terminal(
     admit_terminals(db, tenant, hub, edge, std::slice::from_ref(packet))
 }
 
-// Statements 12/13/14: one admission transaction for the complete returned
+// One admission transaction for the complete returned
 // cohort; no row scan, no truncated acceptance position, no partial credit.
 pub(crate) fn admit_terminals(
     db: &Database,
@@ -1459,7 +1459,7 @@ pub(crate) fn admit_terminals(
                 writes.push(Record::DiagnosticOwner { namespace: t.namespace.clone(), submission: t.submission, life: life.clone() });
             }
         }
-        // Statements 13/15: packet order cannot weaken already admitted image evidence.
+        // Packet order cannot weaken already admitted image evidence.
         if let Some(checkpoint) = strongest
             && let Some(record) = super::checkpoint::admission(db,checkpoint)? { writes.push(record); }
         Ok(writes)

@@ -1,23 +1,13 @@
-//! The unshipped protocol v6 includes a distinct PURGE instruction lane and a
-//! structured authority refusal together with its arrival/source fields.
-//! `decode` already refuses any envelope whose
-//! version is not exactly `PROTOCOL_VERSION` (`protocol.rs`), so the refusal
-//! mechanism itself is not new; this test freezes the completed v6 wire shape
-//! and its actionable authority result.
-//!
-//! Contract: `PROTOCOL_VERSION` is 6. A version-mismatched peer is refused
-//! loudly on push, pull, AND the dedicated status exchange; no rows are ever
-//! applied and no watermark ever advances on either side; the refusal names
-//! the remedy (upgrade both ends), not just the two version numbers.
-//!
-//! Discipline: no sleeps, no elapsed-time assertions, no raw clock reads.
+//! The first released wire accepts protocol 7 only. Earlier development
+//! envelopes and unknown future versions are refused before sync effects.
 
 use contextdb_core::{Incarnation, Lsn, TenantId, Value};
 use contextdb_engine::Database;
 use contextdb_engine::composite_store::ChangeLogEntry;
 use contextdb_server::protocol::{
-    Envelope, MessageType, PROTOCOL_VERSION, PullResponse, SyncStatusRequest, WireChangeSet,
-    WireNaturalKey, WireRowChange, encode,
+    Envelope, MessageType, OLDEST_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, PullRequest,
+    PullResponse, SchemaRecoveryPage, SchemaRecoveryRequest, SyncStatusRequest, WireChangeSet,
+    WireNaturalKey, WireRowChange, decode, encode, supports_protocol_version,
 };
 use contextdb_server::subjects::status_subject;
 use contextdb_server::transport::{ClientTransport, TransportFuture};
@@ -30,10 +20,8 @@ use std::time::Duration;
 
 const DDL: &str =
     "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
-/// A version guaranteed to differ from whatever `PROTOCOL_VERSION` is on
-/// this tree today or after a future bump — never a peer this tree could
-/// legitimately be.
-const BOGUS_VERSION: u8 = 250;
+/// The unreleased development predecessor is not an accepted peer.
+const BOGUS_VERSION: u8 = 6;
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -138,22 +126,22 @@ fn assert_only_optional_peer_contact_changes_since(db: &Database, before_lsn: Ls
     );
 }
 
-/// The completed greenfield v6 contract carries the distinct PURGE lane and
-/// structured authority refusal before any v6 peer ships.
+/// Unreleased predecessors do not enter the first release's support window.
 #[test]
-fn protocol_version_is_amended_v6() {
+fn first_release_accepts_only_protocol_seven() {
     assert_eq!(
-        PROTOCOL_VERSION, 6,
-        "the unshipped protocol v6 must include the distinct PURGE instruction lane and \
-         structured authoritative-hub refusal"
+        PROTOCOL_VERSION, 7,
+        "newly emittable vector policy vocabulary must move the protocol to v7"
     );
+    assert_eq!(OLDEST_SUPPORTED_PROTOCOL_VERSION, 7);
+    assert!(!supports_protocol_version(6));
+    assert!(supports_protocol_version(7));
+    assert!(!supports_protocol_version(5));
 }
 
-/// The two v6 fields exist and round-trip: `WireRowChange.arrival` and
-/// `PullResponse.source`. They remain part of the completed v6 wire contract, and their
-/// absent defaults retain the legacy meaning.
+/// Arrival and serving-store identity retain their meaning in the current wire.
 #[test]
-fn the_v6_wire_fields_exist_and_round_trip() {
+fn current_wire_arrival_and_source_fields_round_trip() {
     let row = WireRowChange {
         table: "notes".to_string(),
         natural_key: WireNaturalKey {
@@ -186,6 +174,7 @@ fn the_v6_wire_fields_exist_and_round_trip() {
         has_more: false,
         cursor: None,
         source: Some(Incarnation(42)),
+        schema_recovery: None,
     };
     let response_bytes = rmp_serde::to_vec(&response).expect("PullResponse encode");
     let response_back: PullResponse =
@@ -204,10 +193,63 @@ fn the_v6_wire_fields_exist_and_round_trip() {
 }
 
 #[test]
-fn protocol_v6_purge_instruction_and_typed_authority_error_round_trip() {
+fn current_protocol_round_trips_bounded_schema_recovery_and_final_acknowledgement() {
+    let continuation = PullRequest {
+        since_lsn: Lsn(90),
+        max_entries: Some(500),
+        schema_recovery: Some(SchemaRecoveryRequest::Continue {
+            target_lsn: Lsn(90),
+            after_lsn: Lsn(40),
+        }),
+    };
+    let encoded = encode(MessageType::PullRequest, &continuation)
+        .expect("encode current schema-recovery continuation");
+    let envelope = decode(&encoded).expect("decode current continuation envelope");
+    assert_eq!(envelope.version, PROTOCOL_VERSION);
+    let decoded: PullRequest =
+        rmp_serde::from_slice(&envelope.payload).expect("decode continuation payload");
+    assert_eq!(decoded, continuation);
+
+    let acknowledgement = PullRequest {
+        since_lsn: Lsn(90),
+        max_entries: Some(500),
+        schema_recovery: Some(SchemaRecoveryRequest::Acknowledge {
+            target_lsn: Lsn(90),
+        }),
+    };
+    let acknowledgement_bytes = encode(MessageType::PullRequest, &acknowledgement)
+        .expect("encode current schema-recovery acknowledgement");
+    let acknowledgement_envelope =
+        decode(&acknowledgement_bytes).expect("decode acknowledgement envelope");
+    let acknowledgement_back: PullRequest =
+        rmp_serde::from_slice(&acknowledgement_envelope.payload)
+            .expect("decode acknowledgement payload");
+    assert_eq!(acknowledgement_back, acknowledgement);
+
+    let response = PullResponse {
+        changeset: WireChangeSet::default(),
+        has_more: true,
+        cursor: Some(Lsn(90)),
+        source: Some(Incarnation(42)),
+        schema_recovery: Some(SchemaRecoveryPage {
+            target_lsn: Lsn(90),
+            next_lsn: Lsn(40),
+            complete: false,
+        }),
+    };
+    let response_bytes =
+        encode(MessageType::PullResponse, &response).expect("encode current schema-recovery page");
+    let response_envelope = decode(&response_bytes).expect("decode recovery-page envelope");
+    let response_back: PullResponse =
+        rmp_serde::from_slice(&response_envelope.payload).expect("decode recovery-page payload");
+    assert_eq!(response_back, response);
+}
+
+#[test]
+fn current_wire_purge_instruction_and_typed_authority_error_round_trip() {
     let changeset = WireChangeSet {
         purges: vec![contextdb_server::protocol::WirePurgeChange {
-            // Statement 18: unchanged key-only instruction has no local predicate.
+            // Unchanged key-only instruction has no local predicate.
             node_local_predicate: None,
             table: "notes".to_string(),
             table_generation: 3,
@@ -237,7 +279,7 @@ fn protocol_v6_purge_instruction_and_typed_authority_error_round_trip() {
                 hub_node_id: "authoritative-hub".to_string(),
             },
         ),
-        // Statement 13: ordinary response lane compile prerequisite.
+        // Ordinary response lane compile prerequisite.
         ..Default::default()
     };
     let response_bytes = rmp_serde::to_vec(&response).expect("PushResponse encode");
@@ -252,7 +294,7 @@ fn protocol_v6_purge_instruction_and_typed_authority_error_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_version_mismatched_peer_is_refused_on_push_moving_no_rows_and_advancing_no_watermark() {
     let broker = InProcessBroker::new();
-    let tenant = "v6-mismatch-push";
+    let tenant = "unsupported-version-push";
     let hub_db = Arc::new(Database::open_memory());
     hub_db.execute(DDL, &p()).expect("hub ddl");
     let hub = start_hub(&broker, tenant, hub_db.clone());
@@ -331,7 +373,7 @@ async fn a_version_mismatched_peer_is_refused_on_push_moving_no_rows_and_advanci
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_version_mismatched_peer_is_refused_on_pull_moving_no_rows_and_advancing_no_watermark() {
     let broker = InProcessBroker::new();
-    let tenant = "v6-mismatch-pull";
+    let tenant = "unsupported-version-pull";
     let hub_db = Arc::new(Database::open_memory());
     hub_db.execute(DDL, &p()).expect("hub ddl");
     let mut row = p();
@@ -406,7 +448,7 @@ async fn a_version_mismatched_peer_is_refused_on_pull_moving_no_rows_and_advanci
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_version_mismatched_peer_is_refused_on_the_status_exchange() {
     let broker = InProcessBroker::new();
-    let tenant = "v6-mismatch-status";
+    let tenant = "unsupported-version-status";
     let hub_db = Arc::new(Database::open_memory());
     hub_db.execute(DDL, &p()).expect("hub ddl");
     let hub = start_hub(&broker, tenant, hub_db.clone());
@@ -539,4 +581,34 @@ fn pre_release_wire_additions_are_incompatible_with_a_stale_build_not_covered_by
             hub_node_id: "hub-1".to_string()
         }
     );
+}
+
+#[test]
+fn every_noncurrent_envelope_is_rejected_by_encoding_and_decoding() {
+    for version in 0..=u8::MAX {
+        if version == PROTOCOL_VERSION {
+            continue;
+        }
+        let envelope = Envelope {
+            version,
+            message_type: MessageType::StatusRequest,
+            payload: vec![],
+        };
+        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        assert!(
+            contextdb_server::protocol::decode(&bytes).is_err(),
+            "accepted version {version}"
+        );
+        assert!(
+            contextdb_server::protocol::encode_for_version(
+                version,
+                MessageType::StatusRequest,
+                &SyncStatusRequest {
+                    incarnation: Incarnation::mint()
+                }
+            )
+            .is_err(),
+            "encoded version {version}"
+        );
+    }
 }

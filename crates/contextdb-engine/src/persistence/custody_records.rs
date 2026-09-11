@@ -1,4 +1,4 @@
-//! Statements 7/11/13/15: verify only the selected persisted custody keys on read.
+//! Verify only the selected persisted custody keys on read.
 use super::*;
 impl RedbPersistence {
     pub(crate) fn load_custody_records_raw(

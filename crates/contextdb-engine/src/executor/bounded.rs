@@ -24,6 +24,7 @@ struct RequestState {
     telemetry: BoundedExecutionTelemetry,
     touches: BTreeMap<BoundedSourceTouch, u64>,
     memory: OwnedMemoryReservation,
+    membership_bytes: usize,
     // What the answer being assembled holds right now, and how much work had
     // been done when its progress was last reported. These describe the
     // in-flight answer a caller is waiting on, which is exactly what the
@@ -99,6 +100,7 @@ impl RequestContext {
                 telemetry: BoundedExecutionTelemetry::default(),
                 touches: BTreeMap::new(),
                 memory: OwnedMemoryReservation::new(db.bounded_read_accountant()),
+                membership_bytes: 0,
                 rows_so_far: 0,
                 bytes_so_far: 0,
                 reported_work: 0,
@@ -356,7 +358,7 @@ impl RequestContext {
         let completed = state.telemetry.work_units;
         drop(state);
         #[cfg(not(feature = "test-seams"))]
-        let _ = first_observation;
+        let _ = (first_observation, completed);
         #[cfg(feature = "test-seams")]
         if first_observation && let Some(probe) = self.probe() {
             probe.cancellation_observed(completed);
@@ -429,6 +431,8 @@ impl RequestContext {
             )
         };
 
+        #[cfg(not(feature = "test-seams"))]
+        let _ = (completed_work, completed_source);
         #[cfg(feature = "test-seams")]
         if let Some(probe) = self.probe() {
             probe.before_work(source, completed_work);
@@ -505,6 +509,8 @@ impl RequestContext {
             }
             (state.telemetry.work_units, state.started_ms)
         };
+        #[cfg(not(feature = "test-seams"))]
+        let _ = completed_work;
         #[cfg(feature = "test-seams")]
         if let Some(probe) = self.probe() {
             probe.before_work(source, completed_work);
@@ -561,6 +567,8 @@ impl RequestContext {
             }
             held
         };
+        #[cfg(not(feature = "test-seams"))]
+        let _ = held;
         #[cfg(feature = "test-seams")]
         if let Some(probe) = self.probe() {
             probe.before_temporary_reservation(source, requested_u64, held);
@@ -573,37 +581,15 @@ impl RequestContext {
             let mut state = self.state();
             // Named, so a store-budget refusal tells the operator WHICH part of
             // the statement wanted the memory rather than only how much.
-            if let Err(error) = state.memory.try_grow_for(
-                requested,
-                "bounded_read",
-                source.reservation_operation(),
-                "Lower the statement's LIMIT or width, or raise MEMORY_LIMIT.",
-            ) {
-                // The read's own ceiling was checked just above and let this
-                // through, so what refused is the STORE's standing budget.
-                // Which vocabulary that is reported in depends on what the
-                // caller declared:
-                //
-                // A read that DECLARED ceilings is answered in the refusal
-                // vocabulary it declared them in -- a crossed ceiling, carrying
-                // the ceiling, whether the memory was denied by its own limit
-                // or by the database's budget. That is the standing contract
-                // (`bounded_memory_refusal_typing.rs`), and it is what lets a
-                // caller branch on one shape.
-                //
-                // A read that declared NONE has no ceiling to name. Reporting
-                // one anyway names `u64::MAX` as the limit that stopped it,
-                // which is not a number anyone can act on, so that caller gets
-                // the store's own typed answer, which names the work its budget
-                // stopped.
-                if self.declares_no_ceilings() {
-                    return Err(BoundedExecutionError::from(error));
-                }
-                return Err(Self::limit_failure(
-                    ReadFailureLimit::Memory,
-                    self.limits.memory,
-                ));
-            }
+            state
+                .memory
+                .try_grow_for(
+                    requested,
+                    "bounded_read",
+                    source.reservation_operation(),
+                    "Lower the statement's LIMIT or width, or raise MEMORY_LIMIT.",
+                )
+                .map_err(BoundedExecutionError::from)?;
             let held_after = u64::try_from(state.memory.bytes())
                 .map_err(|_| Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory))?;
             state.telemetry.peak_temporary_bytes =
@@ -616,6 +602,8 @@ impl RequestContext {
                 .or_insert(held_after);
             held_after
         };
+        #[cfg(not(feature = "test-seams"))]
+        let _ = held_after;
         #[cfg(feature = "test-seams")]
         if let Some(probe) = self.probe() {
             probe.after_temporary_reservation(source, requested_u64, held_after);
@@ -630,12 +618,33 @@ impl RequestContext {
             .map_err(BoundedExecutionError::from)
     }
 
+    fn transfer_vector_load_reservation(&self, bytes: usize) -> Result<()> {
+        self.state().memory.try_transfer_to_store(bytes)
+    }
+
     fn set_encoded_bytes(&self, bytes: u64) {
         self.state().telemetry.encoded_bytes = bytes;
     }
 
     fn can_charge_more_work(&self) -> bool {
         self.state().telemetry.work_units < self.limits.work
+    }
+
+    /// Give the graph traversal a finite ceiling derived from the work this
+    /// request still owns. The normal callbacks remain the aggregate guard;
+    /// these values also prevent the filtered graph algorithm from wandering
+    /// indefinitely while looking for allowed row ids.
+    fn remaining_vector_graph_work(&self) -> std::result::Result<usize, BoundedExecutionError> {
+        self.check_final_boundary()?;
+        let remaining = {
+            let state = self.state();
+            self.limits
+                .work
+                .checked_sub(state.telemetry.work_units)
+                .filter(|remaining| *remaining > 0)
+                .ok_or_else(|| Self::limit_failure(ReadFailureLimit::Work, self.limits.work))?
+        };
+        Ok(usize::try_from(remaining).unwrap_or(usize::MAX))
     }
 
     /// Whether an operator should stop here and finish on a later fetch.
@@ -912,7 +921,97 @@ enum PullKind {
     Union(UnionState),
 }
 
+/// Historical membership allocations live with their cursor and count against
+/// both this request and its engine until the last owned node is released.
+struct MembershipBudget(Arc<RequestContext>);
+
+impl std::fmt::Debug for MembershipBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MembershipBudget")
+    }
+}
+
+impl contextdb_core::read_memory::ReadMemoryBudget for MembershipBudget {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        _: &'static str,
+        _: &'static str,
+        _: &'static str,
+    ) -> Result<()> {
+        self.0
+            .reserve(BoundedWorkSource::IndexRange, bytes)
+            .map_err(|error| match error {
+                BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+                BoundedExecutionError::Cancelled => Error::ReadCancelled,
+                BoundedExecutionError::Engine(error) => error,
+                BoundedExecutionError::Unimplemented => {
+                    Error::Other("unsupported membership allocation".into())
+                }
+            })?;
+        self.0.state().membership_bytes += bytes;
+        Ok(())
+    }
+    fn release(&self, bytes: usize) {
+        self.0.state().membership_bytes -= bytes;
+        self.0.release_parked(bytes);
+    }
+}
+
+impl Drop for MembershipBudget {
+    fn drop(&mut self) {
+        let bytes = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
+        self.0.state().membership_bytes -= bytes;
+        self.0.release_parked(bytes);
+    }
+}
+
+fn capture_scan_membership(
+    db: &dyn ReadExecutionTarget,
+    table: &str,
+    snapshot: SnapshotId,
+    mode: &mut ScanMode,
+    context: &Arc<RequestContext>,
+) -> std::result::Result<(), BoundedExecutionError> {
+    if matches!(mode, ScanMode::Physical { .. } | ScanMode::Empty) {
+        return Ok(());
+    }
+    context.reserve(
+        BoundedWorkSource::IndexRange,
+        std::mem::size_of::<MembershipBudget>() + 2 * std::mem::size_of::<usize>(),
+    )?;
+    context.state().membership_bytes +=
+        std::mem::size_of::<MembershipBudget>() + 2 * std::mem::size_of::<usize>();
+    let budget = Arc::new(MembershipBudget(Arc::clone(context)));
+    let touch = || {
+        context.charge(
+            BoundedWorkSource::IndexRange,
+            BoundedSourceTouch::IndexEntry,
+        )
+    };
+    match mode {
+        ScanMode::Index { cursor, .. } | ScanMode::Ordered { cursor, .. } => cursor.capture(
+            db.relational_membership_store(),
+            table,
+            snapshot,
+            budget,
+            touch,
+        ),
+        ScanMode::Exact { index, cursor } => cursor.capture(
+            db.relational_membership_store(),
+            table,
+            index,
+            snapshot,
+            budget,
+            touch,
+        ),
+        ScanMode::Physical { .. } | ScanMode::Empty => Ok(()),
+    }
+}
+
 struct ScanState {
+    identities_only: bool,
+    vector_candidate_source: bool,
     table: String,
     meta: TableMeta,
     schema_columns: Vec<String>,
@@ -991,6 +1090,8 @@ fn ordered_merge_key(
 struct ScanTransactionOverlay {
     tx: TxId,
     overlay: crate::executor::TransactionTableOverlay,
+    predicate_deleted: Vec<RowId>,
+    committed_predicates_resolved: bool,
     /// Identities of staged rows that also exist as committed rows this
     /// snapshot can see. A staged row whose committed original the
     /// transaction ALSO deleted is still published -- delete-then-reinsert
@@ -1016,6 +1117,9 @@ impl ScanTransactionOverlay {
         }
         if self.overlay.deleted.contains(&row.row_id) {
             return true;
+        }
+        if self.committed_predicates_resolved {
+            return self.predicate_deleted.binary_search(&row.row_id).is_ok();
         }
         contextdb_tx::row_matches_delete_predicates(&self.overlay.delete_predicates, table, row)
     }
@@ -1193,9 +1297,20 @@ struct VectorState {
     _query_bytes: usize,
     k: usize,
     candidate_k: usize,
+    partition_prefixes: Option<Vec<VectorPartitionKey>>,
+    /// The one resolved route contract for this operation. SQL overrides are
+    /// resolved against the durable column declaration before the pull state
+    /// is created, so a resumed bounded read cannot reinterpret the mode.
+    search_mode: contextdb_core::VectorSearchMode,
+    /// AUTO retains its declared mode for disclosure while using exact work
+    /// when the relational candidate source is not an indexed route.
+    force_exact_for_relational_fallback: bool,
     sort_key: Option<String>,
-    #[allow(dead_code)]
     params: Arc<HashMap<String, Value>>,
+    requested_search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
+    query_expr: Expr,
+    candidate_plan: Option<Box<PhysicalPlan>>,
+    restricted_candidates: bool,
     snapshot: SnapshotId,
     _schema: crate::database::VectorSchemaReadGuard,
     preparation: VectorPreparation,
@@ -1220,6 +1335,7 @@ struct VectorState {
     output: VecDeque<PulledRow>,
     output_container_bytes: usize,
     used_hnsw: bool,
+    disclosure: Option<VectorSearchDisclosure>,
     /// What this handle's own open transaction changes about the vectors this
     /// search can see. `None` whenever no transaction is open or it has
     /// touched nothing about this index -- which is every read of a committed
@@ -1330,6 +1446,7 @@ impl PullNode {
             PullKind::Graph(state) => state.next(db, context),
             PullKind::Vector(state) => {
                 let next = state.next(db, context);
+                self.trace.vector_search = state.disclosure.clone();
                 if state.used_hnsw {
                     // Runs on every row, so it has to say the same thing the
                     // second time it runs as the first. A catch-all that
@@ -1394,6 +1511,28 @@ impl PullNode {
                     "Sort"
                 }
             }
+        }
+    }
+
+    /// The vector source owns the actual route decision. Wrapper nodes copy a
+    /// trace before the source runs, so publication walks back to that source
+    /// just as [`Self::published_plan`] does for its physical-plan label.
+    fn published_vector_search(&self) -> Option<&VectorSearchDisclosure> {
+        match &self.kind {
+            PullKind::Scan(_) | PullKind::Graph(_) | PullKind::Static(_) => {
+                self.trace.vector_search.as_ref()
+            }
+            PullKind::Vector(_) => self.trace.vector_search.as_ref(),
+            PullKind::Project(state) => state.input.published_vector_search(),
+            PullKind::Sort(state) => state.input.published_vector_search(),
+            PullKind::Limit(state) => state.input.published_vector_search(),
+            PullKind::Filter(state) => state.input.published_vector_search(),
+            PullKind::Distinct(state) => state.input.published_vector_search(),
+            PullKind::Join(state) => state.left.published_vector_search(),
+            PullKind::Union(state) => state
+                .inputs
+                .first()
+                .and_then(PullNode::published_vector_search),
         }
     }
 
@@ -2030,6 +2169,7 @@ fn physical_plan_capacity_bytes(
             query_expr,
             candidates,
             sort_key,
+            materialized_columns,
             ..
         }
         | PhysicalPlan::HnswSearch {
@@ -2038,11 +2178,19 @@ fn physical_plan_capacity_bytes(
             query_expr,
             candidates,
             sort_key,
+            materialized_columns,
             ..
         } => {
             let mut bytes = checked_size_add(table.capacity(), column.capacity(), "vector plan")?;
             bytes = checked_size_add(bytes, expr_capacity_bytes(query_expr)?, "vector plan")?;
             bytes = checked_size_add(bytes, optional_string_capacity(sort_key), "vector plan")?;
+            if let Some(materialized_columns) = materialized_columns {
+                bytes = checked_size_add(
+                    bytes,
+                    string_vec_capacity_bytes(materialized_columns, "vector materialized columns")?,
+                    "vector plan",
+                )?;
+            }
             if let Some(candidates) = candidates.as_deref() {
                 bytes = checked_size_add(
                     bytes,
@@ -2130,6 +2278,11 @@ fn physical_plan_capacity_bytes(
             }
             Ok(bytes)
         }
+        PhysicalPlan::ShowVectorPartitions { table, column, .. } => checked_size_add(
+            optional_string_capacity(table),
+            optional_string_capacity(column),
+            "vector partition inspection plan",
+        ),
         _ => Ok(0),
     }
 }
@@ -2173,6 +2326,13 @@ fn table_meta_capacity_bytes(
             ] {
                 bytes = checked_size_add(bytes, value.capacity(), "rank policy")?;
             }
+        }
+        if let Some(partition_key_columns) = column.partition_key_columns.as_ref() {
+            bytes = checked_size_add(
+                bytes,
+                string_vec_capacity_bytes(partition_key_columns, "vector partition declaration")?,
+                "table metadata column",
+            )?;
         }
         if let Some(scope) = column.scope_label.as_ref() {
             match scope {
@@ -2510,6 +2670,52 @@ fn index_pick_capacity_bytes(
     }
 }
 
+fn vector_search_disclosure_capacity_bytes(
+    disclosure: &VectorSearchDisclosure,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    let mut bytes = disclosure.auto_index_at_source.capacity();
+    bytes = checked_size_add(
+        bytes,
+        strings_capacity_bytes(
+            &disclosure.partition_key_columns,
+            "trace vector partition-key columns",
+        )?,
+        "trace vector disclosure",
+    )?;
+    for value in [
+        disclosure.fallback.as_ref(),
+        disclosure.refusal.as_ref(),
+        disclosure.recovery.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        bytes = checked_size_add(bytes, value.capacity(), "trace vector disclosure")?;
+    }
+    bytes = checked_size_add(
+        bytes,
+        checked_size_mul(
+            disclosure.partition_hnsw.capacity(),
+            std::mem::size_of::<crate::database::VectorPartitionHnswDisclosure>(),
+            "trace vector partition disclosures",
+        )?,
+        "trace vector disclosure",
+    )?;
+    for partition in &disclosure.partition_hnsw {
+        bytes = checked_size_add(
+            bytes,
+            partition.partition.capacity(),
+            "trace vector partition disclosure",
+        )?;
+        bytes = checked_size_add(
+            bytes,
+            partition.ef_search_source.capacity(),
+            "trace vector partition disclosure",
+        )?;
+    }
+    Ok(bytes)
+}
+
 fn query_trace_capacity_bytes(
     trace: &QueryTrace,
 ) -> std::result::Result<usize, BoundedExecutionError> {
@@ -2550,6 +2756,13 @@ fn query_trace_capacity_bytes(
     if let Some(index) = trace.query_vector_source.as_ref() {
         bytes = checked_size_add(bytes, index.table.capacity(), "trace vector source")?;
         bytes = checked_size_add(bytes, index.column.capacity(), "trace vector source")?;
+    }
+    if let Some(disclosure) = trace.vector_search.as_ref() {
+        bytes = checked_size_add(
+            bytes,
+            vector_search_disclosure_capacity_bytes(disclosure)?,
+            "query trace",
+        )?;
     }
     Ok(bytes)
 }
@@ -3790,6 +4003,7 @@ impl ScanState {
         loop {
             let Some(position) = state.overlay.staged_positions.get(state.published).copied()
             else {
+                state.predicate_deleted = Vec::new();
                 let held = std::mem::take(&mut state.overlay.bytes);
                 context.release(held)?;
                 return Ok(None);
@@ -3809,6 +4023,11 @@ impl ScanState {
             let Some(row) = staged else {
                 continue;
             };
+            #[cfg(feature = "test-seams")]
+            if self.vector_candidate_source {
+                db.note_vector_candidate_materialized();
+            }
+
             // Same trade as a committed row: charged before the clone against
             // the retained estimate, trued up to the copy this read holds.
             let held = pulled_row_retained_bytes(&row)?;
@@ -4113,6 +4332,10 @@ impl ScanState {
                     }
                     continue;
                 };
+                #[cfg(feature = "test-seams")]
+                if self.vector_candidate_source && !self.identities_only {
+                    db.note_vector_candidate_materialized();
+                }
                 self.pending_row = Some((row, reserved.get(), source));
                 self.pending_from_committed = true;
             }
@@ -4127,25 +4350,24 @@ impl ScanState {
                     .as_ref()
                     .map(|(row, _, _)| (row.row_id, row.lsn))
                     .ok_or_else(|| Error::Other("bounded scan lost its row".to_string()))?;
-                let filled: Vec<(String, Value)> = self
-                    .supplement_columns
-                    .iter()
-                    .filter(|column| {
-                        self.pending_row.as_ref().is_some_and(|(row, _, _)| {
-                            matches!(row.values.get(*column), Some(Value::Null) | None)
-                        })
-                    })
-                    .filter_map(|column| {
-                        db.row_vector_for_column(
-                            &self.table,
-                            column,
-                            row_identity,
-                            row_lsn,
-                            self.snapshot,
-                        )
-                        .map(|vector| (column.clone(), Value::Vector(vector)))
-                    })
-                    .collect();
+                let mut filled = Vec::new();
+                for column in &self.supplement_columns {
+                    if !self.pending_row.as_ref().is_some_and(|(row, _, _)| {
+                        matches!(row.values.get(column), Some(Value::Null) | None)
+                    }) {
+                        continue;
+                    }
+                    if let Some(vector) = db.load_row_vector_for_column(
+                        context.transaction(),
+                        &self.table,
+                        column,
+                        row_identity,
+                        row_lsn,
+                        self.snapshot,
+                    )? {
+                        filled.push((column.clone(), Value::Vector(vector)));
+                    }
+                }
                 if let Some((row, _, _)) = self.pending_row.as_mut() {
                     for (column, value) in filled {
                         row.values.insert(column, value);
@@ -4193,9 +4415,13 @@ impl ScanState {
                 continue;
             }
 
-            let index_pick = match &self.mode {
-                ScanMode::Index { pick, .. } => Some(pick),
-                _ => self.residual_pick.as_ref(),
+            let index_pick = if self.identities_only && from_committed {
+                None
+            } else {
+                match &self.mode {
+                    ScanMode::Index { pick, .. } => Some(pick),
+                    _ => self.residual_pick.as_ref(),
+                }
             };
             if let Some(pick) = index_pick {
                 let key = contextdb_relational::index_key_for_row(&pick.columns, &row.values);
@@ -4280,7 +4506,9 @@ impl ScanState {
                 continue;
             }
 
-            if let Some(filter) = self.filter.as_ref() {
+            if let Some(filter) = self.filter.as_ref()
+                && !(self.identities_only && from_committed)
+            {
                 context.check_final_boundary()?;
                 let matched = bounded_row_matches(row, filter, &self.params);
                 context.check_final_boundary()?;
@@ -5381,6 +5609,47 @@ fn vector_candidate_identity(columns: &[String]) -> Option<VectorCandidateIdenti
 }
 
 impl VectorState {
+    fn with_partition_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let operation = || match self.sort_key.as_ref() {
+            Some(_) => contextdb_vector::mem::with_search_policy_limit(self.k, operation),
+            None => operation(),
+        };
+        match self.partition_prefixes.as_ref() {
+            Some(prefixes) => contextdb_vector::mem::with_selected_partition_prefixes(
+                &self.index,
+                prefixes.clone(),
+                operation,
+            ),
+            None => operation(),
+        }
+    }
+
+    fn record_disclosure(
+        &mut self,
+        db: &dyn ReadExecutionTarget,
+        aggregate_allowed_vectors: usize,
+        used_hnsw: bool,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        let authorized_sorted_ids = self
+            .candidate_filter
+            .then_some(self.candidate_ids.as_slice());
+        let disclosure = db.completed_vector_search_disclosure(
+            self.index.clone(),
+            self.k,
+            self.restricted_candidates,
+            self.candidate_plan.as_deref(),
+            self.requested_search_mode,
+            &self.query_expr,
+            self.snapshot,
+            &self.params,
+            aggregate_allowed_vectors,
+            authorized_sorted_ids,
+            used_hnsw,
+        )?;
+        self.disclosure = Some(disclosure);
+        Ok(())
+    }
+
     /// The row one scored candidate names, projected the way the source used
     /// to project it: the row id first, then the table's columns in order.
     ///
@@ -5449,9 +5718,14 @@ impl VectorState {
             if !matches!(row.values.get(column), Some(Value::Null) | None) {
                 continue;
             }
-            if let Some(vector) =
-                db.row_vector_for_column(&self.table, column, row.row_id, row.lsn, self.snapshot)
-            {
+            if let Some(vector) = db.load_row_vector_for_column(
+                context.transaction(),
+                &self.table,
+                column,
+                row.row_id,
+                row.lsn,
+                self.snapshot,
+            )? {
                 row.values.insert(column.clone(), Value::Vector(vector));
             }
         }
@@ -5507,7 +5781,10 @@ impl VectorState {
         };
         // A row this transaction restaged is published from what it staged,
         // not from the committed entry that version replaced.
-        if overlay.removed.contains(&row_id) || overlay.staged_identities.contains(&row_id) {
+        if overlay.removed.contains(&row_id)
+            || overlay.staged_identities.contains(&row_id)
+            || overlay.moved.contains_key(&row_id)
+        {
             return None;
         }
         let published = overlay.moved.get(&row_id).copied().unwrap_or(row_id);
@@ -5597,6 +5874,60 @@ impl VectorState {
         Ok(())
     }
 
+    fn staged_row_admitted(
+        &self,
+        db: &dyn ReadExecutionTarget,
+        context: &Arc<RequestContext>,
+        row_id: RowId,
+    ) -> std::result::Result<bool, BoundedExecutionError> {
+        if !self.candidate_admits(row_id) {
+            return Ok(false);
+        }
+        let mut retained = 0;
+        let row = db.bounded_row_by_identity(
+            context.transaction(),
+            &self.table,
+            row_id,
+            self.snapshot,
+            &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+            &mut |bytes| {
+                retained = bytes;
+                context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+            },
+        )?;
+        let admitted = (|| {
+            let Some(row) = row.as_ref() else {
+                return Ok(false);
+            };
+            let mut plan = self.candidate_plan.as_deref();
+            while let Some(PhysicalPlan::Project { input, .. }) = plan {
+                plan = Some(input);
+            }
+            if let Some(PhysicalPlan::Scan {
+                filter: Some(filter),
+                ..
+            }) = plan
+                && super::eval_bool_expr(row, filter, &self.params)? != Some(true)
+            {
+                return Ok(false);
+            }
+            let meta = db
+                .table_meta(&self.table)
+                .ok_or_else(|| Error::TableNotFound(self.table.clone()))?;
+            db.bounded_read_allowed_for_row(
+                context.transaction(),
+                &self.table,
+                &meta,
+                row,
+                self.snapshot,
+                &mut |_| context.charge_operator(BoundedWorkSource::AccessControl),
+            )
+        })();
+        drop(row);
+        context.release(retained)?;
+        admitted
+    }
+
     /// Score the vectors this transaction staged, after the committed entries
     /// are done.
     ///
@@ -5615,6 +5946,42 @@ impl VectorState {
         let Some(tx) = context.transaction() else {
             return Ok(());
         };
+        // Move the already-accounted overlay into this local scope so scoring
+        // can update the result heap without allocating a second move map.
+        let overlay = self
+            .vector_overlay
+            .take()
+            .expect("a transaction delta is present");
+        let moved_result = (|| -> std::result::Result<(), BoundedExecutionError> {
+            for (&from, &to) in &overlay.moved {
+                if overlay.removed.contains(&to)
+                    || overlay.staged_identities.contains(&to)
+                    || !self.staged_row_admitted(db, context, to)?
+                {
+                    continue;
+                }
+                context.charge(
+                    BoundedWorkSource::VectorCandidates,
+                    BoundedSourceTouch::BruteForceVectorCandidate,
+                )?;
+                let score = db.bounded_score_committed_vector_row(
+                    &self.index,
+                    from,
+                    self.snapshot,
+                    &self.query,
+                    &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                    &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                    &mut |bytes| context.reserve(BoundedWorkSource::VectorCandidates, bytes),
+                    &mut |bytes| context.release_parked(bytes),
+                );
+                if let Some(score) = score? {
+                    self.keep_score(context, to, score)?;
+                }
+            }
+            Ok(())
+        })();
+        self.vector_overlay = Some(overlay);
+        moved_result?;
         let mut staged = 0usize;
         loop {
             let Some(position) = self
@@ -5644,7 +6011,7 @@ impl VectorState {
                 continue;
             };
             let scored = self
-                .candidate_admits(row_id)
+                .staged_row_admitted(db, context, row_id)?
                 .then(|| contextdb_vector::cosine_similarity(&vector, &self.query));
             drop(vector);
             context.release(retained)?;
@@ -5775,32 +6142,95 @@ impl VectorState {
                     let candidates = self
                         .candidate_filter
                         .then_some(self.candidate_ids.as_slice());
-                    let hnsw_search = || {
-                        db.bounded_hnsw_vector_search(
+                    self.candidate_k = self
+                        .with_partition_scope(|| {
+                            db.bounded_vector_candidate_k(
+                                &self.index,
+                                self.k,
+                                self.sort_key.as_deref(),
+                                self.snapshot,
+                                candidates,
+                                &mut || {
+                                    context.charge_operator(BoundedWorkSource::VectorCandidates)
+                                },
+                                &mut |bytes| {
+                                    context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                },
+                                &mut |bytes| context.release_parked(bytes),
+                            )
+                        })?
+                        .saturating_add(
+                            self.vector_overlay
+                                .as_ref()
+                                .map_or(0, |overlay| overlay.searchable_entry_count),
+                        );
+                    // Count the same selected snapshot membership for every mode.
+                    // Directory counts and indexed identities do not hydrate vector bodies.
+                    let aggregate_allowed_count = self.with_partition_scope(|| {
+                        db.bounded_authorized_visible_vector_count(
                             &self.index,
-                            &self.query,
-                            self.candidate_k,
                             candidates,
                             self.snapshot,
-                            &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
                             &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
                             &mut |bytes| {
                                 context.reserve(BoundedWorkSource::VectorCandidates, bytes)
                             },
                             &mut |bytes| context.release_parked(bytes),
                         )
-                    };
-                    // A graph describes committed rows and nothing else, so
-                    // while this transaction has vectors of its own in play
-                    // there is no graph that can answer for them. The
-                    // established door makes the same call -- it reports this
-                    // case as not having used the index -- so both doors fall
-                    // to the same exhaustive scoring rather than one of them
-                    // answering confidently from an index that cannot see half
-                    // the question.
-                    let hnsw = if self.vector_overlay.is_some() {
-                        None
+                    })?;
+                    let hnsw = if self.search_mode == contextdb_core::VectorSearchMode::Exact
+                        || self.force_exact_for_relational_fallback
+                    {
+                        super::BoundedVectorSearchOutcome::ExactRequired
                     } else {
+                        let remaining_graph_work = context.remaining_vector_graph_work()?;
+                        let allowed_search_limits =
+                            contextdb_vector::hnsw::HnswAllowedSearchLimits {
+                                max_visited_nodes: remaining_graph_work,
+                                max_vector_evaluations: remaining_graph_work,
+                            };
+                        let hnsw_search = || {
+                            let accountant = db.bounded_read_accountant();
+                            let transfer_context = Arc::clone(context);
+                            let transfer = Arc::new(move |bytes| {
+                                transfer_context.transfer_vector_load_reservation(bytes)
+                            });
+                            crate::memory_accounting::with_vector_load_reservation_transfer(
+                                &accountant,
+                                transfer,
+                                || {
+                                    self.with_partition_scope(|| {
+                                        db.bounded_hnsw_vector_search(
+                                            &self.index,
+                                            &self.query,
+                                            self.candidate_k,
+                                            candidates,
+                                            self.snapshot,
+                                            self.search_mode,
+                                            aggregate_allowed_count,
+                                            allowed_search_limits,
+                                            &mut || {
+                                                context.charge_operator(
+                                                    BoundedWorkSource::VectorCandidates,
+                                                )
+                                            },
+                                            &mut || {
+                                                context.charge_operator(
+                                                    BoundedWorkSource::VectorCandidates,
+                                                )
+                                            },
+                                            &mut |bytes| {
+                                                context.reserve(
+                                                    BoundedWorkSource::VectorCandidates,
+                                                    bytes,
+                                                )
+                                            },
+                                            &mut |bytes| context.release_parked(bytes),
+                                        )
+                                    })
+                                },
+                            )
+                        };
                         #[cfg(feature = "test-seams")]
                         let searched = if let Some(probe) = context.probe() {
                             contextdb_vector::hnsw::with_hnsw_candidate_observer(
@@ -5812,53 +6242,101 @@ impl VectorState {
                         }?;
                         #[cfg(not(feature = "test-seams"))]
                         let searched = hnsw_search()?;
-                        // No graph yet is not the same as no graph to be had.
-                        // A store whose index has grown past the point where a
-                        // graph is worth building has one built the first time
-                        // a search asks for it, and until this door asked, only
-                        // the other one ever did -- so a store read only
-                        // through here scored every row of every search
-                        // forever, and reported that it had. The store decides
-                        // and the store builds; this asks once and looks again.
-                        match searched {
-                            Some(searched) => Some(searched),
-                            None if db.bounded_ensure_hnsw_built(&self.index, self.snapshot) => {
-                                #[cfg(feature = "test-seams")]
-                                let rebuilt = if let Some(probe) = context.probe() {
-                                    contextdb_vector::hnsw::with_hnsw_candidate_observer(
-                                        Arc::new(BoundedHnswProbeObserver { probe }),
-                                        hnsw_search,
-                                    )
-                                } else {
-                                    hnsw_search()
-                                }?;
-                                #[cfg(not(feature = "test-seams"))]
-                                let rebuilt = hnsw_search()?;
-                                rebuilt
-                            }
-                            None => None,
-                        }
+                        searched
                     };
-                    if let Some((rows, retained_bytes)) = hnsw {
-                        self.used_hnsw = true;
-                        self.score_bytes = retained_bytes;
-                        self.scores = rows;
-                        self.preparation = VectorPreparation::Materialize;
-                        continue;
+                    match hnsw {
+                        super::BoundedVectorSearchOutcome::Complete((mut rows, retained_bytes)) => {
+                            self.used_hnsw = true;
+                            if self.vector_overlay.is_some() {
+                                rows.retain_mut(|(row_id, _score)| {
+                                    let Some(published) = self.overlay_publishes(*row_id) else {
+                                        return false;
+                                    };
+                                    *row_id = published;
+                                    true
+                                });
+                            }
+                            self.score_bytes = retained_bytes;
+                            self.scores = rows;
+                            // INDEXED searches committed rows through the
+                            // maintained graph and scores only this
+                            // transaction's bounded staged delta directly.
+                            self.score_staged_vectors(db, context)?;
+                            self.record_disclosure(db, aggregate_allowed_count, true)?;
+                            self.preparation = VectorPreparation::Materialize;
+                            continue;
+                        }
+                        super::BoundedVectorSearchOutcome::CompleteEmpty => {
+                            self.used_hnsw = true;
+                            self.scores.clear();
+                            self.score_bytes = 0;
+                            self.score_staged_vectors(db, context)?;
+                            self.record_disclosure(db, aggregate_allowed_count, true)?;
+                            self.preparation = VectorPreparation::Materialize;
+                            continue;
+                        }
+                        super::BoundedVectorSearchOutcome::ExactRequired
+                        | super::BoundedVectorSearchOutcome::Unavailable
+                        | super::BoundedVectorSearchOutcome::Incomplete => {}
+                    }
+                    if self.search_mode == contextdb_core::VectorSearchMode::Indexed {
+                        return Err(Error::VectorIndexedRouteUnavailable {
+                            index: self.index.clone(),
+                        }
+                        .into());
                     }
                     self.scores = Vec::new();
                     self.score_bytes = 0;
-                    let cursor = db.bounded_brute_force_vector_cursor(
-                        self.index.clone(),
-                        &self.query,
-                        self.candidate_k,
-                        candidates,
-                        self.snapshot,
-                        &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
-                        &mut |bytes| context.reserve(BoundedWorkSource::VectorCandidates, bytes),
-                        &mut |bytes| context.release_parked(bytes),
-                    )?;
+                    // The exact route is resolved here -- asked for outright,
+                    // forced by a relational fallback, chosen below the
+                    // automatic crossover, or reached because the graph could
+                    // not serve this read. A ranked read on that route promises
+                    // the formula over every allowed stored vector before the
+                    // final LIMIT, so its pool is the whole visible set: the
+                    // indexed route's bounded cap would cut the best-scoring
+                    // row before the formula ever saw it. Every retained score
+                    // is still charged to this read as it is held.
+                    let exact_candidate_k = if self.sort_key.is_some() {
+                        let staged_entries = self
+                            .vector_overlay
+                            .as_ref()
+                            .map_or(0, |overlay| overlay.searchable_entry_count);
+                        db.bounded_vector_entry_count(&self.index, self.snapshot)
+                            .saturating_add(staged_entries)
+                            .max(self.candidate_k)
+                    } else {
+                        self.candidate_k
+                    };
+                    let cursor = self.with_partition_scope(|| {
+                        db.bounded_brute_force_vector_cursor(
+                            self.index.clone(),
+                            &self.query,
+                            exact_candidate_k,
+                            candidates,
+                            self.snapshot,
+                            &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                            &mut |bytes| {
+                                context
+                                    .reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                    .map_err(|error| match error {
+                                        BoundedExecutionError::Engine(
+                                            Error::MemoryBudgetExceeded {
+                                                available_bytes, ..
+                                            },
+                                        ) => Error::VectorExactSearchBudgetExceeded {
+                                            index: self.index.clone(),
+                                            required_bytes: bytes as u64,
+                                            available_bytes: available_bytes as u64,
+                                        }
+                                        .into(),
+                                        other => other,
+                                    })
+                            },
+                            &mut |bytes| context.release_parked(bytes),
+                        )
+                    })?;
                     self.source = Some(VectorCandidateSource::Brute(cursor));
+                    self.record_disclosure(db, aggregate_allowed_count, false)?;
                     self.preparation = VectorPreparation::Materialize;
                     continue;
                 }
@@ -6122,6 +6600,7 @@ impl VectorState {
                         vector_score,
                         row: row.into_row(),
                     });
+                    self.drop_rows_out_of_contention(context)?;
                     continue;
                 }
                 VectorPreparation::Output => {
@@ -6138,15 +6617,32 @@ impl VectorState {
         }
     }
 
-    fn finish_materialization(
+    /// Release the materialised rows that can no longer reach the answer.
+    ///
+    /// Once twice the answer's size is held, the rows are put in answer order
+    /// and everything past `LIMIT` is released, so a rank over the whole
+    /// table holds at most two answers' worth of row values at any moment
+    /// rather than every row it scored. Amortised over the read this is one
+    /// sort per `LIMIT` candidates, and the answer is the same top rows the
+    /// final sort would have kept.
+    fn drop_rows_out_of_contention(
         &mut self,
         context: &Arc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
+        let contention_ceiling = self.k.saturating_mul(2).max(self.k.saturating_add(1));
+        if self.ranked_rows.len() < contention_ceiling {
+            return Ok(());
+        }
+        self.sort_ranked_rows_into_answer_order();
+        self.release_ranked_rows_past_limit(context)
+    }
+
+    fn sort_ranked_rows_into_answer_order(&mut self) {
         if self.sort_key.is_some() {
             self.ranked_rows.sort_by(|left, right| {
                 bounded_rank_float_desc(left.rank, right.rank)
                     .then_with(|| bounded_rank_float_desc(left.vector_score, right.vector_score))
-                    .then_with(|| right.row_id.cmp(&left.row_id))
+                    .then_with(|| left.row_id.cmp(&right.row_id))
             });
         } else {
             self.ranked_rows.sort_by(|left, right| {
@@ -6156,12 +6652,27 @@ impl VectorState {
                     .then_with(|| left.row_id.cmp(&right.row_id))
             });
         }
+    }
+
+    fn release_ranked_rows_past_limit(
+        &mut self,
+        context: &Arc<RequestContext>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
         while self.ranked_rows.len() > self.k {
             let removed = self.ranked_rows.pop().ok_or_else(|| {
                 Error::Other("bounded vector truncation lost its tail row".to_string())
             })?;
             removed.row.release(context)?;
         }
+        Ok(())
+    }
+
+    fn finish_materialization(
+        &mut self,
+        context: &Arc<RequestContext>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        self.sort_ranked_rows_into_answer_order();
+        self.release_ranked_rows_past_limit(context)?;
         let planned_output_bytes = checked_size_mul(
             self.ranked_rows.len(),
             std::mem::size_of::<PulledRow>(),
@@ -6194,12 +6705,12 @@ impl VectorState {
         self.ranked_container_bytes = 0;
         self.output = output;
         self.output_container_bytes = output_bytes;
+        self.scores = Vec::new();
         context.release(self.score_bytes)?;
         self.score_bytes = 0;
-        self.scores = Vec::new();
+        self.candidate_ids = Vec::new();
         context.release(self.candidate_bytes)?;
         self.candidate_bytes = 0;
-        self.candidate_ids = Vec::new();
         // The transaction's own vector work has been read and applied; what
         // remembering it cost goes back with the rest of the search state.
         self.vector_overlay = None;
@@ -7020,11 +7531,13 @@ fn ensure_supported_plan(plan: &PhysicalPlan) -> std::result::Result<(), Bounded
         // changed, and classified a READ, so a reading session runs it.
         PhysicalPlan::ShowMemoryLimit
         | PhysicalPlan::ShowDiskLimit
+        | PhysicalPlan::ShowMaintenancePollInterval
         | PhysicalPlan::ShowSyncConflictPolicy
         | PhysicalPlan::ShowVectorIndexes
         | PhysicalPlan::ShowTenantTablePolicy { .. }
         | PhysicalPlan::ShowSyncBindings
-        | PhysicalPlan::ShowDeliveryOutcomes(_) => Ok(()),
+        | PhysicalPlan::ShowDeliveryOutcomes(_)
+        | PhysicalPlan::ShowVectorPartitions { .. } => Ok(()),
         PhysicalPlan::Pipeline(plans) => {
             for plan in plans {
                 ensure_supported_plan(plan)?;
@@ -7189,9 +7702,18 @@ fn build_kernel(
     snapshot: SnapshotId,
     context: &Arc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
-    build_kernel_with_ctes(db, plan, params, snapshot, &HashMap::new(), context)
+    build_kernel_with_ctes(db, plan, params, snapshot, &HashMap::new(), context).map(|node| *node)
 }
 
+/// Build recursive plan nodes behind their eventual owning pointer.
+///
+/// `PullNode` carries every source state inline and is deliberately large.
+/// Returning it by value from each recursive plan layer makes an unoptimised
+/// build retain several full-node result slots per layer, so a valid deep CTE
+/// query can exhaust an ordinary thread stack before it reads a row. Keeping
+/// the recursive result boxed gives each layer a pointer-sized return slot;
+/// the finished tree has the same ownership shape its wrapper states already
+/// use.
 fn build_kernel_with_ctes<'plan>(
     db: &dyn ReadExecutionTarget,
     plan: &'plan PhysicalPlan,
@@ -7199,7 +7721,7 @@ fn build_kernel_with_ctes<'plan>(
     snapshot: SnapshotId,
     ctes: &HashMap<&'plan str, &'plan PhysicalPlan>,
     context: &Arc<RequestContext>,
-) -> std::result::Result<PullNode, BoundedExecutionError> {
+) -> std::result::Result<Box<PullNode>, BoundedExecutionError> {
     match plan {
         PhysicalPlan::Scan { table, filter, .. } => build_scan(
             db,
@@ -7210,7 +7732,8 @@ fn build_kernel_with_ctes<'plan>(
             None,
             None,
             context,
-        ),
+        )
+        .map(Box::new),
         // Read-classified statements about the store itself. They walk no
         // source, so the whole answer arrives at once -- and every row of it
         // is charged on the way in, so a store with a great many vector
@@ -7218,11 +7741,15 @@ fn build_kernel_with_ctes<'plan>(
         // many rows.
         PhysicalPlan::ShowMemoryLimit
         | PhysicalPlan::ShowDiskLimit
+        | PhysicalPlan::ShowMaintenancePollInterval
         | PhysicalPlan::ShowSyncConflictPolicy
         | PhysicalPlan::ShowVectorIndexes
         | PhysicalPlan::ShowTenantTablePolicy { .. }
         | PhysicalPlan::ShowSyncBindings
-        | PhysicalPlan::ShowDeliveryOutcomes(_) => build_store_state(db, plan, context),
+        | PhysicalPlan::ShowDeliveryOutcomes(_)
+        | PhysicalPlan::ShowVectorPartitions { .. } => {
+            build_store_state(db, plan, context).map(Box::new)
+        }
         PhysicalPlan::Project { input, columns } => {
             let input =
                 build_kernel_with_ctes(db, input, Arc::clone(&params), snapshot, ctes, context)?;
@@ -7235,11 +7762,11 @@ fn build_kernel_with_ctes<'plan>(
             {
                 return Err(mixed_aggregate_error().into());
             }
-            Ok(PullNode {
+            Ok(Box::new(PullNode {
                 columns: project_output_columns(columns),
                 trace,
                 kind: PullKind::Project(ProjectState {
-                    input: Box::new(input),
+                    input,
                     columns: columns.clone(),
                     params,
                     aggregate_done: false,
@@ -7248,19 +7775,19 @@ fn build_kernel_with_ctes<'plan>(
                     aggregates: None,
                     aggregate_state_bytes: 0,
                 }),
-            })
+            }))
         }
         PhysicalPlan::Limit { input, count } => {
             let input = build_kernel_with_ctes(db, input, params, snapshot, ctes, context)?;
-            Ok(PullNode {
+            Ok(Box::new(PullNode {
                 columns: input.columns.clone(),
                 trace: input.trace.clone(),
                 kind: PullKind::Limit(LimitState {
-                    input: Box::new(input),
+                    input,
                     count: *count,
                     emitted: 0,
                 }),
-            })
+            }))
         }
         PhysicalPlan::Sort { input, keys } => {
             // An ordered index run is the committed rows in order and nothing
@@ -7283,7 +7810,8 @@ fn build_kernel_with_ctes<'plan>(
                     Some((column, direction, index, reverse)),
                     None,
                     context,
-                );
+                )
+                .map(Box::new);
             }
             let built =
                 build_kernel_with_ctes(db, input, Arc::clone(&params), snapshot, ctes, context)?;
@@ -7300,11 +7828,11 @@ fn build_kernel_with_ctes<'plan>(
                 return Ok(built);
             }
             let input = built;
-            Ok(PullNode {
+            Ok(Box::new(PullNode {
                 columns: input.columns.clone(),
                 trace: input.trace.clone(),
                 kind: PullKind::Sort(SortState {
-                    input: Box::new(input),
+                    input,
                     keys: keys.clone(),
                     params,
                     rows: Vec::new(),
@@ -7312,42 +7840,42 @@ fn build_kernel_with_ctes<'plan>(
                     pending: None,
                     buffered_bytes: 0,
                 }),
-            })
+            }))
         }
         PhysicalPlan::Filter { input, predicate } => {
             let input =
                 build_kernel_with_ctes(db, input, Arc::clone(&params), snapshot, ctes, context)?;
-            Ok(PullNode {
+            Ok(Box::new(PullNode {
                 columns: input.columns.clone(),
                 trace: input.trace.clone(),
                 kind: PullKind::Filter(FilterState {
-                    input: Box::new(input),
+                    input,
                     predicate: predicate.clone(),
                     params,
                     pending: None,
                 }),
-            })
+            }))
         }
         PhysicalPlan::Distinct { input } | PhysicalPlan::MaterializeCte { input, .. } => {
             let input = build_kernel_with_ctes(db, input, params, snapshot, ctes, context)?;
             if matches!(plan, PhysicalPlan::MaterializeCte { .. }) {
                 return Ok(input);
             }
-            Ok(PullNode {
+            Ok(Box::new(PullNode {
                 columns: input.columns.clone(),
                 trace: input.trace.clone(),
                 kind: PullKind::Distinct(DistinctState {
-                    input: Box::new(input),
+                    input,
                     seen: HashSet::new(),
                     seen_bytes: 0,
                     pending: None,
                 }),
-            })
+            }))
         }
         PhysicalPlan::Union { inputs, all } => {
             let mut built = Vec::with_capacity(inputs.len());
             for input in inputs {
-                built.push(build_kernel_with_ctes(
+                built.push(*build_kernel_with_ctes(
                     db,
                     input,
                     Arc::clone(&params),
@@ -7362,7 +7890,7 @@ fn build_kernel_with_ctes<'plan>(
             let trace = built
                 .first()
                 .map_or_else(QueryTrace::scan, |input| input.trace.clone());
-            Ok(PullNode {
+            Ok(Box::new(PullNode {
                 columns,
                 trace,
                 kind: PullKind::Union(UnionState {
@@ -7373,7 +7901,7 @@ fn build_kernel_with_ctes<'plan>(
                     seen_bytes: 0,
                     pending: None,
                 }),
-            })
+            }))
         }
         PhysicalPlan::Join {
             left,
@@ -7408,12 +7936,12 @@ fn build_kernel_with_ctes<'plan>(
                 &right_prefix,
             );
             let trace = left.trace.clone();
-            Ok(PullNode {
+            Ok(Box::new(PullNode {
                 columns: output_columns,
                 trace,
                 kind: PullKind::Join(JoinState {
-                    left: Box::new(left),
-                    right: Box::new(right),
+                    left,
+                    right,
                     condition: condition.clone(),
                     condition_columns,
                     right_column_count,
@@ -7426,7 +7954,7 @@ fn build_kernel_with_ctes<'plan>(
                     right_position: 0,
                     matched: false,
                 }),
-            })
+            }))
         }
         PhysicalPlan::GraphBfs {
             start_alias,
@@ -7473,14 +8001,14 @@ fn build_kernel_with_ctes<'plan>(
                     if let Some(candidates) = start_candidates.as_deref() {
                         predicates_pushed
                             .push(std::borrow::Cow::Owned(format!("{start_alias}.id")));
-                        candidate_root = Some(Box::new(build_kernel_with_ctes(
+                        candidate_root = Some(build_kernel_with_ctes(
                             db,
                             candidates,
                             Arc::clone(&params),
                             snapshot,
                             ctes,
                             context,
-                        )?));
+                        )?);
                         VecDeque::new()
                     } else if let Some(filter) = resolved_filter.as_ref() {
                         match bounded_graph_static_starts(filter, &params, start_alias)? {
@@ -7627,7 +8155,7 @@ fn build_kernel_with_ctes<'plan>(
             columns.extend(steps.iter().map(|step| format!("{}.id", step.target_alias)));
             columns.push("id".to_string());
             columns.push("depth".to_string());
-            Ok(PullNode {
+            Ok(Box::new(PullNode {
                 columns,
                 trace,
                 kind: PullKind::Graph(GraphState {
@@ -7660,7 +8188,7 @@ fn build_kernel_with_ctes<'plan>(
                     row_memory: AmortizedRowMemory::default(),
                     active: None,
                 }),
-            })
+            }))
         }
         PhysicalPlan::VectorSearch {
             table,
@@ -7669,6 +8197,8 @@ fn build_kernel_with_ctes<'plan>(
             k,
             candidates,
             sort_key,
+            search_mode,
+            ..
         }
         | PhysicalPlan::HnswSearch {
             table,
@@ -7677,6 +8207,8 @@ fn build_kernel_with_ctes<'plan>(
             k,
             candidates,
             sort_key,
+            search_mode,
+            ..
         } => build_vector_kernel(
             db,
             plan,
@@ -7686,11 +8218,13 @@ fn build_kernel_with_ctes<'plan>(
             *k,
             candidates.as_deref(),
             sort_key.as_deref(),
+            *search_mode,
             params,
             snapshot,
             ctes,
             context,
-        ),
+        )
+        .map(Box::new),
         PhysicalPlan::Pipeline(plans) => {
             let mut visible_ctes = ctes.clone();
             let mut last = None;
@@ -7702,7 +8236,7 @@ fn build_kernel_with_ctes<'plan>(
                 }
             }
             let Some(last) = last else {
-                return Ok(empty_node());
+                return Ok(Box::new(empty_node()));
             };
             build_kernel_with_ctes(db, last, params, snapshot, &visible_ctes, context)
         }
@@ -7710,7 +8244,8 @@ fn build_kernel_with_ctes<'plan>(
             table,
             index,
             range,
-        } => build_direct_index_scan(db, table, index, range, params, snapshot, context),
+        } => build_direct_index_scan(db, table, index, range, params, snapshot, context)
+            .map(Box::new),
         PhysicalPlan::CteRef { name } => {
             let input = ctes.get(name.as_str()).copied().ok_or_else(|| {
                 Error::Other(format!(
@@ -7725,6 +8260,257 @@ fn build_kernel_with_ctes<'plan>(
     }
 }
 
+/// Resolve value-based staged deletes by their complete indexed keys. This
+/// costs the staged predicate set, not every candidate row in the search.
+fn resolve_candidate_delete_membership(
+    db: &dyn ReadExecutionTarget,
+    table: &str,
+    snapshot: SnapshotId,
+    tx: &mut ScanTransactionOverlay,
+    context: &Arc<RequestContext>,
+) -> std::result::Result<bool, BoundedExecutionError> {
+    let store = db.relational_membership_store();
+    let indexes = store.indexes.read();
+    let Some(indexes) = indexes.get(table) else {
+        return Ok(false);
+    };
+    // Establish complete support before allocating or reading any postings.
+    let storage_for = |predicate: &contextdb_tx::RelationalDeletePredicate| {
+        indexes.values().find(|storage| {
+            storage.columns.len() == predicate.predicates.len()
+                && !storage.columns.is_empty()
+                && storage
+                    .columns
+                    .iter()
+                    .all(|(column, _)| predicate.predicates.iter().any(|(name, _)| name == column))
+        })
+    };
+    if tx
+        .overlay
+        .delete_predicates
+        .iter()
+        .any(|predicate| storage_for(predicate).is_none())
+    {
+        return Ok(false);
+    }
+    let mut deleted = Vec::new();
+    let mut held = 0usize;
+    for predicate in &tx.overlay.delete_predicates {
+        let storage = storage_for(predicate).expect("complete delete key checked");
+        let key_bytes = storage
+            .columns
+            .len()
+            .saturating_mul(std::mem::size_of::<DirectedValue>())
+            .saturating_add(
+                predicate
+                    .predicates
+                    .iter()
+                    .map(|(_, value)| value.estimated_bytes())
+                    .sum::<usize>(),
+            );
+        context.reserve(BoundedWorkSource::IndexRange, key_bytes)?;
+        let key: IndexKey = storage
+            .columns
+            .iter()
+            .map(|(column, direction)| {
+                let value = &predicate
+                    .predicates
+                    .iter()
+                    .find(|(name, _)| name == column)
+                    .expect("key component checked")
+                    .1;
+                match direction {
+                    contextdb_core::SortDirection::Asc => {
+                        DirectedValue::Asc(TotalOrdAsc(value.clone()))
+                    }
+                    contextdb_core::SortDirection::Desc => {
+                        DirectedValue::Desc(TotalOrdDesc(value.clone()))
+                    }
+                }
+            })
+            .collect();
+        let mut collect = |entry: &contextdb_relational::IndexEntry| -> std::result::Result<(), BoundedExecutionError> {
+            context.charge(BoundedWorkSource::IndexRange, BoundedSourceTouch::IndexEntry)?;
+            store.bump_index_entries_touched(1);
+            if entry.visible_at(snapshot) {
+                held += reserve_vector_slot(context, BoundedWorkSource::IndexRange, &mut deleted, "staged delete identities")?;
+                deleted.push(entry.row_id);
+            }
+            Ok(())
+        };
+        let result = (|| {
+            if storage.exact_only() {
+                for entry in storage.exact_postings(&key).into_iter().flatten() {
+                    collect(entry)?;
+                }
+            } else {
+                for (_, entries) in storage.read_range(
+                    snapshot,
+                    Bound::Included(key.as_slice()),
+                    Bound::Included(key.as_slice()),
+                ) {
+                    for entry in entries {
+                        collect(entry)?;
+                    }
+                }
+            }
+            Ok::<(), BoundedExecutionError>(())
+        })();
+        drop(key);
+        context.release(key_bytes)?;
+        result?;
+    }
+    deleted.sort_unstable();
+    deleted.dedup();
+    tx.predicate_deleted = deleted;
+    tx.overlay.bytes += held;
+    tx.committed_predicates_resolved = true;
+    Ok(true)
+}
+
+/// Index membership can supply identities directly when every conjunct is
+/// enforced by the selected key. Residual predicates and authorization keep
+/// their normal charged row reads.
+fn select_vector_candidate_identity_source(
+    db: &dyn ReadExecutionTarget,
+    root: &mut PullNode,
+    access_filter: bool,
+    context: &Arc<RequestContext>,
+) -> std::result::Result<(), BoundedExecutionError> {
+    let PullKind::Scan(state) = &mut root.kind else {
+        return Ok(());
+    };
+    state.vector_candidate_source = true;
+    if access_filter || state.ordered_merge.is_some() {
+        return Ok(());
+    }
+    let Some(filter) = state.filter.as_ref() else {
+        return Ok(());
+    };
+    let pick = match &state.mode {
+        ScanMode::Index { pick, .. } if pick.columns.len() == 1 => pick,
+        ScanMode::Exact { .. } => match state.residual_pick.as_ref() {
+            Some(pick) => pick,
+            None => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    // One driving shape does not prove every predicate on that column. Keep
+    // repeated terms on the row route, where the complete expression runs.
+    fn column_terms(expr: &Expr, column: &str) -> usize {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            } => column_terms(left, column) + column_terms(right, column),
+            Expr::BinaryOp { left, .. } | Expr::InList { expr: left, .. } => {
+                usize::from(matches!(left.as_ref(), Expr::Column(c) if c.column == column))
+            }
+            _ => 0,
+        }
+    }
+    // SQL comparisons that need coercion, NULL/NaN exclusion or residual
+    // expression evaluation retain their charged row reads.
+    fn covered(expr: &Expr, state: &ScanState, pick: &IndexPick) -> bool {
+        if let Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } = expr
+        {
+            return covered(left, state, pick) && covered(right, state, pick);
+        }
+        let (column, values): (&str, &[Expr]) = match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::Eq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte,
+                right,
+            } => {
+                let Expr::Column(column) = left.as_ref() else {
+                    return false;
+                };
+                (column.column.as_str(), std::slice::from_ref(right.as_ref()))
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } => {
+                let Expr::Column(column) = expr.as_ref() else {
+                    return false;
+                };
+                (column.column.as_str(), list.as_slice())
+            }
+            _ => return false,
+        };
+        if !pick.pushed_columns.iter().any(|name| name == column) {
+            return false;
+        }
+        let Some(meta) = state.meta.columns.iter().find(|meta| meta.name == column) else {
+            return false;
+        };
+        if state
+            .filter
+            .as_ref()
+            .is_none_or(|filter| column_terms(filter, column) != 1)
+        {
+            return false;
+        }
+        if let Expr::BinaryOp {
+            op: op @ (BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte),
+            ..
+        } = expr
+        {
+            // The total index order includes NULL and NaN, which SQL ordered
+            // comparisons exclude. A non-REAL lower bound excludes NULL; an
+            // upper-only bound needs the declaration's NOT NULL guarantee.
+            if meta.column_type == ColumnType::Real
+                || (meta.nullable && matches!(op, BinOp::Lt | BinOp::Lte))
+            {
+                return false;
+            }
+        }
+        values.iter().all(|value| {
+            let value_type = match value {
+                Expr::Literal(Literal::Text(_)) => Some(ColumnType::Text),
+                Expr::Literal(Literal::Integer(_)) => Some(ColumnType::Integer),
+                Expr::Literal(Literal::Bool(_)) => Some(ColumnType::Boolean),
+                Expr::Literal(Literal::Real(value)) if value.is_finite() => Some(ColumnType::Real),
+                Expr::Parameter(name) => match state.params.get(name) {
+                    Some(Value::Text(_)) => Some(ColumnType::Text),
+                    Some(Value::Int64(_)) => Some(ColumnType::Integer),
+                    Some(Value::Bool(_)) => Some(ColumnType::Boolean),
+                    Some(Value::Float64(value)) if value.is_finite() => Some(ColumnType::Real),
+                    Some(Value::Uuid(_)) => Some(ColumnType::Uuid),
+                    Some(Value::Timestamp(_)) => Some(ColumnType::Timestamp),
+                    Some(Value::TxId(_)) => Some(ColumnType::TxId),
+                    _ => None,
+                },
+                _ => None,
+            };
+            value_type.as_ref() == Some(&meta.column_type)
+        })
+    }
+    if !covered(filter, state, pick) {
+        return Ok(());
+    }
+    if let Some(tx) = state.transaction.as_mut()
+        && !resolve_candidate_delete_membership(db, &state.table, state.snapshot, tx, context)?
+    {
+        return Ok(());
+    }
+    match &mut state.mode {
+        ScanMode::Exact { cursor, .. } => cursor.select_identities_only(),
+        ScanMode::Index { cursor, .. } => cursor.select_identities_only(),
+        _ => return Ok(()),
+    }
+    state.identities_only = true;
+    state.schema_columns.clear();
+    root.columns.truncate(1);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_vector_kernel<'plan>(
     db: &dyn ReadExecutionTarget,
@@ -7735,6 +8521,7 @@ fn build_vector_kernel<'plan>(
     requested_k: u64,
     candidates: Option<&'plan PhysicalPlan>,
     sort_key: Option<&str>,
+    requested_search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
     params: Arc<HashMap<String, Value>>,
     snapshot: SnapshotId,
     ctes: &HashMap<&'plan str, &'plan PhysicalPlan>,
@@ -7753,29 +8540,85 @@ fn build_vector_kernel<'plan>(
     let k = usize::try_from(requested_k).map_err(|_| {
         Error::Other("bounded vector LIMIT exceeds the native address space".to_string())
     })?;
-    let candidate_k = db.bounded_vector_candidate_k(&index, k, sort_key)?;
+    let candidate_k = k;
     let access_filter = db.bounded_read_requires_candidate_filter(table)?;
-    let unrestricted = candidates
-        .is_some_and(|candidate| is_unrestricted_scan_for_table(candidate, table))
-        && !access_filter;
-    let candidate_plan = if unrestricted { None } else { candidates };
-    let candidate_root = candidate_plan
+    let meta = db
+        .table_meta(table)
+        .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+    let vector_column = meta
+        .columns
+        .iter()
+        .find(|candidate| candidate.name == column)
+        .ok_or_else(|| Error::UnknownVectorIndex {
+            index: index.clone(),
+        })?;
+    let search_mode = requested_search_mode
+        .map(super::map_vector_search_mode)
+        .unwrap_or(vector_column.search_mode);
+    super::bind_vector_search_parameters(query_expr, candidates, &params)?;
+    let route = super::vector_candidate_route(db, &index, candidates, &params)?;
+    let partition_scope = route.scope;
+    let access_candidates = route.candidates;
+    let complete_relational_route = route.complete;
+    // Refuse before the candidate subtree gets to run.  A bounded read has a
+    // ceiling, but spending that ceiling walking every row is still not an
+    // INDEXED answer.  The shared check uses the same relational index choice
+    // this kernel will use after the caller adds a supporting index.
+    if search_mode == contextdb_core::VectorSearchMode::Indexed && !complete_relational_route {
+        return Err(Error::VectorFilteredRouteUnavailable {
+            index: index.clone(),
+            predicate_columns: super::vector_candidate_refusal_columns(
+                db,
+                &index,
+                access_candidates.as_ref(),
+                access_filter,
+            ),
+        }
+        .into());
+    }
+    if search_mode == contextdb_core::VectorSearchMode::Auto
+        && !complete_relational_route
+        && crate::memory_accounting::ScopedMemoryReservation::try_new_for(
+            &db.bounded_read_accountant(),
+            db.bounded_vector_entry_count(&index, snapshot)
+                .saturating_mul(std::mem::size_of::<(RowId, f32)>()),
+            "vector_search",
+            "preflight_filtered_exact_scores",
+            "Add a relational index for the filter, reduce vector volume, or raise MEMORY_LIMIT.",
+        )
+        .is_err()
+    {
+        return Err(Error::VectorFilteredRouteUnavailable {
+            index: index.clone(),
+            predicate_columns: super::vector_candidate_refusal_columns(
+                db,
+                &index,
+                access_candidates.as_ref(),
+                access_filter,
+            ),
+        }
+        .into());
+    }
+    let directory_candidates = access_filter && route.directory_route;
+    let unrestricted = !access_filter
+        && (partition_scope
+            .as_ref()
+            .is_some_and(super::VectorPartitionScope::covers_filter_for_execution)
+            || candidates
+                .is_some_and(|candidate| is_unrestricted_scan_for_table(candidate, table)));
+    let candidate_plan = if unrestricted || directory_candidates {
+        None
+    } else {
+        access_candidates.as_ref()
+    };
+    let mut candidate_root = candidate_plan
         .map(|candidate| {
             build_kernel_with_ctes(db, candidate, Arc::clone(&params), snapshot, ctes, context)
         })
         .transpose()?;
-    // A description describes the plan, not the shortcut through it. The
-    // candidate source above is skipped only when it is an unrestricted scan
-    // of the whole table -- the vector index already covers every row, so
-    // reading them first would be work for nothing -- but the statement still
-    // named that scan, and the source it names is what an operator is asking
-    // about. So the elided scan is described exactly as a scan is described,
-    // and the label composes through the same function either way.
-    let candidate_trace = match candidate_root.as_ref() {
-        Some(root) => Some(root.trace.clone()),
-        None if unrestricted => Some(QueryTrace::scan()),
-        None => None,
-    };
+    if let Some(root) = candidate_root.as_mut() {
+        select_vector_candidate_identity_source(db, root, access_filter, context)?;
+    }
     // What this handle's own transaction has done to these vectors, decided
     // once here rather than asked per entry. Charged before it is held, like
     // the row overlay a scan takes.
@@ -7789,6 +8632,117 @@ fn build_vector_kernel<'plan>(
     if overlay_bytes > 0 {
         context.reserve(BoundedWorkSource::VectorCandidates, overlay_bytes)?;
     }
+    let mut candidate_ids = Vec::new();
+    let mut candidate_bytes = 0usize;
+    if directory_candidates {
+        let sql_filter = candidates.and_then(|mut candidate| {
+            while let PhysicalPlan::Project { input, .. } = candidate {
+                candidate = input;
+            }
+            match candidate {
+                PhysicalPlan::Scan { filter, .. } => filter.as_ref(),
+                _ => None,
+            }
+        });
+        let mut admit = |row_id| {
+            let mut retained = 0;
+            let row = db.bounded_row_by_identity(
+                context.transaction(),
+                table,
+                row_id,
+                snapshot,
+                &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                &mut |bytes| {
+                    retained = bytes;
+                    context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                },
+            )?;
+            let result = (|| {
+                let Some(row) = row.as_ref() else {
+                    return Ok(());
+                };
+                if let Some(filter) = sql_filter
+                    && super::eval_bool_expr(row, filter, &params)? != Some(true)
+                {
+                    return Ok(());
+                }
+                if db.bounded_read_allowed_for_row(
+                    context.transaction(),
+                    table,
+                    &meta,
+                    row,
+                    snapshot,
+                    &mut |_| {
+                        context.charge(
+                            BoundedWorkSource::AccessControl,
+                            BoundedSourceTouch::AccessRow,
+                        )?;
+                        context.attribute_live_memory(BoundedWorkSource::AccessControl);
+                        Ok(())
+                    },
+                )? {
+                    candidate_bytes += reserve_vector_slot(
+                        context,
+                        BoundedWorkSource::VectorCandidates,
+                        &mut candidate_ids,
+                        "authorized vector identities",
+                    )?;
+                    candidate_ids.push(row_id.0);
+                }
+                Ok::<(), BoundedExecutionError>(())
+            })();
+            drop(row);
+            context.release(retained)?;
+            result
+        };
+        let mut collect = || {
+            db.bounded_vector_visit_visible_ids(
+                &index,
+                snapshot,
+                &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                &mut |bytes| context.reserve(BoundedWorkSource::VectorCandidates, bytes),
+                &mut |bytes| context.release_parked(bytes),
+                &mut admit,
+            )
+        };
+        if let Some(prefixes) = partition_scope
+            .as_ref()
+            .and_then(super::VectorPartitionScope::resolved_prefixes)
+        {
+            contextdb_vector::mem::with_selected_partition_prefixes(
+                &index,
+                prefixes.to_vec(),
+                collect,
+            )?;
+        } else {
+            collect()?;
+        }
+        // Staged rows have no committed directory entry. Admit their metadata
+        // under the same predicate and authorization before scoring the delta.
+        if let Some(overlay) = vector_overlay.as_ref() {
+            for row_id in overlay
+                .staged_identities
+                .iter()
+                .chain(overlay.moved.values())
+            {
+                admit(*row_id)?;
+            }
+        }
+        candidate_ids.sort_unstable();
+        candidate_ids.dedup();
+    }
+    // A description describes the plan, not the shortcut through it. The
+    // candidate source above is skipped only when it is an unrestricted scan
+    // of the whole table -- the vector index already covers every row, so
+    // reading them first would be work for nothing -- but the statement still
+    // named that scan, and the source it names is what an operator is asking
+    // about. So the elided scan is described exactly as a scan is described,
+    // and the label composes through the same function either way.
+    let candidate_trace = match candidate_root.as_ref() {
+        Some(root) => Some(root.trace.clone()),
+        None if unrestricted => Some(QueryTrace::scan()),
+        None => None,
+    };
     // Taken before a single vector is read, and named for the work it belongs
     // to: a store whose limit stops this tells the operator WHICH work it
     // stopped, rather than reporting the read's own ceiling for a limit that
@@ -7805,18 +8759,16 @@ fn build_vector_kernel<'plan>(
         }
         None => None,
     };
-    // With an overlay in play the source must hand up everything this
-    // transaction can see, because the overlay decides what survives AFTER the
-    // source has scored it: stopping at the statement's LIMIT drops a row the
-    // transaction removed and never lets a row it staged compete. The
-    // established door widens its own fetch for exactly this case.
+    // With an overlay in play the source must hand up enough extra committed
+    // candidates for every removed, moved, or staged delta to have its say.
+    // Stopping at the statement's LIMIT can lose the replacement for a row
+    // the transaction removed; treating the delta count as a total does the
+    // same whenever LIMIT is larger than the delta. The established door adds
+    // this exact overfetch before final truncation too.
     let candidate_k = match vector_overlay.as_ref() {
-        Some(overlay) => candidate_k.max(overlay.searchable_entry_count),
+        Some(overlay) => candidate_k.saturating_add(overlay.searchable_entry_count),
         None => candidate_k,
     };
-    let meta = db
-        .table_meta(table)
-        .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
     let schema_columns: Vec<String> = meta
         .columns
         .iter()
@@ -7830,9 +8782,12 @@ fn build_vector_kernel<'plan>(
     } else {
         "VectorSearch"
     };
+    let restricted_candidates =
+        candidates.is_some_and(|candidate| !is_unrestricted_scan_for_table(candidate, table));
+    let trace = vector_search_trace_with_source(operator, candidate_trace, query_vector_source);
     Ok(PullNode {
         columns,
-        trace: vector_search_trace_with_source(operator, candidate_trace, query_vector_source),
+        trace,
         kind: PullKind::Vector(VectorState {
             supplement_columns: Vec::new(),
             table: table.to_string(),
@@ -7841,14 +8796,26 @@ fn build_vector_kernel<'plan>(
             _query_bytes: query_bytes,
             k,
             candidate_k,
+            partition_prefixes: partition_scope
+                .as_ref()
+                .and_then(super::VectorPartitionScope::resolved_prefixes)
+                .map(<[VectorPartitionKey]>::to_vec),
+            search_mode,
+            force_exact_for_relational_fallback: search_mode
+                == contextdb_core::VectorSearchMode::Auto
+                && !complete_relational_route,
             sort_key: sort_key.map(str::to_string),
             params,
+            requested_search_mode,
+            query_expr: query_expr.clone(),
+            candidate_plan: candidates.cloned().map(Box::new),
+            restricted_candidates,
             snapshot,
             _schema: schema,
-            preparation: VectorPreparation::Candidates(candidate_root.map(Box::new)),
-            candidate_filter: candidate_plan.is_some(),
-            candidate_ids: Vec::new(),
-            candidate_bytes: 0,
+            preparation: VectorPreparation::Candidates(candidate_root),
+            candidate_filter: candidate_plan.is_some() || directory_candidates,
+            candidate_ids,
+            candidate_bytes,
             source: None,
             scores: Vec::new(),
             score_bytes: 0,
@@ -7859,6 +8826,7 @@ fn build_vector_kernel<'plan>(
             output: VecDeque::new(),
             output_container_bytes: 0,
             used_hnsw: false,
+            disclosure: None,
             vector_overlay,
             overlay_bytes,
             _overlay_reservation: overlay_reservation,
@@ -8139,6 +9107,8 @@ fn scan_transaction_overlay(
     }
     context.reserve(BoundedWorkSource::TableScan, overlay.bytes)?;
     Ok(Some(ScanTransactionOverlay {
+        predicate_deleted: Vec::new(),
+        committed_predicates_resolved: false,
         tx,
         overlay,
         restaged_over_committed: std::collections::HashSet::new(),
@@ -8226,7 +9196,7 @@ fn build_scan(
     let mut ordered_pick = None;
     let mut exact_pick: Option<IndexPick> = None;
     let mut empty_pick: Option<IndexPick> = None;
-    let mode = if filter_matches_nothing {
+    let mut mode = if filter_matches_nothing {
         considered.extend(
             filter_analysis
                 .as_ref()
@@ -8342,6 +9312,7 @@ fn build_scan(
             cursor: db.bounded_physical_table_cursor(table)?,
         }
     };
+    capture_scan_membership(db, table, snapshot, &mut mode, context)?;
     let offers_every_committed_row = matches!(mode, ScanMode::Physical { .. });
     // An ordered walk with a transaction open folds the transaction's own
     // rows into the run rather than giving the run up for a sort of the
@@ -8432,6 +9403,8 @@ fn build_scan(
             },
         },
         kind: PullKind::Scan(ScanState {
+            identities_only: false,
+            vector_candidate_source: false,
             table: table.to_string(),
             meta,
             schema_columns,
@@ -8440,7 +9413,7 @@ fn build_scan(
             snapshot,
             mode,
             cursor_key_bytes: 0,
-            residual_pick: ordered_pick,
+            residual_pick: ordered_pick.or(exact_pick),
             committed_source_offers_every_row: offers_every_committed_row,
             pending_row: None,
             supplement_columns: Vec::new(),
@@ -8500,6 +9473,9 @@ fn declare_supplemented_columns(
             .into_iter()
             .filter(|column| wanted.contains(column))
             .collect();
+        // Candidate derivation needs identity and its own predicates. The
+        // answer's projection is hydrated only after the global top-k.
+        wanted.clear();
     }
     for input in pull_node_inputs_mut(&mut node.kind) {
         declare_supplemented_columns(db, input, &wanted);
@@ -8638,7 +9614,7 @@ fn build_direct_index_scan(
     // stays a residual the physical walk applies to every row it sees.
     let declared = declaration.kind == contextdb_core::IndexKind::UserDeclared;
     let residual_pick = (!declared).then(|| pick.clone());
-    let mode = if declared {
+    let mut mode = if declared {
         let (run_start, run_end) = declared_index_run(&pick, direction);
         ScanMode::Index {
             pick,
@@ -8652,6 +9628,7 @@ fn build_direct_index_scan(
             cursor: db.bounded_physical_table_cursor(table)?,
         }
     };
+    capture_scan_membership(db, table, snapshot, &mut mode, context)?;
     let offers_every_committed_row = matches!(mode, ScanMode::Physical { .. });
     let mut columns = vec!["row_id".to_string()];
     columns.extend(schema_columns.iter().cloned());
@@ -8663,6 +9640,8 @@ fn build_direct_index_scan(
             ..Default::default()
         },
         kind: PullKind::Scan(ScanState {
+            identities_only: false,
+            vector_candidate_source: false,
             table: table.to_string(),
             meta,
             schema_columns,
@@ -9387,6 +10366,7 @@ pub(crate) fn drain_chosen_plan(
     #[cfg(feature = "test-seams")]
     crate::database::Database::observe_pull_kernel_drained_for_test();
     result.trace.physical_plan = root.published_plan();
+    result.trace.vector_search = root.published_vector_search().cloned();
     result.trace.rows_examined = context.rows_examined()?;
     Ok(result)
 }
@@ -9416,11 +10396,17 @@ pub(super) fn execute(
             #[cfg(feature = "test-seams")]
             probe,
         )?;
+        let schema_capture = db.capture_read_schema();
+        let membership_capture = db.relational_membership_store().begin_membership_capture();
         let Some((snapshot, _snapshot_registration)) =
             db.bounded_read_snapshot_registration(&withdrawn)?
         else {
             return Err(context.withdrawn_failure());
         };
+        #[cfg(feature = "test-seams")]
+        if let Some(probe) = context.probe() {
+            probe.after_snapshot_registration();
+        }
         let statement_bytes = statement_capacity_bytes(&statement)?;
         context.reserve(BoundedWorkSource::TableScan, statement_bytes)?;
         // The resolved statement and the physical plan are built out of this
@@ -9467,6 +10453,12 @@ pub(super) fn execute(
         {
             let named: std::collections::BTreeSet<String> = root.columns.iter().cloned().collect();
             declare_supplemented_columns(db, &mut root, &named);
+        }
+        drop(membership_capture);
+        drop(schema_capture);
+        #[cfg(feature = "test-seams")]
+        if let Some(probe) = context.probe() {
+            probe.after_source_capture();
         }
         let root_bytes = pull_continuation_bytes(&root)?;
         reconcile_new_reservation(
@@ -9562,6 +10554,7 @@ pub(super) fn execute(
             retained_rows.push(row.retained_bytes);
             result.rows.push(row.values);
             result.trace.physical_plan = root.published_plan();
+            result.trace.vector_search = root.published_vector_search().cloned();
             result.trace.rows_examined = context.rows_examined()?;
             let encoded = encoded_query_size(&context, &result)?;
             if encoded > limits.result_bytes {
@@ -9574,6 +10567,7 @@ pub(super) fn execute(
         }
 
         result.trace.physical_plan = root.published_plan();
+        result.trace.vector_search = root.published_vector_search().cloned();
         result.trace.rows_examined = context.rows_examined()?;
         let encoded = encoded_query_size(&context, &result)?;
         if encoded > limits.result_bytes {
@@ -9935,7 +10929,11 @@ impl CursorState {
             .saturating_add(page_base_bytes);
         let target = checked_size_add(
             checked_size_add(fixed, continuation_now, "cursor retained charge")?,
-            carried_now,
+            checked_size_add(
+                carried_now,
+                self.context.state().membership_bytes,
+                "cursor membership",
+            )?,
             "cursor retained charge",
         )?;
         let held = self.context.held_bytes();
@@ -9958,7 +10956,8 @@ impl CursorState {
                 .context
                 .held_bytes()
                 .saturating_sub(continuation)
-                .saturating_sub(carried),
+                .saturating_sub(carried)
+                .saturating_sub(self.context.state().membership_bytes),
             released_base: self.held_page_base,
         })
     }
@@ -10288,6 +11287,8 @@ pub(super) fn open_cursor(
             #[cfg(feature = "test-seams")]
             probe,
         )?;
+        let schema_capture = db.capture_read_schema();
+        let membership_capture = db.relational_membership_store().begin_membership_capture();
         let Some((snapshot, idle_window, snapshot_registration)) = db
             .bounded_cursor_snapshot_registration(
                 Arc::clone(&clock),
@@ -10297,6 +11298,10 @@ pub(super) fn open_cursor(
         else {
             return Err(context.withdrawn_failure());
         };
+        #[cfg(feature = "test-seams")]
+        if let Some(probe) = context.probe() {
+            probe.after_snapshot_registration();
+        }
         let statement_bytes = statement_capacity_bytes(&statement)?;
         context.reserve(BoundedWorkSource::TableScan, statement_bytes)?;
         // The resolved statement and the physical plan are built out of this
@@ -10347,6 +11352,12 @@ pub(super) fn open_cursor(
         {
             let named: std::collections::BTreeSet<String> = root.columns.iter().cloned().collect();
             declare_supplemented_columns(db.as_ref(), &mut root, &named);
+        }
+        drop(membership_capture);
+        drop(schema_capture);
+        #[cfg(feature = "test-seams")]
+        if let Some(probe) = context.probe() {
+            probe.after_source_capture();
         }
         let root_bytes = pull_continuation_bytes(&root)?;
         reconcile_new_reservation(

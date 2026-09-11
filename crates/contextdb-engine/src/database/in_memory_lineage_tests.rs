@@ -1604,3 +1604,401 @@ fn new_memory_database_is_a_new_incarnation_without_old_state() {
         "the fresh memory database cannot inherit a different first-life row lineage"
     );
 }
+
+#[test]
+fn ordinary_push_outcome_survives_hub_reopen_and_newer_edits() {
+    for refused in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let tenant = TenantId::from("ordinary-push-reopen");
+        let creator = identity(&root, "creator");
+        let source = Database::open_memory();
+        notes(&source);
+        let before = source.current_lsn();
+        let id = Uuid::from_u128(0xB001);
+        insert(&source, id, "source-value");
+        let changes = source.changes_since(before);
+        let incarnation = source.sync_incarnation(&tenant).unwrap();
+        let lineages = lineages(&source, &changes, &tenant, &creator, incarnation);
+        let entries = lineage_entries(&changes, &lineages);
+        let request = crate::protocol::PushRequest {
+            changeset: crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
+                changes.clone(),
+                &HashMap::new(),
+                &lineages,
+                Vec::new(),
+            ),
+            incarnation,
+        };
+        let key =
+            Database::sync_push_outcome_key(&tenant, &creator.node_id(), &request, false).unwrap();
+        let receipt = SyncApplyReceipt {
+            tenant_id: tenant.clone(),
+            node_id: creator.node_id(),
+            incarnation,
+            source_lsn: changes.max_lsn().unwrap(),
+            dependency_complete: false,
+        };
+        let path = root.path().join("hub.db");
+        let hub = Database::open(&path).unwrap();
+        if refused {
+            keep_first_notes(&hub);
+            insert(&hub, id, "first-winner");
+        } else {
+            notes(&hub);
+        }
+        let original = hub
+            .apply_authenticated_received_changes_with_outcome(
+                changes.clone(),
+                &HashMap::new(),
+                SyncAdoption::Continuing,
+                receipt.clone(),
+                Some("hub-author"),
+                &entries,
+                None,
+                Some(&key),
+            )
+            .unwrap();
+        assert_eq!(original.conflicts.is_empty(), !refused);
+        assert_eq!(original.applied_rows, usize::from(!refused));
+        let original_wire = crate::protocol::WireApplyResult::from(original);
+        hub.execute(
+            "ALTER TABLE notes SET SYNC CONFLICT KEEP LATEST",
+            &HashMap::new(),
+        )
+        .unwrap();
+        update(&hub, id, "newer-hub-value");
+        hub.close().unwrap();
+        drop(hub);
+        let reopened = Database::open(&path).unwrap();
+        let before_retry = reopened.current_lsn();
+        let replay = reopened
+            .apply_authenticated_received_changes_with_outcome(
+                changes.clone(),
+                &HashMap::new(),
+                SyncAdoption::Continuing,
+                receipt,
+                Some("hub-author"),
+                &entries,
+                None,
+                Some(&key),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::protocol::WireApplyResult::from(replay),
+            original_wire,
+            "acceptance and refusal both return their complete original result"
+        );
+        assert_eq!(
+            reopened.current_lsn(),
+            before_retry,
+            "outcome lookup never commits the stale write again"
+        );
+        assert_eq!(
+            reopened
+                .execute("SELECT body FROM notes", &HashMap::new())
+                .unwrap()
+                .rows,
+            vec![vec![Value::Text("newer-hub-value".to_string())]]
+        );
+        let other =
+            Database::sync_push_outcome_key(&tenant, "different-edge", &request, false).unwrap();
+        assert!(reopened.replay_sync_push_outcome(&other).unwrap().is_none());
+    }
+}
+
+#[test]
+fn ordinary_push_outcomes_keep_only_the_latest_retry_reachable_request_per_edge() {
+    let root = tempfile::tempdir().unwrap();
+    let tenant = TenantId::from("ordinary-push-bounded");
+    let creator = identity(&root, "bounded-creator");
+    let source = Database::open_memory();
+    notes(&source);
+    let incarnation = source.sync_incarnation(&tenant).unwrap();
+    let path = root.path().join("bounded-hub.db");
+    let hub = Database::open(&path).unwrap();
+    notes(&hub);
+
+    let mut since = source.current_lsn();
+    let mut keys = Vec::new();
+    for (offset, body) in [(0_u128, "first"), (1_u128, "second")] {
+        insert(&source, Uuid::from_u128(0xB100 + offset), body);
+        let changes = source.changes_since(since);
+        since = changes.max_lsn().unwrap();
+        let lineages = lineages(&source, &changes, &tenant, &creator, incarnation);
+        let entries = lineage_entries(&changes, &lineages);
+        let request = crate::protocol::PushRequest {
+            changeset: crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
+                changes.clone(),
+                &HashMap::new(),
+                &lineages,
+                Vec::new(),
+            ),
+            incarnation,
+        };
+        let key =
+            Database::sync_push_outcome_key(&tenant, &creator.node_id(), &request, false).unwrap();
+        hub.apply_authenticated_received_changes_with_outcome(
+            changes,
+            &HashMap::new(),
+            SyncAdoption::Continuing,
+            SyncApplyReceipt {
+                tenant_id: tenant.clone(),
+                node_id: creator.node_id(),
+                incarnation,
+                source_lsn: since,
+                dependency_complete: false,
+            },
+            Some("hub-author"),
+            &entries,
+            None,
+            Some(&key),
+        )
+        .unwrap();
+        keys.push(key);
+    }
+
+    let stored = hub
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_config_values_with_prefix::<DurableSyncPushOutcome>(SYNC_PUSH_OUTCOME_PREFIX)
+        .unwrap();
+    assert_eq!(
+        stored.len(),
+        1,
+        "one authenticated edge owns one bounded retry slot"
+    );
+    assert!(
+        hub.replay_sync_push_outcome(&keys[0]).unwrap().is_none(),
+        "receipt of the later request proves the preceding request is no longer on the ordinary retry path"
+    );
+    assert!(hub.replay_sync_push_outcome(&keys[1]).unwrap().is_some());
+
+    hub.close().unwrap();
+    drop(hub);
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_config_values_with_prefix::<DurableSyncPushOutcome>(SYNC_PUSH_OUTCOME_PREFIX)
+            .unwrap()
+            .len(),
+        1,
+        "the bounded slot count survives reopen"
+    );
+    assert!(
+        reopened
+            .replay_sync_push_outcome(&keys[1])
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn purge_leaves_no_natural_key_in_retry_storage_and_exact_refusal_still_replays() {
+    const TABLE: &str = "purge_retry_notes";
+    const FORGOTTEN_KEY: &str = "forget-this-natural-key";
+
+    let root = tempfile::tempdir().unwrap();
+    let tenant = TenantId::from("ordinary-push-purge");
+    let creator = identity(&root, "purge-creator");
+    let source = Database::open_memory();
+    let declaration =
+        format!("CREATE TABLE {TABLE} (id TEXT PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST");
+    source.execute(&declaration, &HashMap::new()).unwrap();
+    let before = source.current_lsn();
+    source
+        .execute(
+            &format!("INSERT INTO {TABLE} (id, body) VALUES ($id, 'edge')"),
+            &HashMap::from([("id".to_string(), Value::Text(FORGOTTEN_KEY.to_string()))]),
+        )
+        .unwrap();
+    let changes = source.changes_since(before);
+    let incarnation = source.sync_incarnation(&tenant).unwrap();
+    let lineages = lineages(&source, &changes, &tenant, &creator, incarnation);
+    let entries = lineage_entries(&changes, &lineages);
+    let request = crate::protocol::PushRequest {
+        changeset: crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
+            changes.clone(),
+            &HashMap::new(),
+            &lineages,
+            Vec::new(),
+        ),
+        incarnation,
+    };
+    let key =
+        Database::sync_push_outcome_key(&tenant, &creator.node_id(), &request, false).unwrap();
+    let receipt = SyncApplyReceipt {
+        tenant_id: tenant,
+        node_id: creator.node_id(),
+        incarnation,
+        source_lsn: changes.max_lsn().unwrap(),
+        dependency_complete: false,
+    };
+
+    let path = root.path().join("purge-retry-hub.db");
+    let hub = Database::open(&path).unwrap();
+    hub.execute(&declaration, &HashMap::new()).unwrap();
+    hub.execute(
+        &format!("INSERT INTO {TABLE} (id, body) VALUES ($id, 'hub')"),
+        &HashMap::from([("id".to_string(), Value::Text(FORGOTTEN_KEY.to_string()))]),
+    )
+    .unwrap();
+    let original = hub
+        .apply_authenticated_received_changes_with_outcome(
+            changes.clone(),
+            &HashMap::new(),
+            SyncAdoption::Continuing,
+            receipt.clone(),
+            Some("hub-author"),
+            &entries,
+            None,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(original.conflicts.len(), 1);
+    let original_wire = crate::protocol::WireApplyResult::from(original);
+
+    let assert_retry_storage_has_no_key = |db: &Database| {
+        let raw = db
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_config_values_raw_with_prefix(SYNC_PUSH_OUTCOME_PREFIX)
+            .unwrap();
+        assert_eq!(raw.len(), 1);
+        assert!(
+            raw[0]
+                .1
+                .windows(FORGOTTEN_KEY.len())
+                .all(|window| window != FORGOTTEN_KEY.as_bytes()),
+            "retry storage keeps request ordinals, never the row natural key"
+        );
+    };
+    assert_retry_storage_has_no_key(&hub);
+    hub.execute(
+        &format!("PURGE FROM {TABLE} WHERE id = $id"),
+        &HashMap::from([("id".to_string(), Value::Text(FORGOTTEN_KEY.to_string()))]),
+    )
+    .unwrap();
+    assert_retry_storage_has_no_key(&hub);
+    hub.close().unwrap();
+    drop(hub);
+
+    let reopened = Database::open(&path).unwrap();
+    assert_retry_storage_has_no_key(&reopened);
+    let replay = reopened
+        .apply_authenticated_received_changes_with_outcome(
+            changes,
+            &HashMap::new(),
+            SyncAdoption::Continuing,
+            receipt,
+            Some("hub-author"),
+            &entries,
+            None,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(
+        crate::protocol::WireApplyResult::from(replay),
+        original_wire,
+        "the exact request reconstructs its complete pre-purge refusal without a persisted natural key"
+    );
+}
+
+struct RejectOrdinaryPushCommit;
+
+impl crate::plugin::DatabasePlugin for RejectOrdinaryPushCommit {
+    fn pre_commit(
+        &self,
+        _ws: &contextdb_tx::WriteSet,
+        source: crate::plugin::CommitSource,
+    ) -> Result<()> {
+        if source == crate::plugin::CommitSource::SyncPull {
+            return Err(Error::Other(
+                "injected ordinary push commit failure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn failed_ordinary_apply_never_publishes_an_outcome_or_consumed_progress() {
+    let root = tempfile::tempdir().unwrap();
+    let tenant = TenantId::from("ordinary-push-failure");
+    let creator = identity(&root, "creator");
+    let source = Database::open_memory();
+    notes(&source);
+    let before = source.current_lsn();
+    source
+        .execute(
+            "INSERT INTO notes (id) VALUES ($id)",
+            &HashMap::from([("id".to_string(), Value::Uuid(Uuid::from_u128(0xB002)))]),
+        )
+        .unwrap();
+    let changes = source.changes_since(before);
+    let incarnation = source.sync_incarnation(&tenant).unwrap();
+    let lineages = lineages(&source, &changes, &tenant, &creator, incarnation);
+    let entries = lineage_entries(&changes, &lineages);
+    let request = crate::protocol::PushRequest {
+        changeset: crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
+            changes.clone(),
+            &HashMap::new(),
+            &lineages,
+            Vec::new(),
+        ),
+        incarnation,
+    };
+    let key =
+        Database::sync_push_outcome_key(&tenant, &creator.node_id(), &request, false).unwrap();
+    let path = root.path().join("hub.db");
+    let hub = Database::open_with_plugin(&path, Arc::new(RejectOrdinaryPushCommit)).unwrap();
+    notes(&hub);
+    let error = hub
+        .apply_authenticated_received_changes_with_outcome(
+            changes.clone(),
+            &HashMap::new(),
+            SyncAdoption::Continuing,
+            SyncApplyReceipt {
+                tenant_id: tenant.clone(),
+                node_id: creator.node_id(),
+                incarnation,
+                source_lsn: changes.max_lsn().unwrap(),
+                dependency_complete: false,
+            },
+            Some("hub-author"),
+            &entries,
+            None,
+            Some(&key),
+        )
+        .expect_err("the durable commit is interrupted after adjudication");
+    assert!(
+        error
+            .to_string()
+            .contains("injected ordinary push commit failure")
+    );
+    assert!(
+        hub.execute("SELECT id FROM notes", &HashMap::new())
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert!(hub.replay_sync_push_outcome(&key).unwrap().is_none());
+    hub.close().unwrap();
+    drop(hub);
+    let reopened = Database::open(&path).unwrap();
+    assert!(reopened.replay_sync_push_outcome(&key).unwrap().is_none());
+    assert!(
+        reopened
+            .persisted_sync_applied_push_watermark_for_node_incarnation(
+                &tenant,
+                &creator.node_id(),
+                incarnation
+            )
+            .unwrap()
+            .is_none()
+    );
+}

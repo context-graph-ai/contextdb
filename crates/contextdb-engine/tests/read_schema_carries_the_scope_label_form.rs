@@ -1,31 +1,10 @@
 //! A read-door consumer can learn a table's scope-label form from the schema
 //! answer, so it can check its own declaration against the store.
 //!
-//! A caller that opens a read session declaring `scope_labels` is asserting
-//! something about the store it has not read: that the tables it is about to
-//! query actually carry a scope-label column, and that the labels it declared
-//! are labels those tables know. Today it cannot check that. The persisted
-//! column carries the constraint --- `ColumnDef.scope_label`, a
-//! `ScopeLabelKind` that is either the Simple form (one label set governing
-//! writes) or the Split form (a read set and a write set) --- but the schema
-//! projection the read door hands back drops it. So the consumer either
-//! declares blind and finds out by seeing zero rows, or it re-parses DDL text.
-//!
-//! The read schema answer therefore carries the scope-label constraint per
-//! column, typed and whole: `DirectSchemaColumn::scope_label`, an
-//! `Option<DirectScopeLabelKind>` mirroring the persisted `ScopeLabelKind` ---
-//! `Simple { write_labels }` and `Split { read_labels, write_labels }` --- with
-//! the label sets exactly as declared. It is present on both read routes,
-//! because a consumer must not have to know whether a writer happens to be
-//! holding the store to get the same answer about it.
-//!
-//! Two things it is NOT. It is not a change to the rendered `.schema` DDL
-//! string: that render is a doc-frozen surface whose round-trip losses are
-//! already ledgered (DL-CDB-38), and the control below pins it byte-identical
-//! to the render of the same table without the declaration. And it is not a
-//! change to any other schema fact: declaring a scope label alters nothing
-//! else the schema answer says about that column, which the same control pins
-//! field by field.
+//! Typed schema answers and rendered `.schema` DDL preserve Simple and Split
+//! scope-label forms, including each authored label set, on the direct-file and
+//! live-owner routes. Replaying the displayed DDL preserves those declarations.
+//! Declaring a scope label changes no unrelated column or table metadata.
 
 #![cfg(all(unix, feature = "test-seams"))]
 
@@ -49,7 +28,7 @@ const SPLIT_TABLE: &str = "split_scoped_rows";
 const UNSCOPED_TABLE: &str = "unscoped_rows";
 /// The same column shape as `SIMPLE_TABLE`, declared WITHOUT the scope-label
 /// constraint. It is the control: every schema fact except the new one must
-/// read identically on both tables, and the DDL render must be identical too.
+/// read identically on both tables; the DDL differs only by the declaration.
 const RENDER_CONTROL_TABLE: &str = "render_control_rows";
 
 /// The scope-carrying column, named the same in every fixture table so the
@@ -138,7 +117,39 @@ fn schema_of(session: &ReadSession, table: &str) -> DirectSchema {
         )
         .unwrap_or_else(|error| panic!("the read door answers the schema of {table}: {error}"));
     match answer.body {
-        MetadataBody::Schema { schema } => schema,
+        MetadataBody::Schema { schema } => {
+            let replayed = Database::open_memory();
+            replayed
+                .execute(&schema.ddl, &HashMap::new())
+                .expect("the displayed schema is executable DDL");
+            let meta = replayed.table_meta(table).expect("replayed table exists");
+            for column in &schema.columns {
+                let replayed_column = meta
+                    .columns
+                    .iter()
+                    .find(|c| c.name == column.name)
+                    .expect("display retains every column");
+                let scope = replayed_column.scope_label.as_ref().map(|kind| match kind {
+                    contextdb_core::ScopeLabelKind::Simple { write_labels } => {
+                        DirectScopeLabelKind::Simple {
+                            write_labels: write_labels.clone(),
+                        }
+                    }
+                    contextdb_core::ScopeLabelKind::Split {
+                        read_labels,
+                        write_labels,
+                    } => DirectScopeLabelKind::Split {
+                        read_labels: read_labels.clone(),
+                        write_labels: write_labels.clone(),
+                    },
+                });
+                assert_eq!(
+                    scope, column.scope_label,
+                    "displayed DDL retains the same scope form as typed schema on both read routes"
+                );
+            }
+            schema
+        }
         other => panic!("asked for the schema of {table} and got {other:?}"),
     }
 }
@@ -334,17 +345,12 @@ fn declaring_a_scope_label_changes_no_other_schema_fact() {
     assert_eq!(scoped.dag_edge_types, control.dag_edge_types);
     assert_eq!(scoped.propagate, control.propagate);
 
-    // The doc-frozen render: identical to the unscoped table's render once the
-    // table name is accounted for. It does not gain a scope-label clause here
-    // (DL-CDB-38 owns that gap), and it does not lose anything either.
+    // Only the declared scope clause and table name distinguish the renders.
+    let clause = format!(" SCOPE_LABEL ('{READ_LABEL}', '{WRITE_LABEL}')");
+    assert!(scoped.ddl.contains(&clause), "{}", scoped.ddl);
     assert_eq!(
-        scoped.ddl,
+        scoped.ddl.replace(&clause, ""),
         control.ddl.replace(RENDER_CONTROL_TABLE, SIMPLE_TABLE),
-        "the `.schema` render is a doc-frozen surface and stays exactly what it was"
-    );
-    assert!(
-        !scoped.ddl.contains("SCOPE_LABEL"),
-        "the render still omits the scope-label clause: {}",
-        scoped.ddl
+        "preserving the access declaration changes no unrelated rendered DDL"
     );
 }

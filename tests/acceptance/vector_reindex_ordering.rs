@@ -1,5 +1,5 @@
 use contextdb_core::{Value, VectorIndexRef};
-use contextdb_engine::Database;
+use contextdb_engine::{Database, MaintenancePolicy};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -137,6 +137,7 @@ fn t17_02_batch_reindex_all_rows_resolve_to_new_vectors() {
 #[test]
 fn t17_08_hnsw_delete_then_insert_recall_returns_new_vector() {
     let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         "CREATE TABLE memories (id UUID PRIMARY KEY, embedding VECTOR(3))",
         &empty(),
@@ -171,6 +172,14 @@ fn t17_08_hnsw_delete_then_insert_recall_returns_new_vector() {
         .unwrap()
         .row_id;
 
+    for _ in 0..32 {
+        if db.__debug_vector_hnsw_len(idx.clone()) == Some(1_001) {
+            break;
+        }
+        db.run_maintenance_cycle()
+            .expect("one finite caller-driven maintenance cycle succeeds");
+    }
+    assert_eq!(db.__debug_vector_hnsw_len(idx.clone()), Some(1_001));
     let warm = db
         .query_vector(idx.clone(), &[0.0, 0.0, 1.0], 10, None, db.snapshot())
         .unwrap();
@@ -202,12 +211,26 @@ fn t17_08_hnsw_delete_then_insert_recall_returns_new_vector() {
         .unwrap();
     db.commit(tx).unwrap();
 
+    for _ in 0..32 {
+        db.run_maintenance_cycle()
+            .expect("one finite caller-driven maintenance cycle compacts the replacement");
+    }
+    assert_eq!(
+        db.__debug_vector_hnsw_len(idx.clone()),
+        Some(1_002),
+        "finite caller-driven maintenance must publish the replacement before indexed assertions"
+    );
+
     let hits = db
         .query_vector(idx.clone(), &[0.0, 0.0, 1.0], 10, None, db.snapshot())
         .unwrap();
     assert!(
         !hits.is_empty() && hits[0].0 == target_row_id && hits[0].1 > 0.99,
         "HNSW reindex must rank the reindexed row's NEW vector first; hits={hits:?}"
+    );
+    assert!(
+        db.__debug_last_query_vector_used_hnsw_for_test(),
+        "the replacement proof must stay on the maintained HNSW route"
     );
 
     let raw_hnsw_hits = db
@@ -223,14 +246,14 @@ fn t17_08_hnsw_delete_then_insert_recall_returns_new_vector() {
         .__debug_vector_hnsw_stats(idx.clone())
         .expect("HNSW graph must remain built after reindex");
     assert_eq!(
-        post_stats.point_count, 1_001,
-        "HNSW graph must be rebuilt from live entries, not append the new vector beside the stale one; stats={post_stats:?}"
+        post_stats.point_count, 1_002,
+        "the immutable maintained graph keeps both physical versions while MVCC visibility publishes only the replacement; stats={post_stats:?}"
     );
     assert_eq!(
         db.__debug_vector_hnsw_raw_entry_count_for_row_for_test(idx.clone(), target_row_id)
-            .expect("target row must have one raw HNSW entry after reindex"),
-        1,
-        "raw HNSW graph must not retain both stale and current entries for the reindexed row"
+            .expect("target row must remain represented in the raw HNSW graph after reindex"),
+        2,
+        "the immutable graph may retain both physical versions; the public HNSW route above must resolve them to one snapshot-visible row"
     );
 
     let old_hits = db

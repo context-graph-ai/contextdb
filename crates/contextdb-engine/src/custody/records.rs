@@ -806,7 +806,7 @@ pub(crate) fn owned_key(key: &str) -> bool {
         || key.starts_with("delivery_")
 }
 
-// Statements 7/11/13/17: signatures are checked at admission; companions are
+// Signatures are checked at admission; companions are
 // validated against the final touched-key overlay, without walking prior units.
 pub(crate) fn validate_record(record: &Record, records: &[&Record]) -> Result<()> {
     use super::authority::*;

@@ -2902,14 +2902,14 @@ fn iroh_word_confined_to_adapter_and_config_surface() {
         "contextdb-engine/tests/direct_file_reader_contract_tests.rs",
         "contextdb-engine/tests/local_transport_containment.rs",
         "contextdb-engine/tests/durable_public_api_surface_tests.rs",
-        // Statements 5-20: fixed custody proofs bind the actual authenticated adapter.
+        // Fixed custody proofs bind the actual authenticated adapter.
         "contextdb-engine/tests/delivery_manifest_contract.rs",
         "contextdb-engine/tests/delivery_outcome_contract.rs",
         "contextdb-engine/tests/custody_protocol_contract.rs",
         "contextdb-engine/tests/custody_purge_and_discard_contract.rs",
         "contextdb-engine/tests/tenant_table_policy_contract.rs",
         "contextdb-engine/tests/custody_inspection_contract.rs",
-        // Statements 9/11/14/15: actual ordinary-push scale measurement.
+        // Actual ordinary-push scale measurement.
         "contextdb-engine/examples/custody_scale.rs",
         "contextdb-engine/tests/server_resource_policy_contract_tests.rs",
         "contextdb-engine/tests/sync_source_mirror_tests.rs",

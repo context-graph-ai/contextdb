@@ -608,6 +608,7 @@ async fn a_schema_carrying_page_takes_its_cursor_from_the_schema_position() {
     let request = PullRequest {
         since_lsn: before_ddl,
         max_entries: None,
+        schema_recovery: None,
     };
     let response = raw_pull_response(&transport, &pull_subject(tenant), &request).await;
 

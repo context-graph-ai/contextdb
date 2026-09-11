@@ -291,11 +291,43 @@ fn ce04_vectors_round_trip_search_results_equal() {
     );
 
     let show = |db: &Database| -> BTreeSet<String> {
-        db.execute("SHOW VECTOR_INDEXES", &p())
-            .unwrap_or_else(|e| panic!("SHOW VECTOR_INDEXES failed: {e}"))
+        let result = db
+            .execute("SHOW VECTOR_INDEXES", &p())
+            .unwrap_or_else(|e| panic!("SHOW VECTOR_INDEXES failed: {e}"));
+        let stable_catalog_columns = [
+            "table",
+            "column",
+            "dimension",
+            "quantization",
+            "vector_count",
+            "partition_key_columns",
+            "max_partitions",
+            "search_mode",
+            "declared_auto_index_at",
+            "effective_auto_index_at",
+            "declared_hnsw_m",
+            "declared_hnsw_ef_construction",
+            "declared_hnsw_ef_search",
+        ];
+        let positions = stable_catalog_columns.map(|name| {
+            result
+                .columns
+                .iter()
+                .position(|column| column == name)
+                .unwrap_or_else(|| panic!("SHOW VECTOR_INDEXES omitted {name}"))
+        });
+        result
             .rows
             .iter()
-            .map(|r| format!("{r:?}"))
+            .map(|row| {
+                format!(
+                    "{:?}",
+                    positions
+                        .iter()
+                        .map(|position| &row[*position])
+                        .collect::<Vec<_>>()
+                )
+            })
             .collect()
     };
     assert_eq!(

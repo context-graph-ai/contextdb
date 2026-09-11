@@ -12,8 +12,9 @@
 //! pure encode/decode round trips.
 
 use contextdb_core::{
-    ColumnDef, ColumnType, CompositeForeignKey, ConflictPolicy, HistoryPolicy, IndexDecl,
-    PropagationRule, RetainUnit, StateMachineConstraint, SyncDirection, TableMeta,
+    ColumnDef, ColumnType, CompositeForeignKey, ConflictPolicy, DEFAULT_VECTOR_POLICY_REVISION,
+    HistoryPolicy, IndexDecl, PropagationRule, RetainUnit, StateMachineConstraint, SyncDirection,
+    TableMeta,
 };
 use serde::Serialize;
 
@@ -33,6 +34,17 @@ fn sample_columns() -> Vec<ColumnDef> {
         context_id: false,
         scope_label: None,
         acl_ref: None,
+        partition_key_columns: None,
+        max_partitions: None,
+        search_mode: Default::default(),
+        auto_index_at: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_ef_search: None,
+        vector_policy_revision: DEFAULT_VECTOR_POLICY_REVISION,
+        consolidation_change_percent: None,
+        consolidation_tombstone_percent: None,
+        consolidation_disabled: false,
     }]
 }
 
@@ -55,7 +67,7 @@ fn sample_meta(history_policy: Option<HistoryPolicy>) -> TableMeta {
         primary_key_columns: Vec::new(),
         conflict_policy: Some(ConflictPolicy::KEEP_LATEST),
         history_policy,
-        // Statements 1/17b: current metadata includes absent custody declarations;
+        // Current metadata includes absent custody declarations;
         // the historical payload structs below retain their exact old shape.
         delivery_manifest_tables: None,
         edge_discard: None,

@@ -12,11 +12,12 @@ cargo build --workspace
 
 ```bash
 cargo test --workspace
+cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
 ```
 
 ## Before Submitting a PR
 
-All five checks must pass. The fifth installs the release binaries into an
+All nine checks must pass. The final check installs the release binaries into an
 isolated root and drives the production ticketed-Iroh durability smoke; its
 feature-gated verifier is not part of the ordinary product CLI.
 The smoke uses Bash 3.2-compatible syntax and requires GNU `timeout`; macOS
@@ -25,8 +26,12 @@ contributors can install it as `gtimeout` with `brew install coreutils`.
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check
+cargo clippy --manifest-path crates/contextdb-redb/Cargo.toml --all-targets -- -D warnings
 cargo test --workspace
+cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
 cargo build --release
+bash scripts/verify-packaged-engine.sh
 install_root="$(mktemp -d)"
 cargo install --locked --path crates/contextdb-cli --root "$install_root"
 cargo install --locked --path crates/contextdb-server --root "$install_root" \

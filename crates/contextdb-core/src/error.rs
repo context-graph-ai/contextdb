@@ -75,6 +75,58 @@ fn acl_denied_display(table: &str, row_id: &RowId, principal: &Principal) -> Str
     )
 }
 
+/// Safe structural reasons a vector partition declaration can be refused.
+///
+/// These cases deliberately carry no column value or partition-key value.
+/// The enclosing error identifies only the vector index; callers can render
+/// the fixed reason without accidentally echoing data from a bound parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum VectorPartitionDeclarationIssue {
+    #[error("vector partition clauses require a VECTOR column")]
+    RequiresVectorColumn,
+    #[error("PARTITION_KEY must contain at least one column")]
+    EmptyPartitionKey,
+    #[error("PARTITION_KEY references a column that does not exist in the same table")]
+    UnknownPartitionKeyColumn,
+    #[error("every PARTITION_KEY column must be NOT NULL")]
+    NullablePartitionKeyColumn,
+    #[error("PARTITION_KEY columns must use UUID, TEXT, INTEGER, BOOLEAN, TIMESTAMP, or TXID")]
+    UnsupportedPartitionKeyColumnType,
+    #[error("a PARTITION_KEY column may appear only once")]
+    DuplicatePartitionKeyColumn,
+    #[error("PARTITION_KEY may not contain the vector column itself")]
+    VectorColumnInPartitionKey,
+    #[error("MAX_PARTITIONS requires PARTITION_KEY")]
+    MaxPartitionsWithoutPartitionKey,
+    #[error("MAX_PARTITIONS must be a positive integer")]
+    MaxPartitionsNotPositive,
+    #[error("MAX_PARTITIONS is outside the persisted numeric range")]
+    MaxPartitionsOutOfRange,
+}
+
+/// Safe structural reasons a per-column vector workload policy can be
+/// refused. The enclosing error identifies the column; values are omitted so
+/// bound or synced input is never echoed through the diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum VectorPolicyDeclarationIssue {
+    #[error("vector policy clauses require a VECTOR column")]
+    RequiresVectorColumn,
+    #[error("AUTO_INDEX_AT must be a positive integer")]
+    AutoIndexAtNotPositive,
+    #[error("AUTO_INDEX_AT is outside the persisted numeric range")]
+    AutoIndexAtOutOfRange,
+    #[error("HNSW policy values must be positive integers")]
+    HnswValueNotPositive,
+    #[error("an HNSW policy value is outside the persisted numeric range")]
+    HnswValueOutOfRange,
+    #[error("HNSW EF_CONSTRUCTION must be at least M")]
+    EfConstructionBelowM,
+    #[error("vector consolidation percentages must be integers from 1 through 100")]
+    ConsolidationPercentOutOfRange,
+}
+
 /// The engine's own answers.
 ///
 /// This vocabulary is the engine's, and it is free to grow and be reordered:
@@ -116,17 +168,69 @@ pub enum Error {
     BfsDepthExceeded(u32),
     #[error("BFS visited set exceeded limit ({0})")]
     BfsVisitedExceeded(usize),
-    #[error("vector index dimension mismatch on {index:?}: expected {expected}, got {actual}")]
+    #[error("vector index dimension mismatch on {index}: expected {expected}, got {actual}")]
     VectorIndexDimensionMismatch {
         index: VectorIndexRef,
         expected: usize,
         actual: usize,
     },
-    #[error("unknown vector index {index:?}")]
+    #[error("unknown vector index {index}")]
     UnknownVectorIndex { index: VectorIndexRef },
-    #[error("persisted row vector source row missing on {index:?}: key {key}")]
+    #[error("invalid vector partition declaration on {index}: {issue}")]
+    InvalidVectorPartitionDeclaration {
+        index: VectorIndexRef,
+        issue: VectorPartitionDeclarationIssue,
+    },
+    #[error("invalid vector policy declaration on {index}: {issue}")]
+    InvalidVectorPolicyDeclaration {
+        index: VectorIndexRef,
+        issue: VectorPolicyDeclarationIssue,
+    },
+    /// A write's PARTITION_KEY value is not of the type its column declares.
+    ///
+    /// The declaration is sound; the VALUE the caller wrote is not, so this
+    /// is deliberately not an `InvalidVectorPartitionDeclaration`, which
+    /// would send a developer to inspect a `CREATE TABLE` that has nothing
+    /// wrong with it. Only the key column is named: the offending value is
+    /// bound or synced input and is never echoed through the diagnostic.
+    #[error(
+        "vector partition key value refused on {index}: the value written to PARTITION_KEY column `{column}` is not of the column's declared type"
+    )]
+    VectorPartitionKeyValueTypeMismatch {
+        index: VectorIndexRef,
+        column: String,
+    },
+    #[error(
+        "vector partition limit reached on {index}: MAX_PARTITIONS is {max_partitions}; raise MAX_PARTITIONS and retry"
+    )]
+    VectorPartitionLimitExceeded {
+        index: VectorIndexRef,
+        max_partitions: u32,
+    },
+    #[error(
+        "EXACT vector search on {index} requires {required_bytes} bytes but the active budget has {available_bytes} bytes available; narrow the authorized scope or raise its active limit"
+    )]
+    VectorExactSearchBudgetExceeded {
+        index: VectorIndexRef,
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    #[error(
+        "INDEXED vector search on {index} has no complete maintained route; wait for or repair index maintenance"
+    )]
+    VectorIndexedRouteUnavailable { index: VectorIndexRef },
+    #[error(
+        "filtered vector search on {index} has no bounded relational candidate route for columns {predicate_columns:?}; add a supporting relational index or use EXACT"
+    )]
+    VectorFilteredRouteUnavailable {
+        index: VectorIndexRef,
+        predicate_columns: Vec<String>,
+    },
+    #[error("whole-vector-index inspection requires an unrestricted database handle")]
+    VectorWholeIndexInspectionDenied,
+    #[error("persisted row vector source row missing on {index}: key {key}")]
     PersistedRowVectorRowMissing { index: VectorIndexRef, key: String },
-    #[error("persisted row vector source cell is NULL on {index:?}: key {key}")]
+    #[error("persisted row vector source cell is NULL on {index}: key {key}")]
     PersistedRowVectorCellNull { index: VectorIndexRef, key: String },
     #[error("rank policy on index `{index}` references unknown column `{column}`")]
     RankPolicyColumnUnknown { index: String, column: String },
@@ -173,6 +277,8 @@ pub enum Error {
     },
     #[error("USE RANK requires ORDER BY embedding <=> $param in the same query")]
     UseRankRequiresVectorOrder,
+    #[error("USE VECTOR requires ORDER BY embedding <=> $param in the same query")]
+    UseVectorRequiresVectorOrder,
     #[error("USE RANK requires LIMIT in the same query")]
     UseRankRequiresLimit,
     #[error(
@@ -389,6 +495,15 @@ pub enum Error {
     },
     #[error("column in index: {table}.{column} referenced by index {index}")]
     ColumnInIndex {
+        table: String,
+        column: String,
+        index: String,
+    },
+
+    #[error(
+        "cannot alter {table}.{column}: it is a partition key for vector index {index}; create a replacement table with the desired vector partition key and copy the wanted rows"
+    )]
+    VectorPartitionKeyInUse {
         table: String,
         column: String,
         index: String,

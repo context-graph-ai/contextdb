@@ -5,6 +5,7 @@ is_connected
 shutdown
 db
 transfer_receipts
+schema_sync_holdbacks
 has_pending_push_changes
 pending_push_change_count
 push

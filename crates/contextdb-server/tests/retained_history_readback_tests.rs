@@ -444,6 +444,35 @@ async fn c2d_a_wiped_machine_recovers_live_rows_and_provably_not_expired_ones() 
     insert(&edge_a, "windows", 2, "live-window-alpha");
     insert(&edge_a, "windows", 3, "live-window-beta");
     insert(&edge_a, "notes", 1, "control-note");
+    // The restored machine never declares this table locally: its access
+    // policy must arrive with the hub's full schema, just like its rows.
+    let access_ddl = "CREATE TABLE restored_access_rows (
+        id INTEGER PRIMARY KEY, context_id UUID CONTEXT_ID,
+        scope TEXT SCOPE_LABEL_READ ('read') WRITE ('write'), body TEXT
+    ) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
+    edge_a
+        .execute(access_ddl, &p())
+        .expect("author the access declaration");
+    let allowed_context = uuid::Uuid::from_u128(0x7101);
+    let foreign_context = uuid::Uuid::from_u128(0x7102);
+    for (id, context, scope, body) in [
+        (1, allowed_context, "read", "visible"),
+        (2, foreign_context, "read", "foreign-context"),
+        (3, allowed_context, "other", "foreign-scope"),
+    ] {
+        edge_a
+            .execute(
+                "INSERT INTO restored_access_rows (id, context_id, scope, body) \
+             VALUES ($id, $context, $scope, $body)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("context".into(), Value::Uuid(context)),
+                    ("scope".into(), Value::Text(scope.into())),
+                    ("body".into(), Value::Text(body.into())),
+                ]),
+            )
+            .expect("insert the independent Context and scope controls");
+    }
     let client_a = edge_client(&edge_a, &broker, "edge-a");
     within(client_a.push()).await.expect("edge-a push");
 
@@ -461,6 +490,7 @@ async fn c2d_a_wiped_machine_recovers_live_rows_and_provably_not_expired_ones() 
     );
 
     let restored = open_edge();
+    assert!(restored.table_meta("restored_access_rows").is_none());
     let restored_client = edge_client(&restored, &broker, "edge-a-restored");
     within(restored_client.pull_default())
         .await
@@ -476,6 +506,80 @@ async fn c2d_a_wiped_machine_recovers_live_rows_and_provably_not_expired_ones() 
         vec!["live-window-alpha", "live-window-beta"],
         "a wiped machine recreated against the same tenant gets every still-live row back, by \
          value, and the row whose window has passed provably does not return"
+    );
+
+    let authored = edge_a.table_meta("restored_access_rows").unwrap();
+    let recovered = restored.table_meta("restored_access_rows").unwrap();
+    assert_eq!(
+        recovered.columns, authored.columns,
+        "a full restore preserves the authored Context and split scope declaration"
+    );
+    let displayed =
+        contextdb_engine::cli_render::render_table_meta("restored_access_rows", &recovered);
+    assert!(displayed.contains("CONTEXT_ID"), "{displayed}");
+    assert!(
+        displayed.contains("SCOPE_LABEL_READ ('read') WRITE ('write')"),
+        "{displayed}"
+    );
+    let replayed = Database::open_memory();
+    replayed
+        .execute(&displayed, &p())
+        .expect("execute restored display DDL");
+    assert_eq!(
+        replayed.table_meta("restored_access_rows").unwrap().columns,
+        authored.columns
+    );
+
+    let restricted = restored.scoped_with_constraints(
+        Some(std::collections::BTreeSet::from([
+            contextdb_core::ContextId::new(allowed_context),
+        ])),
+        Some(std::collections::BTreeSet::from([
+            contextdb_core::ScopeLabel::new("read"),
+            contextdb_core::ScopeLabel::new("write"),
+            contextdb_core::ScopeLabel::new("other"),
+        ])),
+        None,
+    );
+    assert_eq!(
+        bodies(&restored, "restored_access_rows"),
+        vec!["foreign-context", "foreign-scope", "visible"]
+    );
+    assert_eq!(
+        bodies(&restricted, "restored_access_rows"),
+        vec!["visible"],
+        "restored Context and schema read-label gates both constrain the answer"
+    );
+    for (context, scope, context_violation) in [
+        (foreign_context, "write", true),
+        (allowed_context, "other", false),
+    ] {
+        let error = restricted
+            .execute(
+                "INSERT INTO restored_access_rows (id, context_id, scope, body) \
+             VALUES (4, $context, $scope, 'must-not-commit')",
+                &HashMap::from([
+                    ("context".into(), Value::Uuid(context)),
+                    ("scope".into(), Value::Text(scope.into())),
+                ]),
+            )
+            .expect_err("restored authored access policy refuses an unauthorized write");
+        if context_violation {
+            assert!(
+                matches!(error, contextdb_core::Error::ContextScopeViolation { .. }),
+                "{error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, contextdb_core::Error::ScopeLabelViolation { .. }),
+                "{error:?}"
+            );
+        }
+    }
+    assert_eq!(
+        bodies(&restored, "restored_access_rows"),
+        vec!["foreign-context", "foreign-scope", "visible"],
+        "neither refused write changes restored rows"
     );
 
     hub.stop().await;
@@ -650,6 +754,7 @@ async fn c2d_the_expired_row_is_excluded_from_the_hubs_pull_response_itself() {
     let request = PullRequest {
         since_lsn: Lsn(0),
         max_entries: None,
+        schema_recovery: None,
     };
     let encoded = encode(MessageType::PullRequest, &request).expect("encode pull request");
     let reply = within(broker.client_as("edge-reader").request(

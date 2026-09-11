@@ -290,7 +290,9 @@ fn assert_structured_received_schema_has_no_pending_ddl(db: &Database) {
                 && on_events == &vec!["INSERT".to_string()]
     ));
 
-    let (pending, provenance) = db.changes_since_base(Lsn(0));
+    let (pending, provenance) = db
+        .changes_since_base(Lsn(0))
+        .expect("received-schema outbound extraction must read its durable vector directory");
     let outbound = db
         .filter_outbound_received_ddl(pending, &provenance, None)
         .expect("received structured DDL must bind its local durable occurrence");

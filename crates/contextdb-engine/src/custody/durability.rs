@@ -1,4 +1,4 @@
-//! Statement 11: a scoped observation/fault at the actual row/outcome commit.
+//! A scoped observation/fault at the actual row/outcome commit.
 #[cfg(feature = "test-seams")]
 use super::records::*;
 #[cfg(feature = "test-seams")]
@@ -6,7 +6,7 @@ use contextdb_core::Result;
 #[cfg(feature = "test-seams")]
 use redb::ReadableTable;
 
-// Statement 11: ordinary push applies on a blocking worker. Scope the test fault to the
+// Ordinary push applies on a blocking worker. Scope the test fault to the
 // intended unit, across threads, and never let a contact or status write consume it.
 #[cfg(feature = "test-seams")]
 struct CommitFault {
@@ -67,7 +67,7 @@ fn take_commit_fault(transaction: &redb::WriteTransaction) -> Result<bool> {
     Ok(false)
 }
 
-// Statement 11: called only at the actual shared row/outcome commit boundary.
+// Called only at the actual shared row/outcome commit boundary.
 #[cfg(feature = "test-seams")]
 pub(crate) fn before_custody_commit(transaction: &redb::WriteTransaction) -> Result<()> {
     if take_commit_fault(transaction)? {

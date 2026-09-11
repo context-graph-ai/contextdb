@@ -951,6 +951,13 @@ fn cancel_execute_inside_kernel(
     let blocked = session.route_resources_for_test();
     let cancelled_before_request = kernel_token.is_cancelled();
     cancellation.cancel();
+    // Do not release the blocked kernel thread until the cancellation has
+    // actually landed on ITS token. `cancellation.cancel()` above only sent
+    // the interrupt on its way; for the owner route the kernel only learns
+    // of it once the owner's reader thread has taken the interrupt frame off
+    // the wire and applied it to this exact `kernel_token`. Releasing before
+    // that lands would race the cancellation delivery this test exists to prove.
+    wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
     gate.release();
     let outcome = worker.join();
@@ -1014,6 +1021,13 @@ fn cancel_cursor_open_inside_kernel(
     let blocked = session.route_resources_for_test();
     let cancelled_before_request = kernel_token.is_cancelled();
     cancellation.cancel();
+    // Do not release the blocked kernel thread until the cancellation has
+    // actually landed on ITS token. `cancellation.cancel()` above only sent
+    // the interrupt on its way; for the owner route the kernel only learns
+    // of it once the owner's reader thread has taken the interrupt frame off
+    // the wire and applied it to this exact `kernel_token`. Releasing before
+    // that lands would race the cancellation delivery this test exists to prove.
+    wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
     gate.release();
     let outcome = worker.join();
@@ -1043,6 +1057,35 @@ fn cancel_cursor_open_inside_kernel(
     assert_one_selected_backend_operation(before, after, route);
     assert!(identical_token_observed);
     gate.assert_kernel_reported_cancellation();
+}
+
+/// Block until `token` itself reports cancelled -- never a fixed amount of
+/// time, a bounded number of checks, or a race against something else that
+/// happens to run on another thread.
+///
+/// `OwnerReadCancellation::cancel()` on the caller's own handle only starts
+/// delivery: for the owner route that is an interrupt sent over a socket to
+/// a different process/thread, not a guarantee that the kernel's own token
+/// (a distinct object on the far side of that channel) has been marked
+/// cancelled yet. `tell_on_cancel` is the real signal instead of a proxy for
+/// it: it calls back the instant this exact token transitions to cancelled,
+/// or immediately if it already has, so waiting on it can never resolve
+/// ahead of the kernel thread this token belongs to actually seeing it.
+fn wait_for_kernel_cancellation(token: &OwnerReadCancellation) {
+    let signal = Arc::new((Mutex::new(false), Condvar::new()));
+    let notify = Arc::clone(&signal);
+    let _listener = token.tell_on_cancel(move || {
+        let (landed, changed) = &*notify;
+        *landed.lock().expect("kernel cancellation landed lock") = true;
+        changed.notify_all();
+    });
+    let (landed, changed) = &*signal;
+    let mut landed = landed.lock().expect("kernel cancellation landed lock");
+    while !*landed {
+        landed = changed
+            .wait(landed)
+            .expect("kernel cancellation landed wait");
+    }
 }
 
 fn cancel_cursor_fetch_inside_kernel(
@@ -1077,6 +1120,13 @@ fn cancel_cursor_fetch_inside_kernel(
     let blocked = session.route_resources_for_test();
     let cancelled_before_request = kernel_token.is_cancelled();
     cancellation.cancel();
+    // Do not release the blocked kernel thread until the cancellation has
+    // actually landed on ITS token. `cancellation.cancel()` above only sent
+    // the interrupt on its way; for the owner route the kernel only learns
+    // of it once the owner's reader thread has taken the interrupt frame off
+    // the wire and applied it to this exact `kernel_token`. Releasing before
+    // that lands would race the cancellation delivery this test exists to prove.
+    wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
     gate.release();
     let outcome = worker.join();

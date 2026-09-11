@@ -63,6 +63,15 @@ impl Session {
         }
     }
 
+    /// A writer controls its own read limits; only a remote owner route needs
+    /// advice to change another session's owner-read policy.
+    fn limit_advice_route(&self) -> Option<contextdb_core::read_contract::ReadRoute> {
+        match self {
+            Self::Reading { reader, .. } => Some(reader.route()),
+            Self::Writing { .. } => None,
+        }
+    }
+
     /// The store path a reading session was pointed at. A writing session is
     /// its own owner and answers about itself, so it needs none.
     fn read_path(&self) -> Option<&Path> {
@@ -383,15 +392,47 @@ fn read_failure_message(
     // cursor is the in-session escape either way, and the refusal's own detail
     // already carries it copy-ready.
     if failure.kind() == ReadFailureKind::OwnerLimitExceeded {
-        let raise = match route {
-            Some(contextdb_core::read_contract::ReadRoute::File) => Some(
-                "raise --read-result-rows / --read-result-bytes for a deliberate one-shot export",
+        let limit = match failure.detail() {
+            ReadFailureDetail::OwnerLimitExceeded(detail) => Some(detail.limit),
+            _ => None,
+        };
+        let raise = match (route, limit) {
+            (
+                None | Some(contextdb_core::read_contract::ReadRoute::File),
+                Some(ReadFailureLimit::Work),
+            ) => Some("raise --read-work"),
+            (
+                Some(contextdb_core::read_contract::ReadRoute::Owner),
+                Some(ReadFailureLimit::Work),
+            ) => Some(
+                "the ceiling is the owner's: change --owner-read-work on the writer (and \
+                     --read-work if this caller declared a lower ceiling)",
             ),
-            Some(contextdb_core::read_contract::ReadRoute::Owner) => Some(
+            (
+                None | Some(contextdb_core::read_contract::ReadRoute::File),
+                Some(ReadFailureLimit::ResultRows),
+            ) => Some("raise --read-result-rows for a deliberate one-shot read"),
+            (
+                None | Some(contextdb_core::read_contract::ReadRoute::File),
+                Some(ReadFailureLimit::ResultBytes),
+            ) => Some("raise --read-result-bytes for a deliberate one-shot read"),
+            (
+                Some(contextdb_core::read_contract::ReadRoute::Owner),
+                Some(ReadFailureLimit::ResultRows),
+            ) => Some(
                 "the ceiling is the owner's, and a reader cannot raise it: change \
-                 --owner-read-result-rows / --owner-read-result-bytes on the writer",
+                 --owner-read-result-rows on the writer",
             ),
-            None => None,
+            (
+                Some(contextdb_core::read_contract::ReadRoute::Owner),
+                Some(ReadFailureLimit::ResultBytes),
+            ) => Some(
+                "the ceiling is the owner's, and a reader cannot raise it: change \
+                 --owner-read-result-bytes on the writer",
+            ),
+            (Some(contextdb_core::read_contract::ReadRoute::File), _) => None,
+            (Some(contextdb_core::read_contract::ReadRoute::Owner), _) => None,
+            (None, _) => None,
         };
         return match raise {
             Some(raise) => format!("{failure}; {raise}"),
@@ -421,14 +462,18 @@ fn read_failure_message(
         ReadFailureKind::InvalidChannelData | ReadFailureKind::LocalProtocolMismatch => {
             Some("the owner process and this client must be the same release")
         }
-        ReadFailureKind::CursorExpired => Some("reopen it with `.cursor open <SELECT>`"),
-        ReadFailureKind::CursorNotFound => Some("open one with `.cursor open <SELECT>`"),
+        ReadFailureKind::CursorExpired => {
+            Some("reopen it with `.cursor open <SELECT | SHOW VECTOR_PARTITIONS>`")
+        }
+        ReadFailureKind::CursorNotFound => {
+            Some("open one with `.cursor open <SELECT | SHOW VECTOR_PARTITIONS>`")
+        }
         ReadFailureKind::CursorAlreadyOpen => Some("close it with `.cursor close` first"),
         ReadFailureKind::CursorTransactionActive => {
             Some("commit or roll back the transaction first")
         }
         ReadFailureKind::CursorInvalidStatement => {
-            Some("`.cursor open` takes exactly one read-only SELECT")
+            Some("`.cursor open` takes exactly one read-only SELECT or SHOW VECTOR_PARTITIONS")
         }
         ReadFailureKind::DirectReadRequiresWriter => {
             Some("close every holder and rerun with --write")
@@ -464,6 +509,9 @@ fn refusal_naming_the_statement(failure: &ReadFailure, sql: &str) -> ReadFailure
         return failure.clone();
     };
     if detail.statement.is_some() {
+        return failure.clone();
+    }
+    if detail.limit == ReadFailureLimit::Work {
         return failure.clone();
     }
     let statement = sql.trim().trim_end_matches(';').trim().to_owned();
@@ -1237,15 +1285,55 @@ pub(crate) fn handle_meta_command(
                                 &report,
                             ));
                         } else {
+                            let failure_details = report.vector.first_failure_details;
+                            let requested_bytes = failure_details
+                                .and_then(|details| details.requested_bytes)
+                                .map_or_else(|| "none".to_owned(), |bytes| bytes.to_string());
+                            let available_bytes = failure_details
+                                .and_then(|details| details.available_bytes)
+                                .map_or_else(|| "none".to_owned(), |bytes| bytes.to_string());
+                            let current_bytes = failure_details
+                                .and_then(|details| details.current_bytes)
+                                .map_or_else(|| "none".to_owned(), |bytes| bytes.to_string());
+                            let budget_limit_bytes = failure_details
+                                .and_then(|details| details.budget_limit_bytes)
+                                .map_or_else(|| "none".to_owned(), |bytes| bytes.to_string());
                             println!(
                                 "pruned_rows={} rows_deferred_for_readers={} \
                                  currency_pruned_versions={} \
-                                 pruned_trigger_audit_rows={} auto_compact_ran={}",
+                                 pruned_trigger_audit_rows={} auto_compact_ran={} \
+                                 vector_built_indexes={} vector_remaining_indexes={} \
+                                 vector_nonempty_partitions={} vector_ready_partitions={} \
+                                 vector_built_partitions={} vector_remaining_partitions={} \
+                                 vector_first_failure={} vector_failure_operation={} \
+                                 vector_failure_requested_bytes={} vector_failure_available_bytes={} \
+                                 vector_failure_current_bytes={} vector_failure_budget_limit_bytes={} \
+                                 vector_failure_message={:?} vector_failure_recovery_action={} \
+                                 vector_failure_recovery_instruction={:?}",
                                 report.pruning.pruned_rows,
                                 report.pruning.rows_deferred_for_readers,
                                 report.currency.pruned_versions,
                                 report.pruned_trigger_audit_rows,
                                 report.compaction.ran,
+                                report.vector.built_indexes,
+                                report.vector.remaining_indexes,
+                                report.vector.nonempty_partitions,
+                                report.vector.ready_partitions,
+                                report.vector.built_partitions,
+                                report.vector.remaining_partitions,
+                                report
+                                    .vector
+                                    .first_failure
+                                    .map_or("none", |failure| failure.reason()),
+                                failure_details.map_or("none", |details| details.operation),
+                                requested_bytes,
+                                available_bytes,
+                                current_bytes,
+                                budget_limit_bytes,
+                                failure_details.map_or("none", |details| details.message),
+                                failure_details.map_or("none", |details| details.recovery_action()),
+                                failure_details
+                                    .map_or("none", |details| details.recovery_instruction),
                             );
                         }
                     }
@@ -1678,7 +1766,7 @@ fn handle_cursor_command(
         _ => {
             report_failure(
                 ErrorClass::Usage,
-                "Usage: .cursor open <SELECT> | .cursor fetch [rows] | .cursor close",
+                "Usage: .cursor open <SELECT | SHOW VECTOR_PARTITIONS> | .cursor fetch [rows] | .cursor close",
                 input,
             );
             MetaCommandOutcome::failed()
@@ -1732,7 +1820,11 @@ fn cursor_open(
         return refuse_cursor(ReadFailureKind::CursorAlreadyOpen, input);
     }
     if argument.is_empty() {
-        report_failure(ErrorClass::Usage, "Usage: .cursor open <SELECT>", input);
+        report_failure(
+            ErrorClass::Usage,
+            "Usage: .cursor open <SELECT | SHOW VECTOR_PARTITIONS>",
+            input,
+        );
         return MetaCommandOutcome::failed();
     }
     // Cursor state must never mix committed and uncommitted rows, so it may
@@ -1741,9 +1833,9 @@ fn cursor_open(
     if session.transaction_open {
         return refuse_cursor(ReadFailureKind::CursorTransactionActive, input);
     }
-    // Exactly one read-only SELECT. A write handed to the cursor is refused AS
-    // a write, so the user is told the one thing that would let it through;
-    // anything else is command misuse and never executes.
+    // Exactly one cursor-supported read. A write handed to the cursor is
+    // refused AS a write, so the user is told the one thing that would let it
+    // through; anything else is command misuse and never executes.
     match contextdb_parser::parse(argument) {
         Ok(statement) => {
             if contextdb_parser::statement_effect(&statement)
@@ -1751,7 +1843,11 @@ fn cursor_open(
             {
                 return refuse_cursor(ReadFailureKind::WriteRequiresFlag, input);
             }
-            if !matches!(statement, contextdb_parser::Statement::Select(_)) {
+            if !matches!(
+                statement,
+                contextdb_parser::Statement::Select(_)
+                    | contextdb_parser::Statement::ShowVectorPartitions { .. }
+            ) {
                 return refuse_cursor(ReadFailureKind::CursorInvalidStatement, input);
             }
         }
@@ -1891,7 +1987,7 @@ fn report_cursor_error(
         input.output.report_read_failure_on_route(
             failure,
             input.script_line,
-            Some(session_handle.reader().route()),
+            session_handle.limit_advice_route(),
         );
         return;
     }
@@ -2078,49 +2174,31 @@ fn handle_explain_command(session_handle: &Session, line: &str, input: InputCont
         return false;
     }
 
-    // Only a read-only statement may be RUN to collect a real runtime route.
-    // Anything that would write is planned instead — `.explain DELETE FROM t`
-    // answers what it WOULD do and must never do it — and the plan says
-    // plainly that no statement was run to produce it.
-    if !explain_can_use_runtime_trace(rest) {
-        // A writing session plans a write against its own live database. The
-        // bounded read view will not plan one — it accepts read-only plans by
-        // design — so asking it would turn "here is what this WOULD do" into a
-        // refusal, which is not what `.explain` promises.
-        if let Some(database) = session_handle.database() {
-            return match database.explain(rest) {
-                Ok(plan) => {
-                    if input.output.json {
-                        json_output::print_document(&json_output::static_plan_document(&plan));
-                    } else {
-                        print!("{plan}");
-                        if !plan.ends_with('\n') {
-                            println!();
-                        }
-                    }
-                    true
-                }
-                Err(error) => {
-                    report_error(&error, input);
-                    false
-                }
-            };
+    let path = match explain_path(rest) {
+        Ok(path) => path,
+        Err(error) => {
+            report_error(&error, input);
+            return false;
         }
-        return match session_handle.reader().metadata(
-            MetadataRequest::Explain {
-                sql: rest.to_owned(),
-            },
-            None,
-        ) {
-            Ok(answer) => {
-                let MetadataBody::Explain { physical_plan, .. } = &answer.body else {
-                    report_error(&Error::ReadSessionNotImplemented, input);
-                    return false;
-                };
+    };
+
+    // The binding this explain is planned against is the one the user holds
+    // at this prompt. The REPL keeps no bound parameters of its own, so that
+    // binding is empty here -- and it is sent as the caller's binding rather
+    // than dropped on the way, so a handle that does hold one is explained the
+    // way its own query would run.
+    let bound_params = HashMap::new();
+
+    if path == ExplainPath::RuntimeRead {
+        return match session_handle.reader().execute(rest, &bound_params) {
+            Ok(result) => {
                 if input.output.json {
-                    json_output::print_document(&json_output::static_plan_document(physical_plan));
+                    json_output::print_document(&json_output::explain_document(&result));
                 } else {
-                    println!("{physical_plan}");
+                    print!(
+                        "{}",
+                        contextdb_engine::cli_render::render_explain_trace(&result.trace)
+                    );
                 }
                 true
             }
@@ -2131,18 +2209,54 @@ fn handle_explain_command(session_handle: &Session, line: &str, input: InputCont
         };
     }
 
-    match session_handle.reader().execute(rest, &HashMap::new()) {
-        Ok(result) => {
+    let explained = session_handle
+        .reader()
+        .metadata(
+            MetadataRequest::Explain {
+                sql: rest.to_owned(),
+                params: bound_params,
+            },
+            None,
+        )
+        .and_then(|answer| {
+            let MetadataBody::Explain {
+                physical_plan,
+                index,
+                vector_search,
+                ..
+            } = answer.body
+            else {
+                return Err(Error::ReadSessionNotImplemented);
+            };
+            Ok(contextdb_engine::ExplainOutput {
+                physical_plan,
+                index_used: index,
+                predicates_pushed: Vec::new(),
+                indexes_considered: Vec::new(),
+                sort_elided: false,
+                vector_search,
+            })
+        });
+
+    match explained {
+        Ok(explained) if path == ExplainPath::PassiveVector => {
             if input.output.json {
-                json_output::print_document(&json_output::explain_document(&result));
+                json_output::print_document(&json_output::passive_explain_document(&explained));
             } else {
-                // The same shape `.explain` gives for a statement it could
-                // only plan: an operator asking about a route gets one answer,
-                // whether or not the statement was run to produce it.
                 print!(
                     "{}",
-                    contextdb_engine::cli_render::render_explain_trace(&result.trace)
+                    contextdb_engine::cli_render::render_explain_output(&explained)
                 );
+            }
+            true
+        }
+        Ok(explained) => {
+            if input.output.json {
+                json_output::print_document(&json_output::static_plan_document(
+                    &explained.physical_plan,
+                ));
+            } else {
+                println!("{}", explained.physical_plan.trim_end());
             }
             true
         }
@@ -2151,6 +2265,30 @@ fn handle_explain_command(session_handle: &Session, line: &str, input: InputCont
             false
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplainPath {
+    RuntimeRead,
+    PassiveVector,
+    StaticPlan,
+}
+
+/// Decide how `.explain` obtains its answer from the parsed statement, never
+/// from SQL text or rendered plan prose. Ordinary SELECT/WITH keeps the
+/// shipped executed-trace behavior, while every vector nearest-neighbour
+/// SELECT remains passive and every non-SELECT statement is planned only.
+fn explain_path(sql: &str) -> contextdb_core::Result<ExplainPath> {
+    let statement = contextdb_parser::parse(sql)?;
+    Ok(match &statement {
+        contextdb_parser::Statement::Select(select)
+            if contextdb_parser::classification::select_contains_vector_similarity(select) =>
+        {
+            ExplainPath::PassiveVector
+        }
+        contextdb_parser::Statement::Select(_) => ExplainPath::RuntimeRead,
+        _ => ExplainPath::StaticPlan,
+    })
 }
 
 /// Report an engine error: the `{"error":{...}}` envelope on stderr under
@@ -2172,12 +2310,6 @@ fn report_error(error: &Error, input: InputContext) {
     } else {
         eprintln!("Error: {flattened}");
     }
-}
-
-fn explain_can_use_runtime_trace(sql: &str) -> bool {
-    sql.split_whitespace().next().is_some_and(|token| {
-        token.eq_ignore_ascii_case("SELECT") || token.eq_ignore_ascii_case("WITH")
-    })
 }
 
 fn handle_sync_command(
@@ -2841,7 +2973,7 @@ fn execute_sql(
             output.report_read_failure_on_route(
                 &refusal_naming_the_statement(&failure, sql),
                 input.script_line,
-                Some(session_handle.reader().route()),
+                session_handle.limit_advice_route(),
             );
             false
         }
@@ -3050,7 +3182,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_statement_flow_never_registers_a_sink_so_a_routed_event_queues_undelivered() {
+    fn cli_statement_flow_registers_a_default_sink_callback_so_a_routed_event_delivers() {
         // Driven through `feed_line`, the REAL per-line path both the
         // interactive and scripted adapters call — not raw `db.execute` —
         // exactly what running these same lines at the `contextdb` prompt
@@ -3085,7 +3217,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_statement_flow_never_registers_a_cron_callback_so_a_schedule_never_fires() {
+    fn cli_statement_flow_registers_a_cron_callback_so_a_schedule_fires() {
         // Same story for CREATE SCHEDULE, driven through the real `feed_line`
         // path. `cron_run_due_now_for_test` synchronously drives any due
         // schedule (a bounded, sleep-free engine test seam) rather than this

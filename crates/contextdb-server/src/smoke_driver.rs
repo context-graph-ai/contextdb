@@ -345,7 +345,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
         "matching bind",
     )
     .await?;
-    // Statement 3: binding names the tenant and authoritative hub; edge-local
+    // Binding names the tenant and authoritative hub; edge-local
     // identity is not part of this installed journey's public assertion.
     if binding.tenant_id().as_str() != CUSTODY_TENANT
         || binding.hub_node_id() != hub.node_id
@@ -488,7 +488,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
     {
         return Err("discard did not erase the first local unit before re-import".into());
     }
-    // Statements 17b/20: a fresh local unit starts pending after the prior unit was erased.
+    // A fresh local unit starts pending after the prior unit was erased.
     commit_custody_unit(&edge_db, root_one, "numbered-root", &members)?;
     if edge_db
         .delivery_outcome(CUSTODY_ROOT_TABLE, &custody_key(root_one))
@@ -546,7 +546,7 @@ async fn run_custody(args: CustodyArgs) -> Result<(), String> {
             return Err(error);
         }
     };
-    // Statement 11: the installed lost-ack checkpoint identifies its sender.
+    // The installed lost-ack checkpoint identifies its sender.
     let edge_node = FabricIdentity::load_or_generate(&edge_identity)
         .map_err(|e| e.to_string())?
         .node_id();
@@ -1007,7 +1007,7 @@ const CUSTODY_POLICY_FIELDS: &[&str] = &[
     "sync_safe",
     "history",
     "manifest_tables",
-    // Statement 20: whole-row policy has no content-exclusion clause.
+    // Whole-row policy has no content-exclusion clause.
     "edge_discard",
 ];
 
@@ -1126,7 +1126,7 @@ fn require_custody_policies(rows: &[serde_json::Value]) -> Result<(), String> {
             || row.get("retain_unit") != Some(&serde_json::Value::Null)
             || row["sync_safe"] != json!(false)
             || row["history"] != "all"
-            // Statement 20: retain all other declared/default policy assertions.
+            // Retain all other declared/default policy assertions.
             || row["edge_discard"] != "after_outcome"
             || (table == CUSTODY_ROOT_TABLE
                 && row["manifest_tables"] != json!([CUSTODY_MEMBER_TABLE]))
@@ -1150,7 +1150,7 @@ fn require_custody_bindings(
     for table in [CUSTODY_ROOT_TABLE, CUSTODY_MEMBER_TABLE] {
         let row = policy_row(rows, table)?;
         let policy = policy_row(declared, table)?;
-        // Statement 3: binding inspection carries policy metadata, never row content.
+        // Binding inspection carries policy metadata, never row content.
         if row["tenant_id"] != CUSTODY_TENANT
             || row["hub_node_id"] != binding.hub_node_id()
             || row["hub_incarnation"] != binding.hub_incarnation().to_hex()
@@ -1225,7 +1225,7 @@ fn same_outcome(
     a: &contextdb_engine::DeliveryOutcome,
     b: &contextdb_engine::DeliveryOutcome,
 ) -> bool {
-    // Statements 11/13/20: compare promised identity, content and acceptance facts.
+    // Compare promised identity, content and acceptance facts.
     a.tenant_id() == b.tenant_id()
         && a.hub_node_id() == b.hub_node_id()
         && a.hub_incarnation() == b.hub_incarnation()
@@ -1244,7 +1244,7 @@ fn outcome_row<'a>(
     rows: &'a [serde_json::Value],
     outcome: &contextdb_engine::DeliveryOutcome,
 ) -> Result<&'a serde_json::Value, String> {
-    // Statements 19/20: inspect promised facts without requiring private submission/cursor fields.
+    // Inspect promised facts without requiring private submission/cursor fields.
     let root_key = json!(outcome.root_key());
     let digest = outcome.unit_digest().map(|digest| hex(&digest));
     let word = match outcome.kind() {
@@ -1783,7 +1783,7 @@ async fn run_hub(args: HubArgs) -> Result<(), String> {
         .map_err(|_| "cannot bind verifier hub endpoint".to_string())?;
     write_ticket(&args.ticket_file, &endpoint.ticket())?;
     let node_id = endpoint.node_id();
-    // Statement 11: exercise the same established constructor as the server binary.
+    // Exercise the same established constructor as the server binary.
     let server = SyncServer::new(
         database.clone(),
         &endpoint,

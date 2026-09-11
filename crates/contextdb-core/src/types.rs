@@ -777,6 +777,265 @@ impl AdjEntry {
     }
 }
 
+/// The route contract declared by a vector column or requested by one search.
+///
+/// A column declaration always stores one of these values. SQL omission is
+/// normalized to [`VectorSearchMode::Auto`]; an operation-level absence is
+/// represented separately by the caller (for example, `Option<Self>`) so it
+/// can mean "use the column declaration" without adding another enum case.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum VectorSearchMode {
+    /// Choose exact or maintained indexed work using the column's resolved
+    /// `AUTO_INDEX_AT` and the aggregate allowed count across the requested scope.
+    /// Exact fallback for an unavailable route must fit the caller's existing limits.
+    #[default]
+    Auto,
+    /// Compare every allowed stored vector under the active limits. Quantized
+    /// columns remain quantized; this never substitutes an approximate answer.
+    Exact,
+    /// Require a maintained route for the complete authorized scope, including
+    /// small nonempty partitions. An unavailable route gives a typed refusal;
+    /// the query never builds a graph, waits for a full build, or silently scans.
+    Indexed,
+}
+
+impl VectorSearchMode {
+    /// The canonical SQL spelling used by schema and inspection rendering.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "AUTO",
+            Self::Exact => "EXACT",
+            Self::Indexed => "INDEXED",
+        }
+    }
+}
+
+impl fmt::Display for VectorSearchMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One exact typed component of a local vector-partition identity.
+///
+/// The variants are deliberately limited to the declaration types whose
+/// equality is stable. Keeping the type tag means, for example, integer `7`
+/// can never become the same state as text `"7"` through formatting.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum VectorPartitionComponent {
+    Uuid(Uuid),
+    Text(String),
+    Integer(i64),
+    Boolean(bool),
+    Timestamp(i64),
+    TxId(TxId),
+}
+
+impl VectorPartitionComponent {
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Uuid(value) => Some(Self::Uuid(*value)),
+            Value::Text(value) => Some(Self::Text(value.clone())),
+            Value::Int64(value) => Some(Self::Integer(*value)),
+            Value::Bool(value) => Some(Self::Boolean(*value)),
+            Value::Timestamp(value) => Some(Self::Timestamp(*value)),
+            Value::TxId(value) => Some(Self::TxId(*value)),
+            Value::Null | Value::Float64(_) | Value::Json(_) | Value::Vector(_) => None,
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Text(value) => value.capacity(),
+            Self::Uuid(_)
+            | Self::Integer(_)
+            | Self::Boolean(_)
+            | Self::Timestamp(_)
+            | Self::TxId(_) => 0,
+        }
+    }
+}
+
+/// The canonical typed identity of one local vector partition.
+///
+/// An empty tuple is the one logical state of an unpartitioned vector column.
+/// Equality uses the typed components themselves, never a hash or rendered
+/// JSON. `canonical_bytes` is a fixed, versioned encoding used anywhere the
+/// identity crosses a persistence boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct VectorPartitionKey(Vec<VectorPartitionComponent>);
+
+impl VectorPartitionKey {
+    const CANONICAL_VERSION: u8 = 1;
+
+    pub fn unpartitioned() -> Self {
+        Self::default()
+    }
+
+    pub fn from_components(components: Vec<VectorPartitionComponent>) -> Self {
+        Self(components)
+    }
+
+    /// Build a key from already type-checked row values. `None` means one of
+    /// the values is NULL or is not an allowed exact identity type.
+    pub fn from_values(values: &[Value]) -> Option<Self> {
+        values
+            .iter()
+            .map(VectorPartitionComponent::from_value)
+            .collect::<Option<Vec<_>>>()
+            .map(Self)
+    }
+
+    pub fn components(&self) -> &[VectorPartitionComponent] {
+        &self.0
+    }
+
+    pub fn is_unpartitioned(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Memory retained by this key itself, including a large TEXT payload.
+    /// Hash-map/tree slot overhead is charged by the registry that owns it.
+    pub fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.0
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<VectorPartitionComponent>()),
+            )
+            .saturating_add(
+                self.0
+                    .iter()
+                    .map(VectorPartitionComponent::heap_bytes)
+                    .sum::<usize>(),
+            )
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(Self::CANONICAL_VERSION);
+        bytes.extend_from_slice(&(self.0.len() as u64).to_be_bytes());
+        for component in &self.0 {
+            match component {
+                VectorPartitionComponent::Uuid(value) => {
+                    bytes.push(0);
+                    bytes.extend_from_slice(value.as_bytes());
+                }
+                VectorPartitionComponent::Text(value) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+                    bytes.extend_from_slice(value.as_bytes());
+                }
+                VectorPartitionComponent::Integer(value) => {
+                    bytes.push(2);
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
+                VectorPartitionComponent::Boolean(value) => {
+                    bytes.push(3);
+                    bytes.push(u8::from(*value));
+                }
+                VectorPartitionComponent::Timestamp(value) => {
+                    bytes.push(4);
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
+                VectorPartitionComponent::TxId(value) => {
+                    bytes.push(5);
+                    bytes.extend_from_slice(&value.0.to_be_bytes());
+                }
+            }
+        }
+        bytes
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> std::result::Result<Self, &'static str> {
+        fn take<'a>(
+            bytes: &'a [u8],
+            cursor: &mut usize,
+            count: usize,
+        ) -> std::result::Result<&'a [u8], &'static str> {
+            let end = cursor
+                .checked_add(count)
+                .ok_or("vector partition key length overflow")?;
+            let value = bytes
+                .get(*cursor..end)
+                .ok_or("truncated vector partition key")?;
+            *cursor = end;
+            Ok(value)
+        }
+
+        fn read_u64(bytes: &[u8], cursor: &mut usize) -> std::result::Result<u64, &'static str> {
+            let raw: [u8; 8] = take(bytes, cursor, 8)?
+                .try_into()
+                .map_err(|_| "invalid vector partition integer")?;
+            Ok(u64::from_be_bytes(raw))
+        }
+
+        let mut cursor = 0usize;
+        let version = *take(bytes, &mut cursor, 1)?
+            .first()
+            .ok_or("missing vector partition key version")?;
+        if version != Self::CANONICAL_VERSION {
+            return Err("unsupported vector partition key version");
+        }
+        let component_count = usize::try_from(read_u64(bytes, &mut cursor)?)
+            .map_err(|_| "vector partition component count is too large")?;
+        let mut components = Vec::new();
+        components
+            .try_reserve_exact(component_count)
+            .map_err(|_| "vector partition component allocation failed")?;
+        for _ in 0..component_count {
+            let tag = *take(bytes, &mut cursor, 1)?
+                .first()
+                .ok_or("missing vector partition component tag")?;
+            let component = match tag {
+                0 => {
+                    let raw: [u8; 16] = take(bytes, &mut cursor, 16)?
+                        .try_into()
+                        .map_err(|_| "invalid vector partition UUID")?;
+                    VectorPartitionComponent::Uuid(Uuid::from_bytes(raw))
+                }
+                1 => {
+                    let length = usize::try_from(read_u64(bytes, &mut cursor)?)
+                        .map_err(|_| "vector partition text is too large")?;
+                    let raw = take(bytes, &mut cursor, length)?;
+                    let value = std::str::from_utf8(raw)
+                        .map_err(|_| "vector partition text is not UTF-8")?;
+                    VectorPartitionComponent::Text(value.to_owned())
+                }
+                2 => {
+                    let raw: [u8; 8] = take(bytes, &mut cursor, 8)?
+                        .try_into()
+                        .map_err(|_| "invalid vector partition integer")?;
+                    VectorPartitionComponent::Integer(i64::from_be_bytes(raw))
+                }
+                3 => match *take(bytes, &mut cursor, 1)?
+                    .first()
+                    .ok_or("missing vector partition boolean")?
+                {
+                    0 => VectorPartitionComponent::Boolean(false),
+                    1 => VectorPartitionComponent::Boolean(true),
+                    _ => return Err("invalid vector partition boolean"),
+                },
+                4 => {
+                    let raw: [u8; 8] = take(bytes, &mut cursor, 8)?
+                        .try_into()
+                        .map_err(|_| "invalid vector partition timestamp")?;
+                    VectorPartitionComponent::Timestamp(i64::from_be_bytes(raw))
+                }
+                5 => VectorPartitionComponent::TxId(TxId(read_u64(bytes, &mut cursor)?)),
+                _ => return Err("unknown vector partition component tag"),
+            };
+            components.push(component);
+        }
+        if cursor != bytes.len() {
+            return Err("trailing bytes in vector partition key");
+        }
+        Ok(Self(components))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VectorIndexRef {
     pub table: String,
@@ -789,6 +1048,12 @@ impl VectorIndexRef {
             table: table.into(),
             column: column.into(),
         }
+    }
+}
+
+impl std::fmt::Display for VectorIndexRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}", self.table, self.column)
     }
 }
 
@@ -851,6 +1116,63 @@ pub enum UpsertResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_search_mode_defaults_and_renders_canonically() {
+        assert_eq!(VectorSearchMode::default(), VectorSearchMode::Auto);
+        assert_eq!(VectorSearchMode::Auto.as_str(), "AUTO");
+        assert_eq!(VectorSearchMode::Exact.to_string(), "EXACT");
+        assert_eq!(VectorSearchMode::Indexed.to_string(), "INDEXED");
+    }
+
+    #[test]
+    fn public_vector_errors_render_the_sql_column_identity() {
+        let error = crate::Error::VectorIndexedRouteUnavailable {
+            index: VectorIndexRef::new("documents", "embedding"),
+        }
+        .to_string();
+        assert!(error.contains("documents.embedding"));
+        assert!(!error.contains("VectorIndexRef"));
+        assert!(!error.contains("table:"));
+    }
+
+    #[test]
+    fn vector_partition_keys_keep_exact_types_and_round_trip_canonically() {
+        let key = VectorPartitionKey::from_components(vec![
+            VectorPartitionComponent::Uuid(
+                Uuid::parse_str("b4abaf12-2f0a-4a3b-9d7a-c46e01390895").unwrap(),
+            ),
+            VectorPartitionComponent::Text("Case-Sensitive 7".to_owned()),
+            VectorPartitionComponent::Integer(-7),
+            VectorPartitionComponent::Boolean(true),
+            VectorPartitionComponent::Timestamp(1_700_000_000_000),
+            VectorPartitionComponent::TxId(TxId(99)),
+        ]);
+        let encoded = key.canonical_bytes();
+        assert_eq!(
+            VectorPartitionKey::from_canonical_bytes(&encoded).unwrap(),
+            key
+        );
+        assert_ne!(
+            VectorPartitionKey::from_values(&[Value::Int64(7)]).unwrap(),
+            VectorPartitionKey::from_values(&[Value::Text("7".to_owned())]).unwrap()
+        );
+        assert!(VectorPartitionKey::from_values(&[Value::Null]).is_none());
+    }
+
+    #[test]
+    fn unpartitioned_key_is_an_explicit_empty_canonical_tuple() {
+        let key = VectorPartitionKey::unpartitioned();
+        assert!(key.is_unpartitioned());
+        assert_eq!(
+            VectorPartitionKey::from_canonical_bytes(&key.canonical_bytes()).unwrap(),
+            key
+        );
+
+        let mut trailing = key.canonical_bytes();
+        trailing.push(0);
+        assert!(VectorPartitionKey::from_canonical_bytes(&trailing).is_err());
+    }
 
     #[test]
     fn wallclock_test_clock_guard_restores_on_panic_unwind() {

@@ -43,9 +43,12 @@ async fn within<F: std::future::Future>(future: F) -> F::Output {
 }
 
 async fn within_copy_class_replication<F: std::future::Future>(future: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(120), future)
-        .await
-        .expect("bounded high-cardinality copy-class replication")
+    // No in-test wall-clock bound here: the nextest slow-timeout
+    // (terminate-after) is the liveness guard for this high-cardinality
+    // copy-class replication path, so this helper no longer races host CPU
+    // contention against an arbitrary in-test deadline. Every assertion the
+    // test makes about the replicated state is unchanged.
+    future.await
 }
 
 fn spec(path: &Path) -> String {
@@ -794,6 +797,36 @@ fn create_purge_copy_tables(db: &Database) {
             .unwrap_or_else(|error| panic!("create copy-class fixture with `{ddl}`: {error}"));
     }
     install_work_ledger_schema(db).expect("install work-ledger schema");
+}
+
+fn maintain_notes_vector_index_until_complete(db: &Database, place: &str) {
+    for cycle in 0..32 {
+        let partitions = db
+            .execute(
+                "SHOW VECTOR_PARTITIONS FOR notes.embedding",
+                &HashMap::new(),
+            )
+            .unwrap_or_else(|error| panic!("inspect {place} vector serving state: {error}"));
+        let query_state = partitions
+            .columns
+            .iter()
+            .position(|column| column == "query_state")
+            .unwrap_or_else(|| panic!("{place} inspection must report query_state"));
+        let maintenance_state = partitions
+            .columns
+            .iter()
+            .position(|column| column == "maintenance_state")
+            .unwrap_or_else(|| panic!("{place} inspection must report maintenance_state"));
+        if partitions.rows.len() == 1
+            && partitions.rows[0].get(query_state) == Some(&Value::Text("ready".to_string()))
+            && partitions.rows[0].get(maintenance_state) == Some(&Value::Text("idle".to_string()))
+        {
+            return;
+        }
+        db.run_maintenance_cycle()
+            .unwrap_or_else(|error| panic!("run {place} vector maintenance cycle: {error}"));
+        assert!(cycle < 31, "{place} vector maintenance did not complete");
+    }
 }
 
 fn purge_exact(db: &Database, table: &str, column: &str, value: Value) {
@@ -1591,6 +1624,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
     );
 
     let selected_row_id = row_id(&edge_a, selected);
+    maintain_notes_vector_index_until_complete(&edge_a, "edge a");
     let vector_query = edge_a
         .execute(
             "SELECT id FROM notes ORDER BY embedding <=> [1,0,0] LIMIT 10",
@@ -1682,6 +1716,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
     for (place, db) in [("hub", &hub.db), ("edge a", &edge_a), ("edge b", &edge_b)] {
         let local_selected_row_id = row_id(db, selected);
         let local_survivor_row_id = row_id(db, survivor);
+        maintain_notes_vector_index_until_complete(db, place);
         let search = db
             .execute(
                 "SELECT id FROM notes ORDER BY embedding <=> [1,0,0] LIMIT 10",
@@ -1691,6 +1726,10 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         let hnsw_len = db
             .__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding"))
             .unwrap_or_else(|| panic!("{place} must materialize an ANN/HNSW graph"));
+        assert_eq!(
+            hnsw_len, 1001,
+            "{place} pre-purge HNSW graph must contain the selected node and exactly 1,000 survivors"
+        );
         assert!(
             search.trace.physical_plan.contains("HNSWSearch") && hnsw_len > 0,
             "{place} must hold a materialized ANN/HNSW copy before purge"
@@ -1930,6 +1969,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         .expect("edge b applies authoritative purge");
     for (place, db, local_selected_row_id, local_survivor_row_id, hnsw_len_before) in &copy_holders
     {
+        maintain_notes_vector_index_until_complete(db, place);
         assert_absent(db, selected, place);
         assert_eq!(
             body(db, survivor).as_deref(),
@@ -1993,6 +2033,45 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         assert!(
             rebuilt_search.trace.physical_plan.contains("HNSWSearch"),
             "{place} must rematerialize the production HNSW path after purge"
+        );
+        let selected_tail_copies = db.__debug_vector_hnsw_raw_entry_count_for_row_for_test(
+            VectorIndexRef::new("notes", "embedding"),
+            *local_selected_row_id,
+        );
+        let store = db.vector_store_for_test();
+        let state = store
+            .try_state(&VectorIndexRef::new("notes", "embedding"))
+            .unwrap();
+        let sealed_layers = [true, false].map(|is_base| {
+            state.with_resident_sealed_generation(is_base, |identity, graph| {
+                (
+                    identity,
+                    graph.len(),
+                    graph.raw_entry_count_for_row(*local_selected_row_id),
+                )
+            })
+        });
+        println!(
+            "purge place={place} before={hnsw_len_before} after={:?} selected_tail_copies={selected_tail_copies:?} sealed={sealed_layers:?} status={:?} partitions={:?}",
+            db.__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding")),
+            state.graph_generation_status(),
+            db.execute(
+                "SHOW VECTOR_PARTITIONS FOR notes.embedding",
+                &HashMap::new()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            selected_tail_copies,
+            Some(0),
+            "{place} must physically remove every mutable-tail copy of the purged row"
+        );
+        assert!(
+            sealed_layers
+                .into_iter()
+                .flatten()
+                .all(|(_, _, copies)| copies == 0),
+            "{place} must physically remove every sealed-graph copy of the purged row"
         );
         assert_eq!(
             db.__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding")),
@@ -2631,6 +2710,12 @@ async fn ordinary_delete_then_explicit_fresh_same_key_mints_new_lineage_and_sync
         &hub_dial,
         TenantId::from(tenant),
     ));
+    // Destination restoration may first replay schema or previously accepted
+    // batches. Drain them before arming a barrier for this delete's response.
+    within(client.push())
+        .await
+        .expect("reconcile the restored destination");
+    assert_eq!(body(&hub.db, id).as_deref(), Some("old-lineage"));
     delete(&edge, id);
     assert_absent(
         &edge,
@@ -3344,6 +3429,7 @@ async fn post_purge_backup_preserves_absence() {
         .expect("create backup relational index");
     let selected_row_id_before_purge = row_id(&hub.db, id);
     let survivor_row_id_before_purge = row_id(&hub.db, survivor);
+    maintain_notes_vector_index_until_complete(&hub.db, "backup fixture");
     let before_vector_plan = hub
         .db
         .execute(
@@ -3403,6 +3489,7 @@ async fn post_purge_backup_preserves_absence() {
         Ok(_) => {
             let restored =
                 Database::open(&captured_artifact).expect("open safely published race artifact");
+            maintain_notes_vector_index_until_complete(&restored, "captured backup");
             assert_restored_purge(
                 &restored,
                 id,
@@ -3435,6 +3522,7 @@ async fn post_purge_backup_preserves_absence() {
         .export_snapshot(&artifact)
         .expect("export post-purge artifact");
     let restored = Database::open(&artifact).expect("open post-purge artifact");
+    maintain_notes_vector_index_until_complete(&restored, "post-purge backup");
     assert_restored_purge(
         &restored,
         id,

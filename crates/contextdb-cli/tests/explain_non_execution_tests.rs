@@ -1,10 +1,9 @@
-//! `.explain <sql>` must show the engine's chosen plan without ever running
-//! the statement — the same contract for every output mode, including
-//! `--json`. The JSON branch must never call the engine's real execute path
-//! to get a trace: `.explain DELETE FROM t` must never delete rows,
-//! `.explain UPDATE ...` must never mutate them, and `.explain INSERT ...`
-//! must never insert a row. A caller asking "what would this do" must never
-//! get it done to them instead.
+//! `.explain <sql>` keeps three paths distinct in every output mode. Ordinary
+//! relational SELECT/WITH runs through the bounded reader and reports its
+//! real trace. A vector-similarity SELECT is passive so explanation cannot
+//! fault its search state into memory. Writes are planned and never applied:
+//! DELETE must not delete rows, UPDATE must not mutate them, and INSERT must
+//! not insert one.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -140,12 +139,14 @@ fn explain_json_insert_does_not_add_a_row() {
     );
 }
 
-// (c) baseline — a read-only statement's explain document still has the
-// expected shape under --json (guards against a fix that breaks the SELECT
-// path while correcting the mutating one).
+// (d) Ordinary relational explain executes and publishes the trace it really
+// observed, including the statement-local rows-examined count.
 #[test]
-fn explain_json_select_emits_plan_document() {
-    let sql = "CREATE TABLE t (id UUID PRIMARY KEY);\n.explain SELECT * FROM t\n";
+fn explain_json_select_emits_runtime_trace() {
+    let sql = "CREATE TABLE t (id UUID PRIMARY KEY, marker TEXT);\n\
+               CREATE INDEX idx_marker ON t (marker);\n\
+               INSERT INTO t (id, marker) VALUES ('00000000-0000-0000-0000-000000000001', '<=>');\n\
+               .explain SELECT id FROM t WHERE marker = '<=>'\n";
     let (code, stdout, stderr) = run_cli(&["--json"], sql);
     assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
     let docs = stdout_docs(&stdout);
@@ -161,12 +162,16 @@ fn explain_json_select_emits_plan_document() {
             .is_some_and(|s| !s.is_empty()),
         "explain.physical_plan must be a non-empty string, got: {explain}"
     );
+    assert_eq!(explain["explain"]["runtime_trace"], true);
+    assert_eq!(explain["explain"]["index_used"], "idx_marker");
+    assert_eq!(
+        explain["explain"]["predicates_pushed"],
+        serde_json::json!(["marker"])
+    );
+    assert_eq!(explain["explain"]["rows_examined"], 1);
 }
 
-// (d) baseline pin, positive control — human mode routes `.explain`
-// through the non-executing plan path (`explain_output`/`db.explain`), never
-// `db.execute`. This isolates the contract above to the --json branch
-// specifically.
+// (e) Human mode keeps the same non-execution guarantee for writes.
 #[test]
 fn explain_human_mode_still_does_not_execute() {
     let sql = "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\n\
@@ -189,4 +194,102 @@ fn explain_human_mode_still_does_not_execute() {
             "human-mode `.explain DELETE FROM t` must leave {id} intact (echo + SELECT row), got stdout:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn vector_select_and_with_explain_publish_passive_route_facts_even_when_indexed_is_unavailable() {
+    let setup = "CREATE TABLE vector_docs (\
+                     id INTEGER PRIMARY KEY, \
+                     embedding VECTOR(3) SEARCH_MODE INDEXED\
+                 );\n\
+                 INSERT INTO vector_docs (id, embedding) VALUES (1, '[1,0,0]');\n";
+    let select = ".explain SELECT id FROM vector_docs \
+                  ORDER BY embedding <=> '[1,0,0]' USE VECTOR INDEXED LIMIT 1\n";
+    let with = ".explain WITH chosen AS (SELECT id, embedding FROM vector_docs) \
+                SELECT id FROM chosen ORDER BY embedding <=> '[1,0,0]' \
+                USE VECTOR INDEXED LIMIT 1\n";
+    let (code, stdout, stderr) = run_cli(&["--json"], &format!("{setup}{select}{with}"));
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let explained = stdout_docs(&stdout)
+        .into_iter()
+        .filter_map(|document| document.get("explain").cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(explained.len(), 2, "both passive explanations are emitted");
+    for body in &explained {
+        assert_eq!(body["runtime_trace"], serde_json::json!(false));
+        let vector = &body["vector_search"];
+        assert_eq!(vector["requested_mode"], "INDEXED");
+        assert_eq!(vector["resolved_mode"], "INDEXED");
+        assert_eq!(vector["aggregate_allowed_vectors"], 1);
+        assert_eq!(vector["effective_auto_index_at"], 1_000);
+        assert_eq!(vector["scope"], "all");
+        assert_eq!(vector["merge"], "global");
+        assert_eq!(vector["query_source"], "<vector>");
+        assert!(vector["refusal"].as_str().is_some());
+        assert!(vector["recovery"].as_str().is_some());
+        assert_eq!(vector["layers"]["base"], "absent");
+        assert_eq!(vector["layers"]["change"], "absent");
+        assert_eq!(vector["layers"]["tail"], "present");
+        let partitions = vector["partitions"]
+            .as_array()
+            .expect("effective HNSW policy is structured per redacted partition");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0]["partition"], "<redacted:1>");
+        assert!(partitions[0]["hnsw_ef_search"].as_u64().is_some());
+        assert!(partitions[0]["ef_search_source"].as_str().is_some());
+    }
+
+    let (human_code, human_stdout, human_stderr) = run_cli(&[], &format!("{setup}{select}"));
+    assert_eq!(
+        human_code,
+        Some(0),
+        "stdout:\n{human_stdout}\nstderr:\n{human_stderr}"
+    );
+    for fact in [
+        "requested_mode=INDEXED",
+        "resolved_mode=INDEXED",
+        "aggregate_allowed_vectors=1",
+        "route=indexed",
+        "refusal=indexed_route_unavailable",
+        "recovery=run vector maintenance and retry",
+        "tail=present",
+        "partition=<redacted:1>",
+        "hnsw_ef_search=",
+    ] {
+        assert!(
+            human_stdout.contains(fact),
+            "human explain must expose {fact}:\n{human_stdout}"
+        );
+    }
+}
+
+#[test]
+fn trace_on_publishes_the_vector_route_that_actually_executed() {
+    let sql = "CREATE TABLE vector_docs (\
+                   id INTEGER PRIMARY KEY, \
+                   embedding VECTOR(3) SEARCH_MODE AUTO\
+               );\n\
+               INSERT INTO vector_docs (id, embedding) VALUES (1, '[1,0,0]');\n\
+               .trace on\n\
+               SELECT id FROM vector_docs \
+               ORDER BY embedding <=> '[1,0,0]' USE VECTOR AUTO LIMIT 1\n";
+    let (code, stdout, stderr) = run_cli(&["--json"], sql);
+    assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let traces = stdout_docs(&stderr)
+        .into_iter()
+        .filter_map(|document| document.get("trace").cloned())
+        .collect::<Vec<_>>();
+    let trace = traces
+        .iter()
+        .find(|trace| trace["vector_search"].is_object())
+        .unwrap_or_else(|| panic!("the executed vector query must publish its trace:\n{stderr}"));
+    let vector = &trace["vector_search"];
+    assert_eq!(vector["requested_mode"], "AUTO");
+    assert_eq!(vector["resolved_mode"], "EXACT");
+    assert_eq!(vector["aggregate_allowed_vectors"], 1);
+    assert_eq!(vector["route"], "exact");
+    assert_eq!(vector["fallback"], "aggregate_below_auto_index_at");
+    assert!(trace["rows_examined"].as_u64().is_some());
 }

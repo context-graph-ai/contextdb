@@ -1,6 +1,8 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use contextdb_core::read_contract::{ReadClientTimeouts, ReadLimits};
-use contextdb_engine::{DatabaseOpenOptions, OwnerReadConfig, ReadSession, ReadSessionOptions};
+use contextdb_engine::{
+    DatabaseOpenOptions, MaintenancePolicy, OwnerReadConfig, ReadSession, ReadSessionOptions,
+};
 use contextdb_server::owner_read_options::{OwnerConfiguration, OwnerReadOptions};
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -150,6 +152,14 @@ struct Args {
     #[arg(long)]
     disk_limit: Option<String>,
 
+    /// Maintenance scheduling owner for this writable process.
+    #[arg(long, value_enum, default_value = "engine-owned")]
+    maintenance: MaintenanceMode,
+
+    /// Persisted maintenance polling interval in milliseconds. Writer-only.
+    #[arg(long, value_name = "MS")]
+    maintenance_poll_ms: Option<u64>,
+
     /// Debounce interval for background auto-sync pushes. Writer-only. [default: 500]
     #[arg(long, default_value_t = 500)]
     sync_debounce_ms: u64,
@@ -211,6 +221,22 @@ struct Args {
     /// whichever process is holding the store.
     #[command(flatten)]
     owner_read: OwnerReadOptions,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum MaintenanceMode {
+    #[default]
+    EngineOwned,
+    CallerDriven,
+}
+
+impl From<MaintenanceMode> for MaintenancePolicy {
+    fn from(value: MaintenanceMode) -> Self {
+        match value {
+            MaintenanceMode::EngineOwned => Self::EngineOwned,
+            MaintenanceMode::CallerDriven => Self::CallerDriven,
+        }
+    }
 }
 
 /// Every per-invocation read ceiling and deadline, resolved from the command
@@ -324,6 +350,23 @@ fn validated_configuration(args: &Args, path: &str) -> (ReadConfiguration, Owner
             args.json,
             "an in-memory database has no file to bound, so --disk-limit is invalid with \
              `:memory:`",
+        );
+    }
+
+    if args.maintenance_poll_ms == Some(0) {
+        refuse_invocation(
+            args.json,
+            "invalid maintenance configuration: --maintenance-poll-ms must be positive",
+        );
+    }
+    if path != ":memory:"
+        && !args.write
+        && (args.maintenance_poll_ms.is_some()
+            || !matches!(args.maintenance, MaintenanceMode::EngineOwned))
+    {
+        refuse_invocation(
+            args.json,
+            "maintenance configuration belongs to a writable database; add --write",
         );
     }
 
@@ -454,6 +497,7 @@ fn main() {
         let reader = match ReadSession::open_with_progress_in_runtime_dir(
             std::path::Path::new(&path),
             ReadSessionOptions {
+                memory_limit,
                 limits: read.limits,
                 timeouts: read.timeouts,
                 ..ReadSessionOptions::default()
@@ -552,6 +596,8 @@ fn main() {
             },
             memory_limit,
             disk_limit: if memory_backed { None } else { disk_limit },
+            maintenance_policy: args.maintenance.into(),
+            maintenance_poll_interval: args.maintenance_poll_ms.map(Duration::from_millis),
             ..DatabaseOpenOptions::default()
         },
     );

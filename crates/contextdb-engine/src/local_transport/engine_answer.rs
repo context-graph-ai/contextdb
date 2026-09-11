@@ -138,6 +138,20 @@ pub const TAG_OTHER: u16 = 47;
 /// still travel, so a caller learns what happened even though the class is not
 /// one this channel names.
 pub const TAG_UNKNOWN: u16 = 48;
+/// `USE VECTOR` requires a vector nearest-neighbour order in the same query.
+pub const TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER: u16 = 49;
+/// A vector partition declaration is structurally invalid.
+pub const TAG_INVALID_VECTOR_PARTITION_DECLARATION: u16 = 50;
+/// A write would create more local vector partitions than declared.
+pub const TAG_VECTOR_PARTITION_LIMIT_EXCEEDED: u16 = 51;
+/// An exhaustive vector search does not fit the active read budget.
+pub const TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED: u16 = 52;
+/// A requested indexed vector route is not currently complete.
+pub const TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE: u16 = 53;
+/// A broad relational filter has no bounded candidate route.
+pub const TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE: u16 = 54;
+/// Whole-index vector inspection was attempted through a constrained handle.
+pub const TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED: u16 = 55;
 
 /// The principal kinds, tagged explicitly rather than by declaration order.
 const PRINCIPAL_KIND_SYSTEM: u32 = 0;
@@ -178,7 +192,9 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
         | TAG_UNBOUNDED_TRAVERSAL
         | TAG_UNBOUNDED_VECTOR_SEARCH
         | TAG_USE_RANK_REQUIRES_VECTOR_ORDER
-        | TAG_USE_RANK_REQUIRES_LIMIT => &[],
+        | TAG_USE_RANK_REQUIRES_LIMIT
+        | TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER
+        | TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED => &[],
         TAG_READ_FAILURE => &[Failure],
         TAG_PARSE_ERROR
         | TAG_PLAN_ERROR
@@ -191,6 +207,7 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
         TAG_COLUMN_NOT_FOUND
         | TAG_INDEX_NOT_FOUND
         | TAG_UNKNOWN_VECTOR_INDEX
+        | TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE
         | TAG_RANK_POLICY_NOT_FOUND
         | TAG_RANK_POLICY_COLUMN_UNKNOWN
         | TAG_RANK_POLICY_COLUMN_AMBIGUOUS
@@ -198,6 +215,7 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
         | TAG_STORE_CORRUPTED
         | TAG_LEGACY_VECTOR_STORE_DETECTED
         | TAG_UNKNOWN => &[Word, Word],
+        TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE => &[Word, Word, WordSequence],
         TAG_COLUMN_TYPE_MISMATCH | TAG_RANK_POLICY_COLUMN_TYPE => &[Word, Word, Word, Word],
         TAG_PERSISTED_ROW_VECTOR_ROW_MISSING
         | TAG_PERSISTED_ROW_VECTOR_CELL_NULL
@@ -212,6 +230,9 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
         TAG_DATABASE_LOCKED => &[Number32, Word],
         TAG_MEMORY_BUDGET_EXCEEDED => &[Word, Word, Number64, Number64, Number64, Word],
         TAG_DISK_BUDGET_EXCEEDED => &[Word, Number64, Number64, Word],
+        TAG_INVALID_VECTOR_PARTITION_DECLARATION => &[Word, Word, Number32],
+        TAG_VECTOR_PARTITION_LIMIT_EXCEEDED => &[Word, Word, Number32],
+        TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED => &[Word, Word, Number64, Number64],
         _ => return None,
     })
 }
@@ -267,6 +288,13 @@ pub const ALL_TAGS: &[u16] = &[
     TAG_DISK_BUDGET_EXCEEDED,
     TAG_OTHER,
     TAG_UNKNOWN,
+    TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER,
+    TAG_INVALID_VECTOR_PARTITION_DECLARATION,
+    TAG_VECTOR_PARTITION_LIMIT_EXCEEDED,
+    TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
+    TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE,
+    TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE,
+    TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED,
 ];
 
 /// One engine answer, in the vocabulary this channel owns.
@@ -341,6 +369,33 @@ pub enum ReadChannelError {
     },
     UseRankRequiresVectorOrder,
     UseRankRequiresLimit,
+    UseVectorRequiresVectorOrder,
+    InvalidVectorPartitionDeclaration {
+        table: String,
+        column: String,
+        issue: u32,
+    },
+    VectorPartitionLimitExceeded {
+        table: String,
+        column: String,
+        max_partitions: u32,
+    },
+    VectorExactSearchBudgetExceeded {
+        table: String,
+        column: String,
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    VectorIndexedRouteUnavailable {
+        table: String,
+        column: String,
+    },
+    VectorFilteredRouteUnavailable {
+        table: String,
+        column: String,
+        predicate_columns: Vec<String>,
+    },
+    VectorWholeIndexInspectionDenied,
     RankPolicyNotFound {
         index: String,
         sort_key: String,
@@ -466,6 +521,15 @@ impl ReadChannelError {
             Self::PersistedRowVectorCellNull { .. } => TAG_PERSISTED_ROW_VECTOR_CELL_NULL,
             Self::UseRankRequiresVectorOrder => TAG_USE_RANK_REQUIRES_VECTOR_ORDER,
             Self::UseRankRequiresLimit => TAG_USE_RANK_REQUIRES_LIMIT,
+            Self::UseVectorRequiresVectorOrder => TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER,
+            Self::InvalidVectorPartitionDeclaration { .. } => {
+                TAG_INVALID_VECTOR_PARTITION_DECLARATION
+            }
+            Self::VectorPartitionLimitExceeded { .. } => TAG_VECTOR_PARTITION_LIMIT_EXCEEDED,
+            Self::VectorExactSearchBudgetExceeded { .. } => TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
+            Self::VectorIndexedRouteUnavailable { .. } => TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE,
+            Self::VectorFilteredRouteUnavailable { .. } => TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE,
+            Self::VectorWholeIndexInspectionDenied => TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED,
             Self::RankPolicyNotFound { .. } => TAG_RANK_POLICY_NOT_FOUND,
             Self::RankPolicyColumnUnknown { .. } => TAG_RANK_POLICY_COLUMN_UNKNOWN,
             Self::RankPolicyColumnAmbiguous { .. } => TAG_RANK_POLICY_COLUMN_AMBIGUOUS,
@@ -522,6 +586,44 @@ fn context_from_word(word: &str) -> Option<contextdb_core::types::ContextId> {
     uuid::Uuid::parse_str(word)
         .ok()
         .map(contextdb_core::types::ContextId)
+}
+
+fn vector_declaration_issue_code(
+    issue: contextdb_core::VectorPartitionDeclarationIssue,
+) -> Option<u32> {
+    use contextdb_core::VectorPartitionDeclarationIssue as Issue;
+    Some(match issue {
+        Issue::RequiresVectorColumn => 0,
+        Issue::EmptyPartitionKey => 1,
+        Issue::UnknownPartitionKeyColumn => 2,
+        Issue::NullablePartitionKeyColumn => 3,
+        Issue::UnsupportedPartitionKeyColumnType => 4,
+        Issue::DuplicatePartitionKeyColumn => 5,
+        Issue::VectorColumnInPartitionKey => 6,
+        Issue::MaxPartitionsWithoutPartitionKey => 7,
+        Issue::MaxPartitionsNotPositive => 8,
+        Issue::MaxPartitionsOutOfRange => 9,
+        _ => return None,
+    })
+}
+
+fn vector_declaration_issue_from_code(
+    code: u32,
+) -> Option<contextdb_core::VectorPartitionDeclarationIssue> {
+    use contextdb_core::VectorPartitionDeclarationIssue as Issue;
+    Some(match code {
+        0 => Issue::RequiresVectorColumn,
+        1 => Issue::EmptyPartitionKey,
+        2 => Issue::UnknownPartitionKeyColumn,
+        3 => Issue::NullablePartitionKeyColumn,
+        4 => Issue::UnsupportedPartitionKeyColumnType,
+        5 => Issue::DuplicatePartitionKeyColumn,
+        6 => Issue::VectorColumnInPartitionKey,
+        7 => Issue::MaxPartitionsWithoutPartitionKey,
+        8 => Issue::MaxPartitionsNotPositive,
+        9 => Issue::MaxPartitionsOutOfRange,
+        _ => return None,
+    })
 }
 
 impl From<&contextdb_core::Error> for ReadChannelError {
@@ -606,6 +708,53 @@ impl From<&contextdb_core::Error> for ReadChannelError {
             },
             Engine::UseRankRequiresVectorOrder => Self::UseRankRequiresVectorOrder,
             Engine::UseRankRequiresLimit => Self::UseRankRequiresLimit,
+            Engine::UseVectorRequiresVectorOrder => Self::UseVectorRequiresVectorOrder,
+            Engine::InvalidVectorPartitionDeclaration { index, issue } => {
+                match vector_declaration_issue_code(*issue) {
+                    Some(issue) => Self::InvalidVectorPartitionDeclaration {
+                        table: index.table.clone(),
+                        column: index.column.clone(),
+                        issue,
+                    },
+                    None => Self::Unknown {
+                        class_name: class_name_of(error),
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Engine::VectorPartitionLimitExceeded {
+                index,
+                max_partitions,
+            } => Self::VectorPartitionLimitExceeded {
+                table: index.table.clone(),
+                column: index.column.clone(),
+                max_partitions: *max_partitions,
+            },
+            Engine::VectorExactSearchBudgetExceeded {
+                index,
+                required_bytes,
+                available_bytes,
+            } => Self::VectorExactSearchBudgetExceeded {
+                table: index.table.clone(),
+                column: index.column.clone(),
+                required_bytes: *required_bytes,
+                available_bytes: *available_bytes,
+            },
+            Engine::VectorIndexedRouteUnavailable { index } => {
+                Self::VectorIndexedRouteUnavailable {
+                    table: index.table.clone(),
+                    column: index.column.clone(),
+                }
+            }
+            Engine::VectorFilteredRouteUnavailable {
+                index,
+                predicate_columns,
+            } => Self::VectorFilteredRouteUnavailable {
+                table: index.table.clone(),
+                column: index.column.clone(),
+                predicate_columns: predicate_columns.clone(),
+            },
+            Engine::VectorWholeIndexInspectionDenied => Self::VectorWholeIndexInspectionDenied,
             Engine::RankPolicyNotFound { index, sort_key } => Self::RankPolicyNotFound {
                 index: index.clone(),
                 sort_key: sort_key.clone(),
@@ -829,6 +978,54 @@ impl From<ReadChannelError> for contextdb_core::Error {
             }
             ReadChannelError::UseRankRequiresVectorOrder => Self::UseRankRequiresVectorOrder,
             ReadChannelError::UseRankRequiresLimit => Self::UseRankRequiresLimit,
+            ReadChannelError::UseVectorRequiresVectorOrder => Self::UseVectorRequiresVectorOrder,
+            ReadChannelError::InvalidVectorPartitionDeclaration {
+                table,
+                column,
+                issue,
+            } => match vector_declaration_issue_from_code(issue) {
+                Some(issue) => Self::InvalidVectorPartitionDeclaration {
+                    index: VectorIndexRef { table, column },
+                    issue,
+                },
+                None => Self::Other(
+                    "read channel carried an unknown vector declaration issue".to_owned(),
+                ),
+            },
+            ReadChannelError::VectorPartitionLimitExceeded {
+                table,
+                column,
+                max_partitions,
+            } => Self::VectorPartitionLimitExceeded {
+                index: VectorIndexRef { table, column },
+                max_partitions,
+            },
+            ReadChannelError::VectorExactSearchBudgetExceeded {
+                table,
+                column,
+                required_bytes,
+                available_bytes,
+            } => Self::VectorExactSearchBudgetExceeded {
+                index: VectorIndexRef { table, column },
+                required_bytes,
+                available_bytes,
+            },
+            ReadChannelError::VectorIndexedRouteUnavailable { table, column } => {
+                Self::VectorIndexedRouteUnavailable {
+                    index: VectorIndexRef { table, column },
+                }
+            }
+            ReadChannelError::VectorFilteredRouteUnavailable {
+                table,
+                column,
+                predicate_columns,
+            } => Self::VectorFilteredRouteUnavailable {
+                index: VectorIndexRef { table, column },
+                predicate_columns,
+            },
+            ReadChannelError::VectorWholeIndexInspectionDenied => {
+                Self::VectorWholeIndexInspectionDenied
+            }
             ReadChannelError::RankPolicyNotFound { index, sort_key } => {
                 Self::RankPolicyNotFound { index, sort_key }
             }
@@ -986,7 +1183,9 @@ impl Serialize for ReadChannelError {
             | Self::UnboundedTraversal
             | Self::UnboundedVectorSearch
             | Self::UseRankRequiresVectorOrder
-            | Self::UseRankRequiresLimit => document.serialize_element(&())?,
+            | Self::UseRankRequiresLimit
+            | Self::UseVectorRequiresVectorOrder
+            | Self::VectorWholeIndexInspectionDenied => document.serialize_element(&())?,
             Self::ReadFailure(failure) => document.serialize_element(failure)?,
             Self::ParseError { message }
             | Self::PlanError { message }
@@ -997,9 +1196,34 @@ impl Serialize for ReadChannelError {
                 document.serialize_element(table)?;
             }
             Self::StoreIdentityUnprovable { path } => document.serialize_element(path)?,
-            Self::ColumnNotFound { table, column } | Self::UnknownVectorIndex { table, column } => {
+            Self::ColumnNotFound { table, column }
+            | Self::UnknownVectorIndex { table, column }
+            | Self::VectorIndexedRouteUnavailable { table, column } => {
                 document.serialize_element(&(table, column))?;
             }
+            Self::VectorFilteredRouteUnavailable {
+                table,
+                column,
+                predicate_columns,
+            } => {
+                document.serialize_element(&(table, column, predicate_columns))?;
+            }
+            Self::VectorExactSearchBudgetExceeded {
+                table,
+                column,
+                required_bytes,
+                available_bytes,
+            } => document.serialize_element(&(table, column, required_bytes, available_bytes))?,
+            Self::InvalidVectorPartitionDeclaration {
+                table,
+                column,
+                issue,
+            } => document.serialize_element(&(table, column, issue))?,
+            Self::VectorPartitionLimitExceeded {
+                table,
+                column,
+                max_partitions,
+            } => document.serialize_element(&(table, column, max_partitions))?,
             Self::RankPolicyJoinTableUnknown { index, table } => {
                 document.serialize_element(&(index, table))?;
             }
@@ -1176,6 +1400,14 @@ impl<'de> Visitor<'de> for ReadChannelErrorVisitor {
                 body::<A, ()>(&mut sequence)?;
                 ReadChannelError::UseRankRequiresLimit
             }
+            TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER => {
+                body::<A, ()>(&mut sequence)?;
+                ReadChannelError::UseVectorRequiresVectorOrder
+            }
+            TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED => {
+                body::<A, ()>(&mut sequence)?;
+                ReadChannelError::VectorWholeIndexInspectionDenied
+            }
             TAG_READ_FAILURE => {
                 ReadChannelError::ReadFailure(body::<A, ReadFailure>(&mut sequence)?)
             }
@@ -1210,6 +1442,51 @@ impl<'de> Visitor<'de> for ReadChannelErrorVisitor {
             TAG_UNKNOWN_VECTOR_INDEX => {
                 let (table, column) = body::<A, (String, String)>(&mut sequence)?;
                 ReadChannelError::UnknownVectorIndex { table, column }
+            }
+            TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED => {
+                let (table, column, required_bytes, available_bytes) =
+                    body::<A, (String, String, u64, u64)>(&mut sequence)?;
+                ReadChannelError::VectorExactSearchBudgetExceeded {
+                    table,
+                    column,
+                    required_bytes,
+                    available_bytes,
+                }
+            }
+            TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE => {
+                let (table, column) = body::<A, (String, String)>(&mut sequence)?;
+                ReadChannelError::VectorIndexedRouteUnavailable { table, column }
+            }
+            TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE => {
+                let (table, column, predicate_columns) =
+                    body::<A, (String, String, Vec<String>)>(&mut sequence)?;
+                ReadChannelError::VectorFilteredRouteUnavailable {
+                    table,
+                    column,
+                    predicate_columns,
+                }
+            }
+            TAG_INVALID_VECTOR_PARTITION_DECLARATION => {
+                let (table, column, issue) = body::<A, (String, String, u32)>(&mut sequence)?;
+                if vector_declaration_issue_from_code(issue).is_none() {
+                    return Err(de::Error::custom(
+                        "read-channel vector declaration issue is unknown",
+                    ));
+                }
+                ReadChannelError::InvalidVectorPartitionDeclaration {
+                    table,
+                    column,
+                    issue,
+                }
+            }
+            TAG_VECTOR_PARTITION_LIMIT_EXCEEDED => {
+                let (table, column, max_partitions) =
+                    body::<A, (String, String, u32)>(&mut sequence)?;
+                ReadChannelError::VectorPartitionLimitExceeded {
+                    table,
+                    column,
+                    max_partitions,
+                }
             }
             TAG_INDEX_NOT_FOUND => {
                 let (table, index) = body::<A, (String, String)>(&mut sequence)?;

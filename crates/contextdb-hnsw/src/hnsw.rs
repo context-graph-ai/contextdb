@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, binary_heap::BinaryHeap};
 use log::trace;
 use log::{debug, info};
 
+use crate::datamap::DataMap;
 pub use crate::filter::FilterT;
 use anndists::dist::distances::Distance;
 
@@ -125,12 +126,48 @@ impl Neighbour {
 
 //=======================================================================================
 
+struct MappedPointData<T> {
+    backing: Arc<DataMap>,
+    origin_id: DataId,
+    get_data: for<'a> fn(&'a DataMap, &DataId) -> &'a [T],
+}
+
+impl<T> Clone for MappedPointData<T> {
+    fn clone(&self) -> Self {
+        Self {
+            backing: Arc::clone(&self.backing),
+            origin_id: self.origin_id,
+            get_data: self.get_data,
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for MappedPointData<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MappedPointData")
+            .field("origin_id", &self.origin_id)
+            .finish_non_exhaustive()
+    }
+}
+
+fn get_mapped_point_data<'a, T>(backing: &'a DataMap, origin_id: &DataId) -> &'a [T]
+where
+    T: Clone + std::fmt::Debug,
+{
+    backing
+        .get_data::<T>(origin_id)
+        .expect("mapped HNSW point is missing from its owned backing")
+}
+
 #[derive(Debug, Clone)]
 enum PointData<'b, T: Clone + Send + Sync + 'b> {
     // full data
     V(Vec<T>),
-    // areference to a mmaped slice
+    // a reference to an externally owned mmaped slice (legacy API)
     S(&'b [T]),
+    // a mmaped point that owns the mapping from which each temporary slice is read
+    M(MappedPointData<T>),
 } // end of enum PointData
 
 impl<'b, T: Clone + Send + Sync + 'b> PointData<'b, T> {
@@ -144,10 +181,22 @@ impl<'b, T: Clone + Send + Sync + 'b> PointData<'b, T> {
         PointData::S(s)
     }
 
+    fn new_m(backing: Arc<DataMap>, origin_id: DataId) -> Self
+    where
+        T: 'static + std::fmt::Debug,
+    {
+        PointData::M(MappedPointData {
+            backing,
+            origin_id,
+            get_data: get_mapped_point_data::<T>,
+        })
+    }
+
     fn get_v(&self) -> &[T] {
         match self {
             PointData::V(v) => v.as_slice(),
             PointData::S(s) => s,
+            PointData::M(mapped) => (mapped.get_data)(mapped.backing.as_ref(), &mapped.origin_id),
         }
     } // end of get_v
 } // end of impl block for PointData
@@ -156,7 +205,8 @@ impl<'b, T: Clone + Send + Sync + 'b> PointData<'b, T> {
 /// Its constains data as coming from the client, its client id,
 /// and position in layer representation and neighbours.
 ///
-// neighbours table : one vector by layer so neighbours is allocated to NB_LAYER_MAX
+// Store headers only through the point's highest populated or assigned layer. Public/durable views
+// still expose NB_LAYER_MAX layers, padding absent layers with empty lists.
 //
 #[derive(Debug, Clone)]
 #[allow(clippy::type_complexity)]
@@ -168,16 +218,17 @@ pub struct Point<'b, T: Clone + Send + Sync> {
     /// a point id identifying point as stored in our structure
     p_id: PointId,
     /// neighbours info
-    pub(crate) neighbours: Arc<RwLock<Vec<Vec<Arc<PointWithOrder<'b, T>>>>>>,
+    // Edges share the destination point, without a separate allocation and
+    // reference count for each immutable distance record.
+    pub(crate) neighbours: Arc<RwLock<Vec<Vec<PointWithOrder<'b, T>>>>>,
 }
 
 impl<'b, T: Clone + Send + Sync> Point<'b, T> {
     pub fn new(v: Vec<T>, origin_id: usize, p_id: PointId) -> Self {
-        let mut neighbours = Vec::with_capacity(NB_LAYER_MAX as usize);
-        // CAVEAT, perhaps pass nb layer as arg ?
-        for _ in 0..NB_LAYER_MAX {
-            neighbours.push(Vec::<Arc<PointWithOrder<T>>>::new());
-        }
+        let layer_count = usize::from(p_id.0)
+            .saturating_add(1)
+            .min(NB_LAYER_MAX as usize);
+        let neighbours = (0..layer_count).map(|_| Vec::new()).collect();
         Point {
             data: PointData::new_v(v),
             origin_id,
@@ -187,13 +238,32 @@ impl<'b, T: Clone + Send + Sync> Point<'b, T> {
     }
 
     pub fn new_from_mmap(s: &'b [T], origin_id: usize, p_id: PointId) -> Self {
-        let mut neighbours = Vec::with_capacity(NB_LAYER_MAX as usize);
-        // CAVEAT, perhaps pass nb layer as arg ?
-        for _ in 0..NB_LAYER_MAX {
-            neighbours.push(Vec::<Arc<PointWithOrder<T>>>::new());
-        }
+        let layer_count = usize::from(p_id.0)
+            .saturating_add(1)
+            .min(NB_LAYER_MAX as usize);
+        let neighbours = (0..layer_count).map(|_| Vec::new()).collect();
         Point {
             data: PointData::new_s(s),
+            origin_id,
+            p_id,
+            neighbours: Arc::new(RwLock::new(neighbours)),
+        }
+    }
+
+    pub(crate) fn new_from_owned_mmap(
+        backing: Arc<DataMap>,
+        origin_id: usize,
+        p_id: PointId,
+    ) -> Self
+    where
+        T: 'static + std::fmt::Debug,
+    {
+        let layer_count = usize::from(p_id.0)
+            .saturating_add(1)
+            .min(NB_LAYER_MAX as usize);
+        let neighbours = (0..layer_count).map(|_| Vec::new()).collect();
+        Point {
+            data: PointData::new_m(backing, origin_id),
             origin_id,
             p_id,
             neighbours: Arc::new(RwLock::new(neighbours)),
@@ -219,14 +289,15 @@ impl<'b, T: Clone + Send + Sync> Point<'b, T> {
     /// useful for extern crate only as it reallocates vectors
     pub fn get_neighborhood_id(&self) -> Vec<Vec<Neighbour>> {
         let ref_neighbours = self.neighbours.read();
-        let nb_layer = ref_neighbours.len();
+        let nb_layer = NB_LAYER_MAX as usize;
         let mut neighborhood = Vec::<Vec<Neighbour>>::with_capacity(nb_layer);
         for i in 0..nb_layer {
             let mut neighbours = Vec::<Neighbour>::new();
-            let nb_ngbh = ref_neighbours[i].len();
+            let layer = ref_neighbours.get(i).map(Vec::as_slice).unwrap_or_default();
+            let nb_ngbh = layer.len();
             if nb_ngbh > 0usize {
                 neighbours.reserve(nb_ngbh);
-                for pointwo in &ref_neighbours[i] {
+                for pointwo in layer {
                     neighbours.push(Neighbour::new(
                         pointwo.point_ref.get_origin_id(),
                         pointwo.dist_to_ref,
@@ -646,6 +717,11 @@ impl<'b, T: Clone + Send + Sync> PointIndexation<'b, T> {
         }
     } // end of get_point
 
+    /// Borrow one resident graph payload by physical identity without copying it.
+    pub fn with_point_data<R>(&self, p_id: &PointId, f: impl FnOnce(&[T]) -> R) -> Option<R> {
+        self.get_point(p_id).map(|point| f(point.data.get_v()))
+    }
+
     /// get an iterator on the points stored in a given layer
     pub fn get_layer_iterator<'a>(&'a self, layer: usize) -> IterPointLayer<'a, 'b, T> {
         IterPointLayer::new(self, layer)
@@ -694,8 +770,10 @@ impl<'b, T: Clone + Send + Sync> Iterator for IterPoint<'_, 'b, T> {
             self.layer += 1;
             // must reach a non empty layer if possible
             let entry_point_ref = self.point_indexation.entry_point.read();
+            // A graph without an entry point holds no points: there is no
+            // upper layer to reach.
+            let entry_point_level = entry_point_ref.as_ref()?.p_id.0;
             let points_by_layer = self.point_indexation.points_by_layer.read();
-            let entry_point_level = entry_point_ref.as_ref().unwrap().p_id.0;
             while (self.layer as u8) <= entry_point_level
                 && points_by_layer[self.layer as usize].is_empty()
             {
@@ -791,7 +869,169 @@ pub struct Hnsw<'b, T: Clone + Send + Sync + 'b, D: Distance<T>> {
     pub(crate) searching: bool,
     /// set to true if some data come from a mmap
     pub(crate) datamap_opt: bool,
+    /// Controls low-level insertion. Fresh graphs and the legacy raw loader
+    /// retain their historical behavior; the owned lifecycle facade seals it.
+    pub(crate) insertable: bool,
 } // end of Hnsw
+
+/// An owned graph reconstructed from durable state.
+///
+/// This facade deliberately exposes no insertion method, `Deref`, or inner
+/// graph handle. The graph field is declared before the optional mapping guard,
+/// so Rust drops the graph (and every point) before releasing the final guard
+/// that keeps mmap storage alive.
+pub struct LoadedHnsw<T, D>
+where
+    T: Clone + Send + Sync + 'static,
+    D: Distance<T>,
+{
+    graph: Hnsw<'static, T, D>,
+    backing: Option<Arc<DataMap>>,
+}
+
+impl<T, D> LoadedHnsw<T, D>
+where
+    T: Clone + Send + Sync + 'static,
+    D: Distance<T> + Send + Sync,
+{
+    pub(crate) fn from_loaded_parts(
+        mut graph: Hnsw<'static, T, D>,
+        backing: Option<Arc<DataMap>>,
+    ) -> Self {
+        graph.insertable = false;
+        Self { graph, backing }
+    }
+
+    /// Whether point data is retained through a read-only mmap backing.
+    pub fn is_mmap_backed(&self) -> bool {
+        self.backing.is_some()
+    }
+
+    /// Loaded graphs are sealed; this is explicit for lifecycle inspection.
+    pub fn is_insertable(&self) -> bool {
+        self.graph.is_insertable()
+    }
+
+    pub fn get_ef_construction(&self) -> usize {
+        self.graph.get_ef_construction()
+    }
+
+    pub fn get_max_level(&self) -> usize {
+        self.graph.get_max_level()
+    }
+
+    pub fn get_max_level_observed(&self) -> u8 {
+        self.graph.get_max_level_observed()
+    }
+
+    pub fn get_max_nb_connection(&self) -> usize {
+        self.graph.get_max_nb_connection()
+    }
+
+    pub fn get_nb_point(&self) -> usize {
+        self.graph.get_nb_point()
+    }
+
+    pub fn get_distance_name(&self) -> String {
+        self.graph.get_distance_name()
+    }
+
+    pub fn get_distance(&self) -> &D {
+        self.graph.get_distance()
+    }
+
+    pub fn get_point_indexation(&self) -> &PointIndexation<'static, T> {
+        self.graph.get_point_indexation()
+    }
+
+    pub fn search_filter(
+        &self,
+        data: &[T],
+        knbn: usize,
+        ef_arg: usize,
+        filter: Option<&dyn FilterT>,
+    ) -> Vec<Neighbour> {
+        self.graph.search_filter(data, knbn, ef_arg, filter)
+    }
+
+    pub fn search(&self, data: &[T], knbn: usize, ef_arg: usize) -> Vec<Neighbour> {
+        self.graph.search(data, knbn, ef_arg)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_bounded_control<E, S, Dst, A, R>(
+        &self,
+        data: &[T],
+        knbn: usize,
+        ef_arg: usize,
+        before_source_entry: S,
+        before_distance: Dst,
+        acquire: A,
+        release: R,
+    ) -> std::result::Result<HnswSearchResult, HnswBoundedSearchError<E>>
+    where
+        S: FnMut() -> std::result::Result<(), E>,
+        Dst: FnMut() -> std::result::Result<(), E>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
+    {
+        self.graph.search_with_bounded_control(
+            data,
+            knbn,
+            ef_arg,
+            before_source_entry,
+            before_distance,
+            acquire,
+            release,
+        )
+    }
+
+    /// Bounded traversal that charges only graph nodes admitted by `allowed`.
+    /// A sparse allowed set therefore cannot turn excluded history into
+    /// request-owned visit or distance work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_allowed_with_bounded_control<E, S, Dst, A, R, F>(
+        &self,
+        data: &[T],
+        required_results: usize,
+        ef_arg: usize,
+        limits: HnswAllowedSearchLimits,
+        seed_points: &[PointId],
+        allowed_count: usize,
+        candidate_key: impl FnMut(usize) -> u64,
+        allowed: F,
+        before_source_entry: S,
+        before_distance: Dst,
+        acquire: A,
+        release: R,
+    ) -> std::result::Result<HnswAllowedSearchResult, HnswBoundedSearchError<E>>
+    where
+        S: FnMut() -> std::result::Result<(), E>,
+        Dst: FnMut() -> std::result::Result<(), E>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
+        F: FnMut(usize) -> bool,
+    {
+        self.graph.search_allowed_with_bounded_control(
+            data,
+            required_results,
+            ef_arg,
+            limits,
+            seed_points,
+            allowed_count,
+            candidate_key,
+            allowed,
+            before_source_entry,
+            before_distance,
+            acquire,
+            release,
+        )
+    }
+
+    pub fn parallel_search(&self, data: &[Vec<T>], knbn: usize, ef: usize) -> Vec<Vec<Neighbour>> {
+        self.graph.parallel_search(data, knbn, ef)
+    }
+}
 
 /// The owned element storage of one search-local HNSW container.  The event
 /// intentionally reports only collection capacity and element size; it does
@@ -839,6 +1079,119 @@ pub enum HnswSearchScratchEvent {
 #[derive(Debug)]
 pub struct HnswSearchResult {
     pub neighbours: Vec<Neighbour>,
+}
+
+/// Hard limits for an allowed-id HNSW traversal.  These limits are owned by
+/// the traversal itself: a caller cannot accidentally turn a sparse allowed
+/// set into a walk of the entire bottom layer by merely supplying a filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswAllowedSearchLimits {
+    /// Distinct graph nodes admitted to the traversal, including upper-layer
+    /// routing nodes and lower-layer candidates.
+    pub max_visited_nodes: usize,
+    /// Vector distance evaluations.  This is separate from node visits so a
+    /// caller can account for raw-vector work directly.
+    pub max_vector_evaluations: usize,
+}
+
+/// Why an allowed-id traversal could not assemble the number of candidates
+/// the caller said it needs.  Callers must treat this as a refusal/retry
+/// signal, never as a complete partial result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswAllowedSearchIncomplete {
+    VisitLimitReached,
+    VectorEvaluationLimitReached,
+    InsufficientAllowedCandidates,
+}
+
+/// Completion state of an allowed-id traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswAllowedSearchStatus {
+    Complete,
+    Incomplete(HnswAllowedSearchIncomplete),
+}
+
+/// Result of a bounded allowed-id traversal.  `neighbours` are useful only
+/// when `status` is `Complete`; they remain present on `Incomplete` solely for
+/// diagnostics and are never a complete answer.
+#[derive(Debug)]
+pub struct HnswAllowedSearchResult {
+    pub neighbours: Vec<Neighbour>,
+    pub status: HnswAllowedSearchStatus,
+    pub visited_nodes: usize,
+    pub vector_evaluations: usize,
+    pub allowed_admissions: usize,
+}
+
+struct HnswAllowedTraversal {
+    limits: HnswAllowedSearchLimits,
+    visited_nodes: usize,
+    vector_evaluations: usize,
+    allowed_admissions: usize,
+}
+
+impl HnswAllowedTraversal {
+    fn new(limits: HnswAllowedSearchLimits) -> Self {
+        Self {
+            limits,
+            visited_nodes: 0,
+            vector_evaluations: 0,
+            allowed_admissions: 0,
+        }
+    }
+
+    fn visit<E>(
+        &mut self,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<
+        std::result::Result<(), HnswAllowedSearchIncomplete>,
+        HnswBoundedSearchError<E>,
+    > {
+        if self.visited_nodes >= self.limits.max_visited_nodes {
+            return Ok(Err(HnswAllowedSearchIncomplete::VisitLimitReached));
+        }
+        // The callback is deliberately before every entered graph node so
+        // cancellation is observed even when the budget has plenty of room.
+        before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+        self.visited_nodes += 1;
+        Ok(Ok(()))
+    }
+
+    fn distance<E>(
+        &mut self,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<
+        std::result::Result<(), HnswAllowedSearchIncomplete>,
+        HnswBoundedSearchError<E>,
+    > {
+        if self.vector_evaluations >= self.limits.max_vector_evaluations {
+            return Ok(Err(
+                HnswAllowedSearchIncomplete::VectorEvaluationLimitReached,
+            ));
+        }
+        before_distance().map_err(HnswBoundedSearchError::Callback)?;
+        self.vector_evaluations += 1;
+        Ok(Ok(()))
+    }
+
+    fn result(
+        &self,
+        neighbours: Vec<Neighbour>,
+        status: HnswAllowedSearchStatus,
+    ) -> HnswAllowedSearchResult {
+        HnswAllowedSearchResult {
+            neighbours,
+            status,
+            visited_nodes: self.visited_nodes,
+            vector_evaluations: self.vector_evaluations,
+            allowed_admissions: self.allowed_admissions,
+        }
+    }
+}
+
+struct HnswAllowedLayerResult<'a, T: Clone + Send + Sync> {
+    points: BinaryHeap<PointWithOrder<'a, T>>,
+    incomplete: Option<HnswAllowedSearchIncomplete>,
 }
 
 /// Failure from the additive bounded search API. Callback errors retain their
@@ -1092,7 +1445,7 @@ impl<'a, E> QueryScratchControl<'a, E> {
 
 impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     /// allocation function
-    /// . max_nb_connection : number of neighbours stored, by layer, in tables. Must be less than 256.
+    /// . max_nb_connection : number of neighbours stored, by layer, in tables.
     /// . ef_construction : controls numbers of neighbours explored during construction. See README or paper.
     /// . max_elements : hint to speed up allocation tables. number of elements expected.
     /// . f : the distance function
@@ -1148,12 +1501,6 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         );
         let extend_candidates = false;
         let keep_pruned = false;
-        //
-        if max_nb_connection > 256 {
-            println!("error max_nb_connection must be less equal than 256");
-            std::process::exit(1);
-        }
-        //
         info!("Hnsw max_nb_connection {:?}", max_nb_connection);
         info!("Hnsw nb elements {:?}", max_elements);
         info!("Hnsw ef_construction {:?}", ef_construction);
@@ -1171,6 +1518,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
             dist_f: f,
             searching: false,
             datamap_opt: false,
+            insertable: true,
         }
     } // end of new_with_seed
 
@@ -1188,12 +1536,18 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         self.layer_indexed_points.get_max_level_observed()
     }
     /// returns the maximum of links between a point and others points in each layer
-    pub fn get_max_nb_connection(&self) -> u8 {
-        self.max_nb_connection as u8
+    pub fn get_max_nb_connection(&self) -> usize {
+        self.max_nb_connection
     }
     /// returns number of points stored in hnsw structure
     pub fn get_nb_point(&self) -> usize {
         self.layer_indexed_points.get_nb_point()
+    }
+
+    /// Whether this low-level graph handle accepts incremental insertion.
+    /// ContextDB's owned loaded-graph facade always reports `false`.
+    pub fn is_insertable(&self) -> bool {
+        self.insertable
     }
     /// set searching mode.
     /// It is not possible to do parallel insertion and parallel searching simultaneously in different threads
@@ -1290,7 +1644,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         ef: usize,
         layer: u8,
         filter: Option<&dyn FilterT>,
-    ) -> BinaryHeap<Arc<PointWithOrder<'b, T>>> {
+    ) -> BinaryHeap<PointWithOrder<'b, T>> {
         //
         trace!(
             "entering search_layer with entry_point_id {:?} layer : {:?} ef {:?} ",
@@ -1301,7 +1655,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         // log2(skiplist_size) must be greater than 1.
         let skiplist_size = ef.max(2);
         // we will store positive distances in this one
-        let mut return_points = BinaryHeap::<Arc<PointWithOrder<T>>>::with_capacity(skiplist_size);
+        let mut return_points = BinaryHeap::<PointWithOrder<T>>::with_capacity(skiplist_size);
         //
         if self.layer_indexed_points.points_by_layer.read()[layer as usize].is_empty() {
             // at the beginning we can have nothing in layer
@@ -1319,16 +1673,9 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         let mut visited_point_id = HashMap::<PointId, Arc<Point<T>>>::new();
         visited_point_id.insert(entry_point.p_id, Arc::clone(&entry_point));
         //
-        let mut candidate_points =
-            BinaryHeap::<Arc<PointWithOrder<T>>>::with_capacity(skiplist_size);
-        candidate_points.push(Arc::new(PointWithOrder::new(
-            &entry_point,
-            -dist_to_entry_point,
-        )));
-        return_points.push(Arc::new(PointWithOrder::new(
-            &entry_point,
-            dist_to_entry_point,
-        )));
+        let mut candidate_points = BinaryHeap::<PointWithOrder<T>>::with_capacity(skiplist_size);
+        candidate_points.push(PointWithOrder::new(&entry_point, -dist_to_entry_point));
+        return_points.push(PointWithOrder::new(&entry_point, dist_to_entry_point));
         // at the beginning candidate_points contains point passed as arg in layer entry_point_id.0
         while !candidate_points.is_empty() {
             // get nearest point in candidate_points
@@ -1367,7 +1714,11 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
             // now we scan neighborhood of c in layer and increment visited_point, candidate_points
             // and optimize candidate_points so that it contains points with lowest distances to point arg
             //
-            let neighbours_c_l = &c.point_ref.neighbours.read()[layer as usize];
+            let neighbours_guard = c.point_ref.neighbours.read();
+            let neighbours_c_l = neighbours_guard
+                .get(layer as usize)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             let c_pid = c.point_ref.p_id;
             trace!(
                 "       search_layer, {:?} has  nb neighbours  : {:?} ",
@@ -1390,16 +1741,15 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     let e_dist_to_p = self.dist_f.eval(point, e.point_ref.data.get_v());
                     let f_dist_to_p = f.dist_to_ref;
                     if e_dist_to_p < f_dist_to_p || return_points.len() < ef {
-                        let e_prime = Arc::new(PointWithOrder::new(&e.point_ref, e_dist_to_p));
+                        let e_prime = PointWithOrder::new(&e.point_ref, e_dist_to_p);
                         // a neighbour of neighbour is better, we insert it into candidate with the distance to point
                         trace!(
                             "                inserting new candidate {:?}",
                             e_prime.point_ref.p_id
                         );
-                        candidate_points
-                            .push(Arc::new(PointWithOrder::new(&e.point_ref, -e_dist_to_p)));
+                        candidate_points.push(PointWithOrder::new(&e.point_ref, -e_dist_to_p));
                         if filter.is_none() {
-                            return_points.push(Arc::clone(&e_prime));
+                            return_points.push(e_prime.clone());
                         } else {
                             let id: &usize = &e_prime.point_ref.get_origin_id();
                             if filter.as_ref().unwrap().hnsw_filter(id) {
@@ -1409,7 +1759,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                                         return_points.clear()
                                     }
                                 }
-                                return_points.push(Arc::clone(&e_prime))
+                                return_points.push(e_prime.clone())
                             }
                         }
                         if return_points.len() > ef {
@@ -1490,12 +1840,15 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                         "candidate-heap distance",
                     ));
                 }
-                if -candidate.dist_to_ref > farthest.dist_to_ref {
+                if return_points.len() >= ef && -candidate.dist_to_ref > farthest.dist_to_ref {
                     break;
                 }
                 before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
                 let neighbours_guard = candidate.point_ref.neighbours.read();
-                let neighbours = &neighbours_guard[layer as usize];
+                let neighbours = neighbours_guard
+                    .get(layer as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 let mut neighbour_position = 0usize;
                 while neighbour_position < neighbours.len() {
                     before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
@@ -1575,6 +1928,293 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_allowed_search_layer<E, F>(
+        &self,
+        point: &[T],
+        entry_point: Arc<Point<'b, T>>,
+        required_results: usize,
+        ef: usize,
+        seed_points: &[PointId],
+        allowed_count: usize,
+        candidate_key: &mut dyn FnMut(usize) -> u64,
+        allow_bridges: bool,
+        layer: u8,
+        allowed: &mut F,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), E>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), E>,
+        scratch: &mut QueryScratchControl<'_, E>,
+        traversal: &mut HnswAllowedTraversal,
+    ) -> std::result::Result<HnswAllowedLayerResult<'b, T>, HnswBoundedSearchError<E>>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let mut return_points = BinaryHeap::<PointWithOrder<T>>::new();
+        before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+        if self.layer_indexed_points.points_by_layer.read()[layer as usize].is_empty() {
+            return Ok(HnswAllowedLayerResult {
+                points: return_points,
+                incomplete: Some(HnswAllowedSearchIncomplete::InsufficientAllowedCandidates),
+            });
+        }
+        if entry_point.p_id.1 < 0 {
+            return Ok(HnswAllowedLayerResult {
+                points: return_points,
+                incomplete: Some(HnswAllowedSearchIncomplete::InsufficientAllowedCandidates),
+            });
+        }
+
+        let mut visited_point_ids = HashSet::<PointId>::new();
+        let mut candidate_points = BinaryHeap::<PointWithOrder<T>>::new();
+        let search = (|| {
+            scratch.ensure_set_capacity(
+                HnswSearchScratchContainer::VisitedPoints,
+                &mut visited_point_ids,
+                1,
+                "visited points",
+                before_source_entry,
+            )?;
+            visited_point_ids.insert(entry_point.p_id);
+            scratch.ensure_heap_capacity(
+                HnswSearchScratchContainer::CandidateHeap,
+                &mut candidate_points,
+                1,
+                "candidate heap",
+                before_source_entry,
+            )?;
+            candidate_points.push(PointWithOrder::new(&entry_point, 0.0));
+
+            let entry_distance = if allow_bridges || allowed(entry_point.origin_id) {
+                match traversal.distance(before_distance)? {
+                    Ok(()) => {}
+                    Err(reason) => return Ok(Some(reason)),
+                }
+                self.dist_f.eval(point, entry_point.data.get_v())
+            } else {
+                0.0
+            };
+            candidate_points.clear();
+            candidate_points.push(PointWithOrder::new(&entry_point, -entry_distance));
+            if allowed(entry_point.origin_id) {
+                traversal.allowed_admissions += 1;
+                scratch.ensure_heap_capacity(
+                    HnswSearchScratchContainer::ReturnHeap,
+                    &mut return_points,
+                    1,
+                    "return heap",
+                    before_source_entry,
+                )?;
+                return_points.push(PointWithOrder::new(&entry_point, entry_distance));
+            }
+
+            // Relationally selected row identities seed separate allowed graph
+            // components. Every seed is a real graph point and pays the same
+            // visit, distance, cancellation and scratch costs as a neighbor.
+            for seed in seed_points {
+                before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                if visited_point_ids.contains(seed) {
+                    continue;
+                }
+                let Some(seed) = self.layer_indexed_points.get_point(seed) else {
+                    continue;
+                };
+                if !allowed(seed.origin_id) {
+                    continue;
+                }
+                match traversal.visit(before_source_entry)? {
+                    Ok(()) => {}
+                    Err(reason) => return Ok(Some(reason)),
+                }
+                match traversal.distance(before_distance)? {
+                    Ok(()) => {}
+                    Err(reason) => return Ok(Some(reason)),
+                }
+                let distance = self.dist_f.eval(point, seed.data.get_v());
+                let seed_capacity = visited_point_ids.len().saturating_add(1);
+                scratch.ensure_set_capacity(
+                    HnswSearchScratchContainer::VisitedPoints,
+                    &mut visited_point_ids,
+                    seed_capacity,
+                    "seed visits",
+                    before_source_entry,
+                )?;
+                visited_point_ids.insert(seed.p_id);
+                scratch.ensure_heap_capacity(
+                    HnswSearchScratchContainer::CandidateHeap,
+                    &mut candidate_points,
+                    seed_capacity,
+                    "seed candidates",
+                    before_source_entry,
+                )?;
+                candidate_points.push(PointWithOrder::new(&seed, -distance));
+                scratch.ensure_heap_capacity(
+                    HnswSearchScratchContainer::ReturnHeap,
+                    &mut return_points,
+                    seed_capacity,
+                    "seed results",
+                    before_source_entry,
+                )?;
+                let key = candidate_key(seed.origin_id);
+                let previous = return_points
+                    .iter()
+                    .find(|point| candidate_key(point.point_ref.origin_id) == key)
+                    .map(|point| point.dist_to_ref);
+                if previous.is_none_or(|old| distance < old) {
+                    return_points.retain(|point| candidate_key(point.point_ref.origin_id) != key);
+                    return_points.push(PointWithOrder::new(&seed, distance));
+                }
+                if return_points.len() > ef {
+                    return_points.pop();
+                }
+                traversal.allowed_admissions += 1;
+            }
+
+            while let Some(candidate) = candidate_points.pop() {
+                // All logical identities supplied by this graph are already
+                // candidates. Native snapshot scoring decides their order;
+                // revisiting historical occurrences cannot add another row.
+                if return_points.len() >= allowed_count {
+                    break;
+                }
+                if return_points.len() >= ef {
+                    let farthest =
+                        return_points
+                            .peek()
+                            .ok_or(HnswBoundedSearchError::SearchInvariant(
+                                "allowed return heap",
+                            ))?;
+                    if return_points.len() >= ef && -candidate.dist_to_ref > farthest.dist_to_ref {
+                        break;
+                    }
+                }
+                before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                let neighbours_guard = candidate.point_ref.neighbours.read();
+                let neighbours = neighbours_guard
+                    .get(layer as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let mut consider = |point_ref: &Arc<Point<'b, T>>| -> std::result::Result<
+                    Option<HnswAllowedSearchIncomplete>,
+                    HnswBoundedSearchError<E>,
+                > {
+                    before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                    if visited_point_ids.contains(&point_ref.p_id) {
+                        return Ok(None);
+                    }
+                    if !allow_bridges && !allowed(point_ref.origin_id) {
+                        return Ok(None);
+                    }
+                    match traversal.visit(before_source_entry)? {
+                        Ok(()) => {}
+                        Err(reason) => return Ok(Some(reason)),
+                    }
+                    let next_visited = visited_point_ids
+                        .len()
+                        .checked_add(1)
+                        .ok_or(HnswBoundedSearchError::CapacityOverflow("visited points"))?;
+                    scratch.ensure_set_capacity(
+                        HnswSearchScratchContainer::VisitedPoints,
+                        &mut visited_point_ids,
+                        next_visited,
+                        "visited points",
+                        before_source_entry,
+                    )?;
+                    visited_point_ids.insert(point_ref.p_id);
+                    match traversal.distance(before_distance)? {
+                        Ok(()) => {}
+                        Err(reason) => return Ok(Some(reason)),
+                    }
+                    let distance = self.dist_f.eval(point, point_ref.data.get_v());
+                    let next_candidates = candidate_points
+                        .len()
+                        .checked_add(1)
+                        .ok_or(HnswBoundedSearchError::CapacityOverflow("candidate heap"))?;
+                    scratch.ensure_heap_capacity(
+                        HnswSearchScratchContainer::CandidateHeap,
+                        &mut candidate_points,
+                        next_candidates,
+                        "candidate heap",
+                        before_source_entry,
+                    )?;
+                    candidate_points.push(PointWithOrder::new(point_ref, -distance));
+                    if !allowed(point_ref.origin_id) {
+                        return Ok(None);
+                    }
+                    traversal.allowed_admissions += 1;
+                    let next_returns = return_points
+                        .len()
+                        .checked_add(1)
+                        .ok_or(HnswBoundedSearchError::CapacityOverflow("return heap"))?;
+                    scratch.ensure_heap_capacity(
+                        HnswSearchScratchContainer::ReturnHeap,
+                        &mut return_points,
+                        next_returns,
+                        "return heap",
+                        before_source_entry,
+                    )?;
+                    let key = candidate_key(point_ref.origin_id);
+                    let previous = return_points
+                        .iter()
+                        .find(|point| candidate_key(point.point_ref.origin_id) == key)
+                        .map(|point| point.dist_to_ref);
+                    if previous.is_none_or(|old| distance < old) {
+                        return_points
+                            .retain(|point| candidate_key(point.point_ref.origin_id) != key);
+                        return_points.push(PointWithOrder::new(point_ref, distance));
+                    }
+                    if return_points.len() > ef {
+                        return_points.pop();
+                    }
+                    Ok(None)
+                };
+                for neighbour in neighbours {
+                    if let Some(reason) = consider(&neighbour.point_ref)? {
+                        return Ok(Some(reason));
+                    }
+                    if !allow_bridges && allowed_count < self.get_nb_point() {
+                        // A residual predicate can disconnect adjacent allowed
+                        // points. Traverse a fixed second hop through graph
+                        // links without measuring excluded vectors. The degree
+                        // bounds this work; every inspected point still reaches
+                        // the request's cancellation and source-work control.
+                        let bridges = neighbour.point_ref.neighbours.read();
+                        for bridge in bridges
+                            .get(layer as usize)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default()
+                        {
+                            if let Some(reason) = consider(&bridge.point_ref)? {
+                                return Ok(Some(reason));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        })();
+        scratch.release_heap(HnswSearchScratchContainer::CandidateHeap, &candidate_points);
+        scratch.release_set(
+            HnswSearchScratchContainer::VisitedPoints,
+            &visited_point_ids,
+        );
+        match search {
+            Ok(incomplete) => {
+                let incomplete = incomplete.or_else(|| {
+                    (return_points.len() < required_results)
+                        .then_some(HnswAllowedSearchIncomplete::InsufficientAllowedCandidates)
+                });
+                Ok(HnswAllowedLayerResult {
+                    points: return_points,
+                    incomplete,
+                })
+            }
+            Err(error) => {
+                scratch.release_heap(HnswSearchScratchContainer::ReturnHeap, &return_points);
+                Err(error)
+            }
+        }
+    }
+
     /// insert a tuple (&Vec, usize) with its external id as given by the client.
     ///  The insertion method gives the point an internal id.
     #[inline]
@@ -1587,6 +2227,15 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     ///  The insertion method gives the point an internal id.
     ///  The slice insertion makes integration with ndarray crate easier than the vector insertion
     pub fn insert_slice(&self, data_with_id: (&[T], usize)) {
+        self.insert_slice_with_point_id(data_with_id);
+    }
+
+    /// Insert and return the physical graph identity for direct candidate routing.
+    pub fn insert_slice_with_point_id(&self, data_with_id: (&[T], usize)) -> PointId {
+        assert!(
+            self.insertable,
+            "cannot insert into a sealed HNSW graph; create a fresh mutable graph"
+        );
         //
         let (data, origin_id) = data_with_id;
         let keep_pruned = self.keep_pruned;
@@ -1610,14 +2259,14 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                         "Hnsw  stored first point , direct return  {:?} ",
                         new_point.p_id
                     );
-                    return;
+                    return new_point.p_id;
                 }
                 max_level_observed = enter_point_copy.as_ref().unwrap().p_id.0;
             }
         }
         if enter_point_copy.is_none() {
             self.layer_indexed_points.check_entry_point(&new_point);
-            return;
+            return new_point.p_id;
         }
         let mut dist_to_entry = self
             .dist_f
@@ -1649,10 +2298,17 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
             //
             if let Some(ep) = sorted_points.pop() {
                 // useful for projecting lower layer to upper layer. keep track of points encountered.
-                if new_point.neighbours.read()[l as usize].len()
-                    < self.get_max_nb_connection() as usize
                 {
-                    new_point.neighbours.write()[l as usize].push(Arc::clone(&ep));
+                    let mut neighbours = new_point.neighbours.write();
+                    let layer_count = usize::from(l) + 1;
+                    if neighbours.len() < layer_count {
+                        let additional = layer_count - neighbours.len();
+                        neighbours.reserve_exact(additional);
+                        neighbours.resize_with(layer_count, Vec::new);
+                    }
+                    if neighbours[l as usize].len() < self.get_max_nb_connection() {
+                        neighbours[l as usize].push(ep.clone());
+                    }
                 }
                 // get the lowest distance point
                 let tmp_dist = self.dist_f.eval(data, ep.point_ref.data.get_v());
@@ -1693,7 +2349,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     nb_conn = self.max_nb_connection;
                     extend_c = false;
                 }
-                let mut neighbours = Vec::<Arc<PointWithOrder<T>>>::with_capacity(nb_conn);
+                let mut neighbours = Vec::<PointWithOrder<T>>::with_capacity(nb_conn);
                 self.select_neighbours(
                     data,
                     &mut sorted_points,
@@ -1719,11 +2375,12 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         // new_point has been inserted at the beginning in table
         // so that we can call reverse_update_neighborhoodwe consitently
         // now reverse update of neighbours.
-        self.reverse_update_neighborhood_simple(Arc::clone(&new_point));
+        self.reverse_update_neighborhood(Arc::clone(&new_point));
         //
         self.layer_indexed_points.check_entry_point(&new_point);
         //
         trace!("Hnsw exiting insert new point {:?} ", new_point.p_id);
+        new_point.p_id
     } // end of insert
 
     /// Insert in parallel a slice of Vec\<T\> each associated to its id.
@@ -1747,7 +2404,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     } // end of parallel_insert
 
     /// insert new_point in neighbourhood info of point
-    fn reverse_update_neighborhood_simple(&self, new_point: Arc<Point<T>>) {
+    fn reverse_update_neighborhood(&self, new_point: Arc<Point<'b, T>>) {
         //  println!("reverse update neighbourhood for  new point {:?} ", new_point.p_id);
         trace!(
             "reverse update neighbourhood for  new point {:?} ",
@@ -1761,9 +2418,14 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     let q_point = &q.point_ref;
                     let mut q_point_neighbours = q_point.neighbours.write();
                     let n_to_add = PointWithOrder::<T>::new(&Arc::clone(&new_point), q.dist_to_ref);
-                    // must be sure that we add a point at the correct level. See the comment to search_layer!
-                    // this ensures that reverse updating do not add problems.
-                    let l_n = n_to_add.point_ref.p_id.0 as usize;
+                    // Reciprocal links belong to the layer being connected,
+                    // not the new point's highest layer. Otherwise upper-level
+                    // points have no incoming level-zero links and disappear
+                    // from ordinary nearest-neighbor traversal.
+                    let l_n = l as usize;
+                    if q_point_neighbours.len() <= l_n {
+                        q_point_neighbours.resize_with(l_n + 1, Vec::new);
+                    }
                     let already = q_point_neighbours[l_n]
                         .iter()
                         .position(|old| old.point_ref.p_id == new_point.p_id);
@@ -1774,7 +2436,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                         //   panic!();
                         continue;
                     }
-                    q_point_neighbours[l_n].push(Arc::new(n_to_add));
+                    q_point_neighbours[l_n].push(n_to_add);
                     let nbn_at_l = q_point_neighbours[l_n].len();
                     //
                     // if l < level, update upward chaining, insert does a sort! t_q has a neighbour not yet in global table of points!
@@ -1783,19 +2445,33 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     } else {
                         2 * self.max_nb_connection
                     };
-                    let shrink = nbn_at_l > threshold_shrinking;
-                    {
-                        // sort and shring if necessary
-                        q_point_neighbours[l_n].sort_unstable();
-                        if shrink {
-                            q_point_neighbours[l_n].pop();
-                        }
+                    if nbn_at_l > threshold_shrinking {
+                        // Keep the same directional-diversity heuristic used
+                        // for outgoing links. Nearest-only truncation creates
+                        // hubs and can discard the only route to another
+                        // neighborhood, especially in anisotropic embeddings.
+                        let mut candidates = q_point_neighbours[l_n]
+                            .iter()
+                            .map(|point| PointWithOrder::new(&point.point_ref, -point.dist_to_ref))
+                            .collect::<BinaryHeap<_>>();
+                        let mut selected = Vec::with_capacity(threshold_shrinking);
+                        self.select_neighbours(
+                            q_point.data.get_v(),
+                            &mut candidates,
+                            threshold_shrinking,
+                            false,
+                            l,
+                            self.keep_pruned,
+                            &mut selected,
+                        );
+                        q_point_neighbours[l_n] = selected;
                     }
+                    q_point_neighbours[l_n].sort_unstable();
                 } // end protection against point identity
             }
         }
         //   println!("     exitingreverse update neighbourhood for  new point {:?} ", new_point.p_id);
-    } // end of reverse_update_neighborhood_simple
+    } // end of reverse_update_neighborhood
 
     pub fn get_point_indexation(&self) -> &PointIndexation<'b, T> {
         &self.layer_indexed_points
@@ -1808,12 +2484,12 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     fn select_neighbours(
         &self,
         data: &[T],
-        candidates: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
+        candidates: &mut BinaryHeap<PointWithOrder<'b, T>>,
         nb_neighbours_asked: usize,
         extend_candidates_asked: bool,
         layer: u8,
         keep_pruned: bool,
-        neighbours_vec: &mut Vec<Arc<PointWithOrder<'b, T>>>,
+        neighbours_vec: &mut Vec<PointWithOrder<'b, T>>,
     ) {
         //
         trace!(
@@ -1830,8 +2506,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                 while !candidates.is_empty() {
                     let p = candidates.pop().unwrap();
                     assert!(-p.dist_to_ref >= 0.);
-                    neighbours_vec
-                        .push(Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref)));
+                    neighbours_vec.push(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
                 }
                 return;
             } else {
@@ -1850,7 +2525,11 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
             let mut new_candidates_set = BTreeMap::<PointId, Arc<Point<T>>>::new();
             // get a list of all neighbours of candidates
             for p_point in candidates_set.values() {
-                let n_p_layer = &p_point.neighbours.read()[layer as usize];
+                let neighbours_guard = p_point.neighbours.read();
+                let n_p_layer = neighbours_guard
+                    .get(layer as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 for q in n_p_layer {
                     if !candidates_set.contains_key(&q.point_ref.p_id)
                         && !new_candidates_set.contains_key(&q.point_ref.p_id)
@@ -1866,11 +2545,11 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
             );
             for p_point in new_candidates_set.values() {
                 let dist_topoint = self.dist_f.eval(data, p_point.data.get_v());
-                candidates.push(Arc::new(PointWithOrder::new(p_point, -dist_topoint)));
+                candidates.push(PointWithOrder::new(p_point, -dist_topoint));
             }
         } // end if extend_candidates
         //
-        let mut discarded_points = BinaryHeap::<Arc<PointWithOrder<T>>>::new();
+        let mut discarded_points = BinaryHeap::<PointWithOrder<T>>::new();
         while !candidates.is_empty() && neighbours_vec.len() < nb_neighbours_asked {
             // compare distances of e to data. we do not need to recompute dists!
             if let Some(e_p) = candidates.pop() {
@@ -1885,19 +2564,13 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                 }
                 if e_to_insert {
                     trace!("inserting neighbours : {:?} ", e_p.point_ref.p_id);
-                    neighbours_vec.push(Arc::new(PointWithOrder::new(
-                        &e_p.point_ref,
-                        -e_p.dist_to_ref,
-                    )));
+                    neighbours_vec.push(PointWithOrder::new(&e_p.point_ref, -e_p.dist_to_ref));
                 } else {
                     trace!("discarded neighbours : {:?} ", e_p.point_ref.p_id);
                     // ep is taken from a binary heap, so it has a negative sign, we keep its sign
                     // to store it in another binary heap will possibly need to retain the best ones from the discarde binaryHeap
                     if keep_pruned {
-                        discarded_points.push(Arc::new(PointWithOrder::new(
-                            &e_p.point_ref,
-                            e_p.dist_to_ref,
-                        )));
+                        discarded_points.push(PointWithOrder::new(&e_p.point_ref, e_p.dist_to_ref));
                     }
                 }
             }
@@ -1910,10 +2583,10 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                 let best_point = discarded_points.pop().unwrap();
                 // do not forget to reverse sign
                 assert!(best_point.dist_to_ref <= 0.);
-                neighbours_vec.push(Arc::new(PointWithOrder::new(
+                neighbours_vec.push(PointWithOrder::new(
                     &best_point.point_ref,
                     -best_point.dist_to_ref,
-                )));
+                ));
             }
         };
         //
@@ -1978,13 +2651,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         let last = knbn.min(ef).min(neighbours.len());
         let knn_neighbours: Vec<Neighbour> = neighbours[0..last]
             .iter()
-            .map(|p| {
-                Neighbour::new(
-                    p.as_ref().point_ref.origin_id,
-                    p.as_ref().dist_to_ref,
-                    p.as_ref().point_ref.p_id,
-                )
-            })
+            .map(|p| Neighbour::new(p.point_ref.origin_id, p.dist_to_ref, p.point_ref.p_id))
             .collect();
 
         knn_neighbours
@@ -2021,7 +2688,11 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
             let mut has_changed = false;
             // search in stored neighbours
             {
-                let neighbours = &pivot.neighbours.read()[layer as usize];
+                let neighbours_guard = pivot.neighbours.read();
+                let neighbours = neighbours_guard
+                    .get(layer as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 for n in neighbours {
                     // get the lowest  distance point.
                     let tmp_dist = self.dist_f.eval(data, n.point_ref.data.get_v());
@@ -2059,11 +2730,11 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
             let knn_neighbours: Vec<Neighbour> = neighbours[0..last]
                 .iter()
                 .map(|p| {
-                    if filter_t.hnsw_filter(&p.as_ref().point_ref.origin_id) {
+                    if filter_t.hnsw_filter(&p.point_ref.origin_id) {
                         Some(Neighbour::new(
-                            p.as_ref().point_ref.origin_id,
-                            p.as_ref().dist_to_ref,
-                            p.as_ref().point_ref.p_id,
+                            p.point_ref.origin_id,
+                            p.dist_to_ref,
+                            p.point_ref.p_id,
                         ))
                     } else {
                         None
@@ -2077,13 +2748,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         } else {
             let knn_neighbours: Vec<Neighbour> = neighbours[0..last]
                 .iter()
-                .map(|p| {
-                    Neighbour::new(
-                        p.as_ref().point_ref.origin_id,
-                        p.as_ref().dist_to_ref,
-                        p.as_ref().point_ref.p_id,
-                    )
-                })
+                .map(|p| Neighbour::new(p.point_ref.origin_id, p.dist_to_ref, p.point_ref.p_id))
                 .collect();
 
             knn_neighbours
@@ -2153,7 +2818,10 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
             {
                 before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
                 let neighbours_guard = pivot.neighbours.read();
-                let neighbours = &neighbours_guard[layer as usize];
+                let neighbours = neighbours_guard
+                    .get(layer as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 let mut neighbour_position = 0usize;
                 while neighbour_position < neighbours.len() {
                     before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
@@ -2243,6 +2911,307 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         Ok(HnswSearchResult { neighbours: result })
     }
 
+    /// Search a graph while admitting only ids accepted by `allowed`.
+    ///
+    /// This is intentionally separate from `search_filter`: the older filter
+    /// path is compatibility API and may keep expanding when admitted ids are
+    /// sparse.  This route counts each entered graph node and each vector
+    /// distance, checks the request controls at those boundaries, and returns
+    /// `Incomplete` rather than presenting a prefix as a complete answer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_allowed_with_bounded_control<E, S, Dst, A, R, F>(
+        &self,
+        data: &[T],
+        required_results: usize,
+        ef_arg: usize,
+        limits: HnswAllowedSearchLimits,
+        seed_points: &[PointId],
+        allowed_count: usize,
+        mut candidate_key: impl FnMut(usize) -> u64,
+        mut allowed: F,
+        mut before_source_entry: S,
+        mut before_distance: Dst,
+        mut acquire: A,
+        mut release: R,
+    ) -> std::result::Result<HnswAllowedSearchResult, HnswBoundedSearchError<E>>
+    where
+        S: FnMut() -> std::result::Result<(), E>,
+        Dst: FnMut() -> std::result::Result<(), E>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
+        F: FnMut(usize) -> bool,
+    {
+        let first = self.search_allowed_attempt(
+            data,
+            required_results,
+            ef_arg,
+            limits,
+            seed_points,
+            allowed_count,
+            &mut candidate_key,
+            false,
+            &mut allowed,
+            &mut before_source_entry,
+            &mut before_distance,
+            &mut acquire,
+            &mut release,
+        )?;
+        if first.neighbours.len() >= allowed_count
+            || !matches!(
+                first.status,
+                HnswAllowedSearchStatus::Incomplete(
+                    HnswAllowedSearchIncomplete::InsufficientAllowedCandidates
+                )
+            )
+        {
+            return Ok(first);
+        }
+        // Sparse allowed sets can disconnect the induced graph. Retry using
+        // excluded points only as navigation bridges, within the same total budget.
+        let remaining = HnswAllowedSearchLimits {
+            max_visited_nodes: limits.max_visited_nodes.saturating_sub(first.visited_nodes),
+            max_vector_evaluations: limits
+                .max_vector_evaluations
+                .saturating_sub(first.vector_evaluations),
+        };
+        let visits = first.visited_nodes;
+        let distances = first.vector_evaluations;
+        let admissions = first.allowed_admissions;
+        QueryScratchControl {
+            acquire: &mut acquire,
+            release: &mut release,
+        }
+        .release_vec(HnswSearchScratchContainer::Result, &first.neighbours);
+        drop(first);
+        let mut result = self.search_allowed_attempt(
+            data,
+            required_results,
+            ef_arg,
+            remaining,
+            seed_points,
+            allowed_count,
+            &mut candidate_key,
+            true,
+            &mut allowed,
+            &mut before_source_entry,
+            &mut before_distance,
+            &mut acquire,
+            &mut release,
+        )?;
+        result.visited_nodes += visits;
+        result.vector_evaluations += distances;
+        result.allowed_admissions += admissions;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_allowed_attempt<E, S, Dst, A, R, F>(
+        &self,
+        data: &[T],
+        required_results: usize,
+        ef_arg: usize,
+        limits: HnswAllowedSearchLimits,
+        seed_points: &[PointId],
+        allowed_count: usize,
+        candidate_key: &mut dyn FnMut(usize) -> u64,
+        allow_bridges: bool,
+        mut allowed: F,
+        mut before_source_entry: S,
+        mut before_distance: Dst,
+        mut acquire: A,
+        mut release: R,
+    ) -> std::result::Result<HnswAllowedSearchResult, HnswBoundedSearchError<E>>
+    where
+        S: FnMut() -> std::result::Result<(), E>,
+        Dst: FnMut() -> std::result::Result<(), E>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
+        F: FnMut(usize) -> bool,
+    {
+        let mut traversal = HnswAllowedTraversal::new(limits);
+        if required_results == 0 {
+            return Ok(traversal.result(Vec::new(), HnswAllowedSearchStatus::Complete));
+        }
+        let mut scratch = QueryScratchControl {
+            acquire: &mut acquire,
+            release: &mut release,
+        };
+        match traversal.visit(&mut before_source_entry)? {
+            Ok(()) => {}
+            Err(reason) => {
+                return Ok(
+                    traversal.result(Vec::new(), HnswAllowedSearchStatus::Incomplete(reason))
+                );
+            }
+        }
+        let entry_point = {
+            let entry_point_opt_ref = self.layer_indexed_points.entry_point.read();
+            let Some(entry_point) = entry_point_opt_ref.as_ref() else {
+                return Ok(traversal.result(
+                    Vec::new(),
+                    HnswAllowedSearchStatus::Incomplete(
+                        HnswAllowedSearchIncomplete::InsufficientAllowedCandidates,
+                    ),
+                ));
+            };
+            // The oldest point is stable as unrelated history is appended.
+            // Inspect at most one directory slot per graph level; this is
+            // metadata navigation, not a scan for an allowed vector.
+            let points = self.layer_indexed_points.points_by_layer.read();
+            let oldest = points
+                .iter()
+                .filter_map(|layer| layer.first())
+                .min_by_key(|point| point.origin_id);
+            if !allow_bridges && !allowed(entry_point.origin_id) {
+                if let Some(oldest) = oldest.filter(|point| allowed(point.origin_id)) {
+                    Arc::clone(oldest)
+                } else {
+                    Arc::clone(entry_point)
+                }
+            } else {
+                Arc::clone(entry_point)
+            }
+        };
+        match traversal.distance(&mut before_distance)? {
+            Ok(()) => {}
+            Err(reason) => {
+                return Ok(
+                    traversal.result(Vec::new(), HnswAllowedSearchStatus::Incomplete(reason))
+                );
+            }
+        }
+        let mut dist_to_entry = self.dist_f.eval(data, entry_point.as_ref().data.get_v());
+        let mut pivot = Arc::clone(&entry_point);
+        for layer in (1..=entry_point.p_id.0).rev() {
+            // Greedy descent must reach a local minimum at this level. A
+            // single neighbor pass can leave the entry several hops away and
+            // strand the bounded level-zero search in the wrong component.
+            loop {
+                let mut new_pivot = None;
+                let neighbours_guard = pivot.neighbours.read();
+                let neighbours = neighbours_guard
+                    .get(layer as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let mut neighbour_position = 0usize;
+                while neighbour_position < neighbours.len() {
+                    before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                    let neighbour = neighbours.get(neighbour_position).ok_or(
+                        HnswBoundedSearchError::CapacityInvariant("upper-layer neighbours"),
+                    )?;
+                    neighbour_position = neighbour_position.checked_add(1).ok_or(
+                        HnswBoundedSearchError::CapacityOverflow("upper-layer neighbour position"),
+                    )?;
+                    if !allow_bridges && !allowed(neighbour.point_ref.origin_id) {
+                        continue;
+                    }
+                    match traversal.visit(&mut before_source_entry)? {
+                        Ok(()) => {}
+                        Err(reason) => {
+                            return Ok(traversal
+                                .result(Vec::new(), HnswAllowedSearchStatus::Incomplete(reason)));
+                        }
+                    }
+                    match traversal.distance(&mut before_distance)? {
+                        Ok(()) => {}
+                        Err(reason) => {
+                            return Ok(traversal
+                                .result(Vec::new(), HnswAllowedSearchStatus::Incomplete(reason)));
+                        }
+                    }
+                    let candidate_distance =
+                        self.dist_f.eval(data, neighbour.point_ref.data.get_v());
+                    if candidate_distance < dist_to_entry {
+                        new_pivot = Some(Arc::clone(&neighbour.point_ref));
+                        dist_to_entry = candidate_distance;
+                    }
+                }
+                drop(neighbours_guard);
+                match new_pivot {
+                    Some(next) => pivot = next,
+                    None => break,
+                }
+            }
+        }
+        let ef = ef_arg.max(required_results);
+        let mut layer = 0u8;
+        let layer_to_search = loop {
+            before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+            if self
+                .get_point_indexation()
+                .get_layer_nb_point(layer as usize)
+                > 0
+            {
+                break layer;
+            }
+            layer = layer
+                .checked_add(1)
+                .ok_or(HnswBoundedSearchError::SearchInvariant("populated layer"))?;
+        };
+        let searched = self.bounded_allowed_search_layer(
+            data,
+            pivot,
+            required_results,
+            ef,
+            seed_points,
+            allowed_count,
+            candidate_key,
+            allow_bridges,
+            layer_to_search,
+            &mut allowed,
+            &mut before_source_entry,
+            &mut before_distance,
+            &mut scratch,
+            &mut traversal,
+        )?;
+        let neighbours = searched.points.into_sorted_vec();
+        let last = ef.min(neighbours.len());
+        let mut result = match scratch.allocate_vec(
+            HnswSearchScratchContainer::Result,
+            last,
+            "allowed search result",
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                scratch.release_vec(HnswSearchScratchContainer::ReturnHeap, &neighbours);
+                return Err(error);
+            }
+        };
+        let copied =
+            (|| {
+                let mut position = 0usize;
+                while position < last {
+                    before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
+                    let neighbour = neighbours.get(position).ok_or(
+                        HnswBoundedSearchError::CapacityInvariant("allowed sorted search results"),
+                    )?;
+                    position =
+                        position
+                            .checked_add(1)
+                            .ok_or(HnswBoundedSearchError::CapacityOverflow(
+                                "allowed search result position",
+                            ))?;
+                    result.push(Neighbour::new(
+                        neighbour.point_ref.origin_id,
+                        neighbour.dist_to_ref,
+                        neighbour.point_ref.p_id,
+                    ));
+                }
+                Ok(())
+            })();
+        if let Err(error) = copied {
+            scratch.release_vec(HnswSearchScratchContainer::Result, &result);
+            scratch.release_vec(HnswSearchScratchContainer::ReturnHeap, &neighbours);
+            return Err(error);
+        }
+        scratch.release_vec(HnswSearchScratchContainer::ReturnHeap, &neighbours);
+        let status = searched
+            .incomplete
+            .map(HnswAllowedSearchStatus::Incomplete)
+            .unwrap_or(HnswAllowedSearchStatus::Complete);
+        Ok(traversal.result(result, status))
+    }
+
     fn search_with_id(
         &self,
         request: (usize, &Vec<T>),
@@ -2285,14 +3254,14 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
 // The vector is sorted by construction
 #[allow(unused)]
 fn from_negative_binaryheap_to_sorted_vector<'b, T: Send + Sync + Copy>(
-    heap_points: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
-) -> Vec<Arc<PointWithOrder<'b, T>>> {
+    heap_points: &mut BinaryHeap<PointWithOrder<'b, T>>,
+) -> Vec<PointWithOrder<'b, T>> {
     let nb_points = heap_points.len();
-    let mut vec_points = Vec::<Arc<PointWithOrder<T>>>::with_capacity(nb_points);
+    let mut vec_points = Vec::<PointWithOrder<T>>::with_capacity(nb_points);
     //
     for p in heap_points.iter() {
         assert!(p.dist_to_ref <= 0.);
-        let reverse_p = Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
+        let reverse_p = PointWithOrder::new(&p.point_ref, -p.dist_to_ref);
         vec_points.push(reverse_p);
     }
     trace!(
@@ -2307,14 +3276,14 @@ fn from_negative_binaryheap_to_sorted_vector<'b, T: Send + Sync + Copy>(
 // and returns a binary_heap of points with their correct negative distance to some reference distance
 //
 fn from_positive_binaryheap_to_negative_binary_heap<'b, T: Send + Sync + Clone>(
-    positive_heap: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
-) -> BinaryHeap<Arc<PointWithOrder<'b, T>>> {
+    positive_heap: &mut BinaryHeap<PointWithOrder<'b, T>>,
+) -> BinaryHeap<PointWithOrder<'b, T>> {
     let nb_points = positive_heap.len();
-    let mut negative_heap = BinaryHeap::<Arc<PointWithOrder<T>>>::with_capacity(nb_points);
+    let mut negative_heap = BinaryHeap::<PointWithOrder<T>>::with_capacity(nb_points);
     //
     for p in positive_heap.iter() {
         assert!(p.dist_to_ref >= 0.);
-        let reverse_p = Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
+        let reverse_p = PointWithOrder::new(&p.point_ref, -p.dist_to_ref);
         negative_heap.push(reverse_p);
     }
     trace!(
@@ -2404,6 +3373,81 @@ mod tests {
     use super::*;
     use anndists::dist;
 
+    #[test]
+    fn reverse_edge_pruning_preserves_a_distinct_direction_within_the_degree_limit() {
+        let mut graph = Hnsw::new_with_seed(2, 6, 16, 8, dist::DistL1, 17);
+        graph.set_keeping_pruned(true);
+        let center = Arc::new(Point::new(vec![0.0], 0, PointId(0, 0)));
+        for id in 1..=4 {
+            let point = Arc::new(Point::new(vec![id as f32], id, PointId(0, id as i32)));
+            center.neighbours.write()[0].push(PointWithOrder::new(&point, id as f32));
+        }
+        let added = Arc::new(Point::new(vec![-5.0], 5, PointId(0, 5)));
+        added.neighbours.write()[0].push(PointWithOrder::new(&center, 5.0));
+        graph.reverse_update_neighborhood(added.clone());
+        let neighbours = center.neighbours.read();
+        assert_eq!(neighbours[0].len(), 4);
+        assert!(neighbours[0].iter().any(|n| n.point_ref.p_id == added.p_id));
+        drop(neighbours);
+        center.neighbours.write()[0].clear();
+    }
+
+    #[test]
+    fn reverse_edges_connect_each_layer_including_level_zero() {
+        let graph = Hnsw::new_with_seed(8, 3, 16, 32, dist::DistL1, 17);
+        let lower = Arc::new(Point::new(vec![2.0], 0, PointId(0, 0)));
+        let upper = Arc::new(Point::new(vec![1.0], 1, PointId(1, 0)));
+        let added = Arc::new(Point::new(vec![0.0], 2, PointId(1, 1)));
+        added.neighbours.write()[0].push(PointWithOrder::new(&lower, 2.0));
+        added.neighbours.write()[1].push(PointWithOrder::new(&upper, 1.0));
+        graph.reverse_update_neighborhood(added.clone());
+        assert_eq!(lower.neighbours.read()[0][0].point_ref.p_id, added.p_id);
+        assert!(lower.get_neighborhood_id()[1].is_empty());
+        assert_eq!(upper.neighbours.read()[1][0].point_ref.p_id, added.p_id);
+        assert!(upper.neighbours.read()[0].is_empty());
+        // Break the explicit test graph's Arc cycles.
+        lower.neighbours.write()[0].clear();
+        upper.neighbours.write()[1].clear();
+    }
+
+    #[test]
+    fn allowed_search_finishes_greedy_descent_before_entering_level_zero() {
+        let graph = Hnsw::new_with_seed(8, 5, 16, 32, dist::DistL1, 17);
+        let points = (0..4)
+            .map(|id| Arc::new(Point::new(vec![(3 - id) as f32], id, PointId(1, id as i32))))
+            .collect::<Vec<_>>();
+        for pair in points.windows(2) {
+            pair[0].neighbours.write()[1].push(PointWithOrder::new(&pair[1], 1.0));
+        }
+        {
+            let mut layers = graph.layer_indexed_points.points_by_layer.write();
+            layers[0] = vec![Arc::new(Point::new(vec![99.0], 4, PointId(0, 0)))];
+            layers[1] = points.clone();
+        }
+        *graph.layer_indexed_points.entry_point.write() = Some(points[0].clone());
+        *graph.layer_indexed_points.nb_point.write() = 5;
+        let result = graph
+            .search_allowed_with_bounded_control(
+                &[0.0],
+                1,
+                1,
+                HnswAllowedSearchLimits {
+                    max_visited_nodes: 20,
+                    max_vector_evaluations: 20,
+                },
+                &[],
+                5,
+                |id| id as u64,
+                |_| true,
+                || Ok::<_, ()>(()),
+                || Ok::<_, ()>(()),
+                |_| Ok::<_, ()>(()),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(result.neighbours[0].d_id, 3);
+    }
+
     fn log_init_test() {
         let _ = env_logger::builder().is_test(true).try_init();
     }
@@ -2455,6 +3499,12 @@ mod tests {
         //
         assert_eq!(nb_dumped, nbcolumn);
     } // end of test_iter_point
+
+    #[test]
+    fn iterating_a_graph_with_no_points_yields_nothing() {
+        let hns = Hnsw::<f32, dist::DistL1>::new(10, 1, 16, 25, dist::DistL1 {});
+        assert_eq!(hns.get_point_indexation().into_iter().count(), 0);
+    }
 
     #[test]
     fn test_iter_layerpoint() {

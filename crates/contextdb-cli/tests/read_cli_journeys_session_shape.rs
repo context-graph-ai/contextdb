@@ -318,6 +318,38 @@ fn a_piped_session_is_a_full_session_including_the_cursor() {
 }
 
 #[test]
+fn terminal_json_extraction_keeps_a_complete_page_before_immediate_input_echo() {
+    let transcript = concat!(
+        "{\"cursor\":{\"columns\":[\"id\"],\"has_more\":true,\"rows\":[{\"id\":1},{\"id\":2}]}}\n",
+        "{\"cursor\":{\"columns\":[\"id\"],\"has_more\":true,\"rows\":[{\"id\":3},{\"id\":4}]}}.cursor fetch\n",
+        "{\"cursor\":{\"columns\":[\"id\"],\"has_more\":false,\"rows\":[{\"id\":5}]}}\n",
+    );
+    let pages: Vec<serde_json::Value> = lenient_json_lines(transcript)
+        .into_iter()
+        .filter_map(|document| document.get("cursor").cloned())
+        .collect();
+    let shape: Vec<(Vec<i64>, bool)> = pages
+        .iter()
+        .map(|page| {
+            let ids = rows_of(page)
+                .iter()
+                .map(|row| row.get("id").and_then(|id| id.as_i64()).unwrap())
+                .collect();
+            let has_more = page
+                .get("has_more")
+                .and_then(|value| value.as_bool())
+                .unwrap();
+            (ids, has_more)
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![(vec![1, 2], true), (vec![3, 4], true), (vec![5], false),],
+        "a complete JSON page remains a page when terminal echo starts immediately after its closing brace"
+    );
+}
+
+#[test]
 fn a_terminal_session_pages_the_cursor_exactly_as_the_pipe_did() {
     let store = store_with(&create_seeded_table("paged", 5));
     let mut session = terminal(&[

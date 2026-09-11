@@ -1,6 +1,6 @@
 ---
 name: vector-search
-description: Similarity search in contextdb — embedding columns, the <=> operator, pre-filtered search, schema-declared USE RANK policies, and the hybrid graph + vector query.
+description: Similarity search in contextdb — maintained and partitioned embedding columns, the <=> operator, bounded filters, query modes, inspection, schema-declared USE RANK policies, and hybrid graph + vector queries.
 ---
 
 # Vector search in contextdb
@@ -34,8 +34,8 @@ function** — `<=>` is the whole surface.
 contextdb ./vec.db --write <<'SQL'
 CREATE TABLE evidence (
   id UUID PRIMARY KEY,
-  category TEXT,
-  vector_text VECTOR(4),
+  category TEXT NOT NULL,
+  vector_text VECTOR(4) PARTITION_KEY (category) MAX_PARTITIONS 256 SEARCH_MODE AUTO,
   vector_vision VECTOR(8) WITH (quantization = 'SQ8')
 );
 SHOW VECTOR_INDEXES;
@@ -43,8 +43,14 @@ SQL
 ```
 
 Each `VECTOR(n)` column is its own named index, keyed by `(table, column)` — a row can carry a text
-embedding and a vision embedding side by side, searched independently. `SHOW VECTOR_INDEXES`
-reports `table`, `column`, `dimension`, `quantization`, `vector_count` and `bytes`.
+embedding and a vision embedding side by side, searched independently. `PARTITION_KEY` makes local
+search layouts from one or more non-null identity columns. It is not a tenant, authorization rule,
+or sync direction: the normal row-access rule still applies, and a syncing receiver derives the
+local layout from the accepted row without a new vector-sync field. Omit `PARTITION_KEY` for one
+logical layout. With it, omitted `MAX_PARTITIONS` means 256 live-plus-snapshot-retained layouts;
+`.schema` prints that effective value. `SHOW VECTOR_INDEXES` reports the declared key and limit,
+live/retained layout counts, lifecycle, bytes, and broad-route state.
+<!-- enforced by: vector_partition_declaration_contract::partitioned_vector_schema_survives_reopen_with_canonical_defaults, vector_partition_query_contract::partition_scope_does_not_weaken_context_scope_or_principal_filters, vector_partition_sync_inspection_contract::partitioned_sync_derives_receiver_membership_without_changing_owner_pairing, vector_partition_sync_inspection_contract::existing_two_row_sync_keeps_each_vector_with_its_row_and_shows_summary -->
 
 Quantization is per column: `F32` (default), `SQ8`, `SQ4` — the knob for storage footprint.
 
@@ -100,14 +106,38 @@ handles honor source-row visibility: a hidden source row returns the same typed 
 an explicit anchor read. Missing table → `TableNotFound`; non-vector column → `UnknownVectorIndex`;
 dimension mismatch → `VectorIndexDimensionMismatch`; missing row → `PersistedRowVectorRowMissing`;
 NULL cell → `PersistedRowVectorCellNull`.
+<!-- enforced by: sql_surface_tests::prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process, sql_surface_tests::prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_variants, sql_surface_tests::prv_13_row_vector_query_honors_scoped_handle_context_isolation -->
 
-## Indexing is automatic
+## Maintained indexing and search modes
 
-No index to create, no rebuild to schedule. The engine picks the strategy from the vector count:
+There is no separate vector index to create. ContextDB maintains the local layouts after commits;
+first build and repair run outside the query path. A restart validates the saved generations and
+replays only later committed changes, rather than rebuilding every vector before the first search.
+If an indexed route is not ready, an ordinary query can use exact comparison only when its active
+budget permits it; an `INDEXED` query refuses clearly instead of hiding the problem with a scan.
+<!-- enforced by: vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_partition_restart_contract::partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuild, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible -->
 
-- below ~1000 vectors — brute-force linear scan (exact)
-- `F32` at/above ~1000 — HNSW approximate nearest neighbours (recall target ≥ 95%)
-- `SQ8`/`SQ4` through 5000 — exact scan, to preserve self-recall; larger quantized indexes use HNSW
+`SEARCH_MODE AUTO` is the declaration default. `AUTO` decides by count: below the column's
+effective threshold over the aggregate allowed set it answers exact when the active limits can
+pay and a typed refusal when they cannot; at or above that threshold it uses the maintained route.
+`EXACT` examines every
+allowed stored vector or refuses when its active budget cannot pay for it — use it for an audit.
+`INDEXED` requires the maintained bounded route even for a small non-empty layout — use it for a
+live loop that must not trade index loss for a costly scan. <!-- enforced by: vector_search_mode_bounded_contract::auto_uses_the_aggregate_selected_scope_not_each_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible, vector_lazy_raw_residency_contract::auto_refuses_typed_when_the_exact_score_array_cannot_fit --> Override once per vector query:
+
+```sql
+SELECT id FROM evidence
+WHERE category IN ('A', 'B')
+ORDER BY vector_text <=> [1.0, 0.0, 0.0, 0.0]
+USE VECTOR INDEXED
+LIMIT 5;
+```
+
+One key equality searches one layout; finite `IN`/`OR` searches a few; a prefix or no key predicate
+searches all authorized layouts. ContextDB merges them by score before `LIMIT`, so this always means
+one best-answer list, not one list per layout. If one required layout cannot satisfy `INDEXED`, the
+whole query refuses — it never silently omits a layout.
+<!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::composite_partition_prefix_selects_every_tuple_below_the_prefix, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer, vector_search_mode_bounded_contract::auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks -->
 
 Check which one is live:
 
@@ -116,8 +146,66 @@ printf ".explain SELECT id FROM evidence ORDER BY vector_text <=> [1.0, 0.0, 0.0
   | contextdb ./vec.db --json | jq -r '.explain.physical_plan'
 ```
 
-Brute force reads `Scan -> VectorSearch`; once the index switches to HNSW the same line reads
-`Scan -> HNSWSearch`.
+`.explain` shows the requested/resolved mode, one/few/all authorized layouts, routes, global merge,
+and safe refusal or recovery reason. It does not build or repair an index.
+<!-- enforced by: vector_inspection_explain_truth_contract::vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_secrets, vector_inspection_explain_truth_contract::vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts -->
+
+`AUTO_INDEX_AT` and `HNSW (M, EF_CONSTRUCTION, EF_SEARCH)` are per-column declarations for that
+threshold and graph workload; they are not process-wide switches. `AUTO_INDEX_AT` and `EF_SEARCH`
+take effect for newly opened queries without rebuilding, while `M` or `EF_CONSTRUCTION` schedule a
+replacement graph and the previous complete graph continues serving. Leave them silent to keep the
+compatibility profile, or alter them online with `ALTER TABLE ... ALTER COLUMN ... SET ...`. Use
+[the query-language reference](../../docs/query-language.md#vector-similarity-search) for the
+canonical syntax, `DEFAULT` behavior, rendering, and defaults. Inspection separates desired topology
+from the serving graph and its build revision. `EF_SEARCH` takes effect immediately; the serving
+breadth follows current query policy even if that build revision is older. Actual queries raise an
+explicit breadth only to `k`, or an omitted breadth to at least the profile and `10 * k`.
+<!-- enforced by: vector_policy_revision_publication_contract::online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication, vector_policy_resolver_contract::declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor, vector_serving_merge_contract::query_policy_discloses_serving_snapshot_and_full_partition_search_breadth -->
+
+### Broad filters and recovery
+
+Use `WHERE` to narrow candidates before vector ranking. A narrow allowed set can be exact under
+`AUTO`; a broad filter needs a bounded filtered-index route. If ContextDB cannot identify allowed
+rows through a bounded candidate route, `INDEXED` refuses rather than silently scanning the table;
+`AUTO` does exact work only within the active budget. `.explain` says when an ordinary relational
+index would make the filter supportable.
+<!-- enforced by: vector_search_mode_bounded_contract::indexed_broad_filter_refuses_before_scan_and_becomes_eligible_with_a_relational_index -->
+
+Initial graph construction and repair advance only through maintenance, never inside a query or
+as a full build that declarations, writes, or open must wait for. Loaded generations stay sealed;
+tombstones exclude obsolete versions until replacement publication, while pinned old snapshots
+keep their compatible view. Retention can defer physical reclamation until those readers finish.
+<!-- enforced by: vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_generation_quarantine_compaction_lock_contract::pinned_old_snapshot_keeps_its_indexed_generation_until_release_then_reclaims_superseded_bytes, tests/integration/retention_tests.rs::retention_defers_reclaim_without_breaking_vector_search -->
+
+Inspect lifecycle without triggering work (these commands require an unrestricted admin handle;
+a constrained caller uses the redacted `.explain`, which omits per-partition adaptive settings):
+
+```sql
+SHOW VECTOR_INDEXES;
+SHOW VECTOR_PARTITIONS FOR evidence.vector_text;
+```
+
+A populated caller-driven row might read
+`partition_key={"category":"camera"} live_rows=120 base_generation=4 base_tx=891
+pending_inserts=3 tombstones=2 query_state=ready maintenance_state=idle
+maintenance_reason=tombstones recovery_action=run_maintenance_cycle`. The matching summary reports
+`broad_route=fanout`, its aggregate readiness and exact unavailable/stalled counts, and keeps
+`bytes = charged_vector_bytes + charged_index_bytes`; durable byte columns describe file storage
+separately and remain zero in memory-only databases.
+<!-- enforced by: vector_partition_sync_inspection_contract::constrained_handle_refuses_whole_vector_inspection, vector_inspection_explain_truth_contract::restricted_explain_admits_only_visible_identities_at_equal_headroom, vector_inspection_explain_truth_contract::file_backed_inspection_separates_positive_durable_bytes_from_charged_residency_once -->
+
+The detail view names each local key, live/retained rows, base, pending work, bytes, state, reason,
+and recovery action. `ready` means `INDEXED` can serve that layout. Under default engine-owned
+maintenance, wait for automatic work; under explicit caller-driven maintenance, call
+`Database::run_maintenance_cycle` or `.maintenance run`. If admission reaches the limit, raise it
+online with `ALTER TABLE evidence ALTER COLUMN vector_text SET MAX_PARTITIONS 512`; lowering is
+refused while live-plus-retained use is higher.
+<!-- enforced by: vector_partition_cleanup_inspection_contract::inspection_names_the_lifecycle_of_a_populated_unavailable_partition, vector_inspection_explain_truth_contract::the_same_pending_partition_reports_the_owner_of_maintenance_on_both_show_surfaces, vector_partition_declaration_contract::online_partition_limit_and_search_mode_changes_update_the_declaration, vector_partition_sync_inspection_contract::a_lowered_partition_limit_arriving_over_sync_is_refused_and_changes_nothing -->
+
+For a 2 GiB memory limit, use `SET MEMORY_LIMIT 2G` (CLI `--memory-limit 2G`):
+2147483648 bytes of charged memory <!-- enforced by: statement_effect_contract::binary_memory_declaration_accepts_quoted_and_unquoted_sizes -->; whole-process RSS is separate. On a synced or
+restored table, inspect `.schema` for the authored `CONTEXT_ID` and Simple/Split `SCOPE_LABEL`
+clauses; partition selection never replaces those access rules. <!-- enforced by: vector_partition_query_contract::partition_scope_does_not_weaken_context_scope_or_principal_filters, vector_partition_sync_inspection_contract::a_synced_restricted_reads_disclosure_lists_only_its_own_authorized_ids -->
 
 ## Rank by outcomes, not just similarity — `USE RANK`
 
@@ -288,6 +376,7 @@ neighbourhood the graph selected.
 
 Variable-length paths always need an explicit upper bound (`{1,2}`); the engine's maximum traversal
 depth is 10.
+<!-- enforced by: tests/acceptance/query_surface.rs::f98_graph_neighborhood_scoped_vector_search, tests/integration/hybrid_query_on_true_join_tests.rs::scenario4_hybrid_query_returns_rows_once_traversal_has_data -->
 
 ## Gotchas
 
@@ -296,11 +385,8 @@ depth is 10.
   `VectorIndexDimensionMismatch`.
 - **Search routes to the column named in `ORDER BY`**, not to "the table's vector" — a two-vector
   table has two independent indexes.
-- **Opening a pre-0.3.4 store** without the named-index format marker (or any older store whose
-  row/column schema layout predates the current release) returns `LegacyVectorStoreDetected`,
-  naming the recovery command: `contextdb migrate <path>` migrates it in place (backs up first,
-  never destroys the original). Syncing from a peer already on the current format, or recreating
-  the schema and reimporting, remain alternatives if you'd rather not migrate the file directly.
+- **Vector lifecycle recovery uses inspection and maintenance**, as described in this recipe.
+  `contextdb migrate <path>` is only for a store diagnosed as legacy-format.
 - **`PROPAGATE ON STATE <s> EXCLUDE VECTOR`** drops a row out of vector results when it reaches a
   state — the declarative way to stop invalidated rows from being retrieved.
 

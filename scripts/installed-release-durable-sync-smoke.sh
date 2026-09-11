@@ -590,9 +590,12 @@ require_file_text "$lost_ack/reconciled.log" '"event":"oversized_push_confirmed"
   "edge reconciled the already-committed unit"
 lost_applied_rows="$(json_event_file_number \
   "$lost_ack/reconciled.log" oversized_push_confirmed applied_rows)"
-[[ "$lost_applied_rows" -eq 0 ]] \
-  || fail "lost-ack reconciliation applied the dependency unit a second time"
-pass "lost-ack reconciliation applied zero dependency-unit rows"
+lost_replayed_hub_lsn="$(json_event_file_number \
+  "$lost_ack/reconciled.log" oversized_push_confirmed hub_lsn)"
+[[ "$lost_applied_rows" -eq 2 \
+   && "$lost_replayed_hub_lsn" -eq "$lost_hub_lsn_at_checkpoint" ]] \
+  || fail "lost-ack reconciliation did not return the original dependency-unit outcome"
+pass "lost-ack reconciliation returned the original two-row outcome and hub position"
 lost_source_lsn="$(json_event_file_number \
   "$lost_ack/reconciled.log" oversized_push_confirmed source_lsn)"
 lost_push_before="$(json_event_file_number \
@@ -602,7 +605,7 @@ lost_push_after="$(json_event_file_number \
 [[ "$lost_push_after" -eq "$lost_source_lsn" && "$lost_push_after" -gt "$lost_push_before" ]] \
   || fail "reconciliation advanced the edge watermark to the confirmed source position"
 pass "reconciliation advanced the edge watermark to the confirmed source position"
-pass "lost-ack reconciliation made no second dependency-unit application"
+pass "lost-ack reconciliation replayed the original outcome with no second application"
 
 printf 'CHECK fitting dependency and unrelated ordinary work stay on one request with no staging\n'
 for fixture in fitting-dependency ordinary; do

@@ -36,7 +36,7 @@ See [Why contextdb?](docs/why-contextdb.md) for the full problem statement, or j
 
 | Capability | SQLite + extensions | contextdb |
 |---|---|---|
-| Vector search | sqlite-vec (separate extension, no unified transactions with relational data) | Built-in, auto-HNSW at 1K vectors, pre-filtered search, same MVCC transaction as rows |
+| Vector search | sqlite-vec (separate extension, no unified transactions with relational data) | Built-in, automatically maintained index with per-column policy, pre-filtered search, same MVCC transaction as rows <!-- enforced by: vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/hnsw_tests.rs::h08_prefiltered_search_respects_candidate_bitmap, tests/integration/hnsw_tests.rs::h19_relational_graph_and_vector_atomicity_hold_under_hnsw --> |
 | Graph traversal | Recursive CTEs (unbounded, no cycle detection) | SQL/PGQ with bounded BFS, DAG enforcement, typed edges |
 | State machines | CHECK constraints + validation triggers (bypassable) | `STATE MACHINE` in DDL, enforced by the database engine |
 | Atomic cross-model updates | Application-level coordination | Single MVCC transaction across relational + graph + vector |
@@ -265,9 +265,14 @@ ORDER BY vector_text <=> ROW_VECTOR('evidence', 'vector_text', '11111111-1111-11
 LIMIT 1;
 ```
 
-Each `VECTOR(N)` column is its own index, keyed by `(table, column)`. Use
-`VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` to choose the per-column
-storage footprint; omitted quantization defaults to `F32`.
+Every `VECTOR(N)` column is searchable with no separate index to create:
+ContextDB keeps each column's index current as rows commit. Declare
+`PARTITION_KEY (...)` on a vector column to keep one smaller index per key
+value, so a search whose `WHERE` names a key looks only inside that partition.
+`SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW
+VECTOR_PARTITIONS FOR table.column` shows each partition's state. Use `VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` to choose the
+per-column storage footprint; omitted quantization defaults to `F32`.
+<!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_lazy_raw_residency_contract::reopen_and_selected_queries_keep_raw_vector_residency_partition_local, vector_partition_sync_inspection_contract::existing_two_row_sync_keeps_each_vector_with_its_row_and_shows_summary, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms -->
 
 ### Upgrading From 0.3.x
 
@@ -284,7 +289,7 @@ format, or recreate the schema and reimport the data.
 
 **Graph (SQL/PGQ-style)** — `GRAPH_TABLE(... MATCH ...)` following SQL/PGQ conventions for bounded BFS, typed edges, variable-length paths (`{1,3}`), and direction control. DAG constraint enforcement prevents cycles. State propagation cascades changes along graph edges.
 
-**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Query with a bound vector, vector literal, or `ROW_VECTOR('table', 'column', key)` to reuse a persisted row vector as the query vector. Every `VECTOR(N)` column is a named index; `SHOW VECTOR_INDEXES` reports table, column, dimension, quantization, vector count, and bytes. F32 auto-switches between brute-force (< 1000 vectors) and HNSW indexing; SQ8/SQ4 keep exact search through 5000 vectors to preserve self-recall. Pre-filtered search narrows candidates before scoring.
+**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Query with a bound vector, vector literal, or `ROW_VECTOR('table', 'column', key)` to reuse a persisted row vector as the query vector. Every `VECTOR(N)` column is indexed automatically and kept current as rows commit, and can be partitioned by key so a search looks only inside the partitions it names: `SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW VECTOR_PARTITIONS FOR table.column` shows each partition's state. `AUTO_INDEX_AT` and HNSW settings are declared per column; leaving them unset keeps the defaults. Pre-filtered search narrows candidates before scoring. <!-- enforced by: sql_surface_tests::prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/hnsw_tests.rs::h08_prefiltered_search_respects_candidate_bitmap -->
 
 **Unified transactions** — One transaction atomically updates relational rows, graph adjacency structures, and vector indexes. One read snapshot sees consistent state across all three. MVCC with consistent snapshots — readers never block writers.
 

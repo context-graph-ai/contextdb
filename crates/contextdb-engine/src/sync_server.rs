@@ -1,9 +1,8 @@
-// Canonical authenticated-sync implementation. The server-path mirror is
-// intentionally byte-identical and audited by `sync_source_mirror_tests`.
+// Canonical authenticated-sync implementation, re-exported by contextdb-server.
 use crate::protocol::{
     DependencyCompletePullResponse, MessageType, PullRequest, PullResponse, PushRequest,
-    PushResponse, SyncStatusResponse, WirePurgeChange, WirePushError, decode, encode,
-    row_payload_bytes,
+    PushResponse, SchemaRecoveryPage, SchemaRecoveryRequest, SyncStatusResponse, WirePurgeChange,
+    WirePushError, decode, encode_for_version, row_payload_bytes,
 };
 use crate::subjects::{pull_subject, push_subject, status_subject};
 use crate::sync_client::refuse_keyless_tables_with_no_identity_fallback;
@@ -12,10 +11,15 @@ use crate::transport::{
     HandlerRegistration, IncomingRequest, LineageSigner, RequestHandler, Responder,
     ServerTransport, TransportError,
 };
-use contextdb_core::{AtomicLsn, Incarnation, Lsn, TenantId};
-use contextdb_engine::sync_types::{ChangeSet, NaturalKey, SyncAdoption, SyncDirection};
+use contextdb_core::{
+    AtomicLsn, ColumnType, Incarnation, Lsn, TableMeta, TenantId, VectorSearchMode,
+};
+use contextdb_engine::sync_types::{
+    ChangeSet, DdlChange, DurableSchemaSyncHoldback, NaturalKey, SchemaSyncCapability,
+    SchemaSyncHoldback, SyncAdoption, SyncDirection,
+};
 use contextdb_engine::{Conflict, Database};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -28,9 +32,28 @@ const MAX_REPLIES_PER_IN_FLIGHT_PUSH: usize = 128;
 /// Max push applies actively executing blocking engine work at once.
 const MAX_CONCURRENT_PUSH_APPLIES: usize = 16;
 
-type PushRequestKey = Vec<u8>;
+// Reply fanout belongs to one authenticated peer, even when two peers send
+// byte-identical requests. The durable outcome cache has the same ownership.
+type PushRequestKey = (String, Vec<u8>);
 type InFlightPushApplies = Arc<tokio::sync::Mutex<HashMap<PushRequestKey, Vec<Responder>>>>;
 type ApplyTasks = Arc<ApplyTracker>;
+type SchemaSyncHoldbackStates = Arc<std::sync::Mutex<HashMap<String, PeerSchemaSyncHoldbackState>>>;
+
+#[derive(Debug, Clone, Default)]
+struct PeerSchemaSyncHoldbackState {
+    capabilities: BTreeMap<String, BTreeSet<SchemaSyncCapability>>,
+    /// Highest source frontier the current receiver has publicly acknowledged
+    /// for compatible work. A lower request resets it because a rebuilt store
+    /// cannot inherit its predecessor's private progress.
+    compatible_through: Lsn,
+    /// Highest source frontier inspected while the receiver was old. Recovery
+    /// must cover held-table state through this point, but this number must
+    /// never make compatible work disappear after a lost response.
+    held_through: Lsn,
+    /// Cross-call held-table page continuation. This is only a live transport
+    /// cursor; a restart safely begins the bounded recovery image again.
+    recovery_after: Option<Lsn>,
+}
 
 /// The first exact-byte request owns validation and apply. A retry joins that
 /// owner before touching the database, so it receives the original outcome
@@ -175,6 +198,7 @@ struct PushApplyWork {
     receipts: Arc<TransferLedger>,
     request_key: PushRequestKey,
     custody: Option<PushRequest>,
+    outcome_key: contextdb_engine::database::SyncPushOutcomeKey,
     changeset: ChangeSet,
     received_ddl: Option<crate::protocol::ReceivedDdlContext>,
     terminal_conflicts: Option<Vec<Conflict>>,
@@ -186,6 +210,7 @@ struct PushApplyWork {
     apply_tasks: ApplyTasks,
     in_flight_push_applies: InFlightPushApplies,
     apply_permits: Arc<Semaphore>,
+    protocol_version: u8,
 }
 
 struct PushHandlerState {
@@ -243,6 +268,11 @@ pub struct SyncServer {
     per_edge_watermarks: Arc<PerEdgeAppliedPushWatermarks>,
     /// Per-peer transfer counters for the sync plane. In memory only.
     receipts: Arc<TransferLedger>,
+    /// Tables withheld from an immediately previous receiver, keyed by the
+    /// transport-authenticated node that needs the upgrade. This is sender
+    /// state: the older parser is never handed vocabulary it cannot read.
+    schema_sync_holdbacks: SchemaSyncHoldbackStates,
+    peer_schema_capabilities: PeerSchemaCapabilities,
 }
 
 impl SyncServer {
@@ -277,7 +307,7 @@ impl SyncServer {
                     .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
             "tenant_id must be non-empty and alphanumeric (hyphens and underscores allowed): {tenant_id}"
         );
-        // Statements 1/3/11: declarations belong to the served tenant and authenticated hub.
+        // Declarations belong to the served tenant and authenticated hub.
         if let (Some(node), Some(signer)) = (&local_node_id, &lineage_signer) {
             db.set_custody_runtime(tenant_id.clone(), node.clone(), signer.clone());
         }
@@ -293,6 +323,29 @@ impl SyncServer {
                 None
             })
             .unwrap_or(Lsn(0));
+        let schema_sync_holdbacks = db
+            .persisted_inbound_schema_sync_holdbacks(&tenant_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    %tenant_id,
+                    error = %err,
+                    "failed to load persisted schema compatibility holdbacks"
+                );
+                Vec::new()
+            })
+            .into_iter()
+            .map(|state| {
+                (
+                    state.peer_node_id,
+                    PeerSchemaSyncHoldbackState {
+                        capabilities: state.capabilities,
+                        compatible_through: state.through,
+                        held_through: state.held_through.max(state.through),
+                        recovery_after: None,
+                    },
+                )
+            })
+            .collect();
         Self {
             db,
             transport,
@@ -302,6 +355,8 @@ impl SyncServer {
             applied_push_watermark: Arc::new(AtomicLsn::new(applied_push_watermark)),
             per_edge_watermarks: Arc::new(PerEdgeAppliedPushWatermarks::default()),
             receipts: Arc::new(TransferLedger::new()),
+            schema_sync_holdbacks: Arc::new(std::sync::Mutex::new(schema_sync_holdbacks)),
+            peer_schema_capabilities: PeerSchemaCapabilities::default(),
         }
     }
 
@@ -342,6 +397,42 @@ impl SyncServer {
     /// and a peer the transport did not authenticate has no receipt at all.
     pub fn transfer_receipts(&self) -> Vec<TransferReceipt> {
         self.receipts.receipts()
+    }
+
+    /// Current per-table upgrade messages. Compatible tables are not listed
+    /// because they continue to move normally.
+    pub fn schema_sync_holdbacks(&self) -> Vec<SchemaSyncHoldback> {
+        let states = self
+            .schema_sync_holdbacks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut holdbacks = states
+            .iter()
+            .flat_map(|(node_to_upgrade, state)| {
+                state
+                    .capabilities
+                    .iter()
+                    .flat_map(move |(table, capabilities)| {
+                        capabilities
+                            .iter()
+                            .map(move |capability| SchemaSyncHoldback {
+                                table: table.clone(),
+                                capability: *capability,
+                                node_to_upgrade: node_to_upgrade.clone(),
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
+        holdbacks.sort();
+        holdbacks
+    }
+
+    /// Exercise forward capability holdback on the real current transport.
+    /// This changes only the test sender's knowledge of the named receiver.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn set_peer_vector_schema_support_for_test(&self, peer: &str, supported: bool) {
+        self.peer_schema_capabilities.set_for_test(peer, supported);
     }
 
     pub async fn run(&self) {
@@ -394,16 +485,29 @@ impl SyncServer {
             let receipts = self.receipts.clone();
             let tenant_id = self.tenant_id.clone();
             let local_node_id = self.local_node_id.clone();
+            let schema_sync_holdbacks = self.schema_sync_holdbacks.clone();
+            let peer_schema_capabilities = self.peer_schema_capabilities.clone();
             Arc::new(move |req: IncomingRequest| {
                 let db = db.clone();
                 let lineage_signer = lineage_signer.clone();
                 let receipts = receipts.clone();
                 let tenant_id = tenant_id.clone();
                 let local_node_id = local_node_id.clone();
+                let schema_sync_holdbacks = schema_sync_holdbacks.clone();
+                let peer_schema_capabilities = peer_schema_capabilities.clone();
                 Box::pin(async move {
-                    handle_pull(db, lineage_signer, receipts, tenant_id, local_node_id, req)
-                        .await
-                        .map_err(to_transport_error)
+                    handle_pull(
+                        db,
+                        lineage_signer,
+                        receipts,
+                        tenant_id,
+                        local_node_id,
+                        schema_sync_holdbacks,
+                        peer_schema_capabilities,
+                        req,
+                    )
+                    .await
+                    .map_err(to_transport_error)
                 }) as crate::transport::TransportFuture<'static, ()>
             }) as RequestHandler
         };
@@ -432,8 +536,8 @@ impl SyncServer {
             }) as RequestHandler
         };
 
-        // Statements 9/13: manifested requests enter the ordinary push handler above.
-        // Statements 2–4: authenticate the requester, compare/freeze, and return signed authority.
+        // Manifested requests enter the ordinary push handler above.
+        // Authenticate the requester, compare/freeze, and return signed authority.
         let binding_handler = {
             let tenant = self.tenant_id.clone();
             let db = self.db.clone();
@@ -808,8 +912,8 @@ async fn handle_status(
     per_edge_watermarks: Arc<PerEdgeAppliedPushWatermarks>,
     req: IncomingRequest,
 ) -> contextdb_core::Result<()> {
-    let envelope =
-        decode(&req.bytes).map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    let envelope = decode_for_server(&req.bytes)?;
+    let protocol_version = envelope.version;
     if !matches!(envelope.message_type, MessageType::StatusRequest) {
         return Err(contextdb_core::Error::SyncError(
             "unexpected message type on status subject".to_string(),
@@ -834,7 +938,7 @@ async fn handle_status(
         server_current_lsn: Some(db.current_lsn()),
         hub_incarnation,
     };
-    let payload = encode(MessageType::StatusResponse, &response)
+    let payload = encode_for_version(protocol_version, MessageType::StatusResponse, &response)
         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
     (req.responder)(payload)
         .await
@@ -846,8 +950,8 @@ async fn handle_push(
     state: Arc<PushHandlerState>,
     req: IncomingRequest,
 ) -> contextdb_core::Result<()> {
-    let envelope =
-        decode(&req.bytes).map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    let envelope = decode_for_server(&req.bytes)?;
+    let protocol_version = envelope.version;
     let dependency_complete = match envelope.message_type {
         MessageType::PushRequest => false,
         MessageType::DependencyCompletePushRequest => true,
@@ -863,29 +967,29 @@ async fn handle_push(
         let response = PushResponse {
             result: None,
             error: Some(
-                "protocol v6 production push requires an authenticated peer identity".to_string(),
+                "authenticated sync push requires an authenticated peer identity".to_string(),
             ),
             application_error: None,
-            // Statement 13: ordinary replies carry the outcome lane.
+            // Ordinary replies carry the outcome lane.
             ..Default::default()
         };
-        publish_push_response(req.responder, response).await?;
+        publish_push_response(req.responder, response, protocol_version).await?;
         return Ok(());
     };
     if !request.changeset.purges.is_empty() {
         let hub_node_id = state.local_node_id.clone().ok_or_else(|| {
             contextdb_core::Error::SyncError(
-                "protocol v6 production push requires the hub's authenticated identity".to_string(),
+                "authenticated sync push requires the hub's authenticated identity".to_string(),
             )
         })?;
         let response = PushResponse {
             result: None,
             error: None,
             application_error: Some(WirePushError::PurgeRequiresAuthoritativeHub { hub_node_id }),
-            // Statement 13: no outcomes accompany a failed push.
+            // No outcomes accompany a failed push.
             ..Default::default()
         };
-        publish_push_response(req.responder, response).await?;
+        publish_push_response(req.responder, response, protocol_version).await?;
         return Ok(());
     }
     let custody = !request.changeset.manifests.is_empty()
@@ -896,11 +1000,18 @@ async fn handle_push(
                 .is_some_and(|meta| meta.delivery_manifest_tables.is_some())
         });
     let incarnation = request.incarnation;
-    let request_key = req.bytes;
+    let outcome_key = Database::sync_push_outcome_key(
+        &state.tenant_id,
+        &authenticated_peer,
+        &request,
+        dependency_complete,
+    )?;
+    let request_key = (authenticated_peer.clone(), req.bytes);
     let admission = admit_push_request(
         &state.in_flight_push_applies,
         request_key.clone(),
         req.responder,
+        protocol_version,
     )
     .await?;
 
@@ -915,10 +1026,10 @@ async fn handle_push(
         return Ok(());
     }
 
-    // Statements 9–11: custody shares exact-request admission, the bounded
+    // Custody shares exact-request admission, the bounded
     // apply worker, and its installed-release post-commit checkpoint.
     if custody {
-        // Statements 9–11: decode the row payload once, then move it through
+        // Decode the row payload once, then move it through
         // the custody apply. Retain only the small wire-only DDL sidecar and
         // signed manifests needed after conversion.
         let mut wire = request.changeset;
@@ -944,6 +1055,7 @@ async fn handle_push(
             incarnation,
             dependency_complete: true,
             custody: Some(custody_request),
+            outcome_key,
             receipts: state.receipts.clone(),
             request_key,
             changeset,
@@ -957,10 +1069,47 @@ async fn handle_push(
             apply_tasks: state.apply_tasks.clone(),
             in_flight_push_applies: state.in_flight_push_applies.clone(),
             apply_permits: state.apply_permits.clone(),
+            protocol_version,
         })
         .await;
     }
 
+    // Ordinary pushes retain an exact durable apply result. Manifested units
+    // use their signed custody journal so a retry can return the same per-unit
+    // outcome packets instead of dropping them from the response.
+    match state.db.replay_sync_push_outcome(&outcome_key) {
+        Ok(Some(result)) => {
+            publish_in_flight_push_response(
+                state.in_flight_push_applies.clone(),
+                request_key,
+                PushResponse {
+                    result: Some(result.into()),
+                    error: None,
+                    application_error: None,
+                    ..Default::default()
+                },
+                protocol_version,
+            )
+            .await;
+            return Ok(());
+        }
+        Err(err) => {
+            publish_in_flight_push_response(
+                state.in_flight_push_applies.clone(),
+                request_key,
+                PushResponse {
+                    result: None,
+                    error: Some(err.to_string()),
+                    application_error: None,
+                    ..Default::default()
+                },
+                protocol_version,
+            )
+            .await;
+            return Ok(());
+        }
+        Ok(None) => {}
+    }
     let arrivals = crate::protocol::wire_row_arrivals(&request.changeset);
     let lineages = crate::protocol::wire_row_lineages(&request.changeset);
     match (|| {
@@ -985,7 +1134,8 @@ async fn handle_push(
                 return Ok::<_, contextdb_core::Error>((changeset, ddl_context, Some(conflicts)));
             }
         }
-        let changeset = if let Some(received_ddl) = ddl_context.as_ref() {
+        let original_changes = changeset.clone();
+        let checked = if let Some(received_ddl) = ddl_context.as_ref() {
             state.db.validate_incoming_push_lineages_with_received_ddl(
                 &state.tenant_id,
                 &changeset,
@@ -999,7 +1149,7 @@ async fn handle_push(
                 changeset,
                 &lineages,
                 received_ddl,
-            )?
+            )
         } else {
             state.db.validate_incoming_push_lineages(
                 &state.tenant_id,
@@ -1010,9 +1160,19 @@ async fn handle_push(
             )?;
             state
                 .db
-                .reject_accepted_lineage_replays(&state.tenant_id, changeset, &lineages)?
+                .reject_accepted_lineage_replays(&state.tenant_id, changeset, &lineages)
         };
-        Ok::<_, contextdb_core::Error>((changeset, ddl_context, None))
+        match checked {
+            Ok(changeset) => Ok((changeset, ddl_context, None)),
+            Err(contextdb_core::Error::SyncReplayOfAcceptedDelete { table, key }) => {
+                let conflicts =
+                    state
+                        .db
+                        .accepted_delete_replay_conflicts(&original_changes, &table, &key);
+                Ok((original_changes, ddl_context, Some(conflicts)))
+            }
+            Err(error) => Err(error),
+        }
     })() {
         Ok((changeset, received_ddl, terminal_conflicts)) => {
             spawn_apply_and_reply(PushApplyWork {
@@ -1024,6 +1184,7 @@ async fn handle_push(
                 receipts: state.receipts.clone(),
                 request_key,
                 custody: None,
+                outcome_key,
                 changeset,
                 received_ddl,
                 terminal_conflicts,
@@ -1035,6 +1196,7 @@ async fn handle_push(
                 apply_tasks: state.apply_tasks.clone(),
                 in_flight_push_applies: state.in_flight_push_applies.clone(),
                 apply_permits: state.apply_permits.clone(),
+                protocol_version,
             })
             .await?;
         }
@@ -1048,7 +1210,7 @@ async fn handle_push(
                             table: table.clone(),
                             key: key.clone(),
                         }),
-                        // Statement 13: no outcomes accompany a failed push.
+                        // No outcomes accompany a failed push.
                         ..Default::default()
                     }
                 } else {
@@ -1056,7 +1218,7 @@ async fn handle_push(
                         result: None,
                         error: Some(err.to_string()),
                         application_error: None,
-                        // Statement 13: ordinary replies carry the outcome lane.
+                        // Ordinary replies carry the outcome lane.
                         ..Default::default()
                     }
                 };
@@ -1064,6 +1226,7 @@ async fn handle_push(
                 state.in_flight_push_applies.clone(),
                 request_key,
                 response,
+                protocol_version,
             )
             .await;
         }
@@ -1071,16 +1234,21 @@ async fn handle_push(
     Ok(())
 }
 
+// These separate inputs jointly determine one atomic sync-page decision;
+// keeping them explicit preserves the page's holdback, cursor, and wire rules.
+#[allow(clippy::too_many_arguments)]
 async fn handle_pull(
     db: Arc<Database>,
     lineage_signer: Option<LineageSigner>,
     receipts: Arc<TransferLedger>,
     tenant_id: TenantId,
     local_node_id: Option<String>,
+    schema_sync_holdbacks: SchemaSyncHoldbackStates,
+    peer_schema_capabilities: PeerSchemaCapabilities,
     req: IncomingRequest,
 ) -> contextdb_core::Result<()> {
-    let envelope =
-        decode(&req.bytes).map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    let envelope = decode_for_server(&req.bytes)?;
+    let protocol_version = envelope.version;
     if !matches!(envelope.message_type, MessageType::PullRequest) {
         return Err(contextdb_core::Error::SyncError(
             "unexpected message type on pull subject".to_string(),
@@ -1089,6 +1257,147 @@ async fn handle_pull(
 
     let request: PullRequest = rmp_serde::from_slice(&envelope.payload)
         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    let peer_node_id = req.node_id.clone();
+    let capabilities = peer_schema_capabilities.resolve(peer_node_id.as_deref(), protocol_version);
+    let mut prior_holdback = peer_node_id.as_deref().and_then(|peer| {
+        schema_sync_holdbacks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(peer)
+            .cloned()
+    });
+    if !capabilities.supports_all()
+        && let Some(state) = prior_holdback.as_mut()
+        && request.since_lsn < state.compatible_through
+    {
+        // This authenticated receiver is asking from history it no longer
+        // claims to own. The peer name may have survived a disk rebuild, but
+        // its private compatible frontier did not: trust the receiver's
+        // public bookmark and retain the held-table recovery target separately.
+        state.compatible_through = request.since_lsn;
+    }
+    if let Some(state) = prior_holdback.as_mut()
+        && state.recovery_after.is_none()
+    {
+        // The authenticated receiver's public bookmark is stronger evidence
+        // than the sender's last observed request. Capture it before the first
+        // upgraded recovery page so compatible work delivered by the preceding
+        // response is not replayed beside the held table.
+        state.compatible_through = state.compatible_through.max(request.since_lsn);
+    }
+    if let Some(SchemaRecoveryRequest::Acknowledge { target_lsn }) =
+        request.schema_recovery.as_ref()
+        && let Some(state) = prior_holdback.as_ref()
+    {
+        if state.held_through != *target_lsn {
+            return Err(contextdb_core::Error::SyncError(format!(
+                "schema-recovery acknowledgement targets source frontier {}, but the sender is holding frontier {}",
+                target_lsn.0, state.held_through.0
+            )));
+        }
+        let peer = peer_node_id.as_deref().ok_or_else(|| {
+            contextdb_core::Error::SyncError(
+                "schema-recovery acknowledgement requires an authenticated receiver".to_string(),
+            )
+        })?;
+        let (recovered_tables, remaining_capabilities) =
+            holdback_for_capabilities(&db, state, capabilities);
+        if recovered_tables.is_empty() {
+            if state.compatible_through < *target_lsn {
+                return Err(contextdb_core::Error::SyncError(
+                    "schema-recovery acknowledgement names no capability this protocol can recover"
+                        .to_string(),
+                ));
+            }
+            // A final reply can be lost after the partial-upgrade state
+            // commits. Repeating that exact acknowledgement is harmless.
+            prior_holdback = Some(state.clone());
+        } else {
+            // The request itself proves that the receiver durably applied
+            // the final page. Remove only the capabilities this protocol
+            // gained; any capabilities still missing retain their own
+            // table holdbacks.
+            let remaining = (!remaining_capabilities.is_empty()).then(|| {
+                let mut remaining = state.clone();
+                remaining.capabilities = remaining_capabilities;
+                remaining.compatible_through = remaining.compatible_through.max(*target_lsn);
+                remaining
+            });
+            let durable = remaining
+                .as_ref()
+                .map(|remaining| DurableSchemaSyncHoldback {
+                    peer_node_id: peer.to_string(),
+                    capabilities: remaining.capabilities.clone(),
+                    through: remaining.compatible_through,
+                    held_through: remaining.held_through,
+                });
+            db.persist_inbound_schema_sync_holdback(&tenant_id, peer, durable.as_ref())?;
+            let mut states = schema_sync_holdbacks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(remaining) = remaining.clone() {
+                states.insert(peer.to_string(), remaining);
+            } else {
+                states.remove(peer);
+            }
+            prior_holdback = remaining;
+        }
+    }
+    let recovering_tables = prior_holdback
+        .as_ref()
+        .map(|state| {
+            let (recoverable, _) = holdback_for_capabilities(&db, state, capabilities);
+            recoverable
+        })
+        .filter(|tables| !tables.is_empty());
+    let recovery_target = recovering_tables
+        .as_ref()
+        .and_then(|_| prior_holdback.as_ref().map(|state| state.held_through));
+    let recovery_since = if let Some(target_lsn) = recovery_target {
+        match request.schema_recovery.as_ref() {
+            None => prior_holdback
+                .as_ref()
+                .and_then(|state| state.recovery_after)
+                .unwrap_or(Lsn(0)),
+            Some(SchemaRecoveryRequest::Continue {
+                target_lsn: requested_target,
+                after_lsn,
+            }) => {
+                if *requested_target != target_lsn || *after_lsn > target_lsn {
+                    return Err(contextdb_core::Error::SyncError(format!(
+                        "schema-recovery continuation does not match held frontier {}",
+                        target_lsn.0
+                    )));
+                }
+                *after_lsn
+            }
+            Some(SchemaRecoveryRequest::Acknowledge { .. }) => {
+                return Err(contextdb_core::Error::SyncError(
+                    "schema-recovery acknowledgement did not clear its held image".to_string(),
+                ));
+            }
+        }
+    } else {
+        if matches!(
+            request.schema_recovery,
+            Some(SchemaRecoveryRequest::Continue { .. })
+        ) {
+            return Err(contextdb_core::Error::SyncError(
+                "schema-recovery continuation has no held table on this sender".to_string(),
+            ));
+        }
+        request.since_lsn
+    };
+    let effective_since = if recovering_tables.is_some() {
+        recovery_since
+    } else if !capabilities.supports_all() {
+        prior_holdback
+            .as_ref()
+            .map(|state| state.compatible_through.max(request.since_lsn))
+            .unwrap_or(request.since_lsn)
+    } else {
+        request.since_lsn
+    };
 
     // Keep extraction, all serve-time shaping, and its schema-instance
     // evidence on one published schema.  The lease is released before the
@@ -1101,14 +1410,17 @@ async fn handle_pull(
     // declare a PRIMARY KEY, add an indexed `id` column, or set SYNC OFF.
     refuse_keyless_tables_with_no_identity_fallback(&db, &HashMap::new())?;
 
-    // Statements 9/15: never paginate retained custody history that this
+    // Never paginate retained custody history that this
     // declaration cannot serve. Hidden progress is private and schema-bound;
     // the public cursor still advances only for deliverable content.
-    let hidden_scan =
-        db.custody_pull_scan(&tenant_id, req.node_id.as_deref(), request.since_lsn)?;
+    let hidden_scan = if protocol_version == crate::protocol::PROTOCOL_VERSION {
+        db.custody_pull_scan(&tenant_id, req.node_id.as_deref(), effective_since)?
+    } else {
+        None
+    };
     let scan_since = hidden_scan
         .as_ref()
-        .map_or(request.since_lsn, |scan| scan.since);
+        .map_or(effective_since, |scan| scan.since);
     let (mut changes, arrivals, ddl_provenance_source) =
         db.checked_changes_since_with_arrivals(scan_since)?;
     let mut purge_items = db.authoritative_purge_delivery_items_since(scan_since)?;
@@ -1125,6 +1437,53 @@ async fn handle_pull(
         changes = crate::sync_client::drop_push_only_retained_rows(&db, changes);
         if changes.is_empty() && purge_items.is_empty() {
             db.remember_hidden_custody_pull(scan)?;
+        }
+    }
+
+    if let Some(tables) = recovering_tables.as_ref() {
+        let target = recovery_target.expect("recovery target accompanies held tables");
+        let compatible_through = prior_holdback
+            .as_ref()
+            .expect("recovery tables come from a schema holdback")
+            .compatible_through;
+        changes = changes
+            .for_schema_recovery(tables, compatible_through)
+            .through_lsn(target);
+        purge_items.retain(|item| tables.contains(&item.table) && item.frontier <= target);
+    }
+
+    let mut next_holdback = prior_holdback.unwrap_or_default();
+    if !capabilities.supports_all() && recovering_tables.is_none() {
+        next_holdback.recovery_after = None;
+        next_holdback.compatible_through = next_holdback.compatible_through.max(request.since_lsn);
+        for (table, capabilities) in
+            unsupported_schema_capabilities_in_changes(&db, &changes, capabilities)
+        {
+            next_holdback.capabilities.remove(&table);
+            if !capabilities.is_empty() {
+                next_holdback.capabilities.insert(table, capabilities);
+            }
+        }
+        let held_tables = next_holdback
+            .capabilities
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if !held_tables.is_empty() {
+            // Freeze the complete held image before removing it from the old
+            // receiver's page. Pagination and purge ordering below then see
+            // only compatible work, so an erasure waiting on one table cannot
+            // block later healthy tables or advance the public bookmark.
+            if let Some(frontier) = changes
+                .max_lsn()
+                .into_iter()
+                .chain(purge_items.iter().map(|item| item.frontier))
+                .max()
+            {
+                next_holdback.held_through = next_holdback.held_through.max(frontier);
+            }
+            changes = changes.without_tables(&held_tables);
+            purge_items.retain(|item| !held_tables.contains(&item.table));
         }
     }
 
@@ -1249,7 +1608,7 @@ async fn handle_pull(
     // fell back to the max LSN of the FILTERED bytes would strand its watermark
     // below an excluded row and re-request it forever. The cursor is taken from
     // the pre-filter frontier here, so the watermark advances past excluded rows.
-    let cursor = changes
+    let mut cursor = changes
         .max_lsn()
         .into_iter()
         .chain(purge_items.iter().map(|item| item.frontier))
@@ -1261,11 +1620,27 @@ async fn handle_pull(
                 Some(db.current_lsn())
             }
         });
-    let cursor = if has_more {
-        cursor
-    } else {
-        cursor.into_iter().chain(consumed_hidden_frontier).max()
-    };
+    if !has_more {
+        let bounded_hidden_frontier = consumed_hidden_frontier
+            .map(|frontier| recovery_target.map_or(frontier, |target| frontier.min(target)));
+        cursor = cursor.into_iter().chain(bounded_hidden_frontier).max();
+    }
+
+    let recovery_page = recovery_target.map(|target_lsn| SchemaRecoveryPage {
+        target_lsn,
+        next_lsn: cursor.unwrap_or(effective_since),
+        complete: !has_more,
+    });
+    if let Some(recovery_page) = recovery_page.as_ref() {
+        // Recovery progress is private, but the ordinary cursor presented to
+        // existing apply code must remain monotonic. Every recovery page asks
+        // for one more request; the final one is followed by an explicit ACK.
+        cursor = Some(request.since_lsn.max(recovery_page.next_lsn));
+        has_more = true;
+    }
+    let recovery_after = recovery_page
+        .as_ref()
+        .and_then(|page| (!page.complete).then_some(page.next_lsn));
 
     // The cursor is already computed from the full frontier, so declaration
     // filtering excludes `SYNC OFF` rows without stranding the edge's pull
@@ -1293,7 +1668,15 @@ async fn handle_pull(
     // clock). The cursor was computed from the full frontier above, so an
     // excluded row still advances the reader's watermark and is not re-requested.
     let changes = drop_rows_past_retention_window(&db, changes);
-    let units = db.dependency_complete_outbound_units(changes, request.since_lsn)?;
+    if !capabilities.supports_all() && recovering_tables.is_none() {
+        cursor = changes
+            .max_lsn()
+            .into_iter()
+            .chain(purge_items.iter().map(|item| item.frontier))
+            .max()
+            .or(cursor.filter(|_| changes.is_empty() && purge_items.is_empty()));
+    }
+    let units = db.dependency_complete_outbound_units(changes, effective_since)?;
     let mut ordinary = ChangeSet::default();
     let mut dependency_units = Vec::new();
     for unit in units {
@@ -1338,13 +1721,13 @@ async fn handle_pull(
     } else {
         Some(local_node_id.as_deref().ok_or_else(|| {
             contextdb_core::Error::SyncError(
-                "protocol v6 production pull requires the hub's authenticated identity".to_string(),
+                "authenticated sync pull requires the hub's authenticated identity".to_string(),
             )
         })?)
     };
     let signer = lineage_signer.as_ref().ok_or_else(|| {
         contextdb_core::Error::SyncError(
-            "protocol v6 production pull requires the hub transport's creator signer".to_string(),
+            "authenticated sync pull requires the hub transport's creator signer".to_string(),
         )
     })?;
     let ordinary_lineages = authenticated_local_node
@@ -1383,6 +1766,7 @@ async fn handle_pull(
         has_more,
         cursor,
         source: Some(source),
+        schema_recovery: recovery_page,
     };
     let dependency_units = dependency_units
         .into_iter()
@@ -1400,21 +1784,24 @@ async fn handle_pull(
                 .transpose()?
                 .unwrap_or_default();
             let ddl_provenance = db.outbound_ddl_provenance(&unit, &ddl_provenance_source)?;
-            Ok(
-                crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
-                    unit,
-                    &arrivals,
-                    &lineages,
-                    ddl_provenance,
-                ),
-            )
+            let wire = crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
+                unit,
+                &arrivals,
+                &lineages,
+                ddl_provenance,
+            );
+            Ok(wire)
         })
         .collect::<contextdb_core::Result<Vec<_>>>()?;
     drop(schema_read);
     let (message_type, payload) = if dependency_units.is_empty() {
         (
             MessageType::PullResponse,
-            encode(MessageType::PullResponse, &ordinary_response),
+            encode_for_version(
+                protocol_version,
+                MessageType::PullResponse,
+                &ordinary_response,
+            ),
         )
     } else {
         let response = DependencyCompletePullResponse {
@@ -1423,15 +1810,220 @@ async fn handle_pull(
         };
         (
             MessageType::DependencyCompletePullResponse,
-            encode(MessageType::DependencyCompletePullResponse, &response),
+            encode_for_version(
+                protocol_version,
+                MessageType::DependencyCompletePullResponse,
+                &response,
+            ),
         )
     };
     let _ = message_type;
     let payload = payload.map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    if let Some(peer) = peer_node_id.as_deref() {
+        let mut states = schema_sync_holdbacks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !capabilities.supports_all() && recovering_tables.is_none() {
+            if next_holdback.capabilities.is_empty() {
+                db.persist_inbound_schema_sync_holdback(&tenant_id, peer, None)?;
+                states.remove(peer);
+            } else {
+                let durable = DurableSchemaSyncHoldback {
+                    peer_node_id: peer.to_string(),
+                    capabilities: next_holdback.capabilities.clone(),
+                    through: next_holdback.compatible_through,
+                    held_through: next_holdback.held_through,
+                };
+                db.persist_inbound_schema_sync_holdback(&tenant_id, peer, Some(&durable))?;
+                states.insert(peer.to_string(), next_holdback);
+            }
+        } else if recovering_tables.is_some()
+            && let Some(state) = states.get_mut(peer)
+        {
+            state.recovery_after = recovery_after;
+        }
+    }
     (req.responder)(payload)
         .await
         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
     Ok(())
+}
+
+fn decode_for_server(data: &[u8]) -> contextdb_core::Result<crate::protocol::Envelope> {
+    decode(data).map_err(|error| contextdb_core::Error::SyncError(error.to_string()))
+}
+
+const fn schema_capability_minimum_protocol(_capability: SchemaSyncCapability) -> u8 {
+    7
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SchemaCapabilities {
+    protocol_version: u8,
+    vector_schema_supported: bool,
+}
+
+impl SchemaCapabilities {
+    fn supports(self, capability: SchemaSyncCapability) -> bool {
+        self.vector_schema_supported
+            && self.protocol_version >= schema_capability_minimum_protocol(capability)
+    }
+
+    pub(crate) fn supports_all(self) -> bool {
+        [
+            SchemaSyncCapability::VectorPartitioning,
+            SchemaSyncCapability::VectorSearchMode,
+            SchemaSyncCapability::VectorAutoIndexAt,
+            SchemaSyncCapability::VectorHnswPolicy,
+        ]
+        .into_iter()
+        .all(|capability| self.supports(capability))
+    }
+}
+
+/// Production capabilities come exclusively from the accepted protocol.
+/// Tests may model a future gap without enabling an unreleased wire version.
+#[derive(Clone, Default)]
+pub(crate) struct PeerSchemaCapabilities {
+    #[cfg(feature = "test-seams")]
+    overrides: Arc<std::sync::Mutex<HashMap<String, bool>>>,
+}
+
+impl PeerSchemaCapabilities {
+    pub(crate) fn resolve(&self, _peer: Option<&str>, protocol_version: u8) -> SchemaCapabilities {
+        #[cfg(feature = "test-seams")]
+        let vector_schema_supported = _peer
+            .and_then(|peer| {
+                self.overrides
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(peer)
+                    .copied()
+            })
+            .unwrap_or(true);
+        #[cfg(not(feature = "test-seams"))]
+        let vector_schema_supported = true;
+        SchemaCapabilities {
+            protocol_version,
+            vector_schema_supported,
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn set_for_test(&self, peer: &str, supported: bool) {
+        self.overrides
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(peer.to_string(), supported);
+    }
+}
+
+pub(crate) fn unsupported_schema_capabilities_for_table(
+    db: &Database,
+    table: &str,
+    capabilities: SchemaCapabilities,
+) -> BTreeSet<SchemaSyncCapability> {
+    let mut declared = db.authored_schema_capabilities(table);
+    if let Some(meta) = db.table_meta(table) {
+        declared.extend(schema_capabilities_in_meta(&meta));
+    }
+    declared
+        .into_iter()
+        .filter(|capability| !capabilities.supports(*capability))
+        .collect()
+}
+
+/// Include the vocabulary of immutable authored history, even when a later
+/// ALTER or DROP removed it from the current schema. A peer must be able to
+/// replay the entire source vector before this table can leave holdback.
+pub(crate) fn unsupported_schema_capabilities_in_changes(
+    db: &Database,
+    changes: &ChangeSet,
+    capabilities: SchemaCapabilities,
+) -> BTreeMap<String, BTreeSet<SchemaSyncCapability>> {
+    let mut tables = HashSet::new();
+    tables.extend(changes.rows.iter().map(|row| row.table.clone()));
+    tables.extend(
+        changes
+            .vectors
+            .iter()
+            .map(|vector| vector.index.table.clone()),
+    );
+    tables.extend(
+        changes
+            .ddl
+            .iter()
+            .filter_map(DdlChange::table_name)
+            .map(str::to_string),
+    );
+
+    tables
+        .into_iter()
+        .map(|table| {
+            let unsupported = unsupported_schema_capabilities_for_table(db, &table, capabilities);
+            (table, unsupported)
+        })
+        .collect()
+}
+
+fn holdback_for_capabilities(
+    db: &Database,
+    state: &PeerSchemaSyncHoldbackState,
+    capabilities: SchemaCapabilities,
+) -> (
+    HashSet<String>,
+    BTreeMap<String, BTreeSet<SchemaSyncCapability>>,
+) {
+    let mut recoverable = HashSet::new();
+    let mut remaining = BTreeMap::new();
+    for table in state.capabilities.keys() {
+        let unsupported = unsupported_schema_capabilities_for_table(db, table, capabilities);
+        if unsupported.is_empty() {
+            recoverable.insert(table.clone());
+        } else {
+            remaining.insert(table.clone(), unsupported);
+        }
+    }
+    (recoverable, remaining)
+}
+
+fn schema_capabilities_in_meta(meta: &TableMeta) -> BTreeSet<SchemaSyncCapability> {
+    schema_capabilities_in_columns(&meta.columns)
+}
+
+pub(crate) fn schema_capabilities_in_columns(
+    columns: &[contextdb_core::ColumnDef],
+) -> BTreeSet<SchemaSyncCapability> {
+    let mut capabilities = BTreeSet::new();
+    for column in columns {
+        if !matches!(column.column_type, ColumnType::Vector(_)) {
+            continue;
+        }
+        if column
+            .partition_key_columns
+            .as_ref()
+            .is_some_and(|columns| !columns.is_empty())
+            || column.max_partitions.is_some()
+        {
+            capabilities.insert(SchemaSyncCapability::VectorPartitioning);
+        }
+        if column.search_mode != VectorSearchMode::Auto {
+            capabilities.insert(SchemaSyncCapability::VectorSearchMode);
+        }
+        if column.auto_index_at.is_some() {
+            capabilities.insert(SchemaSyncCapability::VectorAutoIndexAt);
+        }
+        if column.hnsw_m.is_some()
+            || column.hnsw_ef_construction.is_some()
+            || column.hnsw_ef_search.is_some()
+            || column.consolidation_change_percent.is_some()
+            || column.consolidation_tombstone_percent.is_some()
+            || column.consolidation_disabled
+        {
+            capabilities.insert(SchemaSyncCapability::VectorHnswPolicy);
+        }
+    }
+    capabilities
 }
 
 /// Exclude the rows of retained tables whose retention window has already
@@ -1472,6 +2064,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         receipts,
         request_key,
         custody,
+        outcome_key,
         changeset,
         received_ddl,
         terminal_conflicts,
@@ -1483,13 +2076,14 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         apply_tasks,
         in_flight_push_applies,
         apply_permits,
+        protocol_version,
     } = work;
 
     let row_count = changeset.rows.len();
     let push_payload_bytes = row_payload_bytes(&changeset.rows);
     let push_max_lsn = changeset.max_lsn();
     #[cfg(feature = "production-smoke-driver")]
-    let checkpoint_request_digest = *blake3::hash(&request_key).as_bytes();
+    let request_digest = *blake3::hash(&request_key.1).as_bytes();
     #[cfg(feature = "production-smoke-driver")]
     let checkpoint_node_id = peer_node_id.clone().unwrap_or_default();
     let guard = apply_tasks.start();
@@ -1546,11 +2140,12 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             },
                             row_count,
                             conflicts,
+                            &outcome_key,
                         )?
                     } else if let (Some(node_id), Some(max_lsn)) =
                         (applying_node_id.as_deref(), push_max_lsn)
                     {
-                        db.apply_authenticated_received_changes_with_receipt_and_lineages(
+                        db.apply_authenticated_received_changes_with_outcome(
                             changeset,
                             &arrivals,
                             SyncAdoption::Continuing,
@@ -1564,6 +2159,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             local_node_id.as_deref(),
                             &lineages,
                             received_ddl.as_ref(),
+                            Some(&outcome_key),
                         )?
                     } else {
                         db.apply_authenticated_received_changes_with_lineages_as_hub_push(
@@ -1624,7 +2220,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                         #[cfg(feature = "production-smoke-driver")]
                         let checkpoint = push_max_lsn.map(|source_lsn| {
                             (
-                                checkpoint_request_digest,
+                                request_digest,
                                 checkpoint_node_id,
                                 source_lsn,
                                 result.new_lsn,
@@ -1648,7 +2244,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             result: None,
                             error: Some(err.to_string()),
                             application_error: None,
-                            // Statement 13: ordinary replies carry the outcome lane.
+                            // Ordinary replies carry the outcome lane.
                             ..Default::default()
                         },
                         None,
@@ -1658,7 +2254,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             result: None,
                             error: Some(format!("push apply task failed: {err}")),
                             application_error: None,
-                            // Statement 13: ordinary replies carry the outcome lane.
+                            // Ordinary replies carry the outcome lane.
                             ..Default::default()
                         },
                         None,
@@ -1670,7 +2266,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                     result: None,
                     error: Some(format!("push apply semaphore closed: {err}")),
                     application_error: None,
-                    // Statement 13: ordinary replies carry the outcome lane.
+                    // Ordinary replies carry the outcome lane.
                     ..Default::default()
                 },
                 None,
@@ -1692,7 +2288,13 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         #[cfg(not(feature = "production-smoke-driver"))]
         let _ = committed_checkpoint;
 
-        publish_in_flight_push_response(in_flight_push_applies, request_key, response).await;
+        publish_in_flight_push_response(
+            in_flight_push_applies,
+            request_key,
+            response,
+            protocol_version,
+        )
+        .await;
     });
     Ok(())
 }
@@ -1703,6 +2305,7 @@ async fn admit_push_request(
     in_flight_push_applies: &InFlightPushApplies,
     request_key: PushRequestKey,
     responder: Responder,
+    protocol_version: u8,
 ) -> contextdb_core::Result<PushAdmission> {
     let mut in_flight = in_flight_push_applies.lock().await;
     if let Some(responders) = in_flight.get_mut(&request_key) {
@@ -1712,10 +2315,10 @@ async fn admit_push_request(
                 result: None,
                 error: Some("sync server push apply duplicate reply fanout full".to_string()),
                 application_error: None,
-                // Statement 13: ordinary replies carry the outcome lane.
+                // Ordinary replies carry the outcome lane.
                 ..Default::default()
             };
-            publish_push_response(responder, response).await?;
+            publish_push_response(responder, response, protocol_version).await?;
             return Ok(PushAdmission::Rejected);
         }
         responders.push(responder);
@@ -1727,10 +2330,10 @@ async fn admit_push_request(
             result: None,
             error: Some("sync server push apply backlog full".to_string()),
             application_error: None,
-            // Statement 13: ordinary replies carry the outcome lane.
+            // Ordinary replies carry the outcome lane.
             ..Default::default()
         };
-        publish_push_response(responder, response).await?;
+        publish_push_response(responder, response, protocol_version).await?;
         return Ok(PushAdmission::Rejected);
     }
     in_flight.insert(request_key, vec![responder]);
@@ -1744,6 +2347,7 @@ async fn publish_in_flight_push_response(
     in_flight_push_applies: InFlightPushApplies,
     request_key: PushRequestKey,
     response: PushResponse,
+    protocol_version: u8,
 ) {
     loop {
         let responders = {
@@ -1759,7 +2363,9 @@ async fn publish_in_flight_push_response(
         };
 
         for responder in responders {
-            if let Err(err) = publish_push_response(responder, response.clone()).await {
+            if let Err(err) =
+                publish_push_response(responder, response.clone(), protocol_version).await
+            {
                 tracing::error!(error = %err, "failed to publish push response");
             }
         }
@@ -1769,8 +2375,9 @@ async fn publish_in_flight_push_response(
 async fn publish_push_response(
     responder: Responder,
     response: PushResponse,
+    protocol_version: u8,
 ) -> contextdb_core::Result<()> {
-    let payload = encode(MessageType::PushResponse, &response)
+    let payload = encode_for_version(protocol_version, MessageType::PushResponse, &response)
         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
     responder(payload)
         .await
@@ -1788,4 +2395,78 @@ fn merge_changeset_groups(groups: Vec<ChangeSet>) -> ChangeSet {
         merged.ddl_lsn.extend(group.ddl_lsn);
     }
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn identical_pushes_from_distinct_authenticated_edges_deliver_independently() {
+        let tasks = Arc::new(ApplyTracker::new());
+        let state = Arc::new(PushHandlerState {
+            db: Arc::new(Database::open_memory()),
+            local_node_id: Some("1".repeat(64)),
+            receipts: Arc::new(TransferLedger::new()),
+            tenant_id: TenantId::from("independent-edges"),
+            applied_push_watermark: Arc::new(AtomicLsn::new(Lsn(0))),
+            per_edge_watermarks: Arc::new(PerEdgeAppliedPushWatermarks::default()),
+            apply_tasks: tasks.clone(),
+            in_flight_push_applies: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            apply_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PUSH_APPLIES)),
+        });
+        let bytes = crate::protocol::encode(MessageType::PushRequest, &PushRequest::default())
+            .expect("encode empty ordinary push");
+        let (first_sent, first_received) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        handle_push(
+            state.clone(),
+            IncomingRequest {
+                bytes: bytes.clone(),
+                node_id: Some("2".repeat(64)),
+                responder: Box::new(move |response| {
+                    Box::pin(async move {
+                        first_sent.send(response).expect("first reply receiver");
+                        released.await.expect("release first reply");
+                        Ok(())
+                    })
+                }),
+            },
+        )
+        .await
+        .expect("first request admitted");
+        let first = first_received
+            .await
+            .expect("first result reached transport");
+        let first: PushResponse =
+            rmp_serde::from_slice(&decode(&first).expect("first envelope").payload)
+                .expect("first response");
+        assert!(first.result.is_some(), "{first:?}");
+        let (second_sent, second_received) = tokio::sync::oneshot::channel();
+        handle_push(
+            state,
+            IncomingRequest {
+                bytes,
+                node_id: Some("3".repeat(64)),
+                responder: Box::new(move |response| {
+                    Box::pin(async move {
+                        let _ = second_sent.send(response);
+                        Ok(())
+                    })
+                }),
+            },
+        )
+        .await
+        .expect("second request admitted");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), second_received).await;
+        release.send(()).expect("release blocked first transport");
+        tasks.wait_idle().await;
+        let second = second
+            .expect("another authenticated edge must not wait on the first edge's reply")
+            .expect("second result");
+        let second: PushResponse =
+            rmp_serde::from_slice(&decode(&second).expect("second envelope").payload)
+                .expect("second response");
+        assert!(second.result.is_some(), "{second:?}");
+    }
 }

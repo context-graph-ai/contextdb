@@ -583,7 +583,7 @@ fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
             "use contextdb_engine::sync_types::{ChangeSet, DdlChange};\n",
             1,
         ),
-        // Statement 20: exact public custody types used by the fixed nine journeys.
+        // Exact public custody types used by the fixed nine journeys.
         (
             "use contextdb_engine::sync_client::ApplicationTablePolicyExpectation;\n",
             1,
@@ -607,7 +607,7 @@ fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
     // its negative-shape proofs may orchestrate. Do not add general engine
     // names here.
     for (authorized_use, expected_count) in [
-        // Statement 20: fixed custody verifier opens and public projections, never apply logic.
+        // Fixed custody verifier opens and public projections, never apply logic.
         ("Database::open(&edge_path)", 2),
         ("Database::open(&restored_path)", 1),
         ("let db = Database::open_memory();", 1),
@@ -897,7 +897,7 @@ async fn ip_01_push_pull_converges_over_fake() {
                 result: Some(expected_result),
                 error: None,
                 application_error: None,
-                // Statement 13: ordinary response lane compile prerequisite.
+                // Ordinary response lane compile prerequisite.
                 ..Default::default()
             },
             &format!("acceptance-stamped push group {idx}"),
@@ -992,6 +992,7 @@ async fn ip_01_push_pull_converges_over_fake() {
             source: server_db
                 .sync_incarnation(&contextdb_core::TenantId::from(tenant))
                 .ok(),
+            schema_recovery: None,
         },
         units: expected_dependency_units
             .into_iter()
@@ -1003,6 +1004,7 @@ async fn ip_01_push_pull_converges_over_fake() {
         PullRequest {
             since_lsn: Lsn(0),
             max_entries: Some(500),
+            schema_recovery: None,
         },
         expected_pull_response,
         "single-page pull",
@@ -1702,6 +1704,7 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
             source: server_db
                 .sync_incarnation(&contextdb_core::TenantId::from(tenant))
                 .ok(),
+            schema_recovery: None,
         },
         units: expected_dependency_units
             .into_iter()
@@ -1713,6 +1716,7 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
         PullRequest {
             since_lsn: Lsn(0),
             max_entries: Some(500),
+            schema_recovery: None,
         },
         expected_pull_response,
         "multi-batch history pull",

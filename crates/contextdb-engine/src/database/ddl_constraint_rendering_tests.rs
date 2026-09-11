@@ -47,3 +47,46 @@ fn state_machine_constraint_rendering_is_deterministic() {
         "the one spelling is the transitions sorted by source state"
     );
 }
+
+#[test]
+fn projected_vector_defaults_render_like_the_durable_declaration() {
+    for (declaration, expected) in [
+        (
+            "VECTOR(3) AUTO_INDEX_AT DEFAULT HNSW (M = DEFAULT, EF_CONSTRUCTION = DEFAULT, EF_SEARCH = DEFAULT)",
+            "VECTOR(3)",
+        ),
+        (
+            "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope) MAX_PARTITIONS 0008 SEARCH_MODE AUTO AUTO_INDEX_AT 0005001 HNSW (M = DEFAULT, EF_CONSTRUCTION = 00064, EF_SEARCH = DEFAULT)",
+            "VECTOR(3) WITH (quantization = 'SQ8') PARTITION_KEY (scope) MAX_PARTITIONS 8 AUTO_INDEX_AT 5001 HNSW (EF_CONSTRUCTION = 64)",
+        ),
+        (
+            "VECTOR(3) AUTO_INDEX_AT 0001000 HNSW (M = 00016, EF_CONSTRUCTION = 00200, EF_SEARCH = 00200)",
+            "VECTOR(3) AUTO_INDEX_AT 1000 HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 200)",
+        ),
+    ] {
+        let db = Database::open_memory();
+        let sql = format!(
+            "CREATE TABLE projected_vectors (id INTEGER PRIMARY KEY, scope TEXT NOT NULL, embedding {declaration})"
+        );
+        let statement = contextdb_parser::parse(&sql).expect("parse vector declaration");
+        let projected = db
+            .ddl_change_for_statement(&statement, None)
+            .expect("valid vector declaration has a DDL projection");
+        db.execute(&sql, &HashMap::new())
+            .expect("install the same declaration");
+        let meta = db
+            .table_meta("projected_vectors")
+            .expect("installed metadata");
+        assert_eq!(
+            projected,
+            ddl_change_from_meta("projected_vectors", &meta),
+            "projection and durable DDL have one normalized identity: {declaration}"
+        );
+        let column = meta
+            .columns
+            .iter()
+            .find(|column| column.name == "embedding")
+            .unwrap();
+        assert_eq!(sql_type_for_meta_column(column, &[]), expected);
+    }
+}

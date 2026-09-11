@@ -5,9 +5,9 @@ use crate::custody_types::{
     AuthenticatedTenantPolicyBinding, DeliveryOutcome, DeliveryOutcomeCursor,
 };
 use crate::protocol::{
-    DependencyCompletePullResponse, MessageType, PullRequest, PullResponse, PushRequest,
-    PushResponse, SyncStatusResponse, WireChangeSet, WirePurgeChange, WirePushError, decode,
-    encode, row_payload_bytes,
+    DependencyCompletePullResponse, MessageType, PROTOCOL_VERSION, PullRequest, PullResponse,
+    PushRequest, PushResponse, SchemaRecoveryRequest, SyncStatusResponse, WireChangeSet,
+    WirePurgeChange, WirePushError, decode_for_version, encode_for_version, row_payload_bytes,
 };
 use crate::subjects::{pull_subject, push_subject, status_subject};
 use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
@@ -16,16 +16,15 @@ use contextdb_core::{AtomicLsn, Error, Incarnation, Lsn, TableMeta, TenantId};
 use contextdb_engine::Database;
 use contextdb_engine::database::{AuthoritativePurgeDeliveryItem, TerminalRefusalPullContext};
 use contextdb_engine::sync_types::{
-    ApplyResult, ChangeSet, PURGED_LINEAGE_CONFLICT_REASON, REMOVED_GENERATION_CONFLICT_REASON,
-    SyncAdoption, SyncDirection,
+    ApplyResult, ChangeSet, DurableSchemaSyncHoldback, PURGED_LINEAGE_CONFLICT_REASON,
+    REMOVED_GENERATION_CONFLICT_REASON, SchemaSyncCapability, SchemaSyncHoldback, SyncAdoption,
+    SyncDirection,
 };
-use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
-#[cfg(feature = "test-seams")]
-use std::sync::Mutex;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "test-seams")]
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "test-seams")]
 use tokio::sync::Notify;
@@ -53,11 +52,21 @@ struct PreparedPushBatch {
     batch: ChangeSet,
     dependency_complete: bool,
     batch_max_lsn: Lsn,
-    batch_items: u64,
-    batch_payload_bytes: u64,
     arrivals: HashMap<Lsn, Option<Lsn>>,
     lineages: HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage>,
     ddl_provenance: Vec<crate::protocol::WireDdlProvenance>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OutboundSchemaSyncHoldbackState {
+    capabilities: BTreeMap<String, BTreeSet<SchemaSyncCapability>>,
+    /// Highest local source frontier the current hub confirmed for compatible
+    /// tables. It never includes work that was merely inspected or held.
+    compatible_through: Lsn,
+    /// Highest local source frontier covered by the table image waiting for a
+    /// newer hub. Keeping this separate lets a rebuilt hub reset compatible
+    /// progress without losing the held recovery target.
+    held_through: Lsn,
 }
 
 /// Resets `pull_in_progress` back to `false` on drop -- every exit path out
@@ -116,6 +125,11 @@ pub struct SyncClient {
     /// pair at construction, so this survives a restart bound to the SAME
     /// store as the cursor it accompanies.
     pull_source: std::sync::RwLock<Option<Incarnation>>,
+    peer_schema_capabilities: crate::sync_server::PeerSchemaCapabilities,
+    /// Sender-owned per-hub compatibility state. Keeping a private delivered
+    /// frontier prevents healthy history from being resent while the public
+    /// all-tables watermark remains behind the held table.
+    schema_sync_holdbacks: Mutex<HashMap<String, OutboundSchemaSyncHoldbackState>>,
     /// Per-peer transfer counters for the sync plane. In memory only.
     receipts: Arc<TransferLedger>,
     #[cfg(feature = "test-seams")]
@@ -211,7 +225,7 @@ fn take_validated_ordinary_purges(
         if purge.table.is_empty() {
             return Err(malformed_purge_page("purge table is empty"));
         }
-        // Statement 17a: local predicates carry their own durable instruction identity.
+        // Local predicates carry their own durable instruction identity.
         if let Some(bytes) = &purge.node_local_predicate {
             crate::database::purge_predicate::NodeLocalPredicate::decode(bytes)?;
             if purge.table_generation != 0
@@ -351,6 +365,7 @@ impl std::fmt::Debug for SyncClient {
                     .load(Ordering::Relaxed),
             )
             .field("pull_source", &self.pull_source.read().map(|g| *g).ok())
+            .field("peer_protocol_version", &self.negotiated_protocol_version())
             .finish()
     }
 }
@@ -401,7 +416,8 @@ impl SyncClient {
             )
             .await
             .map_err(|e| Error::SyncError(e.to_string()))?;
-        let envelope = decode(&response).map_err(|e| Error::SyncError(e.to_string()))?;
+        let envelope =
+            crate::protocol::decode(&response).map_err(|e| Error::SyncError(e.to_string()))?;
         if envelope.message_type != MessageType::BindApplicationTablePolicyResponse {
             return Err(crate::custody::canonical::invalid());
         }
@@ -490,7 +506,8 @@ impl SyncClient {
             )
             .await
             .map_err(|e| Error::SyncError(e.to_string()))?;
-        let envelope = decode(&response).map_err(|e| Error::SyncError(e.to_string()))?;
+        let envelope =
+            crate::protocol::decode(&response).map_err(|e| Error::SyncError(e.to_string()))?;
         if envelope.message_type != MessageType::FetchDeliveryOutcomesResponse {
             return Err(crate::custody::canonical::invalid());
         }
@@ -616,7 +633,7 @@ impl SyncClient {
         )
     }
 
-    /// Statement 10: preserve the ordinary sibling's actual committed lineage in an adversarial request.
+    /// Preserve the ordinary sibling's actual committed lineage in an adversarial request.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __ordinary_push_request_for_test(
@@ -651,7 +668,7 @@ impl SyncClient {
         })
     }
 
-    /// Statements 9/10/11: construct ordinary push input from committed prerequisites.
+    /// Construct ordinary push input from committed prerequisites.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __delivery_push_request_for_test(
@@ -713,15 +730,34 @@ impl SyncClient {
                     table: root_table.into(),
                 })?;
         let rows = crate::custody::fixtures::manifest_rows(&self.db, &manifest)?;
-        self.finish_interrupted_push(
+        let batch = ChangeSet {
+            rows,
+            ..Default::default()
+        };
+        let node = self.transport.local_node_id().ok_or_else(|| {
+            Error::SyncError("progress reconciliation requires an authenticated edge".into())
+        })?;
+        let signer = self.lineage_signer.as_ref().ok_or_else(|| {
+            Error::SyncError("progress reconciliation requires a creator signer".into())
+        })?;
+        let lineages = self.db.outbound_row_lineages(
+            &batch,
+            &self.tenant_id,
+            &node,
+            manifest.edge_incarnation,
+            signer.as_ref(),
+        )?;
+        self.finish_single_attempt_interrupted_push(
             Error::SyncError("the terminal acknowledgement was not admitted".into()),
             manifest.seal.source.0,
             Some(&hub),
-            rows.len() as u64,
-            row_payload_bytes(&rows),
+            batch.rows.len() as u64,
+            row_payload_bytes(&batch.rows),
             manifest.seal.source.0,
             manifest.edge_incarnation,
-            rows.iter().any(|row| row.deleted),
+            &batch,
+            &lineages,
+            false,
         )
         .await
     }
@@ -795,7 +831,7 @@ impl SyncClient {
         self.__seed_hub_delivery_roots_for_test(table, None).await
     }
 
-    // Statement 15 fixture: arrange a selected receipt cohort in one actual commit.
+    // Fixture: arrange a selected receipt cohort in one actual commit.
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub async fn __seed_hub_delivery_roots_for_test(
@@ -873,7 +909,7 @@ impl SyncClient {
                     .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
             "tenant_id must be non-empty and alphanumeric (hyphens and underscores allowed): {tenant_id}"
         );
-        // Statements 3/7: registration uses the authenticated source identity.
+        // Registration uses the authenticated source identity.
         if let (Some(node), Some(signer)) = (transport.local_node_id(), &lineage_signer) {
             db.set_custody_runtime(tenant_id.clone(), node, signer.clone());
         }
@@ -909,6 +945,32 @@ impl SyncClient {
         if let Some(hub) = transport.peer_node_id() {
             let _ = db.register_retention_sync_peer(&hub);
         }
+        let schema_sync_holdbacks = transport
+            .peer_node_id()
+            .and_then(|hub| {
+                db.persisted_outbound_schema_sync_holdback(&tenant_id, &hub)
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            %tenant_id,
+                            %hub,
+                            error = %err,
+                            "failed to load persisted outbound schema compatibility holdback"
+                        );
+                        None
+                    })
+                    .map(|state| {
+                        (
+                            hub,
+                            OutboundSchemaSyncHoldbackState {
+                                capabilities: state.capabilities,
+                                compatible_through: state.through,
+                                held_through: state.held_through,
+                            },
+                        )
+                    })
+            })
+            .into_iter()
+            .collect();
         Self {
             db,
             transport,
@@ -923,6 +985,8 @@ impl SyncClient {
             pull_pages_read_this_pull: AtomicU64::new(0),
             pull_in_progress: std::sync::atomic::AtomicBool::new(false),
             pull_source: std::sync::RwLock::new(pull_source),
+            peer_schema_capabilities: crate::sync_server::PeerSchemaCapabilities::default(),
+            schema_sync_holdbacks: Mutex::new(schema_sync_holdbacks),
             receipts: Arc::new(TransferLedger::new()),
             #[cfg(feature = "test-seams")]
             post_push_reply_effects_pause: Mutex::new(None),
@@ -968,6 +1032,14 @@ impl SyncClient {
             "authenticated-test-transport".to_string(),
             tenant_id,
         )
+    }
+
+    /// Exercise a peer's missing vocabulary without changing transport bytes.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn set_peer_vector_schema_support_for_test(&self, supported: bool) {
+        let peer = self.hub_node_id().expect("test peer must be authenticated");
+        self.peer_schema_capabilities.set_for_test(&peer, supported);
     }
 
     /// Lazily connect the configured transport and reuse its connection.
@@ -1062,6 +1134,67 @@ impl SyncClient {
         self.receipts.receipts()
     }
 
+    /// Current per-table upgrade messages for outbound schema this edge owns.
+    /// Compatible tables are absent because they continue to move normally.
+    pub fn schema_sync_holdbacks(&self) -> Vec<SchemaSyncHoldback> {
+        let states = self
+            .schema_sync_holdbacks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut holdbacks = states
+            .iter()
+            .flat_map(|(node_to_upgrade, state)| {
+                state
+                    .capabilities
+                    .iter()
+                    .flat_map(move |(table, capabilities)| {
+                        capabilities
+                            .iter()
+                            .map(move |capability| SchemaSyncHoldback {
+                                table: table.clone(),
+                                capability: *capability,
+                                node_to_upgrade: node_to_upgrade.clone(),
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
+        holdbacks.sort();
+        holdbacks
+    }
+
+    fn persist_schema_sync_holdback(
+        &self,
+        hub_node_id: &str,
+        state: Option<&OutboundSchemaSyncHoldbackState>,
+    ) -> Result<(), Error> {
+        let durable = state.map(|state| DurableSchemaSyncHoldback {
+            peer_node_id: hub_node_id.to_string(),
+            capabilities: state.capabilities.clone(),
+            through: state.compatible_through,
+            held_through: state.held_through,
+        });
+        self.db.with_authoritative_hub_reply(hub_node_id, |db| {
+            db.persist_outbound_schema_sync_holdback_while_authoritative(
+                &self.tenant_id,
+                hub_node_id,
+                durable.as_ref(),
+            )
+        })?;
+        let mut states = self
+            .schema_sync_holdbacks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match state {
+            Some(state) => {
+                states.insert(hub_node_id.to_string(), state.clone());
+            }
+            None => {
+                states.remove(hub_node_id);
+            }
+        }
+        Ok(())
+    }
+
     /// The hub's transport-authenticated node id, when the transport
     /// authenticates one. The default transport dials by key, so this is the
     /// hub the edge is provably talking to.
@@ -1134,7 +1267,7 @@ impl SyncClient {
             .destination_reupload_epoch(&self.tenant_id, &hub_node_id)
     }
 
-    /// Statements 14/15: authenticated restore verification in one bounded
+    /// Authenticated restore verification in one bounded
     /// status exchange. Failure to verify held receipts is an error, never credit.
     /// An ordinary unbound peer without custody retains its best-effort status probe.
     async fn fetch_sync_status(
@@ -1148,7 +1281,7 @@ impl SyncClient {
         let probe = if let Some(edge) = &edge {
             crate::custody::incarnation::probe(&self.db, &self.tenant_id, &hub, edge, incarnation)?
         } else {
-            // Statements 13/15: ordinary unidentified transports keep lost-ack
+            // Ordinary unidentified transports keep lost-ack
             // status reconciliation; a bound custody edge must identify itself.
             if self.db.custody_authority()?.iter().any(|record| {
                 matches!(record,
@@ -1167,8 +1300,12 @@ impl SyncClient {
             }
         };
         let verification_required = probe.checkpoint.is_some();
+        let requests = probe
+            .pages()?
+            .into_iter()
+            .map(|encoded| (PROTOCOL_VERSION, encoded));
         let mut last = None;
-        for encoded in probe.pages()? {
+        for (version, encoded) in requests {
             let exchange = async {
                 let reply = self
                     .transport
@@ -1178,8 +1315,10 @@ impl SyncClient {
                         STATUS_REQUEST_TIMEOUT,
                     )
                     .await
-                    .map_err(|_| Error::SyncError("restore status exchange failed".into()))?;
-                let envelope = decode(&reply)
+                    .map_err(|error| {
+                        Error::SyncError(format!("restore status exchange failed: {error}"))
+                    })?;
+                let envelope = decode_for_version(&reply, version)
                     .map_err(|_| Error::SyncError("invalid restore status response".into()))?;
                 if !matches!(envelope.message_type, MessageType::StatusResponse) {
                     return Err(Error::SyncError(
@@ -1228,12 +1367,16 @@ impl SyncClient {
         Ok(last)
     }
 
-    fn decode_push_reply(&self, reply: &[u8]) -> Result<ApplyResult, PushReplyError> {
-        let envelope = decode(reply)
+    fn decode_push_reply(
+        &self,
+        reply: &[u8],
+        protocol_version: u8,
+    ) -> Result<ApplyResult, PushReplyError> {
+        let envelope = decode_for_version(reply, protocol_version)
             .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
         let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
             .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
-        // Statement 13: an ordinary reply carries no custody admission obligation.
+        // An ordinary reply carries no custody admission obligation.
         if !response.outcomes.is_empty() {
             let hub = self
                 .hub_node_id()
@@ -1259,10 +1402,18 @@ impl SyncClient {
                 })
                 .map_err(PushReplyError::Terminal)?;
         }
-        decode_push_response(reply)
+        decode_push_response(reply, protocol_version)
     }
 
-    async fn request_push_once(&self, encoded: Vec<u8>) -> Result<ApplyResult, PushRequestError> {
+    fn negotiated_protocol_version(&self) -> u8 {
+        PROTOCOL_VERSION
+    }
+
+    async fn request_push_once(
+        &self,
+        encoded: Vec<u8>,
+        protocol_version: u8,
+    ) -> Result<ApplyResult, PushRequestError> {
         let reply = self
             .transport
             .request(
@@ -1276,19 +1427,24 @@ impl SyncClient {
                     "single-attempt push failed: {err}"
                 )))
             })?;
-        self.decode_push_reply(&reply)
+        self.decode_push_reply(&reply, protocol_version)
             .map_err(PushReplyError::into_request_error)
     }
 
-    async fn request_push(&self, encoded: Vec<u8>) -> Result<ApplyResult, PushRequestError> {
-        match self.transport.ensure_single_reply_retry_safe(&encoded) {
+    async fn request_push(
+        &self,
+        encoded: Vec<u8>,
+        protocol_version: u8,
+        retry_safety: Result<(), TransportError>,
+    ) -> Result<ApplyResult, PushRequestError> {
+        match retry_safety {
             Ok(()) => {}
             Err(TransportError::RetryUnsafe(detail)) => {
                 tracing::debug!(
                     %detail,
                     "push request requires a single-attempt transport send"
                 );
-                return self.request_push_once(encoded).await;
+                return self.request_push_once(encoded, protocol_version).await;
             }
             Err(err) => {
                 return Err(PushRequestError::Terminal(Error::SyncError(format!(
@@ -1312,7 +1468,7 @@ impl SyncClient {
                 )
                 .await
             {
-                Ok(reply) => match self.decode_push_reply(&reply) {
+                Ok(reply) => match self.decode_push_reply(&reply, protocol_version) {
                     Ok(result) => {
                         push_result = Some(result);
                         break;
@@ -1356,7 +1512,8 @@ impl SyncClient {
     }
 
     async fn request_pull(&self, request: PullRequest) -> Result<PullPage, Error> {
-        let encoded = encode(MessageType::PullRequest, &request)
+        let protocol_version = self.negotiated_protocol_version();
+        let encoded = encode_for_version(protocol_version, MessageType::PullRequest, &request)
             .map_err(|e| Error::SyncError(e.to_string()))?;
 
         let mut first_attempt_response = None;
@@ -1399,7 +1556,8 @@ impl SyncClient {
         let reply = first_attempt_response.ok_or_else(|| {
             Error::SyncError("pull request timed out waiting for response".to_string())
         })?;
-        let envelope = decode(&reply).map_err(|e| Error::SyncError(e.to_string()))?;
+        let envelope = decode_for_version(&reply, protocol_version)
+            .map_err(|e| Error::SyncError(e.to_string()))?;
         match envelope.message_type {
             MessageType::PullResponse => rmp_serde::from_slice(&envelope.payload)
                 .map(|ordinary| PullPage {
@@ -1429,6 +1587,16 @@ impl SyncClient {
                 "sync requires the transport-authenticated authoritative hub identity".to_string(),
             )
         })?;
+        let push_lock = self
+            .db
+            .sync_client_push_lock(&self.tenant_id, &authenticated_hub);
+        let _push_stream = push_lock.lock().await;
+        let mut existing_schema_holdback = self
+            .schema_sync_holdbacks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&authenticated_hub)
+            .cloned();
         // Verify connectivity only after the durable authority gate accepts
         // this authenticated ticket, even for an otherwise empty push.
         self.ensure_connected().await.map_err(Error::SyncError)?;
@@ -1482,103 +1650,88 @@ impl SyncClient {
 
         let destination_reupload_epoch = self.destination_reupload_epoch()?;
 
-        // A status watermark only says that this edge's request reached the
-        // hub. It does not identify the row ordering that request received.
-        // Recover that ordering with an ordinary pull before constructing any
-        // next push changeset; otherwise a restart after a lost acknowledgement
-        // could resend the same stampless LatestWins row as a fresh overwrite.
-        // The marker is durable so this gate survives a new SyncClient/process.
-        let durable_pending_confirmation = self
+        // Only an exact committed reply can arm the durable no-send gate.
+        // A consumed watermark can also describe a refusal; without a saved
+        // reply the ordinary request below retrieves its original outcome.
+        let mut recovered_result = None;
+        if let Some(target) = self
             .db
-            .persisted_sync_pending_push_confirmation(&self.tenant_id)
-            .map_err(|err| Error::SyncError(err.to_string()))?;
-        let in_memory_pending = self.pending_push_confirmation.load(Ordering::SeqCst);
-        let pending_confirmation = durable_pending_confirmation
-            .or_else(|| (in_memory_pending.0 != 0).then_some(in_memory_pending));
-        // A status frontier belongs to the edge identity the client presents,
-        // not the remote hub identity. Identity-refusal test transports expose an
-        // aggregate server value, so it must never be mistaken for this
-        // client's pending work.
-        let reconciliation_target = pending_confirmation.or_else(|| {
-            // Moved-to/moved-back hub status-ahead is expected until one-time
-            // rebuild completes, not evidence of this life's lost ack.
-            if destination_reupload_epoch.is_none() && self.transport.has_stable_edge_identity() {
-                pre_push_server_watermark.filter(|server_applied| *server_applied > local)
-            } else {
-                None
-            }
-        });
-        if let Some(target) = reconciliation_target {
+            .persisted_sync_pending_push_confirmation(&self.tenant_id)?
+        {
             let Some(server_applied) = pre_push_server_watermark else {
                 return Err(Error::SyncPushUnconfirmed {
-                    detail: "a prior push awaits exact hub-order reconciliation, but hub status is unavailable; no rows were resent".to_string(),
+                    detail: "a prior push awaits hub reconciliation, but hub status is unavailable; no rows were resent".to_string(),
                 });
             };
-            let restored_before_pending = server_applied < target;
-            // A restored status below the durable pending target proves that
-            // this hub does not yet contain the re-send. Its ordinary history
-            // must not clear Pending; only a status-confirmed hub can use the
-            // explicit Pending-bypassing reconciliation mode.
-            if restored_before_pending {
+            if server_applied < target {
                 self.db
                     .with_authoritative_hub_reply(&authenticated_hub, |db| {
-                        db.mark_outbound_rows_pending(server_applied, None)
+                        db.invalidate_accepted_local_ordering_after_hub_regression(server_applied)?;
+                        db.mark_outbound_rows_pending(server_applied, None)?;
+                        db.complete_sync_push_confirmation_while_authoritative(
+                            &self.tenant_id,
+                            server_applied,
+                        )
                     })?;
+                self.pending_push_confirmation
+                    .store(Lsn(0), Ordering::SeqCst);
+                self.push_watermark.store(server_applied, Ordering::SeqCst);
+                local = server_applied;
             } else {
-                // The status covers this edge's pending batch. Protect only
-                // that confirmed interval while the exact-order pull runs;
-                // later, unconfirmed local work must remain ordinary local
-                // work rather than being stamped by this confirmation.
+                let result = self
+                    .db
+                    .persisted_sync_pending_push_result(&self.tenant_id)?;
+                self.pull_default_confirmed_pending().await.map_err(|err| {
+                    Error::SyncPushUnconfirmed {
+                        detail: format!(
+                            "the prior push reconciliation pull failed ({err}); no rows were resent"
+                        ),
+                    }
+                })?;
+                if result.is_none() && self.db.has_unconfirmed_push_rows(local, target) {
+                    return Err(Error::SyncPushUnconfirmed {
+                        detail: "the pending single-attempt push still lacks exact accepted row ordering; no rows were resent".to_string(),
+                    });
+                }
+                // Never use a later server frontier to retire unrelated local work.
+                let through = if existing_schema_holdback.is_some() {
+                    local
+                } else {
+                    local.max(target)
+                };
                 self.db
                     .with_authoritative_hub_reply(&authenticated_hub, |db| {
-                        db.mark_outbound_rows_pending(local, Some(server_applied))
+                        db.complete_sync_push_confirmation_while_authoritative(
+                            &self.tenant_id,
+                            through,
+                        )
                     })?;
+                self.pending_push_confirmation
+                    .store(Lsn(0), Ordering::SeqCst);
+                self.push_watermark.store(through, Ordering::SeqCst);
+                self.advance_engine_sync_watermark(through);
+                local = through;
+                recovered_result = result;
             }
-            let reconciliation_pull = if restored_before_pending {
-                self.pull_with_initial_adoption(SyncAdoption::Continuing)
-                    .await
-            } else {
-                self.pull_default_confirmed_pending().await
-            };
-            if let Err(pull_err) = reconciliation_pull {
-                return Err(Error::SyncPushUnconfirmed {
-                    detail: format!(
-                        "the prior push reconciliation pull failed ({pull_err}); no rows were resent"
-                    ),
-                });
-            }
-            if restored_before_pending {
-                tracing::info!(
-                    tenant_id = %self.tenant_id,
-                    pending = target.0,
-                    restored_frontier = server_applied.0,
-                    "hub restored below pending push confirmation; adopted its history before re-delivery"
-                );
-            }
-            // The pull supplied exact arrivals; status supplies this edge's
-            // outbound frontier. Persist that frontier before clearing pending:
-            // a crash can then only repeat the safe idempotent pull.
-            self.db
-                .with_authoritative_hub_reply(&authenticated_hub, |db| {
-                    db.persist_sync_push_watermark_while_authoritative(
-                        &self.tenant_id,
-                        server_applied,
-                    )?;
-                    db.persist_sync_pending_push_confirmation_while_authoritative(
-                        &self.tenant_id,
-                        None,
-                    )?;
-                    self.push_watermark.store(server_applied, Ordering::SeqCst);
-                    self.pending_push_confirmation
-                        .store(Lsn(0), Ordering::SeqCst);
-                    self.advance_engine_sync_watermark(server_applied);
-                    Ok(())
-                })
-                .map_err(|err| Error::SyncError(err.to_string()))?;
-            local = server_applied;
         }
 
         let since = local;
+        let protocol_version = self.negotiated_protocol_version();
+        let capabilities = self
+            .peer_schema_capabilities
+            .resolve(Some(&authenticated_hub), protocol_version);
+        if !capabilities.supports_all()
+            && let (Some(server_applied), Some(state)) =
+                (pre_push_server_watermark, existing_schema_holdback.as_mut())
+            && server_applied < state.compatible_through
+        {
+            // The hub's own status proves this store does not contain the
+            // compatible frontier remembered for its predecessor. A peer name
+            // is not a store identity: restart compatible delivery from the
+            // frontier this hub actually reports, while retaining the held
+            // table's independent recovery target.
+            state.compatible_through = server_applied;
+        }
         let schema_read = self.db.enter_outbound_sync_schema_read();
         refuse_keyless_tables_with_no_identity_fallback(&self.db, &HashMap::new())?;
         let (changeset, _, ddl_provenance_source) =
@@ -1603,6 +1756,69 @@ impl SyncClient {
             }
             None => drop_rows_that_arrived_by_sync(&self.db, changeset),
         };
+        let mut recoverable_tables = HashSet::new();
+        let mut remaining_capabilities = BTreeMap::new();
+        if let Some(state) = existing_schema_holdback.as_ref() {
+            for table in state.capabilities.keys() {
+                let unsupported = crate::sync_server::unsupported_schema_capabilities_for_table(
+                    &self.db,
+                    table,
+                    capabilities,
+                );
+                if unsupported.is_empty() {
+                    recoverable_tables.insert(table.clone());
+                } else {
+                    remaining_capabilities.insert(table.clone(), unsupported);
+                }
+            }
+        }
+        let recovering_schema_holdback = !recoverable_tables.is_empty();
+        let mut next_schema_holdback = existing_schema_holdback.clone().and_then(|mut state| {
+            state.capabilities = remaining_capabilities;
+            (!state.capabilities.is_empty()).then_some(state)
+        });
+        let changeset = if recovering_schema_holdback {
+            let state = existing_schema_holdback
+                .as_ref()
+                .expect("recoverable tables come from a schema holdback");
+            let still_held = next_schema_holdback
+                .as_ref()
+                .map(|state| state.capabilities.keys().cloned().collect::<HashSet<_>>())
+                .unwrap_or_default();
+            changeset
+                .for_schema_recovery(&recoverable_tables, state.compatible_through)
+                .without_tables(&still_held)
+        } else if !capabilities.supports_all() {
+            let mut state = next_schema_holdback.clone().unwrap_or_default();
+            for (table, capabilities) in
+                crate::sync_server::unsupported_schema_capabilities_in_changes(
+                    &self.db,
+                    &changeset,
+                    capabilities,
+                )
+            {
+                state.capabilities.remove(&table);
+                if !capabilities.is_empty() {
+                    state.capabilities.insert(table, capabilities);
+                }
+            }
+            if state.capabilities.is_empty() {
+                next_schema_holdback = None;
+                changeset
+            } else {
+                let held_tables = state.capabilities.keys().cloned().collect::<HashSet<_>>();
+                if let Some(frontier) = changeset.only_tables(&held_tables).max_lsn() {
+                    state.held_through = state.held_through.max(frontier);
+                }
+                let compatible = changeset
+                    .without_tables(&held_tables)
+                    .after_lsn(state.compatible_through);
+                next_schema_holdback = Some(state);
+                compatible
+            }
+        } else {
+            changeset
+        };
 
         let changeset = crate::custody::delivery::pending_changes(&self.db, changeset)?;
 
@@ -1621,28 +1837,75 @@ impl SyncClient {
             .max()
             .unwrap_or(Lsn(0));
 
+        // Recovery can send an older held row after newer compatible work
+        // was already acknowledged. That durable compatible frontier is also
+        // known sent work, but never proves this row's outcome: reconciliation
+        // still requires its authenticated echo before retiring it.
+        let reconciliation_ceiling = if recovering_schema_holdback {
+            existing_schema_holdback
+                .as_ref()
+                .map(|state| transmitted_ceiling.max(state.compatible_through))
+                .unwrap_or(transmitted_ceiling)
+        } else {
+            transmitted_ceiling
+        };
+
         if units.iter().all(|unit| unit.changes.is_empty()) {
+            if recovering_schema_holdback {
+                let recovered_through = existing_schema_holdback
+                    .as_ref()
+                    .map(|state| state.compatible_through.max(state.held_through))
+                    .unwrap_or(since);
+                drop(schema_read);
+                if let Some(mut state) = next_schema_holdback {
+                    state.compatible_through = state.compatible_through.max(recovered_through);
+                    self.persist_schema_sync_holdback(&authenticated_hub, Some(&state))?;
+                } else {
+                    // Clearing first is the safe crash order. If the later
+                    // public watermark write fails, an ordinary retry may
+                    // repeat already accepted work; it cannot skip a held
+                    // table.
+                    self.persist_schema_sync_holdback(&authenticated_hub, None)?;
+                    self.db
+                        .with_authoritative_hub_reply(&authenticated_hub, |db| {
+                            db.persist_sync_push_watermark_while_authoritative(
+                                &self.tenant_id,
+                                recovered_through,
+                            )?;
+                            self.push_watermark
+                                .store(recovered_through, Ordering::SeqCst);
+                            self.advance_engine_sync_watermark(recovered_through);
+                            Ok(())
+                        })?;
+                }
+            } else if !capabilities.supports_all()
+                && let Some(state) = next_schema_holdback
+            {
+                drop(schema_read);
+                self.persist_schema_sync_holdback(&authenticated_hub, Some(&state))?;
+            } else {
+                drop(schema_read);
+            }
             if let Some((_, epoch_id)) = destination_reupload_epoch
                 && let Some(hub_node_id) = self.hub_node_id()
             {
                 self.db
                     .complete_destination_reupload(&self.tenant_id, &hub_node_id, epoch_id)?;
             }
-            return Ok(ApplyResult {
+            return Ok(recovered_result.unwrap_or(ApplyResult {
                 applied_rows: 0,
                 skipped_rows: 0,
                 conflicts: Vec::new(),
                 new_lsn: self.db.current_lsn(),
-            });
+            }));
         }
 
-        let mut total = ApplyResult {
+        let mut total = recovered_result.unwrap_or(ApplyResult {
             applied_rows: 0,
             skipped_rows: 0,
             conflicts: Vec::new(),
             new_lsn: since,
-        };
-        let mut hub_reply_effects = Vec::new();
+        });
 
         let hub = Some(authenticated_hub.clone());
         let mut last_successful_lsn = since;
@@ -1687,21 +1950,19 @@ impl SyncClient {
             // Taken BEFORE the send, so the success path and the lost-ack
             // reconciliation below report the same transmitted set. Recomputing
             // them separately on each path is how the two would drift.
-            let batch_items = batch.rows.len() as u64;
-            let batch_payload_bytes = row_payload_bytes(&batch.rows);
             let arrivals = self.db.sync_arrivals_for_changes(&batch);
             let lineages = if batch.rows.is_empty() {
                 HashMap::new()
             } else {
                 let node_id = self.transport.local_node_id().ok_or_else(|| {
                     Error::SyncError(
-                        "protocol v6 production push requires the stable authenticated edge identity"
+                        "authenticated sync push requires the stable authenticated edge identity"
                             .to_string(),
                     )
                 })?;
                 let signer = self.lineage_signer.as_ref().ok_or_else(|| {
                     Error::SyncError(
-                        "protocol v6 production push requires the transport's creator signer"
+                        "authenticated sync push requires the transport's creator signer"
                             .to_string(),
                     )
                 })?;
@@ -1733,8 +1994,6 @@ impl SyncClient {
                 batch,
                 dependency_complete,
                 batch_max_lsn,
-                batch_items,
-                batch_payload_bytes,
                 arrivals,
                 lineages,
                 ddl_provenance,
@@ -1743,12 +2002,18 @@ impl SyncClient {
         // Every database-derived fact is now retained beside its raw batch;
         // release the schema read before encoding or waiting on transport.
         drop(schema_read);
+        // Record the held table before any compatible request can leave this
+        // process. A crash after a reply can then replay safe idempotent work,
+        // but it can never forget which table still needs the newer protocol.
+        if !capabilities.supports_all()
+            && let Some(state) = next_schema_holdback.as_ref()
+        {
+            self.persist_schema_sync_holdback(&authenticated_hub, Some(state))?;
+        }
         for PreparedPushBatch {
             batch,
             dependency_complete,
             batch_max_lsn,
-            batch_items,
-            batch_payload_bytes,
             arrivals,
             lineages,
             ddl_provenance,
@@ -1764,7 +2029,7 @@ impl SyncClient {
                     ),
                 incarnation,
             };
-            // Statement 9: the existing ordinary push and oversized staging
+            // The existing ordinary push and oversized staging
             // paths carry manifests beside the actual application rows.
             if let Some(signer) = &self.lineage_signer {
                 request.changeset.manifests =
@@ -1775,39 +2040,48 @@ impl SyncClient {
             } else {
                 MessageType::PushRequest
             };
-            let encoded =
-                encode(message_type, &request).map_err(|e| Error::SyncError(e.to_string()))?;
+            let encoded = encode_for_version(protocol_version, message_type, &request)
+                .map_err(|e| Error::SyncError(e.to_string()))?;
 
-            let result: ApplyResult = match self.request_push(encoded).await {
+            let retry_safety = self.transport.ensure_single_reply_retry_safe(&encoded);
+            let interrupted_request = retry_safety.is_ok().then(|| encoded.clone());
+            let mut recovered_reply = false;
+            let result: ApplyResult = match self
+                .request_push(encoded, protocol_version, retry_safety)
+                .await
+            {
                 Ok(result) => result,
                 Err(PushRequestError::Terminal(err)) => return Err(err),
                 Err(PushRequestError::Ambiguous(err)) => {
-                    // This request may have left the edge, so the outcome is
-                    // INDETERMINATE: the hub may have applied and committed the
-                    // batch before the acknowledgement was lost. Reconcile once
-                    // against the hub's applied-push watermark before reporting,
-                    // so a push whose data actually landed is never announced as
-                    // a definitive failure (usability job USR-19). Convergence is
-                    // unchanged: the watermark advances only on a CONFIRMED
-                    // batch, and an unconfirmed outcome leaves it untouched so a
-                    // later push re-sends the same batch idempotently.
+                    // A transport that forbids payload replay keeps its existing
+                    // pull-evidence path. Consumed progress alone cannot retire it.
+                    let Some(encoded) = interrupted_request else {
+                        self.finish_single_attempt_interrupted_push(
+                            err,
+                            batch_max_lsn,
+                            hub.as_deref(),
+                            batch.rows.len() as u64,
+                            row_payload_bytes(&batch.rows),
+                            reconciliation_ceiling,
+                            incarnation,
+                            &batch,
+                            &lineages,
+                            !capabilities.supports_all() && next_schema_holdback.is_some(),
+                        )
+                        .await?;
+                        last_successful_lsn = batch_max_lsn;
+                        continue;
+                    };
+                    recovered_reply = true;
                     self.finish_interrupted_push(
                         err,
                         batch_max_lsn,
-                        hub.as_deref(),
-                        batch_items,
-                        batch_payload_bytes,
-                        transmitted_ceiling,
+                        reconciliation_ceiling,
                         incarnation,
-                        batch.rows.iter().any(|row| row.deleted),
+                        encoded,
+                        protocol_version,
                     )
-                    .await?;
-                    // The confirmed group is now durably retired, but this
-                    // push can contain later independently committed LSN
-                    // groups. Continue with them rather than returning a
-                    // misleading success after only the first lost-ack group.
-                    last_successful_lsn = batch_max_lsn;
-                    continue;
+                    .await?
                 }
             };
             // `new_lsn` is the accepting hub's committed position for this
@@ -1915,12 +2189,47 @@ impl SyncClient {
                     (!refused_indexes.contains(&index)).then_some(row.clone())
                 })
                 .collect::<Vec<_>>();
-            hub_reply_effects.push((
-                ordinary_refused_rows,
-                purge_refused_rows,
-                accepted_rows,
-                result.new_lsn,
-            ));
+            self.pause_after_push_response_for_test_if_armed();
+            let keep_public_watermark =
+                !capabilities.supports_all() && next_schema_holdback.is_some();
+            let through = if keep_public_watermark {
+                since
+            } else {
+                self.push_watermark
+                    .load(Ordering::SeqCst)
+                    .max(batch_max_lsn)
+            };
+            self.db
+                .with_authoritative_hub_reply(&authenticated_hub, |db| {
+                    db.commit_hub_push_reply_while_authoritative(
+                        &self.tenant_id,
+                        &authenticated_hub,
+                        &ordinary_refused_rows,
+                        &purge_refused_rows,
+                        &accepted_rows,
+                        result.new_lsn,
+                        (!recovered_reply).then_some(through),
+                        recovered_reply.then_some((batch_max_lsn, &result)),
+                    )
+                })?;
+            if recovered_reply {
+                self.pending_push_confirmation
+                    .store(batch_max_lsn, Ordering::SeqCst);
+                self.pull_default_confirmed_pending().await.map_err(|err| Error::SyncPushUnconfirmed {
+                    detail: format!("the committed push outcome is durable but pull reconciliation failed ({err}); the push remains pending reconciliation"),
+                })?;
+                self.db
+                    .with_authoritative_hub_reply(&authenticated_hub, |db| {
+                        db.complete_sync_push_confirmation_while_authoritative(
+                            &self.tenant_id,
+                            through,
+                        )
+                    })?;
+                self.pending_push_confirmation
+                    .store(Lsn(0), Ordering::SeqCst);
+            }
+            self.push_watermark.store(through, Ordering::SeqCst);
+            self.advance_engine_sync_watermark(through);
             // Every refusal this hub can still report advances the watermark:
             // now that arbitration compares each row against a single
             // accepting-node ordering position instead of two machines'
@@ -1950,28 +2259,40 @@ impl SyncClient {
             );
         }
 
-        self.pause_after_push_response_for_test_if_armed();
+        let completed_schema_holdback = next_schema_holdback.map(|mut state| {
+            state.compatible_through = state.compatible_through.max(transmitted_ceiling);
+            state
+        });
+        if recovering_schema_holdback {
+            // All newly supported batches are now confirmed. Replace the
+            // durable holdback before advancing the public cursor; a partial
+            // upgrade retains any table that still declares an unsupported capability.
+            self.persist_schema_sync_holdback(
+                &authenticated_hub,
+                completed_schema_holdback.as_ref(),
+            )?;
+        }
+        let confirmed_source_through = if completed_schema_holdback.is_some() {
+            since
+        } else if recovering_schema_holdback {
+            last_successful_lsn.max(
+                existing_schema_holdback
+                    .as_ref()
+                    .map(|state| state.compatible_through)
+                    .unwrap_or(since),
+            )
+        } else {
+            last_successful_lsn
+        };
         self.db
             .with_authoritative_hub_reply(&authenticated_hub, |db| {
-                for (ordinary_refused_rows, purge_refused_rows, accepted_rows, hub_lsn) in
-                    hub_reply_effects
-                {
-                    db.record_hub_push_reply_effects_while_authoritative(
-                        &self.tenant_id,
-                        &authenticated_hub,
-                        &ordinary_refused_rows,
-                        &purge_refused_rows,
-                        &accepted_rows,
-                        hub_lsn,
-                    )?;
-                }
                 db.persist_sync_push_watermark_while_authoritative(
                     &self.tenant_id,
-                    last_successful_lsn,
+                    confirmed_source_through,
                 )?;
                 self.push_watermark
-                    .store(last_successful_lsn, Ordering::SeqCst);
-                self.advance_engine_sync_watermark(last_successful_lsn);
+                    .store(confirmed_source_through, Ordering::SeqCst);
+                self.advance_engine_sync_watermark(confirmed_source_through);
                 if let Some((_, epoch_id)) = destination_reupload_epoch {
                     db.complete_destination_reupload_while_authoritative(
                         &self.tenant_id,
@@ -1982,6 +2303,12 @@ impl SyncClient {
                 Ok(())
             })
             .map_err(|err| Error::SyncError(err.to_string()))?;
+        if !recovering_schema_holdback
+            && !capabilities.supports_all()
+            && let Some(state) = completed_schema_holdback.as_ref()
+        {
+            self.persist_schema_sync_holdback(&authenticated_hub, Some(state))?;
+        }
         Ok(total)
     }
 
@@ -2002,22 +2329,49 @@ impl SyncClient {
         }
     }
 
-    /// Resolve a push whose batch was transmitted but whose transport failed
-    /// before the acknowledgement returned. The batch may or may not have
-    /// committed on the hub, so ask the hub what it actually applied:
-    ///
-    /// * If the hub's applied-push watermark covers this batch's max LSN, the
-    ///   batch DID land, but the status watermark is not an exact row-arrival
-    ///   position. Pull before retiring the batch: the accepted echo carries
-    ///   the hub's precise arrival marker, and any later hub write follows it
-    ///   in the same ordinary cursor order. Only that successful reconciliation
-    ///   lets this method advance and persist the push watermark.
-    /// * Otherwise the hub is unreachable or its watermark does not (yet) confirm
-    ///   the batch. The outcome is genuinely UNKNOWN, so surface the distinct
-    ///   [`Error::SyncPushUnconfirmed`] (never a definitive failure) and leave the
-    ///   watermark untouched so a later push re-sends the batch idempotently.
-    #[allow(clippy::too_many_arguments)]
+    /// A consumed frontier is not acceptance. Reconcile the exact request
+    /// through its existing push response; the hub's durable apply record
+    /// returns the original result without reapplying rows, vectors or DDL.
     async fn finish_interrupted_push(
+        &self,
+        transport_err: Error,
+        batch_max_lsn: Lsn,
+        transmitted_ceiling: Lsn,
+        incarnation: Incarnation,
+        encoded: Vec<u8>,
+        protocol_version: u8,
+    ) -> Result<ApplyResult, Error> {
+        let status = self
+            .fetch_sync_status(incarnation)
+            .await
+            .map_err(|verification_err| Error::SyncPushUnconfirmed {
+                detail: format!(
+                    "the hub did not acknowledge the push ({transport_err}); status verification \
+                     failed ({verification_err}); the data may or may not have committed — run \
+                     the push again to reconcile"
+                ),
+            })?;
+        if !status.as_ref().is_some_and(|status| {
+            interrupted_push_status_confirms(status, batch_max_lsn, transmitted_ceiling)
+        }) {
+            return Err(Error::SyncPushUnconfirmed {
+                detail: format!(
+                    "the hub did not acknowledge the push or confirm its consumed frontier ({transport_err}); the push remains pending"
+                ),
+            });
+        }
+        self.request_push_once(encoded, protocol_version).await.map_err(|error| {
+            let error = match error { PushRequestError::Terminal(error) | PushRequestError::Ambiguous(error) => error };
+            Error::SyncPushUnconfirmed {
+                detail: format!("the hub consumed the push but its exact outcome is unavailable ({error}); its watermark was not advanced"),
+            }
+        })
+    }
+
+    // These are the exact transmitted batch and its existing progress bounds;
+    // recovery must not replace any of them with later local state.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_single_attempt_interrupted_push(
         &self,
         transport_err: Error,
         batch_max_lsn: Lsn,
@@ -2026,7 +2380,9 @@ impl SyncClient {
         batch_payload_bytes: u64,
         transmitted_ceiling: Lsn,
         incarnation: Incarnation,
-        contains_delete: bool,
+        batch: &ChangeSet,
+        lineages: &HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage>,
+        keep_public_watermark: bool,
     ) -> Result<(), Error> {
         // The hub answers this edge with the per-edge record it holds for THIS
         // life of the edge — keyed by (node_id, incarnation), stamped on the
@@ -2035,7 +2391,8 @@ impl SyncClient {
         // transmitted:
         //
         //  * The ceiling is the greatest LSN this push actually TRANSMITTED,
-        //    captured from the changeset PRE-send. Recomputing it here would let a
+        //    captured from the changeset PRE-send, or the already-acknowledged
+        //    compatible frontier when recovering an older held table. Recomputing it here would let a
         //    direction change racing this reconciliation (a delivering table
         //    switched to SYNC OFF) drop the ceiling below what already shipped and
         //    reject a batch the hub genuinely holds; and the whole-database
@@ -2051,10 +2408,10 @@ impl SyncClient {
         // Failing the bound leaves the outcome unconfirmed and the edge
         // re-uploads — never opening the SYNC SAFE deletion gate on rows the hub
         // never received.
-        let confirmed = self
+        let status = self
             .fetch_sync_status(incarnation)
             .await
-            // Statements 13/15: failed verification cannot confirm a transmitted
+            // Failed verification cannot confirm a transmitted
             // batch, and must preserve the existing indeterminate-push contract.
             .map_err(|verification_err| Error::SyncPushUnconfirmed {
                 detail: format!(
@@ -2062,11 +2419,10 @@ impl SyncClient {
                      failed ({verification_err}); the data may or may not have committed — run \
                      the push again to reconcile"
                 ),
-            })?
-            .and_then(|status| status.applied_push_watermark)
-            .is_some_and(|server_applied| {
-                server_applied >= batch_max_lsn && server_applied <= transmitted_ceiling
-            });
+            })?;
+        let confirmed = status.as_ref().is_some_and(|status| {
+            interrupted_push_status_confirms(status, batch_max_lsn, transmitted_ceiling)
+        });
 
         if confirmed {
             let hub_node_id = hub.ok_or_else(|| {
@@ -2074,7 +2430,7 @@ impl SyncClient {
                     "confirmed push did not retain its authenticated hub identity".to_string(),
                 )
             })?;
-            if contains_delete {
+            if batch.rows.iter().any(|row| row.deleted) {
                 // Status proves only that this source-LSN group was consumed;
                 // it deliberately cannot distinguish an accepted delete from
                 // a policy refusal.  Do not advance past a durable delete
@@ -2127,20 +2483,30 @@ impl SyncClient {
                     ),
                 });
             }
+            if !self
+                .db
+                .reconciled_push_rows_have_arrivals(batch, lineages)?
+            {
+                return Err(Error::SyncPushUnconfirmed {
+                    detail: "the hub consumed the push, but the lost reply and available pull history do not prove its row outcomes; the push remains unconfirmed and its watermark was not advanced".to_string(),
+                });
+            }
+            let confirmed_source_through = if keep_public_watermark {
+                previous_push_watermark
+            } else {
+                previous_push_watermark.max(batch_max_lsn)
+            };
             self.db
                 .with_authoritative_hub_reply(hub_node_id, |db| {
-                    db.persist_sync_push_watermark_while_authoritative(
+                    db.complete_sync_push_confirmation_while_authoritative(
                         &self.tenant_id,
-                        batch_max_lsn,
+                        confirmed_source_through,
                     )?;
-                    db.persist_sync_pending_push_confirmation_while_authoritative(
-                        &self.tenant_id,
-                        None,
-                    )?;
-                    self.push_watermark.store(batch_max_lsn, Ordering::SeqCst);
+                    self.push_watermark
+                        .store(confirmed_source_through, Ordering::SeqCst);
                     self.pending_push_confirmation
                         .store(Lsn(0), Ordering::SeqCst);
-                    self.advance_engine_sync_watermark(batch_max_lsn);
+                    self.advance_engine_sync_watermark(confirmed_source_through);
                     Ok(())
                 })
                 .map_err(|err| Error::SyncError(err.to_string()))?;
@@ -2211,7 +2577,7 @@ impl SyncClient {
         self.ensure_connected().await.map_err(Error::SyncError)?;
         let authenticated_hub = self.hub_node_id().ok_or_else(|| {
             Error::SyncError(
-                "protocol v6 production pull requires the authenticated authoritative hub identity"
+                "authenticated sync pull requires the authenticated authoritative hub identity"
                     .to_string(),
             )
         })?;
@@ -2318,6 +2684,8 @@ impl SyncClient {
         .then_some(durable_call_cursor);
         let mut terminal_scan_source = terminal_scan_resume.map(|(source, _)| source);
         let mut first_page = true;
+        let mut next_schema_recovery = None;
+        let mut recovery_progress: Option<(Lsn, Lsn)> = None;
         // Set once this call detects its cursor's source changed, and never
         // cleared for the rest of THIS call: every page from that point on
         // is part of the same from-zero re-fetch of the newly adopted
@@ -2325,9 +2693,11 @@ impl SyncClient {
         let mut adoption = initial_adoption;
 
         loop {
+            let sent_schema_recovery = next_schema_recovery.take();
             let request = PullRequest {
                 since_lsn,
                 max_entries: Some(PULL_PAGE_SIZE),
+                schema_recovery: sent_schema_recovery.clone(),
             };
 
             let PullPage {
@@ -2355,6 +2725,17 @@ impl SyncClient {
             }
             self.pause_after_pull_response_for_test_if_armed();
             let served_source = response.source;
+            let schema_recovery_page = response.schema_recovery.take();
+
+            if matches!(
+                sent_schema_recovery,
+                Some(SchemaRecoveryRequest::Continue { .. })
+            ) && schema_recovery_page.is_none()
+            {
+                return Err(Error::SyncError(
+                    "held-table recovery continuation returned no recovery page".to_string(),
+                ));
+            }
 
             if first_page
                 && let Some(scan_source) = terminal_scan_source
@@ -2437,15 +2818,28 @@ impl SyncClient {
                 expected_source = Some(served);
             }
 
-            let authoritative_purges = take_validated_ordinary_purges(
-                &mut response.changeset,
-                since_lsn,
-                response.cursor,
-            )?;
+            let (purge_since, purge_cursor) = if let Some(page) = schema_recovery_page.as_ref() {
+                let after_lsn = match sent_schema_recovery.as_ref() {
+                    None => Lsn(0),
+                    Some(SchemaRecoveryRequest::Continue { after_lsn, .. }) => *after_lsn,
+                    Some(SchemaRecoveryRequest::Acknowledge { .. }) => {
+                        return Err(Error::SyncError(
+                            "held-table recovery acknowledgement unexpectedly carried a recovery page"
+                                .to_string(),
+                        ));
+                    }
+                };
+                (after_lsn, Some(page.next_lsn))
+            } else {
+                (since_lsn, response.cursor)
+            };
+            let authoritative_purges =
+                take_validated_ordinary_purges(&mut response.changeset, purge_since, purge_cursor)?;
             let ddl_context = if !response.changeset.ddl.is_empty() {
                 let source_incarnation = served_source.ok_or_else(|| {
                     Error::SyncError(
-                        "protocol v6 pull DDL requires the serving source incarnation".to_string(),
+                        "authenticated pull DDL requires the serving source incarnation"
+                            .to_string(),
                     )
                 })?;
                 crate::protocol::received_ddl_context(
@@ -2476,7 +2870,7 @@ impl SyncClient {
                     let ddl_context = if !wire.ddl.is_empty() {
                         let source_incarnation = served_source.ok_or_else(|| {
                             Error::SyncError(
-                                "protocol v6 pull DDL requires the serving source incarnation"
+                                "authenticated pull DDL requires the serving source incarnation"
                                     .to_string(),
                             )
                         })?;
@@ -2583,8 +2977,11 @@ impl SyncClient {
             let ordinary_payload_bytes = row_payload_bytes(&ordinary.rows);
             let ordinary_awaits_trigger_callback =
                 page_awaits_trigger_callback_registration(db, &ordinary);
-            let pending_refresh_rows = (adoption == SyncAdoption::ConfirmedPendingReconciliation)
-                .then(|| ordinary.rows.clone());
+            let pending_refresh_rows = if adoption == SyncAdoption::ConfirmedPendingReconciliation {
+                Some(db.matching_pending_reconciliation_rows(&ordinary.rows, &lineages)?)
+            } else {
+                None
+            };
             let dependency_units = prepared_dependency_units;
             let dependency_received_items = dependency_units
                 .iter()
@@ -2612,9 +3009,12 @@ impl SyncClient {
                     {
                         let carries_ddl = !unit.ddl.is_empty();
                         let row_count = unit.rows.len();
-                        let pending_unit_rows = (adoption
-                            == SyncAdoption::ConfirmedPendingReconciliation)
-                            .then(|| unit.rows.clone());
+                        let pending_unit_rows = if adoption
+                            == SyncAdoption::ConfirmedPendingReconciliation {
+                            Some(db.matching_pending_reconciliation_rows(&unit.rows, &unit_lineages)?)
+                        } else {
+                            None
+                        };
                         let unit_result = db
                             .apply_authenticated_received_changes_with_lineages_while_schema_publication_held(
                                 unit,
@@ -2641,10 +3041,6 @@ impl SyncClient {
                             db.refresh_confirmed_pending_rows(&rows, &unit_arrivals)?;
                         }
                     }
-                    db.apply_incoming_authoritative_purge_batch_while_authoritative(
-                        &authoritative_purges,
-                    )?;
-                    result.new_lsn = db.current_lsn();
                     if !ordinary.is_empty() {
                         let ordinary_result = db
                             .apply_authenticated_received_changes_with_lineages_while_schema_publication_held(
@@ -2671,6 +3067,17 @@ impl SyncClient {
                     if let Some(rows) = pending_refresh_rows {
                         db.refresh_confirmed_pending_rows(&rows, &arrivals)?;
                     }
+                    // The server ends a purge-bearing page at its earliest
+                    // irreversible frontier, so every ordinary item in this
+                    // page is older than or equal to the purge. Publish those
+                    // items first, then let the purge's replacement image be
+                    // the final state; applying ordinary vectors afterward
+                    // can re-extend the freshly purged HNSW route with stale
+                    // page entries.
+                    db.apply_incoming_authoritative_purge_batch_while_authoritative(
+                        &authoritative_purges,
+                    )?;
+                    result.new_lsn = db.current_lsn();
                     Ok(AppliedPullPage {
                         result,
                         suppressed_live_replay_only: ordinary_suppressed_only,
@@ -2706,6 +3113,46 @@ impl SyncClient {
             total.new_lsn = applied_page.result.new_lsn;
             last_server_lsn = server_lsn;
             first_page = false;
+
+            if let Some(page) = schema_recovery_page {
+                if page.next_lsn > page.target_lsn {
+                    return Err(Error::SyncError(format!(
+                        "held-table recovery page cursor {} exceeds target {}",
+                        page.next_lsn.0, page.target_lsn.0
+                    )));
+                }
+                if let Some((expected_target, previous_next)) = recovery_progress {
+                    if page.target_lsn != expected_target {
+                        return Err(Error::SyncError(format!(
+                            "held-table recovery target changed from {} to {} mid-pull",
+                            expected_target.0, page.target_lsn.0
+                        )));
+                    }
+                    if !page.complete && page.next_lsn <= previous_next {
+                        return Err(Error::SyncError(format!(
+                            "held-table recovery page did not advance beyond source frontier {}",
+                            previous_next.0
+                        )));
+                    }
+                }
+                recovery_progress = Some((page.target_lsn, page.next_lsn));
+                next_schema_recovery = Some(if page.complete {
+                    SchemaRecoveryRequest::Acknowledge {
+                        target_lsn: page.target_lsn,
+                    }
+                } else {
+                    SchemaRecoveryRequest::Continue {
+                        target_lsn: page.target_lsn,
+                        after_lsn: page.next_lsn,
+                    }
+                });
+                if !has_more {
+                    return Err(Error::SyncError(
+                        "held-table recovery page did not request its continuation or acknowledgement"
+                            .to_string(),
+                    ));
+                }
+            }
 
             if !has_more {
                 if let Some(context) = terminal_refusal_context.as_ref() {
@@ -2895,6 +3342,16 @@ enum PushRequestError {
     Ambiguous(Error),
 }
 
+fn interrupted_push_status_confirms(
+    status: &SyncStatusResponse,
+    batch_max_lsn: Lsn,
+    transmitted_ceiling: Lsn,
+) -> bool {
+    status.applied_push_watermark.is_some_and(|server_applied| {
+        server_applied >= batch_max_lsn && server_applied <= transmitted_ceiling
+    })
+}
+
 impl PushReplyError {
     fn into_request_error(self) -> PushRequestError {
         match self {
@@ -2904,9 +3361,9 @@ impl PushReplyError {
     }
 }
 
-fn decode_push_response(reply: &[u8]) -> Result<ApplyResult, PushReplyError> {
-    let envelope =
-        decode(reply).map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
+fn decode_push_response(reply: &[u8], protocol_version: u8) -> Result<ApplyResult, PushReplyError> {
+    let envelope = decode_for_version(reply, protocol_version)
+        .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
     if !matches!(envelope.message_type, MessageType::PushResponse) {
         return Err(PushReplyError::Malformed(Error::SyncError(
             "unexpected message type in push response".to_string(),
@@ -3262,6 +3719,23 @@ mod tests {
         VectorChange,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn interrupted_push_watermark_is_bounded_and_cannot_confirm_previously_held_work() {
+        let status = SyncStatusResponse {
+            applied_push_watermark: Some(Lsn(9)),
+            server_current_lsn: Some(Lsn(30)),
+            hub_incarnation: None,
+        };
+        assert!(interrupted_push_status_confirms(&status, Lsn(7), Lsn(9)));
+        assert!(!interrupted_push_status_confirms(&status, Lsn(10), Lsn(11)));
+        assert!(!interrupted_push_status_confirms(&status, Lsn(7), Lsn(8)));
+        assert!(!interrupted_push_status_confirms(
+            &SyncStatusResponse::default(),
+            Lsn(7),
+            Lsn(9)
+        ));
+    }
 
     // A14: Batch splitting respects byte size limits
     #[test]
@@ -3800,6 +4274,52 @@ mod tests {
             "all 20 DDL entries must be present across batches, got {}",
             total_ddl
         );
+    }
+
+    #[test]
+    fn consecutive_schema_only_work_stays_authored_ordered_with_its_trigger_bootstrap() {
+        let ddl = vec![
+            DdlChange::CreateTable {
+                name: "host_writes".to_string(),
+                columns: vec![
+                    ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                    ("content".to_string(), "TEXT".to_string()),
+                ],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
+            },
+            DdlChange::CreateIndex {
+                table: "host_writes".to_string(),
+                name: "host_writes_content".to_string(),
+                columns: vec![("content".to_string(), contextdb_core::SortDirection::Asc)],
+            },
+            DdlChange::CreateTrigger {
+                name: "host_write_trigger".to_string(),
+                table: "host_writes".to_string(),
+                on_events: vec!["INSERT".to_string()],
+            },
+        ];
+        let changeset = ChangeSet {
+            ddl: ddl.clone(),
+            ddl_lsn: vec![Lsn(1), Lsn(2), Lsn(3)],
+            ..ChangeSet::default()
+        };
+
+        let batches = split_changeset(changeset);
+        assert_eq!(
+            batches.len(),
+            1,
+            "adjacent schema-only work can commit with the trigger bootstrap because no authored data waits behind it"
+        );
+        assert_eq!(
+            batches[0].ddl, ddl,
+            "grouping never reorders the caller's create-table, create-index, create-trigger vector"
+        );
+        assert_eq!(batches[0].ddl_lsn, vec![Lsn(1), Lsn(2), Lsn(3)]);
+        assert_eq!(batches[0].data_entry_count(), 0);
+        assert!(batches[0].has_create_trigger_ddl());
     }
 
     #[test]

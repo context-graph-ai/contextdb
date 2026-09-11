@@ -1,27 +1,36 @@
-// Statements 7/11/13/15/17: custody-only persistence seam.
+// Custody-only persistence seam.
 #[cfg(feature = "sync-orchestration")]
 pub(crate) mod custody_pull;
 mod custody_remainder;
 mod custody_store;
-// Statements 12/16: compare held units even before their first custody outcome.
+// Compare held units even before their first custody outcome.
 mod custody_incumbent;
 pub(crate) mod discard;
-// Statement 17a: self-contained selections for node-local purge delivery.
+// Self-contained selections for node-local purge delivery.
 pub(crate) mod purge_predicate;
 use crate::blob_repository::BlobRepository;
 use crate::composite_store::{
     ApplyPhasePause, ChangeLogEntry, ChangeLogLsnRefcounts, ChangeLogTableIndex, CompositeStore,
-    build_received_schema_change_log_entries, publish_prepared_change_log_entries,
-    record_change_log_entries,
+    VectorPartitionSnapshotStageRegistry, build_received_schema_change_log_entries,
+    publish_prepared_change_log_entries, record_change_log_entries,
 };
 pub use crate::custody_types::{DeliveryManifest, DeliveryOutcome};
 #[cfg(feature = "test-seams")]
 use crate::executor::bounded_read_test_support::{ExecutionProbe, TestSourceTouch, TestWorkSource};
-use crate::executor::{apply_on_conflict_updates, execute_plan, validate_plan_columns};
+use crate::executor::{
+    analyze_passive_relational_route, apply_on_conflict_updates, execute_plan,
+    validate_plan_columns,
+};
 use crate::memory_accounting::MemoryAccountant;
 use crate::persistence::{
     AuthoritativePurgePersistenceProjection, LegacyMigrationOpenCapability,
-    LocalSchemaPersistenceProjection, ReceivedSchemaPersistenceProjection, RedbPersistence,
+    LoadedVectorPartitionGenerationCatalog, LocalSchemaPersistenceProjection,
+    ReadOnlyVectorGenerationSource, ReceivedSchemaPersistenceProjection, RedbPersistence,
+    VectorPartitionBaseGenerationRecord, VectorPartitionChangeGenerationRecord,
+    VectorPartitionGenerationCandidate, VectorPartitionGenerationCatalogRecord,
+    VectorPartitionGenerationDescriptor, VectorPartitionGraphBytes,
+    VectorPartitionMembershipRecord, VectorPartitionVersionIdentity,
+    VectorPartitionVersionSelector,
 };
 use crate::persistent_store::PersistentCompositeStore;
 use crate::plugin::{
@@ -43,6 +52,58 @@ use crate::schema_enforcer::validate_dml;
 /// The pathname that names a throwaway database rather than a file.
 const MEMORY_DATABASE_PATH: &str = ":memory:";
 
+/// The engine format values written beside the independently versioned HNSW
+/// byte envelope. A loader refuses either mismatch before exposing a route.
+const VECTOR_GRAPH_ALGORITHM_VERSION: u16 = 1;
+const VECTOR_GRAPH_FORMAT_VERSION: u16 = 1;
+
+/// One private replay slot per authenticated edge identity. A later request
+/// from the same edge can exist on the ordinary client path only after the
+/// preceding response was received, so replacing this slot is the existing
+/// protocol's proof that the preceding request is no longer retry-reachable.
+/// The result stores request ordinals instead of natural keys; an exact retry
+/// supplies those keys again, while an authoritative purge therefore has no
+/// hidden diagnostic copy to erase.
+const SYNC_PUSH_OUTCOME_PREFIX: &str = "sync_push_applied.v2.";
+
+#[cfg(any(test, feature = "test-seams"))]
+static RECEIVED_VECTOR_IMAGE_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, feature = "test-seams"))]
+static RECEIVED_VECTOR_IMAGE_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, feature = "test-seams"))]
+static VECTOR_DURABLE_PURGE_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, feature = "test-seams"))]
+static VECTOR_DURABLE_PURGE_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, feature = "test-seams"))]
+static VECTOR_DURABLE_COMPACTION_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, feature = "test-seams"))]
+static VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
+
+/// Count of full candidate rows the vector search arm's candidate subtree
+/// materialized (`qr.rows.len()` at the identity read), never a derived view
+/// of any other counter. Process-global and test-seam only: it exists to let
+/// a test observe how many complete rows candidate derivation built to
+/// answer an identity-only question, before and after an id-only route
+/// removes that materialization.
+#[cfg(any(test, feature = "test-seams"))]
+static CANDIDATE_ROWS_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(test, feature = "test-seams"))]
+fn arm_vector_memory_fault(armed: &AtomicBool, consumed: &AtomicBool) {
+    consumed.store(false, Ordering::SeqCst);
+    armed.store(true, Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn take_vector_memory_fault(armed: &AtomicBool, consumed: &AtomicBool) -> bool {
+    if armed.swap(false, Ordering::SeqCst) {
+        consumed.store(true, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
 /// Announce one startup resource to the route observer this open was given,
 /// when the build carries the observation seam at all.
 macro_rules! observe_open_event {
@@ -55,10 +116,10 @@ macro_rules! observe_open_event {
 }
 
 use crate::sync_types::{
-    ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
-    NaturalKey, RefusalCause, RowChange, SyncAdoption, SyncDirection, SyncDirectionHistory,
-    VectorChange, natural_key_column_for_meta, natural_key_columns_for_meta,
-    natural_key_from_row_values,
+    ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange,
+    DurableSchemaSyncHoldback, EdgeChange, NaturalKey, RefusalCause, RowChange, SyncAdoption,
+    SyncDirection, SyncDirectionHistory, VectorChange, natural_key_column_for_meta,
+    natural_key_columns_for_meta, natural_key_from_row_values,
 };
 use contextdb_core::read_contract::{
     DeadlineClock, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus, OwnerServiceTimeouts,
@@ -80,10 +141,27 @@ use contextdb_tx::{
 };
 #[cfg(any(test, feature = "test-seams"))]
 use contextdb_vector::HnswGraphStats;
+use contextdb_vector::store::{
+    DormantRawVectorLoader, DormantRawVectorPartition, DormantVectorGraphGeneration,
+    DormantVectorGraphLoader, DormantVectorLoadRequest, LoadedRawVectorCandidate,
+    LoadedRawVectorPartition, LoadedVectorFreshTail, LoadedVectorGraphGeneration,
+    RawVectorDirectoryEntry, VectorGraphGeneration, VectorPartitionRef,
+    VectorRouteQuarantineReason,
+};
 use contextdb_vector::{
-    HnswIndex, MemVectorExecutor, PreparedVectorPublication, VectorSearchDebugTrace, VectorStore,
+    HnswIndex, MemVectorExecutor, MemoryBudget, PartitionedVectorEntry, PreparedVectorPublication,
+    VectorIndexLayout, VectorMaintenanceFailure, VectorMaintenanceFailureDetails,
+    VectorMaintenanceReport, VectorSearchDebugTrace, VectorStore, VectorVersionIdentity,
     cosine_similarity,
 };
+#[cfg(any(test, feature = "test-seams"))]
+use contextdb_vector::{
+    VectorGraphCallbackPhaseForTest, VectorJournalTruncationFaultHandle,
+    VectorJournalTruncationPhaseForTest, VectorLifecyclePauseHandle,
+    VectorMaintenancePreparationPhaseForTest, VectorMemoryWorkspacePhaseForTest,
+};
+#[cfg(any(test, feature = "test-seams"))]
+use contextdb_vector::{VectorMaintenanceProgressPauseHandle, VectorPassiveActivityCounters};
 
 // Raw sync application and its progress writers are only public to this
 // crate's test harness. Downstream/default builds retain no capability door.
@@ -1238,6 +1316,7 @@ mod received_schema_stage_tests {
                     lineage("origin", 501, 3),
                 )],
                 ReceivedSchemaAdjudicationInputs {
+                    push_outcome_key: None,
                     apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
@@ -1536,6 +1615,8 @@ mod received_schema_stage_tests {
         let db = Database::open_memory_with_accountant(accountant.clone());
         let baseline = accountant.usage().used;
         let index = VectorIndexRef::new("retired", "embedding");
+        db.vector_store
+            .register_index(index.clone(), 2, contextdb_core::VectorQuantization::F32);
         db.vector_store.insert_loaded_vector(VectorEntry {
             index: index.clone(),
             row_id: RowId(1),
@@ -1546,8 +1627,6 @@ mod received_schema_stage_tests {
         });
         let state = db.vector_store.try_state(&index).unwrap();
         state.set_hnsw_bytes(64);
-        let old_bytes = db.vector_store.index_infos()[0].bytes;
-        accountant.try_allocate(old_bytes).unwrap();
 
         let stage = db
             .prepare_received_schema_stage(
@@ -1589,6 +1668,11 @@ mod received_schema_stage_tests {
         };
         db.graph_store.apply_inserts(vec![graph_entry]);
         let vector_index = VectorIndexRef::new("kept", "embedding");
+        db.vector_store.register_index(
+            vector_index.clone(),
+            2,
+            contextdb_core::VectorQuantization::F32,
+        );
         db.vector_store.insert_loaded_vector(VectorEntry {
             index: vector_index.clone(),
             row_id: RowId(1),
@@ -1892,8 +1976,9 @@ mod received_schema_stage_tests {
             .next()
             .map(|(lsn, _)| *lsn)
             .expect("received schema commit publishes local DDL arrival evidence");
-        let (pending_before_close, source_before_close) =
-            db.changes_since_base(Lsn(received_ddl_lsn.0.saturating_sub(1)));
+        let (pending_before_close, source_before_close) = db
+            .changes_since_base(Lsn(received_ddl_lsn.0.saturating_sub(1)))
+            .expect("materialize received DDL changes before close");
         assert!(
             db.filter_outbound_received_ddl(pending_before_close, &source_before_close, None)
                 .unwrap()
@@ -1931,8 +2016,9 @@ mod received_schema_stage_tests {
                 .read()
                 .contains_key(&(received_ddl_lsn, 0))
         );
-        let (pending_after_reopen, source_after_reopen) =
-            reopened.changes_since_base(Lsn(received_ddl_lsn.0.saturating_sub(1)));
+        let (pending_after_reopen, source_after_reopen) = reopened
+            .changes_since_base(Lsn(received_ddl_lsn.0.saturating_sub(1)))
+            .expect("materialize received DDL changes after reopen");
         assert!(
             reopened
                 .filter_outbound_received_ddl(pending_after_reopen, &source_after_reopen, None)
@@ -2471,6 +2557,7 @@ mod received_schema_stage_tests {
                 &received,
                 &lineages,
                 ReceivedSchemaAdjudicationInputs {
+                    push_outcome_key: None,
                     apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
@@ -2498,6 +2585,7 @@ mod received_schema_stage_tests {
                 &received,
                 &lineages,
                 ReceivedSchemaAdjudicationInputs {
+                    push_outcome_key: None,
                     apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
@@ -2760,6 +2848,7 @@ mod received_schema_stage_tests {
                     ),
                 ],
                 ReceivedSchemaAdjudicationInputs {
+                    push_outcome_key: None,
                     apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
@@ -2919,6 +3008,7 @@ mod received_schema_stage_tests {
                     lineage("terminal-author", 503, 3),
                 )],
                 ReceivedSchemaAdjudicationInputs {
+                    push_outcome_key: None,
                     apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
@@ -2948,6 +3038,7 @@ mod received_schema_stage_tests {
                     lineage("terminal-author", 503, 3),
                 )],
                 ReceivedSchemaAdjudicationInputs {
+                    push_outcome_key: None,
                     apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
@@ -3053,9 +3144,15 @@ mod persisted_state_snapshot_tests {
                 .live_row_by_id("events", old_row_id)
                 .is_none()
         );
-        assert!(db.full_state_snapshot().rows.is_empty());
+        assert!(
+            db.full_state_snapshot()
+                .expect("materialize full state")
+                .rows
+                .is_empty()
+        );
         assert!(
             db.persisted_state_since_with_ddl_provenance(Lsn(1))
+                .expect("materialize persisted state")
                 .0
                 .rows
                 .is_empty()
@@ -3097,8 +3194,13 @@ mod persisted_state_snapshot_tests {
                 .is_some()
         );
         for rows in [
-            db.full_state_snapshot().rows,
-            db.persisted_state_since_with_ddl_provenance(Lsn(1)).0.rows,
+            db.full_state_snapshot()
+                .expect("materialize full state")
+                .rows,
+            db.persisted_state_since_with_ddl_provenance(Lsn(1))
+                .expect("materialize persisted state")
+                .0
+                .rows,
         ] {
             assert_eq!(rows.len(), 1);
             assert_eq!(
@@ -3117,7 +3219,9 @@ mod persisted_state_snapshot_tests {
         drop(db);
 
         let reopened = Database::open(&path).expect("reopen schema pagination database");
-        let (changes, source) = reopened.persisted_state_since_with_ddl_provenance(Lsn(1));
+        let (changes, source) = reopened
+            .persisted_state_since_with_ddl_provenance(Lsn(1))
+            .expect("materialize persisted state");
 
         assert_eq!(source.kind, DdlProvenanceKind::SyntheticSnapshot);
         assert!(
@@ -3176,9 +3280,15 @@ mod persisted_state_snapshot_tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(db.full_state_snapshot().rows.is_empty());
+        assert!(
+            db.full_state_snapshot()
+                .expect("materialize full state")
+                .rows
+                .is_empty()
+        );
         assert!(
             db.persisted_state_since_with_ddl_provenance(Lsn(1))
+                .expect("materialize persisted state")
                 .0
                 .rows
                 .is_empty()
@@ -3732,6 +3842,7 @@ struct ReceivedSchemaAdjudicationInputs<'a> {
     adoption: SyncAdoption,
     apply_role: SyncApplyRole,
     receipt: Option<SyncApplyReceipt>,
+    push_outcome_key: Option<&'a SyncPushOutcomeContext>,
     dependency_complete: bool,
     terminal_refusal_context: Option<&'a TerminalRefusalPullContext>,
     hub_local_author: Option<&'a str>,
@@ -3740,12 +3851,21 @@ struct ReceivedSchemaAdjudicationInputs<'a> {
     receiver_tx: TxId,
 }
 
+struct StrictVectorOverlayRequest<'a> {
+    index: VectorIndexRef,
+    query: &'a [f32],
+    k: usize,
+    candidates: Option<&'a RoaringTreemap>,
+    snapshot: SnapshotId,
+    search_mode: contextdb_core::VectorSearchMode,
+}
+
 /// A private reservation for replacing the in-memory database image.  Positive
 /// deltas are charged while preparing the stage; dropping an unconsumed stage
 /// returns that reservation.  Once the prepared image has been swapped in,
 /// committing is infallible: a positive reservation becomes its permanent
 /// charge and a negative delta releases the retired image's excess.
-struct PreparedMemorySwap {
+pub(crate) struct PreparedMemorySwap {
     accountant: Arc<MemoryAccountant>,
     reserved_positive_delta: usize,
     release_after_swap: usize,
@@ -3816,15 +3936,30 @@ impl PreparedMemorySwap {
         new_bytes: usize,
         retired_bytes_released_by_store: usize,
     ) -> Result<Self> {
-        debug_assert!(retired_bytes_released_by_store <= old_bytes);
-        let old_continuing_bytes = old_bytes.saturating_sub(retired_bytes_released_by_store);
-        let reserved_positive_delta = new_bytes.saturating_sub(old_continuing_bytes);
-        accountant.try_allocate_for(
-            reserved_positive_delta,
+        Self::prepare_for(
+            accountant,
+            old_bytes,
+            new_bytes,
+            retired_bytes_released_by_store,
             "sync",
             "prepare_received_schema_replacement",
             "Reduce the replicated schema/data working set or raise MEMORY_LIMIT before receiving schema.",
-        )?;
+        )
+    }
+
+    fn prepare_for(
+        accountant: Arc<MemoryAccountant>,
+        old_bytes: usize,
+        new_bytes: usize,
+        retired_bytes_released_by_store: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<Self> {
+        debug_assert!(retired_bytes_released_by_store <= old_bytes);
+        let old_continuing_bytes = old_bytes.saturating_sub(retired_bytes_released_by_store);
+        let reserved_positive_delta = new_bytes.saturating_sub(old_continuing_bytes);
+        accountant.try_allocate_for(reserved_positive_delta, subsystem, operation, hint)?;
         Ok(Self {
             accountant,
             reserved_positive_delta,
@@ -3832,7 +3967,7 @@ impl PreparedMemorySwap {
         })
     }
 
-    fn commit_after_swap(&mut self) {
+    pub(crate) fn commit_after_swap(&mut self) {
         self.reserved_positive_delta = 0;
         self.accountant.release(self.release_after_swap);
         self.release_after_swap = 0;
@@ -4048,6 +4183,62 @@ pub(crate) struct AcceptedDeleteSuppression {
     pub(crate) suppressed_live_replay: bool,
 }
 
+type SyncPushApplyLocks = Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>;
+#[cfg(feature = "sync-orchestration")]
+type SyncClientPushLocks = Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+
+#[derive(Debug, Clone)]
+struct SyncPushDiagnosticIdentity {
+    table: Option<String>,
+    natural_key: NaturalKey,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SyncPushOutcomeKey {
+    storage_key: String,
+    incarnation: Incarnation,
+    request_digest: [u8; 32],
+    diagnostic_identities: Vec<SyncPushDiagnosticIdentity>,
+}
+
+#[derive(Clone)]
+struct SyncPushOutcomeContext {
+    key: SyncPushOutcomeKey,
+    committed_lsn: Option<Lsn>,
+    refused_rows: usize,
+    conflicts: Vec<Conflict>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableSyncPushOutcome {
+    incarnation: Incarnation,
+    request_digest: [u8; 32],
+    result: DurableSyncPushApplyResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableSyncPushApplyResult {
+    applied_rows: usize,
+    skipped_rows: usize,
+    conflicts: Vec<DurableSyncPushConflict>,
+    new_lsn: Lsn,
+}
+
+/// A durable refusal deliberately has no natural key. The authenticated,
+/// byte-identical request is the sole source for both the member key and an
+/// optional connected-unit cause when the result is replayed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableSyncPushConflict {
+    request_identity_ordinal: usize,
+    resolution: ConflictPolicy,
+    reason: Option<String>,
+    table: Option<String>,
+    mutation_kind: Option<String>,
+    winning_author_node_id: Option<String>,
+    hub_acceptance_position: Option<Lsn>,
+    refusal_cause_identity_ordinal: Option<usize>,
+}
+
 struct PurgedLineageRefusal {
     changes: ChangeSet,
     refused_rows: Vec<RowChange>,
@@ -4106,6 +4297,7 @@ struct InMemoryLineageState {
     unbound_creations: HashMap<String, DurableUnboundCreationLineage>,
     row_sidecars: HashMap<String, DurableRowLineageSidecar>,
     records: HashMap<String, DurableLineageRecord>,
+    push_outcomes: HashMap<String, DurableSyncPushOutcome>,
 }
 
 /// Decoded from finalized config writes before a memory transaction applies.
@@ -4116,6 +4308,7 @@ struct InMemoryLineageDelta {
     unbound_creations: HashMap<String, DurableUnboundCreationLineage>,
     row_sidecars: HashMap<String, DurableRowLineageSidecar>,
     records: HashMap<String, DurableLineageRecord>,
+    push_outcomes: HashMap<String, DurableSyncPushOutcome>,
 }
 
 /// Edge-client sync progress for one in-memory database life. It deliberately
@@ -4124,6 +4317,7 @@ struct InMemoryLineageDelta {
 #[derive(Default)]
 struct InMemorySyncProgressState {
     tenants: HashMap<String, InMemoryTenantSyncProgress>,
+    schema_holdbacks: HashMap<String, DurableSchemaSyncHoldback>,
 }
 
 #[derive(Default)]
@@ -4131,6 +4325,7 @@ struct InMemoryTenantSyncProgress {
     push_watermark: Lsn,
     pull_watermark: Lsn,
     pending_push_confirmation: Option<Lsn>,
+    pending_push_result: Option<crate::protocol::WireApplyResult>,
     pull_cursor: Option<(Incarnation, Lsn)>,
 }
 
@@ -4403,10 +4598,250 @@ use cron::CronState;
 use event_bus::EventBusState;
 use trigger::{TriggerCallbackThreadGuard, TriggerContention, TriggerState};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCandidate {
     pub name: String,
     pub rejected_reason: std::borrow::Cow<'static, str>,
+}
+
+/// Redacted shape of the authorized vector partitions selected by one query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorSearchScopeShape {
+    One,
+    Few,
+    All,
+}
+
+impl VectorSearchScopeShape {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::One => "one",
+            Self::Few => "several",
+            Self::All => "all",
+        }
+    }
+}
+
+/// The vector execution route described to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorSearchRoute {
+    Exact,
+    Indexed,
+    FilteredIndexed,
+}
+
+impl VectorSearchRoute {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Indexed => "indexed",
+            Self::FilteredIndexed => "filtered-indexed",
+        }
+    }
+}
+
+/// Whether the relational rows admitted to vector work were already bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorSearchResidual {
+    None,
+    Bounded,
+    Unsupported,
+}
+
+impl VectorSearchResidual {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bounded => "bounded",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Safe layer-presence facts. Generation identities and byte counts remain in
+/// operator inspection; a query trace needs only the structure it used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorSearchLayerPresence {
+    Present,
+    Absent,
+}
+
+impl VectorSearchLayerPresence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorSearchTailState {
+    Present,
+    Empty,
+}
+
+/// Passive exact ownership receipt used by the memory-contract proof.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VectorMemoryOwnershipReceiptForTest {
+    pub raw_vector_bodies: usize,
+    pub raw_reverse_directory: usize,
+    pub partition_vectors: usize,
+    pub base_graph: usize,
+    pub change_graph: usize,
+    pub mutable_tail: usize,
+    pub typed_partition_keys: usize,
+    pub retired_pinned_graph_bytes: usize,
+    pub temporary_workspace: usize,
+    pub retained_total: usize,
+    pub non_vector_total: usize,
+    pub accountant_total: usize,
+}
+
+impl VectorSearchTailState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+/// The query-vector source is disclosed structurally, never by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorQuerySourceDisclosure {
+    Vector,
+    RedactedRowKey,
+    Unknown,
+}
+
+impl VectorQuerySourceDisclosure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vector => "<vector>",
+            Self::RedactedRowKey => "<redacted>",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Serving graph topology/build revision and current query search breadth for
+/// one selected partition. Its key is an ordinal redaction. Restricted callers
+/// receive no per-partition entries: adaptive values could reveal hidden sizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorPartitionHnswDisclosure {
+    pub partition: String,
+    pub hnsw_m: usize,
+    pub hnsw_ef_construction: usize,
+    pub hnsw_ef_search: usize,
+    pub ef_search_source: String,
+    pub policy_revision: u64,
+}
+
+/// Per-result vector route facts. Partition values, row ids, and bound values
+/// are redacted. The aggregate count covers authorized identities only;
+/// restricted callers receive no per-partition adaptive HNSW settings.
+///
+/// The planner resolves partition scope only after parameters are bound. A
+/// passive explain of a statement whose partition key is still an unbound
+/// placeholder therefore has no scope to count over: `aggregate_allowed_vectors`
+/// is `None` (rendered `null`), an AUTO `resolved_mode` stays `Auto`, `route`
+/// is `None`, and `fallback` names the unresolved-until-bind reason. `0` is
+/// never used for this: an empty authorized scope is a complete empty answer,
+/// not an unresolved one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorSearchDisclosure {
+    pub requested_mode: contextdb_core::VectorSearchMode,
+    pub resolved_mode: contextdb_core::VectorSearchMode,
+    pub aggregate_allowed_vectors: Option<usize>,
+    pub effective_auto_index_at: usize,
+    pub auto_index_at_source: String,
+    pub partition_key_columns: Vec<String>,
+    pub scope: VectorSearchScopeShape,
+    pub route: Option<VectorSearchRoute>,
+    pub base: VectorSearchLayerPresence,
+    pub change: VectorSearchLayerPresence,
+    pub tail: VectorSearchTailState,
+    pub residual: VectorSearchResidual,
+    pub fallback: Option<String>,
+    pub refusal: Option<String>,
+    pub recovery: Option<String>,
+    pub query_source: VectorQuerySourceDisclosure,
+    /// One redacted entry per selected authorized partition. Values are
+    /// resolved from that partition's snapshot-visible size; no key value is
+    /// representable here.
+    pub partition_hnsw: Vec<VectorPartitionHnswDisclosure>,
+}
+
+impl std::fmt::Display for VectorSearchDisclosure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let partition_key = if self.partition_key_columns.is_empty() {
+            "none".to_owned()
+        } else {
+            self.partition_key_columns.join(",")
+        };
+        let partition_hnsw = self
+            .partition_hnsw
+            .iter()
+            .map(|partition| {
+                format!(
+                    "partition={} hnsw_m={} hnsw_ef_construction={} hnsw_ef_search={} \
+                     ef_search_source={} policy_revision={}",
+                    partition.partition,
+                    partition.hnsw_m,
+                    partition.hnsw_ef_construction,
+                    partition.hnsw_ef_search,
+                    partition.ef_search_source,
+                    partition.policy_revision,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            formatter,
+            "vector_search requested_mode={} resolved_mode={} aggregate_allowed_vectors={} \
+             effective_auto_index_at={} auto_index_at_source={} partition_key={} scope={} route={} \
+             base={} change={} tail={} merge=global residual={} fallback={} refusal={} recovery={} \
+             query_source={} partition_hnsw=[{}]",
+            self.requested_mode,
+            self.resolved_mode,
+            render_optional_count(self.aggregate_allowed_vectors),
+            self.effective_auto_index_at,
+            self.auto_index_at_source,
+            partition_key,
+            self.scope.as_str(),
+            self.route.map_or("null", VectorSearchRoute::as_str),
+            self.base.as_str(),
+            self.change.as_str(),
+            self.tail.as_str(),
+            self.residual.as_str(),
+            self.fallback.as_deref().unwrap_or("none"),
+            self.refusal.as_deref().unwrap_or("none"),
+            self.recovery.as_deref().unwrap_or("none"),
+            self.query_source.as_str(),
+            partition_hnsw,
+        )
+    }
+}
+
+/// A count that has no value yet renders the way every other unresolved
+/// inspection fact does: as `null`, never as a number.
+fn render_optional_count(count: Option<usize>) -> String {
+    count.map_or_else(|| "null".to_owned(), |count| count.to_string())
+}
+
+/// Passive `.explain` result. It is planning metadata, never an executed
+/// query receipt; `.trace on` remains the surface for an actual route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainOutput {
+    pub physical_plan: String,
+    pub index_used: Option<String>,
+    pub predicates_pushed: Vec<String>,
+    pub indexes_considered: Vec<IndexCandidate>,
+    pub sort_elided: bool,
+    pub vector_search: Option<VectorSearchDisclosure>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4417,6 +4852,7 @@ pub struct QueryTrace {
     pub indexes_considered: smallvec::SmallVec<[IndexCandidate; 4]>,
     pub sort_elided: bool,
     pub query_vector_source: Option<contextdb_core::types::VectorIndexRef>,
+    pub vector_search: Option<VectorSearchDisclosure>,
     pub rows_examined: u64,
 }
 
@@ -4982,7 +5418,13 @@ impl SnapshotInspector {
         }
         drop(graph);
 
-        let mut vector_entries = self.database.vector_store.all_entries();
+        // This is a census of the copied durable image, not of its lazy
+        // process cache. Reading Redb directly keeps dormant vectors visible
+        // without faulting their partitions into the inspection database.
+        let persistence = self.database.persistence.as_ref().ok_or_else(|| {
+            Error::Other("snapshot inspection copy is not file-backed".to_string())
+        })?;
+        let mut vector_entries = persistence.load_vectors()?;
         vector_entries.sort_by(|left, right| {
             left.index
                 .table
@@ -5021,9 +5463,6 @@ impl SnapshotInspector {
         }
         let commit_index_entries = commit_index.len() as u64;
 
-        let persistence = self.database.persistence.as_ref().ok_or_else(|| {
-            Error::Other("snapshot inspection copy is not file-backed".to_string())
-        })?;
         let mut config = persistence.dump_config_raw()?;
         config.sort_by(|left, right| left.0.cmp(&right.0));
         field(&mut hasher, b"config");
@@ -5314,6 +5753,8 @@ struct AuthoritativePurgePreparedSet {
     row_version_keys: Vec<AuthoritativePurgeRowVersionKey>,
     change_log_entries: Vec<ChangeLogEntry>,
     vector_entries: Vec<VectorEntry>,
+    vector_partition_identities: Vec<VectorPartitionVersionIdentity>,
+    vector_generation_candidates: Vec<VectorPartitionGenerationCandidate>,
     canonical_graph_entries: Vec<AdjEntry>,
     disk_source_provenance: Vec<(String, RowId, Lsn, u8)>,
     lineage_config_owners: Vec<AuthoritativePurgeLineageConfigOwners>,
@@ -5329,6 +5770,13 @@ pub struct SemanticQuery {
     pub vector_column: String,
     pub query: Vec<f32>,
     pub limit: usize,
+    /// Per-query route override. `None` uses the vector column's declared
+    /// `SEARCH_MODE`; `Some` overrides that declaration for this query only.
+    /// The mode covers the entire authorized scope before global ranking/limit.
+    /// It does not change access rules or resource limits. `Indexed` refuses an
+    /// unavailable route without building it; initial construction and repair
+    /// advance through [`Database::run_maintenance_cycle`] or engine-owned work.
+    pub search_mode: Option<contextdb_core::VectorSearchMode>,
     pub sort_key: Option<String>,
     pub min_similarity: Option<f32>,
     pub where_clause: Option<String>,
@@ -5346,6 +5794,7 @@ impl SemanticQuery {
             vector_column: vector_column.into(),
             query,
             limit,
+            search_mode: None,
             sort_key: None,
             min_similarity: None,
             where_clause: None,
@@ -5458,9 +5907,32 @@ pub struct ApplyPhasePauseGuard {
     generation: u64,
 }
 
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorPartitionJournalFileForTest {
+    pub truncated_through_lsn: Lsn,
+    pub physical_record_lsns: Vec<Lsn>,
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorPartitionGenerationRetentionForTest {
+    pub durable_superseded_generations: usize,
+    pub resident_superseded_generations: usize,
+    pub durable_superseded_bytes: u64,
+    pub resident_superseded_bytes: usize,
+}
+
 impl ApplyPhasePauseGuard {
     pub fn wait_until_reached(&self, timeout: Duration) -> bool {
         self.inner.wait_until_reached(self.generation, timeout)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn wait_until_reached_blocking(&self) -> bool {
+        self.inner.wait_until_reached_blocking(self.generation)
     }
 
     pub fn release(&self) {
@@ -5591,6 +6063,33 @@ impl DatabaseId {
     }
 }
 
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Default)]
+struct MaintenancePollIntervalUpdateProbe {
+    entries: Mutex<u64>,
+    changed: Condvar,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl MaintenancePollIntervalUpdateProbe {
+    fn note_entered(&self) {
+        let mut entries = self.entries.lock();
+        *entries = entries.saturating_add(1);
+        self.changed.notify_all();
+    }
+
+    fn entries(&self) -> u64 {
+        *self.entries.lock()
+    }
+
+    fn wait_for(&self, target: u64) {
+        let mut entries = self.entries.lock();
+        while *entries < target {
+            self.changed.wait(&mut entries);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ActiveQueryRowsExaminedScope {
     id: u64,
@@ -5696,6 +6195,18 @@ impl QueryResult {
 thread_local! {
     static SNAPSHOT_OVERRIDE: std::cell::RefCell<Option<SnapshotId>> =
         const { std::cell::RefCell::new(None) };
+    /// Statement registrations on this thread, in nesting order. A terminal
+    /// autocommit may exclude only its own top registration from the removal
+    /// sample: that statement has finished every old-snapshot read before it
+    /// publishes, while an outer callback statement may still continue.
+    static STATEMENT_SNAPSHOT_REGISTRATION_STACK: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The one statement registration whose terminal commit is currently
+    /// publishing. This is set only around the three SQL commit doors below;
+    /// direct API commits and maintenance never infer that an unrelated
+    /// in-flight statement has stopped reading.
+    static COMMITTING_STATEMENT_SNAPSHOT_REGISTRATION: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
     static CRON_LSN_OVERRIDE: std::cell::RefCell<Option<Lsn>> =
         const { std::cell::RefCell::new(None) };
     static CRON_CALLBACK_TX: std::cell::Cell<Option<TxId>> =
@@ -5999,6 +6510,10 @@ type AcceptedSyncRowAuthors = HashMap<(String, Vec<u8>), String>;
 type InMemoryDdlGenerations = HashMap<DdlGenerationKey, DdlGenerationValue>;
 type OutboundRowLineages = HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage>;
 type AuthoritativePurgeBlobReferences = (BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>);
+/// The row-author lineages and DDL provenance a production sync client would
+/// attach to one outbound push batch.
+#[cfg(all(feature = "test-seams", feature = "sync-orchestration"))]
+type OutboundPushBatchProvenance = (OutboundRowLineages, Vec<crate::protocol::WireDdlProvenance>);
 
 pub struct Database {
     /// This handle's identity, never an address. Every handle gets its own,
@@ -6056,6 +6571,7 @@ pub struct Database {
     /// writes, but before the detached store applies it.
     capture_detached_sync_write_set: Arc<AtomicBool>,
     detached_sync_write_set: Arc<Mutex<Option<WriteSet>>>,
+    received_vector_image_pending: Arc<AtomicBool>,
     /// Ephemeral authenticated hub identity reserved immediately before an
     /// acknowledgement is durably promoted.  It is consumed by the same
     /// config write that changes Pending to Accepted; a crash before that
@@ -6128,6 +6644,14 @@ pub struct Database {
     route_observer: Option<Arc<dyn crate::read_session::ReadSessionTestObserver>>,
     #[cfg(feature = "test-seams")]
     kernel_observer: Option<Arc<dyn crate::read_session::ReadKernelTestObserver>>,
+    /// Production-dead: counts how many times
+    /// `retire_snapshot_free_vector_partitions` actually began its guarded
+    /// removal pass, as opposed to skipping it because a cheap pre-check
+    /// found nothing retirable. Shared across every scoped handle of the
+    /// same database so a test can observe it regardless of which handle
+    /// drove maintenance.
+    #[cfg(feature = "test-seams")]
+    snapshot_free_retirement_pass_count: Arc<AtomicUsize>,
     access: AccessConstraints,
     accountant: Arc<MemoryAccountant>,
     conflict_policies: RwLock<ConflictPolicies>,
@@ -6147,6 +6671,9 @@ pub struct Database {
     /// durable stage commit. The lock is shared by derived handles, so an
     /// absent-vector observation cannot race another local stage writer.
     received_schema_manifest_lock: Arc<Mutex<()>>,
+    sync_push_apply_locks: Arc<SyncPushApplyLocks>,
+    #[cfg(feature = "sync-orchestration")]
+    sync_client_push_locks: Arc<SyncClientPushLocks>,
     in_memory_received_schema_manifests: Arc<Mutex<InMemoryReceivedSchemaManifestState>>,
     /// The sole schema-instance generation owner. File-backed databases keep
     /// the same value in `sync_lineage.v1.table_generation.*`; memory
@@ -6182,13 +6709,17 @@ pub struct Database {
     /// file-backed databases (so a plain reopen loads the same one) and by this
     /// cache alone for in-memory databases (each open is a fresh life).
     sync_incarnations: Arc<Mutex<HashMap<String, Incarnation>>>,
-    // Statements 1/3/7: no public authority setter.
+    // No public authority setter.
     custody_runtime: Arc<Mutex<Option<crate::custody::policy::Runtime>>>,
     custody_cache: Arc<Mutex<Option<crate::custody::store::Store>>>,
     custody_metadata: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     pending_event_bus_ddl: Mutex<HashMap<TxId, Vec<DdlChange>>>,
     pending_commit_metadata: Mutex<HashMap<TxId, PendingCommitMetadata>>,
     limit_update_lock: Arc<Mutex<()>>,
+    #[cfg(any(test, feature = "test-seams"))]
+    maintenance_poll_interval_update_pause: Arc<ApplyPhasePause>,
+    #[cfg(any(test, feature = "test-seams"))]
+    maintenance_poll_interval_update_probe: Arc<MaintenancePollIntervalUpdateProbe>,
     /// The store's disk budget, SHARED by every handle open on it.
     ///
     /// It is a property of the store, not of whoever is holding it: it is
@@ -6214,6 +6745,11 @@ pub struct Database {
     /// through one derived handle is honored by cleanup running through
     /// another handle onto the same underlying database.
     snapshot_registry: Arc<SnapshotFloorRegistry>,
+    /// Commit-LSN bridge from the snapshot guard owned here to the erased
+    /// `WriteSetApplicator` inside the transaction manager. The store consumes
+    /// each sample exactly once before durable vector preparation; absence is
+    /// never interpreted as permission to retire historical index state.
+    vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
     /// Node ids whose live row a retention pass already reclaimed while a
     /// registered reader could still see adjacency entries touching them.
     /// Those entries stay physically in place, and nothing else in the store
@@ -6225,6 +6761,9 @@ pub struct Database {
     /// `MaintenancePolicy::CallerDriven`. Shared, not per-handle, so the
     /// policy is a property of the database, not of one handle onto it.
     maintenance_caller_driven: Arc<AtomicBool>,
+    /// Persisted database poll setting in milliseconds. Shared across handles
+    /// and sampled whenever the engine-owned worker is (re)started.
+    maintenance_poll_interval_ms: Arc<AtomicU64>,
     /// When the last maintenance cycle actually ran (engine-owned tick or a
     /// caller's own `run_maintenance_cycle` call), for the caller-driven
     /// backlog warning's "has a tick interval elapsed" check.
@@ -6246,8 +6785,8 @@ pub struct Database {
     closed: AtomicBool,
     resource_closed: Arc<AtomicBool>,
     rows_examined: AtomicU64,
-    last_vector_search_used_hnsw: AtomicBool,
-    last_vector_search_trace: RwLock<Option<VectorSearchDebugTrace>>,
+    last_vector_search_used_hnsw: Arc<AtomicBool>,
+    last_vector_search_trace: Arc<RwLock<Option<VectorSearchDebugTrace>>>,
     statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,
     /// The rank-policy formulas this STORE has registered, held once and read
     /// by every handle onto it. A derived handle -- a scoped view, a bounded
@@ -6276,6 +6815,9 @@ pub struct Database {
     /// Shared by every handle on this store: how many holders are still live,
     /// and what the owner left for the last of them to release.
     finalization: Arc<StoreFinalization>,
+    // Last to drop: every derived execution target owns the image admission
+    // until its stores and suspended reads have released their allocations.
+    read_image_memory: Option<Arc<crate::read_image_memory::ImageMemory>>,
 }
 
 /// Read-only handle for a validated schema-layout-legacy root opened solely
@@ -7058,6 +7600,7 @@ impl LegacyMigrationSource {
             }
             keyless_table_receipts.push((table_name.clone(), copied_for_table));
         }
+
         // Record the exact target in the ORIGINAL companion before every
         // point a crash could leave it behind, as above.
         if let Err(err) = self.record_replacement_target(tmp_path) {
@@ -7267,6 +7810,15 @@ pub(crate) struct UpdateReplacementContext<'a> {
 
 /// What a removal hands back to the accountant at the commit that removes it.
 ///
+/// A deleted or replaced row version hands its whole charge back here, at
+/// the commit that stamps it: the accountant is a logical attribution of
+/// what the store holds for its caller, not a measurement of the pages the
+/// process still has resident, so the budget a row took is available again
+/// the moment the row is gone from the caller's point of view. The pass that
+/// later removes the tombstoned version physically credits nothing for it
+/// (`prune_expired_rows`, `compact_currency_versions_inner`), so the version
+/// is released exactly once.
+///
 /// Adjacency has no entry here on purpose: deleting an edge stamps the entry
 /// and leaves it whole in both adjacency maps, so its bytes are still held
 /// and are handed back by the retention pass that physically removes it.
@@ -7352,11 +7904,22 @@ enum ConstraintProbe {
 
 static OPEN_FILE_DATABASES: OnceLock<OpenFileRegistry> = OnceLock::new();
 
+#[cfg(all(feature = "test-seams", unix))]
+static PERSISTED_STATE_SCHEMA_FRONTIER_PAUSES: OnceLock<Mutex<HashMap<usize, PathBuf>>> =
+    OnceLock::new();
+
 #[cfg(test)]
 static RECEIVED_SCHEMA_PRE_PUBLISH_PAUSE: OnceLock<Arc<ApplyPhasePause>> = OnceLock::new();
 
 #[cfg(test)]
 static QUERY_TRACE_ROWS_EXAMINED_CAPTURE_PAUSE: OnceLock<Arc<ApplyPhasePause>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-seams"))]
+static VECTOR_JOURNAL_CLEANUP_PAUSE: OnceLock<Arc<ApplyPhasePause>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-seams"))]
+static VECTOR_REPAIR_SNAPSHOT_SAMPLE_TRANSITION_PAUSE: OnceLock<Arc<ApplyPhasePause>> =
+    OnceLock::new();
 
 #[cfg(test)]
 fn received_schema_pre_publish_pause_for_test() -> Arc<ApplyPhasePause> {
@@ -7370,6 +7933,30 @@ fn query_trace_rows_examined_capture_pause_for_test() -> Arc<ApplyPhasePause> {
     QUERY_TRACE_ROWS_EXAMINED_CAPTURE_PAUSE
         .get_or_init(|| Arc::new(ApplyPhasePause::new()))
         .clone()
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn vector_journal_cleanup_pause_for_test() -> Arc<ApplyPhasePause> {
+    VECTOR_JOURNAL_CLEANUP_PAUSE
+        .get_or_init(|| Arc::new(ApplyPhasePause::new()))
+        .clone()
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn vector_repair_snapshot_sample_transition_pause_for_test() -> Arc<ApplyPhasePause> {
+    VECTOR_REPAIR_SNAPSHOT_SAMPLE_TRANSITION_PAUSE
+        .get_or_init(|| Arc::new(ApplyPhasePause::new()))
+        .clone()
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn maybe_pause_vector_journal_cleanup_for_test() {
+    vector_journal_cleanup_pause_for_test().maybe_pause();
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn maybe_pause_vector_repair_snapshot_sample_transition_for_test() {
+    vector_repair_snapshot_sample_transition_pause_for_test().maybe_pause();
 }
 
 #[cfg(test)]
@@ -7483,6 +8070,71 @@ impl HandleRole {
 pub(crate) struct StoreFinalization {
     live_holders: AtomicUsize,
     pending: Mutex<Option<PendingStoreRelease>>,
+    vector: Arc<VectorStore>,
+    accountant: Arc<MemoryAccountant>,
+    non_vector_memory: Mutex<Option<RetainedNonVectorMemoryOwner>>,
+}
+
+/// The standing relational and graph allocations owned by one database life.
+/// Their existing mutation paths admit and release the same estimates; this
+/// final owner returns exactly the objects still present when the last handle
+/// disappears. Vector allocations carry their own object-local reservations.
+struct RetainedNonVectorMemoryOwner {
+    relational: Arc<RelationalStore>,
+    graph: Arc<GraphStore>,
+    accountant: Arc<MemoryAccountant>,
+}
+
+impl Drop for RetainedNonVectorMemoryOwner {
+    fn drop(&mut self) {
+        let metadata = self.relational.table_meta.read().clone();
+        let metadata_bytes = metadata.values().fold(0usize, |bytes, meta| {
+            bytes.saturating_add(meta.estimated_bytes())
+        });
+        let row_bytes =
+            self.relational
+                .tables
+                .read()
+                .iter()
+                .fold(0usize, |bytes, (table, rows)| {
+                    let meta = metadata.get(table);
+                    // Only a live version still owns a charge: a version
+                    // carrying `deleted_tx` handed its bytes back at the
+                    // commit that stamped it (`DeleteReleaseBytes`), and
+                    // `account_loaded_state` charges the same live set.
+                    bytes.saturating_add(
+                        rows.iter()
+                            .filter(|row| {
+                                row.deleted_tx.is_none()
+                                    || self.relational.is_retention_expired(
+                                        table,
+                                        row.row_id,
+                                        row.created_tx,
+                                    )
+                            })
+                            .fold(0usize, |row_bytes, row| {
+                                row_bytes.saturating_add(meta.map_or_else(
+                                    || row.estimated_bytes(),
+                                    |meta| retained_row_bytes_for_meta(&row.values, meta, true),
+                                ))
+                            }),
+                    )
+                });
+        let edge_bytes = self
+            .graph
+            .forward_adj
+            .read()
+            .values()
+            .flatten()
+            .fold(0usize, |bytes, edge| {
+                bytes.saturating_add(edge.estimated_bytes())
+            });
+        self.accountant.release(
+            metadata_bytes
+                .saturating_add(row_bytes)
+                .saturating_add(edge_bytes),
+        );
+    }
 }
 
 /// The resources an owner acquired, waiting for the last holder to release.
@@ -7498,10 +8150,22 @@ struct PendingStoreRelease {
 }
 
 impl StoreFinalization {
-    fn new() -> Arc<Self> {
+    fn new(
+        relational: Arc<RelationalStore>,
+        graph: Arc<GraphStore>,
+        vector: Arc<VectorStore>,
+        accountant: Arc<MemoryAccountant>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             live_holders: AtomicUsize::new(1),
             pending: Mutex::new(None),
+            vector,
+            accountant: accountant.clone(),
+            non_vector_memory: Mutex::new(Some(RetainedNonVectorMemoryOwner {
+                relational,
+                graph,
+                accountant,
+            })),
         })
     }
 
@@ -7515,11 +8179,33 @@ impl StoreFinalization {
     /// so a count already at zero stays there and answers "not the last": the
     /// store has already been let go.
     fn note_holder_released(&self) -> bool {
-        self.live_holders
+        let last = self
+            .live_holders
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
                 live.checked_sub(1)
             })
-            .is_ok_and(|previous| previous == 1)
+            .is_ok_and(|previous| previous == 1);
+        if last {
+            // Internal helper handles can outlive the last caller-facing
+            // holder. They do not keep the store open and therefore must not
+            // keep vector bodies or relational/F32 projection charges alive.
+            for info in self.vector.index_layout_infos() {
+                let removed = self
+                    .vector
+                    .deregister_index(&info.index, self.accountant.as_ref());
+                let raw_bytes = removed
+                    .iter()
+                    .filter(|entry| entry.deleted_tx.is_none())
+                    .fold(0usize, |bytes, entry| {
+                        bytes.saturating_add(
+                            info.layout.quantization.storage_bytes(entry.vector.len()),
+                        )
+                    });
+                self.accountant.release(raw_bytes);
+            }
+            self.non_vector_memory.lock().take();
+        }
+        last
     }
 
     fn defer(&self, release: PendingStoreRelease) {
@@ -7594,7 +8280,7 @@ struct DatabaseOperationGuard<'a> {
 /// table DDL takes the write side; ordinary statements and EXPLAIN take the
 /// read side. It is deliberately separate from the close-operation gate:
 /// schema writers may wait for readers without changing close semantics.
-struct SchemaPublicationGuard<'a> {
+pub(crate) struct SchemaPublicationGuard<'a> {
     gate_id: usize,
     _read: Option<parking_lot::RwLockReadGuard<'a, ()>>,
     _write: Option<parking_lot::RwLockWriteGuard<'a, ()>>,
@@ -7625,6 +8311,17 @@ impl Drop for DatabaseOperationGuard<'_> {
                 "database operation stack mismatch"
             );
         });
+    }
+}
+
+impl DatabaseOperationGuard<'_> {
+    /// A maintenance cycle keeps the close barrier but must not pin one
+    /// schema publication across long vector preparation. The vector path
+    /// samples its declaration and rejects a candidate whose revision changed
+    /// before publication, so online policy DDL can proceed while an old
+    /// candidate is being built.
+    fn release_schema_publication_for_online_maintenance(&mut self) {
+        self._schema_publication.take();
     }
 }
 
@@ -7891,7 +8588,7 @@ impl Database {
         tx: TxId,
         registration: crate::custody::preparation::SourceRegistration,
     ) -> Result<()> {
-        // Statements 7/8: a rejected registration aborts the writing transaction.
+        // A rejected registration aborts the writing transaction.
         let validated = self.tx_mgr.with_write_set(tx, |ws| {
             crate::custody::preparation::validate_registration(self, ws, &registration)?;
             ws.requires_commit_lsn = true;
@@ -7975,7 +8672,7 @@ impl Database {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            // Statement 15: a declared snapshot can predate every binding.
+            // A declared snapshot can predate every binding.
             // The authenticated hub runtime already owns the tenant and identity.
             let mut records = state_records(db, state.clone(), tenant, hub)?;
             for b in &mut bindings {
@@ -8089,12 +8786,195 @@ impl SubscriptionState {
 struct PruningRuntime {
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    interval_ms: Arc<AtomicU64>,
     // Wake-cycles STARTED by the current maintenance thread (incremented on
     // each wake, before the pending gate). Test-build only — production
     // carries neither the field nor the increment; the unit tests poll it as
     // the liveness half of a state-based wait.
     #[cfg(test)]
     wakes: Arc<AtomicU64>,
+    worker_clock: Arc<MaintenanceWorkerClock>,
+}
+
+#[derive(Debug, Default)]
+struct MaintenanceWorkerClockState {
+    #[cfg(any(test, feature = "test-seams"))]
+    held: bool,
+    #[cfg(any(test, feature = "test-seams"))]
+    requested_serial: u64,
+    #[cfg(any(test, feature = "test-seams"))]
+    completed_serial: u64,
+    #[cfg(any(test, feature = "test-seams"))]
+    completed_thread_id: Option<thread::ThreadId>,
+    #[cfg(any(test, feature = "test-seams"))]
+    waiting_while_held: bool,
+    #[cfg(any(test, feature = "test-seams"))]
+    worker_exited: bool,
+}
+
+#[derive(Debug, Default)]
+struct MaintenanceWorkerClock {
+    state: Mutex<MaintenanceWorkerClockState>,
+    changed: Condvar,
+}
+
+impl MaintenanceWorkerClock {
+    /// Wake the real maintenance wait in every build. Shutdown callers set
+    /// the flag first, then notify, so a worker either observes shutdown
+    /// before waiting or is released from this wait to observe it.
+    fn wake(&self) {
+        // Pair notification with the worker's predicate check under this
+        // mutex. `wait_for` releases the mutex as it begins to wait, so the
+        // notifier cannot slip between that check and the wait.
+        let _state = self.state.lock();
+        self.changed.notify_all();
+    }
+
+    fn reschedule(&self) {
+        let _state = self.state.lock();
+        self.changed.notify_all();
+    }
+
+    fn wait_for_cycle(&self, shutdown: &AtomicBool, interval_ms: &AtomicU64) -> Option<u64> {
+        let mut state = self.state.lock();
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    state.waiting_while_held = false;
+                }
+                self.changed.notify_all();
+                return None;
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            if state.held {
+                state.waiting_while_held = true;
+                self.changed.notify_all();
+                if state.requested_serial > state.completed_serial {
+                    state.waiting_while_held = false;
+                    return Some(state.requested_serial);
+                }
+                self.changed.wait(&mut state);
+                continue;
+            }
+            let interval = Duration::from_millis(interval_ms.load(Ordering::SeqCst).max(1));
+            if self.changed.wait_for(&mut state, interval).timed_out() {
+                return Some(0);
+            }
+        }
+    }
+
+    fn complete(&self, _serial: u64) {
+        #[cfg(any(test, feature = "test-seams"))]
+        if _serial != 0 {
+            let mut state = self.state.lock();
+            state.completed_serial = _serial;
+            state.completed_thread_id = Some(thread::current().id());
+            self.changed.notify_all();
+        }
+    }
+
+    fn mark_worker_exited(&self) {
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            let mut state = self.state.lock();
+            state.waiting_while_held = false;
+            state.worker_exited = true;
+        }
+        self.changed.notify_all();
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    fn hold(&self) {
+        self.state.lock().held = true;
+        self.changed.notify_all();
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    fn release(&self) {
+        self.state.lock().held = false;
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait_until_held_asleep(&self) {
+        let mut state = self.state.lock();
+        while !state.waiting_while_held && !state.worker_exited {
+            self.changed.wait(&mut state);
+        }
+    }
+
+    #[cfg(test)]
+    fn worker_exited(&self) -> bool {
+        self.state.lock().worker_exited
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    fn wake_once(&self, shutdown: &AtomicBool) -> Result<VectorMaintenanceWorkerCycleForTest> {
+        let mut state = self.state.lock();
+        if !state.held {
+            return Err(Error::Other(
+                "engine-owned vector maintenance clock is not held".to_string(),
+            ));
+        }
+        state.requested_serial = state.requested_serial.saturating_add(1);
+        let requested = state.requested_serial;
+        self.changed.notify_all();
+        while state.completed_serial < requested && !shutdown.load(Ordering::SeqCst) {
+            self.changed.wait(&mut state);
+        }
+        if state.completed_serial < requested {
+            return Err(Error::Other(
+                "engine-owned vector maintenance worker stopped before completing its wake"
+                    .to_string(),
+            ));
+        }
+        Ok(VectorMaintenanceWorkerCycleForTest {
+            cycle_serial: requested,
+            worker_thread_id: state.completed_thread_id.ok_or_else(|| {
+                Error::Other("maintenance wake completed without a worker identity".to_string())
+            })?,
+        })
+    }
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorMaintenanceWorkerCycleForTest {
+    pub cycle_serial: u64,
+    pub worker_thread_id: thread::ThreadId,
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-seams"))]
+pub struct VectorMaintenanceWorkerClockGuardForTest {
+    clock: Arc<MaintenanceWorkerClock>,
+    shutdown: Arc<AtomicBool>,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl VectorMaintenanceWorkerClockGuardForTest {
+    pub fn wake_once(&self) -> Result<VectorMaintenanceWorkerCycleForTest> {
+        self.clock.wake_once(&self.shutdown)
+    }
+
+    #[cfg(test)]
+    fn wait_until_held_asleep(&self) {
+        self.clock.wait_until_held_asleep();
+    }
+
+    #[cfg(test)]
+    fn worker_exited(&self) -> bool {
+        self.clock.worker_exited()
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for VectorMaintenanceWorkerClockGuardForTest {
+    fn drop(&mut self) {
+        self.clock.release();
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -8120,7 +9000,8 @@ pub struct PruningReport {
     /// place, so a prune that does not compact frees space WITHOUT shrinking
     /// the file — this field says which happened.
     pub file_shrank: bool,
-    /// Whether this cycle ran a full storage compaction.
+    /// Whether this cycle advanced durable storage compaction. A bounded
+    /// sweep may require subsequent maintenance cycles to finish.
     pub compacted: bool,
     /// The storage layer's observed dead-space fraction as it stood BEFORE
     /// this cycle pruned anything — accumulated waste that survived page reuse
@@ -8141,14 +9022,15 @@ pub struct PruningReport {
     /// forever; retention now trims it to what a consumer can still name.
     pub pruned_commit_index_entries: u64,
     /// Expired rows this cycle left physically in place because a REGISTERED
-    /// READER — an in-flight statement, a caller-held snapshot pin, or a
-    /// suspended bounded cursor — can still resolve to them. They are not
-    /// blocked and not lost: the next cycle that runs with no reader holding
-    /// them reclaims them. Without this count a cycle that deferred
-    /// everything reads exactly like a cycle with nothing to reclaim, so an
-    /// operator watching disk that is not coming back cannot tell that
-    /// closing a reader is what would move it. Counted from the rows the pass
-    /// actually held back, never from a configured expectation.
+    /// READER managed independently of an ordinary SQL statement — a
+    /// caller-held snapshot pin or a bounded reader, including a suspended
+    /// cursor — can still resolve to them. They are not blocked and not lost:
+    /// the next cycle that runs with no reader holding them reclaims them.
+    /// Without this count a cycle that deferred everything reads exactly like
+    /// a cycle with nothing to reclaim, so an operator watching disk that is
+    /// not coming back cannot tell that closing a reader is what would move
+    /// it. Counted from the rows the pass actually held back, never from a
+    /// configured expectation.
     pub rows_deferred_for_readers: u64,
 }
 
@@ -8176,7 +9058,10 @@ pub struct MaintenanceStatus {
 /// `EngineOwned` (the default) is what every database gets until a caller
 /// asks otherwise: the engine spawns its own background thread the moment
 /// anything is declared (a `RETAIN` window, `HISTORY CURRENT ONLY`, a
-/// durable trigger-audit history), and stops it the moment nothing is.
+/// durable trigger-audit history, or maintained vector work), and stops it
+/// when nothing remains to maintain. Initial vector construction and repair
+/// advance through this maintenance path, outside foreground declarations,
+/// writes, open, and queries; none waits for a full graph build.
 ///
 /// `CallerDriven` hands the schedule to the host: the engine spawns ZERO
 /// threads for this database, however much is declared, and the caller is
@@ -8200,11 +9085,13 @@ pub enum MaintenancePolicy {
 }
 
 /// Everything one maintenance cycle did: generic retention, currency version
-/// compaction, and the engine's own durable trigger-audit retention.
+/// compaction, maintained vector-index progress, and the engine's own durable
+/// trigger-audit retention.
 #[derive(Debug, Clone, Default)]
 pub struct MaintenanceReport {
     pub pruning: PruningReport,
     pub currency: CurrencyCompactionReport,
+    pub vector: VectorMaintenanceReport,
     pub pruned_trigger_audit_rows: u64,
     /// The rare, interval-gated automatic compaction attempt this cycle made
     /// (see [`AUTO_COMPACT_MIN_INTERVAL`]) — `ran=false` on almost every
@@ -8230,22 +9117,26 @@ pub struct TableSizeEstimate {
 
 /// Every read snapshot currently entitled to resolve a version, keyed by a
 /// registration token. Version cleanup consults EVERY registered snapshot
-/// (not merely the lowest) and defers any version visible to ANY of them to
-/// a later cycle, rather than physically removing it out from under a live
-/// reader.
+/// (not merely the lowest), while retention consults every reader-held
+/// registration but not short-lived SQL statements. Each pass defers any
+/// version visible to the registrations it samples rather than physically
+/// removing it out from under a protected reader.
 ///
-/// Two classes of caller register here:
+/// Three classes of caller register here:
 /// - Every top-level statement execution (`execute`, `execute_in_tx`, and
 ///   `execute_at_snapshot` riding through `execute`) registers its own
 ///   snapshot for exactly that call's duration -- this closes the
-///   mid-statement race with the autonomous maintenance thread: a long read
-///   resolving rows later in the same statement can no longer have a version
-///   vanish underneath it.
+///   mid-statement race with version cleanup: a long read resolving rows later
+///   in the same statement can no longer have a superseded version vanish
+///   underneath it.
 /// - `Database::pin_snapshot` registers a snapshot for as long as the
 ///   returned guard lives, for a caller that holds a `SnapshotId` ACROSS
 ///   separate calls (the shape `execute_at_snapshot` alone cannot protect,
 ///   since a bare `SnapshotId` is a plain `Copy` value the engine has no way
 ///   to know is still wanted once a call returns).
+/// - Bounded reads register independently of SQL statements; a suspended
+///   cursor keeps that registration between pages for exactly its published
+///   idle window.
 #[derive(Default)]
 struct SnapshotFloorRegistry {
     next_token: AtomicU64,
@@ -8275,17 +9166,29 @@ struct SnapshotFloorRegistry {
 }
 
 /// One registered read snapshot, plus whatever the holder published about
-/// how long it stays entitled to that snapshot. A statement's registration
-/// and a caller-held pin carry no window: they last exactly as long as the
-/// guard does. A suspended bounded cursor carries its idle window, because
-/// the engine already refuses that cursor's next page once the window has
-/// passed -- see [`CursorIdleWindow`].
+/// how long it stays entitled to that snapshot. A statement's registration,
+/// a caller-held pin, and an active bounded read carry no window: they last
+/// exactly as long as the guard does. A suspended bounded cursor carries its
+/// idle window, because the engine already refuses that cursor's next page
+/// once the window has passed -- see [`CursorIdleWindow`].
 struct RegisteredSnapshot {
     snapshot: SnapshotId,
+    /// SQL statements own the rows they scan before completing the rest of
+    /// their read, so retention does not let a continuous stream of those
+    /// short-lived registrations pin every expired row. Reader-held
+    /// registrations remain authoritative to retention as well as version
+    /// cleanup.
+    class: SnapshotRegistrationClass,
     /// `None` for a registration that stays entitled for as long as it is
     /// registered; `Some` for one whose holder has an idle deadline of its
     /// own.
     idle_window: Option<Arc<CursorIdleWindow>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotRegistrationClass {
+    Statement,
+    ReaderHeld,
 }
 
 impl RegisteredSnapshot {
@@ -8342,7 +9245,7 @@ impl CursorIdleWindow {
 #[derive(Default)]
 struct SnapshotFloorState {
     active: HashMap<u64, RegisteredSnapshot>,
-    /// `Some(pass)` while a version-cleanup removal pass is in flight;
+    /// `Some(pass)` while a physical-removal pass is in flight;
     /// `None` means no pass is active. Set by `begin_removal_pass` the
     /// moment a pass samples its registered set and watermark; cleared (and
     /// `pass_finished` notified) only by `ActiveRemovalPassGuard`'s `Drop`
@@ -8399,12 +9302,44 @@ impl SnapshotFloorRegistry {
             .is_some_and(|pass| snapshot.0 <= pass.watermark.0)
     }
 
+    /// Cheap, racy peek at whether anything is registered right now, without
+    /// beginning a removal pass. A registration can land the instant after
+    /// this reads, so a caller may use `true` only to decide whether
+    /// beginning a pass is worth attempting this cycle -- never as a
+    /// correctness gate. The pass's own `begin_removal_pass_inner` samples
+    /// the authoritative set atomically under the lock regardless of what
+    /// this returned.
+    fn no_snapshots_currently_registered(&self) -> bool {
+        self.state.lock().active.is_empty()
+    }
+
     fn register(self: &Arc<Self>, snapshot: SnapshotId) -> SnapshotRegistration {
+        self.register_as(snapshot, SnapshotRegistrationClass::ReaderHeld)
+    }
+
+    fn register_as(
+        self: &Arc<Self>,
+        snapshot: SnapshotId,
+        class: SnapshotRegistrationClass,
+    ) -> SnapshotRegistration {
         let mut state = self.state.lock();
         while Self::pass_holds(&state, snapshot) {
             self.pass_finished.wait(&mut state);
         }
-        self.admit(state, snapshot, None)
+        self.admit(state, snapshot, class, None)
+    }
+
+    /// Register one statement and remember its exact token on this thread.
+    /// The separate wrapper is deliberately not `Send`: its thread-local
+    /// nesting marker must be removed on the same thread that installed it.
+    fn register_statement(self: &Arc<Self>, snapshot: SnapshotId) -> StatementSnapshotRegistration {
+        let registration = self.register_as(snapshot, SnapshotRegistrationClass::Statement);
+        STATEMENT_SNAPSHOT_REGISTRATION_STACK
+            .with(|stack| stack.borrow_mut().push(registration.token));
+        StatementSnapshotRegistration {
+            registration,
+            _same_thread: std::marker::PhantomData,
+        }
     }
 
     /// Register `snapshot` for a caller that can withdraw the read it is
@@ -8430,7 +9365,12 @@ impl SnapshotFloorRegistry {
             self.pass_finished
                 .wait_for(&mut state, WITHDRAWAL_CHECK_INTERVAL);
         }
-        Some(self.admit(state, snapshot, idle_window))
+        Some(self.admit(
+            state,
+            snapshot,
+            SnapshotRegistrationClass::ReaderHeld,
+            idle_window,
+        ))
     }
 
     /// Take the registration slot under the lock the caller already holds,
@@ -8440,6 +9380,7 @@ impl SnapshotFloorRegistry {
         self: &Arc<Self>,
         mut state: MutexGuard<'_, SnapshotFloorState>,
         snapshot: SnapshotId,
+        class: SnapshotRegistrationClass,
         idle_window: Option<Arc<CursorIdleWindow>>,
     ) -> SnapshotRegistration {
         let token = self.next_token.fetch_add(1, Ordering::SeqCst);
@@ -8447,6 +9388,7 @@ impl SnapshotFloorRegistry {
             token,
             RegisteredSnapshot {
                 snapshot,
+                class,
                 idle_window,
             },
         );
@@ -8469,6 +9411,87 @@ impl SnapshotFloorRegistry {
     /// land on a sample the pass no longer accounts for. See
     /// `SnapshotFloorState::active_pass`'s doc comment.
     fn begin_removal_pass(self: &Arc<Self>, watermark: TxId) -> ActiveRemovalPassGuard {
+        self.begin_removal_pass_inner(watermark, None, true)
+    }
+
+    /// Retention reclaims only versions no registered statement, explicit
+    /// snapshot pin, or suspended bounded cursor can still observe.
+    fn begin_retention_removal_pass(self: &Arc<Self>, watermark: TxId) -> ActiveRemovalPassGuard {
+        self.begin_removal_pass_inner(watermark, None, true)
+    }
+
+    /// Begin the commit-time pass while omitting at most the exact statement
+    /// registration that is publishing this commit. An explicit pin at the
+    /// same snapshot has a different token and remains in the sample, as do
+    /// every concurrent statement, suspended cursor, and outer callback.
+    fn begin_removal_pass_excluding(
+        self: &Arc<Self>,
+        watermark: TxId,
+        excluded_registration: Option<u64>,
+    ) -> ActiveRemovalPassGuard {
+        self.begin_removal_pass_inner(watermark, excluded_registration, true)
+    }
+
+    /// Begin a repair removal pass after admitting both allocations that
+    /// coexist while its registered-snapshot sample moves from a collection
+    /// buffer into the guard's retained slice. The registry lock stays held
+    /// from the authoritative count through admission and sampling, and the
+    /// pass marker is installed before that lock is released.
+    fn begin_removal_pass_with_sample_admission(
+        self: &Arc<Self>,
+        watermark: TxId,
+        admit_transition: impl FnOnce(usize) -> Result<()>,
+    ) -> Result<(ActiveRemovalPassGuard, usize)> {
+        let mut state = self.state.lock();
+        // Capacity is bounded from the complete registered set before the
+        // eligibility filter. This remains safe if an idle cursor expires
+        // while the lock is held, and no registration can race the count.
+        let sample_capacity = state.active.len();
+        let vector_capacity_bound = if sample_capacity == 0 {
+            0
+        } else {
+            sample_capacity.saturating_mul(2).max(4)
+        };
+        let arc_metadata_bound = std::mem::size_of::<usize>().saturating_mul(4);
+        let transition_bound = vector_capacity_bound
+            .saturating_mul(std::mem::size_of::<SnapshotId>())
+            .saturating_add(sample_capacity.saturating_mul(std::mem::size_of::<SnapshotId>()))
+            .saturating_add(arc_metadata_bound);
+        admit_transition(transition_bound)?;
+
+        let mut sampled_snapshots = Vec::with_capacity(sample_capacity);
+        sampled_snapshots.extend(
+            state
+                .active
+                .values()
+                .filter(|registered| registered.holder_still_entitled())
+                .map(|registered| registered.snapshot),
+        );
+        sampled_snapshots.sort_unstable();
+        state.active_pass = Some(ActiveRemovalPass { watermark });
+        drop(state);
+
+        let retained_bytes = sampled_snapshots
+            .len()
+            .saturating_mul(std::mem::size_of::<SnapshotId>())
+            .saturating_add(arc_metadata_bound);
+        let registered_snapshots = Arc::<[SnapshotId]>::from(sampled_snapshots.as_slice());
+        let guard = ActiveRemovalPassGuard {
+            registry: self.clone(),
+            registered_snapshots,
+        };
+        #[cfg(any(test, feature = "test-seams"))]
+        maybe_pause_vector_repair_snapshot_sample_transition_for_test();
+        drop(sampled_snapshots);
+        Ok((guard, retained_bytes))
+    }
+
+    fn begin_removal_pass_inner(
+        self: &Arc<Self>,
+        watermark: TxId,
+        excluded_registration: Option<u64>,
+        include_statement_registrations: bool,
+    ) -> ActiveRemovalPassGuard {
         let mut state = self.state.lock();
         // A registration whose holder is past its own idle deadline is left
         // out: the engine already refuses that holder's next page, so it is
@@ -8476,22 +9499,28 @@ impl SnapshotFloorRegistry {
         // `RegisteredSnapshot::holder_still_entitled`.
         let mut registered_snapshots: Vec<SnapshotId> = state
             .active
-            .values()
-            .filter(|registered| registered.holder_still_entitled())
-            .map(|registered| registered.snapshot)
+            .iter()
+            .filter(|(token, registered)| {
+                Some(**token) != excluded_registration
+                    && (include_statement_registrations
+                        || registered.class != SnapshotRegistrationClass::Statement)
+                    && registered.holder_still_entitled()
+            })
+            .map(|(_, registered)| registered.snapshot)
             .collect();
         registered_snapshots.sort_unstable();
         state.active_pass = Some(ActiveRemovalPass { watermark });
         drop(state);
         ActiveRemovalPassGuard {
             registry: self.clone(),
-            registered_snapshots,
+            registered_snapshots: registered_snapshots.into(),
         }
     }
 }
 
-/// RAII marker for one in-progress version-cleanup removal pass -- see
-/// `SnapshotFloorRegistry::begin_removal_pass`.
+/// RAII marker for one in-progress physical-removal pass -- see
+/// `SnapshotFloorRegistry::begin_removal_pass` and
+/// `SnapshotFloorRegistry::begin_retention_removal_pass`.
 struct ActiveRemovalPassGuard {
     registry: Arc<SnapshotFloorRegistry>,
     /// This pass's own sorted snapshot of the registered set at the moment
@@ -8499,7 +9528,7 @@ struct ActiveRemovalPassGuard {
     /// via `Self::registered_snapshots` so the pass's deferral loop
     /// consults the EXACT SAME set `register`'s blocking rule was computed
     /// against.
-    registered_snapshots: Vec<SnapshotId>,
+    registered_snapshots: Arc<[SnapshotId]>,
 }
 
 impl ActiveRemovalPassGuard {
@@ -8527,6 +9556,29 @@ struct SnapshotRegistration {
 impl Drop for SnapshotRegistration {
     fn drop(&mut self) {
         self.registry.state.lock().active.remove(&self.token);
+    }
+}
+
+/// A statement-owned snapshot registration plus its same-thread nesting
+/// marker. The inner registration remains live until this wrapper has removed
+/// the token from the thread-local stack.
+struct StatementSnapshotRegistration {
+    registration: SnapshotRegistration,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for StatementSnapshotRegistration {
+    fn drop(&mut self) {
+        STATEMENT_SNAPSHOT_REGISTRATION_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let position = stack
+                .iter()
+                .rposition(|token| *token == self.registration.token);
+            debug_assert!(position.is_some(), "statement snapshot token is registered");
+            if let Some(position) = position {
+                stack.remove(position);
+            }
+        });
     }
 }
 
@@ -8573,8 +9625,8 @@ fn any_registered_snapshot_sees_version(
 }
 
 /// A read snapshot held across separate calls. While this guard lives,
-/// version cleanup defers any version still visible at the pinned snapshot
-/// to a later cycle, exactly as it does for an in-flight statement.
+/// retention and version cleanup defer any version still visible at the
+/// pinned snapshot to a later cycle.
 ///
 /// Without a pin, a `SnapshotId` obtained from [`Database::snapshot`] and
 /// reused in a LATER [`Database::execute_at_snapshot`] call is invisible to
@@ -8582,9 +9634,9 @@ fn any_registered_snapshot_sees_version(
 /// may reclaim a version that snapshot was entitled to see, and the later
 /// call then silently returns fewer rows than it should — never a wrong
 /// value, never an error, just missing data. This is the documented boundary
-/// on a table declaring `HISTORY CURRENT ONLY`; a table that declares
-/// nothing keeps every version, so it never arises there. Pin the snapshot
-/// for as long as you intend to reuse it if the table matters.
+/// on a table declaring `RETAIN` or `HISTORY CURRENT ONLY`; a table that
+/// declares neither keeps every version, so it never arises there. Pin the
+/// snapshot for as long as you intend to reuse it if the table matters.
 pub struct SnapshotPin<'a> {
     _database: &'a Database,
     _registration: SnapshotRegistration,
@@ -8599,11 +9651,1140 @@ pub(crate) enum CurrencyGate {
     Scheduled,
 }
 
+/// Persistence-owned raw-body loader for one partition. The object keeps no
+/// vector values and no stale membership snapshot: each load resolves the
+/// partition's current checksummed directory, which means a committed write
+/// can leave the same partition evictable without publishing a new loader.
+struct DurableRawVectorPartitionLoader {
+    persistence: Arc<RedbPersistence>,
+    accountant: Arc<MemoryAccountant>,
+    partition: VectorPartitionRef,
+    dimension: usize,
+    quantization: VectorQuantization,
+}
+
+impl DurableRawVectorPartitionLoader {
+    fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize> {
+        left.checked_mul(right).ok_or_else(|| {
+            Error::Other(format!(
+                "raw vector {name} exceeds this process's addressable range"
+            ))
+        })
+    }
+
+    fn checked_add(left: usize, right: usize, name: &str) -> Result<usize> {
+        left.checked_add(right).ok_or_else(|| {
+            Error::Other(format!(
+                "raw vector {name} exceeds this process's addressable range"
+            ))
+        })
+    }
+
+    fn stored_bytes_per_entry(&self) -> Result<usize> {
+        match self.quantization {
+            VectorQuantization::F32 => Self::checked_mul(
+                self.dimension,
+                std::mem::size_of::<f32>(),
+                "stored F32 body",
+            ),
+            VectorQuantization::SQ8 => Self::checked_add(self.dimension, 8, "stored SQ8 body"),
+            VectorQuantization::SQ4 => {
+                Self::checked_add(self.dimension.div_ceil(2), 8, "stored SQ4 body")
+            }
+        }
+    }
+
+    fn load_checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<()> {
+        if request(DormantVectorLoadRequest::Checkpoint) {
+            Ok(())
+        } else {
+            Err(Error::ReadCancelled)
+        }
+    }
+}
+
+impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
+    fn load(&self, directory: &[RawVectorDirectoryEntry]) -> Result<LoadedRawVectorPartition> {
+        let expected_entry_count = directory.len();
+        let decoded_bytes_per_entry = Self::checked_mul(
+            self.dimension,
+            std::mem::size_of::<f32>(),
+            "decoded F32 body",
+        )?;
+        let resident_bytes = Self::checked_mul(
+            expected_entry_count,
+            self.stored_bytes_per_entry()?,
+            "partition residency",
+        )?;
+        let workspace_bytes = Self::checked_mul(
+            expected_entry_count,
+            decoded_bytes_per_entry,
+            "returned decode workspace",
+        )?;
+        // Bincode may briefly hold one persisted payload while producing its
+        // decoded F32 body. Reserve that one-vector peak before touching Redb.
+        let decode_scratch = Self::checked_add(
+            decoded_bytes_per_entry,
+            self.stored_bytes_per_entry()?,
+            "decode scratch",
+        )?;
+        let retained = Self::checked_add(
+            resident_bytes,
+            workspace_bytes,
+            "partition retained reservation",
+        )?;
+        let total = Self::checked_add(retained, decode_scratch, "partition load reservation")?;
+        self.accountant.try_allocate_for(
+            total,
+            "vector_store",
+            "load_raw_vector_partition",
+            "Evict another raw vector partition, narrow the selected scope, or raise MEMORY_LIMIT before reading these vector bodies.",
+        )?;
+
+        let loaded = (|| -> Result<Vec<VectorEntry>> {
+            let persisted = self.persistence.load_vector_partition_memberships_for(
+                &self.partition.index,
+                &self.partition.partition_key,
+            )?;
+            let mut by_identity = HashMap::with_capacity(persisted.len());
+            for membership in persisted {
+                if membership.index != self.partition.index
+                    || membership.partition_key != self.partition.partition_key
+                    || membership.visible_from
+                        != TxId(
+                            membership
+                                .row_created_tx
+                                .0
+                                .max(membership.vector_created_tx.0),
+                        )
+                    || membership
+                        .deleted_tx
+                        .is_some_and(|deleted| deleted.0 <= membership.visible_from.0)
+                {
+                    return Err(Error::Other(
+                        "raw vector partition membership has an invalid lifecycle boundary"
+                            .to_string(),
+                    ));
+                }
+                let identity = (
+                    membership.row_id,
+                    membership.vector_created_tx,
+                    membership.deleted_tx,
+                    membership.vector_lsn,
+                );
+                if by_identity.insert(identity, membership).is_some() {
+                    return Err(Error::Other(
+                        "raw vector partition contains duplicate directory identities".to_string(),
+                    ));
+                }
+            }
+            let mut memberships = Vec::with_capacity(expected_entry_count);
+            for entry in directory {
+                let identity = (entry.row_id, entry.created_tx, entry.deleted_tx, entry.lsn);
+                let membership = by_identity.remove(&identity).ok_or_else(|| {
+                    Error::Other(
+                        "raw vector partition identity changed outside its atomic publication"
+                            .to_string(),
+                    )
+                })?;
+                memberships.push(membership);
+            }
+            self.persistence
+                .load_vector_entries_for_memberships(&memberships, self.dimension)
+        })();
+
+        match loaded {
+            Err(error) => {
+                self.accountant.release(total);
+                Err(error)
+            }
+            Ok(entries) => {
+                self.accountant.release(decode_scratch);
+                Ok(LoadedRawVectorPartition {
+                    entries,
+                    resident_bytes,
+                    workspace_bytes,
+                    accountant: self.accountant.clone(),
+                })
+            }
+        }
+    }
+
+    fn load_candidate(
+        &self,
+        identity: &RawVectorDirectoryEntry,
+        caller_charged: bool,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<LoadedRawVectorCandidate> {
+        let decoded_bytes = Self::checked_mul(
+            self.dimension,
+            std::mem::size_of::<f32>(),
+            "candidate decoded F32 body",
+        )?;
+        let stored_bytes = self.stored_bytes_per_entry()?;
+        let retained = Self::checked_add(
+            decoded_bytes,
+            stored_bytes,
+            "candidate decoded and stored bodies",
+        )?;
+        // One persisted body may coexist with its decoded F32 allocation and
+        // the quantized score representation. Charge that complete peak before
+        // opening Redb; none of it becomes partition residency.
+        let decode_scratch =
+            Self::checked_add(decoded_bytes, stored_bytes, "candidate decode scratch")?;
+        let transient_bytes =
+            Self::checked_add(retained, decode_scratch, "candidate point-load reservation")?;
+
+        Self::load_checkpoint(request)?;
+        if caller_charged {
+            if !request(DormantVectorLoadRequest::Reserve(transient_bytes)) {
+                return Err(Error::ReadCancelled);
+            }
+        } else {
+            self.accountant.try_allocate_for(
+                transient_bytes,
+                "vector_store",
+                "load_raw_vector_candidate",
+                "Reduce the selected candidate scope or raise MEMORY_LIMIT before reading this vector body.",
+            )?;
+        }
+
+        let loaded = (|| -> Result<VectorEntry> {
+            Self::load_checkpoint(request)?;
+            let entry = self.persistence.load_vector_entry_for_partition_identity(
+                &self.partition.index,
+                &self.partition.partition_key,
+                identity,
+                self.dimension,
+            )?;
+            Self::load_checkpoint(request)?;
+            if entry.index != self.partition.index
+                || entry.row_id != identity.row_id
+                || entry.created_tx != identity.created_tx
+                || entry.deleted_tx != identity.deleted_tx
+                || entry.lsn != identity.lsn
+                || entry.vector.len() != self.dimension
+            {
+                return Err(Error::Other(
+                    "raw vector candidate disagrees with its exact durable identity".to_string(),
+                ));
+            }
+            Ok(entry)
+        })();
+
+        match loaded {
+            Err(error) => {
+                if !caller_charged {
+                    self.accountant.release(transient_bytes);
+                }
+                Err(error)
+            }
+            Ok(entry) if caller_charged => Ok(LoadedRawVectorCandidate::caller_charged(
+                entry,
+                transient_bytes,
+            )),
+            Ok(entry) => Ok(LoadedRawVectorCandidate::loader_charged(
+                entry,
+                transient_bytes,
+                self.accountant.clone(),
+            )),
+        }
+    }
+}
+
+fn durable_raw_vector_partitions(
+    vector: &VectorStore,
+    persistence: &Arc<RedbPersistence>,
+    accountant: &Arc<MemoryAccountant>,
+) -> Result<Vec<DormantRawVectorPartition>> {
+    let memberships = persistence.load_vector_partition_memberships()?;
+    // Historical EXACT reads need the same immutable vector identities after
+    // reopen. Membership retirement affects maintained graphs, not retained
+    // raw bodies: keep every durable visibility interval in the directory.
+    let mut grouped = HashMap::<VectorPartitionRef, Vec<VectorPartitionMembershipRecord>>::new();
+    for membership in memberships {
+        grouped
+            .entry(VectorPartitionRef::new(
+                membership.index.clone(),
+                membership.partition_key.clone(),
+            ))
+            .or_default()
+            .push(membership);
+    }
+
+    let mut grouped = grouped.into_iter().collect::<Vec<_>>();
+    grouped.sort_by(|(left, _), (right, _)| {
+        left.index
+            .table
+            .cmp(&right.index.table)
+            .then(left.index.column.cmp(&right.index.column))
+            .then(
+                left.partition_key
+                    .canonical_bytes()
+                    .cmp(&right.partition_key.canonical_bytes()),
+            )
+    });
+    let mut dormant = Vec::with_capacity(grouped.len());
+    for (partition, mut memberships) in grouped {
+        memberships.sort_by_key(|membership| {
+            (
+                membership.row_id,
+                membership.row_created_tx,
+                membership.row_lsn,
+                membership.vector_created_tx,
+                membership.vector_lsn,
+            )
+        });
+        let layout = vector.index_layout(&partition.index)?;
+        let directory = memberships
+            .iter()
+            .map(|membership| RawVectorDirectoryEntry {
+                row_id: membership.row_id,
+                created_tx: membership.vector_created_tx,
+                deleted_tx: membership.deleted_tx,
+                lsn: membership.vector_lsn,
+            })
+            .collect::<Vec<_>>();
+        let loader: Arc<dyn DormantRawVectorLoader> = Arc::new(DurableRawVectorPartitionLoader {
+            persistence: persistence.clone(),
+            accountant: accountant.clone(),
+            partition: partition.clone(),
+            dimension: layout.dimension,
+            quantization: layout.quantization,
+        });
+        dormant.push(DormantRawVectorPartition {
+            partition,
+            directory,
+            loader,
+        });
+    }
+    Ok(dormant)
+}
+
+fn register_dormant_raw_vector_partitions(
+    vector: &VectorStore,
+    persistence: &Arc<RedbPersistence>,
+    accountant: &Arc<MemoryAccountant>,
+) -> Result<()> {
+    vector.replace_with_dormant_raw_partitions(durable_raw_vector_partitions(
+        vector,
+        persistence,
+        accountant,
+    )?)
+}
+
+/// Persistence-owned loader attached to one lightweight generation
+/// descriptor. Opening a database registers this object without reading graph
+/// bytes. The first ordinary indexed read reserves the complete decode and
+/// replay working set, verifies the saved graph, and replays only journal
+/// entries after the selected sealed boundary.
+struct DurableVectorGenerationLoader {
+    source: DurableVectorGenerationSource,
+    accountant: Arc<MemoryAccountant>,
+    partition: VectorPartitionRef,
+    descriptor: VectorPartitionGenerationDescriptor,
+    base_generation_id: u64,
+    is_base: bool,
+    dimension: usize,
+    quantization: VectorQuantization,
+    /// Only the final selected sealed layer owns fresh-tail replay. A base
+    /// with a selected change layer leaves this `None`; the change loader owns
+    /// the suffix instead.
+    tail_covered_lsn: Option<Lsn>,
+    layout: VectorIndexLayout,
+    live_rows: usize,
+}
+
+#[derive(Clone)]
+enum DurableVectorGenerationSource {
+    Writable(Arc<RedbPersistence>),
+    CommittedImage(ReadOnlyVectorGenerationSource),
+}
+
+impl DurableVectorGenerationSource {
+    fn tail_entry_count(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        covered_lsn: Lsn,
+    ) -> Result<usize> {
+        #[cfg(feature = "test-seams")]
+        let _reads = crate::vector_observations::observe_reads(index, partition_key, covered_lsn);
+        match self {
+            Self::Writable(persistence) => {
+                persistence.vector_partition_tail_entry_count(index, partition_key, covered_lsn)
+            }
+            Self::CommittedImage(source) => {
+                source.tail_entry_count(index, partition_key, covered_lsn)
+            }
+        }
+    }
+
+    fn record_bytes(
+        &self,
+        partition: &VectorPartitionRef,
+        base: u64,
+        change: Option<u64>,
+    ) -> Result<usize> {
+        match self {
+            Self::Writable(persistence) => persistence.vector_generation_record_bytes(
+                &partition.index,
+                &partition.partition_key,
+                base,
+                change,
+            ),
+            Self::CommittedImage(source) => source.generation_record_bytes(
+                &partition.index,
+                &partition.partition_key,
+                base,
+                change,
+            ),
+        }
+    }
+
+    fn load_base(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        generation_id: u64,
+    ) -> Result<VectorPartitionBaseGenerationRecord> {
+        match self {
+            Self::Writable(persistence) => persistence.load_vector_partition_base_generation(
+                index,
+                partition_key,
+                generation_id,
+            ),
+            Self::CommittedImage(source) => source.load_base(index, partition_key, generation_id),
+        }
+    }
+
+    fn load_change(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        base_generation_id: u64,
+        change_generation_id: u64,
+    ) -> Result<VectorPartitionChangeGenerationRecord> {
+        match self {
+            Self::Writable(persistence) => persistence.load_vector_partition_change_generation(
+                index,
+                partition_key,
+                base_generation_id,
+                change_generation_id,
+            ),
+            Self::CommittedImage(source) => source.load_change(
+                index,
+                partition_key,
+                base_generation_id,
+                change_generation_id,
+            ),
+        }
+    }
+
+    fn load_tail(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        covered_lsn: Lsn,
+    ) -> Result<(Vec<VectorEntry>, Lsn)> {
+        #[cfg(feature = "test-seams")]
+        let _reads = crate::vector_observations::observe_reads(index, partition_key, covered_lsn);
+        match self {
+            Self::Writable(persistence) => {
+                persistence.load_vector_partition_tail_entries(index, partition_key, covered_lsn)
+            }
+            Self::CommittedImage(source) => source.load_tail(index, partition_key, covered_lsn),
+        }
+    }
+}
+
+impl DurableVectorGenerationLoader {
+    fn descriptor_usize(value: u64, name: &str) -> Result<usize> {
+        usize::try_from(value).map_err(|_| {
+            Error::Other(format!(
+                "durable vector {name} exceeds this process's addressable range"
+            ))
+        })
+    }
+
+    fn checked_add(left: usize, right: usize, name: &str) -> Result<usize> {
+        left.checked_add(right).ok_or_else(|| {
+            Error::Other(format!(
+                "durable vector {name} exceeds this process's addressable range"
+            ))
+        })
+    }
+
+    fn tail_reservation(&self, count: usize) -> Result<(usize, usize)> {
+        let resident = HnswIndex::estimated_resident_bytes_with_m(
+            count,
+            self.dimension,
+            self.quantization,
+            self.layout.resolve_policy(self.live_rows, 1).hnsw_m,
+        );
+        let vector_values = count
+            .checked_mul(self.dimension)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                Error::Other(
+                    "durable vector tail values exceed this process's addressable range"
+                        .to_string(),
+                )
+            })?;
+        let entry_overhead = count
+            .checked_mul(std::mem::size_of::<VectorEntry>().saturating_add(256))
+            .ok_or_else(|| {
+                Error::Other(
+                    "durable vector tail entries exceed this process's addressable range"
+                        .to_string(),
+                )
+            })?;
+        // During construction the immutable journal values, the converted
+        // stored values, and the new graph coexist. This is an admission upper
+        // bound; the unused part is returned immediately after construction.
+        let workspace = Self::checked_add(vector_values, entry_overhead, "tail workspace")?;
+        let workspace = Self::checked_add(
+            workspace,
+            resident.checked_mul(2).ok_or_else(|| {
+                Error::Other(
+                    "durable vector tail build exceeds this process's addressable range"
+                        .to_string(),
+                )
+            })?,
+            "tail workspace",
+        )?;
+        let build_reservation = HnswIndex::estimated_build_reservation(
+            count,
+            self.dimension,
+            self.quantization,
+            self.layout.resolve_policy(self.live_rows, 1),
+        );
+        let workspace = workspace.max(build_reservation.saturating_sub(resident));
+        Ok((resident, workspace))
+    }
+
+    fn load_checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<()> {
+        if request(DormantVectorLoadRequest::Checkpoint) {
+            Ok(())
+        } else {
+            Err(Error::ReadCancelled)
+        }
+    }
+}
+
+impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
+    fn load(
+        &self,
+        generation: DormantVectorGraphGeneration,
+        caller_reserved_load_bytes: usize,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<LoadedVectorGraphGeneration> {
+        let mut resident_bytes =
+            Self::descriptor_usize(self.descriptor.resident_bytes, "resident byte declaration")?;
+        let graph_workspace =
+            Self::descriptor_usize(self.descriptor.durable_bytes, "graph decode workspace")?;
+        let known_load_reservation =
+            Self::checked_add(resident_bytes, graph_workspace, "known generation load")?;
+        if generation.identity.generation_id != self.descriptor.generation_id
+            || generation.identity.covered_tx != self.descriptor.covered_tx
+            || generation.identity.covered_lsn != self.descriptor.covered_lsn
+            || generation.resident_bytes != resident_bytes
+            || generation.load_bytes != known_load_reservation
+        {
+            return Err(Error::Other(
+                "durable vector loader received a descriptor other than the one it owns"
+                    .to_string(),
+            ));
+        }
+        if caller_reserved_load_bytes != 0 && caller_reserved_load_bytes != known_load_reservation {
+            return Err(Error::Other(
+                "durable vector caller reservation disagrees with graph load admission".to_string(),
+            ));
+        }
+
+        Self::load_checkpoint(request)?;
+        let record_workspace = self.source.record_bytes(
+            &self.partition,
+            self.base_generation_id,
+            (!self.is_base).then_some(self.descriptor.generation_id),
+        )?;
+        let tail_count = match self.tail_covered_lsn {
+            Some(covered_lsn) => self.source.tail_entry_count(
+                &self.partition.index,
+                &self.partition.partition_key,
+                covered_lsn,
+            )?,
+            None => 0,
+        };
+        Self::load_checkpoint(request)?;
+        let (tail_resident_reservation, tail_workspace) = if self.tail_covered_lsn.is_some() {
+            self.tail_reservation(tail_count)?
+        } else {
+            (0, 0)
+        };
+        let retained_reservation = Self::checked_add(
+            resident_bytes,
+            tail_resident_reservation,
+            "resident generation reservation",
+        )?;
+        let workspace_reservation = Self::checked_add(
+            graph_workspace.max(record_workspace.saturating_mul(2)),
+            tail_workspace,
+            "generation workspace reservation",
+        )?;
+        let mut total_reservation = Self::checked_add(
+            retained_reservation,
+            workspace_reservation,
+            "generation load reservation",
+        )?;
+        let caller_charged = caller_reserved_load_bytes != 0;
+        if caller_charged {
+            let additional = total_reservation
+                .checked_sub(caller_reserved_load_bytes)
+                .ok_or_else(|| {
+                    Error::Other(
+                        "durable vector caller reservation exceeds load admission".to_string(),
+                    )
+                })?;
+            if additional != 0 && !request(DormantVectorLoadRequest::Reserve(additional)) {
+                return Err(Error::ReadCancelled);
+            }
+        }
+        let mut loader_reservation = if caller_charged { 0 } else { total_reservation };
+        self.accountant.try_allocate_for(
+            loader_reservation,
+            "vector_index",
+            "load_durable_vector_generation",
+            "Evict another vector partition, reduce the selected scope, or raise MEMORY_LIMIT before loading this maintained route.",
+        )?;
+
+        let loaded = (|| -> Result<_> {
+            Self::load_checkpoint(request)?;
+            let graph_bytes = if self.is_base {
+                let record = self.source.load_base(
+                    &self.partition.index,
+                    &self.partition.partition_key,
+                    self.descriptor.generation_id,
+                )?;
+                if record.highest_included_tx != self.descriptor.covered_tx
+                    || record.highest_included_lsn != self.descriptor.covered_lsn
+                    || record.dimension as usize != self.dimension
+                    || record.quantization != self.quantization
+                    || record.algorithm_version != VECTOR_GRAPH_ALGORITHM_VERSION
+                    || record.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION
+                {
+                    return Err(Error::Other(
+                        "saved vector base disagrees with its catalog or column declaration"
+                            .to_string(),
+                    ));
+                }
+                record.graph.bytes
+            } else {
+                let record = self.source.load_change(
+                    &self.partition.index,
+                    &self.partition.partition_key,
+                    self.base_generation_id,
+                    self.descriptor.generation_id,
+                )?;
+                if record.covered_through_tx != self.descriptor.covered_tx
+                    || record.covered_through_lsn != self.descriptor.covered_lsn
+                    || record.dimension as usize != self.dimension
+                    || record.quantization != self.quantization
+                    || record.algorithm_version != VECTOR_GRAPH_ALGORITHM_VERSION
+                    || record.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION
+                {
+                    return Err(Error::Other(
+                        "saved vector change graph disagrees with its catalog or column declaration"
+                            .to_string(),
+                    ));
+                }
+                record.graph.bytes
+            };
+            Self::load_checkpoint(request)?;
+            if graph_bytes.len() != graph_workspace {
+                return Err(Error::Other(
+                    "saved vector graph length disagrees with its catalog".to_string(),
+                ));
+            }
+            #[cfg(feature = "test-seams")]
+            if contextdb_vector::test_seam::take_dormant_vector_decode_failure_for_test() {
+                return Err(Error::Other(
+                    "injected dormant vector decode failure".to_string(),
+                ));
+            }
+            Self::load_checkpoint(request)?;
+            let current_resident = HnswIndex::durable_resident_bound(
+                &graph_bytes,
+                self.dimension,
+                self.quantization,
+                generation.identity.hnsw_m as usize,
+            )?;
+            // The codec moves point values into the serving graph and consumes
+            // adjacency as it installs edges. Its encoded payload coexists with
+            // one graph, not a second graph with full neighbour capacity.
+            let decode_total = current_resident
+                .saturating_add(record_workspace.saturating_mul(2))
+                .saturating_add(tail_resident_reservation)
+                .saturating_add(tail_workspace);
+            let additional = decode_total.saturating_sub(total_reservation);
+            if additional != 0 {
+                if caller_charged {
+                    if !request(DormantVectorLoadRequest::Reserve(additional)) {
+                        return Err(Error::ReadCancelled);
+                    }
+                } else {
+                    self.accountant.try_allocate_for(additional, "vector_index", "load_durable_vector_generation", "Evict another vector partition or raise MEMORY_LIMIT before loading this maintained route.")?;
+                    loader_reservation = loader_reservation.saturating_add(additional);
+                }
+                total_reservation = total_reservation.saturating_add(additional);
+            }
+            resident_bytes = current_resident;
+            let graph = HnswIndex::decode_durable_generation(
+                &graph_bytes,
+                self.dimension,
+                self.quantization,
+            )?;
+            Self::load_checkpoint(request)?;
+            if graph.estimated_resident_bytes() != resident_bytes {
+                return Err(Error::Other(
+                    "saved vector graph residency disagrees with its catalog".to_string(),
+                ));
+            }
+
+            let fresh_tail = match self.tail_covered_lsn {
+                None => None,
+                Some(covered_lsn) => {
+                    Self::load_checkpoint(request)?;
+                    let (entries, replayed_through_lsn) = self.source.load_tail(
+                        &self.partition.index,
+                        &self.partition.partition_key,
+                        covered_lsn,
+                    )?;
+                    Self::load_checkpoint(request)?;
+                    if entries.len() > tail_count {
+                        return Err(Error::Other(
+                            "vector journal grew beyond its admitted replay bound".to_string(),
+                        ));
+                    }
+                    let graph = HnswIndex::from_vector_entries_with_progress(
+                        &entries,
+                        self.dimension,
+                        self.quantization,
+                        self.layout.resolve_policy(self.live_rows, 1),
+                        |done| {
+                            if request(DormantVectorLoadRequest::Progress {
+                                done,
+                                total: entries.len(),
+                            }) {
+                                Ok(())
+                            } else {
+                                Err(Error::ReadCancelled)
+                            }
+                        },
+                    )?;
+                    Self::load_checkpoint(request)?;
+                    let actual_resident = graph.estimated_resident_bytes();
+                    if actual_resident > tail_resident_reservation {
+                        return Err(Error::Other(
+                            "vector tail graph exceeded its admitted resident bound".to_string(),
+                        ));
+                    }
+                    Some((graph, actual_resident, replayed_through_lsn))
+                }
+            };
+            Ok((graph, fresh_tail))
+        })();
+
+        match loaded {
+            Err(error) => {
+                self.accountant.release(loader_reservation);
+                Err(error)
+            }
+            Ok((graph, fresh_tail)) => {
+                let actual_tail_resident =
+                    fresh_tail.as_ref().map(|(_, bytes, _)| *bytes).unwrap_or(0);
+                let retained = Self::checked_add(
+                    resident_bytes,
+                    actual_tail_resident,
+                    "loaded generation residency",
+                )
+                .inspect_err(|_| {
+                    self.accountant.release(loader_reservation);
+                })?;
+                Self::load_checkpoint(request).inspect_err(|_| {
+                    self.accountant.release(loader_reservation);
+                })?;
+                if caller_charged {
+                    match self.accountant.adopt_caller_reservation(retained) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.accountant.release(loader_reservation);
+                            return Err(Error::Other(
+                                "bounded vector load lost its caller reservation transfer"
+                                    .to_string(),
+                            ));
+                        }
+                        Err(error) => {
+                            self.accountant.release(loader_reservation);
+                            return Err(error);
+                        }
+                    }
+                }
+                if !caller_charged {
+                    self.accountant
+                        .release(total_reservation.saturating_sub(retained));
+                }
+                let fresh_tail = fresh_tail.map(|(graph, resident_bytes, replayed_through_lsn)| {
+                    LoadedVectorFreshTail {
+                        graph,
+                        resident_bytes,
+                        accountant: self.accountant.clone(),
+                        replayed_through_lsn,
+                    }
+                });
+                Ok(LoadedVectorGraphGeneration {
+                    graph,
+                    resident_bytes,
+                    accountant: self.accountant.clone(),
+                    fresh_tail,
+                })
+            }
+        }
+    }
+}
+
+fn durable_vector_generation_identity(
+    descriptor: VectorPartitionGenerationDescriptor,
+    layout: &VectorIndexLayout,
+    live_rows: usize,
+) -> Result<VectorGraphGeneration> {
+    let fallback = layout.resolve_policy(live_rows, 1);
+    let fallback_m = u32::try_from(fallback.hnsw_m)
+        .map_err(|_| Error::Other("resolved HNSW M exceeds the durable range".to_string()))?;
+    let fallback_ef_construction = u32::try_from(fallback.hnsw_ef_construction).map_err(|_| {
+        Error::Other("resolved HNSW EF_CONSTRUCTION exceeds the durable range".to_string())
+    })?;
+    Ok(VectorGraphGeneration {
+        generation_id: descriptor.generation_id,
+        covered_tx: descriptor.covered_tx,
+        covered_lsn: descriptor.covered_lsn,
+        durable_bytes: descriptor.durable_bytes,
+        policy_revision: if descriptor.policy_revision == 0 {
+            fallback.policy_revision
+        } else {
+            descriptor.policy_revision
+        },
+        hnsw_m: if descriptor.hnsw_m == 0 {
+            fallback_m
+        } else {
+            descriptor.hnsw_m
+        },
+        hnsw_ef_construction: if descriptor.hnsw_ef_construction == 0 {
+            fallback_ef_construction
+        } else {
+            descriptor.hnsw_ef_construction
+        },
+    })
+}
+
+fn register_dormant_vector_generations(
+    vector: &VectorStore,
+    persistence: &Arc<RedbPersistence>,
+    accountant: &Arc<MemoryAccountant>,
+) -> Result<()> {
+    let known_routes = vector_partition_routes(vector)?;
+    let loaded = persistence.inspect_vector_partition_generation_catalog(&known_routes)?;
+    register_loaded_dormant_vector_generations(
+        vector,
+        loaded,
+        DurableVectorGenerationSource::Writable(persistence.clone()),
+        accountant,
+        Some(persistence.as_ref()),
+    )
+}
+
+fn register_loaded_dormant_vector_generations(
+    vector: &VectorStore,
+    loaded: LoadedVectorPartitionGenerationCatalog,
+    source: DurableVectorGenerationSource,
+    accountant: &Arc<MemoryAccountant>,
+    journal_truncation_owner: Option<&RedbPersistence>,
+) -> Result<()> {
+    for (partition, reason) in loaded.quarantines {
+        vector.quarantine_partition_route(&partition, reason);
+    }
+    let catalogs = loaded.catalogs;
+    for catalog in catalogs {
+        let partition =
+            VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone());
+        let Ok(layout) = vector.index_layout(&catalog.index) else {
+            continue;
+        };
+        if vector.partition_is_historical_only(&catalog.index, &catalog.partition_key) {
+            // Historical raw values remain exact-readable, but a retired
+            // partition no longer owns an indexed route.
+            continue;
+        }
+        if vector
+            .partition_info(&catalog.index, &catalog.partition_key)
+            .is_none()
+        {
+            continue;
+        }
+        let live_rows = vector
+            .partition_info(&catalog.index, &catalog.partition_key)
+            .map(|info| info.live_rows)
+            .unwrap_or(0);
+        if catalog.base.generation_id == 0
+            || catalog.base.resident_bytes == 0
+            || catalog.base.durable_bytes == 0
+            || catalog.base.covered_tx.0 > catalog.published_tx.0
+            || catalog.base.covered_lsn.0 > catalog.published_lsn.0
+        {
+            vector.quarantine_partition_route(&partition, VectorRouteQuarantineReason::CorruptBase);
+            continue;
+        }
+        if catalog.change.is_some_and(|change| {
+            change.generation_id == 0
+                || change.resident_bytes == 0
+                || change.durable_bytes == 0
+                || change.covered_tx.0 < catalog.base.covered_tx.0
+                || change.covered_lsn.0 < catalog.base.covered_lsn.0
+                || change.covered_tx.0 > catalog.published_tx.0
+                || change.covered_lsn.0 > catalog.published_lsn.0
+        }) {
+            vector.quarantine_partition_route(
+                &partition,
+                VectorRouteQuarantineReason::CorruptChanges,
+            );
+            continue;
+        }
+
+        // Reopen is also a retry owner for T2. Only a validated catalog may
+        // witness covered deletion; quarantined bytes never authorize it.
+        if let Some(persistence) = journal_truncation_owner {
+            let mut cleanup_workspace = vector.reserve_workspace(
+                accountant.clone(),
+                0,
+                "truncate_vector_partition_journal",
+                "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before cleaning this maintained route.",
+            )?;
+            match persistence
+                .truncate_vector_partition_journal_through_catalog(&catalog, &mut cleanup_workspace)
+            {
+                Ok(_) => {}
+                Err(Error::StoreCorrupted { .. }) => {
+                    vector.quarantine_partition_route(
+                        &partition,
+                        VectorRouteQuarantineReason::CorruptChanges,
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let base_resident_bytes = DurableVectorGenerationLoader::descriptor_usize(
+            catalog.base.resident_bytes,
+            "base resident byte declaration",
+        )?;
+        let base_load_bytes = DurableVectorGenerationLoader::checked_add(
+            base_resident_bytes,
+            DurableVectorGenerationLoader::descriptor_usize(
+                catalog.base.durable_bytes,
+                "base durable byte declaration",
+            )?,
+            "base graph load admission",
+        )?;
+        let base_descriptor = DormantVectorGraphGeneration {
+            identity: durable_vector_generation_identity(catalog.base, &layout, live_rows)?,
+            resident_bytes: base_resident_bytes,
+            load_bytes: base_load_bytes,
+        };
+        let base_loader: Arc<dyn DormantVectorGraphLoader> =
+            Arc::new(DurableVectorGenerationLoader {
+                source: source.clone(),
+                accountant: accountant.clone(),
+                partition: partition.clone(),
+                descriptor: catalog.base,
+                base_generation_id: catalog.base.generation_id,
+                is_base: true,
+                dimension: layout.dimension,
+                quantization: layout.quantization,
+                layout: layout.clone(),
+                live_rows,
+                tail_covered_lsn: catalog.change.is_none().then_some(catalog.base.covered_lsn),
+            });
+        vector.register_dormant_partition_generation(
+            &partition,
+            true,
+            base_descriptor,
+            base_loader,
+        )?;
+
+        if let Some(change) = catalog.change {
+            let change_resident_bytes = DurableVectorGenerationLoader::descriptor_usize(
+                change.resident_bytes,
+                "change resident byte declaration",
+            )?;
+            let change_load_bytes = DurableVectorGenerationLoader::checked_add(
+                change_resident_bytes,
+                DurableVectorGenerationLoader::descriptor_usize(
+                    change.durable_bytes,
+                    "change durable byte declaration",
+                )?,
+                "change graph load admission",
+            )?;
+            let change_descriptor = DormantVectorGraphGeneration {
+                identity: durable_vector_generation_identity(change, &layout, live_rows)?,
+                resident_bytes: change_resident_bytes,
+                load_bytes: change_load_bytes,
+            };
+            let change_loader: Arc<dyn DormantVectorGraphLoader> =
+                Arc::new(DurableVectorGenerationLoader {
+                    source: source.clone(),
+                    accountant: accountant.clone(),
+                    partition: partition.clone(),
+                    descriptor: change,
+                    base_generation_id: catalog.base.generation_id,
+                    is_base: false,
+                    dimension: layout.dimension,
+                    quantization: layout.quantization,
+                    layout: layout.clone(),
+                    live_rows,
+                    tail_covered_lsn: Some(change.covered_lsn),
+                });
+            vector.register_dormant_partition_generation(
+                &partition,
+                false,
+                change_descriptor,
+                change_loader,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn vector_partition_routes(vector: &VectorStore) -> Result<Vec<VectorPartitionRef>> {
+    let mut routes = Vec::new();
+    for index in vector.index_layout_infos() {
+        routes.extend(
+            vector
+                .partition_infos(&index.index)?
+                .into_iter()
+                .map(|partition| partition.partition),
+        );
+    }
+    Ok(routes)
+}
+
+struct MetadataAuthorizedCandidates {
+    ids: Option<RoaringTreemap>,
+    _memory: crate::memory_accounting::OwnedMemoryReservation,
+}
+impl MetadataAuthorizedCandidates {
+    fn as_ref(&self) -> Option<&RoaringTreemap> {
+        self.ids.as_ref()
+    }
+}
+
+const VECTOR_GENERATION_PERSISTENCE_COPIES: usize = 6;
+
+#[derive(Debug, Clone, Copy)]
+struct VectorGenerationWorkspacePlan {
+    graph_build_bytes: usize,
+    raw_entry_bytes: usize,
+    prior_base_bytes: usize,
+    durable_metadata_bytes: usize,
+}
+
+impl VectorGenerationWorkspacePlan {
+    fn new(
+        input_count: usize,
+        layout: &VectorIndexLayout,
+        partition: &VectorPartitionRef,
+        policy: contextdb_vector::store::ResolvedVectorPolicy,
+        prior_base_bytes: usize,
+    ) -> Self {
+        let graph_build_bytes = HnswIndex::estimated_build_reservation(
+            input_count,
+            layout.dimension,
+            layout.quantization,
+            policy,
+        );
+        let raw_entry_bytes = input_count.saturating_mul(
+            std::mem::size_of::<VectorEntry>()
+                .saturating_add(layout.dimension.saturating_mul(4))
+                .saturating_add(partition.index.table.len())
+                .saturating_add(partition.index.column.len())
+                .saturating_add(128),
+        );
+        let durable_metadata_bytes = partition
+            .partition_key
+            .estimated_bytes()
+            .saturating_mul(4)
+            .saturating_add(
+                partition
+                    .index
+                    .table
+                    .len()
+                    .saturating_add(partition.index.column.len())
+                    .saturating_mul(4),
+            )
+            .saturating_add(4096);
+        Self {
+            graph_build_bytes,
+            raw_entry_bytes,
+            prior_base_bytes,
+            durable_metadata_bytes,
+        }
+    }
+
+    fn estimated_generation_bytes(self) -> usize {
+        self.graph_build_bytes
+            .saturating_add(self.prior_base_bytes)
+            .saturating_add(self.durable_metadata_bytes)
+    }
+
+    fn build_phase_bytes(self) -> usize {
+        // The caller's authoritative entries, its graph-input clone, the
+        // HNSW builder and one encoded envelope can coexist during encoding.
+        self.graph_build_bytes
+            .saturating_add(self.raw_entry_bytes.saturating_mul(2))
+            .saturating_add(self.estimated_generation_bytes())
+    }
+
+    fn persistence_phase_bytes(self, encoded_graph_capacity: usize) -> usize {
+        // Construction owners are gone here. Keep the authoritative entries
+        // plus the existing capacity/validation/persistence allowance, sized
+        // from the envelope that was actually built rather than its build
+        // workspace bound.
+        let durable_payload = encoded_graph_capacity
+            .saturating_add(self.prior_base_bytes)
+            .saturating_add(self.durable_metadata_bytes);
+        self.raw_entry_bytes
+            .saturating_add(durable_payload.saturating_mul(VECTOR_GENERATION_PERSISTENCE_COPIES))
+    }
+
+    #[cfg(test)]
+    fn former_combined_bytes(self) -> usize {
+        self.graph_build_bytes
+            .saturating_add(self.raw_entry_bytes.saturating_mul(4))
+            .saturating_add(
+                self.estimated_generation_bytes()
+                    .saturating_mul(VECTOR_GENERATION_PERSISTENCE_COPIES),
+            )
+    }
+}
+
 /// The engine-owned pieces one maintenance cycle needs, cloned out of the
 /// `Database` handle so the SAME cycle code runs whether a caller drives it
 /// synchronously (`Database::run_maintenance_cycle`) or the engine's own loop
 /// dispatches it on a tick.
 pub(crate) struct MaintenanceContext {
+    disk_limit: Arc<AtomicU64>,
+    resource_closed: Arc<AtomicBool>,
+    worker_stop: Option<Arc<AtomicBool>>,
     relational: Arc<RelationalStore>,
     graph: Arc<GraphStore>,
     vector: Arc<VectorStore>,
@@ -8628,9 +10809,296 @@ pub(crate) struct MaintenanceContext {
     last_maintenance_cycle_at: Arc<Mutex<Option<std::time::Instant>>>,
     last_auto_compact_at: Arc<Mutex<Option<std::time::Instant>>>,
     auto_compact_min_interval: Arc<Mutex<Duration>>,
+    /// Shared with the `Database` handle (same `Arc`) -- see that field's
+    /// doc comment.
+    #[cfg(feature = "test-seams")]
+    snapshot_free_retirement_pass_count: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct VectorPartitionPublicationOutcome {
+    published: bool,
+    cleanup_failure: Option<VectorMaintenanceFailureDetails>,
+}
+
+#[derive(Debug, Default)]
+struct VectorJournalCleanupRetryOutcome {
+    first_failure_details: Option<VectorMaintenanceFailureDetails>,
+    failed_partitions: HashSet<VectorPartitionRef>,
+}
+
+impl VectorPartitionPublicationOutcome {
+    fn published() -> Self {
+        Self {
+            published: true,
+            cleanup_failure: None,
+        }
+    }
+
+    fn published_with_cleanup_failure(error: &Error) -> Self {
+        Self {
+            published: true,
+            cleanup_failure: Some(
+                VectorMaintenanceFailureDetails::from_published_cleanup_error(error),
+            ),
+        }
+    }
 }
 
 impl MaintenanceContext {
+    fn retain_published_vector_cleanup_failure(
+        &self,
+        partition: &VectorPartitionRef,
+        error: &Error,
+    ) -> Result<VectorPartitionPublicationOutcome> {
+        let outcome = VectorPartitionPublicationOutcome::published_with_cleanup_failure(error);
+        let details = outcome
+            .cleanup_failure
+            .expect("a cleanup-failure outcome carries its retained detail");
+        self.vector
+            .record_partition_maintenance_failure_details(partition, details)?;
+        Ok(outcome)
+    }
+
+    fn build_checkpoint(&self) -> Result<()> {
+        if self.resource_closed.load(Ordering::SeqCst)
+            || self
+                .worker_stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            return Err(Error::ReadCancelled);
+        }
+        Ok(())
+    }
+
+    fn admit_generation_disk(&self, bytes: usize) -> Result<()> {
+        self.build_checkpoint()?;
+        let limit = self.disk_limit.load(Ordering::SeqCst);
+        let current_bytes = self.file_bytes().unwrap_or(0);
+        if limit == 0 || current_bytes.saturating_add(bytes as u64) <= limit {
+            return Ok(());
+        }
+        Err(Error::DiskBudgetExceeded {
+            operation: "prepare_vector_generation".into(),
+            current_bytes,
+            budget_limit_bytes: limit,
+            hint: "Reduce retained file-backed data or raise DISK_LIMIT before writing more data."
+                .into(),
+        })
+    }
+
+    fn retry_one_vector_journal_truncation(
+        &self,
+        persistence: &RedbPersistence,
+        catalog: &VectorPartitionGenerationCatalogRecord,
+        partition: &VectorPartitionRef,
+        partition_state_present: bool,
+    ) -> Result<()> {
+        let mut cleanup_workspace = self.vector.reserve_workspace(
+            self.accountant.clone(),
+            0,
+            "truncate_vector_partition_journal",
+            "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before cleaning this maintained route.",
+        )?;
+        match persistence
+            .truncate_vector_partition_journal_through_catalog(catalog, &mut cleanup_workspace)
+        {
+            Ok(_) => {}
+            Err(Error::StoreCorrupted { .. }) => {
+                self.vector.quarantine_partition_route(
+                    partition,
+                    VectorRouteQuarantineReason::CorruptChanges,
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        if !partition_state_present {
+            // The route was safely retired after its final live vector
+            // disappeared. Physical journal cleanup still runs, but must not
+            // recreate an empty partition merely because its catalog remains.
+            return Ok(());
+        }
+        let selected = catalog.change.unwrap_or(catalog.base).generation_id;
+        let installed = self
+            .vector
+            .partition_graph_generation_status(partition)
+            .is_some_and(|status| {
+                [
+                    status.base,
+                    status.change,
+                    status.dormant_base,
+                    status.dormant_change,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|generation| generation.generation_id == selected)
+            });
+        // A quarantined descriptor or body must be replaced from the
+        // authoritative raw vectors. Reinstalling the same catalog here
+        // would decode the damaged generation before repair can replace it.
+        if self.vector.partition_route_quarantine(partition).is_some() {
+            return Ok(());
+        }
+        if !installed {
+            self.install_published_vector_catalog(catalog)?;
+        }
+        Ok(())
+    }
+
+    fn retry_vector_journal_truncations(&self) -> Result<VectorJournalCleanupRetryOutcome> {
+        self.build_checkpoint()?;
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(VectorJournalCleanupRetryOutcome::default());
+        };
+        let loaded = persistence.inspect_vector_partition_generation_catalog(
+            &vector_partition_routes(self.vector.as_ref())?,
+        )?;
+        self.build_checkpoint()?;
+        let mut outcome = VectorJournalCleanupRetryOutcome::default();
+        for (partition, reason) in loaded.quarantines {
+            self.vector.quarantine_partition_route(&partition, reason);
+        }
+        for catalog in loaded.catalogs {
+            let partition =
+                VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone());
+            self.build_checkpoint()?;
+            let partition_state_present = self
+                .vector
+                .partition_info(&partition.index, &partition.partition_key)
+                .is_some();
+            let retry = self.retry_one_vector_journal_truncation(
+                persistence,
+                &catalog,
+                &partition,
+                partition_state_present,
+            );
+            self.build_checkpoint()?;
+            match retry {
+                Ok(()) => {}
+                Err(error @ Error::ReadCancelled) => return Err(error),
+                Err(error) => {
+                    let details =
+                        VectorMaintenanceFailureDetails::from_published_cleanup_error(&error);
+                    if partition_state_present {
+                        self.vector
+                            .record_partition_maintenance_failure_details(&partition, details)?;
+                    }
+                    outcome.failed_partitions.insert(partition);
+                    outcome.first_failure_details.get_or_insert(details);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn install_published_vector_catalog(
+        &self,
+        catalog: &VectorPartitionGenerationCatalogRecord,
+    ) -> Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let partition =
+            VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone());
+        let layout = self.vector.index_layout(&catalog.index)?;
+        let live_rows = self
+            .vector
+            .partition_info(&catalog.index, &catalog.partition_key)
+            .map(|info| info.live_rows)
+            .unwrap_or(0);
+        let base_resident_bytes = DurableVectorGenerationLoader::descriptor_usize(
+            catalog.base.resident_bytes,
+            "published base generation resident byte declaration",
+        )?;
+        let base_load_bytes = DurableVectorGenerationLoader::checked_add(
+            base_resident_bytes,
+            DurableVectorGenerationLoader::descriptor_usize(
+                catalog.base.durable_bytes,
+                "published base generation durable byte declaration",
+            )?,
+            "published base graph load admission",
+        )?;
+        let base_dormant = DormantVectorGraphGeneration {
+            identity: durable_vector_generation_identity(catalog.base, &layout, live_rows)?,
+            resident_bytes: base_resident_bytes,
+            load_bytes: base_load_bytes,
+        };
+        let base_loader: Arc<dyn DormantVectorGraphLoader> =
+            Arc::new(DurableVectorGenerationLoader {
+                source: DurableVectorGenerationSource::Writable(persistence.clone()),
+                accountant: self.accountant.clone(),
+                partition: partition.clone(),
+                descriptor: catalog.base,
+                base_generation_id: catalog.base.generation_id,
+                is_base: true,
+                dimension: layout.dimension,
+                quantization: layout.quantization,
+                layout: layout.clone(),
+                live_rows,
+                tail_covered_lsn: catalog.change.is_none().then_some(catalog.base.covered_lsn),
+            });
+        self.vector.register_dormant_partition_generation(
+            &partition,
+            true,
+            base_dormant,
+            base_loader,
+        )?;
+        if let Some(change) = catalog.change {
+            let change_resident_bytes = DurableVectorGenerationLoader::descriptor_usize(
+                change.resident_bytes,
+                "published change generation resident byte declaration",
+            )?;
+            let change_load_bytes = DurableVectorGenerationLoader::checked_add(
+                change_resident_bytes,
+                DurableVectorGenerationLoader::descriptor_usize(
+                    change.durable_bytes,
+                    "published change generation durable byte declaration",
+                )?,
+                "published change graph load admission",
+            )?;
+            let change_dormant = DormantVectorGraphGeneration {
+                identity: durable_vector_generation_identity(change, &layout, live_rows)?,
+                resident_bytes: change_resident_bytes,
+                load_bytes: change_load_bytes,
+            };
+            let change_loader: Arc<dyn DormantVectorGraphLoader> =
+                Arc::new(DurableVectorGenerationLoader {
+                    source: DurableVectorGenerationSource::Writable(persistence.clone()),
+                    accountant: self.accountant.clone(),
+                    partition: partition.clone(),
+                    descriptor: change,
+                    base_generation_id: catalog.base.generation_id,
+                    is_base: false,
+                    dimension: layout.dimension,
+                    quantization: layout.quantization,
+                    layout: layout.clone(),
+                    live_rows,
+                    tail_covered_lsn: Some(change.covered_lsn),
+                });
+            self.vector.register_dormant_partition_generation(
+                &partition,
+                false,
+                change_dormant,
+                change_loader,
+            )?;
+        }
+        if catalog.base.resident_bytes != 0 {
+            self.vector
+                .preload_dormant_partition_generation(&partition, true)?;
+        }
+        if catalog
+            .change
+            .is_some_and(|change| change.resident_bytes != 0)
+        {
+            self.vector
+                .preload_dormant_partition_generation(&partition, false)?;
+        }
+        self.vector.clear_partition_route_quarantine(&partition);
+        Ok(())
+    }
+
     fn file_bytes(&self) -> Option<u64> {
         self.persistence
             .as_ref()
@@ -8641,10 +11109,10 @@ impl MaintenanceContext {
     /// The optional, MUCH RARER automatic compaction path — see
     /// [`AUTO_COMPACT_MIN_INTERVAL`]'s own doc comment for why this exists
     /// separately from any scoped cleanup pass's own compact decision.
-    /// Fires at most once per configured interval, and only when the
-    /// fragmentation ratio is STILL at or above the shared threshold at the
-    /// moment this runs (sampled fresh here, after whatever this cycle's
-    /// own scoped passes already did) — never inside a commit lock, since
+    /// Starts a sweep only after the configured interval and fragmentation
+    /// threshold are satisfied. An active sweep advances one bounded durable
+    /// batch per cycle; completion starts the next interval. It runs outside
+    /// the commit lock, since
     /// this is called from `run_cycle` after both `run_pruning` and
     /// `run_currency` have already returned.
     fn maybe_auto_compact(&self) -> Result<CompactionReport> {
@@ -8656,18 +11124,26 @@ impl MaintenanceContext {
             .last_auto_compact_at
             .lock()
             .is_none_or(|at| at.elapsed() >= min_interval);
-        if !due {
+        let previous_sample = persistence.storage_compaction_fragmentation_ratio()?;
+        if !due && previous_sample.is_none() {
             return Ok(CompactionReport::default());
         }
-        let fragmentation_before = persistence.fragmentation_ratio().unwrap_or(0.0);
-        if fragmentation_before < REDB_COMPACT_FRAGMENTATION_THRESHOLD {
+        let fragmentation_before = match previous_sample {
+            Some(sample) => sample,
+            None => persistence.fragmentation_ratio()?,
+        };
+        if previous_sample.is_none() && fragmentation_before < REDB_COMPACT_FRAGMENTATION_THRESHOLD
+        {
             return Ok(CompactionReport::default());
         }
         let bytes_before = self.file_bytes();
         let start = Instant::now();
-        let handle_recycle_micros = persistence.compact()?;
+        let (progress, handle_recycle_micros) =
+            persistence.compact_incremental(self.accountant.clone(), fragmentation_before)?;
         let duration_micros = start.elapsed().as_micros() as u64;
-        *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
+        if progress.complete {
+            *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
+        }
         let bytes_after = self.file_bytes();
         Ok(CompactionReport {
             ran: true,
@@ -8676,8 +11152,8 @@ impl MaintenanceContext {
             bytes_after,
             file_shrank: matches!((bytes_before, bytes_after), (Some(b), Some(a)) if a < b),
             fragmentation_before,
-            handle_recycled: true,
-            handle_recycle_micros,
+            handle_recycled: handle_recycle_micros.is_some(),
+            handle_recycle_micros: handle_recycle_micros.unwrap_or(0),
         })
     }
 
@@ -8694,6 +11170,124 @@ impl MaintenanceContext {
             .read()
             .values()
             .any(|meta| meta.default_ttl_seconds.is_some())
+    }
+
+    fn stamp_expired_rows(&self, now: Wallclock) -> Result<()> {
+        let tx = self.tx_mgr.begin();
+        let workspace = std::cell::RefCell::new(
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone()),
+        );
+        let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
+            tx,
+            |expiry_lsn| {
+                let metadata_bytes = self
+                    .relational
+                    .table_meta
+                    .read()
+                    .values()
+                    .map(TableMeta::estimated_bytes)
+                    .sum::<usize>();
+                let row_bytes =
+                    self.relational
+                        .tables
+                        .read()
+                        .values()
+                        .flatten()
+                        .fold(0usize, |bytes, row| {
+                            bytes
+                                .saturating_add(row.estimated_bytes())
+                                .saturating_add(512)
+                        });
+                workspace.borrow_mut().try_grow_for(
+                    metadata_bytes.saturating_add(row_bytes),
+                    "retention",
+                    "prepare_expiry",
+                    "Raise MEMORY_LIMIT to admit the expiry transaction workspace.",
+                )?;
+                let metas = self.relational.table_meta.read().clone();
+                let tables = self.relational.tables.read().clone();
+                let watermark = self.sync_watermark.load(Ordering::SeqCst);
+                let candidates =
+                    retention_prune_candidates(&metas, &tables, now, watermark, &self.relational);
+                let protected = fk_protected_prune_candidates(&metas, &tables, &candidates);
+                self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
+                    let mut expired_nodes = HashSet::new();
+                    for (table, rows) in &tables {
+                        for row in rows {
+                            if row.deleted_tx.is_some()
+                                || !candidates.contains(&RetentionRowKey::new(
+                                    table,
+                                    row.row_id,
+                                    row.created_tx,
+                                ))
+                            {
+                                continue;
+                            }
+                            if prune_blocker_for_referenced_parent(
+                                table,
+                                row,
+                                &metas,
+                                &tables,
+                                &candidates,
+                                &protected,
+                            )
+                            .is_some()
+                            {
+                                continue;
+                            }
+                            ws.relational_deletes.push((table.clone(), row.row_id, tx));
+                            if let Some(Value::Uuid(id)) = row.values.get("id") {
+                                expired_nodes.insert(*id);
+                            }
+                            if let Some(meta) = metas.get(table) {
+                                for column in &meta.columns {
+                                    if matches!(column.column_type, ColumnType::Vector(_)) {
+                                        ws.vector_deletes.push((
+                                            VectorIndexRef::new(table, &column.name),
+                                            row.row_id,
+                                            tx,
+                                        ));
+                                    }
+                                }
+                            }
+                            let identity = (table.clone(), row.row_id, row.created_tx, expiry_lsn);
+                            ws.config_writes.push((
+                                crate::composite_store::retention_expiry_key(
+                                    table,
+                                    row.row_id,
+                                    row.created_tx,
+                                ),
+                                RedbPersistence::encode_config_value(&identity)?,
+                            ));
+                        }
+                    }
+                    for entry in self.graph.forward_adj.read().values().flatten() {
+                        if entry.deleted_tx.is_none()
+                            && (expired_nodes.contains(&entry.source)
+                                || expired_nodes.contains(&entry.target))
+                        {
+                            ws.adj_deletes.push((
+                                entry.source,
+                                entry.edge_type.clone(),
+                                entry.target,
+                                tx,
+                            ));
+                        }
+                    }
+                    Ok(())
+                })?
+            },
+            |_| Ok(()),
+        );
+        match result {
+            Ok(_) => Ok(()),
+            Err(failure) => {
+                // A failure before the manager takes the write set leaves the
+                // transaction active; both failure paths publish no expiry.
+                let _ = self.tx_mgr.rollback(tx);
+                Err(failure.error)
+            }
+        }
     }
 
     fn run_pruning(&self) -> Result<PruningReport> {
@@ -8718,8 +11312,10 @@ impl MaintenanceContext {
             .as_ref()
             .map(|persistence| persistence.fragmentation_ratio().unwrap_or(0.0))
             .unwrap_or(0.0);
+        let now = Wallclock::now();
+        self.stamp_expired_rows(now)?;
         let mut report = self.tx_mgr.with_commit_lock(|| {
-            checked_prune_expired_rows(self, self.sync_watermark.load(Ordering::SeqCst))
+            prune_expired_rows(self, self.sync_watermark.load(Ordering::SeqCst), now)
         })?;
         report.file_bytes_before = file_bytes_before;
         report.fragmentation_before = fragmentation_before;
@@ -8734,7 +11330,11 @@ impl MaintenanceContext {
             && let Some(persistence) = self.persistence.as_ref()
             && fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD
         {
-            persistence.compact()?;
+            let (progress, _) =
+                persistence.compact_incremental(self.accountant.clone(), fragmentation_before)?;
+            if progress.complete {
+                *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
+            }
             report.compacted = true;
         }
         report.file_bytes_after = self.file_bytes();
@@ -8763,9 +11363,10 @@ impl MaintenanceContext {
         tables
     }
 
-    /// The scoped cleanup pass ONLY — this never calls `persistence.compact()`
-    /// itself. A scoped, O(pruned) pass and an O(whole-file) compaction are
-    /// different-shaped costs; coupling them here made steady-state churn on
+    /// The scoped cleanup pass only; this never compacts the storage file.
+    /// Selection visits eligible row histories and their vector directories;
+    /// durable removal visits selected keys and affected change-log LSN groups.
+    /// Coupling this work to whole-file compaction made steady-state churn on
     /// a small file (where routine superseded-version debris is a large
     /// fraction of a small file) retrigger a full-file rewrite on every
     /// cycle, which is exactly the per-cycle-compaction cost the
@@ -8865,15 +11466,947 @@ impl MaintenanceContext {
         }
     }
 
+    /// Cheap pre-check for `retire_snapshot_free_vector_partitions`: whether
+    /// this maintenance cycle could retire or reclaim anything at all.
+    /// Conservative -- `true` whenever real work cannot be ruled out
+    /// cheaply -- so `false` is the only answer that may safely skip
+    /// beginning the guarded removal pass, and with it, parking every new
+    /// read for the pass's duration. Never takes the commit lock and never
+    /// begins a pass itself; the pass's own sampling (registered snapshots,
+    /// persisted catalog contents) remains exactly as before whenever it
+    /// does run.
+    fn vector_partition_retirement_is_possible(&self) -> bool {
+        self.vector.has_snapshot_free_retirement_candidate()
+            || self.vector.has_retired_graph_generations()
+            || (self.persistence.is_some()
+                && self.snapshot_registry.no_snapshots_currently_registered())
+    }
+
+    fn retire_snapshot_free_vector_partitions(&self) -> Result<usize> {
+        if !self.vector_partition_retirement_is_possible() {
+            return Ok(0);
+        }
+        self.tx_mgr.with_commit_lock(|| {
+            #[cfg(feature = "test-seams")]
+            self.snapshot_free_retirement_pass_count
+                .fetch_add(1, Ordering::SeqCst);
+            let watermark = self.tx_mgr.current_tx_max();
+            let active_removal_pass = self.snapshot_registry.begin_removal_pass(watermark);
+            let registered = active_removal_pass.registered_snapshots();
+            let mut retired = self
+                .vector
+                .retire_snapshot_free_partition_states(registered, self.accountant.as_ref());
+            for index in self.vector.index_layout_infos() {
+                for partition in self.vector.partition_infos(&index.index)? {
+                    retired = retired.saturating_add(
+                        self.vector
+                            .reclaim_snapshot_free_partition_graph_generations(
+                                &partition.partition,
+                                registered,
+                            ),
+                    );
+                }
+            }
+            if (registered.is_empty() || retired != 0)
+                && let Some(persistence) = self.persistence.as_ref()
+            {
+                let loaded = persistence.inspect_vector_partition_generation_catalog(
+                    &vector_partition_routes(self.vector.as_ref())?,
+                )?;
+                for catalog in loaded.catalogs {
+                    let partition = VectorPartitionRef::new(
+                        catalog.index.clone(),
+                        catalog.partition_key.clone(),
+                    );
+                    let retained = self.vector.retained_partition_chain_ids(&partition);
+                    let (count, _) = persistence
+                        .reclaim_superseded_vector_partition_generations(&catalog, &retained)?;
+                    retired = retired.saturating_add(count);
+                }
+            }
+            Ok(retired)
+        })
+    }
+
+    fn reclaim_snapshot_free_vector_graphs(&self) -> Result<usize> {
+        if !self.vector.has_retired_graph_generations() {
+            return Ok(0);
+        }
+        self.tx_mgr.with_commit_lock(|| {
+            let active_removal_pass = self
+                .snapshot_registry
+                .begin_removal_pass(self.tx_mgr.current_tx_max());
+            let mut reclaimed = 0usize;
+            for index in self.vector.index_layout_infos() {
+                for partition in self.vector.partition_infos(&index.index)? {
+                    let partition_reclaimed = self
+                        .vector
+                        .reclaim_snapshot_free_partition_graph_generations(
+                            &partition.partition,
+                            active_removal_pass.registered_snapshots(),
+                        );
+                    reclaimed = reclaimed.saturating_add(partition_reclaimed);
+                    if partition_reclaimed != 0
+                        && let Some(persistence) = self.persistence.as_ref()
+                        && let Some(catalog) = persistence
+                            .load_vector_partition_generation_catalog_for(
+                                &partition.partition.index,
+                                &partition.partition.partition_key,
+                            )?
+                    {
+                        let retained = self
+                            .vector
+                            .retained_partition_chain_ids(&partition.partition);
+                        let (count, _) = persistence
+                            .reclaim_superseded_vector_partition_generations(&catalog, &retained)?;
+                        reclaimed = reclaimed.saturating_add(count);
+                    }
+                }
+            }
+            Ok(reclaimed)
+        })
+    }
+
+    fn vector_partitions_requiring_build(&self) -> Result<Vec<VectorPartitionRef>> {
+        let mut candidates = Vec::new();
+        for index in self.vector.index_layout_infos() {
+            for partition in self.vector.partition_infos(&index.index)? {
+                let generation_status = self
+                    .vector
+                    .partition_graph_generation_status(&partition.partition);
+                let fresh_tail_entries = generation_status
+                    .map(|status| status.fresh_tail_entries)
+                    .unwrap_or(0);
+                let uncovered_journal = if self
+                    .vector
+                    .partition_route_quarantine(&partition.partition)
+                    .is_some()
+                {
+                    false
+                } else if let Some(persistence) = self.persistence.as_ref() {
+                    let covered_lsn = persistence
+                        .load_vector_partition_generation_catalog_for(
+                            &partition.partition.index,
+                            &partition.partition.partition_key,
+                        )?
+                        .map(|catalog| {
+                            catalog
+                                .change
+                                .map(|change| change.covered_lsn)
+                                .unwrap_or(catalog.base.covered_lsn)
+                        })
+                        .unwrap_or(Lsn(0));
+                    match persistence.vector_partition_has_uncovered_journal_records(
+                        &partition.partition.index,
+                        &partition.partition.partition_key,
+                        covered_lsn,
+                    ) {
+                        Ok(uncovered) => uncovered,
+                        Err(Error::StoreCorrupted { .. }) => {
+                            self.vector.quarantine_partition_route(
+                                &partition.partition,
+                                VectorRouteQuarantineReason::CorruptChanges,
+                            );
+                            false
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    false
+                };
+                if index.layout.maintenance_need(&partition).is_some()
+                    || (!partition.graph_available
+                        && (fresh_tail_entries != 0 || uncovered_journal))
+                {
+                    candidates.push(partition.partition);
+                }
+            }
+        }
+        if let Some(persistence) = self.persistence.as_ref() {
+            let loaded = persistence.inspect_vector_partition_generation_catalog(
+                &vector_partition_routes(self.vector.as_ref())?,
+            )?;
+            for catalog in loaded.catalogs {
+                let covered_lsn = catalog
+                    .change
+                    .map(|change| change.covered_lsn)
+                    .unwrap_or(catalog.base.covered_lsn);
+                if self
+                    .vector
+                    .partition_info(&catalog.index, &catalog.partition_key)
+                    .is_none()
+                    && match persistence.vector_partition_has_uncovered_journal_records(
+                        &catalog.index,
+                        &catalog.partition_key,
+                        covered_lsn,
+                    ) {
+                        Ok(uncovered) => uncovered,
+                        Err(Error::StoreCorrupted { .. }) => {
+                            let partition = VectorPartitionRef::new(
+                                catalog.index.clone(),
+                                catalog.partition_key.clone(),
+                            );
+                            self.vector.quarantine_partition_route(
+                                &partition,
+                                VectorRouteQuarantineReason::CorruptChanges,
+                            );
+                            true
+                        }
+                        Err(error) => return Err(error),
+                    }
+                {
+                    let partition = VectorPartitionRef::new(catalog.index, catalog.partition_key);
+                    if !candidates.contains(&partition) {
+                        candidates.push(partition);
+                    }
+                }
+            }
+        }
+        // Cold partitions are user-visible unavailable routes; advance them
+        // before consolidations and topology replacements on already-serving
+        // partitions. The candidate set is finite at this cycle's sample.
+        candidates.sort_by_key(|partition| {
+            self.vector
+                .partition_info(&partition.index, &partition.partition_key)
+                .is_none_or(|info| {
+                    info.base_generation.is_some()
+                        || info.serving_policy.is_some()
+                        || info.quarantine_reason.is_some()
+                })
+        });
+        Ok(candidates)
+    }
+
+    fn persist_built_vector_partition(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> Result<VectorPartitionPublicationOutcome> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(VectorPartitionPublicationOutcome::default());
+        };
+        loop {
+            let layout = self.vector.index_layout(&partition.index)?;
+            let live_vectors = self
+                .vector
+                .partition_info(&partition.index, &partition.partition_key)
+                .map(|info| info.live_rows)
+                .unwrap_or(0);
+            let policy = layout.resolve_policy(live_vectors, 1);
+            let topology_replacement = self
+                .vector
+                .partition_info(&partition.index, &partition.partition_key)
+                .is_some_and(|info| {
+                    info.graph_available
+                        && info.serving_policy.is_none_or(|serving| {
+                            serving.hnsw_m != policy.hnsw_m
+                                || serving.hnsw_ef_construction != policy.hnsw_ef_construction
+                        })
+                });
+            let _policy_build = self
+                .vector
+                .begin_partition_policy_build(partition, policy.policy_revision)?;
+            let quarantined = self.vector.partition_route_quarantine(partition).is_some();
+            let current = if quarantined {
+                None
+            } else {
+                persistence.load_vector_partition_generation_catalog_for(
+                    &partition.index,
+                    &partition.partition_key,
+                )?
+            };
+            let previous_generation = if quarantined {
+                match persistence.load_vector_partition_generation_catalog_for(
+                    &partition.index,
+                    &partition.partition_key,
+                ) {
+                    Ok(Some(catalog)) => catalog
+                        .change
+                        .map(|change| change.generation_id)
+                        .unwrap_or(catalog.base.generation_id)
+                        .max(catalog.base.generation_id),
+                    Ok(None) | Err(Error::StoreCorrupted { .. }) => persistence
+                        .highest_vector_partition_generation_id(
+                            &partition.index,
+                            &partition.partition_key,
+                        )?,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                current
+                    .as_ref()
+                    .map(|catalog| {
+                        catalog
+                            .change
+                            .map(|change| change.generation_id)
+                            .unwrap_or(catalog.base.generation_id)
+                            .max(catalog.base.generation_id)
+                    })
+                    .unwrap_or(0)
+            };
+            let generation_id = previous_generation.checked_add(1).ok_or_else(|| {
+                Error::Other(format!(
+                    "vector generation identity exhausted for {}.{}",
+                    partition.index.table, partition.index.column
+                ))
+            })?;
+            // One committed frontier owns the candidate. Later commits stay in
+            // the journal suffix and mutable tail; ordinary recording never
+            // invalidates a complete candidate for this earlier snapshot.
+            let (covered_tx, covered_lsn, input_count) = self.tx_mgr.with_commit_lock(|| {
+                let count = self
+                    .vector
+                    .partition_info(&partition.index, &partition.partition_key)
+                    .map_or(0, |info| info.live_rows.saturating_add(info.retained_rows));
+                (
+                    self.tx_mgr.current_tx_max(),
+                    self.tx_mgr.current_lsn(),
+                    count,
+                )
+            });
+            let input_count = input_count
+                .max(persistence.vector_partition_maintenance_entry_count(partition)?)
+                .max(2);
+            let base_bytes = current
+                .as_ref()
+                .map_or(0, |catalog| catalog.base.durable_bytes as usize);
+            let workspace_plan = VectorGenerationWorkspacePlan::new(
+                input_count,
+                &layout,
+                partition,
+                policy,
+                base_bytes,
+            );
+            let encoded_bound = workspace_plan.estimated_generation_bytes();
+            self.admit_generation_disk(encoded_bound.saturating_mul(2).saturating_add(64 * 1024))?;
+            let mut workspace = self.vector.reserve_workspace(
+                self.accountant.clone(),
+                workspace_plan.build_phase_bytes(),
+                "prepare_vector_generation",
+                "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before compacting this maintained route.",
+            )?;
+            let partition_state_present = self
+                .vector
+                .partition_graph_generation_status(partition)
+                .is_some();
+            let publish_change = current
+                .as_ref()
+                .is_some_and(|catalog| catalog.change.is_none())
+                && partition_state_present
+                && !topology_replacement;
+            let quarantine = self.vector.partition_route_quarantine(partition);
+            let phase = if quarantine.is_some() {
+                "repairing"
+            } else if current.is_none() || topology_replacement {
+                "building"
+            } else if publish_change {
+                "replaying"
+            } else {
+                "compacting"
+            };
+            let reason = quarantine.map(|reason| reason.as_str()).unwrap_or_else(|| {
+                if current.is_none() {
+                    "initial_build"
+                } else if self
+                    .vector
+                    .partition_info(&partition.index, &partition.partition_key)
+                    .is_some_and(|info| info.tombstones != 0)
+                {
+                    "tombstones"
+                } else {
+                    "new_changes"
+                }
+            });
+            let progress = self.vector.begin_partition_maintenance_progress(
+                partition,
+                reason,
+                live_vectors,
+                covered_tx,
+                phase,
+            )?;
+            self.build_checkpoint()?;
+            #[cfg(any(test, feature = "test-seams"))]
+            self.vector.maybe_pause_maintenance_preparation_for_test(
+                partition,
+                VectorMaintenancePreparationPhaseForTest::LoadAuthoritativeRawVectors,
+            );
+
+            let mut entries = if partition_state_present {
+                self.vector.entries_for_partition_at_snapshot(
+                    &partition.index,
+                    &partition.partition_key,
+                    SnapshotId(covered_tx.0),
+                )?
+            } else {
+                let memberships = persistence.load_vector_partition_memberships_for(
+                    &partition.index,
+                    &partition.partition_key,
+                )?;
+                persistence.load_vector_entries_for_memberships(&memberships, layout.dimension)?
+            };
+            entries.retain(|entry| entry.created_tx <= covered_tx);
+            for entry in &mut entries {
+                if entry.deleted_tx.is_some_and(|tx| tx > covered_tx) {
+                    entry.deleted_tx = None;
+                }
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            self.vector.maybe_pause_maintenance_preparation_for_test(
+                partition,
+                VectorMaintenancePreparationPhaseForTest::EncodeGraph,
+            );
+
+            let graph_entries = if publish_change {
+                let delta_graph_entries = entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.deleted_tx.is_none()
+                            && current.as_ref().is_none_or(|catalog| {
+                                catalog.change.is_some() || entry.lsn > catalog.base.covered_lsn
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if delta_graph_entries.is_empty() {
+                    // HNSW's durable codec cannot decode a graph with fewer
+                    // than two points. Tombstoned rows carry the delete-only
+                    // frontier while authoritative raw membership still
+                    // excludes every carrier from results.
+                    let covered_lsn = current
+                        .as_ref()
+                        .expect("change publication has one current base catalog")
+                        .base
+                        .covered_lsn;
+                    let mut carriers = persistence
+                        .load_vector_partition_uncovered_tombstone_entries(
+                            &partition.index,
+                            &partition.partition_key,
+                            covered_lsn,
+                            layout.dimension,
+                        )?
+                        .into_iter()
+                        .map(|mut entry| {
+                            entry.deleted_tx = None;
+                            entry
+                        })
+                        .collect::<Vec<_>>();
+                    if carriers.len() == 1 {
+                        let mut second = carriers[0].clone();
+                        if let Some(component) = second.vector.first_mut() {
+                            *component = if *component == 0.0 {
+                                f32::EPSILON
+                            } else {
+                                -*component
+                            };
+                        }
+                        carriers.push(second);
+                    }
+                    carriers
+                } else {
+                    delta_graph_entries
+                }
+            } else {
+                entries
+                    .iter()
+                    .filter(|entry| entry.deleted_tx.is_none())
+                    .cloned()
+                    .collect()
+            };
+            let progress = if graph_entries.len() != live_vectors {
+                drop(progress);
+                self.vector.begin_partition_maintenance_progress(
+                    partition,
+                    reason,
+                    graph_entries.len(),
+                    covered_tx,
+                    phase,
+                )?
+            } else {
+                progress
+            };
+            let graph = HnswIndex::from_vector_entries_with_progress(
+                &graph_entries,
+                layout.dimension,
+                layout.quantization,
+                policy,
+                |done| {
+                    self.build_checkpoint()?;
+                    progress.advance(done);
+                    self.build_checkpoint()
+                },
+            )?;
+            self.build_checkpoint()?;
+            // The builder owns its point values now; its input is not needed
+            // while the durable envelope is allocated.
+            drop(graph_entries);
+            let encoded_graph = graph.encode_durable_generation()?;
+            let resident_bytes = u64::try_from(graph.estimated_resident_bytes()).map_err(|_| {
+                Error::Other("vector generation residency exceeds the durable range".to_string())
+            })?;
+            let durable_bytes = u64::try_from(encoded_graph.len()).map_err(|_| {
+                Error::Other("vector generation bytes exceed the durable range".to_string())
+            })?;
+            let encoded_graph_capacity = encoded_graph.capacity();
+            let descriptor = VectorPartitionGenerationDescriptor {
+                generation_id,
+                covered_tx,
+                covered_lsn,
+                resident_bytes,
+                durable_bytes,
+                policy_revision: policy.policy_revision,
+                hnsw_m: u32::try_from(policy.hnsw_m).map_err(|_| {
+                    Error::Other("resolved HNSW M exceeds the durable range".to_string())
+                })?,
+                hnsw_ef_construction: u32::try_from(policy.hnsw_ef_construction).map_err(|_| {
+                    Error::Other(
+                        "resolved HNSW EF_CONSTRUCTION exceeds the durable range".to_string(),
+                    )
+                })?,
+            };
+            drop(graph);
+            self.build_checkpoint()?;
+            let candidate = if publish_change {
+                let catalog = current
+                    .as_ref()
+                    .expect("change publication has one current base catalog");
+                let base = persistence.load_vector_partition_base_generation(
+                    &partition.index,
+                    &partition.partition_key,
+                    catalog.base.generation_id,
+                )?;
+                let change = VectorPartitionChangeGenerationRecord {
+                    index: partition.index.clone(),
+                    partition_key: partition.partition_key.clone(),
+                    base_generation_id: catalog.base.generation_id,
+                    change_generation_id: generation_id,
+                    covered_through_tx: covered_tx,
+                    covered_through_lsn: covered_lsn,
+                    fresh_tail_from_tx: covered_tx,
+                    fresh_tail_from_lsn: covered_lsn,
+                    dimension: u32::try_from(layout.dimension).map_err(|_| {
+                        Error::Other(
+                            "vector dimension exceeds the durable generation range".to_string(),
+                        )
+                    })?,
+                    quantization: layout.quantization,
+                    algorithm_version: VECTOR_GRAPH_ALGORITHM_VERSION,
+                    graph_format_version: VECTOR_GRAPH_FORMAT_VERSION,
+                    graph: VectorPartitionGraphBytes::verified(encoded_graph),
+                };
+                VectorPartitionGenerationCandidate {
+                    base,
+                    change: Some(change),
+                    catalog: VectorPartitionGenerationCatalogRecord {
+                        index: partition.index.clone(),
+                        partition_key: partition.partition_key.clone(),
+                        base: catalog.base,
+                        change: Some(descriptor),
+                        published_tx: covered_tx,
+                        published_lsn: covered_lsn,
+                    },
+                }
+            } else {
+                let mut live_entries = entries
+                    .iter()
+                    .filter(|entry| entry.deleted_tx.is_none())
+                    .collect::<Vec<_>>();
+                live_entries.sort_by_key(|entry| (entry.row_id, entry.created_tx, entry.lsn));
+                #[cfg(any(test, feature = "test-seams"))]
+                self.vector.maybe_pause_maintenance_preparation_for_test(
+                    partition,
+                    VectorMaintenancePreparationPhaseForTest::HashStateDigest,
+                );
+                let state_bytes =
+                    bincode::serde::encode_to_vec(&live_entries, bincode::config::standard())
+                        .map_err(|error| {
+                            Error::Other(format!(
+                                "could not encode vector generation state digest: {error}"
+                            ))
+                        })?;
+                let base = VectorPartitionBaseGenerationRecord {
+                    index: partition.index.clone(),
+                    partition_key: partition.partition_key.clone(),
+                    generation_id,
+                    base_tx: covered_tx,
+                    base_lsn: covered_lsn,
+                    highest_included_tx: covered_tx,
+                    highest_included_lsn: covered_lsn,
+                    dimension: u32::try_from(layout.dimension).map_err(|_| {
+                        Error::Other(
+                            "vector dimension exceeds the durable generation range".to_string(),
+                        )
+                    })?,
+                    quantization: layout.quantization,
+                    algorithm_version: VECTOR_GRAPH_ALGORITHM_VERSION,
+                    graph_format_version: VECTOR_GRAPH_FORMAT_VERSION,
+                    graph: VectorPartitionGraphBytes::verified(encoded_graph),
+                    state_digest: *blake3::hash(&state_bytes).as_bytes(),
+                };
+                VectorPartitionGenerationCandidate {
+                    base,
+                    change: None,
+                    catalog: VectorPartitionGenerationCatalogRecord {
+                        index: partition.index.clone(),
+                        partition_key: partition.partition_key.clone(),
+                        base: descriptor,
+                        change: None,
+                        published_tx: covered_tx,
+                        published_lsn: covered_lsn,
+                    },
+                }
+            };
+            workspace.resize(
+                workspace_plan.persistence_phase_bytes(encoded_graph_capacity),
+                "prepare_vector_generation",
+                "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before compacting this maintained route.",
+            )?;
+            #[cfg(any(test, feature = "test-seams"))]
+            self.vector.maybe_pause_maintenance_preparation_for_test(
+                partition,
+                VectorMaintenancePreparationPhaseForTest::PrepareDurableGeneration,
+            );
+            drop(entries);
+            self.build_checkpoint()?;
+            let prepared = persistence.prepare_vector_partition_generation_candidate(&candidate)?;
+            self.admit_generation_disk(prepared.write_reservation_bytes())?;
+
+            #[cfg(any(test, feature = "test-seams"))]
+            self.vector.maybe_pause_memory_workspace_for_test();
+            #[cfg(any(test, feature = "test-seams"))]
+            if take_vector_memory_fault(
+                &VECTOR_DURABLE_COMPACTION_FAILURE_ARMED,
+                &VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED,
+            ) {
+                return Err(Error::Other(
+                    "injected vector compaction prepublication failure".to_string(),
+                ));
+            }
+
+            let published = self.tx_mgr.with_commit_lock(|| {
+                self.vector.with_partition_generation_publication(
+                    partition,
+                    || -> contextdb_core::Result<bool> {
+                        let current_layout = self.vector.index_layout(&partition.index)?;
+                        if current_layout.policy_revision != layout.policy_revision
+                            || current_layout.hnsw_m != layout.hnsw_m
+                            || current_layout.hnsw_ef_construction != layout.hnsw_ef_construction
+                        {
+                            return Ok(false);
+                        }
+                        let durable_generation = if quarantined {
+                            match persistence.load_vector_partition_generation_catalog_for(
+                                &partition.index,
+                                &partition.partition_key,
+                            ) {
+                                Ok(Some(catalog)) => catalog
+                                    .change
+                                    .map(|change| change.generation_id)
+                                    .unwrap_or(catalog.base.generation_id)
+                                    .max(catalog.base.generation_id),
+                                Ok(None) | Err(Error::StoreCorrupted { .. }) => persistence
+                                    .highest_vector_partition_generation_id(
+                                        &partition.index,
+                                        &partition.partition_key,
+                                    )?,
+                                Err(error) => return Err(error),
+                            }
+                        } else {
+                            persistence
+                                .load_vector_partition_generation_catalog_for(
+                                    &partition.index,
+                                    &partition.partition_key,
+                                )?
+                                .as_ref()
+                                .map(|catalog| {
+                                    catalog
+                                        .change
+                                        .map(|change| change.generation_id)
+                                        .unwrap_or(catalog.base.generation_id)
+                                        .max(catalog.base.generation_id)
+                                })
+                                .unwrap_or(0)
+                        };
+                        if durable_generation != previous_generation {
+                            return Ok(false);
+                        }
+                        self.admit_generation_disk(prepared.write_reservation_bytes())?;
+                        persistence
+                            .publish_prepared_vector_partition_generation_candidate(&prepared)?;
+                        #[cfg(feature = "test-seams")]
+                        if partition_state_present {
+                            self.vector.observe_durable_base_publication(
+                                partition,
+                                candidate.catalog.base.generation_id,
+                                candidate.catalog.base.covered_tx,
+                            )?;
+                        }
+                        Ok(true)
+                    },
+                )
+            })?;
+            if !published {
+                let current_layout = self.vector.index_layout(&partition.index)?;
+                if current_layout.policy_revision != layout.policy_revision
+                    || current_layout.hnsw_m != layout.hnsw_m
+                    || current_layout.hnsw_ef_construction != layout.hnsw_ef_construction
+                {
+                    // A topology declaration made this candidate stale. One
+                    // maintenance cycle owns one sampled revision; the next
+                    // cycle builds the replacement the newer declaration asks
+                    // for while the old complete graph keeps serving.
+                    return Ok(VectorPartitionPublicationOutcome::default());
+                }
+                continue;
+            }
+            #[cfg(any(test, feature = "test-seams"))]
+            if self.vector.take_journal_truncation_fault_for_test(
+                partition,
+                VectorJournalTruncationPhaseForTest::CatalogDurableBeforeCoveredJournalDelete,
+            ) {
+                let error = Error::Other(
+                    "vector journal truncation crash injected after durable catalog T1".to_string(),
+                );
+                return self.retain_published_vector_cleanup_failure(partition, &error);
+            }
+
+            let (published_catalog, cleanup_complete) = if quarantined {
+                let cleanup = self.tx_mgr.with_commit_lock(|| -> Result<_> {
+                    let persistence_phase_owned =
+                        workspace_plan.persistence_phase_bytes(encoded_graph_capacity);
+                    // Count, admit, and capture the registered snapshot sample
+                    // under the registry's one atomic registration/removal
+                    // lock. During Vec-to-Arc conversion both allocations are
+                    // charged before either is constructed.
+                    let (active_removal_pass, snapshot_guard_owned) = self
+                        .snapshot_registry
+                        .begin_removal_pass_with_sample_admission(
+                            self.tx_mgr.current_tx_max(),
+                            |sample_transition_bound| {
+                                workspace.resize(
+                                    persistence_phase_owned
+                                        .saturating_add(sample_transition_bound),
+                                    "finalize_repaired_vector_partition",
+                                    "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before repairing this maintained route.",
+                                )
+                            },
+                        )?;
+                    let snapshot_count = active_removal_pass.registered_snapshots().len();
+                    // `snapshot_retained_partition_chain_ids` temporarily
+                    // builds a HashSet and returns a Vec with at most one
+                    // chain per sampled snapshot. Grow before that allocation;
+                    // the finalizer replaces this conservative capture bound
+                    // with reported surviving capacities.
+                    let repair_capture_bound = snapshot_count
+                        .saturating_mul(
+                            std::mem::size_of::<(u64, Option<u64>)>()
+                                .saturating_mul(4)
+                                .saturating_add(std::mem::size_of::<SnapshotId>()),
+                        )
+                        .saturating_add(snapshot_guard_owned)
+                        .saturating_add(4096);
+                    workspace.resize(
+                        persistence_phase_owned.saturating_add(repair_capture_bound),
+                        "finalize_repaired_vector_partition",
+                        "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before repairing this maintained route.",
+                    )?;
+                    let retained_chains = self.vector.snapshot_retained_partition_chain_ids(
+                        partition,
+                        active_removal_pass.registered_snapshots(),
+                    );
+                    let repair_context_owned = retained_chains
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(u64, Option<u64>)>())
+                        .saturating_add(snapshot_guard_owned);
+
+                    // Publication owns durable copies now. Repair needs only
+                    // the catalog, not two more encoded graph buffers. The
+                    // finalizer immediately replaces this persistence-phase
+                    // reservation with its admitted cleanup ownership.
+                    let VectorPartitionGenerationCandidate {
+                        base,
+                        change,
+                        catalog: published_catalog,
+                    } = candidate;
+                    drop(base);
+                    drop(change);
+                    drop(prepared);
+                    let (finalized, catalog_owned) =
+                        persistence.finalize_repaired_vector_partition(
+                            &published_catalog,
+                            &retained_chains,
+                            repair_context_owned,
+                            &mut workspace,
+                        )?;
+                    drop(active_removal_pass);
+                    drop(retained_chains);
+                    workspace.resize(
+                        catalog_owned,
+                        "finalize_repaired_vector_partition",
+                        "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before repairing this maintained route.",
+                    )?;
+                    Ok((published_catalog, finalized))
+                });
+                match cleanup {
+                    Ok(cleanup) => cleanup,
+                    Err(error @ Error::ReadCancelled) => return Err(error),
+                    Err(error) => {
+                        return self.retain_published_vector_cleanup_failure(partition, &error);
+                    }
+                }
+            } else {
+                // Normal T2 likewise needs only the surviving catalog. Its
+                // first action replaces the graph-buffer reservation before
+                // allocating cleanup keys or decoded validation records.
+                let VectorPartitionGenerationCandidate {
+                    base,
+                    change,
+                    catalog: published_catalog,
+                } = candidate;
+                drop(base);
+                drop(change);
+                drop(prepared);
+                let truncated = match persistence.truncate_vector_partition_journal_through_catalog(
+                    &published_catalog,
+                    &mut workspace,
+                ) {
+                    Ok(truncated) => truncated,
+                    Err(error @ Error::ReadCancelled) => return Err(error),
+                    Err(error) => {
+                        return self.retain_published_vector_cleanup_failure(partition, &error);
+                    }
+                };
+                (published_catalog, truncated)
+            };
+            if !cleanup_complete {
+                if quarantined {
+                    drop(published_catalog);
+                    drop(workspace);
+                    return Ok(VectorPartitionPublicationOutcome::published());
+                }
+                drop(published_catalog);
+                drop(workspace);
+                let cleanup_retry = self.retry_vector_journal_truncations()?;
+                return Ok(VectorPartitionPublicationOutcome {
+                    published: true,
+                    cleanup_failure: cleanup_retry.first_failure_details,
+                });
+            }
+            if partition_state_present {
+                self.install_published_vector_catalog(&published_catalog)?;
+            }
+            drop(published_catalog);
+            drop(workspace);
+            return Ok(VectorPartitionPublicationOutcome::published());
+        }
+    }
+
     fn run_cycle(&self, gate: CurrencyGate) -> Result<MaintenanceReport> {
+        // Release obsolete graphs before another partition allocates its
+        // replacement. Pending route/journal work still forbids retiring the
+        // route itself; the snapshot guard independently protects old graphs.
+        self.reclaim_snapshot_free_vector_graphs()?;
+        // Idempotent T2 retry never clears or rebuilds a healthy route. Newer
+        // journal suffix records remain outside each catalog's covered LSN. A
+        // local retry refusal is retained in the report while the rest of the
+        // fixed cycle continues.
+        let VectorJournalCleanupRetryOutcome {
+            first_failure_details: cleanup_retry_failure,
+            failed_partitions: cleanup_retry_failed_partitions,
+        } = self.retry_vector_journal_truncations()?;
         let pruning = self.run_pruning()?;
         let pruned_trigger_audit_rows = self.run_trigger_audit_retention()?;
         let currency = self.run_currency(gate)?;
+        let pending_vector_partitions = self
+            .persistence
+            .as_ref()
+            .map(|_| self.vector_partitions_requiring_build())
+            .transpose()?
+            .unwrap_or_default();
+        let vector = if !pending_vector_partitions.is_empty() {
+            // File-backed construction publishes through the durable catalog
+            // first. Building a separate process-only graph here let the
+            // writer call the route ready while a reader of the same
+            // committed store still saw `initial_build`.
+            let mut built_partitions = 0usize;
+            let mut built_indexes = HashSet::new();
+            let mut first_failure_details = cleanup_retry_failure;
+            for partition in &pending_vector_partitions {
+                if cleanup_retry_failed_partitions.contains(partition) {
+                    continue;
+                }
+                let outcome = match self.persist_built_vector_partition(partition) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if matches!(error, Error::ReadCancelled) {
+                            return Err(error);
+                        }
+                        self.vector
+                            .record_partition_maintenance_error(partition, &error)?;
+                        first_failure_details.get_or_insert_with(|| {
+                            VectorMaintenanceFailureDetails::from_error(&error)
+                        });
+                        continue;
+                    }
+                };
+                if let Some(failure) = outcome.cleanup_failure {
+                    first_failure_details.get_or_insert(failure);
+                }
+                // A repair can make its replacement catalog durable while the
+                // worker is being stopped. Keep that publication authoritative,
+                // but observe the stop before counting success or beginning any
+                // later reclamation, retirement, compaction, or cycle stamping.
+                self.build_checkpoint()?;
+                if !outcome.published {
+                    continue;
+                }
+                built_partitions = built_partitions.saturating_add(1);
+                built_indexes.insert(partition.index.clone());
+                self.reclaim_snapshot_free_vector_graphs()?;
+            }
+            let mut report = self.vector.hnsw_maintenance_status();
+            report.built_partitions = built_partitions;
+            report.built_indexes = built_indexes.len();
+            report.first_failure = first_failure_details.map(|details| details.failure);
+            report.first_failure_details = first_failure_details;
+            report
+        } else if self.persistence.is_some() {
+            let mut report = self.vector.hnsw_maintenance_status();
+            let first_failure_details = cleanup_retry_failure.or(report.first_failure_details);
+            report.first_failure = first_failure_details.map(|details| details.failure);
+            report.first_failure_details = first_failure_details;
+            report
+        } else {
+            self.vector
+                .run_hnsw_maintenance_cycle_with(self.accountant.clone(), &mut || {
+                    self.build_checkpoint()
+                })?
+        };
+        // A replacement first publishes the prior graph as a retired snapshot
+        // chain. Reclaim only after publication, under the registry's removal
+        // guard, so active readers keep that route and unselected generations
+        // do not linger until another maintenance wake.
+        self.reclaim_snapshot_free_vector_graphs()?;
+        // Retirement is independent of whether another partition had work,
+        // but follows this wake's durable generation publications. That lets
+        // a delete-only route first represent and truncate its final journal
+        // prefix, then releases it even while a sibling keeps producing work.
+        let _retired_vector_partitions = self.retire_snapshot_free_vector_partitions()?;
         // The rare, interval-gated automatic compaction path -- see
         // `maybe_auto_compact`'s own doc comment. Runs LAST, after every
         // scoped pass this cycle already did its own work, and (like every
         // compact call) outside any commit lock.
-        let compaction = self.maybe_auto_compact()?;
+        let compaction = match self.maybe_auto_compact() {
+            Ok(report) => report,
+            Err(Error::MemoryBudgetExceeded { .. } | Error::DiskBudgetExceeded { .. })
+                if vector.first_failure.is_some() =>
+            {
+                // The cycle already exposes the first partition-local
+                // resource refusal. An opportunistic closing compaction uses
+                // the same exhausted limit; attempting it must not erase the
+                // successful vector counts or prevent the closing stamp.
+                CompactionReport::default()
+            }
+            Err(error) => return Err(error),
+        };
         // Recorded whether this cycle reclaimed anything or not -- a caller
         // that dutifully drives an empty cycle is still driving, and must
         // never trip the caller-driven backlog warning.
@@ -8881,6 +12414,7 @@ impl MaintenanceContext {
         Ok(MaintenanceReport {
             pruning,
             currency,
+            vector,
             pruned_trigger_audit_rows,
             compaction,
         })
@@ -8894,6 +12428,9 @@ fn log_maintenance_cycle(report: &MaintenanceReport) {
         && report.currency.pruned_versions == 0
         && report.pruned_trigger_audit_rows == 0
         && report.pruning.future_dated_rows == 0
+        && report.vector.built_indexes == 0
+        && report.vector.built_partitions == 0
+        && report.vector.first_failure.is_none()
         && !report.compaction.ran
     {
         return;
@@ -8902,7 +12439,10 @@ fn log_maintenance_cycle(report: &MaintenanceReport) {
         "maintenance_cycle pruned_rows={} reclaimed_bytes={} compacted={} file_shrank={} \
          future_dated_rows={} future_dated_tables={} trigger_audit_rows={} \
          currency_versions={} currency_redb_compacted={} auto_compact_ran={} \
-         auto_compact_micros={}",
+         auto_compact_micros={} vector_nonempty_indexes={} vector_ready_indexes={} \
+         vector_built_indexes={} vector_remaining_indexes={} \
+         vector_nonempty_partitions={} vector_ready_partitions={} \
+         vector_built_partitions={} vector_remaining_partitions={} vector_first_failure={}",
         report.pruning.pruned_rows,
         report.pruning.reclaimed_bytes,
         report.pruning.compacted,
@@ -8914,6 +12454,18 @@ fn log_maintenance_cycle(report: &MaintenanceReport) {
         report.currency.redb_compacted,
         report.compaction.ran,
         report.compaction.duration_micros,
+        report.vector.nonempty_indexes,
+        report.vector.ready_indexes,
+        report.vector.built_indexes,
+        report.vector.remaining_indexes,
+        report.vector.nonempty_partitions,
+        report.vector.ready_partitions,
+        report.vector.built_partitions,
+        report.vector.remaining_partitions,
+        report
+            .vector
+            .first_failure
+            .map_or("none", VectorMaintenanceFailure::reason),
     );
 }
 
@@ -8949,10 +12501,9 @@ thread_local! {
 
     /// Test-only injection seam, same shape as
     /// [`RETENTION_PEER_PERSIST_FAULT`]: when armed, the NEXT version-cleanup
-    /// pass on this thread fails immediately before its persisted rewrite,
-    /// after the in-memory change log has already been filtered -- so a test
-    /// can assert whether that ordering leaves memory ahead of disk on a
-    /// failed cycle. Armed only by
+    /// pass on this thread fails immediately before durable removal and before
+    /// memory publication, so a test can assert that a failed cycle retains
+    /// the complete removal set for retry. Armed only by
     /// `Database::__arm_currency_compaction_persist_fault_for_test`; default
     /// off, so production reads a thread-local that is never set.
     static CURRENCY_COMPACTION_PERSIST_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -9044,21 +12595,17 @@ fn maybe_pause_before_query_trace_rows_examined_capture_for_test() {
 /// rare, not per-cycle.
 pub const REDB_COMPACT_FRAGMENTATION_THRESHOLD: f64 = 0.5;
 
-/// Everything one operator-visible redb compaction produced: how long the
-/// full-file rewrite took, the file's size before and after, whether it
+/// Everything one storage-compaction call produced: how long its work took, the file's size before and after, whether it
 /// actually shrank, and the fragmentation ratio that led to it. `ran=false`
 /// (every other field at its zero value) means nothing happened this call —
 /// either there is no file to compact (an in-memory database) or, for the
 /// gated automatic path (see [`AUTO_COMPACT_MIN_INTERVAL`]), the threshold
-/// and the minimum interval were not BOTH satisfied.
+/// and the minimum interval were not both satisfied and no sweep was active.
 ///
-/// Compaction is O(whole file) — it rewrites every live page, unlike the
-/// O(pruned) scoped cleanup passes ([`CurrencyCompactionReport`],
-/// [`PruningReport`]) that free the pages compaction later reclaims. The
-/// two are DELIBERATELY separate operations reported through separate
-/// receipts: a scoped cleanup pass never blocks on a full-file rewrite, and
-/// an operator asking "did compaction run, and what did it cost" reads
-/// this report, not a cleanup pass's.
+/// Explicit compaction drains the whole file. Automatic compaction advances
+/// bounded durable batches and releases foreground access between them. Both
+/// remain separate from the scoped cleanup passes ([`CurrencyCompactionReport`],
+/// [`PruningReport`]) that free the pages they reclaim.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactionReport {
     pub ran: bool,
@@ -9073,8 +12620,8 @@ pub struct CompactionReport {
     /// file-level compact alone does not release the in-process
     /// allocator/region bookkeeping redb retains from a database's
     /// historical peak size, so it does not by itself restore steady-state
-    /// write cost, only file size. `false` only when compaction did not run
-    /// at all (`ran == false`).
+    /// write cost, only file size. Automatic batches keep the handle until
+    /// their sweep completes; intermediate batches therefore report `false`.
     pub handle_recycled: bool,
     /// The recycle's own duration in microseconds, reported separately from
     /// `duration_micros` (which covers the whole compaction, recycle
@@ -9118,6 +12665,7 @@ pub(crate) const TRIGGER_AUDIT_RETENTION: Duration = Duration::from_secs(7 * 24 
 /// [`CURRENCY_COMPACTION_SUPERSEDED_THRESHOLD`], so a quiet node does near-zero
 /// work, and only a tick that actually did something prints a receipt line.
 pub(crate) const MAINTENANCE_TICK: Duration = Duration::from_secs(60);
+const MAINTENANCE_POLL_INTERVAL_CONFIG_KEY: &str = "maintenance_poll_interval_ms";
 
 /// A maintenance tick compacts only once superseded versions across the eligible
 /// tables reach this count, so steady-state churn below it never pays the
@@ -9133,42 +12681,20 @@ pub struct CurrencyCompactionReport {
     pub pruned_change_log_entries: u64,
     /// Estimated in-memory row bytes released by the pruned versions.
     pub reclaimed_bytes: u64,
-    /// The eligible tables that actually had superseded versions pruned.
+    /// The eligible tables that actually had superseded versions pruned, or
+    /// a deleted row's vector copy reclaimed.
     pub compacted_tables: Vec<String>,
     /// Whether a redb file compaction ran to reclaim the freed pages.
     pub redb_compacted: bool,
-    /// Every SURVIVOR key this pass rewrote to disk that it did not need to
-    /// touch: every vector, every physical adjacency-table write (each edge
-    /// writes BOTH the forward and reverse redb tables, so this counts 2 per
-    /// edge -- see `edge_keys_rewritten`), and every surviving relational
-    /// row / change-log entry of a compacted table -- `all_vectors.len() +
-    /// (2 * all_edges.len()) + (surviving rows of the compacted tables) +
-    /// surviving_change_log.len()`, counted where `compact_currency_versions_
-    /// inner` already holds those populations, so this is pure counting of
-    /// existing work, never a behavior change. A scoped, point-removal pass
-    /// touches ONLY the pruned keys, so this reads 0 once that lands; today
-    /// it reads the size of the whole compacted neighborhood on every pass
-    /// (`rewrite_pruned_state`/`rewrite_change_log` rewrite wholesale).
+    /// Wholesale survivor rewrites. Scoped cleanup leaves this at zero;
+    /// it is not a count of all I/O. Affected change-log LSN groups are still
+    /// read and densely rewritten when selected references are removed.
     pub keys_rewritten: u64,
-    /// The vector-population component of `keys_rewritten`: every
-    /// vector-store entry in the WHOLE database this pass rewrote to disk,
-    /// whether or not any compacted table itself carries a vector column.
-    /// Broken out because a proportionality claim about vectors specifically
-    /// needs its own number -- a scoped pass reads 0 here whenever none of
-    /// the compacted tables carry a vector column, and a nonzero count here
-    /// for a compacted table that does not itself hold vectors is exactly
-    /// the "cleanup rewrote an unrelated population" defect.
+    /// Selected durable vector bodies removed, despite the historical field
+    /// name. This excludes unrelated vectors and is zero for in-memory stores.
     pub vector_keys_rewritten: u64,
-    /// The graph-edge component of `keys_rewritten`: every PHYSICAL redb key
-    /// this pass rewrote for the adjacency population. `rewrite_pruned_state`
-    /// writes each edge into BOTH `graph_fwd` and `graph_rev` (a forward key
-    /// and a reverse key per edge), so this counts 2 per edge in the WHOLE
-    /// database, not the edge count itself -- undercounting by half would
-    /// understate the real disk work this pass did. Row-version cleanup has
-    /// no business ever opening the graph tables -- edge identity is
-    /// self-owned and no currency table carries edges -- so this reads 0
-    /// unconditionally, scoped mechanism or not; a nonzero reading here is
-    /// itself the defect.
+    /// Physical adjacency keys rewritten. Currency cleanup leaves this at zero:
+    /// graph edges have their own identities, independent of row versions.
     pub edge_keys_rewritten: u64,
     /// Wall-clock microseconds this pass held the commit lock -- the writer
     /// stall a concurrent commit waits behind. Timed from the FIRST
@@ -9188,21 +12714,13 @@ pub struct CurrencyCompactionReport {
     /// ledger as a single, much larger writer stall than it actually was.
     /// 0 whenever `redb_compacted` is false.
     pub redb_compact_micros: u64,
-    /// How many DISTINCT tables' full row-version history this pass cloned
-    /// into memory to do its work -- `relational_store.tables.read().
-    /// clone()` deep-clones every table sharing the database today, not
-    /// just the eligible ones named in `tables`, so this reads the WHOLE
-    /// table count regardless of how few are actually compaction-eligible.
-    /// Once the in-memory clone is scoped to just the eligible tables, this
-    /// reads `tables.len()` (or fewer, for tables absent from this
-    /// database) instead.
+    /// Eligible tables whose row histories were sampled in memory. Unrelated
+    /// tables are not cloned into the cleanup selection.
     pub tables_in_memory_snapshot: u64,
-    /// Commit-index entries this pass removed, candidate-only: an LSN this
-    /// pass affected whose change-log entries are now all gone AND that
-    /// `retained_commit_index_after_prune`'s own floor no longer needs. 0
-    /// when nothing qualified this cycle — heartbeat churn on a declared
-    /// table would otherwise leave the commit index growing forever, since
-    /// nothing else in version cleanup ever touched it.
+    /// Commit-index entries removed after losing their last change-log reference,
+    /// excluding the anchor needed to resolve the oldest surviving delete.
+    /// Durable removal joins the row/vector cleanup transaction; this count
+    /// records the matching in-memory removal, including on in-memory stores.
     pub commit_index_keys_removed: u64,
     /// Superseded versions left in place this cycle because a registered
     /// reader's snapshot (an in-flight statement, or a caller-held
@@ -9488,9 +13006,20 @@ impl PruningRuntime {
         Self {
             shutdown: Arc::new(AtomicBool::new(false)),
             handle: None,
+            interval_ms: Arc::new(AtomicU64::new(MAINTENANCE_TICK.as_millis() as u64)),
             #[cfg(test)]
             wakes: Arc::new(AtomicU64::new(0)),
+            worker_clock: Arc::new(MaintenanceWorkerClock::default()),
         }
+    }
+
+    /// Request shutdown before handing the worker to its joiner. The clock is
+    /// the worker's production wait in every build, so notification cannot be
+    /// limited to test configurations.
+    fn request_shutdown_and_take_handle(&mut self) -> Option<JoinHandle<()>> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.worker_clock.wake();
+        self.handle.take()
     }
 }
 
@@ -9540,6 +13069,8 @@ impl Database {
         local_erasure_stages: discard::StageRegistry,
         pending_local_schema_stages: Arc<Mutex<HashMap<TxId, PendingLocalSchemaStage>>>,
         local_schema_stages: LocalSchemaStageRegistry,
+        snapshot_registry: Arc<SnapshotFloorRegistry>,
+        vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
         persistence: Option<Arc<RedbPersistence>>,
         blob_repository: Arc<BlobRepository>,
         open_registry_path: Option<PathBuf>,
@@ -9551,6 +13082,12 @@ impl Database {
         event_bus: Arc<EventBusState>,
         trigger: Arc<TriggerState>,
     ) -> Self {
+        let finalization = StoreFinalization::new(
+            relational.clone(),
+            graph.clone(),
+            vector_store.clone(),
+            accountant.clone(),
+        );
         Self {
             id: DatabaseId::next(),
             tx_mgr: tx_mgr.clone(),
@@ -9573,6 +13110,7 @@ impl Database {
             local_schema_stages,
             capture_detached_sync_write_set: Arc::new(AtomicBool::new(false)),
             detached_sync_write_set: Arc::new(Mutex::new(None)),
+            received_vector_image_pending: Arc::new(AtomicBool::new(false)),
             persistence,
             committed_image_startup: None,
             blob_repository,
@@ -9603,6 +13141,8 @@ impl Database {
             route_observer: None,
             #[cfg(feature = "test-seams")]
             kernel_observer: None,
+            #[cfg(feature = "test-seams")]
+            snapshot_free_retirement_pass_count: Arc::new(AtomicUsize::new(0)),
             access: AccessConstraints::default(),
             accountant,
             conflict_policies: RwLock::new(ConflictPolicies::uniform(
@@ -9615,6 +13155,9 @@ impl Database {
             in_memory_destination_reuploads: Arc::new(Mutex::new(HashMap::new())),
             lineage_state_lock: Arc::new(Mutex::new(InMemoryLineageState::default())),
             received_schema_manifest_lock: Arc::new(Mutex::new(())),
+            sync_push_apply_locks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "sync-orchestration")]
+            sync_client_push_locks: Arc::new(Mutex::new(HashMap::new())),
             in_memory_received_schema_manifests: Arc::new(Mutex::new(
                 InMemoryReceivedSchemaManifestState::default(),
             )),
@@ -9635,6 +13178,12 @@ impl Database {
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             limit_update_lock: Arc::new(Mutex::new(())),
+            #[cfg(any(test, feature = "test-seams"))]
+            maintenance_poll_interval_update_pause: Arc::new(ApplyPhasePause::new()),
+            #[cfg(any(test, feature = "test-seams"))]
+            maintenance_poll_interval_update_probe: Arc::new(
+                MaintenancePollIntervalUpdateProbe::default(),
+            ),
             disk_limit: Arc::new(AtomicU64::new(disk_limit.unwrap_or(0))),
             disk_limit_startup_ceiling: Arc::new(AtomicU64::new(
                 disk_limit_startup_ceiling.unwrap_or(0),
@@ -9642,9 +13191,13 @@ impl Database {
             trigger_audit_retention_secs: Arc::new(AtomicU64::new(
                 TRIGGER_AUDIT_RETENTION.as_secs(),
             )),
-            snapshot_registry: Arc::new(SnapshotFloorRegistry::default()),
+            snapshot_registry,
+            vector_partition_snapshot_stages,
             retention_deferred_edge_nodes: Arc::new(Mutex::new(HashSet::new())),
             maintenance_caller_driven: Arc::new(AtomicBool::new(false)),
+            maintenance_poll_interval_ms: Arc::new(AtomicU64::new(
+                MAINTENANCE_TICK.as_millis() as u64
+            )),
             last_maintenance_cycle_at: Arc::new(Mutex::new(None)),
             caller_driven_backlog_warned_at: Arc::new(Mutex::new(None)),
             last_auto_compact_at: Arc::new(Mutex::new(None)),
@@ -9653,8 +13206,8 @@ impl Database {
             closed: AtomicBool::new(false),
             resource_closed: Arc::new(AtomicBool::new(false)),
             rows_examined: AtomicU64::new(0),
-            last_vector_search_used_hnsw: AtomicBool::new(false),
-            last_vector_search_trace: RwLock::new(None),
+            last_vector_search_used_hnsw: Arc::new(AtomicBool::new(false)),
+            last_vector_search_trace: Arc::new(RwLock::new(None)),
             statement_cache: RwLock::new(HashMap::new()),
             rank_formula_cache: Arc::new(RwLock::new(HashMap::new())),
             acl_grant_cache: RwLock::new(HashMap::new()),
@@ -9673,7 +13226,8 @@ impl Database {
             resource_owner: true,
             handle_role: HandleRole::Owner,
             trigger_deadlock_timeout_override: Mutex::new(None),
-            finalization: StoreFinalization::new(),
+            finalization,
+            read_image_memory: None,
         }
     }
 
@@ -9723,6 +13277,8 @@ impl Database {
             plugin,
             memory_limit,
             disk_limit,
+            maintenance_policy,
+            maintenance_poll_interval,
             contexts,
             scope_labels,
             principal,
@@ -9777,6 +13333,13 @@ impl Database {
         db.plugin.on_open()?;
         observe_open_event!(test_observer, PluginOpened);
         db.owner_read_config = Arc::new(owner_reads);
+        db.maintenance_caller_driven.store(
+            maintenance_policy == MaintenancePolicy::CallerDriven,
+            Ordering::SeqCst,
+        );
+        if let Some(interval) = maintenance_poll_interval {
+            db.apply_maintenance_poll_interval(interval)?;
+        }
         db.access = AccessConstraints {
             contexts,
             scope_labels,
@@ -10502,6 +14065,7 @@ impl Database {
             local_schema_stages: self.local_schema_stages.clone(),
             capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
             detached_sync_write_set: self.detached_sync_write_set.clone(),
+            received_vector_image_pending: self.received_vector_image_pending.clone(),
             persistence: self.persistence.clone(),
             committed_image_startup: self.committed_image_startup.clone(),
             blob_repository: self.blob_repository.clone(),
@@ -10535,6 +14099,8 @@ impl Database {
             route_observer: self.route_observer.clone(),
             #[cfg(feature = "test-seams")]
             kernel_observer: self.kernel_observer.clone(),
+            #[cfg(feature = "test-seams")]
+            snapshot_free_retirement_pass_count: self.snapshot_free_retirement_pass_count.clone(),
             access: AccessConstraints {
                 contexts,
                 scope_labels,
@@ -10549,6 +14115,9 @@ impl Database {
             in_memory_destination_reuploads: self.in_memory_destination_reuploads.clone(),
             lineage_state_lock: self.lineage_state_lock.clone(),
             received_schema_manifest_lock: self.received_schema_manifest_lock.clone(),
+            sync_push_apply_locks: self.sync_push_apply_locks.clone(),
+            #[cfg(feature = "sync-orchestration")]
+            sync_client_push_locks: self.sync_client_push_locks.clone(),
             in_memory_received_schema_manifests: self.in_memory_received_schema_manifests.clone(),
             in_memory_table_generations: self.in_memory_table_generations.clone(),
             in_memory_ddl_generations: self.in_memory_ddl_generations.clone(),
@@ -10567,12 +14136,22 @@ impl Database {
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             limit_update_lock: self.limit_update_lock.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            maintenance_poll_interval_update_pause: self
+                .maintenance_poll_interval_update_pause
+                .clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            maintenance_poll_interval_update_probe: self
+                .maintenance_poll_interval_update_probe
+                .clone(),
             disk_limit: Arc::clone(&self.disk_limit),
             disk_limit_startup_ceiling: Arc::clone(&self.disk_limit_startup_ceiling),
             trigger_audit_retention_secs: self.trigger_audit_retention_secs.clone(),
             snapshot_registry: self.snapshot_registry.clone(),
+            vector_partition_snapshot_stages: self.vector_partition_snapshot_stages.clone(),
             retention_deferred_edge_nodes: self.retention_deferred_edge_nodes.clone(),
             maintenance_caller_driven: self.maintenance_caller_driven.clone(),
+            maintenance_poll_interval_ms: self.maintenance_poll_interval_ms.clone(),
             last_maintenance_cycle_at: self.last_maintenance_cycle_at.clone(),
             caller_driven_backlog_warned_at: self.caller_driven_backlog_warned_at.clone(),
             last_auto_compact_at: self.last_auto_compact_at.clone(),
@@ -10581,8 +14160,8 @@ impl Database {
             closed: AtomicBool::new(false),
             resource_closed: self.resource_closed.clone(),
             rows_examined: AtomicU64::new(0),
-            last_vector_search_used_hnsw: AtomicBool::new(false),
-            last_vector_search_trace: RwLock::new(None),
+            last_vector_search_used_hnsw: Arc::clone(&self.last_vector_search_used_hnsw),
+            last_vector_search_trace: Arc::clone(&self.last_vector_search_trace),
             statement_cache: RwLock::new(HashMap::new()),
             // The same cache, not a copy of it: this is another view onto one
             // store, and a formula registered after the view was taken is one
@@ -10609,6 +14188,7 @@ impl Database {
                 *self.trigger_deadlock_timeout_override.lock(),
             ),
             finalization: Arc::clone(&self.finalization),
+            read_image_memory: self.read_image_memory.clone(),
         }
     }
 
@@ -10659,6 +14239,10 @@ impl Database {
         startup_disk_limit: Option<u64>,
         allow_legacy_table_meta_layout: bool,
     ) -> Result<Self> {
+        let persisted_maintenance_poll_interval_ms = persistence
+            .load_config_value::<u64>(MAINTENANCE_POLL_INTERVAL_CONFIG_KEY)?
+            .filter(|milliseconds| *milliseconds != 0)
+            .unwrap_or(MAINTENANCE_TICK.as_millis() as u64);
         if let Some(persisted) = persistence.load_config_value::<usize>("memory_limit")? {
             let startup = accountant.usage();
             if let Some(ceiling) = startup.startup_ceiling {
@@ -10713,14 +14297,19 @@ impl Database {
                 if decl.kind == IndexKind::Auto {
                     relational.create_exact_index_storage(name, &decl.name, decl.columns.clone());
                 } else {
-                    relational.create_index_storage(name, &decl.name, decl.columns.clone());
+                    relational.create_index_storage_with_budget(
+                        name,
+                        &decl.name,
+                        decl.columns.clone(),
+                        accountant.clone(),
+                    );
                 }
             }
             for mut row in persistence.load_relational_table(name)? {
                 if sanitize_loaded_row_for_meta(&mut row, &runtime_meta) {
                     sanitized_row_tables.insert(name.clone());
                 }
-                relational.insert_loaded_row(name, row);
+                relational.insert_loaded_row(name, row)?;
             }
         }
         let loaded_row_ids = relational
@@ -10786,28 +14375,10 @@ impl Database {
 
         let hnsw = Arc::new(OnceLock::new());
         let vector = Arc::new(VectorStore::new(hnsw.clone()));
-        for (table_name, meta) in &all_meta {
-            for column in &meta.columns {
-                if let ColumnType::Vector(dimension) = column.column_type {
-                    vector.register_index(
-                        VectorIndexRef::new(table_name, column.name.clone()),
-                        dimension,
-                        column.quantization,
-                    );
-                }
-            }
-        }
+        register_vector_layouts(&vector, &all_meta)?;
         let loaded_ddl_log = persistence.load_ddl_log()?;
-        let (mut loaded_vectors, repaired_vector_refs) = reconcile_loaded_vectors_for_meta(
-            persistence.load_vectors()?,
-            &all_meta,
-            &loaded_ddl_log,
-        );
-        let supplemented_vectors =
-            supplement_loaded_vectors_from_rows(&relational, &all_meta, &mut loaded_vectors);
-        for entry in &loaded_vectors {
-            vector.insert_loaded_vector(entry.clone());
-        }
+        register_dormant_raw_vector_partitions(&vector, &persistence, &accountant)?;
+        register_dormant_vector_generations(&vector, &persistence, &accountant)?;
 
         let loaded_change_log = persistence.load_change_log()?;
         let mut commit_index = persistence.load_commit_index()?;
@@ -10820,29 +14391,52 @@ impl Database {
                 missing_commit_index.insert(lsn, tx);
             }
         }
-        let repaired_visibility_order = repair_visibility_tx_order_if_needed(
-            &relational,
-            &graph,
-            &vector,
-            loaded_vectors.as_mut_slice(),
-            &all_meta,
-            &persistence,
-            &mut commit_index,
-        )?;
-        if repaired_visibility_order {
-            persistence.rewrite_commit_index(&commit_index)?;
-        } else if !missing_commit_index.is_empty() {
+        if commit_index
+            .values()
+            .try_fold(TxId(0), |previous, tx| (*tx >= previous).then_some(*tx))
+            .is_none()
+        {
+            // Current-format ordering damage is repaired as one atomic MVCC
+            // rewrite, then hydrated again. Routine opens keep the lazy path.
+            drop(vector);
+            drop(graph);
+            drop(relational);
+            let mut workspace =
+                crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone());
+            let bytes = std::fs::metadata(persistence.path())
+                .map_err(RedbPersistence::storage_error)?
+                .len();
+            if let Some(limit) =
+                effective_disk_limit.filter(|limit| bytes.saturating_mul(2) > *limit)
+            {
+                return Err(Error::DiskBudgetExceeded {
+                    operation: "repair_commit_index".into(), current_bytes: bytes, budget_limit_bytes: limit,
+                    hint: "Reduce retained file-backed data or raise DISK_LIMIT before writing more data.".into(),
+                });
+            }
+            workspace.try_grow_for(
+                usize::try_from(bytes)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(3),
+                "storage",
+                "repair_commit_index",
+                "Raise MEMORY_LIMIT to repair the current store.",
+            )?;
+            persistence.repair_current_transaction_order(&commit_index, &all_meta)?;
+            drop(workspace);
+            return Self::open_loaded_from_persistence(
+                registry_reservation,
+                persistence,
+                plugin,
+                accountant,
+                startup_disk_limit,
+                allow_legacy_table_meta_layout,
+            );
+        }
+        if !missing_commit_index.is_empty() {
             persistence.flush_commit_index_entries(&missing_commit_index)?;
         }
-        let hydrated_row_tables = hydrate_relational_vector_values(&relational, &loaded_vectors);
-        if repaired_vector_refs || supplemented_vectors {
-            persistence.rewrite_vectors(&loaded_vectors)?;
-        }
-        for table in sanitized_row_tables
-            .into_iter()
-            .chain(hydrated_row_tables.into_iter())
-            .collect::<HashSet<_>>()
-        {
+        for table in sanitized_row_tables {
             if let Some(rows) = relational.tables.read().get(&table) {
                 persistence.rewrite_table_rows(&table, rows)?;
             }
@@ -10906,6 +14500,8 @@ impl Database {
         let received_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let pending_local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let snapshot_registry = Arc::new(SnapshotFloorRegistry::default());
+        let vector_partition_snapshot_stages = Arc::new(Mutex::new(HashMap::new()));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
         let composite = CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
@@ -10915,6 +14511,7 @@ impl Database {
             change_log_table_index.clone(),
             change_log_lsn_refcounts.clone(),
             ddl_log.clone(),
+            vector_partition_snapshot_stages.clone(),
             accountant.clone(),
             apply_phase_pause.clone(),
         );
@@ -10953,6 +14550,8 @@ impl Database {
             local_erasure_stages,
             pending_local_schema_stages,
             local_schema_stages,
+            snapshot_registry,
+            vector_partition_snapshot_stages,
             Some(persistence),
             blob_repository,
             Some(registry_reservation.disarm()),
@@ -10964,6 +14563,8 @@ impl Database {
             event_bus,
             trigger,
         );
+        db.maintenance_poll_interval_ms
+            .store(persisted_maintenance_poll_interval_ms, Ordering::SeqCst);
 
         db.load_received_ddl_arrivals_from_persistence()?;
         db.load_superseded_ddl_occurrences_from_persistence()?;
@@ -11012,9 +14613,12 @@ impl Database {
     /// This is the reading counterpart of `open_loaded_from_persistence`: the
     /// same runtime stores, the same counters, and therefore the same planner
     /// and the same physical decisions -- assembled from values instead of
-    /// from a live source. Nothing here can reach a file. There is no durable
-    /// store behind the composite, no open-registry claim, and no media
-    /// repository, because the image carries no media and the source is gone.
+    /// from a live source. There is no durable store behind the composite, no
+    /// open-registry claim, and no media repository, because the image carries
+    /// no media and the hydration source is gone. A validated dormant vector
+    /// descriptor retains only a read-only locator for its immutable graph;
+    /// the graph body is reopened and loaded only if a later indexed query
+    /// selects that route.
     /// Every repair the writable path performs while loading is absent by
     /// construction: a store that would need one was refused before the image
     /// was ever built.
@@ -11024,6 +14628,7 @@ impl Database {
         mut accountant: Arc<MemoryAccountant>,
     ) -> Result<Self> {
         let crate::persistence::ReadPersistenceImageParts {
+            memory: _image_memory,
             table_meta: all_meta,
             relational_tables,
             forward_edges,
@@ -11040,6 +14645,8 @@ impl Database {
             trigger_audit,
             trigger_audit_stamps: _,
             sink_queues,
+            vector_generation_catalog,
+            source_path,
             store_file_bytes,
         } = parts;
         let startup = Arc::new(CommittedImageStartupState {
@@ -11070,6 +14677,12 @@ impl Database {
             >(bytes)?),
             None => None,
         };
+        let persisted_maintenance_poll_interval_ms =
+            config_value(MAINTENANCE_POLL_INTERVAL_CONFIG_KEY)
+                .map(crate::persistence::RedbPersistence::decode_config_value::<u64>)
+                .transpose()?
+                .filter(|milliseconds| *milliseconds != 0)
+                .unwrap_or(MAINTENANCE_TICK.as_millis() as u64);
 
         let relational = Arc::new(RelationalStore::new());
         for (name, meta) in &all_meta {
@@ -11087,11 +14700,16 @@ impl Database {
                 if decl.kind == IndexKind::Auto {
                     relational.create_exact_index_storage(name, &decl.name, decl.columns.clone());
                 } else {
-                    relational.create_index_storage(name, &decl.name, decl.columns.clone());
+                    relational.create_index_storage_with_budget(
+                        name,
+                        &decl.name,
+                        decl.columns.clone(),
+                        accountant.clone(),
+                    );
                 }
             }
             for row in relational_tables.get(name).into_iter().flatten() {
-                relational.insert_loaded_row(name, row.clone());
+                relational.insert_loaded_row(name, row.clone())?;
             }
         }
         relational.replace_sync_source_lsns(sync_source_lsns);
@@ -11104,20 +14722,12 @@ impl Database {
 
         let hnsw = Arc::new(OnceLock::new());
         let vector = Arc::new(VectorStore::new(hnsw.clone()));
-        for (table_name, meta) in &all_meta {
-            for column in &meta.columns {
-                if let ColumnType::Vector(dimension) = column.column_type {
-                    vector.register_index(
-                        VectorIndexRef::new(table_name, column.name.clone()),
-                        dimension,
-                        column.quantization,
-                    );
-                }
-            }
-        }
-        for entry in vector_entries {
-            vector.insert_loaded_vector(entry);
-        }
+        register_vector_layouts(&vector, &all_meta)?;
+        vector.replace_loaded_partitioned_vectors(partition_loaded_vectors_from_rows(
+            &relational,
+            &all_meta,
+            vector_entries,
+        )?)?;
 
         let max_row_id = relational.max_row_id();
         let max_tx = max_tx_across_all(&relational, &graph, &vector);
@@ -11171,6 +14781,16 @@ impl Database {
             .max(commit_index_max_lsn)
             .max(ddl_max_lsn)
             .max(purge_frontier_max_lsn);
+        register_loaded_dormant_vector_generations(
+            &vector,
+            vector_generation_catalog,
+            DurableVectorGenerationSource::CommittedImage(ReadOnlyVectorGenerationSource::new(
+                source_path,
+                max_lsn,
+            )),
+            &accountant,
+            None,
+        )?;
         relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
 
         let (initial_table_index, initial_lsn_refcounts) =
@@ -11182,6 +14802,8 @@ impl Database {
         let received_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let pending_local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let snapshot_registry = Arc::new(SnapshotFloorRegistry::default());
+        let vector_partition_snapshot_stages = Arc::new(Mutex::new(HashMap::new()));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
         let composite = CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
@@ -11191,6 +14813,7 @@ impl Database {
             change_log_table_index.clone(),
             change_log_lsn_refcounts.clone(),
             ddl_log.clone(),
+            vector_partition_snapshot_stages.clone(),
             accountant.clone(),
             apply_phase_pause.clone(),
         );
@@ -11220,6 +14843,8 @@ impl Database {
             local_erasure_stages,
             pending_local_schema_stages,
             local_schema_stages,
+            snapshot_registry,
+            vector_partition_snapshot_stages,
             None,
             BlobRepository::absent(),
             None,
@@ -11231,7 +14856,9 @@ impl Database {
             event_bus,
             trigger,
         );
-        // Statements 14/19: the sealed read image retains its durable destination,
+        db.maintenance_poll_interval_ms
+            .store(persisted_maintenance_poll_interval_ms, Ordering::SeqCst);
+        // The sealed read image retains its durable destination,
         // so bindings and scoped custody credit agree with the live database.
         *db.retention_sync_peer.lock() = startup
             .config_values
@@ -11239,6 +14866,7 @@ impl Database {
             .map(|bytes| RedbPersistence::decode_config_value_exact::<String>(bytes))
             .transpose()?;
         db.committed_image_startup = Some(startup);
+        db.read_image_memory = Some(_image_memory);
         // This handle has no persistence to stat, so the length the reader
         // measured of the file it read this image out of travels with the
         // image and answers for it.
@@ -11274,6 +14902,8 @@ impl Database {
         let received_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let pending_local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let snapshot_registry = Arc::new(SnapshotFloorRegistry::default());
+        let vector_partition_snapshot_stages = Arc::new(Mutex::new(HashMap::new()));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
         let trigger = Arc::new(TriggerState::new());
         let composite = CompositeStore::new_with_apply_phase_pause(
@@ -11284,6 +14914,7 @@ impl Database {
             change_log_table_index.clone(),
             change_log_lsn_refcounts.clone(),
             ddl_log.clone(),
+            vector_partition_snapshot_stages.clone(),
             accountant.clone(),
             apply_phase_pause.clone(),
         );
@@ -11307,6 +14938,8 @@ impl Database {
             local_erasure_stages,
             pending_local_schema_stages,
             local_schema_stages,
+            snapshot_registry,
+            vector_partition_snapshot_stages,
             None,
             blob_repository,
             None,
@@ -11732,20 +15365,22 @@ impl Database {
         }
         if !(self.has_version_cleanup_tables()
             || self.has_retained_tables()
-            || self.has_durable_trigger_audit())
+            || self.has_durable_trigger_audit()
+            || self.has_vector_index_declarations())
         {
             return;
         }
         let now = std::time::Instant::now();
+        let poll_interval = self.maintenance_poll_interval();
         let overdue = match *self.last_maintenance_cycle_at.lock() {
-            Some(at) => now.duration_since(at) >= MAINTENANCE_TICK,
+            Some(at) => now.duration_since(at) >= poll_interval,
             None => true,
         };
         if !overdue {
             return;
         }
         let mut warned_at = self.caller_driven_backlog_warned_at.lock();
-        if warned_at.is_some_and(|at| now.duration_since(at) < MAINTENANCE_TICK) {
+        if warned_at.is_some_and(|at| now.duration_since(at) < poll_interval) {
             return;
         }
         *warned_at = Some(now);
@@ -11753,9 +15388,10 @@ impl Database {
         tracing::warn!(
             name: "caller_driven_maintenance_backlog",
             target: "maintenance",
-            "this database declares retention, HISTORY CURRENT ONLY, or a durable trigger \
-             audit, and its maintenance policy is CallerDriven, but no run_maintenance_cycle \
-             call has landed in over a tick interval -- declared cleanup is not being reclaimed"
+            "this database declares retention, HISTORY CURRENT ONLY, a durable trigger audit, \
+             or a vector index, and its maintenance policy is CallerDriven, but no \
+             run_maintenance_cycle call has landed in over a tick interval -- declared \
+             maintenance is not being advanced"
         );
     }
 
@@ -12202,10 +15838,11 @@ impl Database {
         // `try_snapshot_for_read`, not the panicking `snapshot_for_read`:
         // a close landing between the `already_closed` check above and this
         // line must still surface as the typed closed-handle error.
+        let _membership_capture = self.relational_store.begin_membership_capture();
         let Some(read_snapshot) = self.try_snapshot_for_read() else {
             return Err(closed_database_error());
         };
-        let _snapshot_registration = self.snapshot_registry.register(read_snapshot);
+        let _snapshot_registration = self.snapshot_registry.register_statement(read_snapshot);
         let cached = self.cached_statement(sql);
         let parsed_stmt;
         let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
@@ -12249,7 +15886,9 @@ impl Database {
             Statement::Commit => {
                 let tx = *self.session_tx.lock();
                 if let Some(tx) = tx {
-                    match self.commit(tx) {
+                    match self.with_current_statement_snapshot_excluded_from_terminal_commit(|| {
+                        self.commit(tx)
+                    }) {
                         Ok(()) => {
                             let mut session = self.session_tx.lock();
                             if *session == Some(tx) {
@@ -12339,14 +15978,16 @@ impl Database {
             _ => {}
         }
 
-        let result = self.execute_statement_with_plan(
-            stmt,
-            sql,
-            params,
-            active_tx,
-            cached_plan,
-            preopened_autocommit_tx,
-        );
+        let result = self.with_snapshot_override(read_snapshot, || {
+            self.execute_statement_with_plan(
+                stmt,
+                sql,
+                params,
+                active_tx,
+                cached_plan,
+                preopened_autocommit_tx,
+            )
+        });
 
         #[cfg(test)]
         if matches!(stmt, Statement::Select(_)) {
@@ -12682,11 +16323,16 @@ impl Database {
                 match result {
                     Ok(mut qr) => {
                         let event_bus_ddl = self.take_pending_event_bus_ddl(tx);
-                        let validation = self.commit_with_source_and_event_bus_ddl(
-                            tx,
-                            CommitSource::AutoCommit,
-                            &event_bus_ddl,
-                        )?;
+                        let validation = self
+                            .with_current_statement_snapshot_excluded_from_terminal_commit(
+                                || {
+                                    self.commit_with_source_and_event_bus_ddl(
+                                        tx,
+                                        CommitSource::AutoCommit,
+                                        &event_bus_ddl,
+                                    )
+                                },
+                            )?;
                         qr.rows_affected = qr
                             .rows_affected
                             .saturating_sub(validation.conditional_noop_count);
@@ -12779,7 +16425,7 @@ impl Database {
             // the kernel reports here is the engine's own error, carried out
             // unchanged.
             Err(crate::executor::BoundedExecutionError::Engine(error)) => Err(error),
-            // Statement 19: an admin-scope refusal remains typed on this uncapped door.
+            // An admin-scope refusal remains typed on this uncapped door.
             Err(crate::executor::BoundedExecutionError::Refused(failure))
                 if failure.kind() == ReadFailureKind::ConstrainedHandleInspectionRefused =>
             {
@@ -12818,6 +16464,39 @@ impl Database {
     }
 
     pub fn explain(&self, sql: &str) -> Result<String> {
+        let explained = self.explain_output(sql)?;
+        let mut output = crate::cli_render::render_explain_output(&explained);
+        if output.ends_with('\n') {
+            output.pop();
+        }
+        if let Some(disclosure) = explained.vector_search.as_ref() {
+            output.push_str(&format!(
+                "\nvector_policy requested_mode: {} resolved_mode: {} \
+                 aggregate_allowed_vectors: {} effective_auto_index_at: {} \
+                 auto_index_at_source: {}",
+                disclosure.requested_mode,
+                disclosure.resolved_mode,
+                render_optional_count(disclosure.aggregate_allowed_vectors),
+                disclosure.effective_auto_index_at,
+                disclosure.auto_index_at_source,
+            ));
+        }
+        Ok(output)
+    }
+
+    /// Plan and disclose a statement without executing it. Vector facts come
+    /// from passive catalog, authorization, and policy reads only.
+    pub fn explain_output(&self, sql: &str) -> Result<ExplainOutput> {
+        self.explain_output_with_params(sql, &HashMap::new())
+    }
+
+    /// Parameter-aware passive planning used by the CLI rendering helper.
+    /// Values inform route selection only; no statement is executed.
+    pub(crate) fn explain_output_with_params(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<ExplainOutput> {
         let stmt = contextdb_parser::parse(sql)?;
         let _schema_publication = self.enter_schema_publication_gate(false);
         let _operation = self.open_operation()?;
@@ -12826,39 +16505,777 @@ impl Database {
         // query that can never run reads as a green light for it.
         validate_plan_columns(self, &plan)?;
         let vector_shape = vector_search_shape_from_plan(&plan);
+        let relational_route = if vector_shape.is_none() {
+            analyze_passive_relational_route(self, &plan, params)
+        } else {
+            None
+        };
         let _vector_schema = vector_shape
             .as_ref()
             .map(|shape| self.vector_schema_read(&shape.index));
         let snapshot = self.snapshot();
-        let mut output = plan.explain();
-        let uses_hnsw = vector_shape
+        let mut physical_plan = relational_route
             .as_ref()
-            .is_some_and(|shape| self.vector_hnsw_strategy_for_explain(shape, snapshot));
+            .map(|route| route.physical_plan.clone())
+            .unwrap_or_else(|| plan.explain());
+        let vector_policy = vector_shape
+            .as_ref()
+            .map(|shape| self.vector_policy_facts_for_explain(shape, snapshot, params))
+            .transpose()?;
+        let vector_disclosure = vector_shape
+            .as_ref()
+            .map(|shape| self.vector_search_disclosure(shape, snapshot, params, None))
+            .transpose()?;
+        let uses_hnsw = vector_shape.as_ref().is_some_and(|shape| {
+            vector_policy.as_ref().is_some_and(|facts| {
+                facts.resolved_mode == contextdb_core::VectorSearchMode::Indexed
+                    && vector_disclosure
+                        .as_ref()
+                        .is_some_and(|disclosure| disclosure.refusal.is_none())
+                    && self
+                        .vector_hnsw_strategy_for_explain(shape, snapshot, params)
+                        .unwrap_or(false)
+            })
+        });
         if uses_hnsw {
-            output = output.replace("VectorSearch(", "HNSWSearch(");
-            output = output.replace("VectorSearch {", "HNSWSearch {");
+            physical_plan = physical_plan.replace("VectorSearch(", "HNSWSearch(");
+            physical_plan = physical_plan.replace("VectorSearch {", "HNSWSearch {");
         } else {
-            output = annotate_vector_search_strategy(output, "BruteForce");
-            output = output.replace("VectorSearch {", "VectorSearch { strategy: BruteForce,");
+            physical_plan = annotate_vector_search_strategy(physical_plan, "BruteForce");
+            physical_plan =
+                physical_plan.replace("VectorSearch {", "VectorSearch { strategy: BruteForce,");
         }
-        Ok(output)
+        Ok(ExplainOutput {
+            physical_plan,
+            index_used: relational_route
+                .as_ref()
+                .and_then(|route| route.index_used.clone()),
+            predicates_pushed: relational_route
+                .as_ref()
+                .map(|route| route.predicates_pushed.clone())
+                .unwrap_or_default(),
+            indexes_considered: relational_route
+                .as_ref()
+                .map(|route| route.indexes_considered.clone())
+                .unwrap_or_default(),
+            sort_elided: relational_route
+                .as_ref()
+                .is_some_and(|route| route.sort_elided),
+            vector_search: vector_disclosure,
+        })
+    }
+
+    /// Read authorization from resident access metadata. This never invokes a
+    /// table scan or loads a vector or graph.
+    fn vector_metadata_authorized_candidates(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+    ) -> Result<MetadataAuthorizedCandidates> {
+        let mut memory =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        if !self.bounded_read_requires_candidate_filter(&index.table)? {
+            return Ok(MetadataAuthorizedCandidates {
+                ids: None,
+                _memory: memory,
+            });
+        }
+        let mut ids = RoaringTreemap::new();
+        self.visit_authorized_row_metadata(&index.table, snapshot, |row| {
+            if !ids.contains(row.row_id.0)
+                && self
+                    .vector_store
+                    .has_live_entry_for_row(index, row.row_id, snapshot)
+            {
+                // Only an authorized identity can request memory. Neither a
+                // hidden population nor its row sizes affect this reservation.
+                let bytes = if ids.is_empty() { 544 } else { 32 };
+                let held = memory.bytes();
+                memory
+                    .try_grow_for(
+                        bytes,
+                        "vector_search",
+                        "explain_authorization",
+                        "Narrow the inspected scope or raise MEMORY_LIMIT.",
+                    )
+                    .map_err(|error| match error {
+                        Error::MemoryBudgetExceeded {
+                            subsystem,
+                            operation,
+                            requested_bytes,
+                            available_bytes,
+                            hint,
+                            ..
+                        } => Error::MemoryBudgetExceeded {
+                            subsystem,
+                            operation,
+                            requested_bytes,
+                            available_bytes,
+                            // The constrained caller sees this operation's budget,
+                            // never the store's hidden resident allocation.
+                            budget_limit_bytes: available_bytes.saturating_add(held),
+                            hint,
+                        },
+                        other => other,
+                    })?;
+                ids.insert(row.row_id.0);
+            }
+            Ok(())
+        })?;
+        Ok(MetadataAuthorizedCandidates {
+            ids: Some(ids),
+            _memory: memory,
+        })
+    }
+
+    fn vector_policy_facts_for_explain(
+        &self,
+        shape: &VectorExplainShape<'_>,
+        snapshot: SnapshotId,
+        params: &HashMap<String, Value>,
+    ) -> Result<VectorPolicyExplainFacts> {
+        let requested_mode = self.resolved_vector_search_mode(
+            &shape.index,
+            shape
+                .search_mode
+                .map(crate::executor::map_vector_search_mode),
+        )?;
+        let layout = self.vector_store.index_layout(&shape.index)?;
+        let authorized = self.vector_metadata_authorized_candidates(&shape.index, snapshot)?;
+        let candidate_route =
+            crate::executor::vector_candidate_route(self, &shape.index, shape.candidates, params)?;
+        let partition_scope = &candidate_route.scope;
+        let count = || {
+            self.vector.authorized_visible_count_without_build(
+                &shape.index,
+                authorized.as_ref(),
+                snapshot,
+            )
+        };
+        // Partition scope resolves after parameters are bound. A predicate
+        // whose key identity is still an unbound placeholder names a scope
+        // nobody has resolved yet, so there is no count to report: never the
+        // whole column's aggregate, which belongs to a scope the caller did
+        // not name and which a restricted handle must not learn.
+        let aggregate_allowed_vectors = match partition_scope.as_ref() {
+            Some(scope) => match scope.resolved_prefixes() {
+                Some(prefixes) => Some(contextdb_vector::mem::with_selected_partition_prefixes(
+                    &shape.index,
+                    prefixes.to_vec(),
+                    count,
+                )?),
+                None => None,
+            },
+            None => Some(count()?),
+        };
+        let policy = layout.resolve_policy(aggregate_allowed_vectors.unwrap_or(0), shape.k);
+        let filtered_exact =
+            requested_mode == contextdb_core::VectorSearchMode::Auto && !candidate_route.complete;
+        let resolved_mode = match (requested_mode, aggregate_allowed_vectors) {
+            (contextdb_core::VectorSearchMode::Auto, Some(_)) if filtered_exact => {
+                contextdb_core::VectorSearchMode::Exact
+            }
+            // AUTO is unresolved until the key binds: there is no trustworthy
+            // count to derive a route from.
+            (contextdb_core::VectorSearchMode::Auto, None) => {
+                contextdb_core::VectorSearchMode::Auto
+            }
+            (contextdb_core::VectorSearchMode::Auto, Some(count))
+                if count < policy.auto_index_at =>
+            {
+                contextdb_core::VectorSearchMode::Exact
+            }
+            (contextdb_core::VectorSearchMode::Auto, Some(_)) => {
+                contextdb_core::VectorSearchMode::Indexed
+            }
+            (mode, _) => mode,
+        };
+        Ok(VectorPolicyExplainFacts {
+            requested_mode,
+            resolved_mode,
+            aggregate_allowed_vectors,
+            policy,
+        })
+    }
+
+    fn vector_search_disclosure(
+        &self,
+        shape: &VectorExplainShape<'_>,
+        snapshot: SnapshotId,
+        params: &HashMap<String, Value>,
+        actual_used_hnsw: Option<bool>,
+    ) -> Result<VectorSearchDisclosure> {
+        let facts = self.vector_policy_facts_for_explain(shape, snapshot, params)?;
+        let graph_allowed = self.vector_hnsw_strategy_for_explain(shape, snapshot, params)?;
+        let layout = self.vector_store.index_layout(&shape.index)?;
+        let authorized = self.vector_metadata_authorized_candidates(&shape.index, snapshot)?;
+        let candidate_route =
+            crate::executor::vector_candidate_route(self, &shape.index, shape.candidates, params)?;
+        let partition_scope = &candidate_route.scope;
+        // An AUTO route over an unbound key is unresolved until the key binds.
+        // Only the passive explain path can reach this state: every executing
+        // reader binds its parameters before any scope or route is judged.
+        let unresolved_until_bind = facts.resolved_mode == contextdb_core::VectorSearchMode::Auto;
+        let scope = if unresolved_until_bind {
+            // One redacted state, whatever number of unbound branches the
+            // predicate happens to name.
+            VectorSearchScopeShape::One
+        } else {
+            match partition_scope
+                .as_ref()
+                .map(crate::executor::VectorPartitionScope::selected_partitions)
+            {
+                Some(1) => VectorSearchScopeShape::One,
+                Some(count) if count > 1 => VectorSearchScopeShape::Few,
+                _ => VectorSearchScopeShape::All,
+            }
+        };
+        let candidate_residual = vector_search_candidate_residual(shape, &candidate_route);
+        let exact_route = !unresolved_until_bind
+            && (facts.resolved_mode == contextdb_core::VectorSearchMode::Exact
+                || (facts.requested_mode == contextdb_core::VectorSearchMode::Auto
+                    && (actual_used_hnsw == Some(false)
+                        || (actual_used_hnsw.is_none() && !graph_allowed))));
+        let relational_route = if exact_route {
+            VectorSearchResidual::None
+        } else {
+            candidate_residual
+        };
+        let route = if unresolved_until_bind {
+            None
+        } else if exact_route {
+            Some(VectorSearchRoute::Exact)
+        } else if candidate_residual != VectorSearchResidual::None {
+            Some(VectorSearchRoute::FilteredIndexed)
+        } else {
+            Some(VectorSearchRoute::Indexed)
+        };
+        let (refusal, recovery) = if !exact_route
+            && facts.resolved_mode == contextdb_core::VectorSearchMode::Indexed
+            && relational_route == VectorSearchResidual::Unsupported
+        {
+            (
+                Some("filtered_route_unavailable".to_string()),
+                vector_filter_index_recovery(
+                    shape
+                        .candidates
+                        .filter(|_| shape.restricted_candidates)
+                        .or(candidate_route.candidates.as_ref()),
+                    &shape.index.table,
+                ),
+            )
+        } else if !exact_route
+            && facts.resolved_mode == contextdb_core::VectorSearchMode::Indexed
+            && actual_used_hnsw != Some(true)
+            && !graph_allowed
+        {
+            (
+                Some("indexed_route_unavailable".to_string()),
+                Some("run vector maintenance and retry".to_string()),
+            )
+        } else {
+            (None, None)
+        };
+        let filtered_exact = facts.requested_mode == contextdb_core::VectorSearchMode::Auto
+            && !candidate_route.complete;
+        let fallback = if unresolved_until_bind {
+            Some("partition_scope_unresolved_until_bind".to_string())
+        } else if filtered_exact {
+            Some("filtered_route_exact".to_string())
+        } else if facts.requested_mode == contextdb_core::VectorSearchMode::Auto
+            && facts.resolved_mode == contextdb_core::VectorSearchMode::Exact
+        {
+            Some("aggregate_below_auto_index_at".to_string())
+        } else if exact_route && facts.requested_mode == contextdb_core::VectorSearchMode::Auto {
+            Some("maintained_index_unavailable".to_string())
+        } else {
+            None
+        };
+        let layers = || {
+            self.vector.graph_layer_presence_without_load(
+                &shape.index,
+                authorized.as_ref(),
+                snapshot,
+            )
+        };
+        let (base, change, mut tail) = if let Some(prefixes) = partition_scope
+            .as_ref()
+            .and_then(crate::executor::VectorPartitionScope::resolved_prefixes)
+        {
+            contextdb_vector::mem::with_selected_partition_prefixes(
+                &shape.index,
+                prefixes.to_vec(),
+                layers,
+            )?
+        } else {
+            layers()?
+        };
+        tail |= self.vector_pending_tail_without_load(
+            &shape.index,
+            authorized.as_ref(),
+            snapshot,
+            partition_scope
+                .as_ref()
+                .and_then(crate::executor::VectorPartitionScope::resolved_prefixes),
+        )?;
+        let partition_hnsw = self.vector_partition_hnsw_disclosure(
+            &shape.index,
+            shape.k,
+            authorized.as_ref(),
+            snapshot,
+            partition_scope.as_ref(),
+        )?;
+        Ok(VectorSearchDisclosure {
+            requested_mode: facts.requested_mode,
+            resolved_mode: facts.resolved_mode,
+            aggregate_allowed_vectors: facts.aggregate_allowed_vectors,
+            effective_auto_index_at: facts.policy.auto_index_at,
+            auto_index_at_source: facts.policy.auto_index_at_source.to_owned(),
+            partition_key_columns: layout.partition_key_columns,
+            scope,
+            route,
+            base: if base {
+                VectorSearchLayerPresence::Present
+            } else {
+                VectorSearchLayerPresence::Absent
+            },
+            change: if change {
+                VectorSearchLayerPresence::Present
+            } else {
+                VectorSearchLayerPresence::Absent
+            },
+            tail: if tail {
+                VectorSearchTailState::Present
+            } else {
+                VectorSearchTailState::Empty
+            },
+            residual: relational_route,
+            fallback,
+            refusal,
+            recovery,
+            query_source: match shape.query_expr {
+                Expr::RowVectorSource { .. } => VectorQuerySourceDisclosure::RedactedRowKey,
+                Expr::Literal(_) | Expr::Parameter(_) => VectorQuerySourceDisclosure::Vector,
+                _ => VectorQuerySourceDisclosure::Unknown,
+            },
+            partition_hnsw,
+        })
+    }
+
+    /// Read partition inspection facts only for the keys this statement
+    /// selected. A complete key can be resolved directly; computing every
+    /// partition's pending/tombstone counts first would walk every unrelated
+    /// raw directory merely to discard those facts afterward.
+    fn vector_partition_infos_for_prefixes(
+        &self,
+        index: &VectorIndexRef,
+        prefixes: Option<&[VectorPartitionKey]>,
+    ) -> Result<Vec<contextdb_vector::store::VectorPartitionInfo>> {
+        let Some(prefixes) = prefixes else {
+            return self.vector_store.partition_infos(index);
+        };
+        let key_columns = self
+            .vector_store
+            .index_layout(index)?
+            .partition_key_columns
+            .len();
+        let mut keys = if prefixes
+            .iter()
+            .all(|prefix| prefix.components().len() == key_columns)
+        {
+            prefixes.to_vec()
+        } else {
+            self.vector_store
+                .partition_keys(index)?
+                .into_iter()
+                .filter(|key| {
+                    prefixes
+                        .iter()
+                        .any(|prefix| key.components().starts_with(prefix.components()))
+                })
+                .collect()
+        };
+        keys.sort();
+        keys.dedup();
+        Ok(keys
+            .into_iter()
+            .filter_map(|key| self.vector_store.partition_info(index, &key))
+            .collect())
+    }
+
+    /// One entry per selected partition with visible vectors, keys redacted.
+    ///
+    /// A key predicate whose identity is still an unbound placeholder names a
+    /// scope nobody has resolved yet. The list then collapses to one redacted
+    /// state: enumerating one entry per authorized partition would hand back,
+    /// as the length of the list, the very count `aggregate_allowed_vectors`
+    /// withholds for that same unnamed scope. A bound key, or no key
+    /// predicate at all, reports each partition the caller actually named.
+    fn vector_partition_hnsw_disclosure(
+        &self,
+        index: &VectorIndexRef,
+        k: usize,
+        authorized: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+        scope: Option<&crate::executor::VectorPartitionScope>,
+    ) -> Result<Vec<VectorPartitionHnswDisclosure>> {
+        // Adaptive graph effort and serving topology can encode the complete
+        // partition population. These numeric fields have no redacted value;
+        // omit them for constrained callers instead of inventing an effort
+        // based on the authorized subset that the graph did not actually use.
+        if self.bounded_read_requires_candidate_filter(&index.table)? {
+            return Ok(Vec::new());
+        }
+        let layout = self.vector_store.index_layout(index)?;
+        let prefixes = match scope {
+            None => None,
+            Some(scope) => match scope.resolved_prefixes() {
+                Some(prefixes) => Some(prefixes),
+                None => {
+                    let policy = layout.resolve_policy(0, k);
+                    return Ok(vec![VectorPartitionHnswDisclosure {
+                        partition: "<redacted:1>".to_owned(),
+                        hnsw_m: policy.hnsw_m,
+                        hnsw_ef_construction: policy.hnsw_ef_construction,
+                        hnsw_ef_search: policy.hnsw_ef_search,
+                        ef_search_source: policy.ef_search_source.to_owned(),
+                        policy_revision: policy.policy_revision,
+                    }]);
+                }
+            },
+        };
+        let mut partitions = self.vector_partition_infos_for_prefixes(index, prefixes)?;
+        partitions.sort_by(|left, right| {
+            left.partition
+                .partition_key
+                .cmp(&right.partition.partition_key)
+        });
+        let mut disclosure = Vec::new();
+        for partition in partitions {
+            let visible = contextdb_vector::mem::with_selected_partition_prefixes(
+                index,
+                vec![partition.partition.partition_key.clone()],
+                || {
+                    self.vector
+                        .authorized_visible_count_without_build(index, authorized, snapshot)
+                },
+            )?;
+            if visible == 0 {
+                continue;
+            }
+            let state = self
+                .vector_store
+                .partition_state(index, &partition.partition.partition_key)?;
+            // Authorization determines whether this partition is disclosed.
+            // Search effort uses its complete live population, and topology
+            // belongs to the snapshot's published chain rather than desired DDL.
+            let live_count = contextdb_vector::mem::with_selected_partition_prefixes(
+                index,
+                vec![partition.partition.partition_key],
+                || {
+                    self.vector
+                        .authorized_visible_count_without_build(index, None, snapshot)
+                },
+            )?;
+            let mut policy = layout.resolve_policy(live_count, k);
+            if let Some(serving) = state.snapshot_serving_policy(snapshot) {
+                policy.hnsw_m = serving.hnsw_m;
+                policy.hnsw_ef_construction = serving.hnsw_ef_construction;
+                policy.policy_revision = serving.policy_revision;
+            }
+            disclosure.push(VectorPartitionHnswDisclosure {
+                partition: format!("<redacted:{}>", disclosure.len() + 1),
+                hnsw_m: policy.hnsw_m,
+                hnsw_ef_construction: policy.hnsw_ef_construction,
+                hnsw_ef_search: policy.hnsw_ef_search,
+                ef_search_source: policy.ef_search_source.to_owned(),
+                policy_revision: policy.policy_revision,
+            });
+        }
+        Ok(disclosure)
+    }
+
+    /// Whether the selected authorized route has committed work newer than
+    /// its sealed generations. Partition inspection already computes this
+    /// from the raw directory and generation frontier, so explain can report
+    /// the fresh exact tail without loading or replaying that tail.
+    fn vector_pending_tail_without_load(
+        &self,
+        index: &VectorIndexRef,
+        authorized: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+        prefixes: Option<&[VectorPartitionKey]>,
+    ) -> Result<bool> {
+        for partition in self.vector_partition_infos_for_prefixes(index, prefixes)? {
+            if partition.pending_inserts == 0 && partition.tombstones == 0 {
+                continue;
+            }
+            let visible = contextdb_vector::mem::with_selected_partition_prefixes(
+                index,
+                vec![partition.partition.partition_key],
+                || {
+                    self.vector
+                        .authorized_visible_count_without_build(index, authorized, snapshot)
+                },
+            )?;
+            if visible > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn vector_search_disclosure_for_runtime(
+        &self,
+        index: VectorIndexRef,
+        k: usize,
+        restricted_candidates: bool,
+        candidates: Option<&PhysicalPlan>,
+        search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
+        query_expr: &Expr,
+        snapshot: SnapshotId,
+        params: &HashMap<String, Value>,
+        used_hnsw: bool,
+    ) -> Result<VectorSearchDisclosure> {
+        self.vector_search_disclosure(
+            &VectorExplainShape {
+                index,
+                k,
+                restricted_candidates,
+                candidates,
+                search_mode,
+                query_expr,
+            },
+            snapshot,
+            params,
+            Some(used_hnsw),
+        )
+    }
+
+    /// Describe a vector answer after the pull kernel has applied its
+    /// candidate and authorization source. The sorted ids are that source's
+    /// own output, so this path never rescans the relational table merely to
+    /// rediscover which rows the completed query was allowed to consider.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn completed_vector_search_disclosure(
+        &self,
+        index: VectorIndexRef,
+        k: usize,
+        restricted_candidates: bool,
+        candidates: Option<&PhysicalPlan>,
+        search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
+        query_expr: &Expr,
+        snapshot: SnapshotId,
+        params: &HashMap<String, Value>,
+        aggregate_allowed_vectors: usize,
+        authorized_sorted_ids: Option<&[u64]>,
+        used_hnsw: bool,
+    ) -> Result<VectorSearchDisclosure> {
+        let shape = VectorExplainShape {
+            index,
+            k,
+            restricted_candidates,
+            candidates,
+            search_mode,
+            query_expr,
+        };
+        let requested_mode = self.resolved_vector_search_mode(
+            &shape.index,
+            shape
+                .search_mode
+                .map(crate::executor::map_vector_search_mode),
+        )?;
+        let layout = self.vector_store.index_layout(&shape.index)?;
+        let policy = layout.resolve_policy(aggregate_allowed_vectors, shape.k);
+        let candidate_route =
+            crate::executor::vector_candidate_route(self, &shape.index, shape.candidates, params)?;
+        let partition_scope = &candidate_route.scope;
+        let filtered_exact =
+            requested_mode == contextdb_core::VectorSearchMode::Auto && !candidate_route.complete;
+        let resolved_mode = match requested_mode {
+            contextdb_core::VectorSearchMode::Auto if !used_hnsw => {
+                contextdb_core::VectorSearchMode::Exact
+            }
+            contextdb_core::VectorSearchMode::Auto
+                if aggregate_allowed_vectors < policy.auto_index_at =>
+            {
+                contextdb_core::VectorSearchMode::Exact
+            }
+            contextdb_core::VectorSearchMode::Auto => contextdb_core::VectorSearchMode::Indexed,
+            mode => mode,
+        };
+        let scope = match partition_scope
+            .as_ref()
+            .map(crate::executor::VectorPartitionScope::selected_partitions)
+        {
+            Some(1) => VectorSearchScopeShape::One,
+            Some(count) if count > 1 => VectorSearchScopeShape::Few,
+            _ => VectorSearchScopeShape::All,
+        };
+        let candidate_residual = vector_search_candidate_residual(&shape, &candidate_route);
+        let residual = if resolved_mode == contextdb_core::VectorSearchMode::Exact {
+            VectorSearchResidual::None
+        } else {
+            candidate_residual
+        };
+        let route = if resolved_mode == contextdb_core::VectorSearchMode::Exact
+            || (!used_hnsw && requested_mode == contextdb_core::VectorSearchMode::Auto)
+        {
+            VectorSearchRoute::Exact
+        } else if candidate_residual != VectorSearchResidual::None {
+            VectorSearchRoute::FilteredIndexed
+        } else {
+            VectorSearchRoute::Indexed
+        };
+        // HNSW publishes its detailed trace at the graph boundary. The exact
+        // bounded route has no graph result object to carry one, so publish
+        // the corresponding route receipt here when that completed decision
+        // is bound to the disclosure. This is observation only: maintenance
+        // and route selection have already finished.
+        if !used_hnsw {
+            self.last_vector_search_used_hnsw
+                .store(false, Ordering::SeqCst);
+            *self.last_vector_search_trace.write() = Some(VectorSearchDebugTrace {
+                index: shape.index.clone(),
+                used_hnsw: false,
+                hnsw_len: None,
+                hnsw_candidate_count: 0,
+                hnsw_candidate_row_ids: Vec::new(),
+                final_row_ids: Vec::new(),
+                supplemented_row_count: 0,
+                fallback_reason: Some(
+                    if requested_mode == contextdb_core::VectorSearchMode::Exact {
+                        "exact_requested"
+                    } else if filtered_exact {
+                        "filtered_route_exact"
+                    } else if aggregate_allowed_vectors < policy.auto_index_at {
+                        "aggregate_below_auto_index_at"
+                    } else {
+                        "maintained_index_unavailable"
+                    },
+                ),
+                hnsw_ef_search: None,
+                selected_generations: Vec::new(),
+            });
+        }
+        let layers = || {
+            self.vector
+                .graph_layer_presence_without_load_for_sorted_ids(
+                    &shape.index,
+                    authorized_sorted_ids,
+                    snapshot,
+                )
+        };
+        let (base, change, mut tail) = if let Some(prefixes) = partition_scope
+            .as_ref()
+            .and_then(crate::executor::VectorPartitionScope::resolved_prefixes)
+        {
+            contextdb_vector::mem::with_selected_partition_prefixes(
+                &shape.index,
+                prefixes.to_vec(),
+                layers,
+            )?
+        } else {
+            layers()?
+        };
+        let authorized_bitmap = match authorized_sorted_ids {
+            Some(ids) => Some(ids.iter().copied().collect()),
+            None => self.effective_read_candidates(&shape.index.table, snapshot, None)?,
+        };
+        tail |= self.vector_pending_tail_without_load(
+            &shape.index,
+            authorized_bitmap.as_ref(),
+            snapshot,
+            partition_scope
+                .as_ref()
+                .and_then(crate::executor::VectorPartitionScope::resolved_prefixes),
+        )?;
+        let partition_hnsw = self.vector_partition_hnsw_disclosure(
+            &shape.index,
+            shape.k,
+            authorized_bitmap.as_ref(),
+            snapshot,
+            partition_scope.as_ref(),
+        )?;
+        let fallback = if filtered_exact {
+            Some("filtered_route_exact".to_string())
+        } else if requested_mode == contextdb_core::VectorSearchMode::Auto
+            && aggregate_allowed_vectors < policy.auto_index_at
+        {
+            Some("aggregate_below_auto_index_at".to_string())
+        } else if requested_mode == contextdb_core::VectorSearchMode::Auto && !used_hnsw {
+            Some("maintained_index_unavailable".to_string())
+        } else {
+            None
+        };
+        Ok(VectorSearchDisclosure {
+            requested_mode,
+            resolved_mode,
+            aggregate_allowed_vectors: Some(aggregate_allowed_vectors),
+            effective_auto_index_at: policy.auto_index_at,
+            auto_index_at_source: policy.auto_index_at_source.to_owned(),
+            partition_key_columns: layout.partition_key_columns,
+            scope,
+            route: Some(route),
+            base: if base {
+                VectorSearchLayerPresence::Present
+            } else {
+                VectorSearchLayerPresence::Absent
+            },
+            change: if change {
+                VectorSearchLayerPresence::Present
+            } else {
+                VectorSearchLayerPresence::Absent
+            },
+            tail: if tail {
+                VectorSearchTailState::Present
+            } else {
+                VectorSearchTailState::Empty
+            },
+            residual,
+            fallback,
+            refusal: None,
+            recovery: None,
+            query_source: match shape.query_expr {
+                Expr::RowVectorSource { .. } => VectorQuerySourceDisclosure::RedactedRowKey,
+                Expr::Literal(_) | Expr::Parameter(_) => VectorQuerySourceDisclosure::Vector,
+                _ => VectorQuerySourceDisclosure::Unknown,
+            },
+            partition_hnsw,
+        })
     }
 
     fn vector_hnsw_strategy_for_explain(
         &self,
         shape: &VectorExplainShape,
         snapshot: SnapshotId,
-    ) -> bool {
-        if !self
-            .vector
-            .hnsw_eligible_without_build(&shape.index, snapshot)
+        params: &HashMap<String, Value>,
+    ) -> Result<bool> {
+        let authorized = self.vector_metadata_authorized_candidates(&shape.index, snapshot)?;
+        let candidate_route =
+            crate::executor::vector_candidate_route(self, &shape.index, shape.candidates, params)?;
+        let partition_scope = &candidate_route.scope;
+        let eligible = || {
+            self.vector
+                .hnsw_eligible_without_build(&shape.index, authorized.as_ref(), snapshot)
+        };
+        let eligible = if let Some(prefixes) = partition_scope
+            .as_ref()
+            .and_then(crate::executor::VectorPartitionScope::resolved_prefixes)
         {
-            return false;
-        }
-        !shape.restricted_candidates
-            || self
-                .vector
-                .hnsw_search_covers_all_without_build(&shape.index, shape.k)
+            contextdb_vector::mem::with_selected_partition_prefixes(
+                &shape.index,
+                prefixes.to_vec(),
+                eligible,
+            )
+        } else {
+            eligible()
+        };
+        // Candidate completeness is disclosed separately. An unbound,
+        // structurally covering key still reports its prepared route shape;
+        // lack of a binding is not loss of a maintained graph.
+        Ok(eligible)
     }
 
     pub fn execute_in_tx(
@@ -12894,10 +17311,11 @@ impl Database {
         // Registered for exactly this call's duration -- see
         // `SnapshotFloorRegistry`'s doc comment on `execute`. Fallible form,
         // same reason as `execute`'s own identical line.
+        let _membership_capture = self.relational_store.begin_membership_capture();
         let Some(read_snapshot) = self.try_snapshot_for_read() else {
             return Err(closed_database_error());
         };
-        let _snapshot_registration = self.snapshot_registry.register(read_snapshot);
+        let _snapshot_registration = self.snapshot_registry.register_statement(read_snapshot);
         let cached = self.cached_statement(sql);
         let parsed_stmt;
         let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
@@ -12948,7 +17366,9 @@ impl Database {
         } else {
             Some(self.open_operation_after_statement_callback_wait(stmt, "execute_in_tx")?)
         };
-        self.execute_statement_with_plan(stmt, sql, params, Some(tx), cached_plan, None)
+        self.with_snapshot_override(read_snapshot, || {
+            self.execute_statement_with_plan(stmt, sql, params, Some(tx), cached_plan, None)
+        })
     }
 
     /// Register a commit-time guard that requires the visible row selected by
@@ -13003,7 +17423,7 @@ impl Database {
         // naming that column could never fire -- which is indistinguishable to
         // the caller from a row that changed underneath.
         let mut guarded = [row];
-        self.supplement_rows_for_caller(table, &mut guarded);
+        self.supplement_rows_for_caller(table, &mut guarded)?;
         let [row] = guarded;
         if !predicates
             .iter()
@@ -13136,7 +17556,7 @@ impl Database {
                         row_bytes.saturating_add(retained_row_bytes_for_meta(
                             &row.values,
                             meta,
-                            false,
+                            true,
                         ))
                     });
                     bytes
@@ -13160,11 +17580,13 @@ impl Database {
                             "transactional schema projection lost affected table {table}"
                         ))
                     })?;
-                    Ok(RelationalStore::table_projection(
+                    let mut projection = RelationalStore::table_projection(
                         (*table).to_string(),
                         meta,
                         live_rows.get(*table).cloned().unwrap_or_default(),
-                    ))
+                    );
+                    projection.admit_current_memberships(self.accountant.clone())?;
+                    Ok(projection)
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -13390,13 +17812,14 @@ impl Database {
         #[cfg(feature = "test-seams")]
         let apply_started = std::cell::Cell::new(None::<Instant>);
         let delete_release_bytes = std::cell::RefCell::new(DeleteReleaseBytes::default());
+        let vector_snapshot_removal_guard = std::cell::RefCell::new(None::<ActiveRemovalPassGuard>);
         let sync_trigger_dispatch_required = source != CommitSource::SyncPull
             || self.has_matching_sync_trigger_for_tx(tx, sync_pull_trigger_audit_projection)?;
         let (lsn, ws) = {
             match self.tx_mgr.commit_with_lsn_active_prepare_and_applied_mut(
                 tx,
                 |lsn, visibility_tx| {
-                    // Statement 17b: transaction-local absence is never an ordinary DELETE event.
+                    // Transaction-local absence is never an ordinary DELETE event.
                     if !discard_selections.is_empty() {
                         self.tx_mgr.with_write_set(tx, |ws| {
                             ws.relational_deletes.retain(|(table, id, _)| {
@@ -13516,6 +17939,22 @@ impl Database {
                                 .saturating_add(outcome.conditional_noop_count),
                         );
                     }
+                    // The pass parks every read that arrives at a snapshot at or
+                    // before this commit's watermark until the apply is over, so
+                    // it is begun only when it can have an effect -- see
+                    // `write_set_could_empty_a_vector_partition`.
+                    let can_remove_vector_state =
+                        self.write_set_could_empty_a_vector_partition(tx)?;
+                    if can_remove_vector_state {
+                        let watermark = self.tx_mgr.current_tx_max();
+                        let committing_statement_registration =
+                            COMMITTING_STATEMENT_SNAPSHOT_REGISTRATION.with(std::cell::Cell::get);
+                        *vector_snapshot_removal_guard.borrow_mut() =
+                            Some(self.snapshot_registry.begin_removal_pass_excluding(
+                                watermark,
+                                committing_statement_registration,
+                            ));
+                    }
                     Ok(())
                 },
                 |ws| {
@@ -13561,6 +18000,22 @@ impl Database {
                                 .get()
                                 .saturating_add(final_validation.conditional_noop_count),
                         );
+                        let registered_snapshots = vector_snapshot_removal_guard
+                            .borrow()
+                            .as_ref()
+                            .map(|guard| guard.registered_snapshots.clone())
+                            .unwrap_or_default();
+                        if let Some(lsn) = ws.commit_lsn
+                            && self
+                                .vector_partition_snapshot_stages
+                                .lock()
+                                .insert(lsn, registered_snapshots)
+                                .is_some()
+                        {
+                            return Err(Error::Other(
+                                "vector snapshot stage already exists for commit LSN".to_string(),
+                            ));
+                        }
                         *committed_graph_arrivals.borrow_mut() = self.stage_pulled_graph_arrivals(
                             ws,
                             source == CommitSource::SyncPull
@@ -13699,7 +18154,7 @@ impl Database {
                         if let Some(stage) = self.take_local_schema_stage(lsn) {
                             self.publish_local_schema_stage(stage);
                         }
-                        // Statements 7/11/13: publish only the admitted custody keys.
+                        // Publish only the admitted custody keys.
                         if let Some(delta) = prepared_delivery_memory.borrow_mut().take() {
                             self.publish_custody_delta(delta);
                         }
@@ -13781,6 +18236,7 @@ impl Database {
                         let _ = self.take_received_schema_stage(lsn);
                         let _ = self.take_local_schema_stage(lsn);
                         self.local_erasure_stages.lock().remove(&lsn);
+                        self.vector_partition_snapshot_stages.lock().remove(&lsn);
                         let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
                         self.discard_staged_event_bus_ddl_commit(lsn);
                         self.discard_staged_trigger_ddl_commit(lsn);
@@ -13945,8 +18401,7 @@ impl Database {
     fn stop_pruning_thread(&self) {
         let handle = {
             let mut runtime = self.pruning_runtime.lock();
-            runtime.shutdown.store(true, Ordering::SeqCst);
-            let handle = runtime.handle.take();
+            let handle = runtime.request_shutdown_and_take_handle();
             runtime.shutdown = Arc::new(AtomicBool::new(false));
             handle
         };
@@ -14229,7 +18684,9 @@ impl Database {
         };
 
         if auto_commit {
-            self.commit_with_source(tx, CommitSource::AutoCommit)?;
+            self.with_current_statement_snapshot_excluded_from_terminal_commit(|| {
+                self.commit_with_source(tx, CommitSource::AutoCommit)
+            })?;
         }
 
         Ok(QueryResult::empty_with_affected(count))
@@ -14237,7 +18694,10 @@ impl Database {
 
     fn ddl_change_for_statement(&self, stmt: &Statement, tx: Option<TxId>) -> Option<DdlChange> {
         match stmt {
-            Statement::CreateTable(ct) => Some(ddl_change_from_create_table(ct)),
+            Statement::CreateTable(ct) => {
+                crate::executor::validate_create_table_vector_declarations(&ct.name, ct).ok()?;
+                Some(ddl_change_from_create_table(ct))
+            }
             Statement::DropTable(dt) => Some(DdlChange::DropTable {
                 name: dt.name.clone(),
             }),
@@ -14246,59 +18706,14 @@ impl Database {
                 // Simulate the alter action on a cloned meta to get post-alteration columns
                 match &at.action {
                     AlterAction::AddColumn(col) => {
-                        meta.columns.push(contextdb_core::ColumnDef {
-                            name: col.name.clone(),
-                            column_type: crate::executor::map_column_type(&col.data_type),
-                            nullable: col.nullable,
-                            primary_key: col.primary_key,
-                            unique: col.unique,
-                            default: col
-                                .default
-                                .as_ref()
-                                .map(crate::executor::stored_default_expr),
-                            references: col.references.as_ref().map(|reference| {
-                                contextdb_core::ForeignKeyReference {
-                                    table: reference.table.clone(),
-                                    column: reference.column.clone(),
-                                }
-                            }),
-                            expires: col.expires,
-                            immutable: col.immutable,
-                            quantization: match col.quantization {
-                                contextdb_parser::ast::VectorQuantization::F32 => {
-                                    contextdb_core::VectorQuantization::F32
-                                }
-                                contextdb_parser::ast::VectorQuantization::SQ8 => {
-                                    contextdb_core::VectorQuantization::SQ8
-                                }
-                                contextdb_parser::ast::VectorQuantization::SQ4 => {
-                                    contextdb_core::VectorQuantization::SQ4
-                                }
-                            },
-                            rank_policy: col
-                                .rank_policy
-                                .as_deref()
-                                .map(crate::executor::map_rank_policy),
-                            context_id: col.context_id,
-                            scope_label: col.scope_label.as_deref().map(|scope| match scope {
-                                contextdb_parser::ast::ScopeLabelConstraint::Simple { labels } => {
-                                    contextdb_core::ScopeLabelKind::Simple {
-                                        write_labels: labels.clone(),
-                                    }
-                                }
-                                contextdb_parser::ast::ScopeLabelConstraint::Split {
-                                    read,
-                                    write,
-                                } => contextdb_core::ScopeLabelKind::Split {
-                                    read_labels: read.clone(),
-                                    write_labels: write.clone(),
-                                },
-                            }),
-                            acl_ref: col.acl_ref.as_ref().map(|acl| contextdb_core::AclRef {
-                                ref_table: acl.ref_table.clone(),
-                                ref_column: acl.ref_column.clone(),
-                            }),
-                        });
+                        let rank_policy = col
+                            .rank_policy
+                            .as_deref()
+                            .map(crate::executor::map_rank_policy);
+                        let column =
+                            crate::executor::core_column_from_ast(&at.table, col, rank_policy)
+                                .ok()?;
+                        meta.columns.push(column);
                         if col.expires {
                             meta.expires_column = Some(col.name.clone());
                         }
@@ -14319,6 +18734,63 @@ impl Database {
                         if meta.expires_column.as_deref() == Some(from.as_str()) {
                             meta.expires_column = Some(to.clone());
                         }
+                    }
+                    AlterAction::SetVectorMaxPartitions {
+                        column,
+                        max_partitions,
+                    } => {
+                        crate::executor::set_vector_max_partitions(
+                            &at.table,
+                            column,
+                            max_partitions,
+                            &mut meta,
+                        )
+                        .ok()?;
+                    }
+                    AlterAction::SetVectorSearchMode {
+                        column,
+                        search_mode,
+                    } => {
+                        crate::executor::set_vector_search_mode(
+                            &at.table,
+                            column,
+                            *search_mode,
+                            &mut meta,
+                        )
+                        .ok()?;
+                    }
+                    AlterAction::SetVectorAutoIndexAt {
+                        column,
+                        auto_index_at,
+                    } => {
+                        crate::executor::set_vector_auto_index_at(
+                            &at.table,
+                            column,
+                            auto_index_at.as_deref(),
+                            &mut meta,
+                        )
+                        .ok()?;
+                    }
+                    AlterAction::SetVectorHnsw { column, hnsw } => {
+                        crate::executor::set_vector_hnsw(
+                            &at.table,
+                            column,
+                            hnsw.as_ref(),
+                            &mut meta,
+                        )
+                        .ok()?;
+                    }
+                    AlterAction::SetVectorConsolidation {
+                        column,
+                        consolidation,
+                    } => {
+                        crate::executor::set_vector_consolidation(
+                            &at.table,
+                            column,
+                            consolidation.as_ref(),
+                            &mut meta,
+                        )
+                        .ok()?;
                     }
                     AlterAction::SetRetain {
                         duration_seconds,
@@ -14366,6 +18838,7 @@ impl Database {
                         meta.conflict_policy = Some(*policy);
                     }
                 }
+                crate::executor::validate_vector_partition_declarations(&at.table, &meta).ok()?;
                 Some(DdlChange::AlterTable {
                     name: at.table.clone(),
                     columns: meta
@@ -14714,19 +19187,8 @@ impl Database {
         let mut values = values;
         let row_vectors = self.row_vector_values(table, &values);
         self.blank_quantized_vector_values(table, &mut values);
-        let inserted = match created_at {
-            Some(created_at) => self.relational.insert_with_row_id_at(
-                tx,
-                table,
-                row_id,
-                values,
-                self.snapshot(),
-                created_at,
-            ),
-            None => self
-                .relational
-                .insert_with_row_id(tx, table, row_id, values, self.snapshot()),
-        }?;
+        let inserted =
+            self.insert_synced_row_at(tx, table, row_id, values, self.snapshot(), created_at)?;
         self.write_row_vectors(tx, inserted, row_vectors)?;
         Ok(inserted)
     }
@@ -14859,14 +19321,29 @@ impl Database {
         created_at: Option<Wallclock>,
     ) -> Result<RowId> {
         self.validate_primary_key_values_present(table, &values)?;
-        match created_at {
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+        let row_bytes = self.admit_retained_row_bytes(
+            table,
+            &values,
+            &meta,
+            "sync",
+            "insert_received_row",
+            "Reduce sync batch size or raise MEMORY_LIMIT before receiving rows.",
+        )?;
+        let inserted = match created_at {
             Some(created_at) => self
                 .relational
                 .insert_with_row_id_at(tx, table, row_id, values, snapshot, created_at),
             None => self
                 .relational
                 .insert_with_row_id(tx, table, row_id, values, snapshot),
+        };
+        if inserted.is_err() {
+            self.accountant.release(row_bytes);
         }
+        inserted
     }
 
     /// Whether this table's row for `natural_key` currently holds a version
@@ -15179,16 +19656,6 @@ impl Database {
         }
     }
 
-    fn remove_lineage_record(&self, state: &mut InMemoryLineageState, key: &str) -> Result<()> {
-        match &self.persistence {
-            Some(persistence) => persistence.remove_config_value(key),
-            None => {
-                state.records.remove(key);
-                Ok(())
-            }
-        }
-    }
-
     fn list_lineage_records(
         &self,
         state: &InMemoryLineageState,
@@ -15263,7 +19730,11 @@ impl Database {
     ) -> Result<InMemoryLineageDelta> {
         let mut delta = InMemoryLineageDelta::default();
         for (key, value) in config_writes {
-            if key.starts_with("sync_creation_lineage.v1.") {
+            if key.starts_with(SYNC_PUSH_OUTCOME_PREFIX) {
+                delta
+                    .push_outcomes
+                    .insert(key.clone(), RedbPersistence::decode_config_value(value)?);
+            } else if key.starts_with("sync_creation_lineage.v1.") {
                 delta
                     .unbound_creations
                     .insert(key.clone(), RedbPersistence::decode_config_value(value)?);
@@ -15288,6 +19759,7 @@ impl Database {
         state.unbound_creations.extend(delta.unbound_creations);
         state.row_sidecars.extend(delta.row_sidecars);
         state.records.extend(delta.records);
+        state.push_outcomes.extend(delta.push_outcomes);
     }
 
     fn load_graph_arrivals_from_persistence(&self) -> Result<()> {
@@ -15918,6 +20390,7 @@ impl Database {
     }
 
     fn received_schema_replacement_bytes(
+        &self,
         tables: &HashMap<String, TableMeta>,
         rows: &HashMap<String, Vec<VersionedRow>>,
         edges: &[AdjEntry],
@@ -15930,16 +20403,22 @@ impl Database {
             let Some(meta) = tables.get(table) else {
                 return bytes;
             };
-            rows.iter().fold(bytes, |bytes, row| {
-                bytes.saturating_add(retained_row_bytes_for_meta(&row.values, meta, false))
-            })
+            rows.iter()
+                .filter(|row| {
+                    row.deleted_tx.is_none()
+                        || self.relational_store.is_retention_expired(
+                            table,
+                            row.row_id,
+                            row.created_tx,
+                        )
+                })
+                .fold(bytes, |bytes, row| {
+                    bytes.saturating_add(retained_row_bytes_for_meta(&row.values, meta, true))
+                })
         });
-        let edges = edges
-            .iter()
-            .filter(|edge| edge.deleted_tx.is_none())
-            .fold(0usize, |bytes, edge| {
-                bytes.saturating_add(edge.estimated_bytes())
-            });
+        let edges = edges.iter().fold(0usize, |bytes, edge| {
+            bytes.saturating_add(edge.estimated_bytes())
+        });
         metadata
             .saturating_add(rows)
             .saturating_add(edges)
@@ -15978,7 +20457,10 @@ impl Database {
     /// manager, memory accountant and row-id cursor: planning an authenticated
     /// schema unit must not reserve an ID, charge memory or touch a live
     /// receipt/terminal mirror before the real commit has succeeded.
-    fn detached_received_schema_working_database(&self) -> Result<Database> {
+    fn detached_received_schema_working_database(
+        &self,
+        projected_tables: &HashMap<String, TableMeta>,
+    ) -> Result<Database> {
         let working = Database::open_memory();
         let authoritative_table_generations =
             self.authoritative_table_generations_for_detached_working()?;
@@ -16027,7 +20509,7 @@ impl Database {
             for row in rows {
                 working
                     .relational_store
-                    .insert_loaded_row(table, row.clone());
+                    .insert_loaded_row(table, row.clone())?;
             }
         }
         working
@@ -16053,20 +20535,30 @@ impl Database {
         {
             working.graph_store.insert_loaded_edge(edge);
         }
-        // Schema planning must preserve empty vector indexes too. A purge can
-        // remove the final vector while the VECTOR column remains declared;
-        // cloning entries alone would then make the detached adjudicator
-        // reject the next authenticated vector as an unknown index.
-        for info in self.vector_store.index_infos() {
-            working.vector_store.register_or_reconfigure_empty_index(
-                info.index,
-                info.dimension,
-                info.quantization,
-            );
-        }
-        for vector in self.vector_store.all_entries() {
-            working.vector_store.insert_loaded_vector(vector);
-        }
+        // Schema planning must preserve empty vector declarations too. Build
+        // their complete layouts from the copied ColumnDefs. A registry entry
+        // whose declaration no longer exists is retired state, not schema;
+        // do not smuggle it into the detached image as an implicit index.
+        register_vector_layouts(&working.vector_store, &metadata)?;
+        register_vector_layouts(&working.vector_store, projected_tables)?;
+        let declared_vectors = self
+            .vector_store
+            .try_all_partitioned_entries()?
+            .into_iter()
+            .filter(|entry| {
+                projected_tables
+                    .get(&entry.entry.index.table)
+                    .is_some_and(|meta| {
+                        meta.columns.iter().any(|column| {
+                            column.name == entry.entry.index.column
+                                && matches!(column.column_type, ColumnType::Vector(_))
+                        })
+                    })
+            })
+            .collect();
+        working
+            .vector_store
+            .replace_loaded_partitioned_vectors(declared_vectors)?;
         *working.in_memory_table_generations.lock() = authoritative_table_generations;
         *working.in_memory_ddl_generations.lock() = self.in_memory_ddl_generations.lock().clone();
         *working.received_ddl_arrivals.write() = self.received_ddl_arrivals.read().clone();
@@ -16187,8 +20679,9 @@ impl Database {
         );
         let inserted_vectors = finalized.vector_inserts.clone();
         let deleted_vectors = finalized.vector_deletes.clone();
-        let mut vectors = working.vector_store.all_entries();
-        for entry in &mut vectors {
+        let mut vectors = working.vector_store.try_all_partitioned_entries()?;
+        for partitioned in &mut vectors {
+            let entry = &mut partitioned.entry;
             if let Some(replacement) = inserted_vectors.iter().find(|replacement| {
                 replacement.index == entry.index && replacement.row_id == entry.row_id
             }) {
@@ -16201,7 +20694,9 @@ impl Database {
                 entry.deleted_tx = Some(local_tx);
             }
         }
-        working.vector_store.replace_loaded_vectors(vectors);
+        working
+            .vector_store
+            .replace_loaded_partitioned_vectors(vectors)?;
         let deleted_row_ids = finalized
             .relational_deletes
             .iter()
@@ -16224,6 +20719,12 @@ impl Database {
             }
         }
         for (key, bytes) in &mut finalized.config_writes {
+            if key.starts_with(SYNC_PUSH_OUTCOME_PREFIX) {
+                let mut result: DurableSyncPushOutcome =
+                    RedbPersistence::decode_config_value(bytes)?;
+                result.result.new_lsn = local_lsn;
+                *bytes = RedbPersistence::encode_config_value(&result)?;
+            }
             if key.starts_with("sync_lineage.v1.")
                 && let Ok(mut record) =
                     RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes)
@@ -16256,6 +20757,7 @@ impl Database {
             received,
             validated_lineages,
             ReceivedSchemaAdjudicationInputs {
+                push_outcome_key: None,
                 apply_role: SyncApplyRole::PullLeg,
                 arrivals: &arrivals,
                 adoption: SyncAdoption::Continuing,
@@ -16297,6 +20799,11 @@ impl Database {
     ) -> Result<ReceivedSchemaStage> {
         let (source_order, mut persistence) =
             plan_received_schema_source_order(local_lsn, &changes.ddl, &changes.ddl_lsn, received)?;
+        // Vector mutations in this received unit are adjudicated against the
+        // schema produced by the same authenticated DDL vector. Register that
+        // projected layout on the private working image before replaying the
+        // rows/vectors; publication still remains staged and atomic.
+        let side_semantic = self.project_received_schema_source_order(&changes.ddl)?;
         let local_ddl_log_before_extension = self.ddl_log.read().clone();
         // Schema this node authored before the vector arrived, which the
         // vector itself restates, stops being outbound work. The comparison
@@ -16317,7 +20824,8 @@ impl Database {
         ddl_log_replacement.extend(persistence.ddl_log_replacement);
         persistence.ddl_log_replacement = ddl_log_replacement;
         self.validate_received_schema_lineage_sidecars(changes, validated_lineages)?;
-        let working = self.detached_received_schema_working_database()?;
+        let working = self.detached_received_schema_working_database(&side_semantic.tables)?;
+        register_vector_layouts(&working.vector_store, &side_semantic.tables)?;
         // The detached row/table image starts with no event-bus state. Seed it
         // from the receiver before replaying authenticated DDL so a later
         // source-ordered route can be idempotent against independently
@@ -16346,6 +20854,7 @@ impl Database {
             validated_lineages,
             true,
             None,
+            inputs.push_outcome_key,
         )?;
         let mut finalized_write_set = working
             .detached_sync_write_set
@@ -16404,7 +20913,6 @@ impl Database {
         // definitions in exact authored DDL order. The detached database is
         // authoritative for rows/tables, but begins without retained
         // event/trigger definitions.
-        let side_semantic = self.project_received_schema_source_order(&changes.ddl)?;
         let semantic = ReceivedSchemaSemanticProjection {
             tables: working.relational_store.table_meta.read().clone(),
             event_bus: side_semantic.event_bus,
@@ -16481,9 +20989,10 @@ impl Database {
                 RelationalStore::with_sync_sources(projection, sources)
             })
             .collect();
-        let relational = self
+        let mut relational = self
             .relational_store
             .prepare_received_schema_publication(projections, dropped_tables);
+        relational.admit_current_memberships(self.accountant.clone())?;
 
         let edges = working
             .graph_store
@@ -16500,52 +21009,98 @@ impl Database {
         // detached DDL lifecycle may enter the prepared image.
         let vectors = working
             .vector_store
-            .all_entries()
+            .try_all_partitioned_entries()?
             .into_iter()
+            .filter(|entry| entry.entry.deleted_tx.is_none())
             .filter(|entry| {
-                semantic.tables.get(&entry.index.table).is_some_and(|meta| {
-                    meta.columns.iter().any(|column| {
-                        column.name == entry.index.column
-                            && matches!(column.column_type, ColumnType::Vector(_))
+                prepared_rows_for_memory
+                    .get(&entry.entry.index.table)
+                    .is_some_and(|rows| {
+                        rows.iter()
+                            .any(|row| row.row_id == entry.entry.row_id && row.deleted_tx.is_none())
                     })
+            })
+            .filter(|entry| {
+                semantic
+                    .tables
+                    .get(&entry.entry.index.table)
+                    .is_some_and(|meta| {
+                        meta.columns.iter().any(|column| {
+                            column.name == entry.entry.index.column
+                                && matches!(column.column_type, ColumnType::Vector(_))
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let vector_natural_keys = prepared_rows_for_memory
+            .iter()
+            .flat_map(|(table, rows)| {
+                let meta = semantic.tables.get(table);
+                rows.iter().filter_map(move |row| {
+                    let natural_key =
+                        meta.and_then(|meta| natural_key_from_row_values(meta, &row.values))?;
+                    Some((
+                        (table.clone(), row.row_id),
+                        sync_identity_key(table, &natural_key),
+                    ))
                 })
             })
-            .collect::<Vec<_>>();
-        let schemas = semantic
-            .tables
-            .iter()
-            .flat_map(|(table, meta)| {
-                meta.columns
-                    .iter()
-                    .filter_map(move |column| match column.column_type {
-                        ColumnType::Vector(dimension) => Some((
-                            VectorIndexRef::new(table.clone(), column.name.clone()),
-                            dimension,
-                            column.quantization,
-                        )),
-                        _ => None,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let new_vector_bytes = vectors
-            .iter()
-            .filter(|entry| entry.deleted_tx.is_none())
-            .fold(0usize, |bytes, entry| {
-                let quantization = schemas
-                    .iter()
-                    .find(|(index, _, _)| *index == entry.index)
-                    .map(|(_, _, quantization)| *quantization)
-                    .unwrap_or(VectorQuantization::F32);
-                bytes.saturating_add(quantization.storage_bytes(entry.vector.len()))
+            .collect::<HashMap<_, _>>();
+        let mut current_vectors =
+            HashMap::<(VectorIndexRef, Vec<u8>), PartitionedVectorEntry>::new();
+        for entry in vectors {
+            let Some(natural_key) =
+                vector_natural_keys.get(&(entry.entry.index.table.clone(), entry.entry.row_id))
+            else {
+                continue;
+            };
+            let identity = (entry.entry.index.clone(), natural_key.clone());
+            let replace = current_vectors.get(&identity).is_none_or(|current| {
+                (entry.entry.created_tx, entry.entry.lsn)
+                    > (current.entry.created_tx, current.entry.lsn)
             });
-        let new_bytes = Self::received_schema_replacement_bytes(
+            if replace {
+                current_vectors.insert(identity, entry);
+            }
+        }
+        let mut vectors = current_vectors.into_values().collect::<Vec<_>>();
+        vectors.sort_by(|left, right| {
+            left.entry
+                .index
+                .table
+                .cmp(&right.entry.index.table)
+                .then(left.entry.index.column.cmp(&right.entry.index.column))
+                .then(left.partition_key.cmp(&right.partition_key))
+                .then(left.entry.row_id.cmp(&right.entry.row_id))
+        });
+        for entry in &mut vectors {
+            if let Some(finalized) =
+                finalized_write_set
+                    .vector_inserts
+                    .iter()
+                    .rev()
+                    .find(|candidate| {
+                        candidate.index == entry.entry.index
+                            && candidate.row_id == entry.entry.row_id
+                    })
+            {
+                entry.entry = finalized.clone();
+            }
+        }
+        let schemas = vector_layouts_from_meta(&semantic.tables);
+        let durable_vectors = vectors
+            .iter()
+            .map(|entry| entry.entry.clone())
+            .collect::<Vec<_>>();
+        let vector =
+            VectorStore::prepare_partitioned_received_schema_publication(schemas, vectors)?;
+        let new_vector_bytes = vector.memory_swap_vector_bytes();
+        let new_bytes = self.received_schema_replacement_bytes(
             &semantic.tables,
             &prepared_rows_for_memory,
             &edges,
             new_vector_bytes,
         );
-        let durable_vectors = vectors.clone();
-        let vector = VectorStore::prepare_received_schema_publication(schemas, vectors);
 
         let old_tables = self.relational_store.table_meta.read().clone();
         let old_rows = self.relational_store.tables.read().clone();
@@ -16560,21 +21115,7 @@ impl Database {
         let old_vector_bytes = old_vector_infos
             .iter()
             .fold(0usize, |bytes, info| bytes.saturating_add(info.bytes));
-        let old_vector_payload_bytes = self
-            .vector_store
-            .all_entries()
-            .iter()
-            .filter(|entry| entry.deleted_tx.is_none())
-            .fold(0usize, |bytes, entry| {
-                let quantization = old_vector_infos
-                    .iter()
-                    .find(|info| info.index == entry.index)
-                    .map(|info| info.quantization)
-                    .unwrap_or(VectorQuantization::F32);
-                bytes.saturating_add(quantization.storage_bytes(entry.vector.len()))
-            });
-        let retired_hnsw_bytes = old_vector_bytes.saturating_sub(old_vector_payload_bytes);
-        let old_bytes = Self::received_schema_replacement_bytes(
+        let old_bytes = self.received_schema_replacement_bytes(
             &old_tables,
             &old_rows,
             &old_edges,
@@ -16584,7 +21125,7 @@ impl Database {
             self.accountant.clone(),
             old_bytes,
             new_bytes,
-            retired_hnsw_bytes,
+            old_vector_bytes,
         )?;
         let queue_mutation_lease = self.event_bus.begin_queue_mutation();
         let event_bus =
@@ -16685,6 +21226,15 @@ impl Database {
             config_max_u64_keys: persistence.config_max_u64_keys.clone(),
             structurally_dropped_tables: structurally_dropped_tables.clone(),
         };
+        #[cfg(any(test, feature = "test-seams"))]
+        if take_vector_memory_fault(
+            &RECEIVED_VECTOR_IMAGE_FAILURE_ARMED,
+            &RECEIVED_VECTOR_IMAGE_FAILURE_CONSUMED,
+        ) {
+            return Err(Error::Other(
+                "injected received vector image prepublication failure".to_string(),
+            ));
+        }
         Ok(ReceivedSchemaStage {
             custody_memory,
             source_order,
@@ -16733,7 +21283,7 @@ impl Database {
     /// the matching Redb transaction started.
     #[allow(dead_code)]
     fn publish_received_schema_stage(&self, mut stage: ReceivedSchemaStage) {
-        // Statements 9/11: the schema/unit boundary publishes the same metadata delta.
+        // The schema/unit boundary publishes the same metadata delta.
         if let Some(delta) = stage.custody_memory.take() {
             self.publish_custody_delta(delta);
         }
@@ -16762,7 +21312,9 @@ impl Database {
         self.graph_store
             .publish_prepared_received_schema(stage.graph);
         self.vector_store
-            .publish_prepared_received_schema(stage.vector, &*self.accountant);
+            .publish_prepared_received_schema(stage.vector, self.accountant.clone());
+        self.received_vector_image_pending
+            .store(true, Ordering::SeqCst);
         self.publish_prepared_event_bus_publication_under_queue_mutation_lease(
             stage.event_bus,
             stage.sink_events,
@@ -16831,6 +21383,7 @@ impl Database {
         terminal_refusal_context: Option<&TerminalRefusalPullContext>,
         hub_local_author: Option<&str>,
         mut delivery_prepare: Option<&mut crate::custody::preparation::CommitPreparation<'_>>,
+        push_outcome_key: Option<&SyncPushOutcomeContext>,
         apply_preflight: F,
         after_stage_registration: G,
     ) -> Result<crate::protocol::WireApplyResult>
@@ -16842,6 +21395,17 @@ impl Database {
         if let ReceivedSchemaManifestClassification::Replay(result) =
             self.classify_received_schema_manifest(received)?
         {
+            if let (Some(receipt), Some(context)) = (receipt.as_ref(), push_outcome_key) {
+                // The original schema vector is already durable. Preserve its
+                // actual acceptance position when binding this retry.
+                let mut context = context.clone();
+                context.committed_lsn = Some(result.new_lsn);
+                self.commit_sync_apply_outcome_only(
+                    receipt,
+                    Some(&context),
+                    &result.clone().into(),
+                )?;
+            }
             return Ok(result);
         }
         apply_preflight()?;
@@ -16867,6 +21431,7 @@ impl Database {
                         received,
                         validated_lineages,
                         ReceivedSchemaAdjudicationInputs {
+                            push_outcome_key,
                             apply_role,
                             arrivals,
                             adoption,
@@ -16954,6 +21519,7 @@ impl Database {
             None,
             None,
             None,
+            None,
             || Ok(()),
             || {
                 if fail_after_stage_registration {
@@ -17023,7 +21589,7 @@ impl Database {
     ) -> Result<()> {
         if lineage.attestation.is_empty() {
             return Err(Error::SyncError(
-                "protocol v6 row lineage is missing its creator signature".to_string(),
+                "authenticated row lineage is missing its creator signature".to_string(),
             ));
         }
         let bytes = Self::lineage_attestation_bytes(
@@ -17080,6 +21646,16 @@ impl Database {
             return Ok(());
         };
         self.stamp_durable_delete_positions_at_commit(ws)?;
+        for (key, encoded) in &mut ws.config_writes {
+            if key.starts_with(SYNC_PUSH_OUTCOME_PREFIX) {
+                let mut result: DurableSyncPushOutcome =
+                    RedbPersistence::decode_config_value(encoded)?;
+                if result.result.new_lsn == Lsn(0) {
+                    result.result.new_lsn = lsn;
+                }
+                *encoded = RedbPersistence::encode_config_value(&result)?;
+            }
+        }
         let mut creation_positions = HashMap::new();
         for (key, encoded) in &mut ws.config_writes {
             if !key.starts_with("sync_creation_lineage.v1.") {
@@ -17190,7 +21766,7 @@ impl Database {
                 .find(|(k, _)| k == &creation_key)
                 .map(|(_, bytes)| RedbPersistence::decode_config_value(bytes))
                 .transpose()?;
-            // Statements 6/14: offline roots still get their real transaction's creator evidence.
+            // Offline roots still get their real transaction's creator evidence.
             let creation = creation.or_else(|| {
                 (meta.sync_direction == Some(contextdb_core::SyncDirection::None)).then(|| {
                     DurableUnboundCreationLineage {
@@ -18103,7 +22679,7 @@ impl Database {
                 .collect::<Vec<_>>();
             if matching.len() != 1 {
                 return Err(Error::SyncError(format!(
-                    "protocol v6 requires exactly one lineage for {} {:?} at source LSN {}",
+                    "authenticated sync requires exactly one lineage for {} {:?} at source LSN {}",
                     row.table, row.natural_key, row.lsn.0
                 )));
             }
@@ -18135,7 +22711,7 @@ impl Database {
         Ok(())
     }
 
-    /// Validate the amended-v6 provenance before any row mutation. Every data
+    /// Validate authenticated provenance before any row mutation. Every data
     /// row has exactly one full-identity sidecar, its root must be the creator
     /// tuple's canonical root, and its table generation must still be live.
     pub(crate) fn validate_received_row_lineages(
@@ -18378,7 +22954,7 @@ impl Database {
         changes: ChangeSet,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
     ) -> Result<PurgedLineageRefusal> {
-        // Statement 17: the purge journal retains every known source lineage,
+        // The purge journal retains every known source lineage,
         // while the local lifecycle record names the materialized incumbent.
         let purged_copies = self.authoritative_purge_delivery_items_since(Lsn(0))?;
         let projected_meta = self.projected_sync_table_meta(&changes.ddl);
@@ -18508,7 +23084,7 @@ impl Database {
                 .collect::<Vec<_>>();
             if matching.len() != 1 {
                 return Err(Error::SyncError(format!(
-                    "protocol v6 requires exactly one lineage for {} {:?} at source LSN {}",
+                    "authenticated sync requires exactly one lineage for {} {:?} at source LSN {}",
                     row.table, row.natural_key, row.lsn.0
                 )));
             }
@@ -18544,7 +23120,7 @@ impl Database {
                 .collect::<Vec<_>>();
             if matching.len() != 1 {
                 return Err(Error::SyncError(format!(
-                    "protocol v6 requires exactly one lineage for {} {:?} at source LSN {}",
+                    "authenticated sync requires exactly one lineage for {} {:?} at source LSN {}",
                     row.table, row.natural_key, row.lsn.0
                 )));
             }
@@ -18606,13 +23182,31 @@ impl Database {
         receipt: SyncApplyReceipt,
         row_count: usize,
         conflicts: Vec<Conflict>,
+        outcome_key: &SyncPushOutcomeKey,
     ) -> Result<ApplyResult> {
+        let push_lock = self.sync_push_apply_lock_for_key(outcome_key);
+        let _push_apply = push_lock.lock();
+        if let Some(result) = self.replay_sync_push_outcome(outcome_key)? {
+            return Ok(result);
+        }
         if row_count == 0 || conflicts.len() != row_count {
             return Err(Error::SyncError(
                 "terminal sync refusal receipt must cover every transmitted row".to_string(),
             ));
         }
-        self.commit_sync_apply_receipt_only(&receipt)?;
+        let result = ApplyResult {
+            applied_rows: 0,
+            skipped_rows: row_count,
+            conflicts,
+            new_lsn: self.current_lsn(),
+        };
+        let context = SyncPushOutcomeContext {
+            key: outcome_key.clone(),
+            committed_lsn: None,
+            refused_rows: 0,
+            conflicts: Vec::new(),
+        };
+        self.commit_sync_apply_outcome_only(&receipt, Some(&context), &result)?;
         if self.persistence.is_none() {
             let key = Self::applied_push_watermark_node_incarnation_key(
                 &receipt.tenant_id,
@@ -18625,12 +23219,32 @@ impl Database {
                 .and_modify(|current| *current = (*current).max(receipt.source_lsn))
                 .or_insert(receipt.source_lsn);
         }
-        Ok(ApplyResult {
-            applied_rows: 0,
-            skipped_rows: row_count,
-            conflicts,
-            new_lsn: self.current_lsn(),
+        self.replay_sync_push_outcome(outcome_key)?.ok_or_else(|| {
+            Error::SyncError("terminal push omitted its durable apply outcome".to_string())
         })
+    }
+
+    /// Capabilities needed to replay this table's authored schema history.
+    /// Current metadata alone cannot release an immutable CREATE/ALTER vector.
+    #[cfg(feature = "sync-orchestration")]
+    pub(crate) fn authored_schema_capabilities(
+        &self,
+        table: &str,
+    ) -> BTreeSet<crate::sync_types::SchemaSyncCapability> {
+        let mut capabilities = BTreeSet::new();
+        for (_, ddl) in self.ddl_log.read().iter() {
+            if let DdlChange::CreateTable { name, columns, .. }
+            | DdlChange::AlterTable { name, columns, .. } = ddl
+                && name == table
+            {
+                let columns = columns
+                    .iter()
+                    .map(|(name, text)| rough_sync_column_def(name, text))
+                    .collect::<Vec<_>>();
+                capabilities.extend(crate::sync_server::schema_capabilities_in_columns(&columns));
+            }
+        }
+        capabilities
     }
 
     fn changeset_is_wholly_empty(changes: &ChangeSet) -> bool {
@@ -18816,7 +23430,7 @@ impl Database {
                     // A pre-provenance durable delete cannot prove a new
                     // same-key lineage.  Its absent creator is the frozen
                     // compatibility default and safely rejects an absent or
-                    // root-equal replay until a v6 creator root differs.
+                    // root-equal replay until a creator root differs.
                     _ => true,
                 };
                 lineage.lineage_root == record.lineage_root && creator_matches
@@ -19189,6 +23803,7 @@ impl Database {
     }
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     fn record_durable_delete_acceptance(
         &self,
         rows: &[RowChange],
@@ -19214,26 +23829,6 @@ impl Database {
             record.accepted_hub_lsn = Some(hub_lsn.0);
             record.bound_hub_node_id = hub_node_id.map(ToOwned::to_owned);
             self.store_lineage_record(&mut lineage_state, &key, &record)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn retire_durable_delete_obligations(&self, rows: &[RowChange]) -> Result<()> {
-        let mut lineage_state = self.lineage_state_lock.lock();
-        for row in rows.iter().filter(|row| row.deleted) {
-            let key = Self::durable_lineage_config_key(
-                &row.table,
-                &row.natural_key,
-                self.durable_lineage_table_generation(&row.table)?,
-            );
-            let Some(record) = self.load_lineage_record(&lineage_state, &key)? else {
-                continue;
-            };
-            if record.delete_lsn == row.lsn.0
-                && record.delete_obligation == DurableDeleteObligation::Pending
-            {
-                self.remove_lineage_record(&mut lineage_state, &key)?;
-            }
         }
         Ok(())
     }
@@ -19308,6 +23903,7 @@ impl Database {
     }
 
     sync_test_seam! {
+    #[cfg(any(test, feature = "test-seams"))]
     /// Persist the accepting hub's order after a push acknowledgement. The
     /// acknowledgement's existing `ApplyResult::new_lsn` is the hub commit
     /// position, so no wire field is needed. The commit lock makes the
@@ -19432,6 +24028,7 @@ impl Database {
         })
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn record_hub_push_reply_effects_while_authoritative(
         &self,
         tenant_id: &TenantId,
@@ -19441,27 +24038,165 @@ impl Database {
         accepted_rows: &[RowChange],
         hub_lsn: Lsn,
     ) -> Result<()> {
-        if !ordinary_refused_rows.is_empty() {
+        self.commit_hub_push_reply_while_authoritative(
+            tenant_id, hub_node_id, ordinary_refused_rows, purge_refused_rows, accepted_rows,
+            hub_lsn, None, None,
+        )
+    }
+
+    /// One authoritative reply retires only its exact source versions. Its
+    /// refusal markers, accepted ordering, delete lifecycle and push progress
+    /// become durable together before any memory state is published.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_hub_push_reply_while_authoritative(
+        &self,
+        tenant_id: &TenantId,
+        hub_node_id: &str,
+        ordinary_refused_rows: &[RowChange],
+        purge_refused_rows: &[RowChange],
+        accepted_rows: &[RowChange],
+        hub_lsn: Lsn,
+        confirmed_through: Option<Lsn>,
+        pending: Option<(Lsn, &ApplyResult)>,
+    ) -> Result<()> {
+        self.with_commit_lock(|| {
+            let snapshot = self.snapshot();
+            let no_deleted = HashSet::new();
             let context = TerminalRefusalPullContext {
-                tenant_id: tenant_id.clone(),
-                hub_node_id: hub_node_id.to_string(),
-                generation: 0,
+                tenant_id: tenant_id.clone(), hub_node_id: hub_node_id.to_string(), generation: 0,
             };
-            self.record_terminal_refusal_markers(&context, ordinary_refused_rows)?;
-        }
-        let refused_deletes = ordinary_refused_rows
-            .iter()
-            .chain(purge_refused_rows)
-            .filter(|row| row.deleted)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !refused_deletes.is_empty() {
-            self.retire_durable_delete_obligations(&refused_deletes)?;
-        }
-        if !accepted_rows.is_empty() {
-            self.record_hub_accepted_rows(accepted_rows, hub_lsn, Some(hub_node_id))?;
+            let context_key = Self::terminal_refusal_context_key(&context);
+            let mut scans = self.terminal_refusal_scans.write();
+            let mut lineage = self.lineage_state_lock.lock();
+            let prior_scan = scans.get(&context_key).cloned().or(
+                self.persistence.as_ref().map(|p| p.load_config_value::<TerminalRefusalScanState>(
+                    &Self::terminal_refusal_scan_config_key(&context),
+                )).transpose()?.flatten(),
+            );
+            let generation = prior_scan.map_or(1, |scan| scan.generation.saturating_add(1));
+            let mut writes = Vec::new();
+            let mut deletes = Vec::new();
+            let mut refused_markers = Vec::new();
+            let mut accepted_deletes = Vec::new();
+            let mut sources = Vec::new();
+            let mut tombstones = Vec::new();
+            for row in ordinary_refused_rows {
+                if !self.table_meta(&row.table).is_some_and(|meta|
+                    matches!(crate::executor::effective_sync_direction(&meta), SyncDirection::Pull | SyncDirection::Both)) {
+                    continue;
+                }
+                let current = self.visible_row_by_natural_key(&row.table, &row.natural_key, snapshot, &no_deleted)?;
+                let row_id = match current {
+                    Some(current) if !row.deleted && current.lsn == row.lsn => Some(current.row_id),
+                    None if row.deleted => self.row_id_for_delete_change(row),
+                    _ => None,
+                };
+                if let Some(row_id) = row_id {
+                    let record = TerminalRefusalMarkerRecord {
+                        table: row.table.clone(), natural_key: row.natural_key.clone(),
+                        lsn: row.lsn.0, row_id: row_id.0, active: true, generation,
+                    };
+                    writes.push((Self::terminal_refusal_marker_config_key(&context, &row.table, &row.natural_key),
+                        RedbPersistence::encode_config_value(&record)?));
+                    refused_markers.push((Self::terminal_refusal_marker_key(&context, &row.table, &row.natural_key), record));
+                }
+            }
+            let reset_scan = TerminalRefusalScanState { source: None, next_lsn: Lsn(0), active: false, generation };
+            if !refused_markers.is_empty() {
+                writes.push((Self::terminal_refusal_scan_config_key(&context), RedbPersistence::encode_config_value(&reset_scan)?));
+            }
+            for row in ordinary_refused_rows.iter().chain(purge_refused_rows).filter(|row| row.deleted) {
+                let key = Self::durable_lineage_config_key(&row.table, &row.natural_key,
+                    self.durable_lineage_table_generation(&row.table)?);
+                if self.load_lineage_record(&lineage, &key)?.is_some_and(|record|
+                    record.delete_lsn == row.lsn.0 && record.delete_obligation == DurableDeleteObligation::Pending) {
+                    deletes.push(key);
+                }
+            }
+            for row in accepted_rows {
+                let current = self.visible_row_by_natural_key(&row.table, &row.natural_key, snapshot, &no_deleted)?;
+                if row.deleted {
+                    let key = Self::durable_lineage_config_key(&row.table, &row.natural_key,
+                        self.durable_lineage_table_generation(&row.table)?);
+                    if let Some(mut record) = self.load_lineage_record(&lineage, &key)?
+                        && record.delete_lsn == row.lsn.0 && record.delete_obligation == DurableDeleteObligation::Pending {
+                        record.delete_obligation = DurableDeleteObligation::Accepted;
+                        record.accepted_hub_lsn = Some(hub_lsn.0);
+                        record.bound_hub_node_id = Some(hub_node_id.to_string());
+                        writes.push((key.clone(), RedbPersistence::encode_config_value(&record)?));
+                        accepted_deletes.push((key, record));
+                    }
+                    if current.is_none() {
+                        tombstones.push((Self::sync_tombstone_key(&row.table, &row.natural_key), SyncTombstoneArrival {
+                            arrival: hub_lsn, delete_lsn: row.lsn, row_id: self.row_id_for_delete_change(row),
+                            kind: contextdb_relational::store::SyncSourceKind::AcceptedLocal,
+                            accepted_local_order_invalidated: false,
+                        }));
+                    }
+                } else if let Some(current) = current && current.lsn == row.lsn {
+                    sources.push((row.table.clone(), current.row_id, hub_lsn, 1));
+                }
+            }
+            if let Some(through) = confirmed_through {
+                writes.push((tenant_id.config_key("sync_push_watermark"), RedbPersistence::encode_config_value(&through.0)?));
+            }
+            if let Some((through, result)) = pending {
+                writes.push((tenant_id.config_key("sync_pending_push_confirmation"), RedbPersistence::encode_config_value(&through.0)?));
+                writes.push((tenant_id.config_key("sync_pending_push_result"), RedbPersistence::encode_config_value(&crate::protocol::WireApplyResult::from(result.clone()))?));
+            }
+            if let Some(persistence) = &self.persistence {
+                persistence.commit_sync_reply_effects(&sources, &writes, &deletes)?;
+            } else {
+                for key in &deletes { lineage.records.remove(key); }
+                lineage.records.extend(accepted_deletes);
+                let mut progress = self.in_memory_sync_progress.lock();
+                let progress = progress.tenants.entry(tenant_id.as_str().to_string()).or_default();
+                if let Some(through) = confirmed_through { progress.push_watermark = through; }
+                if let Some((through, result)) = pending {
+                    progress.pending_push_confirmation = Some(through);
+                    progress.pending_push_result = Some(result.clone().into());
+                }
+            }
+            self.relational_store.set_sync_source_lsns(sources.iter().map(|(table, row, lsn, _)| (table.clone(), *row, *lsn)).collect::<Vec<_>>());
+            self.relational_store.set_sync_source_kinds(sources.into_iter().map(|(table, row, _, _)|
+                (table, row, contextdb_relational::store::SyncSourceKind::AcceptedLocal)));
+            self.sync_tombstone_arrivals.write().extend(tombstones);
+            if !refused_markers.is_empty() {
+                self.terminal_refusal_markers.write().extend(refused_markers);
+                scans.insert(context_key, reset_scan);
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn complete_sync_push_confirmation_while_authoritative(
+        &self, tenant_id: &TenantId, through: Lsn,
+    ) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            persistence.commit_sync_reply_effects(&[], &[
+                (tenant_id.config_key("sync_push_watermark"), RedbPersistence::encode_config_value(&through.0)?),
+            ], &[
+                tenant_id.config_key("sync_pending_push_confirmation"),
+                tenant_id.config_key("sync_pending_push_result"),
+            ])?;
+        } else {
+            let mut progress = self.in_memory_sync_progress.lock();
+            let progress = progress.tenants.entry(tenant_id.as_str().to_string()).or_default();
+            progress.push_watermark = through;
+            progress.pending_push_confirmation = None;
+            progress.pending_push_result = None;
         }
         Ok(())
+    }
+
+    pub(crate) fn persisted_sync_pending_push_result(&self, tenant_id: &TenantId) -> Result<Option<ApplyResult>> {
+        let result = if let Some(persistence) = &self.persistence {
+            persistence.load_config_value::<crate::protocol::WireApplyResult>(&tenant_id.config_key("sync_pending_push_result"))?
+        } else {
+            self.in_memory_sync_progress.lock().tenants.get(tenant_id.as_str())
+                .and_then(|progress| progress.pending_push_result.clone())
+        };
+        Ok(result.map(Into::into))
     }
 
     /// Serialize every state change derived from one authenticated hub reply
@@ -19661,7 +24396,8 @@ impl Database {
                                 && through_inclusive.is_none_or(|through| row.lsn <= through)
                                 && !matches!(
                                     self.relational_store.sync_source_kind(table, row.row_id),
-                                    Some(contextdb_relational::store::SyncSourceKind::Pulled)
+                                    Some(contextdb_relational::store::SyncSourceKind::Pulled
+                                        | contextdb_relational::store::SyncSourceKind::AcceptedLocal)
                                 )
                         })
                         .map(|row| (table.clone(), row.row_id, row.lsn))
@@ -19750,12 +24486,121 @@ impl Database {
     }
     }
 
+    pub(crate) fn reconciled_push_rows_have_arrivals(
+        &self,
+        changes: &ChangeSet,
+        lineages: &OutboundRowLineages,
+    ) -> Result<bool> {
+        let _operation = self.open_operation()?;
+        for row in &changes.rows {
+            if row.deleted {
+                return Ok(false);
+            }
+            let key = rmp_serde::to_vec(&row.natural_key)
+                .map_err(|error| Error::SyncError(error.to_string()))?;
+            let Some(_expected) = lineages.get(&(row.table.clone(), key, row.lsn)) else {
+                return Ok(false);
+            };
+            let meta = self.table_meta(&row.table);
+            let confirmed = self
+                .relational_store
+                .tables
+                .read()
+                .get(&row.table)
+                .is_some_and(|rows| {
+                    rows.iter().any(|local| {
+                        local.lsn == row.lsn
+                            && Self::sync_incoming_row_is_already_local(
+                                &row.values,
+                                local,
+                                &row.table,
+                                meta.as_ref(),
+                            )
+                            && matches!(
+                                self.relational_store
+                                    .sync_source_kind(&row.table, local.row_id),
+                                Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal)
+                            )
+                            && self
+                                .relational_store
+                                .sync_source_lsn(&row.table, local.row_id)
+                                .is_some()
+                    })
+                });
+            if !confirmed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn has_unconfirmed_push_rows(&self, after: Lsn, through: Lsn) -> bool {
+        self.relational_store
+            .tables
+            .read()
+            .iter()
+            .any(|(table, rows)| {
+                rows.iter().any(|row| {
+                    row.lsn > after
+                        && row.lsn <= through
+                        && !matches!(
+                            self.relational_store.sync_source_kind(table, row.row_id),
+                            Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal)
+                        )
+                        // A pull can replace a refused local version while the
+                        // provenance sidecar follows the current RowId. Its
+                        // retained source version still lacks acceptance; a
+                        // Pulled mark on the replacement cannot confirm it.
+                        && (row.deleted_tx.is_some()
+                            || !matches!(
+                                self.relational_store.sync_source_kind(table, row.row_id),
+                                Some(contextdb_relational::store::SyncSourceKind::Pulled)
+                            ))
+                })
+            })
+    }
+
+    /// Select only authenticated echoes of the local lineage before applying a
+    /// pull page. Equal values from a different creator do not acknowledge the
+    /// local mutation. This reuses ordinary row provenance, with no new receipt.
+    pub(crate) fn matching_pending_reconciliation_rows(
+        &self,
+        rows: &[RowChange],
+        lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
+    ) -> Result<Vec<RowChange>> {
+        let mut matching = Vec::new();
+        let lineage_state = self.lineage_state_lock.lock();
+        for row in rows {
+            let Some((_, _, _, lineage)) = lineages.iter().find(|(table, key, lsn, _)| {
+                table == &row.table && key == &row.natural_key && *lsn == row.lsn
+            }) else {
+                continue;
+            };
+            let known = self.load_row_lineage_sidecar(
+                &lineage_state,
+                &Self::durable_row_lineage_config_key(
+                    &row.table,
+                    &row.natural_key,
+                    lineage.table_generation,
+                ),
+            )?;
+            if known
+                .as_ref()
+                .is_some_and(|known| Self::row_lineage_matches_wire(known, lineage))
+            {
+                matching.push(row.clone());
+            }
+        }
+        Ok(matching)
+    }
+
     sync_test_seam! {
     /// After status confirmed a re-send landed, a byte-identical pull echo
     /// has no row mutation to carry through the normal sync write set. Refresh
-    /// any still-pending current row explicitly, in one durable provenance
-    /// batch under the commit lock. Differing hub truth has already replaced
-    /// Pending during apply and is deliberately left alone.
+    /// matching Pending versions explicitly, in one durable provenance batch
+    /// under the commit lock. Production callers first select authenticated
+    /// lineage matches; retained history keeps evidence if a later page edit
+    /// has already replaced the visible row.
     fn refresh_confirmed_pending_rows(
         &self,
         rows: &[RowChange],
@@ -19763,34 +24608,26 @@ impl Database {
     ) -> Result<()> {
         let _operation = self.assert_open_operation();
         self.with_commit_lock(|| {
-            let snapshot = self.snapshot();
-            let empty_deleted = HashSet::new();
             let mut entries = Vec::new();
             let mut tombstone_refreshes = Vec::new();
             for row in rows.iter().filter(|row| !row.deleted) {
                 let Some(arrival) = Self::resolve_incoming_arrival(row, arrivals) else {
                     continue;
                 };
-                let Some(current) = self.visible_row_by_natural_key(
-                    &row.table,
-                    &row.natural_key,
-                    snapshot,
-                    &empty_deleted,
-                )?
-                else {
+                let tables = self.relational_store.tables.read();
+                let Some(versions) = tables.get(&row.table) else {
                     continue;
                 };
-                if matches!(
-                    self.relational_store
-                        .sync_source_kind(&row.table, current.row_id),
-                    Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
-                ) && Self::sync_incoming_row_is_already_local(
-                    &row.values,
-                    &current,
-                    &row.table,
-                    self.table_meta(&row.table).as_ref(),
-                ) {
-                    entries.push((row.table.clone(), current.row_id, arrival));
+                let meta = self.table_meta(&row.table);
+                for current in versions {
+                    if matches!(
+                        self.relational_store.sync_source_kind(&row.table, current.row_id),
+                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
+                    ) && Self::sync_incoming_row_is_already_local(
+                        &row.values, current, &row.table, meta.as_ref(),
+                    ) {
+                        entries.push((row.table.clone(), current.row_id, arrival));
+                    }
                 }
             }
             for row in rows.iter().filter(|row| row.deleted) {
@@ -20168,7 +25005,7 @@ impl Database {
         // nothing, so a diff against the caller's own full-precision input
         // reports a change on every upsert of the same vector -- and each one
         // would rewrite the row and place the vector again.
-        let stored_now = self.outbound_row_values(table, existing);
+        let stored_now = self.outbound_row_values(table, existing)?;
         let changed = values.iter().any(|(column, value)| {
             stored_now.get(column) != Some(&self.stored_form_of_value(table, column, value))
         });
@@ -20927,19 +25764,18 @@ impl Database {
             let ColumnType::Vector(expected) = column.column_type else {
                 return Err(Error::UnknownVectorIndex { index });
             };
-            let state = self.vector_store.state(&index)?;
-            if state.dimension() != expected {
+            let layout = self.vector_store.index_layout(&index)?;
+            if layout.dimension != expected {
                 return Err(Error::VectorIndexDimensionMismatch {
                     index,
                     expected,
-                    actual: state.dimension(),
+                    actual: layout.dimension,
                 });
             }
         }
 
         for entry in &ws.vector_inserts {
-            let state = self.vector_store.state(&entry.index)?;
-            let expected = state.dimension();
+            let expected = self.vector_store.index_layout(&entry.index)?.dimension;
             if entry.vector.len() != expected {
                 return Err(Error::VectorIndexDimensionMismatch {
                     index: entry.index.clone(),
@@ -21728,11 +26564,11 @@ impl Database {
 
         let incoming_row_bytes = self
             .table_meta(&table)
-            .map(|meta| retained_row_bytes_for_meta(&incoming.values, &meta, false))
+            .map(|meta| retained_row_bytes_for_meta(&incoming.values, &meta, true))
             .unwrap_or_else(|| incoming.estimated_bytes());
         let replacement_row_bytes = self
             .table_meta(&table)
-            .map(|meta| retained_row_bytes_for_meta(&values, &meta, false))
+            .map(|meta| retained_row_bytes_for_meta(&values, &meta, true))
             .unwrap_or_else(|| {
                 let mut replacement = incoming.clone();
                 replacement.values = values.clone();
@@ -21974,7 +26810,9 @@ impl Database {
 
         for column in vector_columns {
             let index = VectorIndexRef::new(table, column.clone());
-            let existing = self.vector_store_live_entry_for_row(&index, conflict_row_id, snapshot);
+            let existing =
+                self.vector_store
+                    .load_live_entry_for_row(&index, conflict_row_id, snapshot)?;
             let final_vector = match replacement_values.get(&column) {
                 Some(Value::Vector(vector)) => Some(vector.clone()),
                 _ => None,
@@ -22926,7 +27764,7 @@ impl Database {
         {
             let bytes = self
                 .table_meta(table)
-                .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, false))
+                .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, true))
                 .unwrap_or_else(|| row.estimated_bytes());
             self.accountant.release(bytes);
         }
@@ -23630,9 +28468,10 @@ impl Database {
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
-        let row_bytes = retained_row_bytes_for_meta(&next_values, &meta, false);
-        self.accountant.try_allocate_for(
-            row_bytes,
+        let row_bytes = self.admit_retained_row_bytes(
+            table,
+            &next_values,
+            &meta,
             "update",
             "prepared_state_propagation_row_replace",
             "Reduce row growth or raise MEMORY_LIMIT before committing this propagated update.",
@@ -23696,7 +28535,7 @@ impl Database {
             }
             let bytes = self
                 .table_meta(&removed_table)
-                .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, false))
+                .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, true))
                 .unwrap_or_else(|| row.estimated_bytes());
             self.accountant.release(bytes);
         }
@@ -23727,7 +28566,7 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Result<()> {
-        self.vector_store.state(&index)?;
+        self.vector_store.index_layout(&index)?;
         let Some(row) = self.row_by_id_in_prepared_write_set(ws, &index.table, row_id, snapshot)?
         else {
             return Err(Error::NotFound(format!(
@@ -23738,8 +28577,7 @@ impl Database {
         self.assert_row_write_allowed(&index.table, row.row_id, &row.values, snapshot)?;
         let existing_live = self
             .vector_store
-            .live_entry_for_row(&index, row_id, snapshot)
-            .is_some();
+            .has_live_entry_for_row(&index, row_id, snapshot);
         let mut canceled_inserts = Vec::new();
         let mut pos = 0;
         while pos < ws.vector_inserts.len() {
@@ -24002,10 +28840,11 @@ impl Database {
             // Before the relational body goes, so a failure leaves the row and
             // its vectors together rather than a row with no embeddings.
             for index in self.vector_indexes_of_table(table) {
-                if self
-                    .vector_store_live_entry_for_row(&index, row_id, self.snapshot_for_read())
-                    .is_some()
-                {
+                if self.vector_store.has_live_entry_for_row(
+                    &index,
+                    row_id,
+                    self.snapshot_for_read(),
+                ) {
                     self.delete_vector(tx, index, row_id)?;
                 }
             }
@@ -24034,7 +28873,7 @@ impl Database {
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::EagerRowSourceTouch);
         let rows = self.relational.scan(table, snapshot)?;
         let mut rows = self.filter_rows_for_read(table, rows, snapshot)?;
-        self.supplement_quantized_vectors(table, snapshot, &mut rows);
+        self.supplement_quantized_vectors(table, snapshot, &mut rows)?;
         Ok(rows)
     }
 
@@ -24047,7 +28886,7 @@ impl Database {
         #[cfg(feature = "test-seams")]
         observe_read_execution_convergence(ReadExecutionConvergenceEvent::EagerRowSourceTouch);
         let mut rows = self.relational.scan_with_tx(Some(tx), table, snapshot)?;
-        self.supplement_quantized_vectors(table, snapshot, &mut rows);
+        self.supplement_quantized_vectors(table, snapshot, &mut rows)?;
         Ok(rows)
     }
 
@@ -24099,7 +28938,7 @@ impl Database {
         let _operation = self.open_operation()?;
         let rows = self.relational.scan(table, snapshot)?;
         let mut rows = self.filter_rows_for_read(table, rows, snapshot)?;
-        self.supplement_rows_for_caller(table, &mut rows);
+        self.supplement_rows_for_caller(table, &mut rows)?;
         Ok(rows.into_iter().filter(|row| predicate(row)).collect())
     }
 
@@ -24120,7 +28959,10 @@ impl Database {
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
         if self.read_allowed_for_row(table, &meta, &row, snapshot)? {
             let mut found = [row];
-            self.supplement_rows_for_caller(table, &mut found);
+            let selected_row_ids = HashSet::from([found[0].row_id]);
+            self.vector_store
+                .ensure_raw_partitions_containing_rows(table, &selected_row_ids)?;
+            self.supplement_rows_for_caller(table, &mut found)?;
             let [row] = found;
             Ok(Some(row))
         } else {
@@ -24432,7 +29274,7 @@ impl Database {
         Ok(props)
     }
 
-    /// Put every vector column of a row into the store that owns vectors.
+    /// Put every vector column of a row into the vector search store.
     ///
     /// A `VECTOR(N)` column IS a named index, so the vector store is the one
     /// place a vector lives and the row-write API is what puts it there.
@@ -24442,18 +29284,12 @@ impl Database {
     ///
     /// Answers with what each write was charged, so a caller whose statement
     /// fails afterwards hands back exactly what it took.
-    /// Leave a quantized vector column's slot empty in the row that is about
-    /// to be stored.
+    /// Leave only quantized vector columns empty in the row that is about to
+    /// be stored.
     ///
-    /// A column declared with space-saving storage keeps its value in the
-    /// vector store, in the representation the column declared. A full-
-    /// precision copy in the row as well is the same value twice, and the
-    /// larger of the two: it makes a quantized column cost MORE live memory
-    /// per row than the space it was declared to save, so an operator who
-    /// asked for a smaller footprint is charged for the bigger one. The slot
-    /// is emptied rather than removed so what is written to disk is byte for
-    /// byte what it was -- persistence already stores nothing for these
-    /// columns and reads them back out of the same store.
+    /// F32 remains an ordinary relational value. SQ4/SQ8 keep their body only
+    /// in the vector store; their relational slot remains NULL internally and
+    /// is filled from the vector store on caller-facing projection.
     pub(crate) fn blank_quantized_vector_values(
         &self,
         table: &str,
@@ -24463,9 +29299,10 @@ impl Database {
             return;
         };
         for column in &meta.columns {
-            if !matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
-                || matches!(column.quantization, contextdb_core::VectorQuantization::F32)
-            {
+            if !matches!(column.column_type, contextdb_core::ColumnType::Vector(_)) {
+                continue;
+            }
+            if matches!(column.quantization, VectorQuantization::F32) {
                 continue;
             }
             if let Some(slot) = values.get_mut(&column.name)
@@ -24488,37 +29325,70 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
         rows: &mut [VersionedRow],
-    ) {
+    ) -> Result<()> {
         let Some(meta) = self.table_meta(table) else {
-            return;
+            return Ok(());
         };
-        let quantized: Vec<String> = meta
+        let vector_columns: Vec<String> = meta
             .columns
             .iter()
-            .filter(|column| {
-                matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
-                    && !matches!(column.quantization, contextdb_core::VectorQuantization::F32)
-            })
+            .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
             .map(|column| column.name.clone())
             .collect();
-        if quantized.is_empty() {
-            return;
+        if vector_columns.is_empty() {
+            return Ok(());
         }
-        for column in quantized {
-            let index = VectorIndexRef::new(table, column.clone());
+        for column in vector_columns {
             for row in rows.iter_mut() {
                 if !matches!(row.values.get(&column), Some(Value::Null) | None) {
                     continue;
                 }
-                if let Some(entry) = self
-                    .vector_store
-                    .live_entry_for_row(&index, row.row_id, snapshot)
-                {
-                    row.values
-                        .insert(column.clone(), Value::Vector(entry.vector));
+                if let Some(vector) = self.load_row_vector_for_column(
+                    None, table, &column, row.row_id, row.lsn, snapshot,
+                )? {
+                    row.values.insert(column.clone(), Value::Vector(vector));
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Fill only vector columns the caller's expression actually reads.
+    /// `None` is the explicit `SELECT *` case; `Some(&[])` deliberately loads
+    /// no vector body. Lazy partitions may fail while loading, so this route
+    /// must preserve that error instead of returning a row with a false NULL.
+    pub(crate) fn supplement_selected_vector_columns(
+        &self,
+        table: &str,
+        snapshot: SnapshotId,
+        tx: Option<TxId>,
+        selected: Option<&[String]>,
+        rows: &mut [VersionedRow],
+    ) -> Result<()> {
+        let Some(meta) = self.table_meta(table) else {
+            return Ok(());
+        };
+        let vector_columns: Vec<String> = meta
+            .columns
+            .iter()
+            .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
+            .map(|column| column.name.clone())
+            .filter(|column| selected.is_none_or(|selected| selected.contains(column)))
+            .collect();
+        for column in vector_columns {
+            for row in rows.iter_mut() {
+                if !matches!(row.values.get(&column), Some(Value::Null) | None) {
+                    continue;
+                }
+                let vector = self.load_row_vector_for_column(
+                    tx, table, &column, row.row_id, row.lsn, snapshot,
+                )?;
+                if let Some(vector) = vector {
+                    row.values.insert(column.clone(), Value::Vector(vector));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// What one row hands to a peer: its own values, with every quantized
@@ -24533,10 +29403,10 @@ impl Database {
         &self,
         table: &str,
         row: &VersionedRow,
-    ) -> HashMap<ColName, Value> {
+    ) -> Result<HashMap<ColName, Value>> {
         let mut values = row.values.clone();
-        self.fill_quantized_from_store(table, row, &mut values);
-        values
+        self.fill_quantized_from_store(table, row, &mut values)?;
+        Ok(values)
     }
 
     fn fill_quantized_from_store(
@@ -24544,8 +29414,8 @@ impl Database {
         table: &str,
         row: &VersionedRow,
         values: &mut HashMap<ColName, Value>,
-    ) {
-        self.fill_quantized_columns(table, row.row_id, row.lsn, values);
+    ) -> Result<()> {
+        self.fill_quantized_columns(table, row.row_id, row.lsn, values)
     }
 
     fn fill_quantized_columns(
@@ -24554,24 +29424,27 @@ impl Database {
         row_id: RowId,
         lsn: Lsn,
         values: &mut HashMap<ColName, Value>,
-    ) {
+    ) -> Result<()> {
         for column in self.quantized_vector_columns(table) {
             if !matches!(values.get(&column), Some(Value::Null) | None) {
                 continue;
             }
             let index = VectorIndexRef::new(table, column.clone());
-            if let Some(vector) = self
+            let vector = match self
                 .vector_store
-                .vector_for_row_lsn(&index, row_id, lsn)
-                .or_else(|| {
-                    self.vector_store
-                        .live_entry_for_row(&index, row_id, self.snapshot())
-                        .map(|entry| entry.vector)
-                })
+                .load_vector_for_row_lsn(&index, row_id, lsn)?
             {
+                some @ Some(_) => some,
+                None => self
+                    .vector_store
+                    .load_live_entry_for_row(&index, row_id, self.snapshot())?
+                    .map(|entry| entry.vector),
+            };
+            if let Some(vector) = vector {
                 values.insert(column, Value::Vector(vector));
             }
         }
+        Ok(())
     }
 
     /// Fill the quantized vector columns of whole rows on their way back to a
@@ -24583,16 +29456,21 @@ impl Database {
     /// vector index, so a row handed back unfilled carries NULL where the
     /// embedding belongs: a predicate testing it never matches, and a caller
     /// reading it is told the row has no vector.
-    pub(crate) fn supplement_rows_for_caller(&self, table: &str, rows: &mut [VersionedRow]) {
+    pub(crate) fn supplement_rows_for_caller(
+        &self,
+        table: &str,
+        rows: &mut [VersionedRow],
+    ) -> Result<()> {
         if self.quantized_vector_columns(table).is_empty() {
-            return;
+            return Ok(());
         }
         for row in rows.iter_mut() {
             let (row_id, lsn) = (row.row_id, row.lsn);
             let mut values = std::mem::take(&mut row.values);
-            self.fill_quantized_columns(table, row_id, lsn, &mut values);
+            self.fill_quantized_columns(table, row_id, lsn, &mut values)?;
             row.values = values;
         }
+        Ok(())
     }
 
     /// What a column will hold once the value given for it is written.
@@ -24629,26 +29507,111 @@ impl Database {
         ))
     }
 
-    /// The value a row's vector column holds, from the store that holds it.
-    pub(crate) fn row_vector_for_column(
+    /// Fallible row projection for the lazy raw-vector store. The exact row
+    /// version is preferred, and only a directory that can answer it is
+    /// loaded. A transaction's staged vector remains authoritative over the
+    /// committed body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded_score_committed_vector_row(
         &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        query: &[f32],
+        before_checkpoint: &mut dyn FnMut() -> std::result::Result<
+            (),
+            crate::executor::BoundedExecutionError,
+        >,
+        before_distance: &mut dyn FnMut() -> std::result::Result<
+            (),
+            crate::executor::BoundedExecutionError,
+        >,
+        before_retain: &mut dyn FnMut(
+            usize,
+        ) -> std::result::Result<
+            (),
+            crate::executor::BoundedExecutionError,
+        >,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<f32>, crate::executor::BoundedExecutionError> {
+        self.vector_store.bounded_score_live_row(
+            index,
+            row_id,
+            snapshot,
+            query,
+            before_checkpoint,
+            before_distance,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    pub(crate) fn load_row_vector_for_column(
+        &self,
+        tx: Option<TxId>,
         table: &str,
         column: &str,
         row_id: RowId,
         lsn: Lsn,
         snapshot: SnapshotId,
-    ) -> Option<Vec<f32>> {
+    ) -> Result<Option<Vec<f32>>> {
         let index = VectorIndexRef::new(table, column.to_owned());
-        // A reopened store's entries carry the generations they were written
-        // with, which a live snapshot comparison need not admit, so the row's
-        // own generation is asked first and visibility second.
+        if tx.is_some() {
+            return self
+                .vector_entry_for_row_in_tx(tx, &index, row_id, snapshot)
+                .map(|entry| entry.map(|entry| entry.vector));
+        }
+        if let Some(vector) = self
+            .vector_store
+            .load_vector_for_row_lsn(&index, row_id, lsn)?
+        {
+            return Ok(Some(vector));
+        }
+        // Writable open keeps only the current membership in each dormant
+        // partition directory so retired bodies do not become permanent live
+        // residency. An older relational snapshot can still name its exact
+        // checksummed membership; load that one body directly without
+        // widening the live directory or its accountant ownership.
+        if let Some(persistence) = self.persistence.as_ref() {
+            let dimension = self
+                .table_meta(table)
+                .and_then(|meta| {
+                    meta.columns
+                        .iter()
+                        .find(|declared| declared.name == column)
+                        .and_then(|declared| match declared.column_type {
+                            ColumnType::Vector(dimension) => Some(dimension),
+                            _ => None,
+                        })
+                })
+                .ok_or_else(|| Error::UnknownVectorIndex {
+                    index: index.clone(),
+                })?;
+            let membership = persistence
+                .load_vector_partition_memberships()?
+                .into_iter()
+                .filter(|membership| {
+                    membership.index == index
+                        && membership.row_id == row_id
+                        && membership.row_lsn == lsn
+                        && membership.visible_from.0 <= snapshot.0
+                        && membership
+                            .deleted_tx
+                            .is_none_or(|deleted| deleted.0 > snapshot.0)
+                })
+                .max_by_key(|membership| (membership.vector_lsn, membership.vector_created_tx));
+            if let Some(membership) = membership {
+                return persistence
+                    .load_vector_entries_for_memberships(&[membership], dimension)
+                    .map(|mut entries| entries.pop().map(|entry| entry.vector));
+            }
+        }
         self.vector_store
-            .live_entry_for_row(&index, row_id, snapshot)
-            .map(|entry| entry.vector)
-            .or_else(|| self.vector_store.vector_for_row_lsn(&index, row_id, lsn))
+            .load_live_entry_for_row(&index, row_id, snapshot)
+            .map(|entry| entry.map(|entry| entry.vector))
     }
 
-    /// Which of a table's vector columns keep their value in the store alone.
+    /// Which of a table's vector columns keep their value in the vector store.
     pub(crate) fn quantized_vector_columns(&self, table: &str) -> Vec<String> {
         self.table_meta(table)
             .map(|meta| {
@@ -24656,10 +29619,6 @@ impl Database {
                     .iter()
                     .filter(|column| {
                         matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
-                            && !matches!(
-                                column.quantization,
-                                contextdb_core::VectorQuantization::F32
-                            )
                     })
                     .map(|column| column.name.clone())
                     .collect()
@@ -24760,7 +29719,7 @@ impl Database {
         let _operation = self.open_operation_after_write_control_wait(tx, "insert_vector")?;
         let _vector_schema = self.vector_schema_read(&index);
         self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
-        self.vector_store.state(&index)?;
+        self.vector_store.index_layout(&index)?;
         self.assert_existing_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
         if let Some(expected) = self.pending_vector_dimension(tx, &index)?
             && expected != vector.len()
@@ -24795,10 +29754,9 @@ impl Database {
             &format!("vector_insert@{}.{}", index.table, index.column),
             "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
         )?;
-        let existing_live = self
-            .vector_store
-            .live_entry_for_row(&index, row_id, self.snapshot())
-            .is_some();
+        let existing_live =
+            self.vector_store
+                .has_live_entry_for_row(&index, row_id, self.snapshot());
         let entry = VectorEntry {
             index: index.clone(),
             row_id,
@@ -24873,12 +29831,11 @@ impl Database {
         let _vector_schema = self.vector_schema_read(&index);
         self.record_vector_schema_epoch(tx, &index)?;
         self.ensure_trigger_table_ready(&index.table, "delete_vector")?;
-        self.vector_store.state(&index)?;
+        self.vector_store.index_layout(&index)?;
         self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
-        let existing_live = self
-            .vector_store
-            .live_entry_for_row(&index, row_id, self.snapshot())
-            .is_some();
+        let existing_live =
+            self.vector_store
+                .has_live_entry_for_row(&index, row_id, self.snapshot());
         let canceled_inserts = self.tx_mgr.with_write_set(tx, |ws| {
             let mut canceled_inserts = Vec::new();
             let mut pos = 0;
@@ -24946,16 +29903,56 @@ impl Database {
         let _vector_schema = self.vector_schema_read(&index);
         self.record_vector_schema_epoch(tx, &index)?;
         self.ensure_trigger_table_ready(&index.table, "move_vector")?;
-        if self.vector_store.try_state(&index).is_none() {
+        if !self.vector_store.contains_index(&index) {
             return Err(Error::UnknownVectorIndex { index });
         }
         if old_row_id == new_row_id {
-            return Ok(());
+            let meta = self
+                .table_meta(&index.table)
+                .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+            let declaration = meta
+                .columns
+                .iter()
+                .find(|column| column.name == index.column)
+                .ok_or_else(|| Error::UnknownVectorIndex {
+                    index: index.clone(),
+                })?;
+            if declaration.partition_key_columns.is_none() {
+                return Ok(());
+            }
+            let snapshot = self.snapshot_for_read();
+            let Some(old_row) = self
+                .relational_store
+                .row_by_id(&index.table, old_row_id, snapshot)
+            else {
+                return Ok(());
+            };
+            let new_row =
+                self.find_row_by_id_in_tx(Some(tx), &index.table, new_row_id, snapshot)?;
+            let old_key = crate::composite_store::vector_partition_key_for_row(
+                &index,
+                &meta,
+                declaration,
+                &old_row,
+            )?;
+            let new_key = crate::composite_store::vector_partition_key_for_row(
+                &index,
+                &meta,
+                declaration,
+                &new_row,
+            )?;
+            if old_key == new_key {
+                self.tx_mgr.with_write_set(tx, |ws| {
+                    ws.vector_moves.retain(|(i, from, to, _)| {
+                        !(i == &index && *from == old_row_id && *to == new_row_id)
+                    })
+                })?;
+                return Ok(());
+            }
         }
-        let existing_live = self
-            .vector_store
-            .live_entry_for_row(&index, old_row_id, self.snapshot())
-            .is_some();
+        let existing_live =
+            self.vector_store
+                .has_live_entry_for_row(&index, old_row_id, self.snapshot());
         let replaced_inserts = self.tx_mgr.with_write_set(tx, |ws| {
             let old_row_deleted =
                 ws.vector_deletes
@@ -25055,28 +30052,50 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
         let _operation = self.open_operation()?;
+        let _membership_capture = self.relational_store.begin_membership_capture();
+        let _snapshot_registration = self.snapshot_registry.register_statement(snapshot);
         let _vector_schema = self.vector_schema_read(&index);
-        if self.vector_store.try_state(&index).is_none() {
+        if !self.vector_store.contains_index(&index) {
             return Err(Error::UnknownVectorIndex { index });
         }
+        let search_mode = self.resolved_vector_search_mode(&index, None)?;
         let effective_candidates =
-            self.effective_read_candidates(&index.table, snapshot, candidates)?;
-        let (rows, trace) = self.vector.search_with_strategy_for_test(
+            self.effective_vector_read_candidates(&index, snapshot, candidates, search_mode)?;
+        let (rows, trace) = self.vector.search_with_mode_owned(
             index,
             query,
             k,
             effective_candidates.as_ref(),
             snapshot,
+            search_mode,
         )?;
         self.last_vector_search_used_hnsw
             .store(trace.used_hnsw, Ordering::SeqCst);
         *self.last_vector_search_trace.write() = Some(trace);
-        Ok(rows)
+        Ok(rows.into_vec())
     }
 
     pub fn semantic_search(&self, query: SemanticQuery) -> Result<Vec<SearchResult>> {
         let _operation = self.open_operation()?;
         self.semantic_search_with_candidates(query, None)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __semantic_search_in_tx_for_test(
+        &self,
+        tx: TxId,
+        query: SemanticQuery,
+    ) -> Result<Vec<SearchResult>> {
+        let _operation = self.open_operation()?;
+        let index = VectorIndexRef::new(query.table.clone(), query.vector_column.clone());
+        let _vector_schema = self.vector_schema_read(&index);
+        self.semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
+            Some(tx),
+            query,
+            None,
+        )
+        .map(|(results, _)| results)
     }
 
     pub(crate) fn semantic_search_with_candidates(
@@ -25115,7 +30134,9 @@ impl Database {
         candidates: Option<RoaringTreemap>,
     ) -> Result<(Vec<SearchResult>, bool)> {
         let index = VectorIndexRef::new(query.table.clone(), query.vector_column.clone());
+        let _membership_capture = self.relational_store.begin_membership_capture();
         let snapshot = self.snapshot_for_read();
+        let _snapshot_registration = self.snapshot_registry.register_statement(snapshot);
         let meta = self
             .table_meta(&query.table)
             .ok_or_else(|| Error::TableNotFound(query.table.clone()))?;
@@ -25126,11 +30147,24 @@ impl Database {
             .ok_or_else(|| Error::UnknownVectorIndex {
                 index: index.clone(),
             })?;
+        let mut search_mode = query.search_mode.unwrap_or(vector_column.search_mode);
 
         let mut candidate_bitmap = candidates;
-        if let Some(where_clause) = &query.where_clause {
-            let where_bitmap =
-                self.semantic_where_candidate_bitmap(&query.table, where_clause, snapshot)?;
+        if query.where_clause.is_some()
+            || self.bounded_read_requires_candidate_filter(&index.table)?
+        {
+            let where_clause = query.where_clause.as_deref().unwrap_or("");
+            let (where_bitmap, complete_indexed_route) = self.semantic_where_candidate_bitmap(
+                tx,
+                &index,
+                where_clause,
+                snapshot,
+                search_mode == contextdb_core::VectorSearchMode::Indexed,
+                search_mode == contextdb_core::VectorSearchMode::Auto,
+            )?;
+            if search_mode == contextdb_core::VectorSearchMode::Auto && !complete_indexed_route {
+                search_mode = contextdb_core::VectorSearchMode::Exact;
+            }
             candidate_bitmap = Some(match candidate_bitmap {
                 Some(mut existing) => {
                     existing &= where_bitmap;
@@ -25141,18 +30175,16 @@ impl Database {
         }
 
         let Some(sort_key) = query.sort_key.as_deref() else {
-            let raw_k = if query.min_similarity.is_some() || candidate_bitmap.is_some() {
-                self.vector_entry_count_in_tx(tx, &index)?.max(query.limit)
-            } else {
-                query.limit
-            };
+            // A score floor filters the nearest LIMIT candidates; it never
+            // widens an indexed query to the whole authorized population.
             let (mut rows, used_hnsw) = self.query_vector_strict_in_tx_with_strategy(
                 tx,
                 index.clone(),
                 &query.query,
-                raw_k,
+                query.limit,
                 candidate_bitmap.as_ref(),
                 snapshot,
+                search_mode,
             )?;
             if let Some(min_similarity) = query.min_similarity {
                 rows.retain(|(_, score)| *score >= min_similarity);
@@ -25193,21 +30225,70 @@ impl Database {
             });
         }
         let formula = self.rank_formula(&query.table, &query.vector_column)?;
-        let entry_count = self.vector_entry_count_in_tx(tx, &index)?;
-        let internal_k = self.rank_policy_candidate_k(entry_count, query.limit);
-        let (mut raw, used_hnsw) = self.query_vector_strict_in_tx_with_strategy(
-            tx,
-            index.clone(),
-            &query.query,
-            internal_k,
+        let entry_count = self.vector_entry_count_in_tx(tx, &index, snapshot)?;
+        let whole_pool = self.rank_policy_candidate_k(
+            &index,
+            entry_count,
+            query.limit,
+            true,
             candidate_bitmap.as_ref(),
             snapshot,
         )?;
+        let internal_k = self.rank_policy_candidate_k(
+            &index,
+            entry_count,
+            query.limit,
+            search_mode == contextdb_core::VectorSearchMode::Exact,
+            candidate_bitmap.as_ref(),
+            snapshot,
+        )?;
+        let (mut raw, mut used_hnsw) =
+            contextdb_vector::mem::with_search_policy_limit(query.limit, || {
+                self.query_vector_strict_in_tx_with_strategy(
+                    tx,
+                    index.clone(),
+                    &query.query,
+                    internal_k,
+                    candidate_bitmap.as_ref(),
+                    snapshot,
+                    search_mode,
+                )
+            })?;
+        if search_mode == contextdb_core::VectorSearchMode::Auto
+            && !used_hnsw
+            && internal_k < whole_pool
+            && raw.len() >= internal_k
+        {
+            // AUTO resolved to the exact route -- below the automatic
+            // crossover, or because the graph could not serve this read --
+            // and inherits that route's candidate meaning: the formula runs
+            // over every allowed stored vector. The bounded pool it was
+            // handed can have cut the best-scoring row before the formula
+            // ever saw it, so the read is repeated over the whole pool,
+            // behind the same score-budget refusal an explicit EXACT read
+            // passes.
+            drop(raw);
+            let (rerun, rerun_used_hnsw) = self.query_vector_strict_in_tx_with_strategy(
+                tx,
+                index.clone(),
+                &query.query,
+                whole_pool,
+                candidate_bitmap.as_ref(),
+                snapshot,
+                search_mode,
+            )?;
+            raw = rerun;
+            used_hnsw = rerun_used_hnsw;
+        }
         if let Some(min_similarity) = query.min_similarity {
             raw.retain(|(_, score)| *score >= min_similarity);
         }
 
-        let mut ranked = Vec::with_capacity(raw.len());
+        // Only the rows still in contention for the answer are held: one
+        // evaluated candidate past `LIMIT` is enough to know which to drop, so
+        // a rank over the whole table holds `LIMIT` rows' values, never every
+        // row's. The scores themselves are what the exact budget pays for.
+        let mut contenders = std::collections::BinaryHeap::new();
         for (row_id, vector_score) in raw {
             crate::executor::observe_bounded_rank_candidate();
             let anchor = self.find_row_by_id_in_tx(tx, &query.table, row_id, snapshot)?;
@@ -25235,22 +30316,34 @@ impl Database {
                     continue;
                 }
             };
+            contenders.push(RankedSearchCandidate {
+                row_id,
+                vector_score,
+                rank,
+                anchor,
+                joined,
+            });
+            if contenders.len() > query.limit {
+                // The heap's top is the candidate that ranks last.
+                contenders.pop();
+            }
+        }
+        let mut ranked = Vec::with_capacity(contenders.len());
+        for candidate in contenders.into_sorted_vec() {
             let values = self.search_result_values_in_tx(
                 tx,
                 &index,
-                row_id,
+                candidate.row_id,
                 snapshot,
-                merged_rank_values(&anchor, joined.as_ref()),
+                merged_rank_values(&candidate.anchor, candidate.joined.as_ref()),
             )?;
             ranked.push(SearchResult {
-                row_id,
+                row_id: candidate.row_id,
                 values,
-                vector_score,
-                rank,
+                vector_score: candidate.vector_score,
+                rank: candidate.rank,
             });
         }
-        ranked.sort_by(compare_ranked_results);
-        ranked.truncate(query.limit);
         Ok((ranked, used_hnsw))
     }
 
@@ -25318,6 +30411,9 @@ impl Database {
         Ok(())
     }
 
+    /// Transaction, scope, snapshot, and mode are separate execution inputs;
+    /// combining them would obscure the vector-query contract at each caller.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn query_vector_strict_in_tx_with_strategy(
         &self,
         tx: Option<TxId>,
@@ -25326,18 +30422,22 @@ impl Database {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> Result<(Vec<(RowId, f32)>, bool)> {
+        search_mode: contextdb_core::VectorSearchMode,
+    ) -> Result<(contextdb_vector::mem::SearchScores, bool)> {
         self.vector_store.validate_vector(&index, query.len())?;
         if let Some(tx) = tx {
             let overlay_result = self.tx_mgr.with_write_set(tx, |ws| {
                 if write_set_touches_vector_search(ws, &index) {
-                    Some(self.query_vector_strict_with_write_set_exact(
+                    Some(self.query_vector_strict_with_write_set_overlay(
                         ws,
-                        index.clone(),
-                        query,
-                        k,
-                        candidates,
-                        snapshot,
+                        StrictVectorOverlayRequest {
+                            index: index.clone(),
+                            query,
+                            k,
+                            candidates,
+                            snapshot,
+                            search_mode,
+                        },
                     ))
                 } else {
                     None
@@ -25348,13 +30448,14 @@ impl Database {
             }
         }
         let effective_candidates =
-            self.effective_read_candidates(&index.table, snapshot, candidates)?;
-        let (rows, trace) = self.vector.search_with_strategy_for_test(
+            self.effective_vector_read_candidates(&index, snapshot, candidates, search_mode)?;
+        let (rows, trace) = self.vector.search_with_mode_owned(
             index,
             query,
             k,
             effective_candidates.as_ref(),
             snapshot,
+            search_mode,
         )?;
         self.last_vector_search_used_hnsw
             .store(trace.used_hnsw, Ordering::SeqCst);
@@ -25363,27 +30464,72 @@ impl Database {
         Ok((rows, used_hnsw))
     }
 
-    fn query_vector_strict_with_write_set_exact(
+    pub(crate) fn resolved_vector_search_mode(
+        &self,
+        index: &VectorIndexRef,
+        requested: Option<contextdb_core::VectorSearchMode>,
+    ) -> Result<contextdb_core::VectorSearchMode> {
+        if let Some(requested) = requested {
+            return Ok(requested);
+        }
+        let meta = self
+            .table_meta(&index.table)
+            .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+        meta.columns
+            .iter()
+            .find(|column| column.name == index.column)
+            .map(|column| column.search_mode)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })
+    }
+
+    fn query_vector_strict_with_write_set_overlay(
         &self,
         ws: &WriteSet,
-        index: VectorIndexRef,
-        query: &[f32],
-        k: usize,
-        candidates: Option<&RoaringTreemap>,
-        snapshot: SnapshotId,
-    ) -> Result<(Vec<(RowId, f32)>, bool)> {
+        request: StrictVectorOverlayRequest<'_>,
+    ) -> Result<(contextdb_vector::mem::SearchScores, bool)> {
+        let StrictVectorOverlayRequest {
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            search_mode,
+        } = request;
         if k == 0 {
-            return Ok((Vec::new(), false));
+            return Ok((
+                contextdb_vector::mem::SearchScores::new(index, self.accountant.clone()),
+                false,
+            ));
         }
-        let state = self.vector_store.state(&index)?;
+        let layout = self.vector_store.index_layout(&index)?;
         let staged_entries = ws
             .vector_inserts
             .iter()
             .filter(|entry| entry.index == index && entry.deleted_tx.is_none())
             .count();
+        let removed_entries = ws
+            .vector_deletes
+            .iter()
+            .filter(|(delete_index, _, _)| delete_index == &index)
+            .count()
+            .saturating_add(
+                ws.relational_deletes
+                    .iter()
+                    .filter(|(table, _, _)| table == &index.table)
+                    .count(),
+            );
+        let moved_entries = ws
+            .vector_moves
+            .iter()
+            .filter(|(move_index, _, _, _)| move_index == &index)
+            .count();
         let overlay_bytes = estimate_active_tx_vector_overlay_bytes(
-            state.entry_count().saturating_add(staged_entries),
-            state.dimension(),
+            staged_entries
+                .saturating_add(removed_entries)
+                .saturating_add(moved_entries),
+            layout.dimension,
         );
         self.accountant.try_allocate_for(
             overlay_bytes,
@@ -25392,43 +30538,156 @@ impl Database {
             "Reduce active transaction vector search scope or raise MEMORY_LIMIT.",
         )?;
 
-        let result = (|| -> Result<(Vec<(RowId, f32)>, bool)> {
-            let mut entries: HashMap<RowId, Vec<f32>> = HashMap::new();
-            for entry in self.vector_store.entries_for_index(&index)? {
-                if entry.visible_at(snapshot) {
-                    entries.insert(entry.row_id, entry.vector);
-                }
-            }
-
+        let result = (|| -> Result<(contextdb_vector::mem::SearchScores, bool)> {
+            let mut removed = HashSet::new();
             for (delete_table, row_id, _) in &ws.relational_deletes {
                 let has_same_row_replacement =
                     ws.relational_inserts.iter().any(|(insert_table, row)| {
                         insert_table == &index.table && row.row_id == *row_id
                     });
                 if delete_table == &index.table && !has_same_row_replacement {
-                    entries.remove(row_id);
+                    removed.insert(*row_id);
                 }
             }
             for (delete_index, row_id, _) in &ws.vector_deletes {
                 if delete_index == &index {
-                    entries.remove(row_id);
+                    removed.insert(*row_id);
                 }
             }
-            for (move_index, from_row_id, to_row_id, _) in &ws.vector_moves {
-                if move_index == &index
-                    && let Some(vector) = entries.remove(from_row_id)
-                {
-                    entries.insert(*to_row_id, vector);
+            let moved = ws
+                .vector_moves
+                .iter()
+                .filter(|(move_index, _, _, _)| move_index == &index)
+                .map(|(_, from_row_id, to_row_id, _)| (*from_row_id, *to_row_id))
+                .collect::<HashMap<_, _>>();
+            let staged_identities = ws
+                .vector_inserts
+                .iter()
+                .filter(|entry| entry.index == index && entry.deleted_tx.is_none())
+                .map(|entry| entry.row_id)
+                .collect::<HashSet<_>>();
+
+            let mut committed_candidates = candidates.cloned();
+            if let Some(committed_candidates) = committed_candidates.as_mut() {
+                for (from, to) in &moved {
+                    if committed_candidates.contains(to.0) {
+                        committed_candidates.insert(from.0);
+                    }
                 }
             }
+            let effective_candidates = self.effective_vector_read_candidates(
+                &index,
+                snapshot,
+                committed_candidates.as_ref(),
+                search_mode,
+            )?;
+            let mut committed_k = k
+                .saturating_add(removed.len())
+                .saturating_add(moved.len())
+                .saturating_add(staged_identities.len());
+            let mut previous_progress = None;
+            let (mut scored, mut trace) = loop {
+                let (committed, next_trace) = self.vector.search_with_mode_owned(
+                    index.clone(),
+                    query,
+                    committed_k,
+                    effective_candidates.as_ref(),
+                    snapshot,
+                    search_mode,
+                )?;
+                let returned = committed.len();
+                let mut eligible = contextdb_vector::mem::SearchScores::new(
+                    index.clone(),
+                    self.accountant.clone(),
+                );
+                if search_mode == contextdb_core::VectorSearchMode::Exact {
+                    eligible = eligible.for_exact();
+                }
+                eligible.reserve(returned.saturating_add(staged_entries))?;
+                for (row_id, score) in committed {
+                    if removed.contains(&row_id)
+                        || staged_identities.contains(&row_id)
+                        || moved.contains_key(&row_id)
+                    {
+                        continue;
+                    }
+                    let row_id = moved.get(&row_id).copied().unwrap_or(row_id);
+                    if let Some(candidates) = candidates
+                        && !candidates.contains(row_id.0)
+                    {
+                        continue;
+                    }
+                    if !self.row_id_read_allowed_in_write_set_for_query(
+                        ws,
+                        &index.table,
+                        row_id,
+                        snapshot,
+                    )? {
+                        continue;
+                    }
+                    eligible.try_push((row_id, score))?;
+                }
+                if eligible.len() >= k || previous_progress == Some((returned, eligible.len())) {
+                    break (eligible, next_trace);
+                }
+                previous_progress = Some((returned, eligible.len()));
+                let refill = k.saturating_sub(eligible.len()).max(1);
+                let next_k = committed_k
+                    .saturating_add(refill)
+                    .max(committed_k.saturating_mul(2));
+                if next_k == committed_k {
+                    break (eligible, next_trace);
+                }
+                committed_k = next_k;
+            };
+
+            let mut newest_staged = HashMap::<RowId, &VectorEntry>::new();
             for entry in &ws.vector_inserts {
                 if entry.index == index && entry.deleted_tx.is_none() {
-                    entries.insert(entry.row_id, entry.vector.clone());
+                    newest_staged.insert(entry.row_id, entry);
                 }
             }
-
-            let mut scored = Vec::with_capacity(entries.len().min(k));
-            for (row_id, vector) in entries {
+            for (from, to) in &moved {
+                if removed.contains(to)
+                    || staged_identities.contains(to)
+                    || candidates.is_some_and(|ids| !ids.contains(to.0))
+                {
+                    continue;
+                }
+                if !self.vector_staged_row_in_selected_partitions(ws, &index, *to)?
+                    || !self.row_id_read_allowed_in_write_set_for_query(
+                        ws,
+                        &index.table,
+                        *to,
+                        snapshot,
+                    )?
+                {
+                    continue;
+                }
+                if let Some(score) = self.vector_store.bounded_score_live_row(
+                    &index,
+                    *from,
+                    snapshot,
+                    query,
+                    || Ok::<_, Error>(()),
+                    || Ok::<_, Error>(()),
+                    |bytes| {
+                        self.accountant.try_allocate_for(
+                            bytes,
+                            "vector_search",
+                            "score_moved_vector",
+                            "Reduce transaction scope or raise MEMORY_LIMIT.",
+                        )
+                    },
+                    |bytes| self.accountant.release(bytes),
+                )? {
+                    scored.try_push((*to, score))?;
+                }
+            }
+            for (row_id, entry) in newest_staged {
+                if !self.vector_staged_row_in_selected_partitions(ws, &index, row_id)? {
+                    continue;
+                }
                 if let Some(candidates) = candidates
                     && !candidates.contains(row_id.0)
                 {
@@ -25442,11 +30701,24 @@ impl Database {
                 )? {
                     continue;
                 }
-                scored.push((row_id, cosine_similarity(&vector, query)));
+                scored.try_push((row_id, cosine_similarity(&entry.vector, query)))?;
             }
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.sort_unstable_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
             scored.truncate(k);
-            Ok((scored, false))
+            trace.final_row_ids = scored.iter().map(|(row_id, _)| *row_id).collect();
+            trace.supplemented_row_count = trace
+                .supplemented_row_count
+                .saturating_add(staged_entries.min(scored.len()));
+            let used_hnsw = trace.used_hnsw;
+            self.last_vector_search_used_hnsw
+                .store(used_hnsw, Ordering::SeqCst);
+            *self.last_vector_search_trace.write() = Some(trace);
+            Ok((scored, used_hnsw))
         })();
         self.accountant.release(overlay_bytes);
         result
@@ -25513,15 +30785,17 @@ impl Database {
             })
     }
 
-    fn vector_entry_count(&self, index: &VectorIndexRef) -> usize {
-        self.vector_store
-            .try_state(index)
-            .map(|state| state.entry_count())
-            .unwrap_or(0)
+    pub(crate) fn vector_entry_count(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> usize {
+        self.vector_store.visible_entry_count(index, snapshot)
     }
 
-    fn vector_entry_count_in_tx(&self, tx: Option<TxId>, index: &VectorIndexRef) -> Result<usize> {
-        let base = self.vector_entry_count(index);
+    fn vector_entry_count_in_tx(
+        &self,
+        tx: Option<TxId>,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+    ) -> Result<usize> {
+        let base = self.vector_store.visible_entry_count(index, snapshot);
         let Some(tx) = tx else {
             return Ok(base);
         };
@@ -25535,41 +30809,239 @@ impl Database {
         })
     }
 
-    fn rank_policy_candidate_k(&self, entry_count: usize, limit: usize) -> usize {
+    /// EXACT ranks every allowed vector; indexed ranking uses the column's
+    /// resolved candidate breadth. The caller's LIMIT is resolved only once.
+    #[allow(clippy::too_many_arguments)]
+    fn rank_policy_candidate_k(
+        &self,
+        index: &VectorIndexRef,
+        entry_count: usize,
+        limit: usize,
+        exact_route: bool,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+    ) -> Result<usize> {
         if entry_count == 0 || limit == 0 {
-            return limit;
+            return Ok(limit);
         }
-        if entry_count < 1000 {
-            return entry_count;
+        if exact_route {
+            return Ok(entry_count);
         }
-        entry_count
-            .saturating_sub(1)
-            .min(limit.saturating_mul(30).max(1500))
-            .max(limit)
+        let bytes = candidates
+            .map_or(0, |ids| ids.len() as usize)
+            .saturating_mul(std::mem::size_of::<u64>());
+        let _credit = crate::memory_accounting::ScopedMemoryReservation::try_new_for(
+            self.accountant(),
+            bytes,
+            "vector_search",
+            "rank_candidate_ids",
+            "Narrow the authorized scope or raise MEMORY_LIMIT.",
+        )?;
+        let ids = candidates.map(|ids| ids.iter().collect::<Vec<_>>());
+        self.vector.bounded_rank_candidate_k(
+            index,
+            limit,
+            ids.as_deref(),
+            snapshot,
+            || Ok::<_, Error>(()),
+            |bytes| {
+                self.accountant.try_allocate_for(
+                    bytes,
+                    "vector_search",
+                    "rank_candidate_sources",
+                    "Narrow the authorized scope or raise MEMORY_LIMIT.",
+                )
+            },
+            |bytes| self.accountant.release(bytes),
+        )
     }
 
     fn semantic_where_candidate_bitmap(
         &self,
-        table: &str,
+        tx: Option<TxId>,
+        index: &VectorIndexRef,
         where_clause: &str,
         snapshot: SnapshotId,
-    ) -> Result<RoaringTreemap> {
-        let sql = format!("SELECT * FROM {table} WHERE {where_clause}");
-        let stmt = contextdb_parser::parse(&sql)?;
-        let expr = match stmt {
-            Statement::Select(select) => select
-                .body
-                .where_clause
-                .ok_or_else(|| Error::ParseError("semantic WHERE missing expression".into()))?,
-            _ => return Err(Error::ParseError("semantic WHERE parse failed".into())),
+        require_bounded_route: bool,
+        preflight_auto_fallback: bool,
+    ) -> Result<(RoaringTreemap, bool)> {
+        let table = index.table.as_str();
+        let sql = if where_clause.is_empty() {
+            format!("SELECT row_id AS __vector_candidate_identity FROM {table}")
+        } else {
+            format!(
+                "SELECT row_id AS __vector_candidate_identity FROM {table} WHERE {where_clause}"
+            )
         };
+        let stmt = contextdb_parser::parse(&sql)?;
+        let Statement::Select(select) = &stmt else {
+            return Err(Error::ParseError("semantic WHERE parse failed".into()));
+        };
+        let params = HashMap::new();
+        let plan = contextdb_planner::plan(&stmt)?;
+        if let Some(expr) = select.body.where_clause.as_ref() {
+            crate::executor::bind_vector_search_parameters(expr, Some(&plan), &params)?;
+        }
+        let route = crate::executor::vector_candidate_route(self, index, Some(&plan), &params)?;
+        let access_filter = route.access_filter;
+        let access_plan = route.candidates;
+        let scope = route.scope;
+        let directory_route = route.directory_route;
+        let complete = route.complete;
+        if require_bounded_route && !complete {
+            return Err(Error::VectorFilteredRouteUnavailable {
+                index: index.clone(),
+                predicate_columns: crate::executor::vector_candidate_refusal_columns(
+                    self,
+                    index,
+                    access_plan.as_ref(),
+                    access_filter,
+                ),
+            });
+        }
+        if preflight_auto_fallback && !complete {
+            let exact_score_bytes = self
+                .vector_entry_count(index, snapshot)
+                .saturating_mul(std::mem::size_of::<(RowId, f32)>());
+            if crate::memory_accounting::ScopedMemoryReservation::try_new_for(
+                self.accountant(),
+                exact_score_bytes,
+                "vector_search",
+                "preflight_filtered_exact_scores",
+                "Add a relational index for the filter, reduce vector volume, or raise MEMORY_LIMIT.",
+            )
+            .is_err()
+            {
+                return Err(Error::VectorFilteredRouteUnavailable {
+                    index: index.clone(),
+            predicate_columns: crate::executor::vector_candidate_refusal_columns(self, index, access_plan.as_ref(), access_filter),
+                });
+            }
+        }
         let mut bitmap = RoaringTreemap::new();
-        for row in self.scan(table, snapshot)? {
-            if crate::executor::row_matches(&row, &expr, &HashMap::new())? {
-                bitmap.insert(row.row_id.0);
+        if directory_route {
+            bitmap = self.vector_directory_candidate_bitmap(
+                tx,
+                index,
+                snapshot,
+                select.body.where_clause.as_ref(),
+                &params,
+                scope.as_ref(),
+            )?;
+        } else {
+            let result =
+                self.run_read_plan(access_plan.as_ref().unwrap_or(&plan), &params, tx, snapshot)?;
+            let row_id_column = result
+                .columns
+                .iter()
+                .position(|column| column == "__vector_candidate_identity")
+                .ok_or_else(|| {
+                    Error::PlanError("semantic candidate source omitted row identity".into())
+                })?;
+            for row in result.rows {
+                if let Some(Value::Int64(id)) = row.get(row_id_column) {
+                    bitmap.insert(*id as u64);
+                }
+            }
+        }
+        Ok((bitmap, complete))
+    }
+
+    pub(crate) fn vector_directory_candidate_bitmap(
+        &self,
+        tx: Option<TxId>,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        filter: Option<&contextdb_parser::ast::Expr>,
+        params: &HashMap<String, Value>,
+        scope: Option<&crate::executor::VectorPartitionScope>,
+    ) -> Result<RoaringTreemap> {
+        let table = index.table.as_str();
+        let mut bitmap = RoaringTreemap::new();
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let mut admit = |id| -> Result<()> {
+            let row = match self.find_row_by_id_in_tx(tx, table, id, snapshot) {
+                Ok(row) => row,
+                Err(Error::NotFound(_)) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if let Some(expr) = filter
+                && !crate::executor::row_matches(&row, expr, params)?
+            {
+                return Ok(());
+            }
+            if self.bounded_read_allowed_for_row(tx, table, &meta, &row, snapshot, &mut |_| {
+                Ok::<(), Error>(())
+            })? {
+                bitmap.insert(id.0);
+            }
+            Ok(())
+        };
+        let mut collect = || {
+            self.vector.bounded_visit_visible_ids(
+                index,
+                snapshot,
+                || Ok(()),
+                |bytes| {
+                    self.accountant.try_allocate_for(
+                        bytes,
+                        "vector_search",
+                        "authorized_directory",
+                        "Narrow the authorized scope or raise MEMORY_LIMIT.",
+                    )
+                },
+                |bytes| self.accountant.release(bytes),
+                &mut admit,
+            )
+        };
+        if let Some(prefixes) =
+            scope.and_then(crate::executor::VectorPartitionScope::resolved_prefixes)
+        {
+            contextdb_vector::mem::with_selected_partition_prefixes(
+                index,
+                prefixes.to_vec(),
+                collect,
+            )?;
+        } else {
+            collect()?;
+        }
+        if let Some(tx) = tx {
+            let staged = self.tx_mgr.with_write_set(tx, |ws| {
+                ws.relational_inserts
+                    .iter()
+                    .filter(|(row_table, _)| row_table == table)
+                    .map(|(_, row)| row.row_id)
+                    .collect::<Vec<_>>()
+            })?;
+            for id in staged {
+                admit(id)?;
             }
         }
         Ok(bitmap)
+    }
+
+    fn effective_vector_read_candidates(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        candidates: Option<&RoaringTreemap>,
+        mode: contextdb_core::VectorSearchMode,
+    ) -> Result<Option<RoaringTreemap>> {
+        if candidates.is_none() && self.bounded_read_requires_candidate_filter(&index.table)? {
+            return self
+                .semantic_where_candidate_bitmap(
+                    None,
+                    index,
+                    "",
+                    snapshot,
+                    mode == contextdb_core::VectorSearchMode::Indexed,
+                    mode == contextdb_core::VectorSearchMode::Auto,
+                )
+                .map(|(ids, _)| Some(ids));
+        }
+        self.effective_read_candidates(&index.table, snapshot, candidates)
     }
 
     fn find_row_by_id_at(
@@ -25796,38 +31268,21 @@ impl Database {
         }
     }
 
-    /// What holding one indexed vector costs the store, at admission and at
-    /// release alike.
-    ///
-    /// A vector column's value is retained TWICE: the relational row keeps
-    /// the vector it was given, and the vector store keeps its own copy in
-    /// whatever representation the index declares. Measured against the
-    /// allocator, a plain row with a vector column holds eight bytes for
-    /// every four written -- charging only the vector store's copy left an
-    /// operator's limit admitting twice what it allowed.
+    /// What admitting one vector body into the vector store costs, at
+    /// admission and at the rollback that returns it alike. This is the raw
+    /// body only: an F32 column's relational projection lives inside the row
+    /// values and is carried by the row's own charge, never by the vector.
     pub(crate) fn vector_insert_accounted_bytes(
         &self,
         index: &VectorIndexRef,
         dimension: usize,
     ) -> usize {
-        let row_copy = 24 + dimension.saturating_mul(std::mem::size_of::<f32>());
-        let Some(quantization) = self
-            .vector_store
-            .try_state(index)
-            .map(|state| state.quantization())
-        else {
-            return row_copy;
-        };
-        let stored_copy = quantization.storage_bytes(dimension);
-        if matches!(quantization, contextdb_core::VectorQuantization::F32) {
-            // A full-precision column keeps its value in the row as well, so
-            // the store's copy is the second of two.
-            return row_copy.saturating_add(stored_copy);
-        }
-        // A quantized column keeps ONE copy, in the store, in the
-        // representation the column declared. That is the whole point of
-        // declaring it, and it is what the charge says.
-        stored_copy
+        self.vector_store
+            .index_layout(index)
+            .ok()
+            .map(|layout| layout.quantization)
+            .unwrap_or(VectorQuantization::F32)
+            .storage_bytes(dimension)
     }
 
     #[doc(hidden)]
@@ -25842,6 +31297,35 @@ impl Database {
     pub fn __debug_last_query_vector_trace_for_test(&self) -> Option<VectorSearchDebugTrace> {
         let _operation = self.assert_open_operation();
         self.last_vector_search_trace.read().clone()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __reset_last_query_vector_trace_for_test(&self) {
+        let _operation = self.assert_open_operation();
+        *self.last_vector_search_trace.write() = None;
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __take_last_query_vector_trace_for_test(&self) -> Option<VectorSearchDebugTrace> {
+        let _operation = self.assert_open_operation();
+        self.last_vector_search_trace.write().take()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __reset_vector_full_index_entries_touched_for_test(&self) {
+        let _operation = self.assert_open_operation();
+        self.vector_store
+            .reset_full_index_entries_touched_for_test();
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __vector_full_index_entries_touched_for_test(&self) -> u64 {
+        let _operation = self.assert_open_operation();
+        self.vector_store.full_index_entries_touched_for_test()
     }
 
     #[doc(hidden)]
@@ -25866,7 +31350,7 @@ impl Database {
         &self,
         index: &VectorIndexRef,
     ) -> Result<()> {
-        if self.vector_store.try_state(index).is_some() {
+        if self.vector_store.contains_index(index) {
             Ok(())
         } else {
             Err(Error::UnknownVectorIndex {
@@ -25954,19 +31438,64 @@ impl Database {
     pub fn has_live_vector(&self, row_id: RowId, snapshot: SnapshotId) -> bool {
         let _operation = self.assert_open_operation();
         let _vector_schema = self.vector_schema_read_many(self.vector_store_schema_refs());
-        self.vector_store
-            .live_entries_for_row(row_id, snapshot)
-            .into_iter()
-            .any(|entry| self.row_id_read_allowed_for_change(&entry.index.table, row_id, snapshot))
+        self.vector_store.index_infos().into_iter().any(|info| {
+            self.vector_store
+                .has_live_entry_for_row(&info.index, row_id, snapshot)
+                && self.row_id_read_allowed_for_change(&info.index.table, row_id, snapshot)
+        })
     }
 
     pub fn live_vector_entry(&self, row_id: RowId, snapshot: SnapshotId) -> Option<VectorEntry> {
         let _operation = self.assert_open_operation();
         let _vector_schema = self.vector_schema_read_many(self.vector_store_schema_refs());
-        self.vector_store
-            .live_entries_for_row(row_id, snapshot)
+        let resident = self
+            .vector_store
+            .load_live_entries_for_row(row_id, snapshot)
+            .unwrap_or_default()
             .into_iter()
-            .find(|entry| self.row_id_read_allowed_for_change(&entry.index.table, row_id, snapshot))
+            .find(|entry| {
+                self.row_id_read_allowed_for_change(&entry.index.table, row_id, snapshot)
+            });
+        if resident.is_some() {
+            return resident;
+        }
+        let persistence = self.persistence.as_ref()?;
+        let membership = persistence
+            .load_vector_partition_memberships()
+            .ok()?
+            .into_iter()
+            .filter(|membership| {
+                membership.row_id == row_id
+                    && membership.visible_from.0 <= snapshot.0
+                    && membership
+                        .deleted_tx
+                        .is_none_or(|deleted| deleted.0 > snapshot.0)
+                    && self.row_id_read_allowed_for_change(
+                        &membership.index.table,
+                        row_id,
+                        snapshot,
+                    )
+            })
+            .max_by_key(|membership| (membership.vector_lsn, membership.vector_created_tx))?;
+        let dimension = self
+            .vector_store
+            .index_layout(&membership.index)
+            .ok()?
+            .dimension;
+        persistence
+            .load_vector_entries_for_memberships(&[membership], dimension)
+            .ok()?
+            .pop()
+    }
+
+    pub(crate) fn vector_store_has_live_entry_for_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> bool {
+        self.vector_store
+            .has_live_entry_for_row(index, row_id, snapshot)
     }
 
     pub(crate) fn vector_store_live_entry_for_row(
@@ -25975,8 +31504,9 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Option<VectorEntry> {
+        let partition_key = self.vector_store.current_partition_for_row(index, row_id)?;
         self.vector_store
-            .live_entry_for_row(index, row_id, snapshot)
+            .live_entry_for_row_in_partition(index, &partition_key, row_id, snapshot)
     }
 
     pub(crate) fn natural_key_column_for_table(&self, table: &str) -> Result<String> {
@@ -26089,10 +31619,12 @@ impl Database {
                 VectorEntryOverlay::Found(entry) => return Ok(Some(entry)),
                 VectorEntryOverlay::Deleted => return Ok(None),
                 VectorEntryOverlay::Moved { from, to } => {
-                    if from == row_id {
+                    if from == row_id && from != to {
                         return Ok(None);
                     }
-                    let mut entry = self.vector_store_live_entry_for_row(index, from, snapshot);
+                    let mut entry = self
+                        .vector_store
+                        .load_live_entry_for_row(index, from, snapshot)?;
                     if let Some(entry) = entry.as_mut() {
                         entry.row_id = to;
                     }
@@ -26102,7 +31634,8 @@ impl Database {
             }
         }
 
-        Ok(self.vector_store_live_entry_for_row(index, row_id, snapshot))
+        self.vector_store
+            .load_live_entry_for_row(index, row_id, snapshot)
     }
 
     pub(crate) fn find_row_by_id_in_tx(
@@ -26139,6 +31672,34 @@ impl Database {
             }
         }
         self.find_row_by_id_at(table, row_id, snapshot)
+    }
+
+    fn vector_staged_row_in_selected_partitions(
+        &self,
+        ws: &WriteSet,
+        index: &VectorIndexRef,
+        row_id: RowId,
+    ) -> Result<bool> {
+        let Some(row) = ws.relational_inserts.iter().rev().find_map(|(table, row)| {
+            (table == &index.table && row.row_id == row_id).then_some(row)
+        }) else {
+            return Ok(true);
+        };
+        let meta = self
+            .table_meta(&index.table)
+            .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+        let declaration = meta
+            .columns
+            .iter()
+            .find(|column| column.name == index.column)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+        let key =
+            crate::composite_store::vector_partition_key_for_row(index, &meta, declaration, row)?;
+        Ok(contextdb_vector::mem::partition_key_is_selected(
+            index, &key,
+        ))
     }
 
     fn row_id_read_allowed_in_write_set_for_query(
@@ -26237,14 +31798,6 @@ impl Database {
             .filter(|entry| {
                 !edge_keys.contains(&(entry.source, entry.edge_type.clone(), entry.target))
             })
-            .collect()
-    }
-
-    pub(crate) fn vector_entries_after_table_drop(&self, table: &str) -> Vec<VectorEntry> {
-        self.vector_store
-            .all_entries()
-            .into_iter()
-            .filter(|entry| entry.index.table != table)
             .collect()
     }
 
@@ -26700,6 +32253,59 @@ impl Database {
         Ok((selected_hashes, survivor_hashes))
     }
 
+    /// Reserve the complete transient vector image and replacement-generation
+    /// disk envelope before either erasure path faults a selected partition in.
+    fn reserve_authoritative_erasure_workspace(
+        &self,
+        selections: &[AuthoritativePurgeSelection],
+    ) -> Result<contextdb_vector::VectorWorkspaceReservation> {
+        let selected_rows = selections
+            .iter()
+            .map(|selection| (selection.table.clone(), selection.local_row_id))
+            .collect::<Vec<_>>();
+        let (vector_bound, disk_bound) = self.vector_store.purge_workspace_bounds(&selected_rows);
+        if disk_bound != 0 {
+            self.maintenance_context()
+                .admit_generation_disk(disk_bound)?;
+        }
+        let rows_bound = self
+            .relational_store
+            .tables
+            .read()
+            .values()
+            .flatten()
+            .fold(0usize, |bytes, row| {
+                bytes.saturating_add(row.estimated_bytes())
+            });
+        let metadata_bound = self
+            .relational_store
+            .table_meta
+            .read()
+            .values()
+            .fold(0usize, |bytes, meta| {
+                bytes.saturating_add(meta.estimated_bytes())
+            });
+        let edges_bound = self
+            .graph_store
+            .forward_adj
+            .read()
+            .values()
+            .flatten()
+            .fold(0usize, |bytes, edge| {
+                bytes.saturating_add(edge.estimated_bytes())
+            });
+        self.vector_store.reserve_workspace(
+            self.accountant.clone(),
+            vector_bound
+                .saturating_add(rows_bound.saturating_mul(6))
+                .saturating_add(metadata_bound.saturating_mul(4))
+                .saturating_add(edges_bound.saturating_mul(4))
+                .max(1),
+            "prepare_authoritative_vector_purge",
+            "Raise MEMORY_LIMIT or reduce the selected purge set before preparing its replacement vector image.",
+        )
+    }
+
     /// Enumerate every owned copy for a previously resolved immutable root.
     /// This is deliberately a pure read: the later commit kernel receives this
     /// prepared set but is the only code allowed to remove or publish state.
@@ -26708,13 +32314,14 @@ impl Database {
         selections: &[AuthoritativePurgeSelection],
         queue_mutation_token: event_bus::AuthoritativePurgeQueueMutationToken,
         report_shape: crate::custody::erasure::PurgeReportShape,
+        frontier: Lsn,
     ) -> Result<AuthoritativePurgePreparedSet> {
         use crate::custody::erasure::PurgeReportShape;
         let report_requested = report_shape != PurgeReportShape::None;
         let _operation = self.open_operation()?;
-        // Statement 17a: an explicit node-local instruction may have no hub rows.
+        // An explicit node-local instruction may have no hub rows.
 
-        // Statements 17/17a/17b: ownership is a (table,row) pair throughout one union.
+        // Ownership is a (table,row) pair throughout one union.
         let mut selected_by_table = BTreeMap::<String, HashSet<RowId>>::new();
         for candidate in selections {
             if !selected_by_table
@@ -26948,12 +32555,57 @@ impl Database {
             .copied()
             .map(|position| change_log[position].clone())
             .collect::<Vec<_>>();
-        let vector_entries = self
-            .vector_store
-            .all_entries()
-            .into_iter()
-            .filter(|entry| selected(&entry.index.table, &entry.row_id))
+        // The relational selector names rows, not vector partitions. Resolve
+        // those rows through the lightweight vector directories and fault in
+        // only partitions that contain a selected lineage before building the
+        // purge image. Reading every registered partition here would turn a
+        // one-row forget into a whole-database memory spike.
+        for (table, row_ids) in &selected_by_table {
+            self.vector_store
+                .ensure_raw_partitions_containing_rows(table, row_ids)?;
+        }
+        let all_partitioned_vector_entries = self.vector_store.all_partitioned_entries();
+        let selected_partitioned_vector_entries = all_partitioned_vector_entries
+            .iter()
+            .filter(|entry| selected(&entry.entry.index.table, &entry.entry.row_id))
+            .cloned()
             .collect::<Vec<_>>();
+        let mut vector_entries = Vec::new();
+        let mut vector_partition_selectors = Vec::new();
+        for selected in &selected_partitioned_vector_entries {
+            if !vector_entries.contains(&selected.entry) {
+                vector_entries.push(selected.entry.clone());
+            }
+            let selector = VectorPartitionVersionSelector {
+                index: selected.entry.index.clone(),
+                partition_key: selected.partition_key.clone(),
+                row_id: selected.entry.row_id,
+                vector_created_tx: selected.entry.created_tx,
+                vector_lsn: selected.entry.lsn,
+            };
+            if !vector_partition_selectors.contains(&selector) {
+                vector_partition_selectors.push(selector);
+            }
+        }
+        let persistence = self.persistence.as_ref().ok_or_else(|| {
+            Error::SyncError("authoritative purge requires a file-backed database".to_string())
+        })?;
+        let vector_partition_identities =
+            persistence.resolve_vector_partition_version_identities(&vector_partition_selectors)?;
+        let mut affected_vector_partitions = selected_partitioned_vector_entries
+            .iter()
+            .map(|entry| {
+                VectorPartitionRef::new(entry.entry.index.clone(), entry.partition_key.clone())
+            })
+            .collect::<Vec<_>>();
+        affected_vector_partitions.sort_by(|left, right| {
+            left.index
+                .table
+                .cmp(&right.index.table)
+                .then(left.index.column.cmp(&right.index.column))
+                .then(left.partition_key.cmp(&right.partition_key))
+        });
+        affected_vector_partitions.dedup();
 
         let mut disk_source_provenance = Vec::new();
         for (table, ids) in &selected_by_table {
@@ -27053,7 +32705,7 @@ impl Database {
                     ),
                 ]);
             } else if report_shape == PurgeReportShape::Single {
-                // Statement 17a preserves the established single-table report.
+                // A single-table selection preserves the established single-table report.
                 survivor_report = report;
             }
             let meta = self
@@ -27078,9 +32730,10 @@ impl Database {
             ));
             affected_rows.insert(table.clone(), after);
         }
-        let relational = self
+        let mut relational = self
             .relational_store
             .prepare_received_schema_publication(projections, std::iter::empty::<String>());
+        relational.admit_current_memberships(self.accountant.clone())?;
         let replacement_change_log = change_log
             .into_iter()
             .enumerate()
@@ -27097,31 +32750,173 @@ impl Database {
         );
         let survivor_graph_entries = surviving_forward_entries;
         let graph = GraphStore::prepare_received_schema_publication(survivor_graph_entries.clone());
-        let vector_registry_entries = self
-            .vector_store
-            .all_entries()
+        let vector_registry_entries = all_partitioned_vector_entries
             .into_iter()
-            .filter(|entry| !selected(&entry.index.table, &entry.row_id))
+            .filter(|entry| !selected(&entry.entry.index.table, &entry.entry.row_id))
             .collect::<Vec<_>>();
-        let vector_schemas = self
+        let all_table_meta = self.relational_store.table_meta.read().clone();
+        let vector_schemas = vector_layouts_from_meta(&all_table_meta);
+        let materialized_vector_partitions = self
             .vector_store
-            .index_infos()
+            .materialized_hnsw_partitions()
             .into_iter()
-            .map(|info| (info.index, info.dimension, info.quantization))
+            .collect::<HashSet<_>>();
+        let mut replacement_generation_plans = Vec::<(VectorPartitionRef, u64)>::new();
+        for partition in &affected_vector_partitions {
+            let has_live_survivor = vector_registry_entries.iter().any(|entry| {
+                entry.entry.index == partition.index
+                    && entry.partition_key == partition.partition_key
+                    && entry.entry.deleted_tx.is_none()
+            });
+            if !has_live_survivor {
+                continue;
+            }
+            let current = persistence.load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )?;
+            if current.is_none() && !materialized_vector_partitions.contains(partition) {
+                // A partition that had no maintained route before purge stays
+                // unavailable; maintenance remains responsible for its first
+                // generation. Purge must replace every route that did exist.
+                continue;
+            }
+            let previous_generation = current
+                .as_ref()
+                .map(|catalog| {
+                    catalog
+                        .change
+                        .map(|change| change.generation_id)
+                        .unwrap_or(catalog.base.generation_id)
+                        .max(catalog.base.generation_id)
+                })
+                .unwrap_or(0);
+            let generation_id = previous_generation.checked_add(1).ok_or_else(|| {
+                Error::Other(format!(
+                    "vector generation identity exhausted for {}.{}",
+                    partition.index.table, partition.index.column
+                ))
+            })?;
+            replacement_generation_plans.push((partition.clone(), generation_id));
+        }
+        let replacement_generation_partitions = replacement_generation_plans
+            .iter()
+            .map(|(partition, _)| partition.clone())
             .collect::<Vec<_>>();
-        // Only graphs that callers had already materialized are part of the
-        // replacement contract.  Build their survivor graph now, before the
-        // one durable purge commit; a 1,000-node graph that becomes 999 must
-        // remain materialized even though ordinary lazy search would not
-        // cross its threshold again.
-        let materialized_vector_indexes = self.vector_store.materialized_hnsw_indexes();
-        let vector = VectorStore::prepare_authoritative_purge_publication(
-            vector_schemas.clone(),
-            vector_registry_entries.clone(),
-            materialized_vector_indexes,
-            self.accountant.clone(),
-        )?;
-        let old_tables = self.relational_store.table_meta.read().clone();
+        let vector = self
+            .vector_store
+            .prepare_partitioned_authoritative_purge_publication(
+                vector_schemas.clone(),
+                vector_registry_entries.clone(),
+                affected_vector_partitions.clone(),
+                replacement_generation_partitions,
+                self.accountant.clone(),
+            )?;
+        let covered_tx = self.tx_mgr.current_tx_max();
+        let mut vector_generation_candidates =
+            Vec::with_capacity(replacement_generation_plans.len());
+        for (partition, generation_id) in replacement_generation_plans {
+            let layout = vector_schemas
+                .iter()
+                .find(|(index, _)| *index == partition.index)
+                .map(|(_, layout)| layout)
+                .ok_or_else(|| Error::UnknownVectorIndex {
+                    index: partition.index.clone(),
+                })?;
+            let live_count = vector_registry_entries
+                .iter()
+                .filter(|entry| {
+                    entry.entry.index == partition.index
+                        && entry.partition_key == partition.partition_key
+                        && entry.entry.deleted_tx.is_none()
+                })
+                .count();
+            let policy = layout.resolve_policy(live_count, 1);
+            let identity = VectorGraphGeneration {
+                generation_id,
+                covered_tx,
+                covered_lsn: frontier,
+                durable_bytes: 0,
+                policy_revision: policy.policy_revision,
+                hnsw_m: u32::try_from(policy.hnsw_m).map_err(|_| {
+                    Error::Other("resolved HNSW M exceeds the durable range".to_string())
+                })?,
+                hnsw_ef_construction: u32::try_from(policy.hnsw_ef_construction).map_err(|_| {
+                    Error::Other(
+                        "resolved HNSW EF_CONSTRUCTION exceeds the durable range".to_string(),
+                    )
+                })?,
+            };
+            let (encoded_graph, resident_bytes) =
+                vector.prepare_partition_base_generation(&partition, identity)?;
+            let durable_bytes = u64::try_from(encoded_graph.len()).map_err(|_| {
+                Error::Other("vector generation bytes exceed the durable range".to_string())
+            })?;
+            let resident_bytes = u64::try_from(resident_bytes).map_err(|_| {
+                Error::Other("vector generation residency exceeds the durable range".to_string())
+            })?;
+            let mut live_entries = vector_registry_entries
+                .iter()
+                .filter(|entry| {
+                    entry.entry.index == partition.index
+                        && entry.partition_key == partition.partition_key
+                        && entry.entry.deleted_tx.is_none()
+                })
+                .map(|entry| &entry.entry)
+                .collect::<Vec<_>>();
+            live_entries.sort_by_key(|entry| (entry.row_id, entry.created_tx, entry.lsn));
+            let state_bytes =
+                bincode::serde::encode_to_vec(&live_entries, bincode::config::standard()).map_err(
+                    |error| {
+                        Error::Other(format!(
+                            "could not encode vector generation state digest: {error}"
+                        ))
+                    },
+                )?;
+            let descriptor = VectorPartitionGenerationDescriptor {
+                generation_id,
+                covered_tx,
+                covered_lsn: frontier,
+                resident_bytes,
+                durable_bytes,
+                policy_revision: policy.policy_revision,
+                hnsw_m: identity.hnsw_m,
+                hnsw_ef_construction: identity.hnsw_ef_construction,
+            };
+            let base = VectorPartitionBaseGenerationRecord {
+                index: partition.index.clone(),
+                partition_key: partition.partition_key.clone(),
+                generation_id,
+                base_tx: covered_tx,
+                base_lsn: frontier,
+                highest_included_tx: covered_tx,
+                highest_included_lsn: frontier,
+                dimension: u32::try_from(layout.dimension).map_err(|_| {
+                    Error::Other(
+                        "vector dimension exceeds the durable generation range".to_string(),
+                    )
+                })?,
+                quantization: layout.quantization,
+                algorithm_version: VECTOR_GRAPH_ALGORITHM_VERSION,
+                graph_format_version: VECTOR_GRAPH_FORMAT_VERSION,
+                graph: VectorPartitionGraphBytes::verified(encoded_graph),
+                state_digest: *blake3::hash(&state_bytes).as_bytes(),
+            };
+            let catalog = VectorPartitionGenerationCatalogRecord {
+                index: partition.index,
+                partition_key: partition.partition_key,
+                base: descriptor,
+                change: None,
+                published_tx: covered_tx,
+                published_lsn: frontier,
+            };
+            vector_generation_candidates.push(VectorPartitionGenerationCandidate {
+                base,
+                change: None,
+                catalog,
+            });
+        }
+        let old_tables = all_table_meta;
         let old_rows = self.relational_store.tables.read().clone();
         let old_edges = self
             .graph_store
@@ -27135,48 +32930,26 @@ impl Database {
         let old_vector_bytes = old_vector_infos
             .iter()
             .fold(0usize, |bytes, info| bytes.saturating_add(info.bytes));
-        let old_vector_payload_bytes = self
-            .vector_store
-            .all_entries()
-            .iter()
-            .filter(|entry| entry.deleted_tx.is_none())
-            .fold(0usize, |bytes, entry| {
-                let quantization = old_vector_infos
-                    .iter()
-                    .find(|info| info.index == entry.index)
-                    .map(|info| info.quantization)
-                    .unwrap_or(VectorQuantization::F32);
-                bytes.saturating_add(quantization.storage_bytes(entry.vector.len()))
-            });
-        let new_vector_payload_bytes = vector_registry_entries
-            .iter()
-            .filter(|entry| entry.deleted_tx.is_none())
-            .fold(0usize, |bytes, entry| {
-                let quantization = vector_schemas
-                    .iter()
-                    .find(|(index, _, _)| *index == entry.index)
-                    .map(|(_, _, quantization)| *quantization)
-                    .unwrap_or(VectorQuantization::F32);
-                bytes.saturating_add(quantization.storage_bytes(entry.vector.len()))
-            });
+        let preserved_vector_bytes = vector.preserved_state_bytes();
+        let new_vector_memory_swap_bytes = vector.memory_swap_vector_bytes();
         let mut replacement_rows = old_rows.clone();
         replacement_rows.extend(affected_rows);
-        let old_bytes = Self::received_schema_replacement_bytes(
+        let old_bytes = self.received_schema_replacement_bytes(
             &old_tables,
             &old_rows,
             &old_edges,
             old_vector_bytes,
         );
-        let new_bytes = Self::received_schema_replacement_bytes(
+        let new_bytes = self.received_schema_replacement_bytes(
             &old_tables,
             &replacement_rows,
             &survivor_graph_entries,
-            new_vector_payload_bytes,
+            new_vector_memory_swap_bytes,
         );
         let memory_swap = PreparedMemorySwap::accounting(
             old_bytes,
             new_bytes,
-            old_vector_bytes.saturating_sub(old_vector_payload_bytes),
+            old_vector_bytes.saturating_sub(preserved_vector_bytes),
         );
         let mut accepted_author_memory_mirror = self.accepted_sync_row_authors.read().clone();
         for owner in &lineage_config_owners {
@@ -27198,6 +32971,8 @@ impl Database {
             row_version_keys: row_versions,
             change_log_entries,
             vector_entries,
+            vector_partition_identities,
+            vector_generation_candidates,
             canonical_graph_entries,
             disk_source_provenance,
             lineage_config_owners,
@@ -27301,7 +33076,7 @@ impl Database {
         &self,
         item: &AuthoritativePurgeDeliveryItem,
     ) -> Result<bool> {
-        // Statement 17a: node-local table generations are intentionally independent.
+        // Node-local table generations are intentionally independent.
         if item.node_local_predicate.is_some() {
             return Ok(false);
         }
@@ -27384,7 +33159,7 @@ impl Database {
                     .push(selection);
                 continue;
             }
-            // Statement 17: retain this node's known creator if present; an
+            // Retain this node's known creator if present; an
             // empty node can adopt the first authenticated purged creator.
             let lineage_root = existing
                 .as_ref()
@@ -27571,6 +33346,7 @@ impl Database {
                     &deletable_hashes,
                     frontier,
                 )?;
+                let _vector_workspace = self.reserve_authoritative_erasure_workspace(selections)?;
                 let queue_mutation_token = queue_drain
                     .take()
                     .expect("authoritative purge queue drain is consumed by one commit attempt")
@@ -27579,10 +33355,9 @@ impl Database {
                     selections,
                     queue_mutation_token,
                     report_shape,
+                    frontier,
                 )?;
 
-                // This is the last fallible in-memory preparation.  Its Drop
-                // returns the reservation if Redb rejects the one durable commit.
                 let mut memory_swap = PreparedMemorySwap::prepare(
                     self.accountant.clone(),
                     prepared.publication_replacements.memory_swap.old_bytes,
@@ -27592,6 +33367,15 @@ impl Database {
                         .memory_swap
                         .retired_bytes_released_by_store,
                 )?;
+                #[cfg(any(test, feature = "test-seams"))]
+                if take_vector_memory_fault(
+                    &VECTOR_DURABLE_PURGE_FAILURE_ARMED,
+                    &VECTOR_DURABLE_PURGE_FAILURE_CONSUMED,
+                ) {
+                    return Err(Error::Other(
+                        "injected durable vector purge prepublication failure".to_string(),
+                    ));
+                }
                 let lifecycle_records = prepared
                     .lineage_config_owners
                     .iter()
@@ -27611,7 +33395,7 @@ impl Database {
                             .map(|bytes| (key, bytes, lifecycle))
                     }))
                     .collect::<Result<Vec<_>>>()?;
-                // Statement 17a: key selections and node-local instructions share one frontier.
+                // Key selections and node-local instructions share one frontier.
                 let purge_delivery_items = if journal_outbound_delivery {
                     let keyed = selections
                         .iter()
@@ -27628,7 +33412,7 @@ impl Database {
                                 table: selection.table.clone(),
                                 table_generation: selection.table_generation,
                                 natural_key: selection.natural_key.clone(),
-                                // Statement 17: carry all known copies on the existing purge lane.
+                                // Carry all known copies on the existing purge lane.
                                 purged_lineage_roots: crate::custody::erasure::lineage_roots(
                                     self,
                                     &selection.table,
@@ -27708,6 +33492,8 @@ impl Database {
                         .collect(),
                     source_provenance: prepared.disk_source_provenance.clone(),
                     vectors: prepared.vector_entries.clone(),
+                    vector_partition_identities: prepared.vector_partition_identities.clone(),
+                    vector_generation_candidates: prepared.vector_generation_candidates.clone(),
                     graph_entries: prepared.canonical_graph_entries.clone(),
                     sink_entries: durable_sink_entries,
                     change_log_entries: prepared.change_log_entries.clone(),
@@ -27736,7 +33522,7 @@ impl Database {
                     lifecycle_records: lifecycle_records
                         .into_iter()
                         .map(|(key, bytes, _)| (key, bytes))
-                        // Statement 17a: applying an instruction and its one-time receipt is atomic.
+                        // Applying an instruction and its one-time receipt is atomic.
                         .chain(
                             instructions
                                 .applied
@@ -27774,7 +33560,7 @@ impl Database {
                     .publish_prepared_received_schema(prepared.publication_replacements.graph);
                 self.vector_store.publish_prepared_received_schema(
                     prepared.publication_replacements.vector,
-                    &*self.accountant,
+                    self.accountant.clone(),
                 );
                 self.event_bus
                     .publish_prepared_authoritative_purge_queue_replacement(
@@ -28145,7 +33931,7 @@ impl Database {
     /// this call returns. Reusing the SAME `snapshot` value in a LATER call
     /// is not automatically protected — see [`Database::pin_snapshot`] if you
     /// need to hold a snapshot across separate calls on a table declaring
-    /// `HISTORY CURRENT ONLY`.
+    /// `RETAIN` or `HISTORY CURRENT ONLY`.
     pub fn execute_at_snapshot(
         &self,
         sql: &str,
@@ -28156,19 +33942,18 @@ impl Database {
     }
 
     /// Hold `snapshot` across separate calls: while the returned guard lives,
-    /// version cleanup defers any version still visible at `snapshot` to a
-    /// later cycle rather than reclaiming it. Drop the guard when you are
-    /// done — a version deferred only because of a pin is reclaimed on the
-    /// next cycle after the pin releases.
+    /// retention and version cleanup defer any version still visible at
+    /// `snapshot` to a later cycle rather than reclaiming it. Drop the guard
+    /// when you are done — a version deferred only because of a pin is
+    /// reclaimed on the next cycle after the pin releases.
     ///
-    /// Needed only for a table declaring `HISTORY CURRENT ONLY`: a table
-    /// that keeps every version (the default) is never affected by cleanup,
-    /// so a snapshot over it needs no pin. Without a pin, calling
+    /// Needed only for a table declaring `RETAIN` or `HISTORY CURRENT ONLY`:
+    /// a table that declares neither keeps every version, so a snapshot over
+    /// it needs no pin. Without a pin, calling
     /// [`Database::execute_at_snapshot`] twice with the same `snapshot` and a
     /// cleanup cycle in between may silently return fewer rows the second
-    /// time — not a wrong value, not an error, just a version cleanup already
-    /// reclaimed because nothing told the engine this snapshot was still
-    /// wanted.
+    /// time — not a wrong value, not an error, just physical cleanup that ran
+    /// because nothing told the engine this snapshot was still wanted.
     ///
     /// Protection begins when this call RETURNS: if a removal pass is
     /// already mid-flight for versions older than `snapshot` when this is
@@ -28183,6 +33968,178 @@ impl Database {
             _database: self,
             _registration: self.snapshot_registry.register(snapshot),
         }
+    }
+
+    /// Whether committing `tx`'s write set could leave a partitioned vector
+    /// partition with no live vector -- the one outcome the commit-time
+    /// snapshot-removal pass exists for: an emptied partition's graph and
+    /// live-plus-retained identity may be released at commit only when no
+    /// registered snapshot still sees an entry in it, and that proof needs
+    /// the pass. The pass holds every read arriving at a snapshot at or
+    /// before this commit's watermark until the whole apply is over, so a
+    /// commit that cannot empty a partition -- an in-place vector or
+    /// attribute update that keeps each row in its partition, or any write
+    /// on a table without a partitioned vector column -- must never begin
+    /// one: a read opened before a commit finishes is owed its old complete
+    /// view at once, not after the writer's apply.
+    ///
+    /// Conservative: answers `true` whenever emptiness cannot be ruled out
+    /// cheaply (a key move, a vector removed without a same-row
+    /// replacement, a row deleted from a partitioned vector table, or a
+    /// replacement whose partition key cannot be shown unchanged).
+    fn write_set_could_empty_a_vector_partition(&self, tx: TxId) -> Result<bool> {
+        struct WriteSetShape {
+            tables: Vec<TableName>,
+            has_moves: bool,
+            has_unreplaced_vector_delete: bool,
+            unreplaced_row_deletes: Vec<TableName>,
+        }
+        let shape = self.tx_mgr.with_write_set(tx, |ws| {
+            let replaced_vectors: HashSet<(&VectorIndexRef, RowId)> = ws
+                .vector_inserts
+                .iter()
+                .map(|entry| (&entry.index, entry.row_id))
+                .collect();
+            let replaced_rows: HashSet<(&str, RowId)> = ws
+                .relational_inserts
+                .iter()
+                .map(|(table, row)| (table.as_str(), row.row_id))
+                .collect();
+            let mut tables: Vec<TableName> = ws
+                .relational_inserts
+                .iter()
+                .map(|(table, _)| table.clone())
+                .chain(
+                    ws.relational_deletes
+                        .iter()
+                        .map(|(table, _, _)| table.clone()),
+                )
+                .collect();
+            tables.sort_unstable();
+            tables.dedup();
+            WriteSetShape {
+                tables,
+                has_moves: !ws.vector_moves.is_empty(),
+                has_unreplaced_vector_delete: ws
+                    .vector_deletes
+                    .iter()
+                    .any(|(index, row_id, _)| !replaced_vectors.contains(&(index, *row_id))),
+                unreplaced_row_deletes: ws
+                    .relational_deletes
+                    .iter()
+                    .filter(|(table, row_id, _)| {
+                        !replaced_rows.contains(&(table.as_str(), *row_id))
+                    })
+                    .map(|(table, _, _)| table.clone())
+                    .collect(),
+            }
+        })?;
+        if shape.has_moves || shape.has_unreplaced_vector_delete {
+            return Ok(true);
+        }
+        // Only a PARTITIONED vector column has partition state to release;
+        // an unpartitioned column is never reclaimed at commit.
+        let mut partitioned_columns: HashMap<TableName, Vec<ColumnDef>> = HashMap::new();
+        for table in &shape.tables {
+            let Some(meta) = self.relational_store.table_meta(table) else {
+                continue;
+            };
+            let columns: Vec<ColumnDef> = meta
+                .columns
+                .iter()
+                .filter(|column| {
+                    matches!(column.column_type, ColumnType::Vector(_))
+                        && column.partition_key_columns.is_some()
+                })
+                .cloned()
+                .collect();
+            if !columns.is_empty() {
+                partitioned_columns.insert(table.clone(), columns);
+            }
+        }
+        if partitioned_columns.is_empty() {
+            return Ok(false);
+        }
+        if shape
+            .unreplaced_row_deletes
+            .iter()
+            .any(|table| partitioned_columns.contains_key(table))
+        {
+            return Ok(true);
+        }
+        // A replacement (or received upsert) on a partitioned table empties
+        // its source partition only if a declared key changed. Rows are
+        // copied out first so no store lock is taken under the write-set
+        // lock; the commit lock is held, so the live row is the pre-commit row.
+        let replacements: Vec<(TableName, VersionedRow)> =
+            self.tx_mgr.with_write_set(tx, |ws| {
+                ws.relational_inserts
+                    .iter()
+                    .filter(|(table, _)| partitioned_columns.contains_key(table))
+                    .cloned()
+                    .collect()
+            })?;
+        for (table, new_row) in &replacements {
+            let Some(old_row) = self.relational_store.live_row_by_id(table, new_row.row_id) else {
+                // A brand-new row leaves no partition.
+                continue;
+            };
+            let Some(meta) = self.relational_store.table_meta(table) else {
+                continue;
+            };
+            for declaration in &partitioned_columns[table] {
+                let index = VectorIndexRef::new(table.clone(), declaration.name.clone());
+                let old_key = crate::composite_store::vector_partition_key_for_row(
+                    &index,
+                    &meta,
+                    declaration,
+                    &old_row,
+                );
+                let new_key = crate::composite_store::vector_partition_key_for_row(
+                    &index,
+                    &meta,
+                    declaration,
+                    new_row,
+                );
+                match (old_key, new_key) {
+                    (Ok(old_key), Ok(new_key)) if old_key == new_key => {}
+                    _ => return Ok(true),
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Run the terminal commit for the statement currently on top of this
+    /// thread. Only that exact registration token is omitted from the
+    /// commit-time removal sample. Nested commits temporarily replace the
+    /// token and restore the outer statement's protection on return.
+    fn with_current_statement_snapshot_excluded_from_terminal_commit<T>(
+        &self,
+        commit: impl FnOnce() -> T,
+    ) -> T {
+        let token =
+            STATEMENT_SNAPSHOT_REGISTRATION_STACK.with(|stack| stack.borrow().last().copied());
+        debug_assert!(
+            token.is_some(),
+            "terminal SQL commit has a statement snapshot"
+        );
+        COMMITTING_STATEMENT_SNAPSHOT_REGISTRATION.with(|cell| {
+            struct RestoreCommitRegistration<'a> {
+                cell: &'a std::cell::Cell<Option<u64>>,
+                prior: Option<u64>,
+            }
+
+            impl Drop for RestoreCommitRegistration<'_> {
+                fn drop(&mut self) {
+                    self.cell.set(self.prior);
+                }
+            }
+
+            let prior = cell.replace(token);
+            let _restore = RestoreCommitRegistration { cell, prior };
+            commit()
+        })
     }
 
     pub(crate) fn with_snapshot_override<T>(
@@ -28206,6 +34163,21 @@ impl Database {
             let _guard = SnapshotOverrideGuard { cell, prior };
             f()
         })
+    }
+
+    /// Run a test-only reader through the same snapshot override used by the
+    /// ordinary historical-read entrypoint. This lets the bounded door prove
+    /// the identical retained-generation selection without adding a second
+    /// production snapshot API.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __with_snapshot_override_for_test<T>(
+        &self,
+        snapshot: SnapshotId,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        self.with_snapshot_override(snapshot, || Ok(operation()))
+            .expect("installing a test snapshot override is infallible")
     }
 
     pub(crate) fn snapshot_for_read(&self) -> SnapshotId {
@@ -28392,7 +34364,6 @@ impl Database {
         tx: TxId,
         index: &VectorIndexRef,
     ) -> Result<crate::executor::TransactionVectorOverlay> {
-        let committed_entries = self.vector_entry_count(index);
         self.tx_mgr.with_write_set(tx, |ws| {
             let mut removed: std::collections::HashSet<RowId> = ws
                 .vector_deletes
@@ -28451,7 +34422,15 @@ impl Database {
                         .len()
                         .saturating_mul(std::mem::size_of::<usize>()),
                 );
-            let searchable_entry_count = committed_entries.saturating_add(staged_positions.len());
+            // The graph owns committed search work. This count sizes only
+            // the transaction delta and the bounded widening needed after
+            // that graph result is filtered; including the whole committed
+            // index here turns `k` into the index cardinality and makes a
+            // healthy INDEXED route look incomplete.
+            let searchable_entry_count = removed
+                .len()
+                .saturating_add(moved.len())
+                .saturating_add(staged_positions.len());
             crate::executor::TransactionVectorOverlay {
                 removed,
                 moved,
@@ -28783,7 +34762,7 @@ impl Database {
     /// precedes the allocation it pays for -- the same order a committed row is
     /// charged in, and the reason this asks the write set twice rather than
     /// cloning it once.
-    pub(crate) fn bounded_staged_row_vector<E>(
+    pub(crate) fn staged_row_vector_for_source<E>(
         &self,
         tx: TxId,
         index: &VectorIndexRef,
@@ -28834,7 +34813,11 @@ impl Database {
         Ok(Some(entry.map(|entry| entry.vector)))
     }
 
-    pub(crate) fn with_bounded_row_vector<E, T>(
+    /// Resolve one ROW_VECTOR source through the relational row and vector
+    /// overlays at the same snapshot. Ordinary and bounded SQL readers share
+    /// this accessor so neither can pair a committed row with a
+    /// transaction-local vector, or the reverse.
+    pub(crate) fn with_row_vector_source<E, T>(
         &self,
         index: &VectorIndexRef,
         row_id: RowId,
@@ -28849,20 +34832,10 @@ impl Database {
         let meta = self
             .table_meta(&index.table)
             .ok_or_else(|| E::from(Error::TableNotFound(index.table.clone())))?;
+        let row = self
+            .find_row_by_id_in_tx(tx, &index.table, row_id, snapshot)
+            .map_err(E::from)?;
         let tables = self.relational_store.tables.read();
-        let row = tables
-            .get(&index.table)
-            .and_then(|rows| {
-                rows.iter()
-                    .rev()
-                    .find(|row| row.row_id == row_id && row.visible_at(snapshot))
-            })
-            .ok_or_else(|| {
-                E::from(Error::NotFound(format!(
-                    "row {row_id} in table {}",
-                    index.table
-                )))
-            })?;
         // The read guard taken above is still live, so access evaluation
         // borrows it rather than acquiring it a second time. A row the reader
         // is not entitled to read is refused as the access decision it is;
@@ -28873,7 +34846,7 @@ impl Database {
             &tables,
             &index.table,
             &meta,
-            row,
+            &row,
             snapshot,
             &mut before_access_row,
         )? {
@@ -28885,17 +34858,26 @@ impl Database {
         // value would name a different nearest neighbour while looking
         // entirely correct doing it.
         if let Some(tx) = tx
-            && let Some(staged) =
-                self.bounded_staged_row_vector(tx, index, row_id, snapshot, &mut before_access_row)?
+            && let Some(staged) = self.staged_row_vector_for_source(
+                tx,
+                index,
+                row_id,
+                snapshot,
+                &mut before_access_row,
+            )?
         {
             return match staged {
                 Some(vector) => use_vector(&vector).map(Some),
                 None => Ok(None),
             };
         }
-        match row.values.get(&index.column) {
-            Some(Value::Vector(vector)) => use_vector(vector).map(Some),
-            _ => Ok(None),
+        drop(tables);
+        match self
+            .vector_entry_for_row_in_tx(tx, index, row_id, snapshot)
+            .map_err(E::from)?
+        {
+            Some(entry) => use_vector(&entry.vector).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -28985,8 +34967,9 @@ impl Database {
             // vector it has just resolved.
             let dimension = self
                 .vector_store
-                .try_state(&shape.index)
-                .map(|state| state.dimension())
+                .index_layout(&shape.index)
+                .ok()
+                .map(|layout| layout.dimension)
                 .unwrap_or(0);
             let bytes = crate::executor::estimate_vector_search_bytes(dimension, shape.k);
             let reservation = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
@@ -29013,8 +34996,9 @@ impl Database {
     ) -> Result<Option<Box<dyn Send + Sync>>> {
         let dimension = self
             .vector_store
-            .try_state(index)
-            .map(|state| state.dimension())
+            .index_layout(index)
+            .ok()
+            .map(|layout| layout.dimension)
             .unwrap_or(0);
         let bytes = estimate_active_tx_vector_overlay_bytes(entry_count, dimension);
         let reservation = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
@@ -29052,14 +35036,48 @@ impl Database {
         })
     }
 
-    pub(crate) fn bounded_ensure_hnsw_built(
+    pub(crate) fn bounded_vector_visit_visible_ids<E>(
         &self,
         index: &VectorIndexRef,
         snapshot: SnapshotId,
-    ) -> bool {
-        self.vector
-            .ensure_hnsw_built(index, snapshot)
-            .unwrap_or(false)
+        before_entry: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize),
+        visit: impl FnMut(RowId) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<Error>,
+    {
+        self.vector.bounded_visit_visible_ids(
+            index,
+            snapshot,
+            before_entry,
+            before_retain,
+            release_retained,
+            visit,
+        )
+    }
+
+    pub(crate) fn bounded_authorized_visible_vector_count<E>(
+        &self,
+        index: &VectorIndexRef,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize),
+    ) -> std::result::Result<usize, E>
+    where
+        E: From<Error>,
+    {
+        self.vector.bounded_authorized_visible_count(
+            index,
+            candidates,
+            snapshot,
+            before_source_entry,
+            before_retain,
+            release_retained,
+        )
     }
 
     #[allow(clippy::type_complexity)]
@@ -29071,11 +35089,14 @@ impl Database {
         k: usize,
         candidates: Option<&[u64]>,
         snapshot: SnapshotId,
+        mode: VectorSearchMode,
+        aggregate_allowed_count: usize,
+        allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: impl FnMut() -> std::result::Result<(), E>,
         before_distance: impl FnMut() -> std::result::Result<(), E>,
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
-    ) -> std::result::Result<Option<(Vec<(RowId, f32)>, usize)>, E>
+    ) -> std::result::Result<crate::executor::BoundedVectorSearchOutcome, E>
     where
         E: From<Error>,
     {
@@ -29088,13 +35109,32 @@ impl Database {
             k,
             candidates,
             snapshot,
+            mode,
+            aggregate_allowed_count,
+            allowed_search_limits,
             before_source_entry,
             before_distance,
             before_retain,
             &mut release_retained,
         )?;
-        let Some(result) = result else {
-            return Ok(None);
+        let contextdb_vector::mem::BoundedHnswOutcome::Complete(result) = result else {
+            return Ok(match result {
+                contextdb_vector::mem::BoundedHnswOutcome::CompleteEmpty => {
+                    crate::executor::BoundedVectorSearchOutcome::CompleteEmpty
+                }
+                contextdb_vector::mem::BoundedHnswOutcome::ExactRequired { .. } => {
+                    crate::executor::BoundedVectorSearchOutcome::ExactRequired
+                }
+                contextdb_vector::mem::BoundedHnswOutcome::Unavailable { .. } => {
+                    crate::executor::BoundedVectorSearchOutcome::Unavailable
+                }
+                contextdb_vector::mem::BoundedHnswOutcome::Incomplete { .. } => {
+                    crate::executor::BoundedVectorSearchOutcome::Incomplete
+                }
+                contextdb_vector::mem::BoundedHnswOutcome::Complete(_) => unreachable!(
+                    "the complete bounded vector outcome was matched before disposition mapping"
+                ),
+            });
         };
         let contextdb_vector::mem::BoundedHnswResult {
             rows,
@@ -29116,7 +35156,9 @@ impl Database {
             .store(true, Ordering::SeqCst);
         *self.last_vector_search_trace.write() = Some(trace.into_trace());
         release_retained(trace_bytes);
-        Ok(Some((rows, row_bytes)))
+        Ok(crate::executor::BoundedVectorSearchOutcome::Complete((
+            rows, row_bytes,
+        )))
     }
 
     /// Refuse a bounded vector read raised on a trigger or cron callback
@@ -29147,40 +35189,64 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn bounded_vector_candidate_k(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded_vector_candidate_k<E>(
         &self,
         index: &VectorIndexRef,
         requested: usize,
         sort_key: Option<&str>,
-    ) -> Result<usize> {
+        snapshot: SnapshotId,
+        candidates: Option<&[u64]>,
+        before_source: impl FnMut() -> std::result::Result<(), E>,
+        acquire: impl FnMut(usize) -> std::result::Result<(), E>,
+        release: impl FnMut(usize),
+    ) -> std::result::Result<usize, E>
+    where
+        E: From<Error>,
+    {
         self.assert_bounded_vector_read_is_schema_protected()?;
-        let Some(sort_key) = sort_key else {
-            return Ok(requested);
+        let base_candidate_k = if let Some(sort_key) = sort_key {
+            let meta = self
+                .table_meta(&index.table)
+                .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+            let column = meta
+                .columns
+                .iter()
+                .find(|column| column.name == index.column)
+                .ok_or_else(|| Error::UnknownVectorIndex {
+                    index: index.clone(),
+                })?;
+            let Some(policy) = column.rank_policy.as_ref() else {
+                return Err(E::from(Error::RankPolicyNotFound {
+                    index: rank_index_name(&index.table, &index.column),
+                    sort_key: sort_key.to_string(),
+                }));
+            };
+            if policy.sort_key != sort_key {
+                return Err(E::from(Error::RankPolicyNotFound {
+                    index: rank_index_name(&index.table, &index.column),
+                    sort_key: sort_key.to_string(),
+                }));
+            }
+            let _formula = self.rank_formula(&index.table, &index.column)?;
+            // The indexed route's bounded pool. The bounded kernel resolves the
+            // route when it runs and widens this to the whole visible set the
+            // moment the exact route is taken, so the pool always carries the
+            // meaning of the route that answered.
+            self.vector.bounded_rank_candidate_k(
+                index,
+                requested,
+                candidates,
+                snapshot,
+                before_source,
+                acquire,
+                release,
+            )?
+        } else {
+            requested
         };
-        let meta = self
-            .table_meta(&index.table)
-            .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
-        let column = meta
-            .columns
-            .iter()
-            .find(|column| column.name == index.column)
-            .ok_or_else(|| Error::UnknownVectorIndex {
-                index: index.clone(),
-            })?;
-        let Some(policy) = column.rank_policy.as_ref() else {
-            return Err(Error::RankPolicyNotFound {
-                index: rank_index_name(&index.table, &index.column),
-                sort_key: sort_key.to_string(),
-            });
-        };
-        if policy.sort_key != sort_key {
-            return Err(Error::RankPolicyNotFound {
-                index: rank_index_name(&index.table, &index.column),
-                sort_key: sort_key.to_string(),
-            });
-        }
-        let _formula = self.rank_formula(&index.table, &index.column)?;
-        Ok(self.rank_policy_candidate_k(self.vector_entry_count(index), requested))
+
+        Ok(base_candidate_k)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -29920,11 +35986,11 @@ impl Database {
                     else {
                         continue;
                     };
-                    let Some((natural_key, _)) = self.row_change_values_from_row(&table, row)
+                    let Some((natural_key, _)) = self.row_change_values_from_row(&table, row)?
                     else {
                         continue;
                     };
-                    let values = self.outbound_row_values(&table, row);
+                    let values = self.outbound_row_values(&table, row)?;
                     out.push(RowChange {
                         table,
                         natural_key,
@@ -30106,6 +36172,7 @@ impl Database {
                 indexes_considered: Default::default(),
                 sort_elided: false,
                 query_vector_source: None,
+                vector_search: None,
                 rows_examined: 0,
             }
         } else {
@@ -30134,6 +36201,12 @@ impl Database {
         }
     }
 
+    /// Run one declared-retention pruning cycle and return its report or error.
+    /// Reader-visible versions are deferred. Each selected row, change-log,
+    /// vector, adjacency, and deferred-edge retry set commits together. Storage
+    /// errors are returned to the caller. This runs the retention pass only;
+    /// use [`Self::run_maintenance_cycle`] to also advance
+    /// current-only history cleanup and maintained vector indexes.
     pub fn run_pruning_cycle_checked(&self) -> Result<PruningReport> {
         let _operation = self.assert_open_operation();
         let _guard = self.pruning_guard.lock();
@@ -30141,46 +36214,53 @@ impl Database {
     }
 
     /// Run ONE maintenance cycle synchronously: generic retention, the
-    /// engine's own durable trigger-audit retention, and currency version
-    /// compaction — the exact work the engine-owned loop dispatches on a tick,
-    /// through the same code path.
+    /// engine's own durable trigger-audit retention, currency version
+    /// compaction, and maintained vector-index progress — the exact work the
+    /// engine-owned loop dispatches on a tick, through the same code path.
+    /// Vector construction and repair advance every needy partition in the
+    /// finite backlog sampled by this call, with never-built partitions first.
+    /// Concurrent new work, a stale candidate, or a typed resource refusal can
+    /// leave work for a later call. Existing snapshot-compatible routes keep
+    /// serving while a replacement is prepared, and active readers defer
+    /// reclamation.
     pub fn run_maintenance_cycle(&self) -> Result<MaintenanceReport> {
-        let _operation = self.assert_open_operation();
+        let mut operation = self.assert_open_operation();
+        operation.release_schema_publication_for_online_maintenance();
         let _guard = self.pruning_guard.lock();
         self.maintenance_context().run_cycle(CurrencyGate::Always)
     }
 
-    /// Explicit operator compaction (`.maintenance compact`): reclaim freed
-    /// pages with a full redb `compact()` right now, unconditionally — no
-    /// fragmentation threshold, no [`AUTO_COMPACT_MIN_INTERVAL`] gate. This
-    /// is the deliberate, on-demand counterpart to the rare automatic path
-    /// the maintenance tick can ALSO take on its own
-    /// (`MaintenanceContext::maybe_auto_compact`); calling this also resets
-    /// that path's own interval clock, so the tick does not immediately
-    /// redo the same work this call already did. A no-op (`ran=false`) on
-    /// an in-memory database, which has no file to compact.
-    ///
-    /// Restores BOTH file size and steady-state per-transaction write cost
-    /// for a store under its DECLARED-FROM-THE-START maintenance regime:
-    /// internally, this closes and reopens the underlying store handle
-    /// after the file-level compaction finishes, releasing in-process
-    /// allocator state redb otherwise keeps sized to the database's
-    /// historical peak — a file-level compact alone shrinks the file and
-    /// normalizes the btree but leaves that state behind, so a
-    /// long-churned store's steady-state commit cost stays elevated even
-    /// on an already-minimal file. A long-running embedded consumer cannot
-    /// process-restart to clear that state itself, so this call does it on
-    /// the consumer's behalf, under the same lock that already serializes
-    /// every other access to the store — no caller can observe an
-    /// intermediate closed state. On a reopen failure the on-disk file is
-    /// untouched (nothing more is written after the file-level compact
-    /// finishes) and this `Database`'s persistence is left closed; a fresh
-    /// `Database::open` on the same path recovers every row.
-    ///
-    /// A RETROFIT root — a table that accumulated a very large amount of
-    /// history BEFORE ever being compacted — is a distinct scenario the
-    /// version-cleanup-scaling bench's A2 arm measures directly; see its
-    /// own comments for the current state of that investigation.
+    /// Production-dead: how many times `retire_snapshot_free_vector_partitions`
+    /// actually began its guarded removal pass, as opposed to skipping it
+    /// because a cheap pre-check found nothing retirable.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn vector_partition_retirement_pass_count_for_test(&self) -> usize {
+        self.snapshot_free_retirement_pass_count
+            .load(Ordering::SeqCst)
+    }
+
+    /// Production-dead observation that a full maintenance wake reached its
+    /// closing stamp even when one partition reported a local refusal.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn maintenance_cycle_stamp_is_set_for_test(&self) -> bool {
+        self.last_maintenance_cycle_at.lock().is_some()
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn clear_maintenance_cycle_stamp_for_test(&self) {
+        *self.last_maintenance_cycle_at.lock() = None;
+    }
+
+    /// Explicit operator compaction drains finite relocation transactions,
+    /// allowing recording and reads between batches. It bypasses the automatic
+    /// fragmentation/interval gates and resets that interval on completion.
+    /// The storage handle is recycled only when no storage reader owns it;
+    /// otherwise existing snapshots retain their handle and source pages.
+    /// A reopen failure preserves the durable file and returns the existing
+    /// `StoreHandleRecycleFailed` error. Memory databases have no file to compact.
     pub fn compact_now(&self) -> Result<CompactionReport> {
         let _operation = self.assert_open_operation();
         let Some(persistence) = self.persistence.as_ref() else {
@@ -30188,8 +36268,13 @@ impl Database {
         };
         let fragmentation_before = persistence.fragmentation_ratio().unwrap_or(0.0);
         let bytes_before = self.disk_file_size();
+        let raw_loaders =
+            durable_raw_vector_partitions(&self.vector_store, persistence, &self.accountant)?;
+        self.vector_store
+            .attach_durable_raw_partition_loaders(raw_loaders)?;
         let start = Instant::now();
-        let handle_recycle_micros = persistence.compact()?;
+        let recycled = persistence.compact(self.accountant.clone())?;
+        self.vector_store.evict_reloadable_raw_partitions();
         let duration_micros = start.elapsed().as_micros() as u64;
         *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
         let bytes_after = self.disk_file_size();
@@ -30200,8 +36285,8 @@ impl Database {
             bytes_after,
             file_shrank: matches!((bytes_before, bytes_after), (Some(b), Some(a)) if a < b),
             fragmentation_before,
-            handle_recycled: true,
-            handle_recycle_micros,
+            handle_recycled: recycled.is_some(),
+            handle_recycle_micros: recycled.unwrap_or(0),
         })
     }
 
@@ -30216,6 +36301,17 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __set_auto_compact_min_interval_for_test(&self, interval: Duration) {
         *self.auto_compact_min_interval.lock() = interval;
+    }
+
+    /// Whether storage maintenance has more batches, followed by actual
+    /// page visits during candidate discovery and relocated pages in its
+    /// most recent batch.
+    #[doc(hidden)]
+    #[cfg(feature = "test-seams")]
+    pub fn __storage_compaction_progress_for_test(&self) -> (bool, usize, usize) {
+        self.persistence
+            .as_ref()
+            .map_or((false, 0, 0), |p| p.storage_compaction_progress_for_test())
     }
 
     /// What the engine-owned maintenance loop is doing for this database.
@@ -30250,6 +36346,107 @@ impl Database {
         self.maintenance_caller_driven
             .store(policy == MaintenancePolicy::CallerDriven, Ordering::SeqCst);
         self.reconcile_maintenance_thread();
+    }
+
+    /// The database's persisted maintenance polling cadence. Time wakes the
+    /// worker; declarations and per-column need thresholds decide whether
+    /// vector consolidation actually runs.
+    pub fn maintenance_poll_interval(&self) -> Duration {
+        Duration::from_millis(
+            self.maintenance_poll_interval_ms
+                .load(Ordering::SeqCst)
+                .max(1),
+        )
+    }
+
+    fn apply_maintenance_poll_interval(&self, interval: Duration) -> Result<()> {
+        let milliseconds = u64::try_from(interval.as_millis()).map_err(|_| {
+            Error::Other("maintenance poll interval exceeds the supported range".to_string())
+        })?;
+        if milliseconds == 0 {
+            return Err(Error::Other(
+                "maintenance poll interval must be at least one millisecond".to_string(),
+            ));
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.flush_config_value(MAINTENANCE_POLL_INTERVAL_CONFIG_KEY, &milliseconds)?;
+        }
+        #[cfg(any(test, feature = "test-seams"))]
+        self.maintenance_poll_interval_update_pause.maybe_pause();
+        self.maintenance_poll_interval_ms
+            .store(milliseconds, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Persist and apply a positive maintenance polling cadence. An existing
+    /// engine-owned worker samples the new value for its next wait without
+    /// joining an active maintenance cycle.
+    pub fn set_maintenance_poll_interval(&self, interval: Duration) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        self.maintenance_poll_interval_update_probe.note_entered();
+        let _operation = self.open_operation()?;
+        let _update = self.limit_update_lock.lock();
+        self.apply_maintenance_poll_interval(interval)?;
+        let rescheduled = if self.maintenance_policy() == MaintenancePolicy::EngineOwned {
+            let runtime = self.pruning_runtime.lock();
+            if runtime.handle.is_some() {
+                runtime.interval_ms.store(
+                    self.maintenance_poll_interval_ms.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                runtime.worker_clock.reschedule();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !rescheduled {
+            self.reconcile_maintenance_thread();
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __pause_after_maintenance_poll_interval_persist_for_test(&self) -> ApplyPhasePauseGuard {
+        let _operation = self.assert_open_operation();
+        let inner = self.maintenance_poll_interval_update_pause.clone();
+        let generation = inner.arm();
+        ApplyPhasePauseGuard { inner, generation }
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __maintenance_poll_interval_update_entries_for_test(&self) -> u64 {
+        let _operation = self.assert_open_operation();
+        self.maintenance_poll_interval_update_probe.entries()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __wait_for_maintenance_poll_interval_update_entry_for_test(&self, target: u64) {
+        let _operation = self.assert_open_operation();
+        self.maintenance_poll_interval_update_probe.wait_for(target);
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __maintenance_poll_interval_update_lock_is_held_for_test(&self) -> bool {
+        let _operation = self.assert_open_operation();
+        self.limit_update_lock.try_lock().is_none()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __maintenance_worker_poll_interval_for_test(&self) -> Option<Duration> {
+        let _operation = self.assert_open_operation();
+        let runtime = self.pruning_runtime.lock();
+        runtime.handle.as_ref()?;
+        Some(Duration::from_millis(
+            runtime.interval_ms.load(Ordering::SeqCst),
+        ))
     }
 
     /// The retention window applied to the engine's OWN durable trigger-audit
@@ -30623,14 +36820,19 @@ impl Database {
     /// confirmation record. Production-dead — nothing but tests calls it.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
+    pub fn __arm_retention_reclaim_crash_for_test(&self, after_commit: bool) {
+        crate::persistence::arm_retention_reclaim_crash_for_test(if after_commit { 2 } else { 1 });
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __arm_retention_peer_persist_fault_for_test(&self) {
         RETENTION_PEER_PERSIST_FAULT.with(|f| f.set(true));
     }
 
     /// Arm the one-shot test injection seam: the NEXT version-cleanup pass
     /// (`compact_currency_versions` / a maintenance cycle's currency pass) on
-    /// THIS thread fails right after the in-memory change log has been
-    /// filtered but before either persisted rewrite runs. Production-dead --
+    /// THIS thread fails before any durable or in-memory removal. Production-dead --
     /// nothing but tests calls it.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
@@ -30674,10 +36876,11 @@ impl Database {
 
     /// Collapse every table that declares `HISTORY CURRENT ONLY` back to one
     /// live version per logical row, dropping superseded MVCC versions and
-    /// their change-log entries in lockstep, then — if dead pages now
-    /// dominate the file — reclaim them with a redb compaction. Provably
-    /// sync-safe (see `compact_currency_versions_inner`): every `changes_since`
-    /// consumer still converges to current truth across a prune.
+    /// their change-log references, associated vector copies, and eligible
+    /// commit-index entries in one durable transaction. Active readers retain
+    /// every version they can still see. This does not compact the storage file;
+    /// file compaction is a separate maintenance operation. Sync replay continues
+    /// to resolve the surviving current state across cleanup.
     pub fn compact_currency_versions(&self) -> Result<CurrencyCompactionReport> {
         let _operation = self.assert_open_operation();
         let _guard = self.pruning_guard.lock();
@@ -30844,8 +37047,18 @@ impl Database {
         !self.trigger.declarations.lock().is_empty()
     }
 
+    /// True when schema metadata declares at least one vector index, including
+    /// an empty index whose maintained graph will become eligible after data
+    /// arrives.
+    fn has_vector_index_declarations(&self) -> bool {
+        !self.vector_store.index_infos().is_empty()
+    }
+
     fn maintenance_context(&self) -> MaintenanceContext {
         MaintenanceContext {
+            disk_limit: self.disk_limit.clone(),
+            resource_closed: self.resource_closed.clone(),
+            worker_stop: None,
             relational: self.relational_store.clone(),
             graph: self.graph_store.clone(),
             vector: self.vector_store.clone(),
@@ -30868,15 +37081,18 @@ impl Database {
             // its life, including a loop that was already running before
             // the setter was called.
             trigger_audit_retention_secs: self.trigger_audit_retention_secs.clone(),
+            #[cfg(feature = "test-seams")]
+            snapshot_free_retirement_pass_count: self.snapshot_free_retirement_pass_count.clone(),
         }
     }
 
     /// Start the ONE engine-owned maintenance loop iff this database has
-    /// anything to maintain — a retained table, a currency table, or a durable
-    /// trigger audit. Called at open (next to the cron tickler) and again
-    /// whenever DDL lands, so a fresh install, a REOPEN, and a table that
-    /// ARRIVED over synced DDL all self-maintain with no consumer call. A
-    /// database with nothing to maintain spawns no thread at all.
+    /// anything to maintain — a retained table, a currency table, a durable
+    /// trigger audit, or a declared vector index. Called at open (next to the
+    /// cron tickler) and again whenever DDL lands, so a fresh install, a
+    /// REOPEN, and a table that ARRIVED over synced DDL all self-maintain with
+    /// no consumer call. A database with nothing to maintain spawns no thread
+    /// at all.
     ///
     /// Registry-table invariant maintenance is engine-owned as of this commit:
     /// the earlier "host-driven maintenance" model was unrealized — `run_pruning_cycle`
@@ -30914,10 +37130,11 @@ impl Database {
         }
         let eligible = self.has_version_cleanup_tables()
             || self.has_retained_tables()
-            || self.has_durable_trigger_audit();
+            || self.has_durable_trigger_audit()
+            || self.has_vector_index_declarations();
         let running = self.__maintenance_thread_running();
         if eligible && !running {
-            self.spawn_maintenance(MAINTENANCE_TICK);
+            self.spawn_maintenance(self.maintenance_poll_interval());
         } else if !eligible && running {
             // The last declaration left (an ALTER dropped the only RETAIN
             // window, the only HISTORY CURRENT ONLY table was dropped, ...):
@@ -30926,6 +37143,25 @@ impl Database {
             // start-only shape never did this.
             self.stop_pruning_thread();
         }
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __hold_engine_owned_vector_maintenance_clock_for_test(
+        &self,
+    ) -> Result<VectorMaintenanceWorkerClockGuardForTest> {
+        let _operation = self.assert_open_operation();
+        let runtime = self.pruning_runtime.lock();
+        if runtime.handle.is_none() {
+            return Err(Error::Other(
+                "engine-owned vector maintenance worker is not running".to_string(),
+            ));
+        }
+        runtime.worker_clock.hold();
+        Ok(VectorMaintenanceWorkerClockGuardForTest {
+            clock: runtime.worker_clock.clone(),
+            shutdown: runtime.shutdown.clone(),
+        })
     }
 
     /// Test-only: restart the currency-maintenance thread at a short interval so
@@ -30962,13 +37198,22 @@ impl Database {
         self.stop_pruning_thread();
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let interval_ms = Arc::new(AtomicU64::new(
+            u64::try_from(interval.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+        ));
         #[cfg(test)]
         let wakes = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
         let thread_wakes = wakes.clone();
-        let context = self.maintenance_context();
+        let mut context = self.maintenance_context();
+        context.worker_stop = Some(shutdown.clone());
         let pruning_guard = self.pruning_guard.clone();
         let thread_shutdown = shutdown.clone();
+        let worker_clock = Arc::new(MaintenanceWorkerClock::default());
+        let thread_worker_clock = worker_clock.clone();
+        let thread_interval_ms = interval_ms.clone();
 
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_maintenance_worker_start();
@@ -30976,7 +37221,12 @@ impl Database {
         crate::read_probe::note_background_worker_start();
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::SeqCst) {
-                sleep_with_shutdown(&thread_shutdown, interval);
+                let controlled_serial = match thread_worker_clock
+                    .wait_for_cycle(&thread_shutdown, &thread_interval_ms)
+                {
+                    Some(serial) => serial,
+                    None => break,
+                };
                 if thread_shutdown.load(Ordering::SeqCst) {
                     break;
                 }
@@ -30993,12 +37243,16 @@ impl Database {
                     Ok(report) => log_maintenance_cycle(&report),
                     Err(err) => log_pruning_error(&err),
                 }
+                thread_worker_clock.complete(controlled_serial);
             }
+            thread_worker_clock.mark_worker_exited();
         });
 
         let mut runtime = self.pruning_runtime.lock();
         runtime.shutdown = shutdown;
         runtime.handle = Some(handle);
+        runtime.interval_ms = interval_ms;
+        runtime.worker_clock = worker_clock;
         #[cfg(test)]
         {
             runtime.wakes = wakes;
@@ -31090,6 +37344,7 @@ impl Database {
     }
 
     sync_test_seam! {
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     fn open_memory_with_plugin_and_accountant(
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
@@ -31210,7 +37465,7 @@ impl Database {
             .and_then(|report| {
                 // Compact so `bytes_written` (and the artifact itself) reflect
                 // content size, not allocator slack from the batched copy.
-                artifact.compact()?;
+                artifact.compact(self.accountant.clone())?;
                 Ok(report)
             });
         artifact.close();
@@ -31341,24 +37596,65 @@ impl Database {
         // HNSW rebuilds deterministically from the same stored data.
         let quantization = RedbPersistence::vector_quantization_map(&table_meta);
         let mut vector_count = 0u64;
-        for info in self.vector_store.index_infos() {
-            let entries = self.vector_store.entries_for_index(&info.index)?;
-            let mut batch = Vec::new();
-            for entry in &entries {
-                let Some(entry) = export_vector_at_snapshot(entry, watermark) else {
-                    continue;
-                };
-                if entry.deleted_tx.is_none() {
-                    vector_count += 1;
-                }
-                batch.push(entry);
-                if batch.len() >= EXPORT_BATCH_SIZE {
-                    artifact.append_vector_entries_batch(&batch, &quantization)?;
-                    batch.clear();
-                }
+        let mut vector_batch = Vec::new();
+        let mut membership_batch = Vec::new();
+        for partitioned in self.vector_store.try_all_partitioned_entries()? {
+            let Some(entry) = export_vector_at_snapshot(&partitioned.entry, watermark) else {
+                continue;
+            };
+            let owner = self
+                .relational_store
+                .tables
+                .read()
+                .get(&entry.index.table)
+                .and_then(|rows| {
+                    rows.iter()
+                        .find(|row| {
+                            row.row_id == entry.row_id
+                                && row.created_tx == entry.created_tx
+                                && row.lsn == entry.lsn
+                        })
+                        .or_else(|| {
+                            entry.deleted_tx.is_none().then(|| {
+                                rows.iter()
+                                    .filter(|row| {
+                                        row.row_id == entry.row_id && row.deleted_tx.is_none()
+                                    })
+                                    .max_by_key(|row| (row.lsn, row.created_tx))
+                            })?
+                        })
+                        .cloned()
+                })
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "exported vector {} row {} has no owning relational version",
+                        entry.index, entry.row_id.0
+                    ))
+                })?;
+            if entry.deleted_tx.is_none() {
+                vector_count += 1;
             }
-            artifact.append_vector_entries_batch(&batch, &quantization)?;
+            membership_batch.push(VectorPartitionMembershipRecord {
+                index: entry.index.clone(),
+                partition_key: partitioned.partition_key,
+                row_id: entry.row_id,
+                row_created_tx: owner.created_tx,
+                row_lsn: owner.lsn,
+                vector_created_tx: entry.created_tx,
+                vector_lsn: entry.lsn,
+                visible_from: TxId(owner.created_tx.0.max(entry.created_tx.0)),
+                deleted_tx: entry.deleted_tx,
+            });
+            vector_batch.push(entry);
+            if vector_batch.len() >= EXPORT_BATCH_SIZE {
+                artifact.append_vector_entries_batch(&vector_batch, &quantization)?;
+                artifact.append_vector_partition_memberships_batch(&membership_batch)?;
+                vector_batch.clear();
+                membership_batch.clear();
+            }
         }
+        artifact.append_vector_entries_batch(&vector_batch, &quantization)?;
+        artifact.append_vector_partition_memberships_batch(&membership_batch)?;
 
         // Change log: entries at or below the snapshot LSN, with per-LSN key
         // indices tracked across batches so multi-entry commits never collide.
@@ -31577,6 +37873,10 @@ impl Database {
 
     fn assert_open_operation(&self) -> DatabaseOperationGuard<'_> {
         self.open_operation().expect("database handle is closed")
+    }
+
+    pub(crate) fn capture_read_schema(&self) -> SchemaPublicationGuard<'_> {
+        self.enter_schema_publication_gate(false)
     }
 
     fn enter_schema_publication_gate(
@@ -31833,6 +38133,7 @@ impl Database {
     sync_test_seam! {
     /// Full constructor with an internal accountant. Test-only outside this
     /// crate; production callers use the numeric startup-limit functions.
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     fn open_with_config(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -31843,6 +38144,7 @@ impl Database {
     }
 
     sync_test_seam! {
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     fn open_with_config_and_disk_limit(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -31887,19 +38189,192 @@ impl Database {
     }
     }
 
-    pub(crate) fn register_vector_index_for_column(&self, table: &str, column: &ColumnDef) {
-        if let ColumnType::Vector(dimension) = column.column_type {
-            self.vector_store.register_index(
-                VectorIndexRef::new(table, column.name.clone()),
-                dimension,
-                column.quantization,
-            );
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn vector_memory_ownership_receipt_for_test(&self) -> VectorMemoryOwnershipReceiptForTest {
+        let sampled = self.vector_store.memory_ownership_snapshot_for_test();
+        let accountant_total = self.accountant.usage().used;
+        let retained_total = sampled
+            .raw_vector_bodies
+            .saturating_add(sampled.raw_reverse_directory)
+            .saturating_add(sampled.partition_vectors)
+            .saturating_add(sampled.base_graph)
+            .saturating_add(sampled.change_graph)
+            .saturating_add(sampled.mutable_tail)
+            .saturating_add(sampled.typed_partition_keys)
+            .saturating_add(sampled.retired_pinned_graph_bytes);
+        let non_vector_total = accountant_total
+            .saturating_sub(retained_total)
+            .saturating_sub(sampled.temporary_workspace);
+        VectorMemoryOwnershipReceiptForTest {
+            raw_vector_bodies: sampled.raw_vector_bodies,
+            raw_reverse_directory: sampled.raw_reverse_directory,
+            partition_vectors: sampled.partition_vectors,
+            base_graph: sampled.base_graph,
+            change_graph: sampled.change_graph,
+            mutable_tail: sampled.mutable_tail,
+            typed_partition_keys: sampled.typed_partition_keys,
+            retired_pinned_graph_bytes: sampled.retired_pinned_graph_bytes,
+            temporary_workspace: sampled.temporary_workspace,
+            retained_total,
+            non_vector_total,
+            accountant_total,
         }
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn arm_vector_tail_admission_failure_for_test(&self) {
+        self.accountant.arm_tail_admission_failure_for_test();
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn vector_tail_admission_failure_consumed_for_test(&self) -> bool {
+        self.accountant.tail_admission_failure_consumed_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn arm_received_vector_image_prepublication_failure_for_test(&self) {
+        arm_vector_memory_fault(
+            &RECEIVED_VECTOR_IMAGE_FAILURE_ARMED,
+            &RECEIVED_VECTOR_IMAGE_FAILURE_CONSUMED,
+        );
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn received_vector_image_prepublication_failure_consumed_for_test(&self) -> bool {
+        RECEIVED_VECTOR_IMAGE_FAILURE_CONSUMED.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn arm_dormant_vector_decode_failure_for_test(&self) {
+        contextdb_vector::test_seam::arm_dormant_vector_decode_failure_for_test();
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn dormant_vector_decode_failure_consumed_for_test(&self) -> bool {
+        contextdb_vector::test_seam::dormant_vector_decode_failure_consumed_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn arm_vector_post_load_reconciliation_failure_for_test(&self) {
+        contextdb_vector::test_seam::arm_vector_post_load_reconciliation_failure_for_test();
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn vector_post_load_reconciliation_failure_consumed_for_test(&self) -> bool {
+        contextdb_vector::test_seam::vector_post_load_reconciliation_failure_consumed_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn __arm_one_shot_vector_memory_workspace_pause_for_test(
+        &self,
+        phase: VectorMemoryWorkspacePhaseForTest,
+    ) -> VectorLifecyclePauseHandle {
+        match phase {
+            VectorMemoryWorkspacePhaseForTest::CompactionPreparedBeforePublication => {
+                self.vector_store.arm_memory_workspace_pause_for_test()
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn arm_vector_durable_purge_failure_for_test(&self) {
+        arm_vector_memory_fault(
+            &VECTOR_DURABLE_PURGE_FAILURE_ARMED,
+            &VECTOR_DURABLE_PURGE_FAILURE_CONSUMED,
+        );
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn vector_durable_purge_failure_consumed_for_test(&self) -> bool {
+        VECTOR_DURABLE_PURGE_FAILURE_CONSUMED.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn arm_vector_durable_compaction_failure_for_test(&self) {
+        arm_vector_memory_fault(
+            &VECTOR_DURABLE_COMPACTION_FAILURE_ARMED,
+            &VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED,
+        );
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn vector_durable_compaction_failure_consumed_for_test(&self) -> bool {
+        VECTOR_DURABLE_COMPACTION_FAILURE_CONSUMED.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn register_vector_index_for_column(
+        &self,
+        table: &str,
+        column: &ColumnDef,
+    ) -> Result<()> {
+        if let Some(layout) = vector_index_layout_from_column(column) {
+            self.vector_store.register_index_with_layout(
+                VectorIndexRef::new(table, column.name.clone()),
+                layout,
+            )?;
+            self.reconcile_maintenance_thread();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_vector_layout_policy_for_ddl(
+        &self,
+        index: &VectorIndexRef,
+        column: &ColumnDef,
+    ) -> Result<()> {
+        self.vector_store.index_layout(index)?;
+        if let Some(max_partitions) = column.effective_max_partitions()
+            && self.vector_store.live_or_retained_partition_count(index)? > max_partitions as usize
+        {
+            return Err(Error::VectorPartitionLimitExceeded {
+                index: index.clone(),
+                max_partitions,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn deregister_vector_index(&self, table: &str, column: &str) {
-        self.vector_store
-            .deregister_index(&VectorIndexRef::new(table, column), self.accountant());
+        let index = VectorIndexRef::new(table, column);
+        let quantization = self
+            .vector_store
+            .index_layout(&index)
+            .ok()
+            .map(|layout| layout.quantization);
+        let removed = self
+            .vector_store
+            .deregister_index(&index, self.accountant());
+        let released = removed
+            .iter()
+            // A tombstoned version returned its admission charge at the
+            // commit that superseded it. Only current copies still own one.
+            .filter(|entry| entry.deleted_tx.is_none())
+            .fold(0usize, |bytes, entry| {
+                let entry_bytes = match quantization {
+                    Some(VectorQuantization::F32) => {
+                        VectorQuantization::F32.storage_bytes(entry.vector.len())
+                    }
+                    Some(quantization) => quantization.storage_bytes(entry.vector.len()),
+                    None => VectorQuantization::F32.storage_bytes(entry.vector.len()),
+                };
+                bytes.saturating_add(entry_bytes)
+            });
+        self.accountant.release(released);
+        self.reconcile_maintenance_thread();
     }
 
     pub(crate) fn rename_vector_index(&self, table: &str, from: &str, to: &str) -> Result<()> {
@@ -31917,21 +38392,44 @@ impl Database {
     ) -> Result<()> {
         let old = VectorIndexRef::new(table, from);
         let new = VectorIndexRef::new(table, to);
-        if self.vector_store.try_state(&new).is_some() {
+        if self.vector_store.contains_index(&new) {
             return Err(Error::Other(format!(
                 "vector index already exists: {}.{}",
                 new.table, new.column
             )));
         }
-        self.vector_store.state(&old).map(|_| ())
+        self.vector_store.index_layout(&old).map(|_| ())
     }
 
     pub(crate) fn vector_store_deregister_table(&self, table: &str) {
-        self.vector_store.deregister_table(table, self.accountant());
+        let layouts = self
+            .vector_store
+            .index_layout_infos()
+            .into_iter()
+            .filter(|info| info.index.table == table)
+            .map(|info| (info.index, info.layout))
+            .collect::<HashMap<_, _>>();
+        let removed = self.vector_store.deregister_table(table, self.accountant());
+        let released = removed
+            .iter()
+            .filter(|entry| entry.deleted_tx.is_none())
+            .fold(0usize, |bytes, entry| {
+                let entry_bytes = match layouts.get(&entry.index).map(|layout| layout.quantization)
+                {
+                    Some(VectorQuantization::F32) => {
+                        VectorQuantization::F32.storage_bytes(entry.vector.len())
+                    }
+                    Some(quantization) => quantization.storage_bytes(entry.vector.len()),
+                    None => VectorQuantization::F32.storage_bytes(entry.vector.len()),
+                };
+                bytes.saturating_add(entry_bytes)
+            });
+        self.accountant.release(released);
+        self.reconcile_maintenance_thread();
     }
 
     pub(crate) fn drain_vector_index_maintenance_for_ddl(&self, index: &VectorIndexRef) {
-        let Some(state) = self.vector_store.try_state(index) else {
+        let Ok(layout) = self.vector_store.index_layout(index) else {
             return;
         };
         #[cfg(feature = "test-seams")]
@@ -31940,11 +38438,9 @@ impl Database {
         self.pause_vector_ddl_for_test(index);
         // Reconfiguration with the current shape is a no-op, but it acquires
         // the affected ref's maintenance lock before SQL metadata changes.
-        self.vector_store.register_or_reconfigure_empty_index(
-            index.clone(),
-            state.dimension(),
-            state.quantization(),
-        );
+        let _ = self
+            .vector_store
+            .register_index_with_layout(index.clone(), layout);
     }
 
     pub(crate) fn drain_vector_table_maintenance_for_ddl(&self, table: &str) {
@@ -31968,9 +38464,43 @@ impl Database {
         self.vector_store.maybe_pause_ddl_for_test(index);
     }
 
-    pub(crate) fn vector_index_infos(&self) -> Vec<contextdb_vector::store::VectorIndexInfo> {
-        let _vector_schema = self.vector_schema_read_many(self.vector_store_schema_refs());
-        self.vector_store.index_infos()
+    pub(crate) fn vector_inspection_infos(
+        &self,
+        target: Option<&VectorIndexRef>,
+    ) -> Result<
+        Vec<(
+            ColumnDef,
+            contextdb_vector::store::VectorIndexLayoutInfo,
+            Vec<contextdb_vector::store::VectorPartitionInfo>,
+        )>,
+    > {
+        if !self.access_is_admin() {
+            return Err(Error::VectorWholeIndexInspectionDenied);
+        }
+
+        let refs = target
+            .map(|index| vec![index.clone()])
+            .unwrap_or_else(|| self.vector_store_schema_refs());
+        let _vector_schema = self.vector_schema_read_many(refs.clone());
+        refs.into_iter()
+            .map(|index| {
+                let declaration = self
+                    .table_meta(&index.table)
+                    .and_then(|meta| {
+                        meta.columns
+                            .into_iter()
+                            .find(|column| column.name == index.column)
+                    })
+                    .ok_or_else(|| Error::UnknownVectorIndex {
+                        index: index.clone(),
+                    })?;
+                Ok((
+                    declaration,
+                    self.vector_store.index_layout_info(&index)?,
+                    self.vector_store.partition_infos(&index)?,
+                ))
+            })
+            .collect()
     }
 
     /// Where this handle reads the definitions, queues, and audit rings it
@@ -31985,6 +38515,27 @@ impl Database {
     }
 
     fn account_loaded_state(&self) -> Result<()> {
+        if let Some(startup) = self.startup_state() {
+            let mut identities = Vec::new();
+            for (table, rows) in self.relational_store.tables.read().iter() {
+                for row in rows.iter().filter(|row| row.deleted_tx.is_some()) {
+                    let key = crate::composite_store::retention_expiry_key(
+                        table,
+                        row.row_id,
+                        row.created_tx,
+                    );
+                    if let Some(identity) =
+                        startup.config_value::<(String, RowId, TxId, Lsn)>(&key)?
+                    {
+                        identities.push(identity);
+                    }
+                }
+            }
+            let prepared = self
+                .relational_store
+                .prepare_retention_expiries(identities, self.accountant.clone())?;
+            self.relational_store.publish_retention_expiries(prepared);
+        }
         let metadata_bytes = self
             .relational_store
             .table_meta
@@ -32013,15 +38564,23 @@ impl Database {
                     // charge. Charging one here would strand bytes no pass can
                     // return, so the row fold skips tombstoned versions
                     // exactly as the edge fold below does.
-                    acc.saturating_add(rows.iter().filter(|row| row.deleted_tx.is_none()).fold(
-                        0usize,
-                        |inner, row| {
-                            inner.saturating_add(meta.as_ref().map_or_else(
-                                || row.estimated_bytes(),
-                                |meta| retained_row_bytes_for_meta(&row.values, meta, false),
-                            ))
-                        },
-                    ))
+                    acc.saturating_add(
+                        rows.iter()
+                            .filter(|row| {
+                                row.deleted_tx.is_none()
+                                    || self.relational_store.is_retention_expired(
+                                        table,
+                                        row.row_id,
+                                        row.created_tx,
+                                    )
+                            })
+                            .fold(0usize, |inner, row| {
+                                inner.saturating_add(meta.as_ref().map_or_else(
+                                    || row.estimated_bytes(),
+                                    |meta| retained_row_bytes_for_meta(&row.values, meta, true),
+                                ))
+                            }),
+                    )
                 });
         self.accountant.try_allocate_for(
             row_bytes,
@@ -32036,7 +38595,6 @@ impl Database {
             .read()
             .values()
             .flatten()
-            .filter(|edge| edge.deleted_tx.is_none())
             .fold(0usize, |acc, edge| {
                 acc.saturating_add(edge.estimated_bytes())
             });
@@ -32047,19 +38605,52 @@ impl Database {
             "Open the database with a larger MEMORY_LIMIT or reduce graph edge volume.",
         )?;
 
-        let vector_bytes = self
-            .vector_store
-            .index_infos()
-            .into_iter()
-            .fold(0usize, |acc, info| acc.saturating_add(info.bytes));
-        self.accountant.try_allocate_for(
-            vector_bytes,
-            "open",
-            "load_vectors",
-            "Open the database with a larger MEMORY_LIMIT or reduce stored vector data.",
-        )?;
+        // The vector store attaches the exact open-time reservations to the
+        // directory/raw objects that own them. A later DROP or eviction can
+        // therefore return the original charge once without reconstructing
+        // it from a different cache state.
+        self.vector_store
+            .account_loaded_state(self.accountant.clone())?;
 
         Ok(())
+    }
+
+    /// Admit one row version's retained bytes: the non-vector figure under
+    /// the caller's own operation name, then each F32 vector column's
+    /// relational projection under `vector_insert@<table>.<column>`, so a
+    /// budget refusal names the vector column that caused it. The whole
+    /// amount is one charge owned by the row version -- exactly
+    /// `retained_row_bytes_for_meta(values, meta, true)`, which is what every
+    /// release of the version returns -- and is returned here so the caller
+    /// can hand it back if its statement fails afterwards. A refusal leaves
+    /// nothing charged.
+    pub(crate) fn admit_retained_row_bytes(
+        &self,
+        table: &str,
+        values: &HashMap<ColName, Value>,
+        meta: &TableMeta,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<usize> {
+        let non_vector_bytes = retained_row_bytes_for_meta(values, meta, false);
+        self.accountant
+            .try_allocate_for(non_vector_bytes, subsystem, operation, hint)?;
+        let mut admitted = non_vector_bytes;
+        for (column, projection_bytes) in f32_projection_payload_bytes_by_column(values, meta) {
+            if let Err(err) = self.accountant.try_allocate_for(
+                projection_bytes,
+                subsystem,
+                &format!("vector_insert@{table}.{column}"),
+                "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
+            ) {
+                self.accountant.release(admitted);
+                return Err(err);
+            }
+            admitted = admitted.saturating_add(projection_bytes);
+        }
+        debug_assert_eq!(admitted, retained_row_bytes_for_meta(values, meta, true));
+        Ok(admitted)
     }
 
     /// Give back what an abandoned transaction's inserts were holding.
@@ -32077,7 +38668,7 @@ impl Database {
             let bytes = self
                 .relational_store
                 .table_meta(table)
-                .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, false))
+                .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, true))
                 .unwrap_or_else(|| row.estimated_bytes());
             self.accountant.release(bytes);
         }
@@ -32097,6 +38688,12 @@ impl Database {
         ws: &contextdb_tx::WriteSet,
     ) -> DeleteReleaseBytes {
         let mut bytes = DeleteReleaseBytes::default();
+        // The whole charge the version took when it was admitted -- its
+        // non-vector values and, for an F32 vector column, its relational
+        // projection (`retained_row_bytes_for_meta(.., true)`, the same
+        // figure `admit_retained_row_bytes` charged). Returned at this
+        // commit; the pass that later removes the tombstoned version
+        // physically credits nothing for it.
         for (table, row_id, _) in &ws.relational_deletes {
             if let Some(row) =
                 self.relational_store
@@ -32104,7 +38701,7 @@ impl Database {
             {
                 bytes.relational.push(
                     self.table_meta(table)
-                        .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, false))
+                        .map(|meta| retained_row_bytes_for_meta(&row.values, &meta, true))
                         .unwrap_or_else(|| row.estimated_bytes()),
                 );
             }
@@ -32117,7 +38714,22 @@ impl Database {
         // covering what the process held. The retention pass that physically
         // removes the entry is the one release it gets.
 
+        // A raw body whose partition state carries the accountant is owned by
+        // that state from its load or apply until the prune, eviction, or
+        // removal that physically drops it, and the state returns it from
+        // its own record at that moment. Tombstoning the body here changes
+        // nothing about who holds the bytes, so this commit returns nothing
+        // for it. A body a partition that is not yet resident would fault in
+        // later is charged by that load, never here. Only a resident body in
+        // a state without an accountant still carries the per-insert charge
+        // this commit must settle.
         for (index, row_id, _) in &ws.vector_deletes {
+            if self
+                .vector_store
+                .raw_entry_charge_owned_by_state(index, *row_id)
+            {
+                continue;
+            }
             if let Some(vector) = self.find_vector_by_index_and_row(index, *row_id) {
                 bytes
                     .vectors
@@ -32141,9 +38753,7 @@ impl Database {
         index: &VectorIndexRef,
         row_id: RowId,
     ) -> Option<VectorEntry> {
-        self.vector_store
-            .try_state(index)
-            .and_then(|state| state.find_by_row_id(index, row_id))
+        self.vector_store_live_entry_for_row(index, row_id, SnapshotId::from_raw_wire(u64::MAX))
     }
 
     #[allow(dead_code)]
@@ -32412,6 +39022,48 @@ impl Database {
         )
     }
 
+    /// Reserve the retained-memory delta for one local table replacement
+    /// before its durable half runs. A larger projection owns its reservation
+    /// after publication; a smaller projection releases only after the old
+    /// in-memory image has actually been swapped out.
+    pub(crate) fn prepare_local_table_projection_memory(
+        &self,
+        name: &str,
+        old_meta: &TableMeta,
+        new_meta: &TableMeta,
+        new_rows: &[VersionedRow],
+    ) -> Result<PreparedMemorySwap> {
+        // Only live versions own a charge on either side of the swap: a
+        // tombstoned version handed its bytes back at the commit that
+        // stamped it, so counting it here would release it a second time.
+        let retained_rows = |rows: &[VersionedRow], meta: &TableMeta| {
+            rows.iter()
+                .filter(|row| row.deleted_tx.is_none())
+                .fold(0usize, |bytes, row| {
+                    bytes.saturating_add(retained_row_bytes_for_meta(&row.values, meta, true))
+                })
+        };
+        let old_bytes = {
+            let tables = self.relational_store.tables.read();
+            old_meta.estimated_bytes().saturating_add(retained_rows(
+                tables.get(name).map(Vec::as_slice).unwrap_or_default(),
+                old_meta,
+            ))
+        };
+        let new_bytes = new_meta
+            .estimated_bytes()
+            .saturating_add(retained_rows(new_rows, new_meta));
+        PreparedMemorySwap::prepare_for(
+            self.accountant.clone(),
+            old_bytes,
+            new_bytes,
+            0,
+            "ddl",
+            "prepare_local_table_projection",
+            "Reduce schema or indexed row size, or raise MEMORY_LIMIT before altering the table.",
+        )
+    }
+
     /// Commit one locally authored table projection before making that schema
     /// visible in memory.  The caller supplies the complete same-LSN DDL
     /// sequence, including any CASCADEd index drops, so provenance sidecars
@@ -32421,17 +39073,15 @@ impl Database {
         name: &str,
         meta: &TableMeta,
         rows: &[VersionedRow],
-        vectors: &[VectorEntry],
         lsn: Lsn,
         ddl: &[DdlChange],
     ) -> Result<()> {
         let values = self.ddl_generation_sidecar_values(lsn, ddl, 0)?;
         if let Some(persistence) = &self.persistence {
-            persistence.rewrite_table_meta_rows_vectors_and_append_ddl_log(
+            persistence.rewrite_table_meta_rows_and_append_ddl_log(
                 name,
                 meta,
                 rows,
-                vectors,
                 lsn,
                 ddl,
                 values
@@ -32445,20 +39095,27 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) fn prepare_local_index_projection(
+        &self,
+        meta: &TableMeta,
+        rows: &[VersionedRow],
+    ) -> Result<HashMap<String, contextdb_relational::IndexStorage>> {
+        RelationalStore::projected_index_storage_with_budget(meta, rows, self.accountant.clone())
+    }
+
     /// Publish the already-durable local table projection.  This is the sole
     /// executor path that changes in-memory table metadata/rows/indexes after
     /// the matching DDL and provenance have committed.
     pub(crate) fn publish_local_table_projection_and_ddl(
         &self,
         name: &str,
-        _old_meta: &TableMeta,
         meta: TableMeta,
         rows: Vec<VersionedRow>,
         lsn: Lsn,
         ddl: &[DdlChange],
+        projected_indexes: HashMap<String, contextdb_relational::IndexStorage>,
     ) -> Result<()> {
         let store = self.relational_store();
-        let projected_indexes = RelationalStore::projected_index_storage(&meta, &rows);
         if !store.publish_table_projection(name, meta, rows, projected_indexes) {
             return Err(Error::TableNotFound(name.to_string()));
         }
@@ -32480,10 +39137,6 @@ impl Database {
         meta
     }
 
-    pub(crate) fn vector_entries_for_ddl_projection(&self) -> Vec<VectorEntry> {
-        self.vector_store.all_entries()
-    }
-
     fn persist_table_meta_rows_vectors_and_append_alter_table_ddl(
         &self,
         name: &str,
@@ -32502,13 +39155,11 @@ impl Database {
                 .get(name)
                 .cloned()
                 .unwrap_or_default();
-            let vectors = self.vector_store.all_entries();
             let values = self.ddl_generation_sidecar_values(lsn, &prior_ddl, 0)?;
-            persistence.rewrite_table_meta_rows_vectors_and_append_ddl_log(
+            persistence.rewrite_table_meta_rows_and_append_ddl_log(
                 name,
                 meta,
                 &rows,
-                &vectors,
                 lsn,
                 &prior_ddl,
                 values
@@ -32692,6 +39343,130 @@ impl Database {
         })
     }
 
+    const OUTBOUND_SCHEMA_HOLDBACK_PREFIX: &'static str = "sync_schema_holdback_outbound.v1.";
+    const INBOUND_SCHEMA_HOLDBACK_PREFIX: &'static str = "sync_schema_holdback_inbound.v1.";
+
+    fn schema_holdback_config_key(
+        prefix: &str,
+        tenant_id: &TenantId,
+        peer_node_id: &str,
+    ) -> String {
+        tenant_id.config_key(&format!("{prefix}{peer_node_id}"))
+    }
+
+    pub(crate) fn persisted_outbound_schema_sync_holdback(
+        &self,
+        tenant_id: &TenantId,
+        peer_node_id: &str,
+    ) -> Result<Option<DurableSchemaSyncHoldback>> {
+        let _operation = self.open_operation()?;
+        let key = Self::schema_holdback_config_key(
+            Self::OUTBOUND_SCHEMA_HOLDBACK_PREFIX,
+            tenant_id,
+            peer_node_id,
+        );
+        if let Some(persistence) = &self.persistence {
+            return persistence.load_config_value(&key);
+        }
+        Ok(self
+            .in_memory_sync_progress
+            .lock()
+            .schema_holdbacks
+            .get(&key)
+            .cloned())
+    }
+
+    pub(crate) fn persist_outbound_schema_sync_holdback_while_authoritative(
+        &self,
+        tenant_id: &TenantId,
+        peer_node_id: &str,
+        state: Option<&DurableSchemaSyncHoldback>,
+    ) -> Result<()> {
+        let key = Self::schema_holdback_config_key(
+            Self::OUTBOUND_SCHEMA_HOLDBACK_PREFIX,
+            tenant_id,
+            peer_node_id,
+        );
+        if let Some(persistence) = &self.persistence {
+            match state {
+                Some(state) => persistence.flush_config_value(&key, state)?,
+                None => persistence.remove_config_value(&key)?,
+            }
+            return Ok(());
+        }
+        let mut progress = self.in_memory_sync_progress.lock();
+        match state {
+            Some(state) => {
+                progress.schema_holdbacks.insert(key, state.clone());
+            }
+            None => {
+                progress.schema_holdbacks.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persisted_inbound_schema_sync_holdbacks(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<DurableSchemaSyncHoldback>> {
+        let _operation = self.open_operation()?;
+        let tenant_suffix = format!(":{}", tenant_id.as_str());
+        let mut states = if let Some(persistence) = &self.persistence {
+            persistence
+                .load_config_values_with_prefix::<DurableSchemaSyncHoldback>(
+                    Self::INBOUND_SCHEMA_HOLDBACK_PREFIX,
+                )?
+                .into_iter()
+                .filter_map(|(key, state)| key.ends_with(&tenant_suffix).then_some(state))
+                .collect::<Vec<_>>()
+        } else {
+            self.in_memory_sync_progress
+                .lock()
+                .schema_holdbacks
+                .iter()
+                .filter(|(key, _)| {
+                    key.starts_with(Self::INBOUND_SCHEMA_HOLDBACK_PREFIX)
+                        && key.ends_with(&tenant_suffix)
+                })
+                .map(|(_, state)| state.clone())
+                .collect::<Vec<_>>()
+        };
+        states.sort_by(|left, right| left.peer_node_id.cmp(&right.peer_node_id));
+        Ok(states)
+    }
+
+    pub(crate) fn persist_inbound_schema_sync_holdback(
+        &self,
+        tenant_id: &TenantId,
+        peer_node_id: &str,
+        state: Option<&DurableSchemaSyncHoldback>,
+    ) -> Result<()> {
+        let _operation = self.open_operation()?;
+        let key = Self::schema_holdback_config_key(
+            Self::INBOUND_SCHEMA_HOLDBACK_PREFIX,
+            tenant_id,
+            peer_node_id,
+        );
+        if let Some(persistence) = &self.persistence {
+            match state {
+                Some(state) => persistence.flush_config_value(&key, state)?,
+                None => persistence.remove_config_value(&key)?,
+            }
+            return Ok(());
+        }
+        let mut progress = self.in_memory_sync_progress.lock();
+        match state {
+            Some(state) => {
+                progress.schema_holdbacks.insert(key, state.clone());
+            }
+            None => {
+                progress.schema_holdbacks.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
     pub fn persisted_sync_watermarks(&self, tenant_id: &TenantId) -> Result<(Lsn, Lsn)> {
         let _operation = self.open_operation()?;
         let Some(persistence) = &self.persistence else {
@@ -32807,7 +39582,11 @@ impl Database {
             let key = tenant_id.config_key("sync_pending_push_confirmation");
             match watermark {
                 Some(watermark) => persistence.flush_config_value(&key, &watermark.0)?,
-                None => persistence.remove_config_value(&key)?,
+                None => {
+                    persistence.commit_sync_reply_effects(&[], &[], &[
+                        key, tenant_id.config_key("sync_pending_push_result"),
+                    ])?;
+                },
             }
         } else {
             let mut progress = self.in_memory_sync_progress.lock();
@@ -32822,6 +39601,7 @@ impl Database {
                 None => {
                     if let Some(tenant) = progress.tenants.get_mut(tenant_id.as_str()) {
                         tenant.pending_push_confirmation = None;
+                        tenant.pending_push_result = None;
                     }
                 }
             }
@@ -32855,7 +39635,11 @@ impl Database {
             let key = tenant_id.config_key("sync_pending_push_confirmation");
             match watermark {
                 Some(watermark) => persistence.flush_config_value(&key, &watermark.0)?,
-                None => persistence.remove_config_value(&key)?,
+                None => {
+                    persistence.commit_sync_reply_effects(&[], &[], &[
+                        key, tenant_id.config_key("sync_pending_push_result"),
+                    ])?;
+                },
             }
         } else {
             let mut progress = self.in_memory_sync_progress.lock();
@@ -32870,6 +39654,7 @@ impl Database {
                 None => {
                     if let Some(tenant) = progress.tenants.get_mut(tenant_id.as_str()) {
                         tenant.pending_push_confirmation = None;
+                        tenant.pending_push_result = None;
                     }
                 }
             }
@@ -33515,8 +40300,67 @@ impl Database {
 
     /// Builds a complete snapshot of all live data as a ChangeSet.
     /// Used as fallback when change_log/ddl_log cannot serve a watermark.
+    #[cfg(all(feature = "test-seams", unix))]
+    #[doc(hidden)]
+    pub fn arm_persisted_state_schema_frontier_pause_for_test(&self, socket_path: PathBuf) {
+        PERSISTED_STATE_SCHEMA_FRONTIER_PAUSES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .insert(self as *const Self as usize, socket_path);
+    }
+
+    #[cfg(all(feature = "test-seams", unix))]
+    fn pause_at_persisted_state_schema_frontier_for_test(&self) -> Result<()> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let Some(socket_path) = PERSISTED_STATE_SCHEMA_FRONTIER_PAUSES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .remove(&(self as *const Self as usize))
+        else {
+            return Ok(());
+        };
+        let mut stream = UnixStream::connect(&socket_path).map_err(|error| {
+            Error::SyncError(format!(
+                "connect persisted-state schema-frontier test pause {}: {error}",
+                socket_path.display()
+            ))
+        })?;
+        stream.write_all(&[1]).map_err(|error| {
+            Error::SyncError(format!(
+                "announce persisted-state schema-frontier test pause: {error}"
+            ))
+        })?;
+        let mut release = [0u8; 1];
+        stream.read_exact(&mut release).map_err(|error| {
+            Error::SyncError(format!(
+                "wait for persisted-state schema-frontier test release: {error}"
+            ))
+        })?;
+        if release != [1] {
+            return Err(Error::SyncError(
+                "persisted-state schema-frontier test release was malformed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "test-seams", unix))]
+    fn persisted_state_schema_frontier_pause_is_armed_for_test(&self) -> bool {
+        PERSISTED_STATE_SCHEMA_FRONTIER_PAUSES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .contains_key(&(self as *const Self as usize))
+    }
+
     #[allow(dead_code)]
-    fn full_state_snapshot(&self) -> ChangeSet {
+    fn full_state_snapshot(&self) -> Result<ChangeSet> {
+        // Freeze the source ceiling before enumerating any body. A commit that
+        // lands during enumeration belongs to the next extraction; using a
+        // later global clock as this snapshot's DDL position would claim that
+        // unseen commit was already represented here.
+        let snapshot_ceiling = self.current_lsn();
         let mut rows = Vec::new();
         let mut edges = Vec::new();
         let mut vectors = Vec::new();
@@ -33538,6 +40382,9 @@ impl Database {
                 continue;
             }
             for row in table_rows.values() {
+                if row.lsn > snapshot_ceiling {
+                    continue;
+                }
                 if !self.row_read_allowed_for_change(table_name, row, acl_snapshot) {
                     continue;
                 }
@@ -33563,7 +40410,7 @@ impl Database {
                 rows.push(RowChange {
                     table: table_name.clone(),
                     natural_key,
-                    values: self.outbound_row_values(table_name, row),
+                    values: self.outbound_row_values(table_name, row)?,
                     deleted: false,
                     lsn: row.lsn,
                     created_at: row.created_at,
@@ -33576,7 +40423,10 @@ impl Database {
         // Edges (live only)
         let fwd = self.graph_store.forward_adj.read();
         for (_source, entries) in fwd.iter() {
-            for entry in entries.iter().filter(|e| e.deleted_tx.is_none()) {
+            for entry in entries
+                .iter()
+                .filter(|e| e.deleted_tx.is_none() && e.lsn <= snapshot_ceiling)
+            {
                 if !self.graph_edge_read_allowed_for_change(
                     entry.source,
                     entry.target,
@@ -33599,9 +40449,9 @@ impl Database {
         // Vectors (live only, skip orphans)
         for entry in self
             .vector_store
-            .all_entries()
+            .try_all_entries()?
             .into_iter()
-            .filter(|v| v.deleted_tx.is_none())
+            .filter(|v| v.deleted_tx.is_none() && v.lsn <= snapshot_ceiling)
         {
             if !live_row_ids.contains(&entry.row_id) {
                 continue; // skip orphan vectors
@@ -33614,26 +40464,29 @@ impl Database {
             });
         }
 
+        #[cfg(all(feature = "test-seams", unix))]
+        self.pause_at_persisted_state_schema_frontier_for_test()?;
+
         let first_data_lsn = rows
             .iter()
             .map(|row| row.lsn)
             .chain(edges.iter().map(|edge| edge.lsn))
             .chain(vectors.iter().map(|vector| vector.lsn))
             .min()
-            .unwrap_or_else(|| self.current_lsn());
+            .unwrap_or(snapshot_ceiling);
         let snapshot_schema_lsn = if rows.is_empty() && edges.is_empty() && vectors.is_empty() {
-            self.current_lsn()
+            snapshot_ceiling
         } else {
             Lsn(first_data_lsn.0.saturating_sub(1))
         };
         let ddl_lsn = vec![snapshot_schema_lsn; ddl.len()];
-        ChangeSet {
+        Ok(ChangeSet {
             rows,
             edges,
             vectors,
             ddl,
             ddl_lsn,
-        }
+        })
     }
 
     /// Enumerate each row instance through the current row-position map so a
@@ -33655,12 +40508,17 @@ impl Database {
     fn persisted_state_since_with_ddl_provenance(
         &self,
         since_lsn: Lsn,
-    ) -> (ChangeSet, DdlProvenanceSource) {
+    ) -> Result<(ChangeSet, DdlProvenanceSource)> {
         if since_lsn == Lsn(0) {
-            let changes = self.full_state_snapshot();
+            let changes = self.full_state_snapshot()?;
             let source = DdlProvenanceSource::synthetic_snapshot(&changes);
-            return (changes, source);
+            return Ok((changes, source));
         }
+
+        // This ceiling and every selected row/vector/edge form one immutable
+        // outbound snapshot. Work committed later must retain a larger LSN so
+        // the next request can still see it.
+        let snapshot_ceiling = self.current_lsn();
 
         let mut rows = Vec::new();
         let mut edges = Vec::new();
@@ -33682,6 +40540,9 @@ impl Database {
                 continue;
             }
             for row in table_rows.values() {
+                if row.lsn > snapshot_ceiling {
+                    continue;
+                }
                 if !self.row_read_allowed_for_change(table_name, row, acl_snapshot) {
                     continue;
                 }
@@ -33710,7 +40571,7 @@ impl Database {
                 rows.push(RowChange {
                     table: table_name.clone(),
                     natural_key,
-                    values: self.outbound_row_values(table_name, row),
+                    values: self.outbound_row_values(table_name, row)?,
                     deleted: false,
                     lsn: row.lsn,
                     created_at: row.created_at,
@@ -33721,10 +40582,9 @@ impl Database {
 
         let fwd = self.graph_store.forward_adj.read();
         for entries in fwd.values() {
-            for entry in entries
-                .iter()
-                .filter(|entry| entry.deleted_tx.is_none() && entry.lsn > since_lsn)
-            {
+            for entry in entries.iter().filter(|entry| {
+                entry.deleted_tx.is_none() && entry.lsn > since_lsn && entry.lsn <= snapshot_ceiling
+            }) {
                 if !self.graph_edge_read_allowed_for_change(
                     entry.source,
                     entry.target,
@@ -33746,9 +40606,11 @@ impl Database {
 
         for entry in self
             .vector_store
-            .all_entries()
+            .try_all_entries()?
             .into_iter()
-            .filter(|entry| entry.deleted_tx.is_none() && entry.lsn > since_lsn)
+            .filter(|entry| {
+                entry.deleted_tx.is_none() && entry.lsn > since_lsn && entry.lsn <= snapshot_ceiling
+            })
         {
             if !live_row_ids.contains(&entry.row_id) {
                 continue;
@@ -33760,7 +40622,10 @@ impl Database {
                 lsn: entry.lsn,
             });
         }
-        self.restore_vector_owner_rows(&mut rows, &vectors);
+        self.restore_vector_owner_rows(&mut rows, &vectors)?;
+
+        #[cfg(all(feature = "test-seams", unix))]
+        self.pause_at_persisted_state_schema_frontier_for_test()?;
 
         // A persisted-state fallback has no historical DDL log to replay. If
         // this delta is paged at an older purge frontier, omitting schema here
@@ -33776,7 +40641,7 @@ impl Database {
             .chain(edges.iter().map(|edge| edge.lsn))
             .chain(vectors.iter().map(|vector| vector.lsn))
             .min()
-            .unwrap_or_else(|| self.current_lsn());
+            .unwrap_or(snapshot_ceiling);
         if snapshot_schema_lsn > since_lsn {
             ddl = self.full_state_snapshot_ddl();
         }
@@ -33794,7 +40659,7 @@ impl Database {
         } else {
             DdlProvenanceSource::synthetic_snapshot(&changes)
         };
-        (changes, source)
+        Ok((changes, source))
     }
 
     fn preflight_sync_apply_memory(
@@ -33847,11 +40712,8 @@ impl Database {
                 continue;
             }
 
-            required = required.saturating_add(retained_row_bytes_for_meta(
-                &row.values,
-                table_meta,
-                false,
-            ));
+            required =
+                required.saturating_add(retained_row_bytes_for_meta(&row.values, table_meta, true));
         }
 
         for edge in &changes.edges {
@@ -34660,6 +41522,9 @@ impl Database {
         );
         let stmt = contextdb_parser::parse(&sql)?;
         let _ = contextdb_planner::plan(&stmt)?;
+        if let Statement::CreateTable(create) = &stmt {
+            crate::executor::validate_create_table_vector_declarations(name, create)?;
+        }
 
         let incoming = rough_sync_table_meta(
             columns,
@@ -34670,6 +41535,7 @@ impl Database {
         );
         let mut candidate = projected.get(name).cloned().unwrap_or_default();
         Self::apply_sync_alter_to_projected_table_meta(name, &mut candidate, incoming, constraints);
+        crate::executor::validate_vector_partition_declarations(name, &candidate)?;
         let candidate_lookup = candidate.clone();
         crate::executor::validate_exact_constraint_keys_for_meta(name, &candidate)?;
         crate::executor::validate_single_column_foreign_keys_for_meta(
@@ -34712,6 +41578,9 @@ impl Database {
         );
         let stmt = contextdb_parser::parse(&sql)?;
         let _ = contextdb_planner::plan(&stmt)?;
+        if let Statement::CreateTable(create) = &stmt {
+            crate::executor::validate_create_table_vector_declarations(name, create)?;
+        }
         let candidate = rough_sync_table_meta(
             columns,
             constraints,
@@ -34719,6 +41588,7 @@ impl Database {
             composite_foreign_keys,
             composite_unique,
         );
+        crate::executor::validate_vector_partition_declarations(name, &candidate)?;
         let candidate_lookup = candidate.clone();
         crate::executor::validate_exact_constraint_keys_for_meta(name, &candidate)?;
         crate::executor::validate_single_column_foreign_keys_for_meta(
@@ -36074,7 +42944,7 @@ impl Database {
     }
 
     /// Extracts changes from this database since the given LSN.
-    fn changes_since_base(&self, since_lsn: Lsn) -> (ChangeSet, DdlProvenanceSource) {
+    fn changes_since_base(&self, since_lsn: Lsn) -> Result<(ChangeSet, DdlProvenanceSource)> {
         // Public callers hold this for their complete extraction; retain the
         // re-entrant acquisition here as the base helper's own invariant for
         // future internal callers.
@@ -36085,7 +42955,16 @@ impl Database {
         if since_lsn > self.current_lsn() {
             let changes = ChangeSet::default();
             let source = DdlProvenanceSource::historical(&changes);
-            return (changes, source);
+            return Ok((changes, source));
+        }
+
+        // Deterministically select the real persisted-state fallback for the
+        // one frozen race proof. The production branch below reaches the same
+        // function when its logs no longer cover the requested cursor; this
+        // test-only selector changes no fallback behavior.
+        #[cfg(all(feature = "test-seams", unix))]
+        if self.persisted_state_schema_frontier_pause_is_armed_for_test() {
+            return self.persisted_state_since_with_ddl_provenance(since_lsn);
         }
 
         // Check if the ephemeral logs can serve the requested watermark.
@@ -36164,7 +43043,7 @@ impl Database {
                     if let Some(row) = self.row_for_change(&table, row_id, lsn)
                         && self.row_read_allowed_for_change(&table, &row, snapshot)
                         && let Some((natural_key, values)) =
-                            self.row_change_values_from_row(&table, &row)
+                            self.row_change_values_from_row(&table, &row)?
                     {
                         rows.push(RowChange {
                             table,
@@ -36260,7 +43139,9 @@ impl Database {
                         &index.table,
                         row_id,
                         self.snapshot_at(lsn),
-                    ) && let Some(vector) = self.vector_for_row_lsn(&index, row_id, lsn)
+                    ) && let Some(vector) = self
+                        .vector_store
+                        .load_vector_for_row_lsn(&index, row_id, lsn)?
                     {
                         vectors.push(VectorChange {
                             index,
@@ -36372,7 +43253,7 @@ impl Database {
                     vector.lsn,
                 ))
         });
-        self.restore_vector_owner_rows(&mut rows, &vectors);
+        self.restore_vector_owner_rows(&mut rows, &vectors)?;
 
         let changes = ChangeSet {
             rows,
@@ -36382,7 +43263,7 @@ impl Database {
             ddl_lsn,
         };
         let source = DdlProvenanceSource::historical(&changes);
-        (changes, source)
+        Ok((changes, source))
     }
 
     /// Builds ordinary outbound requests without separating a changed child
@@ -36614,7 +43495,7 @@ impl Database {
 
         let mut units = components
             .into_iter()
-            .map(|component| {
+            .map(|component| -> Result<OutboundSyncUnit> {
                 let rows = component
                     .iter()
                     .filter_map(|identity| rows.get(identity).cloned())
@@ -36664,7 +43545,10 @@ impl Database {
                     })
                     .collect::<HashSet<_>>();
                 for row_id in injected_row_ids {
-                    for entry in self.vector_store.live_entries_for_row(row_id, snapshot) {
+                    for entry in self
+                        .vector_store
+                        .load_live_entries_for_row(row_id, snapshot)?
+                    {
                         if !vectors.iter().any(|vector| {
                             vector.index == entry.index
                                 && vector.row_id == entry.row_id
@@ -36679,7 +43563,7 @@ impl Database {
                         }
                     }
                 }
-                OutboundSyncUnit {
+                Ok(OutboundSyncUnit {
                     changes: ChangeSet {
                         rows,
                         edges: Vec::new(),
@@ -36688,9 +43572,9 @@ impl Database {
                         ddl_lsn: Vec::new(),
                     },
                     dependency_complete: true,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         let residual = ChangeSet {
             rows: changes
@@ -36827,7 +43711,7 @@ impl Database {
             return Ok(None);
         };
         Ok(self
-            .row_change_values_from_row(table, &row)
+            .row_change_values_from_row(table, &row)?
             .map(|(natural_key, values)| RowChange {
                 table: table.to_string(),
                 natural_key,
@@ -36943,7 +43827,19 @@ impl Database {
     }
 
     fn changes_since_under_schema_gate(&self, since_lsn: Lsn) -> ChangeSet {
-        self.append_durable_pending_delete_changes(since_lsn, self.changes_since_base(since_lsn).0)
+        let base = match self.changes_since_base(since_lsn) {
+            Ok((changes, _)) => changes,
+            Err(error) => {
+                tracing::warn!(
+                    name: "changes_since_vector_load_error",
+                    target: "changes_since_vector_load_error",
+                    error = %error,
+                    "infallible change inspection could not materialize its durable vector bodies"
+                );
+                ChangeSet::default()
+            }
+        };
+        self.append_durable_pending_delete_changes(since_lsn, base)
     }
 
     /// Same as [`Self::changes_since`], but additionally returns each row's
@@ -36979,7 +43875,7 @@ impl Database {
         // arrivals must not straddle one local or received DDL publication.
         let _schema_publication = self.enter_schema_publication_gate(false);
         let pending = self.durable_pending_deletes_since(since_lsn)?;
-        let (base, provenance_source) = self.changes_since_base(since_lsn);
+        let (base, provenance_source) = self.changes_since_base(since_lsn)?;
         let changes = Self::reconcile_durable_pending_deletes(base, pending);
         let arrivals = self.sync_arrivals_for_changes(&changes);
         Ok((changes, arrivals, provenance_source))
@@ -37368,7 +44264,7 @@ impl Database {
         source: &DdlProvenanceSource,
         destination_frontier: Option<Lsn>,
     ) -> Result<ChangeSet> {
-        // Statement 15: after restore verification regresses an edge's push
+        // After restore verification regresses an edge's push
         // frontier, an ordinary pull may have restated the hub's complete
         // schema as a synthetic snapshot. If durable arrival evidence proves
         // that the current snapshot is exactly that received schema, suppress
@@ -37425,7 +44321,7 @@ impl Database {
         Ok(changes)
     }
 
-    /// Build v6 wire-only schema-instance evidence without changing the
+    /// Build wire-only schema-instance evidence without changing the
     /// public `ChangeSet`/`DdlChange` API.  Normal history reads immutable
     /// sidecars; the synthetic full snapshot has no historical DDL entry, so
     /// it deliberately reads the current authoritative generation instead.
@@ -37465,6 +44361,47 @@ impl Database {
             });
         }
         Ok(provenance)
+    }
+
+    /// Test-scoped read seam: the row-author lineages and DDL provenance a
+    /// production sync client would attach to this exact outbound batch,
+    /// computed via the same production functions the client calls
+    /// (`outbound_row_lineages`, `outbound_ddl_provenance`) over the same
+    /// durable state -- so a test can build its own reference encoding of a
+    /// push that matches what the client actually sends, instead of
+    /// guessing the byte cost of lineage and DDL provenance.
+    ///
+    /// WARNING -- despite the name, this is NOT read-only: `outbound_row_lineages`
+    /// calls `bind_unbound_creation_lineage_with_state` (see that function,
+    /// this file), which durably signs and persists a row's creation-lineage
+    /// sidecar the first time it is computed and immutably reuses it on every
+    /// later call. Calling this accessor for a row BEFORE the real push that
+    /// is supposed to describe it permanently binds that row's lineage to
+    /// whichever `signer` this call happened to pass; the real push then
+    /// reuses that already-bound (and possibly wrong) signature and fails
+    /// hub-side verification. Only call this after the push whose outbound
+    /// batch it is reconstructing, once every row's lineage is already
+    /// durably bound by that push -- never before it.
+    #[cfg(all(feature = "test-seams", feature = "sync-orchestration"))]
+    #[doc(hidden)]
+    pub fn outbound_row_lineages_and_ddl_provenance_for_test(
+        &self,
+        changes: &ChangeSet,
+        tenant_id: &TenantId,
+        local_node_id: &str,
+        local_incarnation: Incarnation,
+        signer: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
+    ) -> Result<OutboundPushBatchProvenance> {
+        let lineages = self.outbound_row_lineages(
+            changes,
+            tenant_id,
+            local_node_id,
+            local_incarnation,
+            signer,
+        )?;
+        let source = DdlProvenanceSource::historical(changes);
+        let ddl_provenance = self.outbound_ddl_provenance(changes, &source)?;
+        Ok((lineages, ddl_provenance))
     }
 
     /// Stages authenticated authorship only for incoming rows that actually
@@ -37642,128 +44579,6 @@ impl Database {
                     .then_some((*lsn, *row_id))
             })
             .is_some_and(|(lsn, row_id)| lsn == marker_lsn && row_id == marker_row_id))
-    }
-
-    pub(crate) fn record_terminal_refusal_markers(
-        &self,
-        context: &TerminalRefusalPullContext,
-        rows: &[RowChange],
-    ) -> Result<()> {
-        let snapshot = self.snapshot();
-        let no_deleted = HashSet::new();
-        let mut entries = Vec::new();
-        for row in rows {
-            let has_pull_leg = self.table_meta(&row.table).is_some_and(|meta| {
-                matches!(
-                    crate::executor::effective_sync_direction(&meta),
-                    SyncDirection::Pull | SyncDirection::Both
-                )
-            });
-            if !has_pull_leg {
-                continue;
-            }
-            let current = self.visible_row_by_natural_key(
-                &row.table,
-                &row.natural_key,
-                snapshot,
-                &no_deleted,
-            )?;
-            match current {
-                Some(current) if !row.deleted && current.lsn == row.lsn => {
-                    entries.push((
-                        row.table.clone(),
-                        row.natural_key.clone(),
-                        current.lsn,
-                        current.row_id,
-                    ));
-                }
-                None if row.deleted => {
-                    if let Some(row_id) = self.row_id_for_delete_change(row) {
-                        // A refused delete has no live relational row. Its
-                        // durable change-log tombstone is the exact current
-                        // edge version that reconciliation must consume, not
-                        // a second delete model.
-                        entries.push((row.table.clone(), row.natural_key.clone(), row.lsn, row_id));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let context_key = Self::terminal_refusal_context_key(context);
-        // Keep a reset and every older scan-progress writer on one lock. The
-        // durable write happens while it is held, so an older reconciliation
-        // cannot persist its cursor after a newer refusal reset.
-        let mut scans = self.terminal_refusal_scans.write();
-        let prior_state = match scans.get(&context_key).cloned() {
-            Some(state) => Some(state),
-            None => self.persistence.as_ref().map_or(Ok(None), |persistence| {
-                persistence.load_config_value::<TerminalRefusalScanState>(
-                    &Self::terminal_refusal_scan_config_key(context),
-                )
-            })?,
-        };
-        let generation = prior_state
-            .map(|state| state.generation.saturating_add(1))
-            .unwrap_or(1);
-        let refusal_records = entries
-            .iter()
-            .map(
-                |(table, natural_key, lsn, row_id)| TerminalRefusalMarkerRecord {
-                    table: table.clone(),
-                    natural_key: natural_key.clone(),
-                    lsn: lsn.0,
-                    row_id: row_id.0,
-                    active: true,
-                    generation,
-                },
-            )
-            .collect::<Vec<_>>();
-        let tx = self.begin()?;
-        let staged = entries
-            .iter()
-            .zip(refusal_records.iter())
-            .map(|((table, natural_key, _, _), record)| {
-                Ok((
-                    Self::terminal_refusal_marker_config_key(context, table, natural_key),
-                    RedbPersistence::encode_config_value(record)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let reset_scan = RedbPersistence::encode_config_value(&TerminalRefusalScanState {
-            source: None,
-            next_lsn: Lsn(0),
-            active: false,
-            generation,
-        })?;
-        self.tx_mgr.with_write_set(tx, |ws| {
-            ws.config_writes.extend(staged);
-            ws.config_writes
-                .push((Self::terminal_refusal_scan_config_key(context), reset_scan));
-        })?;
-        self.commit_with_source(tx, CommitSource::SyncPull)?;
-        self.terminal_refusal_markers
-            .write()
-            .extend(entries.into_iter().zip(refusal_records).map(
-                |((table, natural_key, _, _), record)| {
-                    (
-                        Self::terminal_refusal_marker_key(context, &table, &natural_key),
-                        record,
-                    )
-                },
-            ));
-        scans.insert(
-            context_key,
-            TerminalRefusalScanState {
-                source: None,
-                next_lsn: Lsn(0),
-                active: false,
-                generation,
-            },
-        );
-        Ok(())
     }
 
     fn terminal_refusal_marker_matches(
@@ -38102,10 +44917,226 @@ impl Database {
         ApplyPhasePauseGuard { inner, generation }
     }
 
-    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __arm_one_shot_vector_maintenance_preparation_pause_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+        phase: VectorMaintenancePreparationPhaseForTest,
+    ) -> VectorLifecyclePauseHandle {
+        let _operation = self.assert_open_operation();
+        self.vector_store
+            .arm_maintenance_preparation_pause_for_test(partition, phase)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __arm_one_shot_vector_graph_callback_pause_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+        phase: VectorGraphCallbackPhaseForTest,
+    ) -> VectorLifecyclePauseHandle {
+        let _operation = self.assert_open_operation();
+        self.vector_store
+            .arm_graph_callback_pause_for_test(partition, phase)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __arm_vector_journal_truncation_crash_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+        phase: VectorJournalTruncationPhaseForTest,
+    ) -> VectorJournalTruncationFaultHandle {
+        let _operation = self.assert_open_operation();
+        self.vector_store
+            .arm_journal_truncation_fault_for_test(partition, phase)
+    }
+
+    /// Pause after cleanup owns and charges its physical journal-key copies,
+    /// while the durable deletion transaction is still uncommitted.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __arm_one_shot_vector_journal_cleanup_pause_for_test(&self) -> ApplyPhasePauseGuard {
+        let _operation = self.assert_open_operation();
+        let inner = vector_journal_cleanup_pause_for_test();
+        let generation = inner.arm();
+        ApplyPhasePauseGuard { inner, generation }
+    }
+
+    /// Pause while repair owns both the sampled snapshot Vec and the retained
+    /// Arc slice, after their complete overlap was admitted and before the Vec
+    /// is released.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __arm_one_shot_vector_repair_snapshot_sample_transition_pause_for_test(
+        &self,
+    ) -> ApplyPhasePauseGuard {
+        let _operation = self.assert_open_operation();
+        let inner = vector_repair_snapshot_sample_transition_pause_for_test();
+        let generation = inner.arm();
+        ApplyPhasePauseGuard { inner, generation }
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __try_vector_generation_publication_lock_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> bool {
+        let _operation = self.assert_open_operation();
+        self.vector_store
+            .try_generation_publication_lock_for_test(partition)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __try_global_commit_lock_for_test(&self) -> bool {
+        let _operation = self.assert_open_operation();
+        let manager = self.tx_mgr.clone();
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            manager.with_commit_lock(|| {
+                let _ = sent.send(());
+            });
+        });
+        received
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok()
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __debug_vector_partition_journal_file_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> VectorPartitionJournalFileForTest {
+        let _operation = self.assert_open_operation();
+        let persistence = self
+            .persistence
+            .as_ref()
+            .expect("journal-file inspection requires a durable database");
+        let (truncated_through_lsn, physical_record_lsns) = persistence
+            .debug_vector_partition_journal_for_test(partition)
+            .expect("journal-file inspection verifies the physical route");
+        VectorPartitionJournalFileForTest {
+            truncated_through_lsn,
+            physical_record_lsns,
+        }
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __debug_vector_partition_generation_retention_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> VectorPartitionGenerationRetentionForTest {
+        let _operation = self.assert_open_operation();
+        let (resident_superseded_generations, resident_superseded_bytes) = self
+            .vector_store
+            .partition_superseded_generation_retention_for_test(partition);
+        let (durable_superseded_generations, durable_superseded_bytes) = self
+            .persistence
+            .as_ref()
+            .and_then(|persistence| {
+                persistence
+                    .load_vector_partition_generation_catalog_for(
+                        &partition.index,
+                        &partition.partition_key,
+                    )
+                    .ok()
+                    .flatten()
+                    .and_then(|catalog| {
+                        persistence
+                            .debug_superseded_vector_generation_retention_for_test(&catalog)
+                            .ok()
+                    })
+            })
+            .unwrap_or((0, 0));
+        VectorPartitionGenerationRetentionForTest {
+            durable_superseded_generations,
+            resident_superseded_generations,
+            durable_superseded_bytes,
+            resident_superseded_bytes,
+        }
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __mutate_vector_generation_catalog_record_for_test(
+        path: &Path,
+        partition: &VectorPartitionRef,
+        fault: crate::persistence::VectorGenerationCatalogRecordFaultForTest,
+    ) -> Result<()> {
+        RedbPersistence::mutate_vector_generation_catalog_record_for_test(path, partition, fault)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __corrupt_vector_partition_journal_record_for_test(
+        path: &Path,
+        partition: &VectorPartitionRef,
+    ) -> Result<()> {
+        RedbPersistence::corrupt_vector_partition_journal_record_for_test(path, partition)
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __corrupt_vector_partition_base_record_for_test(
+        path: &Path,
+        partition: &VectorPartitionRef,
+    ) -> Result<()> {
+        RedbPersistence::corrupt_vector_partition_base_record_for_test(path, partition)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn vector_store_for_test(&self) -> Arc<VectorStore> {
         let _operation = self.assert_open_operation();
         self.vector_store.clone()
+    }
+
+    /// Read the vector store's event receipt without inspecting cache state or
+    /// performing lifecycle work itself.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __vector_passive_activity_counters_for_test(&self) -> VectorPassiveActivityCounters {
+        let _operation = self.assert_open_operation();
+        self.vector_store.passive_activity_counters_for_test()
+    }
+
+    /// Count of full candidate rows the vector search arm's candidate
+    /// subtree has materialized, process-wide, since the process started.
+    /// Never a derived view of `rows_examined` or any residency counter.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __candidate_derivation_counters_for_test(&self) -> u64 {
+        let _operation = self.assert_open_operation();
+        CANDIDATE_ROWS_MATERIALIZED.load(Ordering::SeqCst)
+    }
+
+    /// Record actual candidate row materialization: once per stored/staged
+    /// row in the shared kernel, or for the legacy candidate result batch.
+    /// Identity-only membership reads do not increment this counter.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __bump_candidate_rows_materialized_for_test(&self, count: u64) {
+        let _operation = self.assert_open_operation();
+        CANDIDATE_ROWS_MATERIALIZED.fetch_add(count, Ordering::SeqCst);
+    }
+
+    /// Pause the next real maintenance build for this partition after it has
+    /// traversed `after_vectors` stored vectors. Dropping the returned guard
+    /// releases a reached worker, so an assertion panic cannot strand it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn __arm_vector_maintenance_progress_pause_for_test(
+        &self,
+        partition: &VectorPartitionRef,
+        after_vectors: usize,
+    ) -> VectorMaintenanceProgressPauseHandle {
+        let _operation = self.assert_open_operation();
+        self.vector_store
+            .arm_maintenance_progress_pause_for_test(partition, after_vectors)
     }
 
     /// Subscribe to commit events. Returns a receiver that yields a `CommitEvent`
@@ -38350,79 +45381,81 @@ impl Database {
     }
 
     sync_test_seam! {
-        /// Engine-internal apply primitive. Authenticated orchestration is
-        /// co-located in this crate so no downstream feature can reopen it.
-        ///
-        /// It carries no apply role, so it never adopts: a caller that has not
-        /// said which leg it is serving must not be handed the pull leg's
-        /// hub-adoption, which would let a pushed value displace the value already
-        /// held. Every production pull states its role through the sync client's
-        /// own entry point.
-        fn apply_changes(
-            &self,
-            changes: ChangeSet,
-            policies: &ConflictPolicies,
-        ) -> Result<ApplyResult> {
-            self.apply_changes_impl(
-                changes,
-                policies,
-                &HashMap::new(),
-                SyncAdoption::Continuing,
-                SyncApplyRole::HubPushApply,
-                None,
-                false,
-                None,
-                None,
-                &[],
-                None,
-                None,
-                false,
-                None,
-    )
-        }
-        }
+    /// Engine-internal apply primitive. Authenticated orchestration is
+    /// co-located in this crate so no downstream feature can reopen it.
+    ///
+    /// It carries no apply role, so it never adopts: a caller that has not
+    /// said which leg it is serving must not be handed the pull leg's
+    /// hub-adoption, which would let a pushed value displace the value already
+    /// held. Every production pull states its role through the sync client's
+    /// own entry point.
+    fn apply_changes(
+        &self,
+        changes: ChangeSet,
+        policies: &ConflictPolicies,
+    ) -> Result<ApplyResult> {
+        self.apply_changes_impl(
+            changes,
+            policies,
+            &HashMap::new(),
+            SyncAdoption::Continuing,
+            SyncApplyRole::HubPushApply,
+            None,
+            false,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+    }
 
     sync_test_seam! {
-        #[cfg(any(test, feature = "test-seams"))]
-        /// Apply a synced changeset carrying explicit per-row arrival positions —
-        /// each row's ordering position on the node that ACCEPTED it, keyed by the
-        /// row's own `.lsn` (see [`Self::resolve_incoming_arrival`]). This is the
-        /// entry point the sync transport (`contextdb-server`) calls; every other
-        /// caller keeps using [`Self::apply_changes`], which is unaffected (an
-        /// empty `arrivals` map is the legacy behavior: each row's own `.lsn` IS
-        /// its arrival, exactly as before this concept existed).
-        ///
-        /// `adoption` distinguishes a continuing pull from the full re-fetch a
-        /// client issues right after its cursor's source changed — see
-        /// [`SyncAdoption`] for why the two arbitrate differently under
-        /// `ConflictPolicy::LatestWins`.
-        /// Engine-internal synced apply primitive. The public sync façade has no
-        /// way to supply either policy maps or progress state.
-        fn apply_synced_changes(
-            &self,
-            changes: ChangeSet,
-            policies: &ConflictPolicies,
-            arrivals: &HashMap<Lsn, Option<Lsn>>,
-            adoption: SyncAdoption,
-        ) -> Result<ApplyResult> {
-            self.apply_changes_impl(
-                changes,
-                policies,
-                arrivals,
-                adoption,
-                SyncApplyRole::HubPushApply,
-                None,
-                false,
-                None,
-                None,
-                &[],
-                None,
-                None,
-                false,
-                None,
-    )
-        }
-        }
+    #[cfg(any(test, feature = "test-seams"))]
+    /// Apply a synced changeset carrying explicit per-row arrival positions —
+    /// each row's ordering position on the node that ACCEPTED it, keyed by the
+    /// row's own `.lsn` (see [`Self::resolve_incoming_arrival`]). This is the
+    /// entry point the sync transport (`contextdb-server`) calls; every other
+    /// caller keeps using [`Self::apply_changes`], which is unaffected (an
+    /// empty `arrivals` map is the legacy behavior: each row's own `.lsn` IS
+    /// its arrival, exactly as before this concept existed).
+    ///
+    /// `adoption` distinguishes a continuing pull from the full re-fetch a
+    /// client issues right after its cursor's source changed — see
+    /// [`SyncAdoption`] for why the two arbitrate differently under
+    /// `ConflictPolicy::LatestWins`.
+    /// Engine-internal synced apply primitive. The public sync façade has no
+    /// way to supply either policy maps or progress state.
+    fn apply_synced_changes(
+        &self,
+        changes: ChangeSet,
+        policies: &ConflictPolicies,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
+    ) -> Result<ApplyResult> {
+        self.apply_changes_impl(
+            changes,
+            policies,
+            arrivals,
+            adoption,
+            SyncApplyRole::HubPushApply,
+            None,
+            false,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+    }
 
     /// The hub applying a pushed unit it cannot receipt — an unidentified peer
     /// carries no node identity to receipt against. It is still a PUSH: the
@@ -38451,6 +45484,7 @@ impl Database {
             received_ddl,
             dependency_complete,
             false,
+            None,
         )
     }
 
@@ -38485,6 +45519,7 @@ impl Database {
             received_ddl,
             dependency_complete,
             false,
+            None,
         )
     }
 
@@ -38511,6 +45546,7 @@ impl Database {
             received_ddl,
             dependency_complete,
             true,
+            None,
         )
     }
 
@@ -38527,6 +45563,7 @@ impl Database {
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         dependency_complete: bool,
         schema_publication_held: bool,
+        push_outcome_key: Option<&SyncPushOutcomeContext>,
     ) -> Result<ApplyResult> {
         self.apply_changes_impl(
             changes,
@@ -38543,53 +45580,56 @@ impl Database {
             received_ddl,
             schema_publication_held,
             None,
+            push_outcome_key,
         )
     }
 
     sync_test_seam! {
-        #[cfg(any(test, feature = "test-seams"))]
-        /// Engine-internal authenticated push apply primitive.
-        fn apply_synced_changes_with_receipt(
-            &self,
-            changes: ChangeSet,
-            policies: &ConflictPolicies,
-            arrivals: &HashMap<Lsn, Option<Lsn>>,
-            adoption: SyncAdoption,
-            receipt: SyncApplyReceipt,
-        ) -> Result<ApplyResult> {
-            let result =
-                self.apply_changes_impl(
-                    changes,
-                    policies,
-                    arrivals,
-                    adoption,
-                    SyncApplyRole::HubPushApply,
-                    Some(receipt.clone()),
-                    receipt.dependency_complete,
-                    None,
-                    None,
-                    &[],
-                    None,
-                    None,
-                    false,
-                    None,
-    )?;
-            if self.persistence.is_none() {
-                let key = Self::applied_push_watermark_node_incarnation_key(
-                    &receipt.tenant_id,
-                    &receipt.node_id,
-                    receipt.incarnation,
-                );
-                self.in_memory_applied_push_watermarks
-                    .lock()
-                    .entry(key)
-                    .and_modify(|current| *current = (*current).max(receipt.source_lsn))
-                    .or_insert(receipt.source_lsn);
-            }
-            Ok(result)
+    #[cfg(any(test, feature = "test-seams"))]
+    /// Engine-internal authenticated push apply primitive.
+    fn apply_synced_changes_with_receipt(
+        &self,
+        changes: ChangeSet,
+        policies: &ConflictPolicies,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
+        receipt: SyncApplyReceipt,
+    ) -> Result<ApplyResult> {
+        let result =
+            self.apply_changes_impl(
+                changes,
+                policies,
+                arrivals,
+                adoption,
+                SyncApplyRole::HubPushApply,
+                Some(receipt.clone()),
+                receipt.dependency_complete,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                false,
+                None,
+                None,
+            )?;
+        if self.persistence.is_none() {
+            let key = Self::applied_push_watermark_node_incarnation_key(
+                &receipt.tenant_id,
+                &receipt.node_id,
+                receipt.incarnation,
+            );
+            self.in_memory_applied_push_watermarks
+                .lock()
+                .entry(key)
+                .and_modify(|current| *current = (*current).max(receipt.source_lsn))
+                .or_insert(receipt.source_lsn);
         }
-        }
+        Ok(result)
+    }
+    }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_authenticated_received_changes_with_receipt_and_lineages(
         &self,
@@ -38601,6 +45641,37 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
     ) -> Result<ApplyResult> {
+        self.apply_authenticated_received_changes_with_outcome(
+            changes,
+            arrivals,
+            adoption,
+            receipt,
+            hub_local_author,
+            lineages,
+            received_ddl,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_authenticated_received_changes_with_outcome(
+        &self,
+        changes: ChangeSet,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
+        receipt: SyncApplyReceipt,
+        hub_local_author: Option<&str>,
+        lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
+        received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
+        push_outcome_key: Option<&SyncPushOutcomeKey>,
+    ) -> Result<ApplyResult> {
+        let push_lock = push_outcome_key.map(|key| self.sync_push_apply_lock_for_key(key));
+        let _push_apply = push_lock.as_ref().map(|lock| lock.lock());
+        if let Some(key) = push_outcome_key
+            && let Some(result) = self.replay_sync_push_outcome(key)?
+        {
+            return Ok(result);
+        }
         let original_changes = changes.clone();
         let PurgedLineageRefusal {
             changes,
@@ -38616,6 +45687,12 @@ impl Database {
                     .to_string(),
             ));
         }
+        let outcome = push_outcome_key.map(|key| SyncPushOutcomeContext {
+            key: key.clone(),
+            committed_lsn: None,
+            refused_rows: refused_rows.len(),
+            conflicts: conflicts.clone(),
+        });
         let applied = self.apply_changes_impl(
             changes,
             &Self::declared_sync_policies(true),
@@ -38631,6 +45708,7 @@ impl Database {
             received_ddl,
             false,
             None,
+            outcome.as_ref(),
         );
         let result = match applied {
             Ok(mut result) => {
@@ -38647,13 +45725,20 @@ impl Database {
                 if refused_rows.is_empty() || !Self::changeset_is_wholly_empty(&changes) {
                     return Err(error);
                 }
-                self.commit_sync_apply_receipt_only(&receipt)?;
-                ApplyResult {
+                let result = ApplyResult {
                     applied_rows: 0,
                     skipped_rows: refused_rows.len(),
                     conflicts,
                     new_lsn: self.current_lsn(),
-                }
+                };
+                let context = push_outcome_key.map(|key| SyncPushOutcomeContext {
+                    key: key.clone(),
+                    committed_lsn: None,
+                    refused_rows: 0,
+                    conflicts: Vec::new(),
+                });
+                self.commit_sync_apply_outcome_only(&receipt, context.as_ref(), &result)?;
+                result
             }
             Err(error) => return Err(error),
         };
@@ -38669,6 +45754,11 @@ impl Database {
                 .and_modify(|current| *current = (*current).max(receipt.source_lsn))
                 .or_insert(receipt.source_lsn);
         }
+        if let Some(key) = push_outcome_key {
+            return self.replay_sync_push_outcome(key)?.ok_or_else(|| {
+                Error::SyncError("committed push omitted its durable apply outcome".to_string())
+            });
+        }
         Ok(result)
     }
 
@@ -38681,7 +45771,7 @@ impl Database {
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         prepare: &mut crate::custody::preparation::CommitPreparation<'_>,
     ) -> Result<ApplyResult> {
-        // Statements 9/11/14: preserve normal authenticated apply metadata, but
+        // Preserve normal authenticated apply metadata, but
         // hold progress until the custody batch has adjudicated every sibling.
         receipt.source_lsn = self
             .persisted_sync_applied_push_watermark_for_node_incarnation(
@@ -38705,6 +45795,7 @@ impl Database {
             received_ddl,
             false,
             Some(prepare),
+            None,
         )?;
         Ok(result)
     }
@@ -38743,7 +45834,7 @@ impl Database {
         Ok(())
     }
 
-    // Statements 5/6: use authenticated arrival provenance to distinguish this
+    // Use authenticated arrival provenance to distinguish this
     // node's own declaration from policy it merely adopted and relays.
     fn locally_declared_custody_policy(&self, table: &str) -> bool {
         let arrivals = self.received_ddl_arrivals.read();
@@ -38855,7 +45946,7 @@ impl Database {
                 .and_then(|()| crate::custody::policy::check_declared(self, name, &incoming))
                 .err();
             if refusal.is_none() {
-                // Statement 6: preserve installer-owned DDL guards and silent-clause
+                // Preserve installer-owned DDL guards and silent-clause
                 // merge after binding/declaration admission, using the existing owners.
                 let installer_owned = crate::executor::ENGINE_OWNED_LEDGER_TABLES
                     .contains(&name.as_str())
@@ -38916,6 +46007,7 @@ impl Database {
         received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
         schema_publication_held: bool,
         delivery_prepare: Option<&mut crate::custody::preparation::CommitPreparation<'_>>,
+        push_outcome_key: Option<&SyncPushOutcomeContext>,
     ) -> Result<ApplyResult> {
         // Received table DDL is serialized with SQL statements too. It does
         // not inherit the permissive local callback path: malformed or
@@ -39001,7 +46093,7 @@ impl Database {
             ));
         }
 
-        // Statements 5/6: refuse only the affected table after authentication,
+        // Refuse only the affected table after authentication,
         // preserving each retained DDL entry's original signed occurrence.
         let refused = self.arriving_policy_refusals(&changes)?;
         let keep = changes
@@ -39041,10 +46133,20 @@ impl Database {
         changes
             .vectors
             .retain(|vector| !refused.contains_key(&vector.index.table));
+        let mut policy_refusal_conflicts = refused.values().cloned().collect::<Vec<_>>();
+        policy_refusal_conflicts.sort_by(|a, b| a.reason.cmp(&b.reason));
+        let durable_push_outcome = push_outcome_key.map(|context| {
+            let mut context = context.clone();
+            context
+                .conflicts
+                .extend(policy_refusal_conflicts.iter().cloned());
+            context
+        });
+        let push_outcome_key = durable_push_outcome.as_ref();
         let add_refusals = |mut result: ApplyResult| {
-            let mut conflicts = refused.values().cloned().collect::<Vec<_>>();
-            conflicts.sort_by(|a, b| a.reason.cmp(&b.reason));
-            result.conflicts.extend(conflicts);
+            result
+                .conflicts
+                .extend(policy_refusal_conflicts.iter().cloned());
             result
         };
 
@@ -39070,6 +46172,7 @@ impl Database {
                     terminal_refusal_context,
                     hub_local_author,
                     delivery_prepare,
+                    push_outcome_key,
                     || {
                         self.check_disk_budget("sync_pull")?;
                         self.preflight_sync_apply_memory(&changes, policies)?;
@@ -39158,6 +46261,7 @@ impl Database {
                     lineages,
                     lineage_tenant.is_some(),
                     None,
+                    None,
                 )?;
                 total.applied_rows += result.applied_rows;
                 total.skipped_rows += result.skipped_rows;
@@ -39187,6 +46291,7 @@ impl Database {
             lineages,
             lineage_tenant.is_some(),
             delivery_prepare,
+            push_outcome_key,
         )
         .map(add_refusals)
     }
@@ -39302,17 +46407,23 @@ impl Database {
                 }
             };
         let snapshot = self.snapshot();
-        let vectors = self
+        let vector_columns = self
             .table_meta(table)
             .into_iter()
             .flat_map(|meta| meta.columns.into_iter())
             .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
-            .filter_map(|column| {
-                let index = VectorIndexRef::new(table, column.name);
-                self.vector_store_live_entry_for_row(&index, local.row_id, snapshot)
-                    .map(|entry| (index, entry.vector))
-            })
+            .map(|column| column.name)
             .collect::<Vec<_>>();
+        let mut vectors = Vec::new();
+        for column in vector_columns {
+            let index = VectorIndexRef::new(table, column);
+            if let Some(entry) =
+                self.vector_store
+                    .load_live_entry_for_row(&index, local.row_id, snapshot)?
+            {
+                vectors.push((index, entry.vector));
+            }
+        }
         let before = self.write_set_counts(tx)?;
 
         for (index, _) in &vectors {
@@ -39370,7 +46481,11 @@ impl Database {
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         stage_verified_lineages: bool,
         delivery_prepare: Option<&mut crate::custody::preparation::CommitPreparation<'_>>,
+        push_outcome_key: Option<&SyncPushOutcomeContext>,
     ) -> Result<ApplyResult> {
+        let replace_received_vector_image = stage_verified_lineages
+            && !changes.vectors.is_empty()
+            && self.received_vector_image_pending.load(Ordering::SeqCst);
         let mut tx = self.begin()?;
         let _local_schema_bypass = self.enter_sync_apply_local_schema_bypass(tx);
         let atomic_receipt = dependency_complete;
@@ -39386,6 +46501,7 @@ impl Database {
             new_lsn: self.current_lsn(),
         };
         let mut vector_row_map: HashMap<RowId, RowId> = HashMap::new();
+        let mut received_image_superseded_vectors = Vec::new();
         let mut vector_row_idx = 0usize;
         let mut failed_vector_groups: HashSet<(RowId, String, Lsn, bool)> = HashSet::new();
         let mut table_meta_cache: HashMap<String, Option<TableMeta>> = HashMap::new();
@@ -39763,8 +46879,7 @@ impl Database {
                                 if let Some((from, to)) = &renamed_vector_column
                                     && self
                                         .vector_store
-                                        .try_state(&VectorIndexRef::new(&name, from))
-                                        .is_some()
+                                        .contains_index(&VectorIndexRef::new(&name, from))
                                 {
                                     self.rename_vector_index(&name, from, to)?;
                                 }
@@ -39781,13 +46896,8 @@ impl Database {
                                     self.deregister_vector_index(&name, column);
                                 }
                                 for column in &meta.columns {
-                                    if matches!(column.column_type, ColumnType::Vector(_))
-                                        && self
-                                            .vector_store
-                                            .try_state(&VectorIndexRef::new(&name, &column.name))
-                                            .is_none()
-                                    {
-                                        self.register_vector_index_for_column(&name, column);
+                                    if matches!(column.column_type, ColumnType::Vector(_)) {
+                                        self.register_vector_index_for_column(&name, column)?;
                                     }
                                 }
                                 if let Some((from, to)) = &renamed_vector_column {
@@ -39890,9 +47000,22 @@ impl Database {
                             crate::executor::refuse_reclaimed_history_under_keep_first(
                                 &name, &meta,
                             )?;
+                            for column in &meta.columns {
+                                if matches!(column.column_type, ColumnType::Vector(_)) {
+                                    self.validate_vector_layout_policy_for_ddl(
+                                        &VectorIndexRef::new(&name, &column.name),
+                                        column,
+                                    )?;
+                                }
+                            }
                             let meta = self.replace_table_meta_and_refresh_auto_indexes(
                                 &name, &old_meta, meta,
                             )?;
+                            for column in &meta.columns {
+                                if matches!(column.column_type, ColumnType::Vector(_)) {
+                                    self.register_vector_index_for_column(&name, column)?;
+                                }
+                            }
                             self.persist_table_meta(&name, &meta)?;
                             // The shipped defect this closes: an arriving
                             // AlterTable never called this, so a RETAIN (or
@@ -40379,14 +47502,11 @@ impl Database {
                             // delete; persistent vector storage treats an
                             // absent owner as NotFound, so do not stage a
                             // fictitious delete.
-                            if self
-                                .vector_store_live_entry_for_row(
-                                    index,
-                                    local.row_id,
-                                    self.snapshot(),
-                                )
-                                .is_none()
-                            {
+                            if !self.vector_store_has_live_entry_for_row(
+                                index,
+                                local.row_id,
+                                self.snapshot(),
+                            ) {
                                 continue;
                             }
                             if let Err(err) = self.delete_vector(tx, index.clone(), local.row_id) {
@@ -40504,11 +47624,24 @@ impl Database {
             {
                 let confirmed_pending_echo = adoption
                     == SyncAdoption::ConfirmedPendingReconciliation
-                    && matches!(
-                        self.relational_store
-                            .sync_source_kind(&row.table, local.row_id),
-                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
-                    );
+                    && match self
+                        .relational_store
+                        .sync_source_kind(&row.table, local.row_id)
+                    {
+                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending) => {
+                            true
+                        }
+                        // Ordinary reply recovery has already persisted the
+                        // exact accepted order before pulling. Its identical
+                        // echo must preserve local authorship for later restore.
+                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal) => {
+                            Self::resolve_incoming_arrival(&row, arrivals)
+                                == self
+                                    .relational_store
+                                    .sync_source_lsn(&row.table, local.row_id)
+                        }
+                        _ => false,
+                    };
                 // The content is unchanged, but a row arriving WITH an
                 // established arrival is now KNOWN to be at that fleet
                 // position — even on its first appearance in this node's own
@@ -41481,6 +48614,23 @@ impl Database {
                     continue;
                 }
             };
+            // An unchanged received vector is the same no-op as its owner
+            // row's echo. Re-inserting it would create a new local change-log
+            // position and make already confirmed local work outbound again.
+            if !vector.vector.is_empty()
+                && self
+                    .find_vector_by_index_and_row(&vector.index, local_row_id)
+                    .is_some_and(|previous| previous.vector == vector.vector)
+            {
+                continue;
+            }
+            if replace_received_vector_image
+                && !vector.vector.is_empty()
+                && let Some(previous) =
+                    self.find_vector_by_index_and_row(&vector.index, local_row_id)
+            {
+                received_image_superseded_vectors.push(previous);
+            }
             if vector.vector.is_empty() {
                 if let Err(err) = self.delete_vector(tx, vector.index.clone(), local_row_id) {
                     let _ = self.rollback(tx);
@@ -41562,9 +48712,9 @@ impl Database {
                     "dependency-unit refusal lacked complete winner diagnostics".to_string(),
                 ));
             }
-            self.commit_sync_apply_receipt_only(receipt)?;
             result.applied_rows = 0;
             result.skipped_rows = dependency_unit_row_count;
+            self.commit_sync_apply_outcome_only(receipt, push_outcome_key, &result)?;
             result.new_lsn = self.current_lsn();
             return Ok(result);
         }
@@ -41641,6 +48791,9 @@ impl Database {
             self.sync_apply_pre_commit_pause.maybe_pause();
         }
 
+        if let Some(key) = push_outcome_key {
+            self.stage_sync_push_outcome(tx, key, &result)?;
+        }
         self.commit_adjudicated_sync_apply(
             tx,
             &event_bus_ddl,
@@ -41653,6 +48806,25 @@ impl Database {
             hub_local_author.is_some(),
             delivery_prepare,
         )?;
+        if replace_received_vector_image {
+            if let Some(persistence) = &self.persistence
+                && !received_image_superseded_vectors.is_empty()
+            {
+                persistence
+                    .prune_vectors_and_edges_scoped(&received_image_superseded_vectors, &[])?;
+            }
+            let identities = received_image_superseded_vectors
+                .iter()
+                .map(VectorVersionIdentity::from_entry)
+                .collect::<Vec<_>>();
+            // A state carrying the accountant returns each pruned body from
+            // its own record inside the prune; only bytes still charged to a
+            // per-insert admission come back for this release.
+            let accounted_bytes = self.vector_store.prune_superseded_versions(&identities);
+            self.accountant.release(accounted_bytes);
+            self.received_vector_image_pending
+                .store(false, Ordering::SeqCst);
+        }
         let committed_lsn = self.current_lsn();
         result.new_lsn = committed_lsn;
         Ok(result)
@@ -41858,6 +49030,355 @@ impl Database {
         Ok(())
     }
 
+    fn sync_push_apply_lock_for_key(&self, key: &SyncPushOutcomeKey) -> Arc<Mutex<()>> {
+        // The durable retention slot is deliberately shared by every request
+        // from one edge, but the in-flight lock is not. Only byte-identical
+        // retries join an apply; a different request from the same edge must
+        // remain free to commit while that apply is parked.
+        let apply_key = format!(
+            "{}.{}",
+            key.storage_key,
+            Self::hex_component(&key.request_digest),
+        );
+        let mut locks = self.sync_push_apply_locks.lock();
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(&apply_key).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(apply_key, Arc::downgrade(&lock));
+        lock
+    }
+
+    /// All ordinary clients sharing this source database and authoritative
+    /// hub advance one push stream. Holding this lock through reply handling
+    /// makes the next different request proof that the preceding request can
+    /// no longer be retried, including when callers constructed more than one
+    /// `SyncClient` over the same database handle.
+    #[cfg(feature = "sync-orchestration")]
+    pub(crate) fn sync_client_push_lock(
+        &self,
+        tenant_id: &TenantId,
+        hub_node_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!(
+            "{}.{}",
+            Self::hex_component(tenant_id.as_str().as_bytes()),
+            Self::hex_component(hub_node_id.as_bytes()),
+        );
+        let mut locks = self.sync_client_push_locks.lock();
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
+    pub(crate) fn sync_push_outcome_key(
+        tenant_id: &TenantId,
+        node_id: &str,
+        request: &crate::protocol::PushRequest,
+        dependency_complete: bool,
+    ) -> Result<SyncPushOutcomeKey> {
+        // Sort only maps. Preserve floating-point bits and every ordered
+        // source occurrence; JSON encoding would collapse non-finite values.
+        let changes = &request.changeset;
+        let rows = changes
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    &row.table,
+                    &row.natural_key,
+                    row.values.iter().collect::<BTreeMap<_, _>>(),
+                    row.deleted,
+                    row.lsn,
+                    row.created_at,
+                    row.arrival,
+                    &row.lineage,
+                )
+            })
+            .collect::<Vec<_>>();
+        let edges = changes
+            .edges
+            .iter()
+            .map(|edge| {
+                (
+                    edge.source,
+                    edge.target,
+                    &edge.edge_type,
+                    edge.properties.iter().collect::<BTreeMap<_, _>>(),
+                    edge.lsn,
+                )
+            })
+            .collect::<Vec<_>>();
+        let encoded = rmp_serde::to_vec(&(
+            dependency_complete,
+            request.incarnation,
+            &changes.ddl,
+            &changes.ddl_lsn,
+            rows,
+            edges,
+            &changes.vectors,
+            &changes.ddl_provenance,
+            &changes.purges,
+        ))
+        .map_err(|err| Error::SyncError(err.to_string()))?;
+        let mut diagnostic_identities = changes
+            .rows
+            .iter()
+            .map(|row| SyncPushDiagnosticIdentity {
+                table: Some(row.table.clone()),
+                natural_key: row.natural_key.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        diagnostic_identities.extend(changes.ddl.iter().filter_map(|ddl| {
+            let ddl = DdlChange::from(ddl.clone());
+            let table = Self::ddl_affected_table(&ddl)?.to_string();
+            Some(SyncPushDiagnosticIdentity {
+                table: Some(table.clone()),
+                natural_key: NaturalKey::single("table".to_string(), Value::Text(table)),
+            })
+        }));
+        Ok(SyncPushOutcomeKey {
+            // The slot deliberately omits the incarnation and request hash.
+            // A new incarnation supersedes the old edge life, and a new
+            // request on one life follows receipt of the preceding response.
+            storage_key: format!(
+                "{}{}.{}",
+                SYNC_PUSH_OUTCOME_PREFIX,
+                Self::hex_component(tenant_id.as_str().as_bytes()),
+                Self::hex_component(node_id.as_bytes()),
+            ),
+            incarnation: request.incarnation,
+            request_digest: *blake3::hash(&encoded).as_bytes(),
+            diagnostic_identities,
+        })
+    }
+
+    pub(crate) fn accepted_delete_replay_conflicts(
+        &self,
+        changes: &ChangeSet,
+        table: &str,
+        key: &[(String, Value)],
+    ) -> Vec<Conflict> {
+        let cause = changes
+            .rows
+            .iter()
+            .find(|row| row.table == table && row.natural_key.pairs() == key)
+            .expect("accepted-delete replay names a transmitted member");
+        let cause = RefusalCause {
+            table: cause.table.clone(),
+            natural_key: cause.natural_key.clone(),
+        };
+        let policies = Self::declared_sync_policies(true);
+        let mut remaining = changes.rows.iter().collect::<Vec<_>>();
+        let mut conflicts = Vec::new();
+        while !remaining.is_empty() {
+            let index = remaining
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    !remaining
+                        .iter()
+                        .any(|parent| dependency_row_references_parent(self, row, parent))
+                })
+                .min_by_key(|(_, row)| sync_row_identity(row))
+                .map(|(index, _)| index)
+                .unwrap_or_else(|| {
+                    (0..remaining.len())
+                        .min_by_key(|index| sync_row_identity(remaining[*index]))
+                        .unwrap()
+                });
+            let row = remaining.remove(index);
+            conflicts.push(Conflict {
+                natural_key: row.natural_key.clone(),
+                resolution: Self::sync_conflict_policy_for_table(
+                    &policies,
+                    self.table_meta(&row.table).as_ref(),
+                    &row.table,
+                ),
+                reason: Some("replays_accepted_delete".to_string()),
+                table: Some(row.table.clone()),
+                mutation_kind: Some(if row.deleted { "delete" } else { "edit" }.to_string()),
+                winning_author_node_id: None,
+                hub_acceptance_position: None,
+                refusal_cause: Some(cause.clone()),
+            });
+        }
+        conflicts
+    }
+
+    /// Exact authenticated request lookup in the existing durable apply path.
+    /// A retry returns the committed result; it never arbitrates old work again.
+    pub(crate) fn replay_sync_push_outcome(
+        &self,
+        key: &SyncPushOutcomeKey,
+    ) -> Result<Option<ApplyResult>> {
+        let result = if let Some(persistence) = &self.persistence {
+            persistence.load_config_value::<DurableSyncPushOutcome>(&key.storage_key)?
+        } else {
+            self.lineage_state_lock
+                .lock()
+                .push_outcomes
+                .get(&key.storage_key)
+                .cloned()
+        };
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        if result.incarnation != key.incarnation || result.request_digest != key.request_digest {
+            return Ok(None);
+        }
+        let conflicts = result
+            .result
+            .conflicts
+            .into_iter()
+            .map(|conflict| {
+                let identity = key
+                    .diagnostic_identities
+                    .get(conflict.request_identity_ordinal)
+                    .ok_or_else(|| {
+                        Error::SyncError(
+                            "durable push outcome names a missing request diagnostic".to_string(),
+                        )
+                    })?;
+                let refusal_cause = conflict
+                    .refusal_cause_identity_ordinal
+                    .map(|ordinal| {
+                        let cause = key.diagnostic_identities.get(ordinal).ok_or_else(|| {
+                            Error::SyncError(
+                                "durable push outcome names a missing refusal cause".to_string(),
+                            )
+                        })?;
+                        Ok::<RefusalCause, Error>(RefusalCause {
+                            table: cause.table.clone().ok_or_else(|| {
+                                Error::SyncError(
+                                    "durable push refusal cause has no request table".to_string(),
+                                )
+                            })?,
+                            natural_key: cause.natural_key.clone(),
+                        })
+                    })
+                    .transpose()?;
+                Ok(Conflict {
+                    natural_key: identity.natural_key.clone(),
+                    resolution: conflict.resolution,
+                    reason: conflict.reason,
+                    table: conflict.table,
+                    mutation_kind: conflict.mutation_kind,
+                    winning_author_node_id: conflict.winning_author_node_id,
+                    hub_acceptance_position: conflict.hub_acceptance_position,
+                    refusal_cause,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(ApplyResult {
+            applied_rows: result.result.applied_rows,
+            skipped_rows: result.result.skipped_rows,
+            conflicts,
+            new_lsn: result.result.new_lsn,
+        }))
+    }
+
+    fn durable_sync_push_outcome(
+        context: &SyncPushOutcomeContext,
+        result: ApplyResult,
+    ) -> Result<DurableSyncPushOutcome> {
+        let mut claimed_identities = HashSet::new();
+        let conflicts = result
+            .conflicts
+            .into_iter()
+            .map(|conflict| {
+                let matches = |identity: &SyncPushDiagnosticIdentity| {
+                    identity.natural_key == conflict.natural_key
+                        && conflict
+                            .table
+                            .as_ref()
+                            .is_none_or(|table| identity.table.as_ref() == Some(table))
+                };
+                let request_identity_ordinal = context
+                    .key
+                    .diagnostic_identities
+                    .iter()
+                    .enumerate()
+                    .find_map(|(ordinal, identity)| {
+                        (matches(identity) && !claimed_identities.contains(&ordinal))
+                            .then_some(ordinal)
+                    })
+                    .or_else(|| context.key.diagnostic_identities.iter().position(matches))
+                    .ok_or_else(|| {
+                        Error::SyncError(
+                            "push outcome diagnostic does not identify a transmitted row or DDL"
+                                .to_string(),
+                        )
+                    })?;
+                claimed_identities.insert(request_identity_ordinal);
+                let refusal_cause_identity_ordinal = conflict
+                    .refusal_cause
+                    .as_ref()
+                    .map(|cause| {
+                        context
+                            .key
+                            .diagnostic_identities
+                            .iter()
+                            .position(|identity| {
+                                identity.table.as_deref() == Some(cause.table.as_str())
+                                    && identity.natural_key == cause.natural_key
+                            })
+                            .ok_or_else(|| {
+                                Error::SyncError(
+                                    "push refusal cause does not identify a transmitted row"
+                                        .to_string(),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                Ok(DurableSyncPushConflict {
+                    request_identity_ordinal,
+                    resolution: conflict.resolution,
+                    reason: conflict.reason,
+                    table: conflict.table,
+                    mutation_kind: conflict.mutation_kind,
+                    winning_author_node_id: conflict.winning_author_node_id,
+                    hub_acceptance_position: conflict.hub_acceptance_position,
+                    refusal_cause_identity_ordinal,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DurableSyncPushOutcome {
+            incarnation: context.key.incarnation,
+            request_digest: context.key.request_digest,
+            result: DurableSyncPushApplyResult {
+                applied_rows: result.applied_rows,
+                skipped_rows: result.skipped_rows,
+                conflicts,
+                new_lsn: result.new_lsn,
+            },
+        })
+    }
+
+    fn stage_sync_push_outcome(
+        &self,
+        tx: TxId,
+        context: &SyncPushOutcomeContext,
+        result: &ApplyResult,
+    ) -> Result<()> {
+        let mut result = result.clone();
+        result.new_lsn = context.committed_lsn.unwrap_or(Lsn(0));
+        result.skipped_rows += context.refused_rows;
+        result.conflicts.extend(context.conflicts.clone());
+        let bytes = RedbPersistence::encode_config_value(&Self::durable_sync_push_outcome(
+            context, result,
+        )?)?;
+        self.tx_mgr.with_write_set(tx, |ws| {
+            ws.config_writes
+                .push((context.key.storage_key.clone(), bytes))
+        })
+    }
+
     fn stage_sync_apply_receipt(&self, tx: TxId, receipt: &SyncApplyReceipt) -> Result<()> {
         let key = Self::applied_push_watermark_node_incarnation_key(
             &receipt.tenant_id,
@@ -41869,6 +49390,26 @@ impl Database {
             ws.config_max_u64_keys.push(key.clone());
             ws.config_writes.push((key, encoded));
         })
+    }
+
+    fn commit_sync_apply_outcome_only(
+        &self,
+        receipt: &SyncApplyReceipt,
+        key: Option<&SyncPushOutcomeContext>,
+        result: &ApplyResult,
+    ) -> Result<()> {
+        let tx = self.begin()?;
+        if let Err(err) = self.stage_sync_apply_receipt(tx, receipt) {
+            let _ = self.rollback(tx);
+            return Err(err);
+        }
+        if let Some(key) = key
+            && let Err(err) = self.stage_sync_push_outcome(tx, key, result)
+        {
+            let _ = self.rollback(tx);
+            return Err(err);
+        }
+        self.commit_with_source(tx, CommitSource::SyncPull)
     }
 
     fn commit_sync_apply_receipt_only(&self, receipt: &SyncApplyReceipt) -> Result<()> {
@@ -42028,9 +49569,13 @@ impl Database {
             .map(|conflicts| conflicts.into_iter().flatten().collect())
     }
 
-    fn restore_vector_owner_rows(&self, rows: &mut Vec<RowChange>, vectors: &[VectorChange]) {
+    fn restore_vector_owner_rows(
+        &self,
+        rows: &mut Vec<RowChange>,
+        vectors: &[VectorChange],
+    ) -> Result<()> {
         if vectors.is_empty() {
-            return;
+            return Ok(());
         }
         // Key on the WHOLE natural key, not the leading column alone: two
         // composite-PK rows that share only their leading key are DIFFERENT rows,
@@ -42059,7 +49604,7 @@ impl Database {
                 continue;
             }
             let Some((natural_key, values)) =
-                self.row_change_values_from_row(&vector.index.table, &row)
+                self.row_change_values_from_row(&vector.index.table, &row)?
             else {
                 continue;
             };
@@ -42080,6 +49625,7 @@ impl Database {
                 created_at: None,
             });
         }
+        Ok(())
     }
 
     fn row_for_change(&self, table: &str, row_id: RowId, lsn: Lsn) -> Option<VersionedRow> {
@@ -42114,9 +49660,14 @@ impl Database {
         &self,
         table: &str,
         row: &VersionedRow,
-    ) -> Option<(NaturalKey, HashMap<String, Value>)> {
+    ) -> Result<Option<(NaturalKey, HashMap<String, Value>)>> {
         let meta = self.relational_store.table_meta.read();
-        let natural_key = natural_key_from_row_values(meta.get(table)?, &row.values)?;
+        let Some(table_meta) = meta.get(table) else {
+            return Ok(None);
+        };
+        let Some(natural_key) = natural_key_from_row_values(table_meta, &row.values) else {
+            return Ok(None);
+        };
 
         let mut values = row
             .values
@@ -42124,8 +49675,8 @@ impl Database {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<HashMap<_, _>>();
         drop(meta);
-        self.fill_quantized_from_store(table, row, &mut values);
-        Some((natural_key, values))
+        self.fill_quantized_from_store(table, row, &mut values)?;
+        Ok(Some((natural_key, values)))
     }
 
     fn row_id_for_natural_key(
@@ -42147,7 +49698,7 @@ impl Database {
 
     /// The visible row carrying a whole sync identity, matched on every key
     /// column — the composite-aware sibling of [`Self::row_id_for_natural_key`].
-    // Statement 19 and existing row scopes: metadata follows the root's visibility.
+    // Like existing row scopes, custody metadata follows the root's visibility.
     pub(crate) fn delivery_root_visible(&self, table: &str, key: &NaturalKey) -> Result<bool> {
         if self.access_is_admin() {
             return Ok(true);
@@ -42156,7 +49707,7 @@ impl Database {
         if self.table_meta(table).is_none() {
             return Ok(false);
         }
-        // Statements 14/19: inspect the named root through its covering key
+        // Inspect the named root through its covering key
         // index; scoped metadata must not scan application rows per receipt.
         let Some(row) = self.visible_row_by_natural_key(table, key, snapshot, &HashSet::new())?
         else {
@@ -42194,42 +49745,6 @@ impl Database {
         };
         self.read_allowed_for_row(table, &meta, row, snapshot)
             .unwrap_or(false)
-    }
-
-    pub(crate) fn assert_row_id_read_allowed_for_change(
-        &self,
-        tx: Option<TxId>,
-        table: &str,
-        row_id: RowId,
-        snapshot: SnapshotId,
-    ) -> Result<()> {
-        if let Some(tx) = tx {
-            let staged = self.tx_mgr.with_write_set(tx, |ws| {
-                ws.relational_inserts
-                    .iter()
-                    .rev()
-                    .find(|(insert_table, row)| insert_table == table && row.row_id == row_id)
-                    .map(|(_, row)| row.clone())
-            })?;
-            if let Some(row) = staged {
-                let rows = self.filter_rows_for_anchor_read(table, vec![row], snapshot)?;
-                if rows.is_empty() {
-                    return Err(Error::NotFound(format!("row {row_id} in table {table}")));
-                }
-                return Ok(());
-            }
-        }
-        if self.row_id_read_allowed_for_change(table, row_id, snapshot) {
-            return Ok(());
-        }
-        let Some(row) = self.row_visible_at_snapshot(table, row_id, snapshot) else {
-            return Err(Error::NotFound(format!("row {row_id} in table {table}")));
-        };
-        let rows = self.filter_rows_for_anchor_read(table, vec![row], snapshot)?;
-        if rows.is_empty() {
-            return Err(Error::NotFound(format!("row {row_id} in table {table}")));
-        }
-        Ok(())
     }
 
     fn row_id_read_allowed_for_change(
@@ -42275,15 +49790,6 @@ impl Database {
                     .find(|e| e.target == target && e.edge_type == edge_type && e.lsn == lsn)
                     .map(|e| e.properties.clone())
             })
-    }
-
-    fn vector_for_row_lsn(
-        &self,
-        index: &VectorIndexRef,
-        row_id: RowId,
-        lsn: Lsn,
-    ) -> Option<Vec<f32>> {
-        self.vector_store.vector_for_row_lsn(index, row_id, lsn)
     }
 }
 
@@ -42648,10 +50154,47 @@ fn values_equal_for_rank_join(left: &Value, right: &Value) -> bool {
     left == right
 }
 
-fn compare_ranked_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
-    rank_float_desc(left.rank, right.rank)
-        .then_with(|| rank_float_desc(left.vector_score, right.vector_score))
-        .then_with(|| right.row_id.cmp(&left.row_id))
+/// One scored vector still in contention for a ranked answer: the formula's
+/// result and the rows that produced it, so a winner is materialised from
+/// what was already read rather than fetched a second time.
+///
+/// Ordered exactly as the answer is: a candidate that ranks earlier compares
+/// `Less`, so a max-heap of these keeps the candidate that ranks last on top,
+/// and sorting ascending yields the answer's order.
+struct RankedSearchCandidate {
+    row_id: RowId,
+    vector_score: f32,
+    rank: f32,
+    anchor: VersionedRow,
+    joined: Option<VersionedRow>,
+}
+
+impl RankedSearchCandidate {
+    fn answer_order(&self, other: &Self) -> std::cmp::Ordering {
+        rank_float_desc(self.rank, other.rank)
+            .then_with(|| rank_float_desc(self.vector_score, other.vector_score))
+            .then_with(|| self.row_id.cmp(&other.row_id))
+    }
+}
+
+impl PartialEq for RankedSearchCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.answer_order(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for RankedSearchCandidate {}
+
+impl PartialOrd for RankedSearchCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedSearchCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.answer_order(other)
+    }
 }
 
 fn rank_float_desc(left: f32, right: f32) -> std::cmp::Ordering {
@@ -42861,10 +50404,44 @@ fn vector_row_group_end(vectors: &[VectorChange], cursor: usize) -> usize {
     end
 }
 
-struct VectorExplainShape {
+struct VectorExplainShape<'a> {
     index: VectorIndexRef,
     k: usize,
     restricted_candidates: bool,
+    candidates: Option<&'a PhysicalPlan>,
+    search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
+    query_expr: &'a Expr,
+}
+
+// Access predicates remain residual even when SQL or access-derived tuple
+// selection covers the partition key. Both passive and completed disclosure
+// use the same candidate-route decision that admits execution.
+fn vector_search_candidate_residual(
+    shape: &VectorExplainShape<'_>,
+    route: &crate::executor::VectorCandidateRoute,
+) -> VectorSearchResidual {
+    let restricted = route.access_filter
+        || (shape.restricted_candidates
+            && !route
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.covers_filter));
+    if !restricted {
+        VectorSearchResidual::None
+    } else if route.complete {
+        VectorSearchResidual::Bounded
+    } else {
+        VectorSearchResidual::Unsupported
+    }
+}
+
+struct VectorPolicyExplainFacts {
+    requested_mode: contextdb_core::VectorSearchMode,
+    resolved_mode: contextdb_core::VectorSearchMode,
+    /// `None` when the partition key is an unbound placeholder: no scope has
+    /// been resolved to count over.
+    aggregate_allowed_vectors: Option<usize>,
+    policy: contextdb_vector::store::ResolvedVectorPolicy,
 }
 
 /// The traversal steps a plan walks, if it walks any.
@@ -42885,20 +50462,24 @@ fn graph_bfs_steps_from_plan(plan: &PhysicalPlan) -> Option<&[contextdb_planner:
     }
 }
 
-fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<VectorExplainShape> {
+fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<VectorExplainShape<'_>> {
     match plan {
         PhysicalPlan::VectorSearch {
             table,
             column,
+            query_expr,
             k,
             candidates,
+            search_mode,
             ..
         }
         | PhysicalPlan::HnswSearch {
             table,
             column,
+            query_expr,
             k,
             candidates,
+            search_mode,
             ..
         } => Some(VectorExplainShape {
             index: VectorIndexRef::new(table.clone(), column.clone()),
@@ -42906,6 +50487,9 @@ fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<VectorExplainSha
             restricted_candidates: candidates
                 .as_deref()
                 .is_some_and(|candidate| !is_unrestricted_scan_for_table(candidate, table)),
+            candidates: candidates.as_deref(),
+            search_mode: *search_mode,
+            query_expr,
         }),
         PhysicalPlan::Project { input, .. }
         | PhysicalPlan::Filter { input, .. }
@@ -42930,6 +50514,70 @@ fn is_unrestricted_scan_for_table(plan: &PhysicalPlan, table: &str) -> bool {
             ..
         } if scan_table == table
     )
+}
+
+fn vector_filter_index_recovery(candidates: Option<&PhysicalPlan>, table: &str) -> Option<String> {
+    const GENERIC_RECOVERY: &str =
+        "use EXACT or rewrite the filter with a supporting relational index";
+
+    fn collect(expr: &Expr, table: &str, columns: &mut BTreeSet<String>) {
+        match expr {
+            Expr::Column(column) if column.table.as_deref().is_none_or(|named| named == table) => {
+                columns.insert(column.column.clone());
+            }
+            Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+                collect(left, table, columns);
+                collect(right, table, columns);
+            }
+            Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+                collect(operand, table, columns);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    collect(arg, table, columns);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                collect(expr, table, columns);
+                for item in list {
+                    collect(item, table, columns);
+                }
+            }
+            Expr::Like { expr, pattern, .. } => {
+                collect(expr, table, columns);
+                collect(pattern, table, columns);
+            }
+            Expr::RowVectorSource { key, .. } => collect(key, table, columns),
+            Expr::InSubquery { expr, .. } => collect(expr, table, columns),
+            Expr::Literal(_) | Expr::Parameter(_) | Expr::Column(_) => {}
+        }
+    }
+
+    let Some(candidates) = candidates else {
+        return Some(GENERIC_RECOVERY.to_string());
+    };
+    let PhysicalPlan::Scan {
+        table: candidate_table,
+        filter: Some(filter),
+        ..
+    } = candidates
+    else {
+        return Some(GENERIC_RECOVERY.to_string());
+    };
+    if candidate_table != table {
+        return Some(GENERIC_RECOVERY.to_string());
+    }
+    let mut columns = BTreeSet::new();
+    collect(filter, table, &mut columns);
+    if columns.is_empty() {
+        return Some(GENERIC_RECOVERY.to_string());
+    }
+    let columns = columns.into_iter().collect::<Vec<_>>();
+    Some(format!(
+        "CREATE INDEX {table}_{}_idx ON {table} ({})",
+        columns.join("_"),
+        columns.join(", ")
+    ))
 }
 
 fn annotate_vector_search_strategy(mut output: String, strategy: &str) -> String {
@@ -43061,135 +50709,175 @@ fn sanitize_loaded_row_for_meta(row: &mut VersionedRow, meta: &TableMeta) -> boo
     let columns = meta
         .columns
         .iter()
-        .map(|column| (column.name.as_str(), &column.column_type))
+        .map(|column| (column.name.as_str(), column))
         .collect::<HashMap<_, _>>();
-    let before = row.values.len();
-    row.values
-        .retain(|column, value| match columns.get(column.as_str()) {
-            Some(ColumnType::Vector(dimension)) => {
-                matches!(value, Value::Vector(vector) if vector.len() == *dimension)
-            }
-            Some(_) => true,
-            None => false,
-        });
-    row.values.len() != before
-}
-
-fn vector_specs_from_meta(
-    table_meta: &HashMap<String, TableMeta>,
-) -> HashMap<VectorIndexRef, usize> {
-    let mut specs = HashMap::new();
-    for (table, meta) in table_meta {
-        for column in &meta.columns {
-            if let ColumnType::Vector(dimension) = column.column_type {
-                specs.insert(
-                    VectorIndexRef::new(table.clone(), column.name.clone()),
-                    dimension,
-                );
-            }
-        }
-    }
-    specs
-}
-
-#[derive(Clone)]
-struct VectorRenameDdl {
-    lsn: Lsn,
-    from: VectorIndexRef,
-    to: VectorIndexRef,
-}
-
-fn vector_renames_from_ddl_log(ddl_log: &[(Lsn, DdlChange)]) -> Vec<VectorRenameDdl> {
-    let mut renames = Vec::new();
-    for (lsn, change) in ddl_log {
-        let DdlChange::AlterTable {
-            name, constraints, ..
-        } = change
-        else {
-            continue;
+    let mut durable_repair_needed = false;
+    row.values.retain(|column, value| {
+        let Some(definition) = columns.get(column.as_str()) else {
+            durable_repair_needed = true;
+            return false;
         };
-        if let Some((from, to)) = sync_vector_rename_from_constraints(constraints) {
-            renames.push(VectorRenameDdl {
-                lsn: *lsn,
-                from: VectorIndexRef::new(name, from),
-                to: VectorIndexRef::new(name, to),
-            });
+        let ColumnType::Vector(dimension) = definition.column_type else {
+            return true;
+        };
+        match value {
+            Value::Vector(vector) if vector.len() == dimension => {
+                // F32 is an ordinary row value. Quantized columns keep their
+                // body in the vector store and retain only a relational
+                // placeholder in the writable image.
+                if !matches!(definition.quantization, VectorQuantization::F32) {
+                    *value = Value::Null;
+                }
+                true
+            }
+            Value::Null if definition.nullable => true,
+            _ => {
+                durable_repair_needed = true;
+                false
+            }
         }
-    }
-    renames.sort_by(|a, b| {
-        a.lsn
-            .cmp(&b.lsn)
-            .then(a.from.table.cmp(&b.from.table))
-            .then(a.from.column.cmp(&b.from.column))
-            .then(a.to.table.cmp(&b.to.table))
-            .then(a.to.column.cmp(&b.to.column))
     });
-    renames
+    durable_repair_needed
 }
 
-fn resolve_loaded_vector_index(
-    index: &VectorIndexRef,
-    entry_lsn: Lsn,
-    vector_specs: &HashMap<VectorIndexRef, usize>,
-    renames: &[VectorRenameDdl],
-) -> Option<VectorIndexRef> {
-    let mut current = index.clone();
-    let mut seen = HashSet::new();
-    for _ in 0..=renames.len() {
-        if !seen.insert(current.clone()) {
-            return None;
-        }
-        if let Some(rename) = renames
-            .iter()
-            .filter(|rename| rename.from == current && entry_lsn <= rename.lsn)
-            .min_by_key(|rename| rename.lsn)
-        {
-            current = rename.to.clone();
-            continue;
-        }
-        return vector_specs.contains_key(&current).then_some(current);
-    }
-    None
+pub(crate) fn vector_index_layout_from_column(column: &ColumnDef) -> Option<VectorIndexLayout> {
+    let ColumnType::Vector(dimension) = &column.column_type else {
+        return None;
+    };
+    Some(
+        VectorIndexLayout::new(
+            *dimension,
+            column.quantization,
+            column.partition_key_columns.clone().unwrap_or_default(),
+            column.effective_max_partitions(),
+            column.search_mode,
+        )
+        .with_policy(
+            column.auto_index_at,
+            column.hnsw_m,
+            column.hnsw_ef_construction,
+            column.hnsw_ef_search,
+            column.vector_policy_revision,
+        )
+        .with_consolidation_policy(
+            column.consolidation_change_percent,
+            column.consolidation_tombstone_percent,
+        )
+        .with_consolidation_disabled(column.consolidation_disabled),
+    )
 }
 
-fn reconcile_loaded_vectors_for_meta(
-    vectors: Vec<VectorEntry>,
+fn vector_layouts_from_meta(
     table_meta: &HashMap<String, TableMeta>,
-    ddl_log: &[(Lsn, DdlChange)],
-) -> (Vec<VectorEntry>, bool) {
-    let vector_specs = vector_specs_from_meta(table_meta);
-    let renames = vector_renames_from_ddl_log(ddl_log);
-    let mut repaired = false;
-    let mut reconciled = Vec::with_capacity(vectors.len());
-    for mut entry in vectors {
-        let Some(index) =
-            resolve_loaded_vector_index(&entry.index, entry.lsn, &vector_specs, &renames)
-        else {
-            repaired = true;
-            continue;
-        };
-        if entry.index != index {
-            entry.index = index;
-            repaired = true;
-        }
-        if vector_specs.get(&entry.index).copied() == Some(entry.vector.len()) {
-            reconciled.push(entry);
-        } else {
-            repaired = true;
-        }
-    }
-    (reconciled, repaired)
+) -> Vec<(VectorIndexRef, VectorIndexLayout)> {
+    let mut layouts = table_meta
+        .iter()
+        .flat_map(|(table, meta)| {
+            meta.columns.iter().filter_map(move |column| {
+                vector_index_layout_from_column(column).map(|layout| {
+                    (
+                        VectorIndexRef::new(table.clone(), column.name.clone()),
+                        layout,
+                    )
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    layouts.sort_by(|(left, _), (right, _)| {
+        left.table
+            .cmp(&right.table)
+            .then(left.column.cmp(&right.column))
+    });
+    layouts
 }
 
-fn supplement_loaded_vectors_from_rows(
+fn register_vector_layouts(
+    vector: &VectorStore,
+    table_meta: &HashMap<String, TableMeta>,
+) -> Result<()> {
+    for (index, layout) in vector_layouts_from_meta(table_meta) {
+        vector.register_index_with_layout(index, layout)?;
+    }
+    Ok(())
+}
+
+/// Attach each loaded vector occurrence to the typed partition declared by
+/// the relational row version that owns that occurrence. A still-live vector
+/// may outlive its original body-only row version after compaction; in that
+/// case the newest live successor is the established owner fallback.
+fn partition_loaded_vectors_from_rows(
     relational: &RelationalStore,
     table_meta: &HashMap<String, TableMeta>,
-    vectors: &mut Vec<VectorEntry>,
-) -> bool {
+    vectors: Vec<VectorEntry>,
+) -> Result<Vec<PartitionedVectorEntry>> {
     let tables = relational.tables.read();
-    supplement_loaded_vectors_from_table_rows(&tables, table_meta, vectors)
+    vectors
+        .into_iter()
+        .map(|entry| {
+            let (meta, declaration) = table_meta
+                .get(&entry.index.table)
+                .and_then(|meta| {
+                    meta.columns
+                        .iter()
+                        .find(|column| column.name == entry.index.column)
+                        .map(|declaration| (meta, declaration))
+                })
+                .ok_or_else(|| Error::UnknownVectorIndex {
+                    index: entry.index.clone(),
+                })?;
+            if declaration.partition_key_columns.is_none() {
+                return Ok(PartitionedVectorEntry::new(
+                    VectorPartitionKey::unpartitioned(),
+                    entry,
+                ));
+            }
+            let rows = tables.get(&entry.index.table).ok_or_else(|| {
+                Error::Other(format!(
+                    "partitioned vector {}.{} row {} has no relational table image",
+                    entry.index.table, entry.index.column, entry.row_id.0
+                ))
+            })?;
+            let owner = rows
+                .iter()
+                .find(|row| {
+                    row.row_id == entry.row_id
+                        && row.created_tx == entry.created_tx
+                        && row.lsn == entry.lsn
+                })
+                .or_else(|| {
+                    if entry.deleted_tx.is_none() {
+                        rows.iter()
+                            .filter(|row| {
+                                row.row_id == entry.row_id && row.deleted_tx.is_none()
+                            })
+                            .max_by_key(|row| (row.lsn, row.created_tx))
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "partitioned vector {}.{} row {} has no owning relational version at tx {} lsn {}",
+                        entry.index.table,
+                        entry.index.column,
+                        entry.row_id.0,
+                        entry.created_tx.0,
+                        entry.lsn.0
+                    ))
+                })?;
+            let partition_key = crate::composite_store::vector_partition_key_for_row(
+                &entry.index,
+                meta,
+                declaration,
+                owner,
+            )?;
+            Ok(PartitionedVectorEntry::new(partition_key, entry))
+        })
+        .collect()
 }
 
+// Proof-only recovery coverage retains this helper in test builds.
+#[cfg_attr(not(test), allow(dead_code))]
 fn supplement_loaded_vectors_from_table_rows(
     tables: &HashMap<String, Vec<VersionedRow>>,
     table_meta: &HashMap<String, TableMeta>,
@@ -43365,56 +51053,6 @@ mod loaded_vector_supplement_tests {
     }
 }
 
-/// Put a full-precision vector column's value back into the rows a reopen
-/// loaded.
-///
-/// A column declared with space-saving storage is NOT put back: its value
-/// lives in the vector store, the row keeps an empty slot, and a reader fills
-/// it from there on demand. Putting it back here would give every reopened
-/// quantized table a full-precision copy per row that no read asked for and
-/// that nothing charges -- the declared footprint would hold while the store
-/// was live and quietly stop holding the moment it was reopened.
-fn hydrate_relational_vector_values(
-    relational: &RelationalStore,
-    vectors: &[VectorEntry],
-) -> HashSet<String> {
-    let mut changed = HashSet::new();
-    if vectors.is_empty() {
-        return changed;
-    }
-    let declared_meta = relational.table_meta.read();
-    let quantized = |table: &str, column: &str| -> bool {
-        declared_meta.get(table).is_some_and(|meta| {
-            meta.columns.iter().any(|declared| {
-                declared.name == column
-                    && !matches!(
-                        declared.quantization,
-                        contextdb_core::VectorQuantization::F32
-                    )
-            })
-        })
-    };
-    let mut tables = relational.tables.write();
-    for entry in vectors {
-        if quantized(&entry.index.table, &entry.index.column) {
-            continue;
-        }
-        let Some(rows) = tables.get_mut(&entry.index.table) else {
-            continue;
-        };
-        if let Some(row) = rows.iter_mut().find(|row| {
-            row.row_id == entry.row_id && row.created_tx == entry.created_tx && row.lsn == entry.lsn
-        }) {
-            let value = Value::Vector(entry.vector.clone());
-            if row.values.get(&entry.index.column) != Some(&value) {
-                row.values.insert(entry.index.column.clone(), value);
-                changed.insert(entry.index.table.clone());
-            }
-        }
-    }
-    changed
-}
-
 fn remove_cached_row(cache: &mut HashMap<String, Vec<VersionedRow>>, table: &str, row_id: RowId) {
     if let Some(rows) = cache.get_mut(table) {
         rows.retain(|row| row.row_id != row_id);
@@ -43440,16 +51078,65 @@ fn maybe_prebuild_hnsw(vector_store: &VectorStore, accountant: &MemoryAccountant
     let _ = (vector_store, accountant);
 }
 
-/// What a row costs the store that KEEPS it, as opposed to what one copy of
-/// it occupies. An index over any of the row's columns keeps a whole clone of
-/// the value, so the memory a limit governs is `ROW_VALUE_RETENTIONS` copies;
-/// the per-copy figure is what a size report wants, not what admission does.
-fn retained_row_bytes_for_meta(
+/// What a row VERSION costs the store that KEEPS it, as opposed to what one
+/// copy of it occupies. An index over any of the row's non-vector columns
+/// keeps a whole clone of the value, so the memory a limit governs is
+/// `ROW_VALUE_RETENTIONS` copies; the per-copy figure is what a size report
+/// wants, not what admission does.
+///
+/// An F32 vector column keeps its relational projection inside the row
+/// values, so that projection is part of what the row version physically
+/// holds: it is charged when the version is admitted and released when the
+/// version is physically removed, never by any other owner (the vector store
+/// owns only the raw body it keeps). `include_vectors` says whether that
+/// projection is part of the figure. Every site that charges or releases a
+/// whole version passes `true`; the one exception is an admission that
+/// charges the projection separately under its own `vector_insert@` tag
+/// (`Database::admit_retained_row_bytes`), so a budget refusal names the
+/// vector column that caused it. The figure with `true` is exactly the sum
+/// of the two parts, so the version's release is the same whichever door
+/// admitted it.
+pub(crate) fn retained_row_bytes_for_meta(
     values: &HashMap<ColName, Value>,
     meta: &TableMeta,
     include_vectors: bool,
 ) -> usize {
-    estimate_row_bytes_for_meta(values, meta, include_vectors).saturating_mul(ROW_VALUE_RETENTIONS)
+    let non_vector =
+        estimate_row_bytes_for_meta(values, meta, false).saturating_mul(ROW_VALUE_RETENTIONS);
+    if include_vectors {
+        non_vector.saturating_add(f32_projection_payload_bytes(values, meta))
+    } else {
+        non_vector
+    }
+}
+
+/// The F32 projection bytes a row version holds, per vector column, in
+/// declaration order. Only an F32 column keeps its vector inside the row;
+/// a quantized column's relational slot is blank (`blank_quantized_vector_values`).
+fn f32_projection_payload_bytes_by_column<'a>(
+    values: &'a HashMap<ColName, Value>,
+    meta: &'a TableMeta,
+) -> impl Iterator<Item = (&'a ColName, usize)> + 'a {
+    meta.columns.iter().filter_map(move |column| {
+        if !matches!(column.column_type, ColumnType::Vector(_))
+            || column.quantization != VectorQuantization::F32
+        {
+            return None;
+        }
+        let Some(Value::Vector(vector)) = values.get(&column.name) else {
+            return None;
+        };
+        Some((
+            &column.name,
+            vector.len().saturating_mul(std::mem::size_of::<f32>()),
+        ))
+    })
+}
+
+fn f32_projection_payload_bytes(values: &HashMap<ColName, Value>, meta: &TableMeta) -> usize {
+    f32_projection_payload_bytes_by_column(values, meta).fold(0usize, |bytes, (_, column_bytes)| {
+        bytes.saturating_add(column_bytes)
+    })
 }
 
 fn estimate_row_bytes_for_meta(
@@ -43507,13 +51194,19 @@ impl Drop for Database {
         if self.resource_owner && !self.closed.load(Ordering::SeqCst) {
             let _stopped = self.stop_owner_reads_without_waiting();
         }
-        let already_closed = {
+        let already_closed = if self.resource_owner {
             let _operation_barrier = self.operation_gate.write();
             let already_closed = self.closed.swap(true, Ordering::SeqCst);
             if !already_closed && self.resource_owner {
                 self.resource_closed.store(true, Ordering::SeqCst);
             }
             already_closed
+        } else {
+            // Rust has exclusive ownership of this handle at destruction.
+            // Its readers retain their own Arc, so retiring a non-owning view
+            // cannot race an operation through that view and must not wait
+            // for unrelated work using the store's shared operation barrier.
+            self.closed.swap(true, Ordering::SeqCst)
         };
         // A handle closed by hand has already done the work below, but it is
         // still one of the holders this store is waiting on, so it still
@@ -43527,8 +51220,7 @@ impl Drop for Database {
             self.stop_cron_tickler();
             let event_bus_shutdown = self.stop_event_bus_threads();
             let runtime = self.pruning_runtime.get_mut();
-            runtime.shutdown.store(true, Ordering::SeqCst);
-            if let Some(handle) = runtime.handle.take() {
+            if let Some(handle) = runtime.request_shutdown_and_take_handle() {
                 let _ = handle.join();
             }
             if self.resource_owner {
@@ -43573,18 +51265,6 @@ impl Drop for Database {
             }
             release_store(release);
         }
-    }
-}
-
-fn sleep_with_shutdown(shutdown: &AtomicBool, interval: Duration) {
-    let deadline = Instant::now() + interval;
-    while !shutdown.load(Ordering::SeqCst) {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        thread::sleep(remaining.min(Duration::from_millis(50)));
     }
 }
 
@@ -43646,7 +51326,11 @@ fn staged_tuple_exists(ws: &WriteSet, table: &str, columns: &[String], values: &
     })
 }
 
-fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<PruningReport> {
+fn prune_expired_rows(
+    ctx: &MaintenanceContext,
+    sync_watermark: Lsn,
+    now: Wallclock,
+) -> Result<PruningReport> {
     let relational_store = &ctx.relational;
     let graph_store = &ctx.graph;
     let vector_store = &ctx.vector;
@@ -43656,10 +51340,9 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
     let change_log_table_index = &ctx.change_log_table_index;
     let change_log_lsn_refcounts = &ctx.change_log_lsn_refcounts;
     let tx_mgr = ctx.tx_mgr.as_ref();
-    let now = Wallclock::now();
     let metas = relational_store.table_meta.read().clone();
     let mut pruned_versions_by_table: HashMap<String, Vec<(RowId, TxId)>> = HashMap::new();
-    let mut pruned_live_row_ids = HashSet::new();
+    let mut fully_pruned_row_ids = HashSet::new();
     let mut pruned_node_ids = HashSet::new();
     // Grouped by table -- see `compact_currency_versions_inner`'s identical
     // choice.
@@ -43668,9 +51351,9 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
     // already being walked -- no scan is needed later to find it (see
     // `RedbPersistence::prune_versions_scoped`).
     let mut row_keys: Vec<(String, RowId, TxId, Lsn)> = Vec::new();
-    // A row whose LIVE version is pruned here loses its one sync-source-lsn
-    // tracking row too -- looked up by key rather than the table-wide scan
-    // `retain_sync_source_lsns_for_table_rows` used to need.
+    // A row whose complete retained lifetime is pruned here loses its one
+    // sync-source-lsn tracking row too -- looked up by key rather than the
+    // table-wide scan `retain_sync_source_lsns_for_table_rows` used to need.
     let mut orphaned_source_lsn_rows: Vec<(String, RowId)> = Vec::new();
     let mut released_row_bytes = 0usize;
     // The physical bytes this pass reclaims (`released_row_bytes`) and the
@@ -43680,17 +51363,14 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
     let mut accounted_row_bytes = 0usize;
     let mut blocked = Vec::new();
 
-    // Retention removes rows PHYSICALLY, exactly as version cleanup does, so
-    // it defers to the same read-snapshot registry: a row still visible to
-    // ANY registered reader (an in-flight statement, a caller-held
-    // `SnapshotPin`, or a suspended bounded cursor's pinned snapshot) is left
-    // for a later cycle rather than removed out from under it. The watermark
-    // is sampled under the SAME commit-lock hold this whole pass runs inside
-    // (`run_pruning` wraps this call in `with_commit_lock`), which is what
-    // `SnapshotFloorRegistry::register`'s blocking rule relies on -- see
-    // `compact_currency_versions_inner`, whose pattern this mirrors.
+    // Every registered reader owns the versions visible at its snapshot,
+    // including ordinary statements that have registered before their first
+    // source pull. The committed expiry already hides these rows from newer
+    // snapshots, so continuous reads do not keep extending their lifetime.
     let watermark = tx_mgr.current_tx_max();
-    let active_removal_pass = ctx.snapshot_registry.begin_removal_pass(watermark);
+    let active_removal_pass = ctx
+        .snapshot_registry
+        .begin_retention_removal_pass(watermark);
     ctx.snapshot_registry.removal_pass_test_pause.maybe_pause();
 
     let table_snapshot = relational_store.tables.read().clone();
@@ -43784,22 +51464,19 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
                 .or_default()
                 .insert((row.row_id, row.lsn));
             row_keys.push((table_name.clone(), row.row_id, row.created_tx, row.lsn));
-            let version_bytes = retained_row_bytes_for_meta(&row.values, meta, false);
+            let version_bytes = retained_row_bytes_for_meta(&row.values, meta, true);
             released_row_bytes = released_row_bytes.saturating_add(version_bytes);
-            if row.deleted_tx.is_none() {
+            if row.deleted_tx.is_none()
+                || relational_store.is_retention_expired(table_name, row.row_id, row.created_tx)
+            {
                 // A version that was never deleted still carries the charge it
                 // took at insert, so pruning it here is its ONE release. A
                 // version carrying `deleted_tx` was released at commit by
                 // `release_delete_allocations_from_bytes`; releasing it again
                 // would take the same bytes back twice. This is the rule the
-                // vector and edge reclaim below already follow — both are
-                // scoped to `pruned_live_row_ids`.
+                // vector and edge reclaim below keep their own complete-row
+                // lifecycle test; accounting must not decide data ownership.
                 accounted_row_bytes = accounted_row_bytes.saturating_add(version_bytes);
-                pruned_live_row_ids.insert(row.row_id);
-                orphaned_source_lsn_rows.push((table_name.clone(), row.row_id));
-                if let Some(Value::Uuid(id)) = row.values.get("id") {
-                    pruned_node_ids.insert(*id);
-                }
             }
         }
     }
@@ -43813,7 +51490,16 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
     // and had to leave adjacency behind because a registered reader could
     // still see it. A pass that prunes no row at all still has to revisit
     // that carry-over -- the reader it was waiting on may be gone.
-    let carried_edge_nodes: HashSet<NodeId> = ctx.retention_deferred_edge_nodes.lock().clone();
+    let mut carried_edge_nodes: HashSet<NodeId> = ctx.retention_deferred_edge_nodes.lock().clone();
+    if let Some(persistence) = persistence {
+        carried_edge_nodes.extend(
+            persistence
+                .load_config_value::<BTreeSet<NodeId>>(
+                    crate::persistence::RETENTION_DEFERRED_EDGE_NODES,
+                )?
+                .unwrap_or_default(),
+        );
+    }
     if pruned_version_count == 0 && carried_edge_nodes.is_empty() {
         return Ok(PruningReport {
             pruned_rows: 0,
@@ -43835,18 +51521,46 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
             )
         })
         .collect::<HashMap<_, _>>();
-    // The vectors and edges being REMOVED (a row whose LIVE version just
-    // aged out), not the wholesale "everything that survives" set the old
-    // full-rewrite path needed — `prune_vectors_and_edges_scoped` takes
-    // exactly what to remove.
-    let removed_vectors: Vec<VectorEntry> = if pruned_live_row_ids.is_empty() {
+
+    // Row memory was released when a delete stamped `deleted_tx`, but the
+    // row's durable vector membership, body and provenance remain until the
+    // retention pass removes its final version. Select those owners from the
+    // complete row lifetime, independently of the accounting condition above.
+    // If even one version survives (including one owed to a pinned reader),
+    // retain every row-scoped owner until a later pass can remove them together.
+    for (table_name, pruned_versions) in &pruned_versions_by_table_sets {
+        let Some(rows) = table_snapshot.get(table_name) else {
+            continue;
+        };
+        let candidate_row_ids = pruned_versions
+            .iter()
+            .map(|(row_id, _)| *row_id)
+            .collect::<HashSet<_>>();
+        for row_id in candidate_row_ids {
+            if rows.iter().any(|row| {
+                row.row_id == row_id && !pruned_versions.contains(&(row.row_id, row.created_tx))
+            }) {
+                continue;
+            }
+            fully_pruned_row_ids.insert(row_id);
+            orphaned_source_lsn_rows.push((table_name.clone(), row_id));
+            pruned_node_ids.extend(rows.iter().filter(|row| row.row_id == row_id).filter_map(
+                |row| match row.values.get("id") {
+                    Some(Value::Uuid(id)) => Some(*id),
+                    _ => None,
+                },
+            ));
+        }
+    }
+
+    // The vectors and edges being removed, not the wholesale survivor set the
+    // old full-rewrite path needed. A fully removed row contributes every
+    // retained vector version, including tombstoned versions that no longer
+    // own relational memory.
+    let removed_vectors: Vec<VectorEntry> = if fully_pruned_row_ids.is_empty() {
         Vec::new()
     } else {
-        vector_store
-            .all_entries()
-            .into_iter()
-            .filter(|entry| pruned_live_row_ids.contains(&entry.row_id))
-            .collect()
+        vector_store.load_entries_for_rows(&fully_pruned_row_ids)?
     };
     let mut reclaimable_edge_nodes = pruned_node_ids;
     reclaimable_edge_nodes.extend(carried_edge_nodes.iter().copied());
@@ -43873,6 +51587,16 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
             .collect()
     };
 
+    let deferred_edge_nodes = graph_store
+        .forward_adj
+        .read()
+        .values()
+        .flat_map(|entries| entries.iter())
+        .filter(|entry| !edge_is_reclaimable(entry))
+        .flat_map(|entry| [entry.source, entry.target])
+        .filter(|node| reclaimable_edge_nodes.contains(node))
+        .collect::<HashSet<_>>();
+
     // Bounded to the tables THIS pass touches, never the whole change log
     // -- matching the cleanup path's own fix (`count_pruned_change_log_
     // entries`/`change_log_table_index`). Persist-then-mutate: nothing here
@@ -43890,40 +51614,49 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
         count_pruned_change_log_entries(&table_index, &pruned_change_keys)
     };
 
+    let membership_deletes = orphaned_source_lsn_rows
+        .iter()
+        .map(|(table, row)| (table.clone(), *row, watermark))
+        .collect::<Vec<_>>();
+    let memberships =
+        relational_store.prepare_memberships(&membership_deletes, &[], ctx.accountant.clone())?;
+
+    // Commit-index candidate-only removal, shared with the cleanup path —
+    // see the function doc. Over-retention remains the deliberate safe
+    // direction: a candidate not yet proven safe by `scoped_commit_index_
+    // removal`'s own floor computation simply is not removed.
+    let mut affected_lsns: HashSet<Lsn> = removed_lsn_counts.keys().copied().collect();
+    affected_lsns
+        .extend(relational_store.reclaimed_retention_expiry_lsns(&pruned_versions_by_table_sets));
+    let commit_index_candidates = {
+        let lsn_refcounts = change_log_lsn_refcounts.read();
+        scoped_commit_index_candidates(tx_mgr, &lsn_refcounts, &removed_lsn_counts, &affected_lsns)
+    };
+
+    let generation_cleanup = prepare_cleanup_generations(
+        vector_store,
+        persistence,
+        pruned_versions_by_table.keys().map(String::as_str),
+        active_removal_pass.registered_snapshots(),
+    )?;
     if let Some(persistence) = persistence {
         // Point-removes in ONE redb write transaction: exactly the pruned
         // row versions, the change-log entries that referenced them
         // (change-log-first WITHIN that transaction, exactly as the cleanup
         // path's fix), and the sync-source-lsn rows orphaned by a row whose
         // whole lifetime just ended. Nothing else is read or rewritten.
-        // Empty on a pass that only revisits deferred adjacency; the
-        // persisted call itself is a no-op then, and the edge removal below
-        // is the whole of that pass's durable work.
-        persistence.prune_versions_scoped(
+        // The same commit removes vectors and adjacency and retains retry
+        // identities for edges still owed to registered readers, including a
+        // pass that only revisits adjacency after its row is already gone.
+        persistence.prune_retention_scoped(
             &row_keys,
             &pruned_change_keys_vec,
             &orphaned_source_lsn_rows,
+            Some((&removed_vectors, &removed_edges, &deferred_edge_nodes)),
+            &commit_index_candidates,
+            &generation_cleanup,
         )?;
-        if !removed_vectors.is_empty() || !removed_edges.is_empty() {
-            persistence.prune_vectors_and_edges_scoped(&removed_vectors, &removed_edges)?;
-        }
     }
-
-    // Commit-index candidate-only removal, shared with the cleanup path —
-    // see the function doc. Over-retention remains the deliberate safe
-    // direction: a candidate not yet proven safe by `scoped_commit_index_
-    // removal`'s own floor computation simply is not removed.
-    let affected_lsns: HashSet<Lsn> = removed_lsn_counts.keys().copied().collect();
-    let commit_index_candidates = {
-        let lsn_refcounts = change_log_lsn_refcounts.read();
-        scoped_commit_index_removal(
-            tx_mgr,
-            persistence,
-            &lsn_refcounts,
-            &removed_lsn_counts,
-            &affected_lsns,
-        )?
-    };
 
     // Only now, with every persisted step behind us, does memory follow —
     // scoped to a suffix of `change_log` (see
@@ -43951,20 +51684,28 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
         relational_store.remove_row_versions(table_name, versions);
     }
 
+    relational_store.publish_memberships(memberships);
+
     for table_name in pruned_versions_by_table.keys() {
         if let Some(meta) = metas.get(table_name) {
             for index in &meta.indexes {
-                relational_store.rebuild_index(table_name, &index.name);
+                relational_store.rebuild_index_preserving_current(table_name, &index.name);
             }
         }
     }
 
-    let released_vector_bytes = if pruned_live_row_ids.is_empty() {
+    let released_vector_bytes = if fully_pruned_row_ids.is_empty() {
         0
     } else {
-        vector_store.prune_row_ids(&pruned_live_row_ids, accountant)
+        vector_store.prune_row_ids(&fully_pruned_row_ids, accountant)
     };
 
+    for (catalog, _) in &generation_cleanup {
+        vector_store.reclaim_snapshot_free_partition_graph_generations(
+            &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()),
+            active_removal_pass.registered_snapshots(),
+        );
+    }
     let mut released_edge_bytes = 0usize;
     // Every adjacency entry this pass removes is charged until it is removed,
     // whether it was stamped `deleted_tx` by an earlier commit or was still
@@ -43975,7 +51716,6 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
     // Ids whose adjacency this pass had to leave behind, so the next pass
     // knows to come back to them. Rebuilt from what is actually still in
     // place, so an id whose entries are all gone stops being carried.
-    let mut deferred_edge_nodes: HashSet<NodeId> = HashSet::new();
     {
         let mut forward = graph_store.forward_adj.write();
         for entries in forward.values_mut() {
@@ -43987,11 +51727,6 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
                         accounted_edge_bytes.saturating_add(entry.estimated_bytes());
                     false
                 } else {
-                    for end in [entry.source, entry.target] {
-                        if reclaimable_edge_nodes.contains(&end) {
-                            deferred_edge_nodes.insert(end);
-                        }
-                    }
                     true
                 }
             });
@@ -44033,62 +51768,48 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
     })
 }
 
-fn checked_prune_expired_rows(
-    ctx: &MaintenanceContext,
-    sync_watermark: Lsn,
-) -> Result<PruningReport> {
-    prune_expired_rows(ctx, sync_watermark)
+/// Capture snapshot-protected chains before any durable cleanup. The caller
+/// holds its commit and removal guards until disk and memory both agree.
+fn prepare_cleanup_generations<'a>(
+    vector: &VectorStore,
+    persistence: Option<&Arc<RedbPersistence>>,
+    tables: impl Iterator<Item = &'a str>,
+    snapshots: &[SnapshotId],
+) -> Result<crate::persistence::VectorGenerationCleanup> {
+    let Some(persistence) = persistence else {
+        return Ok(Vec::new());
+    };
+    let tables = tables.collect::<HashSet<_>>();
+    let mut cleanup = Vec::new();
+    for index in vector.index_layout_infos() {
+        if !tables.contains(index.index.table.as_str()) {
+            continue;
+        }
+        for key in vector.partition_keys_including_historical(&index.index)? {
+            if let Some(catalog) =
+                persistence.load_vector_partition_generation_catalog_for(&index.index, &key)?
+            {
+                let partition = VectorPartitionRef::new(index.index.clone(), key);
+                cleanup.push((
+                    catalog,
+                    vector.snapshot_retained_partition_chain_ids(&partition, snapshots),
+                ));
+            }
+        }
+    }
+    Ok(cleanup)
 }
 
-/// Commit-index candidate-only removal, shared by version cleanup and
-/// retention: only the LSNs THIS PASS affected (`affected_lsns`) are
-/// candidates, and only those still unreferenced after this pass AND not
-/// the ANCHOR are actually removable — never a rebuild of the whole index.
-///
-/// `lsn_refcounts` is the maintained global "how many change-log entries of
-/// any kind still name this LSN" map (see `ChangeLogLsnRefcounts`), read
-/// BEFORE this pass's own removal; `removed_lsn_counts` is this pass's own
-/// per-LSN removal count (small, bounded to the tables it touched — see
-/// `count_pruned_change_log_entries`). Neither is cloned: "is `lsn` still
-/// covered after this pass" is the O(log n) pre-pass count minus this
-/// pass's own (small) delta, and "what is the lowest LSN still covered"
-/// (the floor) starts from `lsn_refcounts.keys().next()` — a `BTreeMap`
-/// first-key lookup — and only walks forward if THAT exact key is itself
-/// being fully removed this pass (rare: it means the earliest entry in the
-/// WHOLE change log belongs to a table this pass is cleaning), never a
-/// scan of the whole map otherwise. The floor matters because
-/// `changes_since`'s delete arms resolve `snapshot_at(lsn - 1)` — they ask
-/// about the LSN BELOW their own entry — so keeping only the still-covered
-/// LSNs would leave the oldest surviving delete resolving against nothing;
-/// the ANCHOR (the greatest commit-index entry strictly below the floor,
-/// found via [`TransactionManager::commit_index_floor_below`] — a targeted
-/// range query, never a clone of the whole index) closes that gap. When
-/// nothing in the change log survives at all there is no floor to derive;
-/// the anchor falls back to the single most recent commit-index entry
-/// instead ([`TransactionManager::commit_index_last`]) — the index is
-/// never trimmed to empty, because an empty index answers `TxId(0)` for
-/// every lookup and would hide the whole database.
-///
-/// Persist-then-mutate: the PERSISTED removal runs here (and can fail) —
-/// this is a side effect only, and returns ONLY the candidate LSN list, not
-/// a count. The caller must not report the persisted side effect's own
-/// count as "how many entries this pass removed": that count is `0` on an
-/// in-memory database (no persistence to remove from at all) even though
-/// the in-memory index genuinely shrinks, so the caller derives the real
-/// count from `tx_mgr.remove_commit_index_entries`'s OWN return value,
-/// AFTER actually mutating memory with the candidates returned here —
-/// applies to an in-memory database too, since the commit index is
-/// `TransactionManager` state, not persistence state, and grows with every
-/// commit whether or not this database has a file.
-fn scoped_commit_index_removal(
+/// Select without mutating either durable or in-memory state. Currency cleanup
+/// includes these candidates in the same transaction as their last references.
+fn scoped_commit_index_candidates(
     tx_mgr: &TransactionManager<DynStore>,
-    persistence: Option<&Arc<RedbPersistence>>,
     lsn_refcounts: &ChangeLogLsnRefcounts,
     removed_lsn_counts: &HashMap<Lsn, u64>,
     affected_lsns: &HashSet<Lsn>,
-) -> Result<Vec<Lsn>> {
+) -> Vec<Lsn> {
     if affected_lsns.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let still_covered = |lsn: Lsn| -> bool {
         lsn_refcounts.get(&lsn).copied().unwrap_or(0)
@@ -44106,18 +51827,11 @@ fn scoped_commit_index_removal(
         Some(floor) => tx_mgr.commit_index_floor_below(floor).map(|(lsn, _)| lsn),
         None => tx_mgr.commit_index_last().map(|(lsn, _)| lsn),
     };
-    let candidates: Vec<Lsn> = affected_lsns
+    affected_lsns
         .iter()
         .filter(|lsn| !still_covered(**lsn) && Some(**lsn) != anchor_lsn)
         .copied()
-        .collect();
-    if candidates.is_empty() {
-        return Ok(candidates);
-    }
-    if let Some(persistence) = persistence {
-        persistence.remove_commit_index_entries_scoped(&candidates)?;
-    }
-    Ok(candidates)
+        .collect()
 }
 
 /// Whether a change-log entry names one of the pruned `(table, row_id, lsn)`
@@ -44340,10 +52054,6 @@ fn compact_currency_versions_inner(
     // released row version: a vector write shares its row's `created_tx`/
     // `lsn` (same commit), so this triple names it exactly.
     let mut pruned_row_identities: HashSet<(RowId, TxId, Lsn)> = HashSet::new();
-    // The subset of `pruned_row_identities` whose versions still hold their
-    // charge. The full set drives physical removal; only this subset is
-    // returned to the accountant.
-    let mut charged_row_identities: HashSet<(RowId, TxId, Lsn)> = HashSet::new();
     let mut released_row_bytes = 0usize;
     // See the retention pass above: the bytes this pass physically reclaims
     // and the bytes it returns to the accountant are different sets. A version
@@ -44371,6 +52081,24 @@ fn compact_currency_versions_inner(
         }
         for row in rows {
             if keeper_lsn.get(&row.row_id).copied() == Some(row.lsn) {
+                // A deleted row's final version is still its relational
+                // keeper (the delete stamps that version; the tombstone stays
+                // for the relational and sync doors), but under `HISTORY
+                // CURRENT ONLY` the row has no current version, so the vector
+                // copy attached to it is a tombstone with nothing left to
+                // serve: a deletion remains a vector tombstone only until
+                // compaction, and is reclaimed once no registered snapshot
+                // can still resolve it. Named here by the same identity
+                // triple as a superseded copy; only the vector side is
+                // pruned.
+                if row.deleted_tx.is_some()
+                    && !any_registered_snapshot_sees(
+                        active_removal_pass.registered_snapshots(),
+                        row,
+                    )
+                {
+                    pruned_row_identities.insert((row.row_id, row.created_tx, row.lsn));
+                }
                 continue;
             }
             // A superseded version still visible to ANY registered reader
@@ -44394,21 +52122,28 @@ fn compact_currency_versions_inner(
                 .insert((row.row_id, row.lsn));
             row_keys.push((table.to_string(), row.row_id, row.created_tx, row.lsn));
             pruned_row_identities.insert((row.row_id, row.created_tx, row.lsn));
-            if row.deleted_tx.is_none() {
-                charged_row_identities.insert((row.row_id, row.created_tx, row.lsn));
-            }
-            if let Some(meta) = metas.get(table) {
-                let version_bytes = retained_row_bytes_for_meta(&row.values, meta, false);
-                released_row_bytes = released_row_bytes.saturating_add(version_bytes);
-                if row.deleted_tx.is_none() {
-                    // An update stamps the version it supersedes with
-                    // `deleted_tx` and releases its charge at commit, so this
-                    // pass reclaims the memory without returning the bytes a
-                    // second time. A non-keeper version that was never marked
-                    // deleted still holds its charge, and this is its one
-                    // release.
-                    accounted_row_bytes = accounted_row_bytes.saturating_add(version_bytes);
-                }
+            // Mirror the charge side's fallback (`account_loaded_state`'s
+            // `map_or_else` above): a version is charged via
+            // `row.estimated_bytes()` when its table has no `table_meta`
+            // entry, so its release must use the same fallback here. Without
+            // this, a version physically removed below (`pruned_versions_by_table`,
+            // already recorded above this guard) while its table's meta is
+            // missing would leave memory charged with no release.
+            let version_bytes = metas.get(table).map_or_else(
+                || row.estimated_bytes(),
+                |meta| retained_row_bytes_for_meta(&row.values, meta, true),
+            );
+            released_row_bytes = released_row_bytes.saturating_add(version_bytes);
+            if row.deleted_tx.is_none()
+                || relational_store.is_retention_expired(table, row.row_id, row.created_tx)
+            {
+                // An update stamps the version it supersedes with
+                // `deleted_tx` and releases its charge at commit, so this
+                // pass reclaims the memory without returning the bytes a
+                // second time. A non-keeper version that was never marked
+                // deleted still holds its charge, and this is its one
+                // release.
+                accounted_row_bytes = accounted_row_bytes.saturating_add(version_bytes);
             }
         }
     }
@@ -44417,7 +52152,10 @@ fn compact_currency_versions_inner(
         .values()
         .map(|versions| versions.len() as u64)
         .sum();
-    if pruned_version_count == 0 {
+    // A pass with no superseded relational version may still owe the vector
+    // copies of deleted rows (named into `pruned_row_identities` above), so
+    // it returns early only when it has nothing at all to reclaim.
+    if pruned_version_count == 0 && pruned_row_identities.is_empty() {
         return Ok(CurrencyCompactionReport {
             tables_in_memory_snapshot: table_snapshot.len() as u64,
             versions_deferred_for_readers,
@@ -44428,17 +52166,19 @@ fn compact_currency_versions_inner(
     // Vector copies attached to a released row version are part of the
     // reclaim set too: a declared vector-bearing table would otherwise stay
     // unbounded while this report claims success. Scoped to exactly the
-    // vector columns of the tables THIS pass touches (`entries_for_index`
-    // per column), never the whole vector store: `all_entries()` scans
-    // every index across the whole database, which would make an unrelated
-    // vector-bearing table's population show up in this pass's own
-    // commit-lock hold time -- precisely the proportional-to-ballast cost
-    // this rewrite exists to remove.
+    // vector columns of the tables THIS pass touches, never the whole vector
+    // store: an unrelated vector-bearing table's population must not show up
+    // in this pass's exclusive commit-lock hold time -- precisely the
+    // proportional-to-ballast cost this rewrite exists to remove. The copies
+    // are named from the partitions' durable directories
+    // (`directory_versions_matching`), never by reading bodies: a partition
+    // that is dormant after a restart stays dormant, and the superseded copy
+    // it holds is still pruned durably by identity below.
     // Edges are NOT touched: edge identity is self-owned (`source`, `target`,
     // `edge_type` plus its own `created_tx`/`lsn`), versioned by no
     // relational row, so cleanup neither needs nor claims edge boundedness
     // (see `prune_vectors_and_edges_scoped`'s doc comment).
-    let released_vectors: Vec<VectorEntry> = if pruned_row_identities.is_empty() {
+    let released_vectors: Vec<VectorVersionIdentity> = if pruned_row_identities.is_empty() {
         Vec::new()
     } else {
         let mut candidates = Vec::new();
@@ -44451,19 +52191,13 @@ fn compact_currency_versions_inner(
                     continue;
                 }
                 let index_ref = VectorIndexRef::new(*table, column.name.clone());
-                if let Ok(entries) = vector_store.entries_for_index(&index_ref) {
-                    candidates.extend(entries);
-                }
+                candidates.extend(
+                    vector_store.directory_versions_matching(&index_ref, &pruned_row_identities),
+                );
             }
         }
         candidates
-            .into_iter()
-            .filter(|entry| {
-                pruned_row_identities.contains(&(entry.row_id, entry.created_tx, entry.lsn))
-            })
-            .collect()
     };
-
     // Bounded to the tables THIS pass touches (`count_pruned_change_log_
     // entries` walks each affected table's own `change_log_table_index`
     // shadow, never the whole change log) -- persist-then-mutate: nothing
@@ -44481,66 +52215,46 @@ fn compact_currency_versions_inner(
         count_pruned_change_log_entries(&table_index, &pruned_change_keys)
     };
 
+    // Select commit-index removals from the pre-pass counts before deleting any
+    // nomination source. The anchor and unrelated references remain protected.
+    let affected_lsns: HashSet<Lsn> = removed_lsn_counts.keys().copied().collect();
+    let commit_index_candidates = {
+        let lsn_refcounts = change_log_lsn_refcounts.read();
+        scoped_commit_index_candidates(tx_mgr, &lsn_refcounts, &removed_lsn_counts, &affected_lsns)
+    };
+
+    let generation_cleanup = prepare_cleanup_generations(
+        vector_store,
+        persistence,
+        tables.iter().copied(),
+        active_removal_pass.registered_snapshots(),
+    )?;
     let mut vector_keys_rewritten = 0u64;
     if let Some(persistence) = persistence {
-        // Test-only injection seam (`__arm_currency_compaction_persist_fault_
-        // for_test`): fails the pass HERE -- after the in-memory change log
-        // above has already been filtered, but before the persisted removal
-        // runs. Production-dead; reads a thread-local that is never set
-        // outside a test.
+        // Fail before any durable or in-memory removal. The same selected
+        // identities remain available to a later cycle after an error.
         if take_currency_compaction_persist_fault_for_test() {
             return Err(Error::Other(
                 "injected persistence failure mid version-cleanup pass (test seam)".to_string(),
             ));
         }
-        // Point-removes in ONE redb write transaction: exactly the pruned row
-        // versions and exactly the change-log entries that referenced them
-        // (change-log-first WITHIN that one transaction). Nothing else is
-        // read or rewritten -- no wholesale rewrite of surviving rows,
-        // vectors, or edges. Cleanup never touches sync-source-lsn tracking:
-        // a currency table's row_id STAYS live (only superseded versions are
-        // pruned), so its one source-lsn entry is untouched by construction.
-        let stats = persistence.prune_versions_scoped(&row_keys, &pruned_change_keys_vec, &[])?;
+        // Rows, change-log references, vector bodies, memberships, tombstones,
+        // and eligible commit-index entries commit together. A crash at either
+        // former transaction gap leaves the entire removal set retryable.
+        // Sync-source provenance stays: only superseded row versions are removed.
+        let stats = persistence.prune_currency_scoped(
+            &row_keys,
+            &pruned_change_keys_vec,
+            &released_vectors,
+            &commit_index_candidates,
+            &generation_cleanup,
+        )?;
         vector_keys_rewritten = stats.vector_keys_removed;
-        if !released_vectors.is_empty() {
-            // Vector/edge pruning in a SEPARATE redb transaction, independent
-            // from the row/version-cleanup transaction above.
-            let vector_stats =
-                persistence.prune_vectors_and_edges_scoped(&released_vectors, &[])?;
-            vector_keys_rewritten += vector_stats.vector_keys_removed;
-        }
     }
 
-    // Commit-index candidate-only removal in a THIRD independent redb transaction,
-    // after row/version pruning and vector/edge pruning above. Shared with retention;
-    // see the function doc. `removed_lsn_counts` (this pass's own, small) is
-    // checked against `change_log_lsn_refcounts` (the pre-pass global count)
-    // under a single read guard -- neither is cloned.
-    let affected_lsns: HashSet<Lsn> = removed_lsn_counts.keys().copied().collect();
-    let commit_index_candidates = {
-        let lsn_refcounts = change_log_lsn_refcounts.read();
-        scoped_commit_index_removal(
-            tx_mgr,
-            persistence,
-            &lsn_refcounts,
-            &removed_lsn_counts,
-            &affected_lsns,
-        )?
-    };
-
-    // Only after all persisted steps succeed does memory follow. The persisted
-    // work is split across multiple independent redb transactions: row/version
-    // pruning (line 19694, 19698) and commit-index removal (line 19710).
-    // Each transaction is scoped to only the affected entries — never touching
-    // unrelated data. If any transaction fails (lines 19694, 19698, or 19710
-    // return Err), the function returns early without updating memory, and the
-    // next maintenance cycle will re-attempt the same work. Between-transaction
-    // failures leave only benign over-retention (persisted data ahead of what's
-    // in the memory snapshot) — the next cycle re-prunes and completes the
-    // cleanup. The test seam (line 19682) can inject a failure BEFORE
-    // prune_versions_scoped to test idempotency. The physical memory removal is
-    // scoped to a suffix of `change_log` (see `remove_pruned_change_log_entries`),
-    // never the whole Vec.
+    // Publish memory only after the complete durable removal succeeds, under
+    // the existing commit and snapshot-removal gates. The physical change-log
+    // removal visits its affected suffix, not unrelated earlier entries.
     if let Some(min_affected_lsn) = affected_lsns.iter().min().copied() {
         remove_pruned_change_log_entries(
             &mut change_log.write(),
@@ -44564,33 +52278,37 @@ fn compact_currency_versions_inner(
         relational_store.remove_row_versions(table, versions);
         if let Some(meta) = metas.get(table) {
             for index in &meta.indexes {
-                relational_store.rebuild_index(table, &index.name);
+                relational_store.rebuild_index_preserving_current(table, &index.name);
             }
         }
     }
-    // The vector copy attached to a version that was stamped `deleted_tx`
-    // had its bytes handed back at the commit that superseded it, so removing
-    // that copy here reclaims memory without returning the bytes again. The
-    // accounted share is summed from the entries whose version still holds a
-    // charge; the physical removal still covers every pruned version.
-    let accounted_vector_bytes = released_vectors
-        .iter()
-        .filter(|entry| {
-            charged_row_identities.contains(&(entry.row_id, entry.created_tx, entry.lsn))
-        })
-        .fold(0usize, |acc, entry| {
-            acc.saturating_add(entry.estimated_bytes())
-        });
-    let released_vector_bytes = if released_vectors.is_empty() {
-        0
-    } else {
-        vector_store.prune_superseded_versions(&pruned_row_identities)
-    };
-    // Reclaimed physical bytes are reported in full below; only the versions
-    // that still held a charge are returned to the accountant.
-    accountant.release(accounted_row_bytes.saturating_add(accounted_vector_bytes));
+    // A partition state that carries the accountant returns each pruned raw
+    // body from its own record inside the prune; what comes back here is
+    // only the bytes a state without an accountant still leaves charged to
+    // the per-insert admission, which this pass is the one release for.
+    let released_vector_bytes = vector_store.prune_superseded_versions(&released_vectors);
+    for (catalog, _) in &generation_cleanup {
+        vector_store.reclaim_snapshot_free_partition_graph_generations(
+            &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()),
+            active_removal_pass.registered_snapshots(),
+        );
+    }
 
-    let mut compacted_tables: Vec<String> = pruned_versions_by_table.keys().cloned().collect();
+    accountant.release(accounted_row_bytes.saturating_add(released_vector_bytes));
+
+    // A table whose only reclaimed state this pass was a deleted row's vector
+    // copy was compacted too.
+    let mut compacted_tables: Vec<String> = pruned_versions_by_table
+        .keys()
+        .cloned()
+        .chain(
+            released_vectors
+                .iter()
+                .map(|version| version.index.table.clone()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     compacted_tables.sort();
     Ok(CurrencyCompactionReport {
         pruned_versions: pruned_version_count,
@@ -44598,9 +52316,8 @@ fn compact_currency_versions_inner(
         reclaimed_bytes: released_row_bytes.saturating_add(released_vector_bytes) as u64,
         compacted_tables,
         redb_compacted: false,
-        // A scoped, point-removal pass touches only the pruned keys, so a
-        // survivor is never rewritten -- this reads 0 by construction now
-        // that the wholesale rewrite is gone.
+        // No wholesale survivor rewrite. Selected change-log LSN groups are
+        // still densely rewritten; this compatibility field does not count I/O.
         keys_rewritten: 0,
         vector_keys_rewritten,
         edge_keys_rewritten: 0,
@@ -44891,9 +52608,9 @@ fn max_tx_across_all(
         .max()
         .unwrap_or(TxId(0));
     let vector_max = vector
-        .all_entries()
+        .raw_directory_entries()
         .into_iter()
-        .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
+        .flat_map(|(_, entry)| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
         .max()
         .unwrap_or(TxId(0));
 
@@ -44920,9 +52637,9 @@ fn max_lsn_across_all(
         .max()
         .unwrap_or(Lsn(0));
     let vector_max = vector
-        .all_entries()
+        .raw_directory_entries()
         .into_iter()
-        .map(|entry| entry.lsn)
+        .map(|(_, entry)| entry.lsn)
         .max()
         .unwrap_or(Lsn(0));
 
@@ -44950,7 +52667,7 @@ type RowTombstoneIndex<'a> = HashMap<&'a str, HashMap<RowId, Vec<(Lsn, TxId)>>>;
 /// Per-(source, edge_type, target) tombstone lookup borrowed from the graph store.
 type EdgeTombstoneIndex<'a> = HashMap<(NodeId, &'a str, NodeId), Vec<(Lsn, TxId)>>;
 /// Per-(index, row_id) tombstone lookup borrowed from the materialized vectors.
-type VectorTombstoneIndex<'a> = HashMap<(&'a VectorIndexRef, RowId), Vec<(Lsn, TxId)>>;
+type VectorTombstoneIndex = HashMap<(VectorIndexRef, RowId), Vec<(Lsn, TxId)>>;
 
 /// Reconstructs the `Lsn -> TxId` commit index from the live stores plus the
 /// change log. Runs on EVERY `Database::open`, so it must be near-linear: it
@@ -45018,15 +52735,15 @@ fn commit_index_across_all(
         versions.sort_by_key(|(lsn, _)| *lsn);
     }
 
-    // Vector: `all_entries` already materializes an owned Vec, so borrow it for
-    // the created_tx pass and the (index, row_id) tombstone lookup.
-    let vector_entries = vector.all_entries();
+    // Vector: the lightweight directory carries every transaction and LSN
+    // needed here, so startup bookkeeping never faults a raw body.
+    let vector_entries = vector.raw_directory_entries();
     let mut vector_tombstones: VectorTombstoneIndex = HashMap::new();
-    for entry in &vector_entries {
+    for (vector_index, entry) in vector_entries {
         add_entry(entry.lsn, entry.created_tx);
         if let Some(deleted_tx) = entry.deleted_tx {
             vector_tombstones
-                .entry((&entry.index, entry.row_id))
+                .entry((vector_index, entry.row_id))
                 .or_default()
                 .push((entry.lsn, deleted_tx));
         }
@@ -45070,7 +52787,7 @@ fn commit_index_across_all(
                 lsn,
             } => {
                 if let Some(deleted_tx) = vector_tombstones
-                    .get(&(vector_index, *row_id))
+                    .get(&(vector_index.clone(), *row_id))
                     .and_then(|versions| resolve_tombstone(versions, *lsn))
                 {
                     add_entry(*lsn, deleted_tx);
@@ -45079,115 +52796,6 @@ fn commit_index_across_all(
         }
     }
     index
-}
-
-fn repair_visibility_tx_order_if_needed(
-    relational: &RelationalStore,
-    graph: &GraphStore,
-    vector: &VectorStore,
-    loaded_vectors: &mut [VectorEntry],
-    table_meta: &HashMap<String, TableMeta>,
-    persistence: &RedbPersistence,
-    commit_index: &mut BTreeMap<Lsn, TxId>,
-) -> Result<bool> {
-    let mut previous = TxId(0);
-    let mut needs_repair = false;
-    for tx in commit_index.values() {
-        if *tx < previous {
-            needs_repair = true;
-            break;
-        }
-        previous = *tx;
-    }
-    if !needs_repair {
-        return Ok(false);
-    }
-
-    let mut tx_remap = HashMap::new();
-    for (idx, tx) in commit_index.values().copied().enumerate() {
-        tx_remap.entry(tx).or_insert(TxId(idx as u64 + 1));
-    }
-
-    for tx in commit_index.values_mut() {
-        if let Some(mapped) = tx_remap.get(tx) {
-            *tx = *mapped;
-        }
-    }
-
-    let mut table_rows = {
-        let mut tables = relational.tables.write();
-        for rows in tables.values_mut() {
-            for row in rows.iter_mut() {
-                remap_tx_id(&mut row.created_tx, &tx_remap);
-                if let Some(deleted_tx) = &mut row.deleted_tx {
-                    remap_tx_id(deleted_tx, &tx_remap);
-                }
-            }
-        }
-        tables
-            .iter()
-            .map(|(table, rows)| (table.clone(), rows.clone()))
-            .collect::<Vec<_>>()
-    };
-    relational.rebuild_row_position_maps();
-    for (table, meta) in table_meta {
-        for decl in &meta.indexes {
-            relational.rebuild_index(table, &decl.name);
-        }
-    }
-
-    let graph_edges = {
-        let mut edges = graph
-            .forward_adj
-            .read()
-            .values()
-            .flat_map(|entries| entries.iter().cloned())
-            .collect::<Vec<_>>();
-        for edge in &mut edges {
-            remap_tx_id(&mut edge.created_tx, &tx_remap);
-            if let Some(deleted_tx) = &mut edge.deleted_tx {
-                remap_tx_id(deleted_tx, &tx_remap);
-            }
-        }
-
-        let mut forward = HashMap::new();
-        let mut reverse = HashMap::new();
-        for edge in &edges {
-            forward
-                .entry(edge.source)
-                .or_insert_with(Vec::new)
-                .push(edge.clone());
-            reverse
-                .entry(edge.target)
-                .or_insert_with(Vec::new)
-                .push(edge.clone());
-        }
-        *graph.forward_adj.write() = forward;
-        *graph.reverse_adj.write() = reverse;
-        edges
-    };
-
-    for entry in loaded_vectors.iter_mut() {
-        remap_tx_id(&mut entry.created_tx, &tx_remap);
-        if let Some(deleted_tx) = &mut entry.deleted_tx {
-            remap_tx_id(deleted_tx, &tx_remap);
-        }
-    }
-    vector.replace_loaded_vectors(loaded_vectors.to_vec());
-
-    for (table, rows) in table_rows.drain(..) {
-        persistence.rewrite_table_rows(&table, &rows)?;
-    }
-    persistence.rewrite_graph_edges(&graph_edges)?;
-    persistence.rewrite_vectors(loaded_vectors)?;
-
-    Ok(true)
-}
-
-fn remap_tx_id(tx: &mut TxId, tx_remap: &HashMap<TxId, TxId>) {
-    if let Some(mapped) = tx_remap.get(tx) {
-        *tx = *mapped;
-    }
 }
 
 fn is_fatal_sync_apply_error(err: &Error) -> bool {
@@ -45439,6 +53047,25 @@ fn sql_type_for_ast(data_type: &DataType) -> String {
 /// it, so a table declared through SQL and the same table read back out of the
 /// store print the same access control rather than two shapes that only agree
 /// by accident.
+fn append_scope_label(ty: &mut String, read: Option<&[String]>, write: &[String]) {
+    let labels = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| format!("'{}'", sql_quote(value)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(read) = read {
+        ty.push_str(&format!(
+            " SCOPE_LABEL_READ ({}) WRITE ({})",
+            labels(read),
+            labels(write)
+        ));
+    } else {
+        ty.push_str(&format!(" SCOPE_LABEL ({})", labels(write)));
+    }
+}
+
 fn append_acl_reference(ty: &mut String, ref_table: &str, ref_column: &str) {
     ty.push_str(&format!(" ACL REFERENCES {ref_table}({ref_column})"));
 }
@@ -45449,6 +53076,24 @@ fn sql_type_for_ast_column(
 ) -> String {
     let mut ty = sql_type_for_ast(&col.data_type);
     append_ast_quantization(&mut ty, col.quantization);
+    append_ast_vector_declaration(&mut ty, col);
+    if col.context_id {
+        ty.push_str(" CONTEXT_ID");
+    }
+    if let Some(scope) = col.scope_label.as_deref() {
+        match scope {
+            contextdb_parser::ast::ScopeLabelConstraint::Simple { labels } => {
+                append_scope_label(&mut ty, None, labels)
+            }
+            contextdb_parser::ast::ScopeLabelConstraint::Split { read, write } => {
+                append_scope_label(&mut ty, Some(read), write)
+            }
+        }
+    }
+    if col.expires {
+        ty.push_str(" EXPIRES");
+    }
+
     if let Some(reference) = &col.references {
         ty.push_str(&format!(
             " REFERENCES {}({})",
@@ -45502,10 +53147,21 @@ fn sql_type_for_ast_column(
     ty
 }
 
+pub(crate) fn sql_type_for_display_column(
+    col: &contextdb_core::ColumnDef,
+    rules: &[PropagationRule],
+) -> String {
+    sql_type_for_meta_column(col, rules)
+}
+
 pub(crate) fn sql_type_for_meta_column(
     col: &contextdb_core::ColumnDef,
     rules: &[PropagationRule],
 ) -> String {
+    render_meta_column(col, rules)
+}
+
+fn render_meta_column(col: &contextdb_core::ColumnDef, rules: &[PropagationRule]) -> String {
     let mut ty = match col.column_type {
         ColumnType::Integer => "INTEGER".to_string(),
         ColumnType::Real => "REAL".to_string(),
@@ -45518,6 +53174,21 @@ pub(crate) fn sql_type_for_meta_column(
         ColumnType::TxId => "TXID".to_string(),
     };
     append_core_quantization(&mut ty, col.quantization);
+    append_core_vector_declaration(&mut ty, col);
+    if col.context_id {
+        ty.push_str(" CONTEXT_ID");
+    }
+    if let Some(scope) = &col.scope_label {
+        match scope {
+            ScopeLabelKind::Simple { write_labels } => {
+                append_scope_label(&mut ty, None, write_labels)
+            }
+            ScopeLabelKind::Split {
+                read_labels,
+                write_labels,
+            } => append_scope_label(&mut ty, Some(read_labels), write_labels),
+        }
+    }
 
     let fk_rules = rules
         .iter()
@@ -45617,6 +53288,153 @@ fn append_core_quantization(ty: &mut String, quantization: contextdb_core::Vecto
             " WITH (quantization = '{}')",
             quantization.as_str()
         ));
+    }
+}
+
+fn append_ast_vector_declaration(ty: &mut String, col: &contextdb_parser::ast::ColumnDef) {
+    if !matches!(col.data_type, DataType::Vector(_)) {
+        return;
+    }
+    if !col.partition_key_columns.is_empty() {
+        ty.push_str(&format!(
+            " PARTITION_KEY ({})",
+            col.partition_key_columns.join(", ")
+        ));
+        match col.max_partitions.as_deref() {
+            Some(max_partitions) => {
+                let max_partitions = max_partitions
+                    .parse::<u32>()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|_| max_partitions.to_owned());
+                ty.push_str(&format!(" MAX_PARTITIONS {max_partitions}"));
+            }
+            None => ty.push_str(&format!(" MAX_PARTITIONS {DEFAULT_VECTOR_MAX_PARTITIONS}")),
+        }
+    }
+    match col
+        .search_mode
+        .unwrap_or(contextdb_parser::ast::VectorSearchMode::Auto)
+    {
+        contextdb_parser::ast::VectorSearchMode::Auto => {}
+        contextdb_parser::ast::VectorSearchMode::Exact => ty.push_str(" SEARCH_MODE EXACT"),
+        contextdb_parser::ast::VectorSearchMode::Indexed => ty.push_str(" SEARCH_MODE INDEXED"),
+    }
+    if let Some(auto_index_at) = col.auto_index_at.as_deref() {
+        let auto_index_at = auto_index_at
+            .parse::<u32>()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| auto_index_at.to_owned());
+        ty.push_str(&format!(" AUTO_INDEX_AT {auto_index_at}"));
+    }
+    append_ast_hnsw_declaration(ty, &col.hnsw);
+    append_ast_consolidation_declaration(ty, &col.consolidation);
+}
+
+fn append_ast_hnsw_declaration(ty: &mut String, policy: &contextdb_parser::ast::VectorHnswOptions) {
+    let render =
+        |name: &str, value: &Option<contextdb_parser::ast::VectorPolicyValue>| -> Option<String> {
+            match value.as_ref()? {
+                contextdb_parser::ast::VectorPolicyValue::Default => None,
+                contextdb_parser::ast::VectorPolicyValue::Value(value) => {
+                    let value = value
+                        .parse::<u32>()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|_| value.clone());
+                    Some(format!("{name} = {value}"))
+                }
+            }
+        };
+    let members = [
+        render("M", &policy.m),
+        render("EF_CONSTRUCTION", &policy.ef_construction),
+        render("EF_SEARCH", &policy.ef_search),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if !members.is_empty() {
+        ty.push_str(&format!(" HNSW ({})", members.join(", ")));
+    }
+}
+
+fn append_ast_consolidation_declaration(
+    ty: &mut String,
+    policy: &contextdb_parser::ast::VectorConsolidationOptions,
+) {
+    if policy.disabled {
+        ty.push_str(" CONSOLIDATION NONE");
+        return;
+    }
+    let render =
+        |name: &str, value: &Option<contextdb_parser::ast::VectorPolicyValue>| -> Option<String> {
+            match value.as_ref()? {
+                contextdb_parser::ast::VectorPolicyValue::Default => None,
+                contextdb_parser::ast::VectorPolicyValue::Value(value) => {
+                    Some(format!("{name} = {value}"))
+                }
+            }
+        };
+    let members = [
+        render("CHANGE_PERCENT", &policy.change_percent),
+        render("TOMBSTONE_PERCENT", &policy.tombstone_percent),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if !members.is_empty() {
+        ty.push_str(&format!(" CONSOLIDATION ({})", members.join(", ")));
+    }
+}
+
+fn append_core_vector_declaration(ty: &mut String, col: &contextdb_core::ColumnDef) {
+    if !matches!(col.column_type, ColumnType::Vector(_)) {
+        return;
+    }
+    if let Some(partition_key_columns) = col.partition_key_columns.as_ref()
+        && !partition_key_columns.is_empty()
+    {
+        ty.push_str(&format!(
+            " PARTITION_KEY ({})",
+            partition_key_columns.join(", ")
+        ));
+        ty.push_str(&format!(
+            " MAX_PARTITIONS {}",
+            col.effective_max_partitions()
+                .unwrap_or(DEFAULT_VECTOR_MAX_PARTITIONS)
+        ));
+    }
+    if !matches!(col.search_mode, contextdb_core::VectorSearchMode::Auto) {
+        ty.push_str(&format!(" SEARCH_MODE {}", col.search_mode));
+    }
+    if let Some(auto_index_at) = col.auto_index_at {
+        ty.push_str(&format!(" AUTO_INDEX_AT {auto_index_at}"));
+    }
+    let mut hnsw = Vec::new();
+    if let Some(value) = col.hnsw_m {
+        hnsw.push(format!("M = {value}"));
+    }
+    if let Some(value) = col.hnsw_ef_construction {
+        hnsw.push(format!("EF_CONSTRUCTION = {value}"));
+    }
+    if let Some(value) = col.hnsw_ef_search {
+        hnsw.push(format!("EF_SEARCH = {value}"));
+    }
+    if !hnsw.is_empty() {
+        ty.push_str(&format!(" HNSW ({})", hnsw.join(", ")));
+    }
+    if col.consolidation_disabled {
+        ty.push_str(" CONSOLIDATION NONE");
+        return;
+    }
+    let mut consolidation = Vec::new();
+    if let Some(value) = col.consolidation_change_percent {
+        consolidation.push(format!("CHANGE_PERCENT = {value}"));
+    }
+    if let Some(value) = col.consolidation_tombstone_percent {
+        consolidation.push(format!("TOMBSTONE_PERCENT = {value}"));
+    }
+    if !consolidation.is_empty() {
+        ty.push_str(&format!(" CONSOLIDATION ({})", consolidation.join(", ")));
     }
 }
 
@@ -45900,6 +53718,36 @@ where
 }
 
 fn merge_sync_alter_existing_column(current: &mut ColumnDef, incoming: ColumnDef) {
+    if matches!(
+        (&current.column_type, &incoming.column_type),
+        (ColumnType::Vector(_), ColumnType::Vector(_))
+    ) {
+        // A synced ALTER carries that moment's full column declaration, so an
+        // absent policy member means "no longer declared" and clears the
+        // receiver's override, exactly as `SET ... DEFAULT` does locally.
+        let previous_topology = (current.hnsw_m, current.hnsw_ef_construction);
+        current.partition_key_columns = incoming.partition_key_columns.clone();
+        current.max_partitions = incoming.max_partitions;
+        current.search_mode = incoming.search_mode;
+        current.auto_index_at = incoming.auto_index_at;
+        current.hnsw_m = incoming.hnsw_m;
+        current.hnsw_ef_construction = incoming.hnsw_ef_construction;
+        current.hnsw_ef_search = incoming.hnsw_ef_search;
+        current.consolidation_change_percent = incoming.consolidation_change_percent;
+        current.consolidation_tombstone_percent = incoming.consolidation_tombstone_percent;
+        current.consolidation_disabled = incoming.consolidation_disabled;
+        // The receiver owns its own revision counter: the wire carries
+        // rendered SQL, not a revision, so `incoming.vector_policy_revision`
+        // is always the default and is never copied. Advance on exactly the
+        // axes the local ALTER door advances on, which schedules the
+        // receiver's own bounded replacement build.
+        if previous_topology != (current.hnsw_m, current.hnsw_ef_construction)
+            && let Some(next) =
+                crate::executor::next_vector_policy_revision(current.vector_policy_revision)
+        {
+            current.vector_policy_revision = next;
+        }
+    }
     if incoming.primary_key {
         current.primary_key = true;
         current.nullable = false;
@@ -46315,6 +54163,12 @@ fn rough_sync_table_meta(
         .iter()
         .map(|(name, ty)| rough_sync_column_def(name, ty))
         .collect::<Vec<_>>();
+    let primary_key_columns = ddl_primary_key_columns(constraints);
+    for column in &mut column_defs {
+        if primary_key_columns.contains(&column.name) {
+            column.nullable = false;
+        }
+    }
     for fk in foreign_keys {
         if let Some(column) = column_defs
             .iter_mut()
@@ -46359,7 +54213,7 @@ fn rough_sync_table_meta(
             .iter()
             .find_map(|constraint| constraint_declares_sync_direction(constraint)),
         retain_declared_unit: retention.map(|(_, unit)| unit),
-        primary_key_columns: ddl_primary_key_columns(constraints),
+        primary_key_columns,
         conflict_policy: constraints
             .iter()
             .find_map(|constraint| constraint_declares_conflict_policy(constraint)),
@@ -46369,7 +54223,7 @@ fn rough_sync_table_meta(
         delivery_manifest_tables: None,
         edge_discard: None,
     };
-    // Statements 5/6: decode policy clauses with the same grammar as DECLARE.
+    // Decode policy clauses with the same grammar as DECLARE.
     for constraint in constraints {
         if let Ok(contextdb_parser::Statement::DeclareTenantTablePolicy(p)) =
             contextdb_parser::parse(&format!(
@@ -46426,7 +54280,13 @@ fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
             .rank_policy
             .as_deref()
             .map(crate::executor::map_rank_policy);
-        return crate::executor::core_column_from_ast(&ast_column, rank_policy);
+        if let Ok(column) = crate::executor::core_column_from_ast(
+            "__rough_sync_column_shape",
+            &ast_column,
+            rank_policy,
+        ) {
+            return column;
+        }
     }
     // Defensive fallback only: by the time real apply reaches this
     // function, `ty` has already parsed successfully as part of the FULL
@@ -46452,6 +54312,17 @@ fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
         context_id: false,
         scope_label: None,
         acl_ref: None,
+        partition_key_columns: None,
+        max_partitions: None,
+        search_mode: contextdb_core::VectorSearchMode::Auto,
+        auto_index_at: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_ef_search: None,
+        vector_policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
+        consolidation_change_percent: None,
+        consolidation_tombstone_percent: None,
+        consolidation_disabled: false,
     }
 }
 
@@ -46668,7 +54539,7 @@ fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {
 
 fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
     let mut constraints = Vec::new();
-    // Statements 5/6/18: preserve declared custody policy in schema transport and inspection.
+    // Preserve declared custody policy in schema transport and inspection.
     if let Some(tables) = &meta.delivery_manifest_tables {
         constraints.push(format!(
             "DELIVERY MANIFEST OVER {}",
@@ -46838,7 +54709,7 @@ fn retain_clause_from_meta(meta: &TableMeta, ttl_seconds: u64) -> String {
 
 pub(crate) fn retain_and_propagate_clauses_from_meta(meta: &TableMeta) -> Vec<String> {
     let mut clauses = Vec::new();
-    // Statements 5/6/18: preserve declared custody policy in schema transport and inspection.
+    // Preserve declared custody policy in schema transport and inspection.
     if let Some(tables) = &meta.delivery_manifest_tables {
         clauses.push(format!(
             "DELIVERY MANIFEST OVER {}",
@@ -46958,6 +54829,168 @@ fn has_exact_column_type(meta: &TableMeta, name: &str, column_type: &ColumnType)
 mod retention_prune_persistence_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity() {
+        const CHILD_PATH: &str = "CONTEXTDB_RETENTION_RECLAIM_TEST_PATH";
+        const CHILD_CASE: &str = "CONTEXTDB_RETENTION_RECLAIM_TEST_CASE";
+        let _clock = Wallclock::test_clock_guard(|| 1_000_000);
+        let expired = uuid::Uuid::from_u128(80_001);
+        let survivor = uuid::Uuid::from_u128(80_002);
+        let endpoint = uuid::Uuid::from_u128(80_003);
+        let insert = |db: &Database, id: uuid::Uuid, expires: i64| {
+            db.execute(
+                "INSERT INTO retained VALUES ($id, $expires, '[1,0]')",
+                &HashMap::from([
+                    ("id".into(), Value::Uuid(id)),
+                    ("expires".into(), Value::Timestamp(expires)),
+                ]),
+            )
+            .unwrap();
+        };
+        if let Ok(path) = std::env::var(CHILD_PATH) {
+            let case = std::env::var(CHILD_CASE).unwrap();
+            let db = Database::open(&path).unwrap();
+            db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+            let pin = (case == "deferred").then(|| db.pin_snapshot(db.snapshot()));
+            if pin.is_some() {
+                insert(&db, expired, -1);
+            }
+            assert_eq!(
+                db.persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_vectors()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                db.persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_forward_edges()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            db.__arm_retention_reclaim_crash_for_test(case != "before");
+            db.run_pruning_cycle_checked().unwrap();
+            panic!("the production reclaim checkpoint was not reached");
+        }
+        for case in ["before", "after", "deferred"] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("retention-crash.redb");
+            {
+                let db = Database::open(&path).unwrap();
+                db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+                db.execute("CREATE TABLE retained (id UUID PRIMARY KEY, expires_at TIMESTAMP EXPIRES, embedding VECTOR(2)) RETAIN 1 HOURS", &params()).unwrap();
+                db.execute("CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)", &params()).unwrap();
+                insert(&db, survivor, i64::MAX);
+                if case != "deferred" {
+                    insert(&db, expired, -1);
+                }
+                for (ordinal, source) in [expired, survivor].into_iter().enumerate() {
+                    db.execute(
+                        "INSERT INTO edges VALUES ($id, $source, $target, 'LINKS')",
+                        &HashMap::from([
+                            (
+                                "id".into(),
+                                Value::Uuid(uuid::Uuid::from_u128(90_000 + ordinal as u128)),
+                            ),
+                            ("source".into(), Value::Uuid(source)),
+                            ("target".into(), Value::Uuid(endpoint)),
+                        ]),
+                    )
+                    .unwrap();
+                }
+                db.close().unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "database::retention_prune_persistence_tests::retention_reclaim_crash_preserves_atomic_copies_and_deferred_retry_identity", "--nocapture"])
+                .env(CHILD_PATH, &path).env(CHILD_CASE, case).output().unwrap();
+            assert!(!output.status.success());
+            let marker = format!(
+                "RETENTION_RECLAIM_CRASH={}",
+                if case == "before" { 1 } else { 2 }
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(&marker),
+                "child must reach the actual durable boundary: {:?}",
+                output
+            );
+            {
+                let db = Database::open(&path).unwrap();
+                db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+                let persistence = db.persistence.as_ref().unwrap();
+                assert_eq!(
+                    visible_rows(&db, "retained"),
+                    1,
+                    "expiry stays durable across the crash"
+                );
+                assert_eq!(
+                    persistence.load_vectors().unwrap().len(),
+                    if case == "before" { 2 } else { 1 },
+                    "a row commit must never strand its vector"
+                );
+                assert_eq!(
+                    persistence.load_forward_edges().unwrap().len(),
+                    if case == "after" { 1 } else { 2 }
+                );
+                if case == "deferred" {
+                    let nodes = persistence
+                        .load_config_value::<BTreeSet<NodeId>>(
+                            crate::persistence::RETENTION_DEFERRED_EDGE_NODES,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        nodes,
+                        BTreeSet::from([expired]),
+                        "the reader-deferred edge has a durable retry identity after its row is gone"
+                    );
+                }
+                db.run_pruning_cycle_checked().unwrap();
+                assert_eq!(persistence.load_vectors().unwrap().len(), 1);
+                let edges = persistence.load_forward_edges().unwrap();
+                assert_eq!(edges.len(), 1);
+                assert_eq!(edges[0].source, survivor);
+                assert_eq!(persistence.load_reverse_edges().unwrap().len(), 1);
+                assert!(
+                    persistence
+                        .load_config_value::<BTreeSet<NodeId>>(
+                            crate::persistence::RETENTION_DEFERRED_EDGE_NODES
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                db.close().unwrap();
+            }
+            let reopened = Database::open(&path).unwrap();
+            reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+            assert_eq!(visible_rows(&reopened, "retained"), 1);
+            assert_eq!(
+                reopened
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_vectors()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                reopened
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_forward_edges()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
 
     fn params() -> HashMap<String, Value> {
         HashMap::new()
@@ -47884,8 +55917,8 @@ mod currency_version_compaction_tests {
         // thread-gone state is the assertion; a genuinely hung join hangs the
         // test and is caught by the harness/mutants timeout (the failure
         // ceiling). The old `elapsed < 2s` wall-clock bound asserted only
-        // promptness and flipped verdicts under load — the join cadence is
-        // structurally bounded by sleep_with_shutdown's 50ms poll regardless.
+        // promptness and flipped verdicts under load; the production clock
+        // now wakes directly on shutdown.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("fabric-ledger.db");
         let db = Database::open(&path).expect("open");
@@ -47897,4 +55930,43 @@ mod currency_version_compaction_tests {
             "close must join and clear the maintenance thread"
         );
     }
+
+    #[test]
+    fn dropping_vector_only_database_wakes_and_joins_held_maintenance_worker() {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE embeddings (id INTEGER PRIMARY KEY, embedding VECTOR(2))",
+            &HashMap::new(),
+        )
+        .expect("create vector-only table");
+        assert!(
+            db.__maintenance_thread_running(),
+            "a vector declaration must start engine-owned maintenance"
+        );
+
+        let worker_clock = db
+            .__hold_engine_owned_vector_maintenance_clock_for_test()
+            .expect("hold the engine-owned vector maintenance worker");
+        worker_clock.wait_until_held_asleep();
+        assert!(
+            !worker_clock.worker_exited(),
+            "the worker must still be asleep when automatic drop begins"
+        );
+
+        drop(db);
+
+        assert!(
+            worker_clock.worker_exited(),
+            "automatic drop must wake and join the held maintenance worker"
+        );
+    }
 }
+
+#[cfg(test)]
+mod currency_cleanup_atomicity_tests;
+
+#[cfg(test)]
+mod storage_compaction_overlap_tests;
+
+#[cfg(all(test, feature = "test-seams"))]
+mod maintenance_resource_tests;

@@ -1,6 +1,64 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+type VectorLoadReservationTransfer = Arc<dyn Fn(usize) -> contextdb_core::Result<()> + Send + Sync>;
+
+struct ActiveVectorLoadReservationTransfer {
+    accountant: usize,
+    transfer: VectorLoadReservationTransfer,
+}
+
+thread_local! {
+    static VECTOR_LOAD_RESERVATION_TRANSFERS: RefCell<Vec<ActiveVectorLoadReservationTransfer>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Give one synchronous vector-load call a way to move its request charge to
+/// the resident graph owner. The accountant identity prevents a nested load
+/// for another database from adopting the wrong request's bytes.
+pub(crate) fn with_vector_load_reservation_transfer<T>(
+    accountant: &Arc<MemoryAccountant>,
+    transfer: VectorLoadReservationTransfer,
+    operation: impl FnOnce() -> T,
+) -> T {
+    VECTOR_LOAD_RESERVATION_TRANSFERS.with(|transfers| {
+        transfers
+            .borrow_mut()
+            .push(ActiveVectorLoadReservationTransfer {
+                accountant: Arc::as_ptr(accountant) as usize,
+                transfer,
+            });
+    });
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VECTOR_LOAD_RESERVATION_TRANSFERS.with(|transfers| {
+                transfers.borrow_mut().pop();
+            });
+        }
+    }
+    let _restore = Restore;
+    operation()
+}
+
+fn adopt_vector_load_reservation(
+    accountant: &MemoryAccountant,
+    bytes: usize,
+) -> contextdb_core::Result<bool> {
+    VECTOR_LOAD_RESERVATION_TRANSFERS.with(|transfers| {
+        let transfers = transfers.borrow();
+        let Some(active) = transfers.last() else {
+            return Ok(false);
+        };
+        if active.accountant != accountant as *const MemoryAccountant as usize {
+            return Ok(false);
+        }
+        (active.transfer)(bytes)?;
+        Ok(true)
+    })
+}
 
 /// Test-build only: a one-shot callback slot fired inside `try_allocate` at
 /// the TOCTOU window between reading `limit` and re-checking it. It lets a unit
@@ -28,6 +86,10 @@ pub struct MemoryAccountant {
     used: AtomicUsize,
     startup_ceiling: AtomicUsize,
     has_ceiling: AtomicBool,
+    #[cfg(any(test, feature = "test-seams"))]
+    underflow_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-seams"))]
+    tail_admission_failure: AtomicUsize,
     #[cfg(test)]
     alloc_race_hook: AllocRaceHook,
 }
@@ -135,6 +197,23 @@ impl OwnedMemoryReservation {
         self.bytes = remaining;
         Ok(())
     }
+
+    /// Transfer an existing charge to a store owner. The shared accountant
+    /// total is deliberately unchanged; only this request stops owning it.
+    pub(crate) fn try_transfer_to_store(&mut self, bytes: usize) -> contextdb_core::Result<()> {
+        self.bytes = self.bytes.checked_sub(bytes).ok_or_else(|| {
+            contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem: "bounded_read".to_string(),
+                operation: "transfer_vector_load_reservation".to_string(),
+                requested_bytes: bytes,
+                available_bytes: self.bytes,
+                budget_limit_bytes: self.bytes,
+                hint: "The vector load cannot transfer more memory than its request reserved."
+                    .to_string(),
+            }
+        })?;
+        Ok(())
+    }
 }
 
 impl OwnedMemoryReservation {
@@ -174,6 +253,10 @@ impl MemoryAccountant {
             used: AtomicUsize::new(0),
             startup_ceiling: AtomicUsize::new(0),
             has_ceiling: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-seams"))]
+            underflow_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-seams"))]
+            tail_admission_failure: AtomicUsize::new(0),
             #[cfg(test)]
             alloc_race_hook: AllocRaceHook::default(),
         }
@@ -186,6 +269,10 @@ impl MemoryAccountant {
             used: AtomicUsize::new(0),
             startup_ceiling: AtomicUsize::new(bytes),
             has_ceiling: AtomicBool::new(true),
+            #[cfg(any(test, feature = "test-seams"))]
+            underflow_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-seams"))]
+            tail_admission_failure: AtomicUsize::new(0),
             #[cfg(test)]
             alloc_race_hook: AllocRaceHook::default(),
         }
@@ -200,6 +287,10 @@ impl MemoryAccountant {
             used: AtomicUsize::new(0),
             startup_ceiling: AtomicUsize::new(0),
             has_ceiling: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-seams"))]
+            underflow_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-seams"))]
+            tail_admission_failure: AtomicUsize::new(0),
             #[cfg(test)]
             alloc_race_hook: AllocRaceHook::default(),
         }
@@ -265,11 +356,17 @@ impl MemoryAccountant {
             return;
         }
 
-        let _ = self
+        let released = self
             .used
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 Some(used.saturating_sub(bytes))
             });
+        #[cfg(any(test, feature = "test-seams"))]
+        if bytes > released.expect("release update always supplies a value") {
+            self.underflow_count.fetch_add(1, Ordering::SeqCst);
+        }
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let _ = released;
     }
 
     /// Runtime budget adjustment. None removes limit.
@@ -323,6 +420,22 @@ impl MemoryAccountant {
         }
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn underflow_count_for_test(&self) -> usize {
+        self.underflow_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn arm_tail_admission_failure_for_test(&self) {
+        self.tail_admission_failure.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn tail_admission_failure_consumed_for_test(&self) -> bool {
+        self.tail_admission_failure.load(Ordering::SeqCst) == 2
+    }
+
     pub fn try_allocate_for(
         &self,
         bytes: usize,
@@ -330,6 +443,22 @@ impl MemoryAccountant {
         operation: &str,
         hint: &str,
     ) -> contextdb_core::Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        if operation == "prepare_hnsw_tail"
+            && self
+                .tail_admission_failure
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem: subsystem.to_owned(),
+                operation: operation.to_owned(),
+                requested_bytes: bytes,
+                available_bytes: 0,
+                budget_limit_bytes: self.used.load(Ordering::SeqCst),
+                hint: "Injected fresh-tail admission exhaustion.".to_owned(),
+            });
+        }
         self.try_allocate(bytes).map_err(|err| match err {
             contextdb_core::Error::MemoryBudgetExceeded {
                 requested_bytes,
@@ -360,6 +489,29 @@ impl contextdb_vector::MemoryBudget for MemoryAccountant {
         MemoryAccountant::try_allocate_for(self, bytes, subsystem, operation, hint)
     }
 
+    fn release(&self, bytes: usize) {
+        MemoryAccountant::release(self, bytes);
+    }
+
+    fn available_bytes(&self) -> Option<usize> {
+        self.usage().available
+    }
+
+    fn adopt_caller_reservation(&self, bytes: usize) -> contextdb_core::Result<bool> {
+        adopt_vector_load_reservation(self, bytes)
+    }
+}
+
+impl contextdb_core::read_memory::ReadMemoryBudget for MemoryAccountant {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> contextdb_core::Result<()> {
+        self.try_allocate_for(bytes, subsystem, operation, hint)
+    }
     fn release(&self, bytes: usize) {
         MemoryAccountant::release(self, bytes);
     }

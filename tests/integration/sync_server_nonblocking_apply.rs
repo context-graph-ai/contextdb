@@ -395,7 +395,7 @@ impl CapturingSignedPushTransport {
                     ),
                     error: None,
                     application_error: None,
-                    // Statement 13: ordinary response lane compile prerequisite.
+                    // Ordinary response lane compile prerequisite.
                     ..Default::default()
                 },
             )
@@ -600,6 +600,7 @@ async fn try_raw_pull(
     let request = PullRequest {
         since_lsn,
         max_entries: None,
+        schema_recovery: None,
     };
     let encoded = encode(MessageType::PullRequest, &request)
         .map_err(|err| format!("encode pull request: {err}"))?;

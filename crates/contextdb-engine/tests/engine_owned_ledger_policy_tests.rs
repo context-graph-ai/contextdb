@@ -1389,7 +1389,7 @@ fn drop_then_recreate_work_capabilities_with_canonical_columns_silent_policy_sti
 // `work_claims` / `work_results` / `work_failures` / `work_cancellations`
 // (`refuse_hub_refereed_ledger_sync_conflict_declaration` -- the door that
 // DOES cover these five -- is wired only into the local ALTER arm and the
-// three wire-DDL preflights named in the follow-up design brief; the local
+// three wire-DDL preflights; the local
 // CREATE arm calls only `refuse_engine_owned_policy_axes`). `db.table_meta`
 // then carries the lying `KEEP_LATEST`, while `SHOW SYNC_CONFLICT_POLICY`
 // (from that earlier fix) still renders the true `keep_first (engine-owned)`
@@ -1817,8 +1817,7 @@ fn schema_and_show_never_disagree_after_a_refused_alter_or_wire_attempt_on_a_hub
 // operator types" -- a TABLE-WIDE claim. But for these five tables, SYNC
 // CONFLICT is the ONLY axis any door actually judges: no door named in this
 // suite gates `ALTER TABLE work_jobs SET RETAIN ...` or `... SET SYNC OFF`
-// at all (that wider gap is filed separately, NOT this lane's scope -- see
-// the follow-up design brief). The refusal text must speak only for the axis it
+// at all (a separate, wider gap). The refusal text must speak only for the axis it
 // actually enforces.
 // ---------------------------------------------------------------------
 

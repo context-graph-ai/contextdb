@@ -745,3 +745,482 @@ async fn production_sync_refuses_identityless_transport() {
         .expect("direct server task stops within the test bound");
     hub.stop().await;
 }
+
+/// Drops one row-bearing reply at the client boundary after the real Iroh
+/// exchange, or drops that request before delivery. Status still uses the real
+/// authenticated transport and the current envelope in both cases.
+struct LoseOnePushReply {
+    inner: Arc<dyn ClientTransport>,
+    subject: String,
+    armed: AtomicBool,
+    withhold_push_replies: AtomicBool,
+    before_delivery: bool,
+    versions: std::sync::Mutex<Vec<u8>>,
+    dropped_reply: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl LoseOnePushReply {
+    async fn exchange(
+        &self,
+        subject: &str,
+        bytes: Vec<u8>,
+        timeout: Duration,
+        single: bool,
+    ) -> TransportResult<Vec<u8>> {
+        let envelope = decode(&bytes).map_err(|error| TransportError::Other(error.to_string()))?;
+        self.versions
+            .lock()
+            .expect("observed versions")
+            .push(envelope.version);
+        let has_rows = subject == self.subject
+            && matches!(
+                envelope.message_type,
+                MessageType::PushRequest | MessageType::DependencyCompletePushRequest
+            )
+            && !rmp_serde::from_slice::<PushRequest>(&envelope.payload)
+                .map_err(|error| TransportError::Other(error.to_string()))?
+                .changeset
+                .rows
+                .is_empty();
+        let lose = has_rows && self.armed.swap(false, Ordering::SeqCst);
+        if lose && self.before_delivery {
+            return Err(TransportError::IncompleteReply(
+                "request interrupted before delivery".to_string(),
+            ));
+        }
+        let reply = if single {
+            self.inner
+                .request_single_reply(subject, bytes, timeout)
+                .await?
+        } else {
+            self.inner.request(subject, bytes, timeout).await?
+        };
+        if lose || (has_rows && self.withhold_push_replies.load(Ordering::SeqCst)) {
+            self.dropped_reply
+                .lock()
+                .expect("dropped reply witness")
+                .get_or_insert(reply);
+            return Err(TransportError::IncompleteReply(
+                "reply interrupted after hub commit".to_string(),
+            ));
+        }
+        Ok(reply)
+    }
+}
+
+impl ClientTransport for LoseOnePushReply {
+    fn peer_node_id(&self) -> Option<String> {
+        self.inner.peer_node_id()
+    }
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
+    }
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
+    }
+    fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
+        self.inner.ensure_connected()
+    }
+    fn is_connected<'a>(&'a self) -> TransportStatusFuture<'a> {
+        self.inner.is_connected()
+    }
+    fn request<'a>(
+        &'a self,
+        subject: &'a str,
+        bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> TransportFuture<'a, Vec<u8>> {
+        Box::pin(self.exchange(subject, bytes, timeout, false))
+    }
+    fn request_single_reply<'a>(
+        &'a self,
+        subject: &'a str,
+        bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> TransportFuture<'a, Vec<u8>> {
+        Box::pin(self.exchange(subject, bytes, timeout, true))
+    }
+    fn ensure_single_reply_retry_safe(&self, bytes: &[u8]) -> TransportResult<()> {
+        self.inner.ensure_single_reply_retry_safe(bytes)
+    }
+    fn shutdown<'a>(&'a self) -> TransportFuture<'a, ()> {
+        self.inner.shutdown()
+    }
+}
+
+async fn edge_with_reply_loss(
+    root: &Path,
+    hub: &Hub,
+    tenant: &str,
+    before_delivery: bool,
+) -> (Arc<Database>, SyncClient, Arc<LoseOnePushReply>) {
+    let identity_path = root.join("faulted-edge.db.fabric-identity.key");
+    let identity =
+        Arc::new(FabricIdentity::load_or_generate(&identity_path).expect("edge identity"));
+    let db = Arc::new(Database::open(root.join("faulted-edge.db")).expect("edge database"));
+    table(&db);
+    let transport = Arc::new(LoseOnePushReply {
+        inner: client_transport(&peer_dial_spec(&hub.ticket, &identity_path)),
+        subject: push_subject(tenant),
+        armed: AtomicBool::new(false),
+        withhold_push_replies: AtomicBool::new(false),
+        before_delivery,
+        versions: std::sync::Mutex::new(Vec::new()),
+        dropped_reply: std::sync::Mutex::new(None),
+    });
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        db.clone(),
+        transport.clone(),
+        TenantId::from(tenant),
+        identity,
+    );
+    within(client.push())
+        .await
+        .expect("ordinary declaration bootstrap");
+    (db, client, transport)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_iroh_lost_accepted_reply_reconciles_without_resending_the_row() {
+    let _permit = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let root = tempfile::tempdir().expect("temporary directory");
+    let tenant = "accepted-reply-reconciliation";
+    let hub = hub(root.path(), tenant).await;
+    let (db, client, transport) = edge_with_reply_loss(root.path(), &hub, tenant, false).await;
+    let id = Uuid::from_u128(0xACCE_0001);
+    insert(&db, id, "accepted");
+    let frontier = db.current_lsn();
+    transport.armed.store(true, Ordering::SeqCst);
+    within(client.push())
+        .await
+        .expect("accepted echo reconciles the lost reply");
+    assert_eq!(client.push_watermark(), frontier);
+    assert_eq!(body(&hub.db, id).as_deref(), Some("accepted"));
+    let received = received_sync_receipts(&hub);
+    within(client.push())
+        .await
+        .expect("already reconciled work is a no-op");
+    assert_eq!(
+        received_sync_receipts(&hub),
+        received,
+        "reconciliation never resends the accepted row"
+    );
+    assert!(
+        transport
+            .versions
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|version| *version == 7)
+    );
+    client.shutdown().await;
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_iroh_lost_refusal_is_not_clean_success_on_any_status_probe() {
+    let _permit = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let root = tempfile::tempdir().expect("temporary directory");
+    let tenant = "refused-reply-reconciliation";
+    let hub = hub(root.path(), tenant).await;
+    let (db, client, transport) = edge_with_reply_loss(root.path(), &hub, tenant, false).await;
+    let id = Uuid::from_u128(0xDEAD_0001);
+    insert(&hub.db, id, "hub winner");
+    insert(&db, id, "refused source");
+    let frontier = db.current_lsn();
+    let before = client.push_watermark();
+    let safe_before = db.sync_watermark();
+    // The ordinary cache can recover the first lost reply. Keep withholding
+    // that exact diagnostic while proving that status alone cannot retire it.
+    transport
+        .withhold_push_replies
+        .store(true, Ordering::SeqCst);
+    transport.armed.store(true, Ordering::SeqCst);
+    for attempt in 0..2 {
+        let outcome = within(client.push()).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(contextdb_core::Error::SyncPushUnconfirmed { .. })
+            ),
+            "a consumed refusal without its diagnostic must stay unconfirmed on attempt {attempt}: {outcome:?}"
+        );
+        assert_eq!(client.push_watermark(), before);
+        assert_eq!(db.sync_watermark(), safe_before);
+    }
+    assert_eq!(body(&hub.db, id).as_deref(), Some("hub winner"));
+    let lost = transport
+        .dropped_reply
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("actual hub response was lost");
+    let envelope = decode(&lost).expect("current response envelope");
+    let response: contextdb_server::protocol::PushResponse =
+        rmp_serde::from_slice(&envelope.payload).unwrap();
+    let result = response.result.expect("ordinary refusal result");
+    assert_eq!(result.conflicts.len(), 1);
+    let diagnostic = &result.conflicts[0];
+    assert_eq!(diagnostic.table.as_deref(), Some("notes"));
+    assert_eq!(diagnostic.reason.as_deref(), Some("keep_first_refused"));
+    assert_eq!(
+        diagnostic.winning_author_node_id.as_deref(),
+        Some(hub.node_id.as_str())
+    );
+    assert!(diagnostic.hub_acceptance_position.is_some());
+    // A fresh client reads the same durable no-send gate; status still cannot
+    // manufacture the diagnostic that this witness intentionally withheld.
+    let identity = Arc::new(
+        FabricIdentity::load_or_generate(&root.path().join("faulted-edge.db.fabric-identity.key"))
+            .unwrap(),
+    );
+    let reopened_client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        db.clone(),
+        transport.clone(),
+        TenantId::from(tenant),
+        identity,
+    );
+    assert!(matches!(
+        within(reopened_client.push()).await,
+        Err(contextdb_core::Error::SyncPushUnconfirmed { .. })
+    ));
+    assert_eq!(reopened_client.push_watermark(), before);
+    assert_eq!(db.sync_watermark(), safe_before);
+    transport
+        .withhold_push_replies
+        .store(false, Ordering::SeqCst);
+    let recovered = within(reopened_client.push())
+        .await
+        .expect("the available exact refusal completes recovery");
+    assert_eq!(
+        contextdb_server::protocol::WireApplyResult::from(recovered),
+        result,
+        "recovery returns the original complete refusal, never a clean success"
+    );
+    assert_eq!(reopened_client.push_watermark(), frontier);
+    assert_eq!(
+        db.sync_watermark(),
+        safe_before.max(contextdb_core::Lsn(frontier.0 + 1))
+    );
+    let received = received_sync_receipts(&hub);
+    let completed = within(reopened_client.push())
+        .await
+        .expect("retired refusal is a no-op");
+    assert_eq!(completed.applied_rows, 0);
+    assert!(completed.conflicts.is_empty());
+    assert_eq!(received_sync_receipts(&hub), received);
+    reopened_client.shutdown().await;
+    client.shutdown().await;
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_iroh_push_only_lost_refusal_stays_unconfirmed_without_resending() {
+    let _permit = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let root = tempfile::tempdir().expect("temporary directory");
+    let tenant = "push-only-refused-reply";
+    let hub = hub(root.path(), tenant).await;
+    let (db, client, transport) = edge_with_reply_loss(root.path(), &hub, tenant, false).await;
+    db.execute("ALTER TABLE notes SET SYNC PUSH ONLY", &HashMap::new())
+        .expect("declare push-only direction");
+    within(client.push())
+        .await
+        .expect("confirm the declaration");
+    let id = Uuid::from_u128(0xDEAD_0002);
+    insert(&hub.db, id, "hub winner");
+    insert(&db, id, "refused source");
+    let frontier = db.current_lsn();
+    let before = client.push_watermark();
+    let safe_before = db.sync_watermark();
+    let mut received_after_original = None;
+    transport
+        .withhold_push_replies
+        .store(true, Ordering::SeqCst);
+    transport.armed.store(true, Ordering::SeqCst);
+    for attempt in 0..2 {
+        let outcome = within(client.push()).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(contextdb_core::Error::SyncPushUnconfirmed { .. })
+            ),
+            "a consumed push-only refusal stays unconfirmed on attempt {attempt}: {outcome:?}"
+        );
+        assert_eq!(client.push_watermark(), before);
+        assert_eq!(db.sync_watermark(), safe_before);
+        assert_eq!(
+            body(&db, id).as_deref(),
+            Some("refused source"),
+            "acceptance inspection never imports a push-only row"
+        );
+        let received = received_sync_receipts(&hub);
+        if let Some(previous) = &received_after_original {
+            assert_eq!(&received, previous, "status recovery never resends the row");
+        } else {
+            received_after_original = Some(received);
+        }
+    }
+    assert_eq!(body(&hub.db, id).as_deref(), Some("hub winner"));
+    transport
+        .withhold_push_replies
+        .store(false, Ordering::SeqCst);
+    let recovered = within(client.push())
+        .await
+        .expect("exact push-only refusal is recovered");
+    let lost = transport.dropped_reply.lock().unwrap().clone().unwrap();
+    let original: PushResponse = rmp_serde::from_slice(&decode(&lost).unwrap().payload).unwrap();
+    assert_eq!(
+        contextdb_server::protocol::WireApplyResult::from(recovered),
+        original.result.unwrap()
+    );
+    assert_eq!(client.push_watermark(), frontier);
+    assert_eq!(
+        db.sync_watermark(),
+        safe_before.max(contextdb_core::Lsn(frontier.0 + 1))
+    );
+    assert_eq!(body(&db, id).as_deref(), Some("refused source"));
+    assert_eq!(
+        received_sync_receipts(&hub),
+        received_after_original.unwrap()
+    );
+    let received = received_sync_receipts(&hub);
+    let completed = within(client.push())
+        .await
+        .expect("retired push-only refusal is a no-op");
+    assert_eq!(completed.applied_rows, 0);
+    assert!(completed.conflicts.is_empty());
+    assert_eq!(received_sync_receipts(&hub), received);
+    client.shutdown().await;
+    hub.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_iroh_undelivered_push_stays_pending_then_gets_a_truthful_reply() {
+    let _permit = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let root = tempfile::tempdir().expect("temporary directory");
+    let tenant = "undelivered-push-reconciliation";
+    let hub = hub(root.path(), tenant).await;
+    let (db, client, transport) = edge_with_reply_loss(root.path(), &hub, tenant, true).await;
+    let id = Uuid::from_u128(0xAB5E_0001);
+    insert(&db, id, "pending");
+    let before = client.push_watermark();
+    transport.armed.store(true, Ordering::SeqCst);
+    let outcome = within(client.push()).await;
+    assert!(matches!(
+        outcome,
+        Err(contextdb_core::Error::SyncPushUnconfirmed { .. })
+    ));
+    assert_eq!(client.push_watermark(), before);
+    assert_eq!(body(&hub.db, id), None);
+    let accepted = within(client.push())
+        .await
+        .expect("ordinary retry is accepted");
+    assert!(accepted.conflicts.is_empty());
+    assert_eq!(accepted.applied_rows, 1);
+    assert_eq!(body(&hub.db, id).as_deref(), Some("pending"));
+    client.shutdown().await;
+    hub.stop().await;
+}
+
+#[cfg(feature = "test-seams")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_iroh_holds_only_the_missing_schema_capability_then_catches_up() {
+    let _permit = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let root = tempfile::tempdir().expect("temporary directory");
+    let tenant = "current-schema-capability";
+    let hub = hub(root.path(), tenant).await;
+    let (source, client, transport) = edge_with_reply_loss(root.path(), &hub, tenant, false).await;
+    source.execute("CREATE TABLE embeddings (id INTEGER PRIMARY KEY, scope INTEGER NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope))", &HashMap::new()).unwrap();
+    source
+        .execute(
+            "INSERT INTO embeddings VALUES (1, 7, '[1,0,0]')",
+            &HashMap::new(),
+        )
+        .unwrap();
+    insert(&source, Uuid::from_u128(0xCAFE_0001), "ordinary");
+    client.set_peer_vector_schema_support_for_test(false);
+    within(client.push())
+        .await
+        .expect("unaffected table keeps flowing");
+    assert!(hub.db.table_meta("embeddings").is_none());
+    let held = client.schema_sync_holdbacks();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].table, "embeddings");
+    assert_eq!(held[0].node_to_upgrade, hub.node_id);
+    assert_eq!(
+        held[0].capability,
+        contextdb_engine::sync_types::SchemaSyncCapability::VectorPartitioning
+    );
+    assert_eq!(
+        body(&hub.db, Uuid::from_u128(0xCAFE_0001)).as_deref(),
+        Some("ordinary")
+    );
+    let ordinary_received = received_sync_receipts(&hub)
+        .into_iter()
+        .map(|receipt| receipt.counters.items)
+        .sum::<u64>();
+    within(client.push())
+        .await
+        .expect("held table does not repeat ordinary work");
+    assert_eq!(
+        received_sync_receipts(&hub)
+            .into_iter()
+            .map(|receipt| receipt.counters.items)
+            .sum::<u64>(),
+        ordinary_received
+    );
+    client.set_peer_vector_schema_support_for_test(true);
+    within(client.push())
+        .await
+        .expect("capability gain recovers the held table");
+    assert!(client.schema_sync_holdbacks().is_empty());
+    assert_eq!(
+        hub.db
+            .execute("SELECT id FROM embeddings", &HashMap::new())
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    // Exercise the pull sender's seam with another authenticated receiver.
+    let (receiver, receiver_client) = edge(root.path(), "receiver", &hub.ticket, tenant);
+    within(receiver_client.ensure_connected())
+        .await
+        .expect("connect receiving edge");
+    let receiver_node =
+        FabricIdentity::load_or_generate(&root.path().join("receiver.db.fabric-identity.key"))
+            .unwrap()
+            .node_id();
+    hub.server
+        .set_peer_vector_schema_support_for_test(&receiver_node, false);
+    within(receiver_client.pull_default())
+        .await
+        .expect("ordinary pull while vectors are held");
+    assert!(receiver.table_meta("embeddings").is_none());
+    assert_eq!(hub.server.schema_sync_holdbacks().len(), 1);
+    hub.server
+        .set_peer_vector_schema_support_for_test(&receiver_node, true);
+    within(receiver_client.pull_default())
+        .await
+        .expect("automatic pull recovery");
+    assert!(hub.server.schema_sync_holdbacks().is_empty());
+    assert_eq!(
+        receiver
+            .execute("SELECT id FROM embeddings", &HashMap::new())
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    assert!(
+        transport
+            .versions
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|version| *version == 7)
+    );
+    receiver_client.shutdown().await;
+    client.shutdown().await;
+    hub.stop().await;
+}

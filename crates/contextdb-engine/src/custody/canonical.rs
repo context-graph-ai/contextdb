@@ -268,6 +268,7 @@ pub(crate) fn diagnostic_resolution(policy: crate::sync_types::ConflictPolicy) -
         crate::sync_types::ConflictPolicy::LatestWins => 3,
     }
 }
+#[cfg(feature = "test-seams")]
 pub(crate) fn decode_diagnostic_resolution(tag: u8) -> Result<crate::sync_types::ConflictPolicy> {
     match tag {
         0 => Ok(crate::sync_types::ConflictPolicy::InsertIfNotExists),

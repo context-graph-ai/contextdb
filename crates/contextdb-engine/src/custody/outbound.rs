@@ -1,4 +1,4 @@
-//! Statements 9/10/14: explicit manifested units beside unchanged ordinary FK units.
+//! Explicit manifested units beside unchanged ordinary FK units.
 use super::{canonical::*, preparation::current_manifest, records::*};
 use crate::{Database, database::OutboundSyncUnit, sync_types::ChangeSet};
 use contextdb_core::{Lsn, Result};

@@ -696,7 +696,7 @@ fn c1d_declared_directions_travel_through_the_real_changeset_on_create() {
 /// A direction CHANGED after the table existed travels too — the `ALTER` a
 /// operator runs when they move an installation, carried on the emitted
 /// `AlterTable` rather than only in local metadata.
-// Statement 6: authenticated arrival provenance distinguishes an adopted source
+// Authenticated arrival provenance distinguishes an adopted source
 // declaration from one authored locally. Both changes use the ordinary push API.
 async fn receive_changed_policy(source: Arc<Database>, alter: &str) -> String {
     let receiver = Arc::new(Database::open_memory());

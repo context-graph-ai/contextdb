@@ -24,6 +24,12 @@
 //! message envelope itself changes incompatibly after a release ships it;
 //! adding a document tag is not such a change.
 
+// This private production module is a public façade only for `test-seams`
+// integration proofs. Its reexports and the child APIs those proofs exercise
+// intentionally have no default-build consumer; production uses the private
+// operational subset instead.
+#![cfg_attr(not(feature = "test-seams"), allow(unused_imports, dead_code))]
+
 mod address;
 mod authentication;
 mod carrier;
@@ -54,7 +60,8 @@ pub use engine_answer::{
     ALL_TAGS, BodyField, ReadChannelError, TAG_ACL_DENIED, TAG_BFS_DEPTH_EXCEEDED,
     TAG_BFS_VISITED_EXCEEDED, TAG_COLUMN_NOT_FOUND, TAG_COLUMN_TYPE_MISMATCH,
     TAG_CONTEXT_SCOPE_VIOLATION, TAG_DATABASE_LOCKED, TAG_DISK_BUDGET_EXCEEDED,
-    TAG_FULL_TEXT_SEARCH_NOT_SUPPORTED, TAG_INDEX_NOT_FOUND, TAG_LEGACY_VECTOR_STORE_DETECTED,
+    TAG_FULL_TEXT_SEARCH_NOT_SUPPORTED, TAG_INDEX_NOT_FOUND,
+    TAG_INVALID_VECTOR_PARTITION_DECLARATION, TAG_LEGACY_VECTOR_STORE_DETECTED,
     TAG_MEMORY_BUDGET_EXCEEDED, TAG_NOT_FOUND, TAG_ORDER_BY_EXPRESSION_NOT_SUPPORTED, TAG_OTHER,
     TAG_OWNER_READ_DRAIN_TIMEOUT, TAG_PARSE_ERROR, TAG_PERSISTED_ROW_VECTOR_CELL_NULL,
     TAG_PERSISTED_ROW_VECTOR_ROW_MISSING, TAG_PLAN_ERROR, TAG_PRINCIPAL_REQUIRED,
@@ -67,7 +74,10 @@ pub use engine_answer::{
     TAG_STORED_PROC_NOT_SUPPORTED, TAG_SUBQUERY_NOT_SUPPORTED, TAG_TABLE_NOT_FOUND,
     TAG_UNBOUNDED_TRAVERSAL, TAG_UNBOUNDED_VECTOR_SEARCH, TAG_UNKNOWN, TAG_UNKNOWN_VECTOR_INDEX,
     TAG_USE_RANK_REQUIRES_LIMIT, TAG_USE_RANK_REQUIRES_VECTOR_ORDER,
-    TAG_VECTOR_INDEX_DIMENSION_MISMATCH, TAG_WINDOW_FUNCTION_NOT_SUPPORTED, body_grammar,
+    TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER, TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
+    TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE, TAG_VECTOR_INDEX_DIMENSION_MISMATCH,
+    TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE, TAG_VECTOR_PARTITION_LIMIT_EXCEEDED,
+    TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, TAG_WINDOW_FUNCTION_NOT_SUPPORTED, body_grammar,
 };
 pub use framing::{
     AssembledOrdinaryResult, CursorCloseAcknowledgement, CursorOpenedResponse, CursorPageResponse,
@@ -120,16 +130,18 @@ use contextdb_core::read_contract::{
 pub const LOCAL_PROTOCOL_MARKER: [u8; 20] = *b"contextdb-local-read";
 /// The shape of every frame named in this module, taken together.
 ///
-/// This value NAMES a shape, so it moves whenever the shape moves. Version 2
-/// is the handshake carrying the visibility a reader declares for its session;
-/// version 1 was the same vocabulary without it. Two builds whose handshakes
+/// This value NAMES a shape, so it moves whenever the shape moves. Version 3
+/// adds the declared vector partition key, effective cap, and search mode to
+/// each schema-column body. Version 2 is the handshake carrying the visibility
+/// a reader declares for its session; version 1 was the same vocabulary without
+/// it. Two builds whose handshakes
 /// encode differently must never share a version name: the fence is an exact
 /// equality check, so a peer from the other build is answered the typed
 /// protocol-mismatch refusal it can read, instead of dying inside a decoder on
 /// bytes that are not the shape it expected.
 ///
 /// The golden byte fixtures are what make such a change impossible to miss.
-pub const LOCAL_PROTOCOL_VERSION: u16 = 2;
+pub const LOCAL_PROTOCOL_VERSION: u16 = 3;
 /// A complete local payload may be no larger than four mebibytes.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 

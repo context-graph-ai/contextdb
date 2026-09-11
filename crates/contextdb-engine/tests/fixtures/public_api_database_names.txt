@@ -28,6 +28,7 @@ execute
 execute_at_snapshot
 execute_in_tx
 explain
+explain_output
 export_snapshot
 force_reset
 get_edge_properties
@@ -43,6 +44,7 @@ is_memory_backed
 list_triggers
 live_vector_entry
 maintenance_policy
+maintenance_poll_interval
 maintenance_status
 memory_limit
 next_tx
@@ -98,6 +100,7 @@ semantic_search
 set_disk_limit
 set_memory_limit
 set_maintenance_policy
+set_maintenance_poll_interval
 set_pruning_interval
 set_trigger_audit_retention
 sink_metrics

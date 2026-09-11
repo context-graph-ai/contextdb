@@ -1418,6 +1418,46 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         Ok(())
     }
 
+    fn vector_search_disclosure(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
+        self.string()?;
+        self.string()?;
+        if self.option()? {
+            self.u64()?;
+        }
+        self.u64()?;
+        self.string()?;
+        self.strings()?;
+        self.string()?;
+        if self.option()? {
+            self.string()?;
+        }
+        self.string()?;
+        self.string()?;
+        self.string()?;
+        self.string()?;
+        for _ in 0..3 {
+            if self.option()? {
+                self.string()?;
+            }
+        }
+        self.string()?;
+
+        let partitions = self.length()?;
+        if partitions > self.remaining() {
+            return Self::malformed();
+        }
+        self.charge::<crate::read_contract::CanonicalVectorPartitionHnswDisclosure>(partitions)?;
+        for _ in 0..partitions {
+            self.string()?;
+            self.u64()?;
+            self.u64()?;
+            self.u64()?;
+            self.string()?;
+            self.u64()?;
+        }
+        Ok(())
+    }
+
     fn query_trace(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         self.string()?;
         if self.option()? {
@@ -1439,6 +1479,9 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         if self.option()? {
             self.string()?;
             self.string()?;
+        }
+        if self.option()? {
+            self.vector_search_disclosure()?;
         }
         self.u64()?;
         Ok(())

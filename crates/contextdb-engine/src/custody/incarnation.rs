@@ -1,4 +1,4 @@
-//! Statements 14/15: signed image-prefix evidence, independent of outcome history length.
+//! Signed image-prefix evidence, independent of outcome history length.
 use super::{canonical::*, checkpoint, records::*};
 use crate::Database;
 use contextdb_core::{Incarnation, Result, TenantId};

@@ -326,9 +326,9 @@ fn a_graph_edge_cursor_emits_every_visible_edge_when_retention_compacts_entries_
     );
     assert_eq!(
         visible_edge_targets(&db),
-        visible_sorted,
-        "{journey}: the two expired target rows the pinned reader can still see must be held \
-         back by this cycle, so their adjacency entries stay in place"
+        kept,
+        "{journey}: the new snapshot sees logical expiry; the pinned cursor below must still \
+         receive every deferred edge"
     );
 
     emitted.extend(drain(&mut opened.cursor, 2, second.page.has_more, journey));

@@ -1,17 +1,18 @@
-//! Statement 17b: local erasure is staged and committed with ordinary transaction writes.
+//! Local erasure is staged and committed with ordinary transaction writes.
 use super::*;
 use crate::custody::records::{Record, RowRef};
 use contextdb_core::EdgeDiscardMode;
 
 pub(crate) struct Stage {
     pub(crate) durable: AuthoritativePurgePersistenceProjection,
+    pub(crate) _vector_workspace: contextdb_vector::VectorWorkspaceReservation,
     pub(crate) publish: Box<dyn FnOnce() + Send>,
 }
 pub(crate) type StageRegistry = Arc<Mutex<HashMap<Lsn, Stage>>>;
 
 impl Database {
     pub(crate) fn discard_policy(&self, table: &str) -> Result<Option<(String, EdgeDiscardMode)>> {
-        // Statement 17b: stopping the server does not remove durable hub authority.
+        // Stopping the server does not remove durable hub authority.
         if self.sync_relay_mode_enabled()
             || self.custody_authority()?.iter().any(|record| match record {
                 Record::Control(control) => control.hub_node.is_some(),
@@ -57,7 +58,7 @@ impl Database {
                 .map(|p| p.policy.edge_discard),
             _ => None,
         }) else {
-            // Statement 17b: only bound tables carry a hub-declared discard mode.
+            // Only bound tables carry a hub-declared discard mode.
             return Ok(None);
         };
         if mode == EdgeDiscardMode::Never {
@@ -114,7 +115,7 @@ impl Database {
                         && records.iter().any(|r| matches!(r,Record::Root{submission,..} if *submission==m.id))
                         && !records.iter().any(|r| matches!(r,Record::Terminal{edge:true,record:t} if t.submission==m.id && destination==Some(&t.namespace))) { pending.insert(m.id.as_bytes().to_vec()); }
                 }
-                // Statement 17b: transaction-local rows participate in the same selection.
+                // Transaction-local rows participate in the same selection.
                 // Newly staged units have no durable outcome and remain pending under the policy.
                 for registration in &registrations {
                     if registration.root == reference || registration.members.contains(&reference) {
@@ -156,7 +157,7 @@ impl Database {
                     pending_count,
                 });
             }
-            // Statement 17b: pending units are reported once, under their root table.
+            // Pending units are reported once, under their root table.
             let reported_pending = if self
                 .table_meta(table)
                 .is_some_and(|m| m.delivery_manifest_tables.is_some())
@@ -237,10 +238,12 @@ impl Database {
             .commit_lsn
             .ok_or_else(crate::custody::canonical::invalid)?;
         // Selected immutable row identities are revalidated under the ordinary commit mutex.
+        let vector_workspace = self.reserve_authoritative_erasure_workspace(selections)?;
         let prepared = self.prepare_authoritative_purge_set_batch(
             selections,
             token,
             crate::custody::erasure::PurgeReportShape::None,
+            lsn,
         )?;
         let (selected_hashes, mut survivors) =
             self.authoritative_purge_current_blob_references(selections, true)?;
@@ -276,7 +279,7 @@ impl Database {
             ]);
         }
         keys.extend(prepared.graph_arrival_config_keys.iter().cloned());
-        // Statement 17b: discarded sidecars cannot be rewritten by earlier work in this transaction.
+        // Discarded sidecars cannot be rewritten by earlier work in this transaction.
         ws.config_writes.retain(|(key, _)| !keys.contains(key));
         ws.config_deletes.extend(keys.iter().cloned());
         let durable = AuthoritativePurgePersistenceProjection {
@@ -287,6 +290,8 @@ impl Database {
                 .collect(),
             source_provenance: prepared.disk_source_provenance,
             vectors: prepared.vector_entries,
+            vector_partition_identities: prepared.vector_partition_identities,
+            vector_generation_candidates: prepared.vector_generation_candidates,
             graph_entries: prepared.canonical_graph_entries,
             sink_entries: prepared
                 .durable_sink_entries
@@ -337,13 +342,14 @@ impl Database {
             lsn,
             Stage {
                 durable,
+                _vector_workspace: vector_workspace,
                 publish: Box::new(move || {
                     relational_store.publish_prepared_received_schema(publication.relational);
                     *change_log.write() = publication.change_log;
                     *change_log_table_index.write() = publication.change_log_table_index;
                     *change_log_lsn_refcounts.write() = publication.change_log_lsn_refcounts;
                     graph_store.publish_prepared_received_schema(publication.graph);
-                    vector_store.publish_prepared_received_schema(publication.vector, &*accountant);
+                    vector_store.publish_prepared_received_schema(publication.vector, accountant);
                     event_bus.publish_prepared_authoritative_purge_queue_replacement(
                         publication.event_bus,
                     );

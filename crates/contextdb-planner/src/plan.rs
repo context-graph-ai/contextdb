@@ -1,7 +1,7 @@
 use contextdb_core::{Direction, PropagationRule};
 use contextdb_parser::ast::{
     AlterAction, ColumnDef, CompositeForeignKey, Cte, Expr, OnConflict, RetainOption,
-    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, StateMachineDef,
+    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, StateMachineDef, VectorSearchMode,
 };
 
 #[derive(Debug, Clone)]
@@ -41,6 +41,11 @@ pub enum PhysicalPlan {
         k: u64,
         candidates: Option<Box<PhysicalPlan>>,
         sort_key: Option<String>,
+        search_mode: Option<VectorSearchMode>,
+        /// Columns whose row values the outer SELECT actually reads. `None`
+        /// means `SELECT *`; an empty vector means the search answer needs no
+        /// stored row value beyond its synthetic row id and score.
+        materialized_columns: Option<Vec<String>>,
     },
     HnswSearch {
         table: String,
@@ -49,6 +54,8 @@ pub enum PhysicalPlan {
         k: u64,
         candidates: Option<Box<PhysicalPlan>>,
         sort_key: Option<String>,
+        search_mode: Option<VectorSearchMode>,
+        materialized_columns: Option<Vec<String>>,
     },
     Filter {
         input: Box<PhysicalPlan>,
@@ -93,6 +100,8 @@ pub enum PhysicalPlan {
     ShowMemoryLimit,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
+    SetMaintenancePollInterval(u64),
+    ShowMaintenancePollInterval,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicyPlan),
@@ -101,9 +110,36 @@ pub enum PhysicalPlan {
     },
     ShowSyncBindings,
     ShowDeliveryOutcomes(ShowDeliveryOutcomesPlan),
+    ShowVectorPartitions {
+        table: Option<String>,
+        column: Option<String>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    },
 }
 
 impl PhysicalPlan {
+    /// The table-local residual predicate carried into a vector search.
+    /// It is intentionally only a predicate source: after parameter binding
+    /// the engine may ask the relational store for *unauthorised* candidates,
+    /// then intersects those ids with its independent authorization result.
+    pub fn vector_residual_filters(&self) -> Vec<&Expr> {
+        match self {
+            PhysicalPlan::Scan { filter, .. } => filter.iter().collect(),
+            PhysicalPlan::Filter { input, predicate } => {
+                let mut filters = input.vector_residual_filters();
+                filters.push(predicate);
+                filters
+            }
+            PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::MaterializeCte { input, .. } => input.vector_residual_filters(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn explain(&self) -> String {
         match self {
             PhysicalPlan::GraphBfs { steps, .. } => {
@@ -194,13 +230,7 @@ fn query_source_suffix(expr: &Expr) -> String {
 
 fn row_vector_key_for_explain(expr: &Expr) -> String {
     match expr {
-        Expr::Literal(contextdb_parser::ast::Literal::Null) => "NULL".to_string(),
-        Expr::Literal(contextdb_parser::ast::Literal::Bool(value)) => value.to_string(),
-        Expr::Literal(contextdb_parser::ast::Literal::Integer(value)) => value.to_string(),
-        Expr::Literal(contextdb_parser::ast::Literal::Real(value)) => value.to_string(),
-        Expr::Literal(contextdb_parser::ast::Literal::Text(value)) => value.clone(),
-        Expr::Literal(contextdb_parser::ast::Literal::Vector(_)) => "<vector>".to_string(),
-        Expr::Parameter(name) => format!("${name}"),
+        Expr::Literal(_) | Expr::Parameter(_) => "<redacted>".to_string(),
         _ => "<expr>".to_string(),
     }
 }

@@ -887,6 +887,7 @@ fn t27_15_scoped_open_does_not_start_persisted_tickler() {
     let path = tmp.path().join("scoped_open_tickler.redb");
     {
         let admin = Database::open(&path).unwrap();
+        let _pause = admin.pause_cron_tickler_for_test();
         admin
             .execute(
                 "CREATE SCHEDULE orphan EVERY '200 MILLISECONDS' TX (missing_cb)",
@@ -911,13 +912,18 @@ fn t27_15_scoped_open_does_not_start_persisted_tickler() {
         scoped.close().unwrap();
     }
 
-    let admin = Database::open(&path).unwrap();
-    let audit = admin.cron_audit_log_for_test();
+    // Reopen with the same scope so verification cannot start the schedule
+    // whose absence this test is measuring.
+    let check =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(Uuid::from_u128(1))]))
+            .unwrap();
+    assert!(!check.cron_tickler_running_for_test());
+    let audit = check.cron_audit_log_for_test();
     assert!(
         audit.is_empty(),
         "scoped open must not run persisted schedules or write missing-callback audit entries; got {audit:?}"
     );
-    admin.close().unwrap();
+    check.close().unwrap();
 }
 
 /// REGRESSION GUARD — cron tx binding is confined to the callback owner thread.

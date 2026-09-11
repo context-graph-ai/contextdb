@@ -781,3 +781,68 @@ fn production_cursor_retains_a_real_multi_page_continuation_after_opening_handle
     );
     cursor.close().expect("close the production-owned cursor");
 }
+
+#[test]
+fn reader_startup_memory_ceiling_admits_loaded_state_without_rewriting_store_configuration() {
+    use contextdb_engine::{
+        DirectImageMetadataKind, DirectImageState, MetadataBody, MetadataRequest,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reader-memory.redb");
+    {
+        let database = Database::open(&path).unwrap();
+        seed_rows(&database, "reader_memory", 16);
+        database.set_memory_limit(Some(1024 * 1024)).unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let options = |memory_limit| ReadSessionOptions {
+        memory_limit: Some(memory_limit),
+        ..ReadSessionOptions::default()
+    };
+    let failure = match ReadSession::open_with_options(&path, options(128)) {
+        Ok(_) => panic!("a session cannot hold an image larger than its startup budget"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            failure,
+            Error::MemoryBudgetExceeded {
+                budget_limit_bytes: 128,
+                ..
+            }
+        ),
+        "the actual startup budget keeps its typed refusal: {failure:?}"
+    );
+    for ceiling in [512 * 1024, 2 * 1024 * 1024] {
+        let reader = ReadSession::open_with_options(&path, options(ceiling)).unwrap();
+        assert_eq!(reader.route(), ReadRoute::File);
+        let configuration = reader
+            .metadata(
+                MetadataRequest::ImageState {
+                    kind: DirectImageMetadataKind::Configuration,
+                },
+                None,
+            )
+            .unwrap();
+        let MetadataBody::ImageState {
+            state: DirectImageState::Configuration(configuration),
+        } = configuration.body
+        else {
+            panic!("configuration inspection must keep its typed body");
+        };
+        assert_eq!(
+            configuration.memory_limit_bytes,
+            Some(1024 * 1024),
+            "inspection reports the durable declaration, never a caller's ceiling"
+        );
+        assert_eq!(
+            reader
+                .execute("SELECT id FROM reader_memory ORDER BY id", &HashMap::new())
+                .unwrap()
+                .rows
+                .len(),
+            16
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}

@@ -1,4 +1,4 @@
-//! Statements 9–16: authenticated custody uses the ordinary push lane.
+//! Authenticated custody uses the ordinary push lane.
 use super::{canonical::*, preparation::*, records::*};
 use crate::{
     Database,
@@ -100,7 +100,7 @@ pub(crate) fn manifested_request(
         &std::collections::HashMap::new(),
         &lineage,
     );
-    // Statements 9/10/11: the actual ordinary push carries committed rows and manifests.
+    // The actual ordinary push carries committed rows and manifests.
     wire.manifests = vec![manifest];
     Ok(PushRequest {
         changeset: wire,
@@ -360,7 +360,7 @@ pub(crate) fn apply(
                 == contextdb_core::ConflictPolicy::KEEP_FIRST
         }) && let Some(digest) = db.custody_incumbent_digest(&m.seal.root)?
         {
-            // Statements 12/16: a hub-written root has custody even before any
+            // A hub-written root has custody even before any
             // terminal exists. Compare its complete held content and membership.
             if digest == m.seal.unit_digest {
                 (1, None)
@@ -609,10 +609,10 @@ pub(crate) fn fetch(
         .collect()
 }
 
-// Statements 14/16: resend and status share the durable outcome decision.
+// Resend and status share the durable outcome decision.
 // Watermarks can retire ordinary history but cannot retire an unanswered unit.
 pub(crate) fn pending_changes(db: &Database, mut changes: ChangeSet) -> Result<ChangeSet> {
-    // Statements 14/16: examine the changed identities and the pending index,
+    // Examine the changed identities and the pending index,
     // never all delivered history. Only active local root ownership is eligible.
     let mut terminal_rows = std::collections::BTreeSet::new();
     let mut terminal_vectors = std::collections::BTreeSet::new();
@@ -662,7 +662,7 @@ pub(crate) fn pending_changes(db: &Database, mut changes: ChangeSet) -> Result<C
         }) {
             continue;
         }
-        // Statements 9/14: absent or superseded roots cannot resurrect a unit.
+        // Absent or superseded roots cannot resurrect a unit.
         let Some(m) = current_manifest(db, &m.seal.root.table, &m.seal.root.key)? else {
             continue;
         };
@@ -688,7 +688,7 @@ pub(crate) fn pending_changes(db: &Database, mut changes: ChangeSet) -> Result<C
     Ok(changes)
 }
 
-// Statement 10: absent membership refuses the root and its dependent rows;
+// Absent membership refuses the root and its dependent rows;
 // unrelated rows remain eligible for ordinary arbitration in the same request.
 fn missing_rows(
     db: &Database,

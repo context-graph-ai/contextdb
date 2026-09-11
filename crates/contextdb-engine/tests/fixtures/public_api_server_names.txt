@@ -1,5 +1,6 @@
 new
 db
 transfer_receipts
+schema_sync_holdbacks
 run
 run_until

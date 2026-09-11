@@ -124,7 +124,12 @@ pub fn strict_json_lines(text: &str, stream: &str) -> Vec<Value> {
 
 pub fn lenient_json_lines(text: &str) -> Vec<Value> {
     text.lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter_map(|line| {
+            serde_json::Deserializer::from_str(line.trim_start())
+                .into_iter::<Value>()
+                .next()
+                .and_then(Result::ok)
+        })
         .collect()
 }
 

@@ -175,7 +175,7 @@ fn exclusive_bounds_on_a_desc_indexed_integer_column_return_matching_rows() {
 /// the guard's `Ordering::Equal` arm only excludes an empty range when at
 /// least one side is `Excluded`, and both sides here are `Included`, so
 /// this shape does not hit the DESC-blindness the RED tests above pin.
-/// Coverage of the bound-shape matrix per the brief.
+/// Completes the bound-shape matrix.
 #[test]
 fn single_point_between_on_a_desc_indexed_integer_column_returns_the_matching_row() {
     let db = Database::open_memory();

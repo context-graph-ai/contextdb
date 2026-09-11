@@ -113,7 +113,7 @@ impl ClientTransport for TerminalPushErrorTransport {
                     result: None,
                     error: Some("server rejected push".to_string()),
                     application_error: None,
-                    // Statement 13: ordinary response lane compile prerequisite.
+                    // Ordinary response lane compile prerequisite.
                     ..Default::default()
                 },
             )
@@ -214,7 +214,7 @@ impl ClientTransport for RetryUnsafePushTransport {
                     }),
                     error: None,
                     application_error: None,
-                    // Statement 13: ordinary response lane compile prerequisite.
+                    // Ordinary response lane compile prerequisite.
                     ..Default::default()
                 },
             )

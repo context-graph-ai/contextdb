@@ -10,7 +10,7 @@ use crate::Database;
 use crate::custody_types::*;
 use crate::sync_types::{NaturalKey, RowChange};
 use contextdb_core::{Result, TenantId};
-// Statements 9/10/11: ordinary request preparation needs no separate envelope identity.
+// Ordinary request preparation needs no separate envelope identity.
 pub(crate) fn fixture_binding_subject(t: &TenantId) -> String {
     format!("sync.{}.test-fixture.binding", t.as_str())
 }
@@ -66,7 +66,7 @@ impl Database {
             },
         )
     }
-    /// Statement 11: fail this unit's real storage commit, including on a receiver worker.
+    /// Fail this unit's real storage commit, including on a receiver worker.
     #[doc(hidden)]
     pub fn __arm_delivery_commit_fault_for_test(
         &self,
@@ -256,7 +256,7 @@ pub(crate) fn manifest_rows(db: &Database, m: &ManifestRecord) -> Result<Vec<Row
         .collect()
 }
 
-// Statement 10 fixture builder: arrange signed mismatched caller policy without
+// Fixture builder: arrange signed mismatched caller policy without
 // weakening the real bind door, which now rejects that expectation.
 pub(crate) fn issue_fixture_binding(
     db: &Database,

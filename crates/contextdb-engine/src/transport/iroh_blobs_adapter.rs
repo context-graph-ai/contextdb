@@ -31,7 +31,7 @@ use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::api::proto::*;
 use iroh_blobs::api::remote::GetProgressItem;
 use iroh_blobs::api::{self, TempTag};
-use iroh_blobs::protocol::{ChunkRangesExt, ChunkRangesSeq, GetRequest, Request};
+use iroh_blobs::protocol::{ChunkRangesExt, ChunkRangesSeq, Request};
 use iroh_blobs::provider::events::EventSender;
 use iroh_blobs::provider::{StreamPair, handle_get};
 use iroh_blobs::store::IROH_BLOCK_SIZE;
@@ -1656,8 +1656,8 @@ pub(crate) struct BlobStoreHandle {
     inner: Arc<StoreRuntime>,
     repository: Arc<BlobRepository>,
     bytes_hydrated_while_opening: u64,
-    /// Harness seam: requested hash -> substitute content hash to serve.
-    tamper: Arc<Mutex<HashMap<[u8; 32], Hash>>>,
+    /// Harness seam: requested hash -> replacement leaf payload.
+    tamper: Arc<Mutex<HashMap<[u8; 32], bytes::Bytes>>>,
     /// Harness seam: reset the next authorized, servable GET once after N
     /// payload bytes.
     drop_after: Arc<Mutex<Option<u64>>>,
@@ -1665,9 +1665,17 @@ pub(crate) struct BlobStoreHandle {
     /// Holder-side: count of blob-door requests whose `GetRequest` was read
     /// and authorized, INCLUDING refused ones (a reset still counts).
     fetch_requests_received: Arc<AtomicU64>,
-    /// Holder-side: the exact PAYLOAD bytes (not wire/framing bytes) this
-    /// holder has served across every successful `handle_get`.
+    /// Holder-side payload bytes successfully handed to the transport,
+    /// including bytes emitted before a consumer aborts verification.
     payload_bytes_emitted: Arc<AtomicU64>,
+    /// Test seam: completed provider serves. This advances only after the
+    /// terminal provider accounting above has run, so a consumer-side decode
+    /// failure can synchronize with the independent serving task before it
+    /// inspects the holder counters.
+    #[cfg(any(test, feature = "test-seams"))]
+    completed_serves: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "test-seams"))]
+    completed_serves_notify: Arc<tokio::sync::Notify>,
 }
 
 fn other(context: &str, err: impl std::fmt::Display) -> Error {
@@ -1785,6 +1793,10 @@ impl BlobStoreHandle {
             serve_permits: Arc::new(tokio::sync::Semaphore::new(SERVE_CONCURRENCY)),
             fetch_requests_received: Arc::new(AtomicU64::new(0)),
             payload_bytes_emitted: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-seams"))]
+            completed_serves: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-seams"))]
+            completed_serves_notify: Arc::new(tokio::sync::Notify::new()),
         };
         let bytes_after_open = handle.repository.bounded_blob_bytes_read();
         let mut handle = handle;
@@ -1877,30 +1889,28 @@ impl BlobStoreHandle {
         Ok(hash)
     }
 
-    /// Harness seam: serve `bytes` (their OWN valid Bao encoding) whenever
-    /// `claimed` is requested — the consumer's verification against `claimed`
-    /// then fails, which is the point.
+    /// Harness seam: replace an ingested blob's payload while preserving its
+    /// original Bao proof. A changed final leaf exercises verification after
+    /// the complete payload has crossed the transport.
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn arm_tamper(&self, claimed: &[u8; 32], bytes: &[u8]) -> Result<()> {
-        let data = bytes.to_vec();
-        let substitute = self.block_on_store(move |store| async move {
-            let tag = store
-                .add_bytes(data)
-                .temp_tag()
+        let hash = to_backend_hash(claimed);
+        let len = bytes.len() as u64;
+        self.block_on_store(move |store| async move {
+            match store
+                .blobs()
+                .status(hash)
                 .await
-                .map_err(|e| other("add tamper bytes", e))?;
-            let hash = tag.hash();
-            store
-                .tags()
-                .set(servable_tag(&hash), hash)
-                .await
-                .map_err(|e| other("tag tamper blob", e))?;
-            Ok(hash)
+                .map_err(|e| other("tamper status", e))?
+            {
+                BlobStatus::Complete { size } if size == len => Ok(()),
+                _ => Err(other("tamper", "requires an ingested blob of equal length")),
+            }
         })?;
         self.tamper
             .lock()
             .expect("tamper lock")
-            .insert(*claimed, substitute);
+            .insert(*claimed, bytes::Bytes::copy_from_slice(bytes));
         Ok(())
     }
 
@@ -1911,9 +1921,8 @@ impl BlobStoreHandle {
         *self.drop_after.lock().expect("drop lock") = Some(n);
     }
 
-    /// Test seam: the exact PAYLOAD bytes this holder has served across
-    /// every successfully completed `handle_get`. Never counts refused or
-    /// aborted transfers.
+    /// Test seam: exact payload bytes handed to the transport, including
+    /// bytes from a subsequently aborted transfer. Framing is excluded.
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn payload_bytes_emitted(&self) -> u64 {
         self.payload_bytes_emitted.load(Ordering::SeqCst)
@@ -1924,6 +1933,21 @@ impl BlobStoreHandle {
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn fetch_requests_received(&self) -> u64 {
         self.fetch_requests_received.load(Ordering::SeqCst)
+    }
+
+    /// Wait until `completed` provider `handle_get` calls have reached their
+    /// terminal accounting point. This is test-only synchronization between
+    /// the consumer task and the independently scheduled holder task; it does
+    /// not delay, retry, or alter a transfer.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) async fn wait_for_completed_serves_for_test(&self, completed: u64) {
+        loop {
+            let notified = self.completed_serves_notify.notified();
+            if self.completed_serves.load(Ordering::SeqCst) >= completed {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Test seam: how many blobs this node currently serves (mirrors the
@@ -2051,6 +2075,10 @@ impl BlobStoreHandle {
         let permits = self.serve_permits.clone();
         let fetch_requests = self.fetch_requests_received.clone();
         let payload_bytes = self.payload_bytes_emitted.clone();
+        #[cfg(any(test, feature = "test-seams"))]
+        let completed_serves = self.completed_serves.clone();
+        #[cfg(any(test, feature = "test-seams"))]
+        let completed_serves_notify = self.completed_serves_notify.clone();
         endpoint.register_connection_protocol(
             iroh_blobs::protocol::ALPN.to_vec(),
             Arc::new(move |peer: PeerConnection| {
@@ -2063,6 +2091,10 @@ impl BlobStoreHandle {
                 let permits = permits.clone();
                 let fetch_requests = fetch_requests.clone();
                 let payload_bytes = payload_bytes.clone();
+                #[cfg(any(test, feature = "test-seams"))]
+                let completed_serves = completed_serves.clone();
+                #[cfg(any(test, feature = "test-seams"))]
+                let completed_serves_notify = completed_serves_notify.clone();
                 Box::pin(async move {
                     let remote = peer.remote_node_id.clone();
                     loop {
@@ -2078,6 +2110,10 @@ impl BlobStoreHandle {
                             &verdict,
                             &fetch_requests,
                             &payload_bytes,
+                            #[cfg(any(test, feature = "test-seams"))]
+                            &completed_serves,
+                            #[cfg(any(test, feature = "test-seams"))]
+                            &completed_serves_notify,
                             &served,
                             &remote,
                             peer.connection.stable_id() as u64,
@@ -2120,27 +2156,52 @@ struct CountingSend<W> {
     inner: W,
     payload_sent: u64,
     reset_after: Option<u64>,
+    emitted: Arc<AtomicU64>,
+    tamper: Option<bytes::Bytes>,
 }
 
-impl<W: SendStream> SendStream for CountingSend<W> {
+#[cfg(test)]
+#[path = "iroh_blobs_adapter/payload_tests.rs"]
+mod payload_tests;
+
+impl<W: SendStream + tokio::io::AsyncWrite + Unpin> CountingSend<W> {
+    async fn write_payload(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            // A single write reports its accepted prefix in the same poll.
+            // Record it before another await: a later error or cancellation
+            // must not erase bytes already accepted by the transport.
+            let written = tokio::io::AsyncWriteExt::write(&mut self.inner, bytes).await?;
+            if written == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            self.payload_sent = self.payload_sent.saturating_add(written as u64);
+            self.emitted.fetch_add(written as u64, Ordering::SeqCst);
+            bytes = &bytes[written..];
+        }
+        Ok(())
+    }
+}
+
+impl<W: SendStream + tokio::io::AsyncWrite + Unpin> SendStream for CountingSend<W> {
     async fn send_bytes(&mut self, bytes: bytes::Bytes) -> std::io::Result<()> {
+        let bytes = match &self.tamper {
+            Some(replacement) => {
+                let start = self.payload_sent as usize;
+                replacement.slice(start..start + bytes.len())
+            }
+            None => bytes,
+        };
         if let Some(limit) = self.reset_after {
             let remaining = limit.saturating_sub(self.payload_sent);
             if remaining < bytes.len() as u64 {
                 if remaining != 0 {
-                    self.inner
-                        .send_bytes(bytes.slice(..remaining as usize))
-                        .await?;
-                    self.payload_sent = self.payload_sent.saturating_add(remaining);
+                    self.write_payload(&bytes[..remaining as usize]).await?;
                 }
                 let _ = self.inner.reset(RESET_DROPPED.into());
                 return Err(std::io::Error::other("drop-after harness reset"));
             }
         }
-        let len = bytes.len() as u64;
-        self.inner.send_bytes(bytes).await?;
-        self.payload_sent = self.payload_sent.saturating_add(len);
-        Ok(())
+        self.write_payload(&bytes).await
     }
 
     async fn send(&mut self, buf: &[u8]) -> std::io::Result<()> {
@@ -2175,11 +2236,13 @@ impl<W: SendStream> SendStream for CountingSend<W> {
 async fn serve_stream<W, R>(
     store: &Store,
     repository: &Arc<BlobRepository>,
-    tamper: &Arc<Mutex<HashMap<[u8; 32], Hash>>>,
+    tamper: &Arc<Mutex<HashMap<[u8; 32], bytes::Bytes>>>,
     drop_after: &Arc<Mutex<Option<u64>>>,
     verdict: &VerdictFn,
     fetch_requests: &Arc<AtomicU64>,
     payload_bytes: &Arc<AtomicU64>,
+    #[cfg(any(test, feature = "test-seams"))] completed_serves: &Arc<AtomicU64>,
+    #[cfg(any(test, feature = "test-seams"))] completed_serves_notify: &Arc<tokio::sync::Notify>,
     served: &ServedObserver,
     remote_node_id: &str,
     connection_id: u64,
@@ -2187,7 +2250,7 @@ async fn serve_stream<W, R>(
     mut recv: R,
 ) -> std::result::Result<(), ()>
 where
-    W: SendStream,
+    W: SendStream + tokio::io::AsyncWrite + Unpin,
     R: RecvStream,
 {
     // Bound the read: a peer that opens a stream and then stalls without
@@ -2231,25 +2294,16 @@ where
         }
     }
     let provider_guard = repository.open_read(requested).ok().flatten();
-    let tampered = tamper.lock().expect("tamper lock").contains_key(&requested);
     let servable = repository
         .has_tag_role(&requested, BlobTagRole::Servable)
         .unwrap_or(false);
-    if !tampered && (provider_guard.is_none() || !servable) {
+    if provider_guard.is_none() || !servable {
         let _ = send.reset(RESET_NOT_FOUND.into());
         return Err(());
     }
-    // Harness seams. Tamper serves the substitute content's (valid) encoding
-    // under the requested stream — the consumer's verification against the
-    // hash it asked for is what must catch it.
-    let effective = tamper.lock().expect("tamper lock").get(&requested).copied();
-    let get = match effective {
-        Some(substitute) => GetRequest {
-            hash: substitute,
-            ranges: get.ranges,
-        },
-        None => get,
-    };
+    // Keep the requested blob's genuine Bao proof, replacing only its leaf
+    // payload in the test seam. Authorization and generation guards still apply.
+    let replacement = tamper.lock().expect("tamper lock").get(&requested).cloned();
     let served_hash = get.hash;
     let served_ranges = get.ranges.clone();
     // Consume the transient fault only after both authorization and servable
@@ -2260,6 +2314,8 @@ where
         inner: send,
         payload_sent: 0,
         reset_after,
+        emitted: payload_bytes.clone(),
+        tamper: replacement,
     };
     let pair = StreamPair::new(connection_id, recv, send, EventSender::DEFAULT);
     let result = handle_get(pair, store.clone(), get).await;
@@ -2271,12 +2327,19 @@ where
         // GET serves from its lowest requested chunk boundary to the end.
         if let Ok(BlobStatus::Complete { size }) = store.blobs().status(served_hash).await {
             let moved = served_bytes_for_request(&served_ranges, size);
-            payload_bytes.fetch_add(moved, Ordering::SeqCst);
             // Same derived figure, now attributed to the authenticated peer
             // that asked for it — the per-peer receipt the aggregate counter
             // above cannot produce.
             served(remote_node_id, moved);
         }
+    }
+    // `handle_get` runs in the holder's connection task, independently from
+    // the consumer's verification task. Publish completion only after the
+    // holder-side counter and receipt above are final.
+    #[cfg(any(test, feature = "test-seams"))]
+    {
+        completed_serves.fetch_add(1, Ordering::SeqCst);
+        completed_serves_notify.notify_waiters();
     }
     drop(provider_guard);
     Ok(())

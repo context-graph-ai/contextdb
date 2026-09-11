@@ -156,6 +156,7 @@ fn the_idle_file_answers_every_question_a_store_is_asked_about_itself() {
         .metadata(
             MetadataRequest::Explain {
                 sql: "SELECT id FROM documents".to_owned(),
+                params: HashMap::new(),
             },
             None,
         )
@@ -244,6 +245,7 @@ fn the_owner_answers_the_same_questions_in_the_same_words() {
         .metadata(
             MetadataRequest::Explain {
                 sql: "SELECT id FROM documents".to_owned(),
+                params: HashMap::new(),
             },
             None,
         )
@@ -374,6 +376,217 @@ fn both_routes_describe_the_same_store_the_same_way() {
     );
 }
 
+/// A Context-, scope-label-, or principal-constrained handle is promised
+/// a redacted `.explain` for its own query -- the same count and route its
+/// own bound query reports locally. The owner socket honors that for the
+/// OWNER-READ route (`owner_read_service_contract`). This proof is about the
+/// door every OTHER reader uses: `ReadSession::metadata`, whichever route
+/// answers it -- the live owner over its read-session channel, or the
+/// committed file once nobody owns the store. Both plan a `.explain` through
+/// `MetadataRequest::Explain { sql, params }`
+/// (`direct_file_reader.rs`'s `DirectMetadataRequest::Explain`), which now
+/// carries the caller's own binding alongside the statement, and
+/// `read_session.rs`'s own `owner_explain` plans the statement with that same
+/// binding -- so a constrained handle asking why ITS query routes as it does
+/// gets the same bound answer, however it is routed.
+#[test]
+fn the_owner_route_and_the_file_route_both_explain_a_bound_partition_key_the_way_the_owner_plans_it_locally()
+ {
+    let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
+    let runtime_root = secure_runtime_root(directory.path(), "bound-explain-runtime");
+    let (database, path) = served_store(directory.path(), runtime_root.clone());
+
+    database
+        .execute(
+            "CREATE TABLE bound_docs (\
+                id UUID PRIMARY KEY, \
+                scope_id TEXT NOT NULL, \
+                embedding VECTOR(3) PARTITION_KEY (scope_id) \
+                    MAX_PARTITIONS 8 SEARCH_MODE AUTO\
+            )",
+            &HashMap::new(),
+        )
+        .expect("declare a partitioned AUTO-mode vector column");
+    for (offset, scope, vector) in [
+        (0_u128, "alpha-scope", vec![1.0_f32, 0.0, 0.0]),
+        (1_u128, "alpha-scope", vec![0.9, 0.1, 0.0]),
+        (2_u128, "bravo-scope", vec![0.0, 1.0, 0.0]),
+        (3_u128, "bravo-scope", vec![0.0, 0.9, 0.1]),
+    ] {
+        database
+            .execute(
+                "INSERT INTO bound_docs (id, scope_id, embedding) VALUES ($id, $scope, $embedding)",
+                &HashMap::from([
+                    (
+                        "id".to_owned(),
+                        Value::Uuid(uuid::Uuid::from_u128(
+                            0xB0B1_0000_0000_0000_0000_0000_0000_0000 + offset,
+                        )),
+                    ),
+                    ("scope".to_owned(), Value::Text(scope.to_owned())),
+                    ("embedding".to_owned(), Value::Vector(vector)),
+                ]),
+            )
+            .expect("commit one fixture row");
+    }
+
+    let sql = "SELECT id FROM bound_docs WHERE scope_id = $scope \
+               ORDER BY embedding <=> [1.0,0.0,0.0] USE VECTOR AUTO LIMIT 2";
+
+    // Local ground truth: the same parameter-aware passive-planning path the
+    // CLI's `.explain <sql>` command uses, with the key actually bound.
+    let bound_params = HashMap::from([("scope".to_owned(), Value::Text("alpha-scope".to_owned()))]);
+    let local_rendered =
+        contextdb_engine::cli_render::render_explain(&database, sql, &bound_params)
+            .expect("explaining a bound statement locally must succeed");
+    let local_vector_search_line = local_rendered
+        .lines()
+        .find(|line| line.starts_with("vector_search "))
+        .unwrap_or_else(|| {
+            panic!("a vector-similarity SELECT discloses vector_search: {local_rendered}")
+        })
+        .to_owned();
+
+    // The owner route: a constrained handle reaching the same live writer
+    // over its read-session channel, asking to explain the identical bound
+    // query, sending the same binding it bound locally.
+    let owner_session =
+        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path))
+            .expect("a live owner is reachable");
+    assert_eq!(owner_session.route(), ReadRoute::Owner);
+    let owner_explained = owner_session
+        .metadata(
+            MetadataRequest::Explain {
+                sql: sql.to_owned(),
+                params: bound_params.clone(),
+            },
+            None,
+        )
+        .expect("the owner explains the statement");
+    let MetadataBody::Explain { vector_search, .. } = &owner_explained.body else {
+        panic!("asked for an explain and got {:?}", owner_explained.body);
+    };
+    let owner_rendered = vector_search
+        .as_ref()
+        .expect("a vector-similarity SELECT reports a disclosure over the owner route too")
+        .to_string();
+    assert_eq!(
+        owner_rendered, local_vector_search_line,
+        "a constrained handle's `.explain` over the read-session owner route must report the \
+         same bound count and route its own query reports locally: \
+         local={local_vector_search_line:?} owner={owner_rendered:?}"
+    );
+
+    drop(owner_session);
+    database.close().expect("the writer closes cleanly");
+
+    // The direct-file route: nobody owns the store any more, so the reader
+    // reads the committed file itself and must still answer the same way,
+    // given the same binding.
+    let file_session =
+        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path))
+            .expect("the store is still readable once its owner is gone");
+    assert_eq!(file_session.route(), ReadRoute::File);
+    let file_explained = file_session
+        .metadata(
+            MetadataRequest::Explain {
+                sql: sql.to_owned(),
+                params: bound_params.clone(),
+            },
+            None,
+        )
+        .expect("the file explains the statement");
+    let MetadataBody::Explain { vector_search, .. } = &file_explained.body else {
+        panic!("asked for an explain and got {:?}", file_explained.body);
+    };
+    let file_rendered = vector_search
+        .as_ref()
+        .expect("a vector-similarity SELECT reports a disclosure over the direct-file route too")
+        .to_string();
+    assert_eq!(
+        file_rendered, local_vector_search_line,
+        "the direct-file route must also report the bound count and route a constrained \
+         handle's own query reports locally: local={local_vector_search_line:?} \
+         file={file_rendered:?}"
+    );
+}
+
+#[test]
+fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_execution() {
+    let directory = tempfile::TempDir::new().expect("task-scoped trace directory");
+    let runtime_root = secure_runtime_root(directory.path(), "vector-trace-runtime");
+    let (database, path) = served_store(directory.path(), runtime_root.clone());
+    database
+        .execute(
+            "CREATE TABLE trace_docs (\
+                id UUID PRIMARY KEY, \
+                scope TEXT NOT NULL, \
+                embedding VECTOR(3) PARTITION_KEY (scope) \
+                    MAX_PARTITIONS 4 SEARCH_MODE EXACT\
+            )",
+            &HashMap::new(),
+        )
+        .expect("declare the vector trace fixture");
+    for (id, scope, embedding) in [
+        (1_u128, "alpha", vec![1.0, 0.0, 0.0]),
+        (2_u128, "alpha", vec![0.9, 0.1, 0.0]),
+        (3_u128, "hidden-value", vec![0.0, 1.0, 0.0]),
+    ] {
+        database
+            .execute(
+                "INSERT INTO trace_docs (id, scope, embedding) VALUES ($id, $scope, $embedding)",
+                &HashMap::from([
+                    ("id".to_owned(), Value::Uuid(uuid::Uuid::from_u128(id))),
+                    ("scope".to_owned(), Value::Text(scope.to_owned())),
+                    ("embedding".to_owned(), Value::Vector(embedding)),
+                ]),
+            )
+            .expect("seed one trace vector");
+    }
+    let sql = "SELECT id FROM trace_docs WHERE scope = $scope \
+               ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 2";
+    let params = HashMap::from([
+        ("scope".to_owned(), Value::Text("alpha".to_owned())),
+        ("query".to_owned(), Value::Vector(vec![1.0, 0.0, 0.0])),
+    ]);
+    let local = database
+        .execute(sql, &params)
+        .expect("the live writer executes the vector query");
+    let local_trace = local
+        .trace
+        .vector_search
+        .clone()
+        .expect("local execution publishes its bounded vector disclosure");
+    let rendered = local_trace.to_string();
+    assert!(rendered.contains("partition=<redacted:1>"));
+    assert!(!rendered.contains("alpha"));
+    assert!(!rendered.contains("hidden-value"));
+
+    let owner =
+        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path))
+            .expect("a second reader reaches the live owner");
+    assert_eq!(owner.route(), ReadRoute::Owner);
+    let owner_result = owner
+        .execute(sql, &params)
+        .expect("the live owner returns the executed query");
+    assert_eq!(
+        owner_result.trace.vector_search.as_ref(),
+        Some(&local_trace),
+        "the canonical owner result restores the exact bounded and redacted vector trace"
+    );
+    drop(owner);
+
+    database.close().expect("close the vector trace writer");
+    let file =
+        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path))
+            .expect("the committed file remains readable");
+    assert_eq!(file.route(), ReadRoute::File);
+    let file_result = file
+        .execute(sql, &params)
+        .expect("the committed file executes the same query");
+    assert_eq!(file_result.trace.vector_search.as_ref(), Some(&local_trace));
+}
+
 #[test]
 fn a_continuation_is_refused_by_a_question_that_never_issues_one() {
     let directory = tempfile::TempDir::new().expect("task-scoped metadata directory");
@@ -386,6 +599,7 @@ fn a_continuation_is_refused_by_a_question_that_never_issues_one() {
         },
         MetadataRequest::Explain {
             sql: "SELECT id FROM documents".to_owned(),
+            params: HashMap::new(),
         },
         MetadataRequest::MaintenanceStatus,
         MetadataRequest::ImageState {

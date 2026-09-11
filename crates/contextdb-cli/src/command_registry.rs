@@ -459,7 +459,7 @@ mod contract_tests {
             spelling: ".maintenance compact",
             effect: CommandEffect::StoreWrite,
         },
-        // Statement 19: the three custody inspections are canonical store reads.
+        // The three custody inspections are canonical store reads.
         CommandDeclaration {
             spelling: ".sync policy",
             effect: CommandEffect::StoreRead,

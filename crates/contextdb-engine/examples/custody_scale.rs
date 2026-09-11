@@ -1,4 +1,4 @@
-//! Statements 9/11/14/15: measure actual file-backed, authenticated Iroh pushes.
+//! Measure actual file-backed, authenticated Iroh pushes.
 //! One source transaction and ordinary push per unit; no fixture batch submission.
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::protocol::{MessageType, decode};

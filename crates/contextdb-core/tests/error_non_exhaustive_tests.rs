@@ -1,13 +1,14 @@
-//! `contextdb_core::Error` (`crates/contextdb-core/src/error.rs:79`) does not
-//! carry `#[non_exhaustive]` today. A published error-classification enum
+//! `contextdb_core::Error` (`crates/contextdb-core/src/error.rs:141`) already
+//! carries `#[non_exhaustive]`. A published error-classification enum
 //! elsewhere in this workspace, `ErrorClass`
-//! (`crates/contextdb-cli/src/json_output.rs`), already sets the precedent
-//! for this exact question: it is `#[non_exhaustive]` specifically so a
+//! (`crates/contextdb-cli/src/json_output.rs`), sets the same precedent for
+//! this exact question: it is `#[non_exhaustive]` specifically so a
 //! downstream crate can never assume its variant list is closed. `Error`
 //! itself has ~80 variants and grows routinely as new failure modes are
-//! typed — without `#[non_exhaustive]`, adding one more variant is a
+//! typed — without `#[non_exhaustive]`, adding one more variant would be a
 //! breaking change for any external crate that matched exhaustively,
 //! silently turning a routine engine change into a downstream compile break.
+//! This test pins that the attribute stays on the enum.
 
 #[test]
 fn error_enum_rejects_an_exhaustive_match_from_an_external_crate() {
@@ -22,9 +23,8 @@ fn error_enum_rejects_an_exhaustive_match_from_an_external_crate() {
     // enumerate `Error`'s variants or reference any line inside the enum
     // definition — it only names the fixture's own match expression and the
     // fixed "non-exhaustive patterns: `&_` not covered" diagnostic — so it
-    // does not need updating every time `Error` gains a variant. Today the
-    // fixture compiles cleanly (nothing left uncovered), so the outer test
-    // fails ("expected test case to fail to compile, but it succeeded");
-    // once `#[non_exhaustive]` lands on `Error`, the identical fixture must
-    // fail to compile with exactly this pinned diagnostic.
+    // does not need updating every time `Error` gains a variant. Because
+    // `Error` already carries `#[non_exhaustive]`, the fixture's exhaustive
+    // match (no wildcard arm, every variant listed) fails to compile with
+    // exactly this pinned diagnostic today, which is what pins the contract.
 }

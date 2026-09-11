@@ -1,14 +1,13 @@
 // Every test in this file exercises the `test-seams` pause-window seam, so the
 // whole binary is gated on that feature. (The one previously-ungated test,
-// `reopen_per_index_hnsw_rebuild_yields_same_live_set`, was folded into
-// `per_index_independent_progress_reopen_flake_is_fixed_under_repeat` in
-// hnsw_rebuild_determinism_tests.rs: the folded test's top-50 assertion is
-// strictly implied by that test's bitwise-sequence assertion, proven by a
-// decisive mutant both tests detect.)
+// Reopen identity and result parity live in
+// `per_index_independent_progress_reopen_flake_is_fixed_under_repeat`; this
+// binary isolates the independent per-index maintenance-lock proof.)
 #![cfg(feature = "test-seams")]
 
 use contextdb_core::{Value, VectorIndexRef};
-use contextdb_engine::Database;
+use contextdb_engine::memory_accounting::MemoryAccountant;
+use contextdb_engine::{Database, MaintenancePolicy};
 use std::collections::HashMap;
 #[cfg(feature = "test-seams")]
 use std::sync::Arc;
@@ -18,7 +17,6 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 #[cfg(feature = "test-seams")]
 use std::time::Duration;
-use tempfile::TempDir;
 use uuid::Uuid;
 
 const REOPEN_ROWS: usize = 1024;
@@ -138,19 +136,13 @@ fn assert_top_ranked(result: &[(Uuid, f64)], expected_id: Uuid) {
 
 #[cfg(feature = "test-seams")]
 #[test]
-fn reopened_store_two_refs_both_enter_build_windows_concurrently() {
+fn caller_driven_store_two_refs_both_enter_build_windows_concurrently() {
     use contextdb_vector::test_seam::PauseWindow;
 
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("per-index-reopen.db");
-    {
-        let db = Database::open(&path).unwrap();
-        create_reopen_tables(&db);
-        seed_reopen_tables(&db);
-        db.close().unwrap();
-    }
-
-    let db = Arc::new(Database::open(&path).unwrap());
+    let db = Arc::new(Database::open_memory());
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    create_reopen_tables(&db);
+    seed_reopen_tables(&db);
     let vector_store = db.vector_store_for_test();
     let text_ref = VectorIndexRef::new("table_text", "embedding");
     let face_ref = VectorIndexRef::new("table_face", "embedding");
@@ -158,19 +150,27 @@ fn reopened_store_two_refs_both_enter_build_windows_concurrently() {
     let face_pause = vector_store.arm_maintenance_pause_for_test(&face_ref, PauseWindow::Build);
 
     let (done_text_tx, done_text_rx) = mpsc::channel();
-    let db_text = db.clone();
+    let store_text = vector_store.clone();
+    let text_worker_ref = text_ref.clone();
     thread::spawn(move || {
         done_text_tx
-            .send(top_ranked(&db_text, "table_text", 1))
+            .send(store_text.run_hnsw_maintenance_for_index_for_test(
+                &text_worker_ref,
+                Arc::new(MemoryAccountant::no_limit()),
+            ))
             .unwrap();
     });
     assert!(text_pause.wait_until_reached(REOPEN_TIMEOUT));
 
     let (done_face_tx, done_face_rx) = mpsc::channel();
-    let db_face = db.clone();
+    let store_face = vector_store.clone();
+    let face_worker_ref = face_ref.clone();
     thread::spawn(move || {
         done_face_tx
-            .send(top_ranked(&db_face, "table_face", 1))
+            .send(store_face.run_hnsw_maintenance_for_index_for_test(
+                &face_worker_ref,
+                Arc::new(MemoryAccountant::no_limit()),
+            ))
             .unwrap();
     });
     let face_reached_before_text_release = face_pause.wait_until_reached(REOPEN_TIMEOUT);
@@ -184,21 +184,20 @@ fn reopened_store_two_refs_both_enter_build_windows_concurrently() {
     // the unconditional assert below fails that run regardless.)
     face_pause.release();
     text_pause.release();
-    let text_result = done_text_rx.recv_timeout(REOPEN_TIMEOUT).unwrap();
-    let face_result = done_face_rx.recv_timeout(REOPEN_TIMEOUT).unwrap();
+    let text_built = done_text_rx.recv_timeout(REOPEN_TIMEOUT).unwrap().unwrap();
+    let face_built = done_face_rx.recv_timeout(REOPEN_TIMEOUT).unwrap().unwrap();
 
     assert!(face_reached_before_text_release);
     assert!(matches!(text_done_before_release, Err(TryRecvError::Empty)));
     assert!(matches!(face_done_before_release, Err(TryRecvError::Empty)));
-    assert_top_ranked(&text_result, Uuid::from_u128(100_000));
-    assert_top_ranked(&face_result, Uuid::from_u128(200_000));
+    assert!(text_built);
+    assert!(face_built);
     assert!(vector_store.has_hnsw_index_for(&text_ref));
     assert!(vector_store.has_hnsw_index_for(&face_ref));
+    assert_top_ranked(&top_ranked(&db, "table_text", 1), Uuid::from_u128(100_000));
+    assert_top_ranked(&top_ranked(&db, "table_face", 1), Uuid::from_u128(200_000));
 }
 
-// NOTE: `reopen_per_index_hnsw_rebuild_yields_same_live_set` was folded into
-// `per_index_independent_progress_reopen_flake_is_fixed_under_repeat` in
-// hnsw_rebuild_determinism_tests.rs — that test asserts the full bitwise search
-// sequence + HNSW observation identity on the identical two-table reopen, which
-// strictly implies this test's top-50 ranked-results match. Proven by a
-// reopen-load-drop decisive mutant that both tests detect.
+// Reopen load/result identity is asserted independently in
+// `hnsw_rebuild_determinism_tests.rs`; keeping it there avoids making a query
+// the construction owner in this lock-overlap proof.

@@ -14,7 +14,7 @@ categories.workspace = true
 
 [features]
 in-process-test-seams = []
-test-seams = ["in-process-test-seams", "contextdb-vector/test-seams"]
+test-seams = ["in-process-test-seams", "redb/test-seams", "contextdb-vector/test-seams"]
 # Build-only validation facility used by the installed release smoke. It keeps
 # the real Iroh path and exposes only two fixed crash checkpoints; it does not
 # enable the broader test seam.
@@ -59,7 +59,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_bytes = "0.11"
 tracing.workspace = true
-redb = { workspace = true }
+redb = { package = "contextdb-redb", version = "4.1.0", path = "../contextdb-redb" }
 bincode = { workspace = true }
 smallvec = "1"
 time.workspace = true
@@ -92,6 +92,8 @@ nix = { version = "0.30.1", features = ["fs", "mount", "poll", "socket", "user"]
 
 [dev-dependencies]
 contextdb-server = { path = "../contextdb-server", features = ["in-process-test-seams"] }
+contextdb-vector = { path = "../contextdb-vector", version = "1.0", features = ["test-seams"] }
+redb = { package = "contextdb-redb", version = "4.1.0", path = "../contextdb-redb", features = ["test-seams"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 num_cpus = "1.16"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -216,6 +218,11 @@ required-features = ["test-seams"]
 [[test]]
 name = "server_resource_policy_contract_tests"
 path = "tests/server_resource_policy_contract_tests.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "snapshot_visible_posting_membership_contract"
+path = "tests/snapshot_visible_posting_membership_contract.rs"
 required-features = ["test-seams"]
 
 # The SQL surface suite drives the raw sync-apply primitive
@@ -405,12 +412,12 @@ name = "custody_protocol_contract"
 path = "tests/custody_protocol_contract.rs"
 required-features = ["test-seams", "iroh"]
 
-# Documentation recipe uses the ordinary authenticated transport (statements 1/3/7/13/14).
+# Documentation recipe uses the ordinary authenticated transport.
 [[example]]
 name = "event_custody"
 required-features = ["iroh"]
 
-# Statements 9/11/14/15: receipt for ordinary Iroh delivery cost at scale.
+# Receipt for ordinary Iroh delivery cost at scale.
 [[example]]
 name = "custody_scale"
 required-features = ["iroh", "test-seams"]

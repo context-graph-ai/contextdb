@@ -8,6 +8,7 @@
 //! does, and the projection is read back out of that same handle rather than
 //! re-derived beside it.
 
+use crate::OwnerReadCancellation;
 use crate::cli_render::{render_column_type, render_table_meta};
 use crate::database::{Database, MaintenancePolicy};
 use crate::direct_file_reader::{
@@ -22,16 +23,16 @@ use crate::direct_file_reader::{
     DirectTypedImageDigest, DirectVectorQuantization,
 };
 use crate::executor::ReadExecutionTarget;
+use crate::memory_accounting::MemoryAccountant;
 use crate::persistence::ReadPersistenceImageParts;
 use contextdb_core::read_contract::{
-    DeadlineClock, MetadataPageVocabulary, OwnerReadCancellation, ReadFailure, ReadLimits,
+    DeadlineClock, MetadataPageVocabulary, ReadFailure, ReadLimits,
 };
 use contextdb_core::{
     ColumnType, ContextId, Direction, Error, HistoryPolicy, IndexKind, Lsn, Principal,
     PropagationRule, Result, RetainUnit, ScopeLabel, ScopeLabelKind, SortDirection, SyncDirection,
     TxId, Value, VectorIndexRef, VectorQuantization,
 };
-use contextdb_planner::PhysicalPlan;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -41,6 +42,7 @@ pub(crate) struct CommittedImage {
     pub(crate) target: Arc<dyn ReadExecutionTarget>,
     pub(crate) image: Arc<DirectOwnedImage>,
     pub(crate) digest: DirectTypedImageDigest,
+    pub(crate) memory: Arc<crate::read_image_memory::ImageMemory>,
 }
 
 /// What a read session declared about who it reads as and which part of the
@@ -68,28 +70,55 @@ impl crate::persistence::ReadPersistenceImage {
     /// with the owned projection and identity that ride alongside it.
     pub(crate) fn into_committed_image(
         self,
-        limits: ReadLimits,
+        memory_limit: Option<usize>,
         contexts: Option<BTreeSet<ContextId>>,
         scope_labels: Option<BTreeSet<ScopeLabel>>,
         principal: Option<Principal>,
-    ) -> Result<CommittedImage> {
+    ) -> std::result::Result<CommittedImage, DirectFileReaderError> {
         build_committed_image(
             self.into_runtime_parts(),
-            limits,
+            memory_limit,
             DeclaredReadVisibility {
                 contexts,
                 scope_labels,
                 principal,
             },
         )
+        .map_err(|error| match error {
+            Error::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            } => DirectFileReaderError::MemoryBudget {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            },
+            other => DirectFileReaderError::Engine(other.to_string()),
+        })
     }
 }
 
 fn build_committed_image(
     parts: ReadPersistenceImageParts,
-    _limits: ReadLimits,
+    memory_limit: Option<usize>,
     declared: DeclaredReadVisibility,
 ) -> Result<CommittedImage> {
+    let memory = parts.memory.clone();
+    let accountant = memory.accountant.clone();
+    if let Some(limit) = memory_limit {
+        accountant.set_budget(Some(limit))?;
+    }
+    // The Database and its immutable projection coexist with the hydrated
+    // source during construction. Reserve their source-shaped copies before
+    // either projection clones a row, vector, schema, or change record.
+    memory.reserve(memory.held().saturating_mul(2))?;
     let graph_edges = project_edges(&parts);
     let vectors = project_vectors(&parts);
     let commit_index = parts
@@ -98,11 +127,14 @@ fn build_committed_image(
         .map(|(lsn, tx)| (*lsn, *tx))
         .collect::<Vec<_>>();
 
-    // The reader's own ceiling bounds each read, not the handle: seeding the
-    // accountant with it would let a caller's request limit stand in for the
-    // store's declared memory limit, and the image would then report the
-    // reader's number as the store's own.
-    let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+    // Keep durable configuration separate from this process's startup ceiling,
+    // so the same committed image keeps the same identity for every reader.
+    let declared_memory_limit = parts
+        .config_values
+        .iter()
+        .find(|(key, _)| key == "memory_limit")
+        .map(|(_, bytes)| crate::persistence::RedbPersistence::decode_config_value::<usize>(bytes))
+        .transpose()?;
     let mut database =
         Database::open_committed_image(parts, Arc::new(crate::plugin::CorePlugin), accountant)?;
 
@@ -112,8 +144,9 @@ fn build_committed_image(
     // them a consumer should be shown is the consumer's own filtering, and
     // hiding a table here would make a narrowed session report a different
     // store rather than a narrowed view of the same one.
-    let image = project_owned_image(&database, graph_edges, vectors, commit_index)?;
-    let digest = typed_digest(&image)?;
+    let mut image = project_owned_image(&database, graph_edges, vectors, commit_index)?;
+    image.configuration.memory_limit_bytes = declared_memory_limit;
+    let digest = typed_digest(&image, &memory.accountant)?;
     let image = DirectOwnedImage {
         snapshot: DirectSnapshot {
             image_id: digest.complete,
@@ -134,6 +167,7 @@ fn build_committed_image(
         target: Arc::new(database) as Arc<dyn ReadExecutionTarget>,
         image: Arc::new(image),
         digest,
+        memory,
     })
 }
 
@@ -448,6 +482,9 @@ pub(crate) fn project_schema(table: &str, meta: &contextdb_core::TableMeta) -> D
                     }),
                 quantization: matches!(column.column_type, ColumnType::Vector(_))
                     .then(|| direct_quantization(column.quantization)),
+                partition_key_columns: column.partition_key_columns.clone().unwrap_or_default(),
+                max_partitions: column.effective_max_partitions(),
+                search_mode: column.search_mode,
                 rank: column.rank_policy.as_ref().map(|rank| DirectRankPolicy {
                     sort_key: rank.sort_key.clone(),
                     formula: rank.formula.clone(),
@@ -616,14 +653,17 @@ fn propagation_sort_key(rule: &DirectPropagationRule) -> (u8, String, String) {
 }
 
 /// Length-prefixed absorption, so two different shapes cannot hash alike.
-#[derive(Default)]
 struct FamilyDigest {
     hasher: blake3::Hasher,
+    accountant: Arc<MemoryAccountant>,
 }
 
 impl FamilyDigest {
-    fn new() -> Self {
-        Self::default()
+    fn new(accountant: &Arc<MemoryAccountant>) -> Self {
+        Self {
+            hasher: blake3::Hasher::new(),
+            accountant: accountant.clone(),
+        }
     }
 
     fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
@@ -651,6 +691,14 @@ impl FamilyDigest {
     /// which is per-process, so identity is taken over a key-sorted rendering
     /// instead.
     fn canonical_set<T: serde::Serialize>(&mut self, values: &[T]) -> Result<&mut Self> {
+        let mut workspace =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        workspace.try_grow_for(
+            crate::read_image_memory::canonical_workspace(values)?,
+            "direct_read",
+            "canonical_image_identity",
+            "Raise MEMORY_LIMIT to admit canonical image identity workspace.",
+        )?;
         let mut rendered = values
             .iter()
             .map(|value| {
@@ -677,8 +725,11 @@ impl FamilyDigest {
     }
 }
 
-fn typed_digest(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
-    let mut relational = FamilyDigest::new();
+fn typed_digest(
+    image: &DirectOwnedImage,
+    accountant: &Arc<MemoryAccountant>,
+) -> Result<DirectTypedImageDigest> {
+    let mut relational = FamilyDigest::new(accountant);
     for row in &image.relational_rows {
         relational.text(&row.table).number(row.row_id.0);
         for (column, value) in &row.values {
@@ -687,7 +738,7 @@ fn typed_digest(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
         }
     }
 
-    let mut graph = FamilyDigest::new();
+    let mut graph = FamilyDigest::new(accountant);
     for edge in &image.graph_edges {
         graph
             .text(&edge.edge_type)
@@ -700,9 +751,9 @@ fn typed_digest(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
     }
 
     let mut families = [
-        FamilyDigest::new(),
-        FamilyDigest::new(),
-        FamilyDigest::new(),
+        FamilyDigest::new(accountant),
+        FamilyDigest::new(accountant),
+        FamilyDigest::new(accountant),
     ];
     for vector in &image.vectors {
         let family = match vector.quantization {
@@ -720,8 +771,8 @@ fn typed_digest(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
         }
     }
 
-    let mut schema_and_indexes = FamilyDigest::new();
-    let mut policy = FamilyDigest::new();
+    let mut schema_and_indexes = FamilyDigest::new(accountant);
+    let mut policy = FamilyDigest::new(accountant);
     for schema in &image.configuration.schemas {
         schema_and_indexes
             .text(&schema.table)
@@ -736,6 +787,18 @@ fn typed_digest(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
                 .flag(column.immutable)
                 .flag(column.expires)
                 .text(column.default.as_deref().unwrap_or_default());
+            schema_and_indexes.number(column.partition_key_columns.len() as u64);
+            for partition_column in &column.partition_key_columns {
+                schema_and_indexes.text(partition_column);
+            }
+            schema_and_indexes
+                .flag(column.max_partitions.is_some())
+                .number(u64::from(column.max_partitions.unwrap_or_default()))
+                .number(match column.search_mode {
+                    contextdb_core::VectorSearchMode::Auto => 0,
+                    contextdb_core::VectorSearchMode::Exact => 1,
+                    contextdb_core::VectorSearchMode::Indexed => 2,
+                });
         }
         for column in &schema.primary_key {
             schema_and_indexes.text(column);
@@ -763,7 +826,7 @@ fn typed_digest(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
         }
     }
 
-    let mut sync = FamilyDigest::new();
+    let mut sync = FamilyDigest::new(accountant);
     sync.number(image.sync.watermark.0);
     for source in &image.sync.sources {
         sync.number(source.row_lsn.0)
@@ -775,7 +838,7 @@ fn typed_digest(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
             .text(&table.conflict_policy);
     }
 
-    let mut change_and_ddl = FamilyDigest::new();
+    let mut change_and_ddl = FamilyDigest::new(accountant);
     change_and_ddl
         .number(image.changes.current_lsn.0)
         .number(image.changes.committed_watermark.0)
@@ -798,12 +861,12 @@ fn typed_digest(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
         change_and_ddl.number(lsn.0);
     }
 
-    let mut configuration = FamilyDigest::new();
+    let mut configuration = FamilyDigest::new(accountant);
     configuration
         .number(image.configuration.memory_limit_bytes.unwrap_or_default() as u64)
         .number(image.configuration.disk_limit_bytes.unwrap_or_default());
 
-    let mut status = FamilyDigest::new();
+    let mut status = FamilyDigest::new(accountant);
     for event in &image.events.event_types {
         status
             .text(&event.name)
@@ -854,7 +917,7 @@ fn typed_digest(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
     let configuration = configuration.finish();
     let status = status.finish();
 
-    let mut complete = FamilyDigest::new();
+    let mut complete = FamilyDigest::new(accountant);
     for family in [
         &relational,
         &graph,
@@ -905,6 +968,192 @@ fn unused_error_shape(error: Error) -> Error {
     error
 }
 
+fn write_vector_search_disclosure(
+    bytes: &mut crate::read_contract::CanonicalWriter,
+    disclosure: Option<&crate::database::VectorSearchDisclosure>,
+) {
+    let Some(disclosure) = disclosure else {
+        bytes.tag(0);
+        return;
+    };
+    let mode = |mode| match mode {
+        contextdb_core::VectorSearchMode::Auto => 0,
+        contextdb_core::VectorSearchMode::Exact => 1,
+        contextdb_core::VectorSearchMode::Indexed => 2,
+    };
+    bytes
+        .tag(1)
+        .tag(mode(disclosure.requested_mode))
+        .tag(mode(disclosure.resolved_mode));
+    // An unresolved count is absent, never zero: zero is a complete empty
+    // authorized scope.
+    match disclosure.aggregate_allowed_vectors {
+        Some(count) => bytes.tag(1).count(count as u64),
+        None => bytes.tag(0),
+    };
+    bytes
+        .count(disclosure.effective_auto_index_at as u64)
+        .text(&disclosure.auto_index_at_source)
+        .count(disclosure.partition_key_columns.len() as u64);
+    for column in &disclosure.partition_key_columns {
+        bytes.text(column);
+    }
+    bytes
+        .tag(match disclosure.scope {
+            crate::database::VectorSearchScopeShape::One => 0,
+            crate::database::VectorSearchScopeShape::Few => 1,
+            crate::database::VectorSearchScopeShape::All => 2,
+        })
+        .tag(match disclosure.route {
+            None => 0,
+            Some(crate::database::VectorSearchRoute::Exact) => 1,
+            Some(crate::database::VectorSearchRoute::Indexed) => 2,
+            Some(crate::database::VectorSearchRoute::FilteredIndexed) => 3,
+        })
+        .tag(match disclosure.base {
+            crate::database::VectorSearchLayerPresence::Present => 1,
+            crate::database::VectorSearchLayerPresence::Absent => 0,
+        })
+        .tag(match disclosure.change {
+            crate::database::VectorSearchLayerPresence::Present => 1,
+            crate::database::VectorSearchLayerPresence::Absent => 0,
+        })
+        .tag(match disclosure.tail {
+            crate::database::VectorSearchTailState::Present => 1,
+            crate::database::VectorSearchTailState::Empty => 0,
+        })
+        .tag(match disclosure.residual {
+            crate::database::VectorSearchResidual::None => 0,
+            crate::database::VectorSearchResidual::Bounded => 1,
+            crate::database::VectorSearchResidual::Unsupported => 2,
+        })
+        .optional_text(disclosure.fallback.as_deref())
+        .optional_text(disclosure.refusal.as_deref())
+        .optional_text(disclosure.recovery.as_deref())
+        .tag(match disclosure.query_source {
+            crate::database::VectorQuerySourceDisclosure::Vector => 0,
+            crate::database::VectorQuerySourceDisclosure::RedactedRowKey => 1,
+            crate::database::VectorQuerySourceDisclosure::Unknown => 2,
+        })
+        .count(disclosure.partition_hnsw.len() as u64);
+    for partition in &disclosure.partition_hnsw {
+        bytes
+            .text(&partition.partition)
+            .count(partition.hnsw_m as u64)
+            .count(partition.hnsw_ef_construction as u64)
+            .count(partition.hnsw_ef_search as u64)
+            .text(&partition.ef_search_source)
+            .count(partition.policy_revision);
+    }
+}
+
+fn read_vector_search_disclosure(
+    bytes: &mut crate::read_contract::CanonicalReader<'_>,
+) -> std::result::Result<
+    Option<crate::database::VectorSearchDisclosure>,
+    crate::read_contract::ReadEncodingError,
+> {
+    match bytes.tag()? {
+        0 => return Ok(None),
+        1 => {}
+        _ => return Err(invalid_metadata_payload()),
+    }
+    let mode = |tag| match tag {
+        0 => Ok(contextdb_core::VectorSearchMode::Auto),
+        1 => Ok(contextdb_core::VectorSearchMode::Exact),
+        2 => Ok(contextdb_core::VectorSearchMode::Indexed),
+        _ => Err(invalid_metadata_payload()),
+    };
+    let requested_mode = mode(bytes.tag()?)?;
+    let resolved_mode = mode(bytes.tag()?)?;
+    let aggregate_allowed_vectors = match bytes.tag()? {
+        0 => None,
+        1 => Some(usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?),
+        _ => return Err(invalid_metadata_payload()),
+    };
+    let effective_auto_index_at =
+        usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?;
+    let auto_index_at_source = bytes.text()?;
+    let column_count = bytes.element_count()?;
+    let mut partition_key_columns = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        partition_key_columns.push(bytes.text()?);
+    }
+    let scope = match bytes.tag()? {
+        0 => crate::database::VectorSearchScopeShape::One,
+        1 => crate::database::VectorSearchScopeShape::Few,
+        2 => crate::database::VectorSearchScopeShape::All,
+        _ => return Err(invalid_metadata_payload()),
+    };
+    let route = match bytes.tag()? {
+        0 => None,
+        1 => Some(crate::database::VectorSearchRoute::Exact),
+        2 => Some(crate::database::VectorSearchRoute::Indexed),
+        3 => Some(crate::database::VectorSearchRoute::FilteredIndexed),
+        _ => return Err(invalid_metadata_payload()),
+    };
+    let layer = |tag| match tag {
+        0 => Ok(crate::database::VectorSearchLayerPresence::Absent),
+        1 => Ok(crate::database::VectorSearchLayerPresence::Present),
+        _ => Err(invalid_metadata_payload()),
+    };
+    let base = layer(bytes.tag()?)?;
+    let change = layer(bytes.tag()?)?;
+    let tail = match bytes.tag()? {
+        0 => crate::database::VectorSearchTailState::Empty,
+        1 => crate::database::VectorSearchTailState::Present,
+        _ => return Err(invalid_metadata_payload()),
+    };
+    let residual = match bytes.tag()? {
+        0 => crate::database::VectorSearchResidual::None,
+        1 => crate::database::VectorSearchResidual::Bounded,
+        2 => crate::database::VectorSearchResidual::Unsupported,
+        _ => return Err(invalid_metadata_payload()),
+    };
+    let fallback = bytes.optional_text()?;
+    let refusal = bytes.optional_text()?;
+    let recovery = bytes.optional_text()?;
+    let query_source = match bytes.tag()? {
+        0 => crate::database::VectorQuerySourceDisclosure::Vector,
+        1 => crate::database::VectorQuerySourceDisclosure::RedactedRowKey,
+        2 => crate::database::VectorQuerySourceDisclosure::Unknown,
+        _ => return Err(invalid_metadata_payload()),
+    };
+    let partition_count = bytes.element_count()?;
+    let mut partition_hnsw = Vec::with_capacity(partition_count);
+    for _ in 0..partition_count {
+        partition_hnsw.push(crate::database::VectorPartitionHnswDisclosure {
+            partition: bytes.text()?,
+            hnsw_m: usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?,
+            hnsw_ef_construction: usize::try_from(bytes.count()?)
+                .map_err(|_| invalid_metadata_payload())?,
+            hnsw_ef_search: usize::try_from(bytes.count()?)
+                .map_err(|_| invalid_metadata_payload())?,
+            ef_search_source: bytes.text()?,
+            policy_revision: bytes.count()?,
+        });
+    }
+    Ok(Some(crate::database::VectorSearchDisclosure {
+        requested_mode,
+        resolved_mode,
+        aggregate_allowed_vectors,
+        effective_auto_index_at,
+        auto_index_at_source,
+        partition_key_columns,
+        scope,
+        route,
+        base,
+        change,
+        tail,
+        residual,
+        fallback,
+        refusal,
+        recovery,
+        query_source,
+        partition_hnsw,
+    }))
+}
+
 /// Write one metadata answer into canonical bytes.
 ///
 /// Ordering here is the document's own: the shape a reader gets back is the
@@ -942,12 +1191,14 @@ pub(crate) fn write_metadata_body(
             sql,
             physical_plan,
             index,
+            vector_search,
         } => {
             bytes
                 .tag(2)
                 .text(sql)
                 .text(physical_plan)
                 .optional_text(index.as_deref());
+            write_vector_search_disclosure(bytes, vector_search.as_ref());
         }
         DirectMetadataBody::EventsStatus {
             status,
@@ -1060,11 +1311,18 @@ pub(crate) fn read_metadata_body(
         1 => Ok(DirectMetadataBody::Schema {
             schema: read_schema(bytes)?,
         }),
-        2 => Ok(DirectMetadataBody::Explain {
-            sql: bytes.text()?,
-            physical_plan: bytes.text()?,
-            index: bytes.optional_text()?,
-        }),
+        2 => {
+            let sql = bytes.text()?;
+            let physical_plan = bytes.text()?;
+            let index = bytes.optional_text()?;
+            let vector_search = read_vector_search_disclosure(bytes)?;
+            Ok(DirectMetadataBody::Explain {
+                sql,
+                physical_plan,
+                index,
+                vector_search,
+            })
+        }
         3 => {
             let status = read_events(bytes)?;
             let has_more = bytes.flag()?;
@@ -1329,6 +1587,22 @@ fn read_schema(
             }
             _ => return Err(invalid_metadata_payload()),
         };
+        let partition_key_count = bytes.element_count()?;
+        let mut partition_key_columns = Vec::with_capacity(partition_key_count);
+        for _ in 0..partition_key_count {
+            partition_key_columns.push(bytes.text()?);
+        }
+        let max_partitions = match bytes.tag()? {
+            0 => None,
+            1 => Some(u32::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?),
+            _ => return Err(invalid_metadata_payload()),
+        };
+        let search_mode = match bytes.tag()? {
+            0 => contextdb_core::VectorSearchMode::Auto,
+            1 => contextdb_core::VectorSearchMode::Exact,
+            2 => contextdb_core::VectorSearchMode::Indexed,
+            _ => return Err(invalid_metadata_payload()),
+        };
         columns.push(DirectSchemaColumn {
             name,
             data_type,
@@ -1340,6 +1614,9 @@ fn read_schema(
             default,
             references,
             quantization,
+            partition_key_columns,
+            max_partitions,
+            search_mode,
             rank,
             scope_label,
             acl_ref,
@@ -1643,6 +1920,23 @@ fn write_schema(bytes: &mut crate::read_contract::CanonicalWriter, schema: &Dire
                 bytes.tag(0);
             }
         }
+        bytes.count(column.partition_key_columns.len() as u64);
+        for partition_column in &column.partition_key_columns {
+            bytes.text(partition_column);
+        }
+        match column.max_partitions {
+            Some(max_partitions) => {
+                bytes.tag(1).count(u64::from(max_partitions));
+            }
+            None => {
+                bytes.tag(0);
+            }
+        }
+        bytes.tag(match column.search_mode {
+            contextdb_core::VectorSearchMode::Auto => 0,
+            contextdb_core::VectorSearchMode::Exact => 1,
+            contextdb_core::VectorSearchMode::Indexed => 2,
+        });
     }
     bytes.count(schema.primary_key.len() as u64);
     for column in &schema.primary_key {
@@ -1835,9 +2129,14 @@ pub(crate) fn project_metadata_from_database(
                 schema: project_schema(&table, &meta),
             }
         }
-        DirectMetadataRequest::Explain { sql } => {
-            explained_statement(database, sql, limits, Arc::clone(&clock), cancellation)?
-        }
+        DirectMetadataRequest::Explain { sql, params } => explained_statement(
+            database,
+            sql,
+            &params,
+            limits,
+            Arc::clone(&clock),
+            cancellation,
+        )?,
         DirectMetadataRequest::EventsStatus => {
             let page = paged(
                 MetadataPageVocabulary::EventsStatus,
@@ -1962,9 +2261,14 @@ pub(crate) fn project_metadata(
                 })?;
             DirectMetadataBody::Schema { schema }
         }
-        DirectMetadataRequest::Explain { sql } => {
-            explained_statement(target, sql, limits, Arc::clone(&clock), cancellation)?
-        }
+        DirectMetadataRequest::Explain { sql, params } => explained_statement(
+            target,
+            sql,
+            &params,
+            limits,
+            Arc::clone(&clock),
+            cancellation,
+        )?,
         DirectMetadataRequest::EventsStatus => {
             let page = paged(
                 MetadataPageVocabulary::EventsStatus,
@@ -2013,51 +2317,44 @@ pub(crate) fn project_metadata(
     })
 }
 
-/// What the engine would do with this statement, answered the only honest way
-/// for the kind of statement it is.
+/// What the engine would do with this statement, without running it.
 ///
-/// A READ is run: the route a read really takes -- which index it picks, what
-/// it pushes down, what it rejects -- is only known once it has taken it, and
-/// running it changes nothing. A WRITE is planned and NOT run: `.explain
-/// DELETE FROM t` has to leave the rows alone, so what it answers is the plan
-/// the engine chose, which reads schema and decides a strategy and touches no
-/// data. Refusing to explain a write at all -- which is what asking the
-/// bounded read door for a write plan used to produce -- turns "here is what
-/// this WOULD do" into "no", which is not what explaining is for.
+/// This is metadata: explaining a vector read must not hydrate a dormant
+/// graph, replay its journal, spend request memory, or change the next route.
+/// Executed-route facts belong to the ordinary query trace instead.
 ///
-/// No index is reported for a planned write, because nothing ran to pick one;
-/// reporting one would be a claim about an execution that never happened.
+/// The statement is planned against the caller's own binding, the same way
+/// the owner plans it for a caller in its own process: a partition scope
+/// resolves only after its key binds, so the binding is what decides the
+/// count and route this answer reports.
 pub(crate) fn explained_statement(
     target: &dyn ReadExecutionTarget,
     sql: String,
+    params: &HashMap<String, Value>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
     cancellation: &OwnerReadCancellation,
 ) -> std::result::Result<DirectMetadataBody, DirectFileReaderError> {
     let statement = contextdb_parser::parse(&sql)
         .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
-    if contextdb_parser::statement_effect(&statement) != contextdb_parser::StatementEffect::Read {
-        let physical_plan = target
-            .explain_plan_without_running_it(&sql)
-            .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
+    let explained = target
+        .explain_output_without_running_it(&sql, params)
+        .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
+    if contextdb_parser::statement_effect(&statement) != contextdb_parser::StatementEffect::Read
+        || explained.vector_search.is_some()
+    {
         return Ok(DirectMetadataBody::Explain {
-            physical_plan,
-            index: None,
+            physical_plan: explained.physical_plan,
+            index: explained.index_used,
+            vector_search: explained.vector_search,
             sql,
         });
     }
-    // An explain request carries a statement, not the values a caller would
-    // run it with, and the engine's plan can depend on those values -- an
-    // index seek needs something to seek to. Every parameter the statement
-    // names is therefore bound to nothing, which is the honest reading of
-    // "explain this statement, with no values supplied", and keeps the answer
-    // the engine's own rather than a second description of what it might have
-    // chosen.
-    let params = explain_bindings(target, &sql);
-    let answered = target.read_query(&sql, &params, limits, clock, cancellation)?;
+    let answered = target.read_query(&sql, params, limits, clock, cancellation)?;
     Ok(DirectMetadataBody::Explain {
         physical_plan: answered.0.trace.physical_plan.to_owned(),
         index: answered.0.trace.index_used.clone(),
+        vector_search: None,
         sql,
     })
 }
@@ -2099,136 +2396,5 @@ fn admit_complete(
     match crate::metadata_page::admit_complete_metadata(payload.len(), result_bytes) {
         Some(failure) => Err(DirectFileReaderError::ReadFailure(failure)),
         None => Ok(()),
-    }
-}
-
-/// Stand-in values for the parameters an explain request does not carry.
-///
-/// A plan can depend on the values a statement is run with -- an index seek
-/// needs something of the column's own type to seek on -- so explaining a
-/// parameterized statement with nothing bound would answer for a query nobody
-/// asked about. Each parameter compared against a column is therefore bound
-/// to an empty value OF THAT COLUMN'S TYPE, which is what makes the answer
-/// the plan the engine really chooses for this statement rather than the
-/// fallback it chooses when it has nothing to seek on.
-fn explain_bindings(target: &dyn ReadExecutionTarget, sql: &str) -> HashMap<String, Value> {
-    let mut bound = HashMap::new();
-    let Ok(statement) = contextdb_parser::parse(sql) else {
-        return bound;
-    };
-    let Ok(plan) = contextdb_planner::plan(&statement) else {
-        return bound;
-    };
-    let mut predicates = Vec::new();
-    collect_plan_predicates(&plan, &mut predicates);
-    for (table, predicate) in predicates {
-        let Some(meta) = target.table_meta(&table) else {
-            continue;
-        };
-        let mut compared = Vec::new();
-        collect_compared_parameters(predicate, &mut compared);
-        for (column, request) in compared {
-            if bound.contains_key(&request) {
-                continue;
-            }
-            if let Some(declaration) = meta.columns.iter().find(|entry| entry.name == column) {
-                bound.insert(request, empty_value_of_type(&declaration.column_type));
-            }
-        }
-    }
-    bound
-}
-
-/// Every filter a plan applies, with the table it applies to.
-fn collect_plan_predicates<'a>(
-    plan: &'a PhysicalPlan,
-    found: &mut Vec<(String, &'a contextdb_parser::ast::Expr)>,
-) {
-    match plan {
-        PhysicalPlan::Scan {
-            table,
-            filter: Some(filter),
-            ..
-        } => found.push((table.clone(), filter)),
-        PhysicalPlan::Filter { input, predicate } => {
-            if let Some(table) = plan_table(input) {
-                found.push((table, predicate));
-            }
-            collect_plan_predicates(input, found);
-        }
-        PhysicalPlan::Project { input, .. }
-        | PhysicalPlan::Distinct { input, .. }
-        | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::Limit { input, .. } => collect_plan_predicates(input, found),
-        _ => {}
-    }
-}
-
-fn plan_table(plan: &PhysicalPlan) -> Option<String> {
-    match plan {
-        PhysicalPlan::Scan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
-            Some(table.clone())
-        }
-        PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Project { input, .. }
-        | PhysicalPlan::Distinct { input, .. }
-        | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::Limit { input, .. } => plan_table(input),
-        _ => None,
-    }
-}
-
-/// Every `column <op> $parameter` pairing a predicate makes, either way round.
-fn collect_compared_parameters(
-    predicate: &contextdb_parser::ast::Expr,
-    found: &mut Vec<(String, String)>,
-) {
-    use contextdb_parser::ast::Expr;
-
-    match predicate {
-        Expr::BinaryOp { left, right, .. } => {
-            match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(column), Expr::Parameter(request))
-                | (Expr::Parameter(request), Expr::Column(column)) => {
-                    found.push((column.column.clone(), request.clone()));
-                }
-                _ => {}
-            }
-            collect_compared_parameters(left, found);
-            collect_compared_parameters(right, found);
-        }
-        Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
-            collect_compared_parameters(operand, found);
-        }
-        Expr::InList { expr, list, .. } => {
-            if let Expr::Column(column) = expr.as_ref() {
-                for entry in list {
-                    if let Expr::Parameter(request) = entry {
-                        found.push((column.column.clone(), request.clone()));
-                    }
-                }
-            }
-            collect_compared_parameters(expr, found);
-        }
-        Expr::Like { expr, pattern, .. } => {
-            if let (Expr::Column(column), Expr::Parameter(request)) =
-                (expr.as_ref(), pattern.as_ref())
-            {
-                found.push((column.column.clone(), request.clone()));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn empty_value_of_type(column_type: &ColumnType) -> Value {
-    match column_type {
-        ColumnType::Integer | ColumnType::TxId => Value::Int64(0),
-        ColumnType::Real => Value::Float64(0.0),
-        ColumnType::Text | ColumnType::Json => Value::Text(String::new()),
-        ColumnType::Boolean => Value::Bool(false),
-        ColumnType::Uuid => Value::Uuid(uuid::Uuid::nil()),
-        ColumnType::Timestamp => Value::Timestamp(0),
-        ColumnType::Vector(dimension) => Value::Vector(vec![0.0; *dimension]),
     }
 }

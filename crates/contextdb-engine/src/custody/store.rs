@@ -1,4 +1,4 @@
-//! Statements 7/11/13/15/17: key-indexed committed metadata and touched-record validation.
+//! Key-indexed committed metadata and touched-record validation.
 //! The index owns each decoded record once. A unit reads/clones only its selected keys;
 //! admitting a delta never clones or revalidates the historical journal.
 use super::{authority::object_digest, canonical::*, records::*};

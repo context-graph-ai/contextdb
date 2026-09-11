@@ -27,6 +27,7 @@ use contextdb_core::read_contract::{
 };
 use contextdb_core::{Error, Value};
 use contextdb_engine::Database;
+use serial_test::serial;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -299,6 +300,7 @@ fn read_under(what: &str, limits: ReadLimits, expected_limit: ReadFailureLimit) 
 }
 
 #[test]
+#[serial]
 fn reading_a_large_staged_write_set_stays_inside_a_small_memory_ceiling() {
     read_under(
         "a small memory ceiling",
@@ -311,6 +313,7 @@ fn reading_a_large_staged_write_set_stays_inside_a_small_memory_ceiling() {
 }
 
 #[test]
+#[serial]
 fn reading_a_large_staged_write_set_stays_inside_a_small_work_ceiling() {
     read_under(
         "a small work ceiling",
@@ -388,6 +391,7 @@ fn committed_payload_graph() -> Database {
 /// This is also why the paging measurement below reads a COMMITTED graph: a
 /// paged walk of STAGED work is not a shape the store offers.
 #[test]
+#[serial]
 fn a_cursor_over_staged_work_is_refused_while_the_transaction_is_open() {
     let database = seeded();
     stage_a_large_write_set(&database);
@@ -431,6 +435,7 @@ fn a_cursor_over_staged_work_is_refused_while_the_transaction_is_open() {
 /// a WRONG one -- the rows it never delivered are indistinguishable from rows
 /// the walk does not have.
 #[test]
+#[serial]
 fn paging_through_a_walk_delivers_every_row_the_walk_has() {
     let database = committed_payload_graph();
     let expected_rows = database
@@ -489,6 +494,7 @@ fn paging_through_a_walk_delivers_every_row_the_walk_has() {
 }
 
 #[test]
+#[serial]
 fn paging_through_a_walk_costs_what_walking_it_once_costs() {
     let database = committed_payload_graph();
     // How many rows the walk really has, taken from the executor rather than

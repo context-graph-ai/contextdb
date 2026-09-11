@@ -1,4 +1,4 @@
-//! Statements 9/10/14: partition only the ordinary remainder of a custody envelope.
+//! Partition only the ordinary remainder of a custody envelope.
 //! The normal apply seam still owns arbitration and dependency-complete refusal.
 use super::*;
 

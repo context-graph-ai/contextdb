@@ -111,7 +111,7 @@ fn local_schema_authoring_never_publishes_a_metadata_only_index_or_uses_a_vanish
         "a projected table must build its postings first, then publish rows, metadata, and indexes together"
     );
     assert!(
-        database.contains("RelationalStore::projected_index_storage(&meta, &rows)")
+        database.contains("RelationalStore::projected_index_storage_with_budget(meta, rows, self.accountant.clone())")
             && database
                 .contains("store.publish_table_projection(name, meta, rows, projected_indexes)"),
         "the durable local-DDL publisher must use the coherent relational projection path"
@@ -184,11 +184,18 @@ fn outbound_changeset_extraction_holds_the_schema_gate_before_commit_sampling() 
         .expect("end of checked outbound extraction");
     let checked = &checked_tail[..checked_end];
 
+    let base_start = database
+        .find("fn changes_since_base(&self, since_lsn: Lsn)")
+        .expect("commit-locked outbound base extraction");
+    let base_tail = &database[base_start..];
+    let base_end = base_tail
+        .find("\n    pub(crate) fn ordinary_dependency_complete_outbound_units")
+        .expect("end of commit-locked outbound base extraction");
+    let base = &base_tail[..base_end];
     assert!(
-        database.contains("fn changes_since_under_schema_gate(&self, since_lsn: Lsn) -> ChangeSet")
-            && database.contains("self.changes_since_base(since_lsn).0")
-            && database.contains("Take schema before changes_since_base takes the commit mutex"),
-        "outbound extraction must acquire schema before its commit-locked base snapshot"
+        base.contains("self.enter_schema_publication_gate(false)")
+            && base.contains("let _operation = self.assert_open_operation();"),
+        "outbound base extraction must retain its schema gate before sampling committed changes"
     );
     assert!(
         database
@@ -266,7 +273,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .map(|offset| client_provenance + offset)
         .expect("push drops lease");
     let client_await = client[client_drop..]
-        .find("self.request_push(encoded).await")
+        .find(".request_push(encoded, protocol_version, retry_safety)")
         .map(|offset| client_drop + offset)
         .expect("push awaits transport after lease");
     assert!(

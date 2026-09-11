@@ -2,24 +2,16 @@
 
 ## Why this crate exists
 
-This crate is a temporary fork of upstream `hnsw_rs-0.3.4` (crates.io). Upstream
-does not expose a way to seed the level-assignment RNG, which contextdb requires
-for deterministic HNSW rebuilds. The only delta from upstream is
-`new_with_seed` constructors on `LayerGenerator`, `PointIndexation`, and `Hnsw`.
+This crate is ContextDB's maintained fork of upstream `hnsw_rs` 0.3.4 (crates.io), packaged as
+`contextdb-hnsw` while keeping the Rust library name `hnsw_rs`. It adds what ContextDB's vector
+search depends on and upstream does not provide: seeded constructors for deterministic graph
+rebuilds, non-panicking iteration over a graph with no points, an owned and validated graph
+encoding that reloads as a read-only graph, and allowed-set search with hard work limits.
 
-**Retire this crate** when upstream `hnsw_rs` publishes a release that accepts a
-caller-provided RNG seed on `Hnsw::new`. At that point: bump the workspace
-`hnsw_rs` dependency to that release, delete `crates/contextdb-hnsw/`, remove it
-from `Cargo.toml` workspace members, and switch `crates/contextdb-vector/Cargo.toml`
-back to `hnsw_rs = "<new-version>"`.
-
-Upstream tracking: https://github.com/jean-pierreBoth/hnswlib-rs (file an issue or
-PR for `Hnsw::new_with_seed` if none exists).
-
-ContextDB packages this crate as `contextdb-hnsw` while keeping the Rust
-library name `hnsw_rs` for compatibility with the upstream API. This package is
-based on `hnsw_rs` 0.3.4 and adds ContextDB-owned seeded constructors for
-deterministic HNSW rebuilds.
+[MAINTENANCE.md](MAINTENANCE.md) records the exact upstream package, the complete source delta
+([upstream-0.3.4.patch](upstream-0.3.4.patch)), the upgrade procedure, and the upstream proposals
+that would let the fork shrink. The fork stays until upstream carries every one of those
+capabilities; removing it breaks vector search.
 
 This crate provides a Rust implementation of the paper by Yu.A. Malkov and D.A Yashunin:
 

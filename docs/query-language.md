@@ -76,6 +76,10 @@ ALTER TABLE t DROP RETAIN
 ALTER TABLE t SET HISTORY ALL | CURRENT ONLY
 ALTER TABLE t SET SYNC OFF | SYNC PUSH ONLY | SYNC PULL ONLY | SYNC TWO WAY
 ALTER TABLE t SET SYNC CONFLICT KEEP FIRST | KEEP LATEST
+ALTER TABLE t ALTER COLUMN vector_col SET MAX_PARTITIONS positive_integer
+ALTER TABLE t ALTER COLUMN vector_col SET SEARCH_MODE AUTO | EXACT | INDEXED
+ALTER TABLE t ALTER COLUMN vector_col SET AUTO_INDEX_AT positive_integer | DEFAULT
+ALTER TABLE t ALTER COLUMN vector_col SET HNSW DEFAULT | (M = positive_integer | DEFAULT, EF_CONSTRUCTION = positive_integer | DEFAULT, EF_SEARCH = positive_integer | DEFAULT)
 ```
 
 `COLUMN` is optional on `ADD` but required on `DROP` — `ALTER TABLE t DROP a` does not parse;
@@ -144,6 +148,10 @@ CREATE INDEX idx_name ON t (col)
 ```
 
 ### INSERT
+
+In the Rust API, a missing binding for a required `INSERT` value returns the existing
+`Error::NotFound` naming the parameter before the row is staged. A supplied `NULL` remains a
+constraint violation; a missing binding is not silently converted to `NULL`.
 
 ```sql
 INSERT INTO documents (id, data, embedding)
@@ -287,20 +295,41 @@ ROLLBACK;
 
 ```sql
 SHOW SYNC_CONFLICT_POLICY;
-SET MEMORY_LIMIT '512M';
+SET MEMORY_LIMIT 512M;
 SHOW MEMORY_LIMIT;
-SET DISK_LIMIT '1G';
-SET DISK_LIMIT 'none';
+SET MEMORY_LIMIT NONE;
+SET DISK_LIMIT 1G;
+SET DISK_LIMIT NONE;
 SHOW DISK_LIMIT;
+SET MAINTENANCE_POLL_INTERVAL 250 MILLISECONDS;
+SET MAINTENANCE_POLL_INTERVAL '5 SECONDS';
+SHOW MAINTENANCE_POLL_INTERVAL;
 ```
 
 `SHOW SYNC_CONFLICT_POLICY` returns one `policy` column: a first row giving the bare deployment default (`keep_first`), then one `{table}={word}` row per table that declares a conflict policy, plus one such row for each built-in work-ledger table (and `peer_directory`) currently present in the store, suffixed `(engine-owned)` to distinguish it from an operator-declared row.
 
 `SHOW MEMORY_LIMIT` returns `limit`, `used`, `available`, and `startup_ceiling`.
+Size suffixes are binary. Both settings accept an unquoted or quoted size and `NONE`: `SET MEMORY_LIMIT 2G`,
+`SET MEMORY_LIMIT '2G'`, `SET DISK_LIMIT 2G`, and `SET DISK_LIMIT NONE` use the same forms. `2G` resolves to
+**2147483648 bytes**. CLI `--memory-limit 2G` uses the same value. The limit governs charged bytes,
+which are separate from whole-process RSS.
 
 `SHOW DISK_LIMIT` returns the same columns for file-backed storage. On `:memory:` databases, disk limit commands are accepted but ignored.
 
+`SHOW MAINTENANCE_POLL_INTERVAL` returns one `milliseconds` column. The default is 60,000 ms.
+`SET MAINTENANCE_POLL_INTERVAL` accepts a positive integer followed by `MILLISECONDS` or `SECONDS`,
+either unquoted or as one quoted value. The CLI flag `--maintenance-poll-ms` remains an integer
+millisecond value, not SQL text. If that flag is omitted, a file-backed store keeps and uses its
+persisted interval.
+For a file-backed database the value persists and governs later opens. Time wakes the engine-owned
+worker; the declared per-column thresholds decide whether vector consolidation runs.
+
 ---
+
+Schema inspection preserves authored `CONTEXT_ID`, `SCOPE_LABEL (...)`, and
+`SCOPE_LABEL_READ (...) WRITE (...)` in rendered `.schema` DDL. The typed schema answer also keeps
+Simple and Split scope-label forms and their label sets. A synced full-schema restore retains the
+same access declarations; local vector partition keys grant no additional access.
 
 ## Column Types
 
@@ -363,10 +392,14 @@ Inspect registered vector indexes with:
 
 ```sql
 SHOW VECTOR_INDEXES;
+SHOW VECTOR_PARTITIONS FOR media.vector_vision;
 ```
 
-It returns `table`, `column`, `dimension`, `quantization`, `vector_count`, and
-`bytes`.
+`SHOW VECTOR_INDEXES` returns one summary row per `(table, column)` with its
+declaration, aggregate lifecycle and accounting state. `SHOW VECTOR_PARTITIONS`
+returns the typed-key detail for individual layouts; use its optional `FOR`,
+`LIMIT`, and `OFFSET` clauses when a column has many layouts. Inspection is
+read-only and does not build, replay, or repair an index.
 
 ### Rank Policies
 
@@ -481,11 +514,14 @@ made the formula large.
 
 Current limits to account for in production designs:
 
-- On large HNSW-backed vector indexes, rank policies rank the ANN candidate set
-  returned by vector retrieval before applying the final top-k. They do not
-  force an exhaustive scan of every row in the corpus. If a formula does not
-  reference `{vector_score}`, use a larger search limit or an exact workflow
-  when cosine is a weak candidate generator for the metric being optimized.
+- `INDEXED` — and `AUTO` on the indexed route — ranks the rank formula over the
+  bounded candidate set vector retrieval returns, then applies the final
+  top-k; it does not force an exhaustive scan of every row in the corpus.
+  `USE VECTOR EXACT` evaluates the rank formula over every allowed stored
+  vector before the final `LIMIT`. If a formula does not reference
+  `{vector_score}` and cosine is a weak candidate generator for the metric
+  being optimized, use `USE VECTOR EXACT` rather than widening the search
+  limit.
 - If more than one joined row matches a candidate, the current policy uses one
   matched row, chosen by highest internal `RowId`. Model joined data as a
   single current summary row when ranking semantics need to be stable.
@@ -908,7 +944,7 @@ When a `tasks` row transitions to `invalidated`, rows connected via incoming `CI
 
 ### PROPAGATE ON STATE ... EXCLUDE VECTOR
 
-Remove a row's vector from similarity search results when it enters a given state, without deleting the row:
+Remove a row's vector from similarity search results when it enters a given state, without deleting the row: <!-- enforced by: vector_exclusion_persistence_tests::excluded_vector_stays_excluded_across_reopen, parser_tests::ddl_state_propagation_vector_exclusions_parse -->
 
 ```sql
 CREATE TABLE tasks (...)
@@ -1130,7 +1166,7 @@ WHERE t.status = 'active'
 
 ### Graph + Vector: Neighborhood Similarity Search
 
-Find semantically similar items within a graph neighborhood:
+Find semantically similar items within a graph neighborhood: <!-- enforced by: tests/acceptance/query_surface.rs::f98_graph_neighborhood_scoped_vector_search, tests/integration/hybrid_query_on_true_join_tests.rs::scenario4_hybrid_query_returns_rows_once_traversal_has_data -->
 
 ```sql
 WITH neighborhood AS (
@@ -1174,7 +1210,7 @@ ORDER BY vector_text <=> [0.1, 0.2, 0.3, 0.4]
 LIMIT 10
 ```
 
-Lower distance = more similar. A `LIMIT` clause is required — unbounded vector searches are rejected.
+Lower distance = more similar. A `LIMIT` clause is required — unbounded vector searches are rejected. <!-- enforced by: engine_tests::test_vector_search_requires_limit, parser_tests::rejection_unbounded_vector_search -->
 
 The query vector can also come from an existing row:
 
@@ -1195,7 +1231,7 @@ read-scope error as an explicit anchor read. Missing source tables return
 `TableNotFound`, non-vector source columns return `UnknownVectorIndex`,
 dimension mismatches return `VectorIndexDimensionMismatch`, missing source rows
 return `PersistedRowVectorRowMissing`, and rows with NULL vector cells return
-`PersistedRowVectorCellNull`.
+`PersistedRowVectorCellNull`. <!-- enforced by: sql_surface_tests::prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results, sql_surface_tests::prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process, sql_surface_tests::prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_variants -->
 
 ### Pre-Filtered Search
 
@@ -1210,20 +1246,188 @@ LIMIT 5
 
 ### Indexing
 
-The engine automatically selects the search strategy based on vector count:
+Every vector column has a maintained local search layout. An unpartitioned column has one
+logical layout; a partitioned column has one for each declared key tuple. A partition is a
+local search layout, not an authorization boundary, tenant, or sync direction. Authorization
+still applies to the rows a caller may read, and a table may use any declared sync direction.
 
-- Below ~1000 vectors: brute-force linear scan (exact)
-- F32 at/above ~1000 vectors: HNSW approximate nearest neighbors (recall target >= 95%)
-- SQ8/SQ4 through 5000 vectors: exact scan to preserve self-recall; larger quantized indexes use HNSW
+Declare a partitioned column in this canonical order (the same order `.schema` prints):
 
-No manual index creation needed. Use `.explain` in the CLI to see which strategy is active:
-
+```sql
+CREATE TABLE vector_items (
+  item_id UUID PRIMARY KEY,
+  scope_id UUID NOT NULL,
+  kind TEXT NOT NULL,
+  embedding VECTOR(768)
+    PARTITION_KEY (scope_id, kind)
+    MAX_PARTITIONS 256
+    SEARCH_MODE AUTO
+    AUTO_INDEX_AT 10000
+    HNSW (M = 24, EF_CONSTRUCTION = 400, EF_SEARCH = 128)
+    CONSOLIDATION (CHANGE_PERCENT = 25, TOMBSTONE_PERCENT = 5)
+);
 ```
-contextdb> .explain SELECT id FROM documents ORDER BY embedding <=> $q LIMIT 5
-Scan -> VectorSearch
+
+`WITH (quantization = 'SQ8')`, when used, follows `VECTOR(768)` and precedes these clauses.
+`PARTITION_KEY` is optional. Its columns must be non-null columns on the same table with an
+exact identity type (`UUID`, `TEXT`, `INTEGER`, `BOOLEAN`, `TIMESTAMP`, or `TXID`); a key cannot
+repeat a column or include the vector column. `MAX_PARTITIONS` is legal only with
+`PARTITION_KEY`; omitting it means the effective limit is 256, and `.schema` prints that value.
+A key value written to a row, locally or through sync, must be of its column's declared type or
+the write is refused naming that column; the declaration itself is not at fault.
+The limit counts layouts containing a live indexed vector or a version still needed by a held
+snapshot. A NULL vector creates no layout. A write that would exceed the limit is refused as one
+atomic write; it does not leave a row accepted without its vector.
+<!-- enforced by: vector_partition_declaration_contract::partitioned_vector_schema_survives_reopen_with_canonical_defaults, vector_partition_declaration_contract::invalid_partition_components_are_refused_without_partial_schema, vector_partition_declaration_contract::max_partitions_without_a_partition_key_is_a_typed_refusal, vector_partition_declaration_contract::every_exact_identity_type_is_valid_in_a_composite_partition_key, vector_partition_query_contract::a_partition_key_value_of_the_wrong_type_gets_its_own_typed_refusal_naming_the_column, vector_partition_query_contract::a_partition_key_value_of_the_wrong_type_arriving_through_sync_gets_the_same_typed_refusal, vector_partition_cleanup_inspection_contract::second_vector_column_cap_refusal_rolls_back_the_row_and_both_columns -->
+
+`AUTO_INDEX_AT`, `HNSW`, and `CONSOLIDATION` are optional per-column policy clauses and follow
+`SEARCH_MODE` in
+the canonical rendered order. `AUTO_INDEX_AT` is the first aggregate allowed-vector count for the
+whole requested answer at which `AUTO` requires the maintained indexed route; below it, `AUTO`
+compares exactly only when the existing resource limits permit. It is not a per-partition
+threshold. `HNSW` names the maintained graph's `M` (neighbour links per point),
+`EF_CONSTRUCTION` (candidate work while building), and `EF_SEARCH` (candidate work while
+searching). `EF_CONSTRUCTION` must be at least `M`.
+
+`CONSOLIDATION` controls when maintenance rebuilds an otherwise healthy graph. `CHANGE_PERCENT`
+counts pending inserts plus tombstones against the live-plus-retained partition population;
+`TOMBSTONE_PERCENT` counts tombstones alone. Because tombstones are part of total change, the
+tombstone trigger can decide first only when its percentage is lower than the change percentage.
+Each value is from 1 through 100. If the clause or one member is silent, the effective defaults are
+20% total change and 10% tombstones, and `.schema` keeps that default silent. At each maintenance
+wake, the change percentage is the policy bound that decides when a healthy partition's retained
+post-base journal is published into a replacement generation. Writes can take the journal past that
+percentage between wakes, and the percentage is not a byte ceiling. `ALTER ... SET CONSOLIDATION
+(...)` changes the named members while retaining omitted members; `ALTER ... SET CONSOLIDATION
+DEFAULT` clears both declarations. The policy persists in schema, travels with it, and is honored by
+in-memory and file-backed maintenance.
+`CONSOLIDATION NONE` (including `ALTER ... SET CONSOLIDATION NONE`) disables automatic threshold
+consolidation without disabling the maintained index, initial construction, topology replacement,
+or repair. Because healthy-tail threshold rebuilds no longer advance the covered frontier, the
+post-base change journal remains retained until a required replacement or repair publishes, or
+threshold consolidation is re-enabled and becomes due; choose `NONE` with that disk-retention
+consequence in mind. Both vector inspection surfaces show
+the declared mode and members beside their effective mode and members.
+`declared_consolidation_mode` is `NULL` when the declaration is silent, `thresholds` when either
+percentage is explicit, and `none` for explicit `CONSOLIDATION NONE`; effective mode is always
+`thresholds` or `none`.
+<!-- enforced by: vector_partition_declaration_contract::consolidation_and_maintenance_poll_declarations_round_trip_and_reset, vector_resource_maintenance_contract::in_memory_maintenance_honours_declared_consolidation_thresholds, vector_partition_sync_inspection_contract::every_consolidation_form_keeps_schema_identity_across_sync -->
+
+On `CREATE TABLE`, omitting either clause preserves the compatibility profile and `.schema`
+renders that silence. Its current defaults are: F32 uses `(M, EF_CONSTRUCTION, profile
+EF_SEARCH)` of `(16, 200, max(200,n))` through 5,000 live vectors, `(24, 400, 400)` from 5,001
+through 50,000, and `(16, 200, 200)` above 50,000; SQ8/SQ4 use `(8, 32,
+min(96,max(32,n)))` through 5,000 and `(12, 64, 128)` above 5,000. The undeclared
+`AUTO_INDEX_AT` defaults are 1,000 for F32 and 5,001 for SQ8/SQ4. An undeclared `EF_SEARCH` uses
+at least its profile and the existing `10 * k` query default; an explicit value is raised only to
+reach `k`.
+
+Change the policy online with the `ALTER` forms above. `DEFAULT` on `AUTO_INDEX_AT` clears that
+declaration; `SET HNSW DEFAULT` clears the whole group, while `DEFAULT` for a named HNSW member
+clears only that member and omitted members retain their declarations. Each statement changes its
+named HNSW members atomically. `AUTO_INDEX_AT` and `EF_SEARCH` affect newly opened queries without
+rebuilding a graph. A change to the effective `M` or `EF_CONSTRUCTION` topology schedules a bounded
+replacement generation; the previous complete graph continues serving, and an older policy revision
+cannot publish over a newer declaration. An explicit value that resolves to the serving topology
+retains its authored identity without forcing a redundant build. Explicit `AUTO_INDEX_AT`, `HNSW`,
+and `CONSOLIDATION` values persist, participate in schema identity, and render in this canonical
+order.
+<!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_policy_declaration_contract::partial_alters_member_defaults_and_group_defaults_change_only_the_declared_policy, vector_policy_declaration_contract::invalid_policy_values_refuse_atomically_without_changing_schema_or_inspection, vector_policy_revision_publication_contract::online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication, vector_policy_revision_publication_contract::explicit_current_defaults_keep_their_identity_without_rebuilding_matching_graphs -->
+
+An operator can raise the limit online, but cannot lower it below live-plus-retained use:
+
+```sql
+ALTER TABLE vector_items ALTER COLUMN embedding SET MAX_PARTITIONS 512;
+ALTER TABLE vector_items ALTER COLUMN embedding SET SEARCH_MODE INDEXED;
+ALTER TABLE vector_items ALTER COLUMN embedding SET AUTO_INDEX_AT 10000;
+ALTER TABLE vector_items ALTER COLUMN embedding SET HNSW (EF_SEARCH = 128);
+ALTER TABLE vector_items ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 11);
+ALTER TABLE vector_items ALTER COLUMN embedding SET CONSOLIDATION NONE;
 ```
 
-Below the HNSW threshold the vector search is brute-force (`Scan -> VectorSearch`); once the index switches to HNSW the same line reads `Scan -> HNSWSearch`.
+Changing a key value moves that row's non-NULL vector between local layouts in the same commit.
+Changing the key declaration itself, or dropping, renaming, or changing the type/nullability of a
+key component while the declaration remains, is refused through dependent-DDL rules. Rename the
+vector column through otherwise legal DDL to move its local state with it, or make a replacement
+table with the desired vector partition key and copy the wanted rows; the replacement vector
+column creates the corresponding local vector index.
+<!-- enforced by: vector_serving_merge_contract::partition_key_only_update_is_visible_in_the_writing_transaction, vector_lazy_consumer_restart_contract::key_only_partition_move_after_reopen_preserves_the_vector_across_another_restart, vector_partition_declaration_contract::partition_key_component_refusal_names_the_replacement_table_journey, vector_generation_ddl_cleanup_contract::rename_moves_a_durably_sealed_partition_generation_to_the_new_identity -->
+
+### Search modes and query override
+
+`SEARCH_MODE` sets the column default:
+
+- `AUTO` decides by count: it compares the aggregate allowed count for the whole requested answer
+  against the column's effective `AUTO_INDEX_AT`. Below that count, the answer is exact when the
+  active limits can pay for it and a typed refusal when they cannot; memory never silently picks
+  the indexed route on `AUTO`'s behalf. At or above that count, the maintained indexed route serves
+  the request, using whatever memory is free. For F32 the automatic switch is at 1,000 allowed
+  vectors; for SQ8/SQ4 it is at 5,001. These counts apply to the whole requested answer, not
+  separately to each partition.
+- `EXACT` compares every allowed stored vector, or returns a typed budget refusal. It never quietly
+  substitutes an indexed answer. Exact means exact over the stored column values; SQ8 and SQ4 stay
+  quantized by design.
+- `INDEXED` requires a maintained bounded route, including for a small non-empty layout. If that
+  route is not ready, it returns a typed unavailable-route refusal instead of a full scan.
+  <!-- enforced by: vector_search_mode_bounded_contract::auto_uses_the_aggregate_selected_scope_not_each_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible, vector_policy_resolver_contract::default_crossovers_execute_both_sides_without_a_normal_write_availability_gap -->
+
+Override the declaration for one vector-nearest-neighbour query after vector ordering and before
+`USE RANK` or `LIMIT`:
+
+```sql
+SELECT passage_id
+FROM event_search_passages
+WHERE context_id = $context
+ORDER BY vector_text <=> $query
+USE VECTOR EXACT
+LIMIT 10;
+```
+
+`USE VECTOR` is legal only with vector ordering. The selected mode covers the whole requested
+scope: if any required layout cannot satisfy `INDEXED`, the query refuses rather than omit that
+layout or return a partial list. A missing or empty authorized tuple is a complete empty result.
+<!-- enforced by: vector_partition_syntax_contract::vector_search_override_follows_vector_ordering_and_precedes_rank_and_limit, vector_partition_query_contract::every_use_vector_mode_refuses_a_non_vector_ordering_query, vector_partition_query_contract::missing_named_partition_tuple_is_an_empty_answer, vector_search_mode_bounded_contract::auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks -->
+
+Initial graph construction and repair run only through maintenance. Declarations, writes, database
+open, and queries do not wait for a full build. Engine-owned maintenance advances in the background;
+caller-driven hosts advance it with `Database::run_maintenance_cycle` or CLI `.maintenance run`.
+While a required indexed route is unavailable, `INDEXED` refuses and `AUTO` may compare exactly only
+inside its existing budget. Ordinary relational/graph reads and admitted writes remain usable.
+<!-- enforced by: vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors -->
+
+### Partition scope, filters, and one answer
+
+Equality on every key component selects one layout. A finite `IN` or equivalent `OR` selects a
+finite set; a prefix of a composite key, or no key predicate, searches every authorized matching
+layout. A named tuple that does not exist returns no rows and never broadens to another tuple.
+ContextDB searches selected layouts independently, then merges candidates by score before `USE RANK`
+and `LIMIT`. The result is one global top-k, with the existing ascending row-id tie-break for equal
+scores — never one limit per layout and never iteration-order results.
+<!-- enforced by: vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_partition_query_contract::equivalent_or_partition_scope_keeps_cross_partition_row_id_ties, vector_partition_query_contract::composite_partition_prefix_selects_every_tuple_below_the_prefix, vector_partition_query_contract::no_partition_key_predicate_returns_one_global_limited_answer, vector_partition_query_contract::missing_named_partition_tuple_is_an_empty_answer, vector_serving_merge_contract::global_ties_keep_internal_row_order_across_partition_load_permutations -->
+
+`WHERE` filters still decide which rows are allowed inside that scope. A small allowed set may be
+compared exactly under `AUTO`; a large one needs a bounded filtered-index route. If ContextDB has
+no bounded way to find or evaluate the allowed rows, `INDEXED` refuses before a table-wide predicate
+scan. `AUTO` uses exact work only when the active budget can pay for it; `EXACT` remains exhaustive
+within its declared budget. `.explain` names a supporting ordinary `CREATE INDEX` when one is a safe
+recovery, otherwise it says to use `EXACT` or rewrite the filter. It never hides a full table scan
+behind indexed search.
+<!-- enforced by: vector_search_mode_bounded_contract::indexed_broad_filter_refuses_before_scan_and_becomes_eligible_with_a_relational_index, vector_partition_query_contract::unaligned_restriction_inside_a_bounded_candidate_set_never_scans, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads -->
+
+### Explain
+
+`.explain` reports the requested and resolved mode, declared partition key, whether the query
+selects one, several, or all authorized layouts, each route, the global candidate merge, and any
+safe fallback or refusal reason. It redacts unauthorized keys and counts. A constrained
+handle's explanation omits per-partition HNSW numbers, whose adaptive values could reveal
+the hidden population. For an unrestricted caller, disclosed `M`, `EF_CONSTRUCTION`, and policy
+revision describe the snapshot's serving graph; `EF_SEARCH` describes the current query policy at
+its requested `k`. A query-only policy change therefore applies immediately even while the serving
+build revision is older. Its authorized count and memory refusals use only authorized identities
+and the operation's available headroom. Explaining is
+metadata-only: it does not build an index, replay a journal, start repair, or fault every graph or
+vector page into memory.
+<!-- enforced by: vector_inspection_explain_truth_contract::vector_explain_names_mode_scope_route_merge_and_safe_filter_recovery_without_secrets, vector_inspection_explain_truth_contract::restricted_explain_admits_only_visible_identities_at_equal_headroom, vector_partition_query_contract::restricted_inspection_keeps_adaptive_partition_populations_private, vector_inspection_explain_truth_contract::explaining_a_prepared_partition_predicate_binds_nothing_and_names_the_shape -->
 
 ---
 
@@ -1301,7 +1505,10 @@ ALTER TABLE t DROP COLUMN a CASCADE;      -- drops dependent indexes
 
 Under `RESTRICT` (the default), dropping a column referenced by any index
 returns `ColumnInIndex { table, column, index }` naming the first dependent
-index in declaration order. Under `CASCADE`, every index whose column list
+index in declaration order. A vector partition-key component instead returns
+`VectorPartitionKeyInUse { table, column, index }` with the required next step:
+create a replacement table with the desired partition key and copy the wanted
+rows. Under `CASCADE`, every index whose column list
 mentions the target column is removed, and the returned `QueryResult.cascade`
 carries a `dropped_indexes` list.
 
@@ -1404,6 +1611,7 @@ programmatic trace. Multi-hop or variable-length traversals report `GraphBfs`.
 | `DuplicateIndex { table, index }` | `CREATE INDEX` with a name already in use on the same table |
 | `ColumnNotIndexable { table, column, column_type }` | `CREATE INDEX` on a `JSON` or `VECTOR` column |
 | `ColumnInIndex { table, column, index }` | `ALTER TABLE ... DROP COLUMN c RESTRICT` on a column referenced by an index |
+| `VectorPartitionKeyInUse { table, column, index }` | Dropping, renaming, or changing a vector partition-key component; create a replacement table/index and copy the wanted rows |
 | `ColumnNotFound { table, column }` | `CREATE INDEX` naming a column that does not exist on the table — also the class every `WHERE` / `JOIN ... ON` / `ORDER BY` / `SELECT`-list unknown-column or unrecognized-qualifier reference uses (see [Column Qualifiers](#column-qualifiers) and the `SELECT` section above) |
 | `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_`, `__unique_`, or `__fk_` (reserved for auto-indexes) |
 | `UniqueViolation { table, column }` | A duplicate value on a `UNIQUE` column, or a duplicate tuple on a table-level `UNIQUE (col, ...)` (`column` names every column of the constraint); also a `PRIMARY KEY` duplicate |

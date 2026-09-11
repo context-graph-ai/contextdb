@@ -9,9 +9,13 @@ pub enum SyncError {
     #[error("serialization error: {0}")]
     Serde(String),
     #[error(
-        "protocol version mismatch: received {received}, supported {supported} — upgrade both ends to the same contextdb release so they speak the same sync protocol"
+        "protocol version mismatch: received {received}, supported range {oldest_supported} through {newest_supported} — upgrade the older node to a contextdb release inside this sync window"
     )]
-    ProtocolVersionMismatch { received: u8, supported: u8 },
+    ProtocolVersionMismatch {
+        received: u8,
+        oldest_supported: u8,
+        newest_supported: u8,
+    },
     #[error("chunk reassembly error: {0}")]
     ChunkError(String),
 }

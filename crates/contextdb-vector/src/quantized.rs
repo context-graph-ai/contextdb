@@ -2,7 +2,7 @@ use contextdb_core::{Lsn, RowId, TxId, VectorEntry, VectorIndexRef, VectorQuanti
 
 const HNSW_HEADER_BYTES: usize = 12;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StoredVectorEntry {
     pub row_id: RowId,
     pub vector: StoredVector,
@@ -52,7 +52,7 @@ impl StoredVectorEntry {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StoredVector {
     F32(Vec<f32>),
     SQ8 {
@@ -85,6 +85,18 @@ pub fn stored_vector_value(vector: &[f32], quantization: VectorQuantization) -> 
         VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
             StoredVector::from_f32(vector, quantization).to_f32()
         }
+    }
+}
+
+/// Exact retained payload bytes for one vector in the representation declared
+/// by a column. Persistence-owned lazy loaders use the same calculation as
+/// `StoredVector::storage_bytes` before they allocate or decode a partition.
+#[doc(hidden)]
+pub fn stored_vector_resident_bytes(dimension: usize, quantization: VectorQuantization) -> usize {
+    match quantization {
+        VectorQuantization::F32 => dimension.saturating_mul(std::mem::size_of::<f32>()),
+        VectorQuantization::SQ8 => dimension.saturating_add(8),
+        VectorQuantization::SQ4 => dimension.div_ceil(2).saturating_add(8),
     }
 }
 
@@ -150,9 +162,15 @@ impl StoredVector {
 
     pub fn storage_bytes(&self) -> usize {
         match self {
-            StoredVector::F32(vector) => vector.len().saturating_mul(std::mem::size_of::<f32>()),
-            StoredVector::SQ8 { len, .. } => len.saturating_add(8),
-            StoredVector::SQ4 { len, .. } => len.div_ceil(2).saturating_add(8),
+            StoredVector::F32(vector) => {
+                stored_vector_resident_bytes(vector.len(), VectorQuantization::F32)
+            }
+            StoredVector::SQ8 { len, .. } => {
+                stored_vector_resident_bytes(*len, VectorQuantization::SQ8)
+            }
+            StoredVector::SQ4 { len, .. } => {
+                stored_vector_resident_bytes(*len, VectorQuantization::SQ4)
+            }
         }
     }
 
@@ -262,6 +280,33 @@ pub(crate) fn decode_hnsw_quantized(bytes: &[u8]) -> Option<HnswQuantizedHeader<
         max,
         payload: &bytes[HNSW_HEADER_BYTES..],
     })
+}
+
+pub(crate) fn quantized_hnsw_query_score(
+    bytes: &[u8],
+    query: &[f32],
+    quantization: VectorQuantization,
+) -> Option<f32> {
+    let stored = decode_hnsw_quantized(bytes)?;
+    if stored.len != query.len() {
+        return None;
+    }
+    match quantization {
+        VectorQuantization::SQ8 => Some(cosine_query_sq8(
+            query,
+            stored.payload,
+            stored.min,
+            stored.max,
+        )),
+        VectorQuantization::SQ4 => Some(cosine_query_sq4(
+            query,
+            stored.payload,
+            stored.len,
+            stored.min,
+            stored.max,
+        )),
+        VectorQuantization::F32 => None,
+    }
 }
 
 pub(crate) fn quantized_hnsw_distance(

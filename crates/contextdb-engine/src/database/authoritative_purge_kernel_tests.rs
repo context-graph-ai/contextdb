@@ -429,6 +429,7 @@ fn fixture_seed() -> FixtureSeed {
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("authoritative-purge.db");
     let db = Database::open(&path).expect("open file db");
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT, embedding VECTOR(3)) SYNC CONFLICT KEEP LATEST",
         &HashMap::new(),
@@ -491,6 +492,16 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
             &params(Uuid::new_v4(), &format!("threshold-corpus-{ordinal}")),
         )
         .expect("seed real HNSW threshold corpus");
+    }
+    for _ in 0..16 {
+        if db
+            .__debug_vector_hnsw_len(VectorIndexRef::new(NOTES, "embedding"))
+            .is_some()
+        {
+            break;
+        }
+        db.run_maintenance_cycle()
+            .expect("deterministically materialize fixture HNSW");
     }
     let hnsw_query = db
         .execute(

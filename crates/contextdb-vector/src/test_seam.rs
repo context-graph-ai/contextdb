@@ -2,11 +2,73 @@
 //! Mirrors the shape of `contextdb-engine::ApplyPhasePause`.
 
 use crate::store::VectorStore;
-use contextdb_core::{RowId, VectorIndexRef, VectorQuantization};
+use contextdb_core::{RowId, VectorIndexRef, VectorPartitionKey, VectorQuantization};
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+static DORMANT_DECODE_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
+static DORMANT_DECODE_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
+static POST_LOAD_RECONCILIATION_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
+static POST_LOAD_RECONCILIATION_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
+
+fn arm(armed: &AtomicBool, consumed: &AtomicBool) {
+    consumed.store(false, Ordering::SeqCst);
+    armed.store(true, Ordering::SeqCst);
+}
+
+fn take(armed: &AtomicBool, consumed: &AtomicBool) -> bool {
+    if armed.swap(false, Ordering::SeqCst) {
+        consumed.store(true, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
+#[doc(hidden)]
+pub fn arm_dormant_vector_decode_failure_for_test() {
+    arm(
+        &DORMANT_DECODE_FAILURE_ARMED,
+        &DORMANT_DECODE_FAILURE_CONSUMED,
+    );
+}
+
+#[doc(hidden)]
+pub fn take_dormant_vector_decode_failure_for_test() -> bool {
+    take(
+        &DORMANT_DECODE_FAILURE_ARMED,
+        &DORMANT_DECODE_FAILURE_CONSUMED,
+    )
+}
+
+#[doc(hidden)]
+pub fn dormant_vector_decode_failure_consumed_for_test() -> bool {
+    DORMANT_DECODE_FAILURE_CONSUMED.load(Ordering::SeqCst)
+}
+
+#[doc(hidden)]
+pub fn arm_vector_post_load_reconciliation_failure_for_test() {
+    arm(
+        &POST_LOAD_RECONCILIATION_FAILURE_ARMED,
+        &POST_LOAD_RECONCILIATION_FAILURE_CONSUMED,
+    );
+}
+
+#[doc(hidden)]
+pub fn take_vector_post_load_reconciliation_failure_for_test() -> bool {
+    take(
+        &POST_LOAD_RECONCILIATION_FAILURE_ARMED,
+        &POST_LOAD_RECONCILIATION_FAILURE_CONSUMED,
+    )
+}
+
+#[doc(hidden)]
+pub fn vector_post_load_reconciliation_failure_consumed_for_test() -> bool {
+    POST_LOAD_RECONCILIATION_FAILURE_CONSUMED.load(Ordering::SeqCst)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PauseWindow {
@@ -139,6 +201,9 @@ pub(crate) struct GraphCandidateCapSlot {
     cap: Mutex<Option<usize>>,
 }
 
+type GraphCandidateCapKey = (VectorIndexRef, Option<VectorPartitionKey>);
+type GraphCandidateCapSlots = HashMap<GraphCandidateCapKey, Arc<GraphCandidateCapSlot>>;
+
 impl GraphCandidateCapSlot {
     fn cap(&self) -> Option<usize> {
         *self.cap.lock()
@@ -151,7 +216,7 @@ impl GraphCandidateCapSlot {
 
 #[derive(Default)]
 pub(crate) struct GraphCandidateCapRegistry {
-    slots: Mutex<HashMap<VectorIndexRef, Arc<GraphCandidateCapSlot>>>,
+    slots: Mutex<GraphCandidateCapSlots>,
 }
 
 impl GraphCandidateCapRegistry {
@@ -161,21 +226,32 @@ impl GraphCandidateCapRegistry {
     pub(crate) fn cap_graph_candidates(
         &self,
         index: &VectorIndexRef,
+        partition: Option<&VectorPartitionKey>,
         candidates: &mut Vec<(RowId, f32)>,
     ) {
         let slot = {
             let slots = self.slots.lock();
-            slots.get(index).cloned()
+            partition
+                .and_then(|partition| {
+                    slots
+                        .get(&(index.clone(), Some(partition.clone())))
+                        .cloned()
+                })
+                .or_else(|| slots.get(&(index.clone(), None)).cloned())
         };
         if let Some(cap) = slot.and_then(|slot| slot.cap()) {
             candidates.truncate(cap);
         }
     }
 
-    fn slot(&self, index: &VectorIndexRef) -> Arc<GraphCandidateCapSlot> {
+    fn slot(
+        &self,
+        index: &VectorIndexRef,
+        partition: Option<&VectorPartitionKey>,
+    ) -> Arc<GraphCandidateCapSlot> {
         self.slots
             .lock()
-            .entry(index.clone())
+            .entry((index.clone(), partition.cloned()))
             .or_insert_with(|| Arc::new(GraphCandidateCapSlot::default()))
             .clone()
     }
@@ -198,19 +274,7 @@ pub fn estimate_hnsw_final_bytes_for_test(
     dimension: usize,
     quantization: VectorQuantization,
 ) -> usize {
-    let entry_bytes = match quantization {
-        VectorQuantization::F32 => quantization.storage_bytes(dimension),
-        VectorQuantization::SQ8 => dimension.saturating_add(12),
-        VectorQuantization::SQ4 => dimension.div_ceil(2).saturating_add(12),
-    };
-    let exact_key_bytes = entry_bytes
-        .saturating_add(std::mem::size_of::<RowId>())
-        .saturating_add(64);
-    entry_count.saturating_mul(
-        entry_bytes
-            .saturating_mul(3)
-            .saturating_add(exact_key_bytes),
-    )
+    crate::mem::estimate_hnsw_bytes(entry_count, dimension, quantization)
 }
 
 pub fn estimate_hnsw_build_reservation_for_test(
@@ -218,46 +282,9 @@ pub fn estimate_hnsw_build_reservation_for_test(
     dimension: usize,
     quantization: VectorQuantization,
 ) -> usize {
-    let final_bytes = estimate_hnsw_final_bytes_for_test(entry_count, dimension, quantization);
-    let (m, ef_construction, max_level_bound) = match quantization {
-        VectorQuantization::F32 => match entry_count {
-            0..=5000 => (16usize, 200usize, 16usize),
-            5001..=50000 => (24, 400, 16),
-            _ => (16, 200, 16),
-        },
-        _ => match entry_count {
-            0..=5000 => (8usize, 32usize, 16usize),
-            5001..=50000 => (12, 64, 16),
-            _ => (12, 64, 16),
-        },
-    };
-    let stored_vector_bytes = quantization.storage_bytes(dimension);
-    let word = std::mem::size_of::<usize>();
-    let sorted_entry_refs = entry_count.saturating_mul(word);
-    let cloned_vectors_and_refs = entry_count.saturating_mul(
-        stored_vector_bytes
-            .saturating_add(word.saturating_mul(5))
-            .saturating_add(std::mem::size_of::<RowId>()),
-    );
-    let map_and_exact_key_overhead = entry_count.saturating_mul(
-        std::mem::size_of::<RowId>()
-            .saturating_add(word.saturating_mul(3))
-            .saturating_add(64),
-    );
-    let graph_link_upper_bound = entry_count
-        .saturating_mul(m)
-        .saturating_mul(max_level_bound)
-        .saturating_mul(word.saturating_add(std::mem::size_of::<f32>()));
-    let construction_scratch = entry_count.min(ef_construction).saturating_mul(
-        word.saturating_mul(6)
-            .saturating_add(std::mem::size_of::<f32>().saturating_mul(2)),
-    );
-    final_bytes
-        .saturating_add(sorted_entry_refs)
-        .saturating_add(cloned_vectors_and_refs)
-        .saturating_add(map_and_exact_key_overhead)
-        .saturating_add(graph_link_upper_bound)
-        .saturating_add(construction_scratch)
+    let policy = crate::store::VectorIndexLayout::unpartitioned(dimension, quantization)
+        .resolve_policy(entry_count, 1);
+    crate::mem::estimate_hnsw_build_reservation(entry_count, dimension, quantization, policy)
 }
 
 impl VectorStore {
@@ -284,7 +311,19 @@ impl VectorStore {
         index: &VectorIndexRef,
         cap: usize,
     ) -> GraphCandidateCapHandle {
-        let slot = self.graph_candidate_caps().slot(index);
+        let slot = self.graph_candidate_caps().slot(index, None);
+        slot.set(Some(cap));
+        GraphCandidateCapHandle { slot }
+    }
+
+    /// Shorten one partition's graph result without changing sibling routes.
+    pub fn cap_partition_graph_candidates_for_test(
+        &self,
+        index: &VectorIndexRef,
+        partition: &VectorPartitionKey,
+        cap: usize,
+    ) -> GraphCandidateCapHandle {
+        let slot = self.graph_candidate_caps().slot(index, Some(partition));
         slot.set(Some(cap));
         GraphCandidateCapHandle { slot }
     }

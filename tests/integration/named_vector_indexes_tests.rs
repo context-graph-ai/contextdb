@@ -1,6 +1,6 @@
 use contextdb_core::{Error, Lsn, RowId, Value, VectorIndexRef};
-use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ChangeSet, VectorChange};
+use contextdb_engine::{Database, MaintenancePolicy};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -1669,6 +1669,45 @@ fn nv16b_engine_surface_is_embedding_space_id_agnostic() {
         "quantization",
         "vector_count",
         "bytes",
+        "partition_key_columns",
+        "max_partitions",
+        "live_partitions",
+        "retained_partitions",
+        "search_mode",
+        "declared_auto_index_at",
+        "effective_auto_index_at",
+        "declared_hnsw_m",
+        "declared_hnsw_ef_construction",
+        "declared_hnsw_ef_search",
+        "declared_consolidation_mode",
+        "declared_consolidation_change_percent",
+        "declared_consolidation_tombstone_percent",
+        "effective_consolidation_mode",
+        "effective_consolidation_change_percent",
+        "effective_consolidation_tombstone_percent",
+        "oldest_base_tx",
+        "newest_base_tx",
+        "pending_inserts",
+        "tombstones",
+        "durable_vector_bytes",
+        "charged_vector_bytes",
+        "durable_index_bytes",
+        "charged_index_bytes",
+        "query_state",
+        "maintenance_state",
+        "maintenance_vectors_total",
+        "maintenance_vectors_done",
+        "maintenance_vectors_remaining",
+        "unavailable_partitions",
+        "stalled_partitions",
+        "broad_route",
+        "broad_route_state",
+        "broad_route_base_tx",
+        "broad_route_vectors_total",
+        "broad_route_vectors_done",
+        "broad_route_vectors_remaining",
+        "broad_route_reason",
+        "broad_route_recovery_action",
     ]
     .iter()
     .copied()
@@ -2060,11 +2099,50 @@ fn nv16d_show_vector_indexes_on_empty_database_returns_empty_with_header() {
         "quantization",
         "vector_count",
         "bytes",
+        "partition_key_columns",
+        "max_partitions",
+        "live_partitions",
+        "retained_partitions",
+        "search_mode",
+        "declared_auto_index_at",
+        "effective_auto_index_at",
+        "declared_hnsw_m",
+        "declared_hnsw_ef_construction",
+        "declared_hnsw_ef_search",
+        "declared_consolidation_mode",
+        "declared_consolidation_change_percent",
+        "declared_consolidation_tombstone_percent",
+        "effective_consolidation_mode",
+        "effective_consolidation_change_percent",
+        "effective_consolidation_tombstone_percent",
+        "oldest_base_tx",
+        "newest_base_tx",
+        "pending_inserts",
+        "tombstones",
+        "durable_vector_bytes",
+        "charged_vector_bytes",
+        "durable_index_bytes",
+        "charged_index_bytes",
+        "query_state",
+        "maintenance_state",
+        "maintenance_vectors_total",
+        "maintenance_vectors_done",
+        "maintenance_vectors_remaining",
+        "unavailable_partitions",
+        "stalled_partitions",
+        "broad_route",
+        "broad_route_state",
+        "broad_route_base_tx",
+        "broad_route_vectors_total",
+        "broad_route_vectors_done",
+        "broad_route_vectors_remaining",
+        "broad_route_reason",
+        "broad_route_recovery_action",
     ];
     assert_eq!(
         r.columns.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         expected,
-        "SHOW VECTOR_INDEXES must return the canonical 6-column header even when empty"
+        "SHOW VECTOR_INDEXES must return the canonical header even when empty"
     );
 }
 
@@ -2354,12 +2432,10 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
 
 #[test]
 fn nv_deferred_hnsw_build_per_index() {
-    // The "lazy on first search" HNSW build serialization must be PER-INDEX, not a global flag. A
-    // global flag means rebuilds the wrong index on first search. Indirect observation: insert
-    // beyond the build threshold for ONE index, leave the other small, search both — both must
-    // return correct results regardless of which builds first. A global-flag impl gets at most one
-    // index built; the other is permanently linear-scan and returns wrong results past threshold.
+    // Queries are observers: one caller-driven wake builds every needy index,
+    // and each column receives its own graph and routing policy.
     let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4), vector_vision VECTOR(8))",
         &empty_params(),
@@ -2445,25 +2521,19 @@ fn nv_deferred_hnsw_build_per_index() {
         "vector_text bytes must account for the stored vector payload before HNSW build; got {text_bytes_before}"
     );
     assert!(
-        text_bytes_before < text_payload_floor * 2,
-        "vector_text HNSW memory must be lazy and absent before first search; bytes before search={text_bytes_before}"
-    );
-    assert!(
-        vision_bytes_before >= vision_payload_floor
-            && vision_bytes_before < vision_payload_floor * 2,
-        "small vector_vision bytes must account only for its payload before text search; got {vision_bytes_before}"
+        vision_bytes_before >= vision_payload_floor,
+        "small vector_vision bytes must account for its payload before maintenance; got {vision_bytes_before}"
     );
 
-    // Search vector_text first — triggers HNSW build for vector_text only. A global-flag impl marks
-    // BOTH indexes "built" and never builds vector_vision.
+    // Searching either column before maintenance must not build either graph.
     let (text_id, text_vec) = text_target_id.unwrap();
     let used_before_text_build = db.accountant().usage().used;
     let text_trace = db
         .explain("SELECT id FROM evidence ORDER BY vector_text <=> $q LIMIT 1")
         .expect("text explain");
     assert!(
-        text_trace.contains("HNSWSearch") && text_trace.contains("vector_text"),
-        "large vector_text index must build/use HNSW independently; got: {text_trace}"
+        text_trace.contains("VectorSearch") && text_trace.contains("vector_text"),
+        "unmaintained vector_text must disclose exact fallback; got: {text_trace}"
     );
     let r1 = db
         .execute(
@@ -2473,10 +2543,24 @@ fn nv_deferred_hnsw_build_per_index() {
         .expect("text search");
     let id_idx = r1.columns.iter().position(|c| c == "id").unwrap();
     assert_eq!(r1.rows[0][id_idx], Value::Uuid(text_id));
+    assert_eq!(db.accountant().usage().used, used_before_text_build);
+    assert_eq!(
+        db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_text")),
+        None,
+        "a query must not build vector_text"
+    );
+    assert_eq!(
+        db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_vision")),
+        None,
+        "a query on vector_text must not build vector_vision"
+    );
+
+    db.run_maintenance_cycle()
+        .expect("one finite caller-driven wake builds every needy index");
     let used_after_text_build = db.accountant().usage().used;
     assert!(
         used_after_text_build > used_before_text_build,
-        "first vector_text explain/search must materialize an accountant-tracked HNSW build; used before={used_before_text_build}, after={used_after_text_build}"
+        "caller-driven maintenance must materialize an accountant-tracked HNSW build; used before={used_before_text_build}, after={used_after_text_build}"
     );
     assert_eq!(
         db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_text")),
@@ -2504,25 +2588,26 @@ fn nv_deferred_hnsw_build_per_index() {
     );
     assert_eq!(
         db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_vision")),
-        None,
-        "below-threshold vector_vision must not inherit vector_text's HNSW graph"
+        Some(1),
+        "the same maintenance wake gives vector_vision its own one-point graph"
     );
-    assert_eq!(
-        db.__debug_vector_hnsw_stats(VectorIndexRef::new("evidence", "vector_vision")),
-        None,
-        "below-threshold vector_vision must not inherit vector_text's HNSW graph stats"
-    );
+    let vision_graph_stats = db
+        .__debug_vector_hnsw_stats(VectorIndexRef::new("evidence", "vector_vision"))
+        .expect("vector_vision has its own maintained graph");
+    assert_eq!(vision_graph_stats.point_count, 1);
+    assert_eq!(vision_graph_stats.layer0_points, 1);
+    assert_eq!(vision_graph_stats.dimension, 8);
     let text_bytes_after = vector_index_bytes("vector_text")
         .expect("SHOW VECTOR_INDEXES must list vector_text after HNSW build");
-    let vision_bytes_after_text_search = vector_index_bytes("vector_vision")
+    let vision_bytes_after_maintenance = vector_index_bytes("vector_vision")
         .expect("SHOW VECTOR_INDEXES must list vector_vision after text HNSW build");
     assert!(
         text_bytes_after > text_bytes_before,
         "vector_text SHOW bytes must increase after HNSW build; before={text_bytes_before}, after={text_bytes_after}"
     );
-    assert_eq!(
-        vision_bytes_after_text_search, vision_bytes_before,
-        "building vector_text HNSW must not mutate the small vector_vision index bytes"
+    assert!(
+        vision_bytes_after_maintenance > vision_bytes_before,
+        "the all-needy wake charges vector_vision's independent graph; before={vision_bytes_before}, after={vision_bytes_after_maintenance}"
     );
 
     let vision_trace = db
@@ -2535,8 +2620,8 @@ fn nv_deferred_hnsw_build_per_index() {
         "small vector_vision index must not inherit vector_text's HNSW build state; got: {vision_trace}"
     );
 
-    // Now search vector_vision. A global-flag impl that already considers itself "built" returns the
-    // wrong answer; a per-IndexState impl runs linear-scan against vector_vision and returns vision_id.
+    // AUTO still chooses exact for the one-row column even though maintenance
+    // has prepared its independent graph for a future threshold crossing.
     let used_before_vision_search = db.accountant().usage().used;
     let r2 = db
         .execute(
@@ -2557,8 +2642,17 @@ fn nv_deferred_hnsw_build_per_index() {
     assert_eq!(
         vector_index_bytes("vector_vision")
             .expect("SHOW VECTOR_INDEXES must list vector_vision after its own search"),
-        vision_bytes_before,
-        "below-threshold vector_vision SHOW bytes must stay unchanged after its own search"
+        vision_bytes_after_maintenance,
+        "below-threshold vector_vision search must not allocate or replace its maintained graph"
+    );
+    let used_before_second_wake = db.accountant().usage().used;
+    db.run_maintenance_cycle()
+        .expect("a second wake finds no remaining needy index");
+    assert_eq!(db.accountant().usage().used, used_before_second_wake);
+    assert_eq!(
+        db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_vision")),
+        Some(1),
+        "the second index receives its own maintained graph"
     );
 }
 
@@ -3282,8 +3376,11 @@ fn nv17_protocol_version_mismatch_returns_typed_error() {
     assert!(
         matches!(
             result,
-            Err(contextdb_server::error::SyncError::ProtocolVersionMismatch { received, supported })
-                if received == bogus_version && supported >= 2
+            Err(contextdb_server::error::SyncError::ProtocolVersionMismatch {
+                received,
+                oldest_supported: 7,
+                newest_supported: 7,
+            }) if received == bogus_version
         ),
         "decode must reject bogus version with the typed variant; got {result:?}"
     );
@@ -3309,7 +3406,8 @@ fn nv17b_protocol_version_mismatch_rejects_lower_version_envelopes() {
             Err(
                 contextdb_server::error::SyncError::ProtocolVersionMismatch {
                     received: 1,
-                    supported: PROTOCOL_VERSION
+                    oldest_supported: 7,
+                    newest_supported: PROTOCOL_VERSION,
                 }
             )
         ),

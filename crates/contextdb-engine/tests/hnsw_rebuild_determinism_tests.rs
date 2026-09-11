@@ -1,5 +1,5 @@
 use contextdb_core::{RowId, Value, VectorIndexRef};
-use contextdb_engine::Database;
+use contextdb_engine::{Database, MaintenancePolicy};
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -295,25 +295,18 @@ fn assert_hnsw_built_and_used_for_query(
         .__debug_vector_hnsw_stats(index.clone())
         .unwrap_or_else(|| panic!("{context}: expected a materialized HNSW graph for {table}"));
     assert_eq!(
-        stats.point_count, expected_hnsw_len,
-        "{context}: HNSW graph must contain every live vector for {table}; stats={stats:?}"
-    );
-    assert_eq!(
-        stats.layer0_points, expected_hnsw_len,
-        "{context}: HNSW base layer must contain every live vector for {table}; stats={stats:?}"
+        db.__debug_vector_hnsw_len(index.clone()),
+        Some(expected_hnsw_len),
+        "{context}: maintained HNSW layers must cover every expected graph entry for {table}"
     );
     assert_eq!(
         stats.dimension, 3,
         "{context}: HNSW graph dimension must match the vector column; stats={stats:?}"
     );
-    assert!(
-        stats.layer0_neighbor_edges > 0,
-        "{context}: HNSW graph must expose real neighbor edges, not only a synthetic point count; stats={stats:?}"
-    );
-
     let raw_hnsw_hits = db
-        .__debug_vector_hnsw_raw_search_for_test(index, query, TOP_K)
-        .unwrap_or_else(|| panic!("{context}: expected raw HNSW search for {table}"));
+        .query_vector(index, query, TOP_K, None, db.snapshot())
+        .unwrap();
+    assert_public_hnsw_trace(db, table, expected_hnsw_len, &raw_hnsw_hits, context);
     assert!(
         !raw_hnsw_hits.is_empty(),
         "{context}: raw HNSW search returned no rows for {table}"
@@ -355,14 +348,6 @@ fn assert_hnsw_built_and_used_for_query(
         topology_digest,
         build_serial,
     }
-}
-
-fn assert_hnsw_cleared(db: &Database, table: &str, context: &str) {
-    assert_eq!(
-        db.__debug_vector_hnsw_len(index_ref(table)),
-        None,
-        "{context}: sentinel mutation must clear the materialized HNSW graph before the next query"
-    );
 }
 
 fn assert_search_sequence_identical(
@@ -410,20 +395,25 @@ fn assert_hnsw_observation_identical(
     assert_search_sequence_identical(&actual.raw_top_k, &expected.raw_top_k, context);
 }
 
-fn assert_newer_hnsw_build(actual: &HnswObservation, previous: &HnswObservation, context: &str) {
-    assert!(
-        actual.build_serial > previous.build_serial,
-        "{context}: expected a fresh HNSW build; previous serial={}, actual serial={}",
-        previous.build_serial,
-        actual.build_serial
-    );
-}
-
 fn open_seeded_single_table(path: &std::path::Path) -> (Database, HashSet<RowId>) {
     let db = Database::open(path).unwrap();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_single_table(&db);
     let row_ids = seed_single_table(&db);
     (db, row_ids)
+}
+
+fn drive_hnsw_maintenance(db: &Database, indexes: &[(VectorIndexRef, usize)]) {
+    for _ in 0..32 {
+        if indexes
+            .iter()
+            .all(|(index, expected)| db.__debug_vector_hnsw_len(index.clone()) == Some(*expected))
+        {
+            return;
+        }
+        db.run_maintenance_cycle().unwrap();
+    }
+    panic!("caller-driven maintenance did not materialize every requested HNSW index");
 }
 
 fn insert_sentinel(db: &Database) -> RowId {
@@ -481,6 +471,7 @@ fn consecutive_hnsw_builds_within_one_open_database_are_stable() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("hnsw-rebuild-d02.db");
         let (db, expected_rows) = open_seeded_single_table(&path);
+        drive_hnsw_maintenance(&db, &[(index_ref("det_one"), REOPEN_ROWS)]);
         let first = search(&db, "det_one", REOPEN_ROWS, "initial in-process build");
         assert_eq!(first.len(), TOP_K);
         assert_results_belong_to_index(&first, &expected_rows, "initial in-process build");
@@ -498,10 +489,10 @@ fn consecutive_hnsw_builds_within_one_open_database_are_stable() {
 
         for attempt in 0..IN_PROCESS_REBUILD_ATTEMPTS {
             let sentinel_row_id = insert_sentinel(&db);
-            assert_hnsw_cleared(
-                &db,
-                "det_one",
-                &format!("live-sentinel rebuild attempt {attempt}"),
+            assert_eq!(
+                db.__debug_vector_hnsw_len(index_ref("det_one")),
+                Some(REOPEN_ROWS + 1),
+                "live-sentinel attempt {attempt}: maintained graph route must survive insert"
             );
             let mut live_rows = expected_rows.clone();
             assert!(
@@ -543,22 +534,23 @@ fn consecutive_hnsw_builds_within_one_open_database_are_stable() {
                 live_raw.topology_digest, first_raw.topology_digest,
                 "live-sentinel rebuild attempt {attempt}: live sentinel build must create a distinct graph"
             );
-            assert_newer_hnsw_build(
-                &live_raw,
-                &first_raw,
-                &format!("live-sentinel rebuild attempt {attempt}"),
-            );
             delete_sentinel(&db);
-            assert_hnsw_cleared(
-                &db,
-                "det_one",
-                &format!("post-delete in-process rebuild attempt {attempt}"),
+            assert_eq!(
+                db.__debug_vector_hnsw_len(index_ref("det_one")),
+                Some(REOPEN_ROWS + 1),
+                "post-delete attempt {attempt}: immutable graph stays installed while the tombstone excludes the deleted row"
             );
+            let builds_before_query = db.__vector_passive_activity_counters_for_test().hnsw_builds;
             let second = search(
                 &db,
                 "det_one",
-                REOPEN_ROWS,
+                REOPEN_ROWS + 1,
                 &format!("in-process rebuild attempt {attempt}"),
+            );
+            assert_eq!(
+                db.__vector_passive_activity_counters_for_test().hnsw_builds,
+                builds_before_query,
+                "post-delete query must not rebuild HNSW"
             );
             assert_results_belong_to_index(
                 &second,
@@ -568,19 +560,13 @@ fn consecutive_hnsw_builds_within_one_open_database_are_stable() {
             let second_raw = assert_hnsw_built_and_used(
                 &db,
                 "det_one",
-                &expected_rows,
-                REOPEN_ROWS,
+                &live_rows,
+                REOPEN_ROWS + 1,
                 &format!("in-process rebuild attempt {attempt}"),
             );
-            assert_newer_hnsw_build(
-                &second_raw,
-                &live_raw,
-                &format!("in-process rebuild attempt {attempt}"),
-            );
-            assert_hnsw_observation_identical(
-                &second_raw,
-                &first_raw,
-                &format!("raw in-process rebuild attempt {attempt}"),
+            assert_eq!(
+                second_raw.build_serial, live_raw.build_serial,
+                "post-delete query must observe the existing maintained graph"
             );
             assert_search_sequence_identical(
                 &second,
@@ -599,11 +585,19 @@ fn per_index_independent_progress_reopen_flake_is_fixed_under_repeat() {
         let path = tmp.path().join(format!("hnsw-rebuild-d03-{iter}.db"));
         let (text_rows, face_rows, pre_text, pre_text_raw, pre_face, pre_face_raw) = {
             let db = Database::open(&path).unwrap();
+            db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
             create_reopen_tables(&db);
             let (text_rows, face_rows) = seed_reopen_tables(&db);
             assert!(
                 text_rows.is_disjoint(&face_rows),
                 "iteration {iter}: table_text and table_face row ids must be disjoint"
+            );
+            drive_hnsw_maintenance(
+                &db,
+                &[
+                    (index_ref("table_text"), REOPEN_ROWS),
+                    (index_ref("table_face"), REOPEN_ROWS),
+                ],
             );
             let pre_text = search(&db, "table_text", REOPEN_ROWS, "pre-reopen table_text");
             assert_results_belong_to_index(&pre_text, &text_rows, "pre-reopen table_text");
@@ -635,6 +629,10 @@ fn per_index_independent_progress_reopen_flake_is_fixed_under_repeat() {
         };
 
         let reopened = Database::open(&path).unwrap();
+        reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        let builds_before_queries = reopened
+            .__vector_passive_activity_counters_for_test()
+            .hnsw_builds;
         let post_face = search(
             &reopened,
             "table_face",
@@ -663,15 +661,12 @@ fn per_index_independent_progress_reopen_flake_is_fixed_under_repeat() {
             REOPEN_ROWS,
             "post-reopen table_text",
         );
-        assert_newer_hnsw_build(
-            &post_text_raw,
-            &pre_text_raw,
-            &format!("iteration {iter}, table_text"),
-        );
-        assert_newer_hnsw_build(
-            &post_face_raw,
-            &pre_face_raw,
-            &format!("iteration {iter}, table_face"),
+        assert_eq!(
+            reopened
+                .__vector_passive_activity_counters_for_test()
+                .hnsw_builds,
+            builds_before_queries,
+            "iteration {iter}: reopen queries must load durable graphs without building"
         );
         assert_hnsw_observation_identical(
             &post_text_raw,
@@ -704,6 +699,7 @@ fn hnsw_build_invariant_under_parallel_pressure_does_not_drift() {
             let tmp = TempDir::new().unwrap();
             let path = tmp.path().join(format!("hnsw-rebuild-d04-{attempt}.db"));
             let (db, expected_rows) = open_seeded_single_table(&path);
+            drive_hnsw_maintenance(&db, &[(index_ref("det_one"), REOPEN_ROWS)]);
             let first = search(&db, "det_one", REOPEN_ROWS, "parallel-pressure first build");
             assert_eq!(first.len(), TOP_K);
             assert_results_belong_to_index(&first, &expected_rows, "parallel-pressure first build");
@@ -718,6 +714,10 @@ fn hnsw_build_invariant_under_parallel_pressure_does_not_drift() {
             drop(db);
 
             let reopened = Database::open(&path).unwrap();
+            reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+            let builds_before_query = reopened
+                .__vector_passive_activity_counters_for_test()
+                .hnsw_builds;
             let second = search(
                 &reopened,
                 "det_one",
@@ -736,10 +736,12 @@ fn hnsw_build_invariant_under_parallel_pressure_does_not_drift() {
                 REOPEN_ROWS,
                 "parallel-pressure second build",
             );
-            assert_newer_hnsw_build(
-                &second_raw,
-                &first_raw,
-                &format!("parallel-pressure rebuild attempt {attempt}"),
+            assert_eq!(
+                reopened
+                    .__vector_passive_activity_counters_for_test()
+                    .hnsw_builds,
+                builds_before_query,
+                "parallel-pressure reopen query must not build HNSW"
             );
             assert_hnsw_observation_identical(
                 &second_raw,

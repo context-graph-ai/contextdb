@@ -333,7 +333,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "nearest neighbours through the approximate index after an index narrowed",
-            database: indexed_vector_store(1_024),
+            database: indexed_vector_store(4_096),
             sql: "SELECT id FROM docs WHERE bucket = $bucket ORDER BY embedding <=> $query LIMIT 3"
                 .to_owned(),
             params: params(vec![

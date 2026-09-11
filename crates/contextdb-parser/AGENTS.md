@@ -1,51 +1,79 @@
 # contextdb-parser — Agent Rules
 
-Repo-wide rules are in the [root `AGENTS.md`](../../AGENTS.md). This file carries the one
-discipline that is local to this crate.
+Repo-wide rules are in the [root `AGENTS.md`](../../AGENTS.md). The grammar a user sees is
+documented in [`docs/query-language.md`](../../docs/query-language.md).
 
-## Char-boundary discipline
+**Purpose:** turn one SQL string into one typed `Statement` — SQL, `GRAPH_TABLE ... MATCH`, and the
+vector, sync, custody and event extensions — or refuse it with a typed `Error`, never a panic.
 
-**Every fixed-width lookahead into the input string must be boundary-safe.** This crate scans raw
-user SQL, and user SQL contains multi-byte UTF-8 — in string literals, in comments, in quoted
-identifiers. A byte-offset slice built from `idx + <ascii token>.len()` is a *fixed-width* window:
-`idx` is a char boundary because it came from `char_indices()`, but `idx + len` is not, the moment a
-multi-byte character starts inside that window. `&s[a..b]` on a non-boundary **panics**, and a panic
-in the parser takes down the caller's process on valid input.
+## Owns / must not own
 
-So: never index with `&input[a..b]` on a window whose end you computed. Use `str::get(a..b)`, which
-returns `None` at a non-boundary instead of panicking — and a window that ends mid-character can
-never equal an ASCII token anyway, so `None` is also the correct answer.
+Owns `src/grammar.pest` (the pest grammar), `src/ast.rs` (every `Statement` and `Expr` shape),
+`src/parser.rs` (`parse()`: raw-text pre-checks, then pest, then AST builders), and
+`src/classification.rs` (`statement_effect()` — whether a statement needs a writable store, and
+`select_contains_vector_similarity`). The pre-checks refuse unsupported features by name before
+pest runs: `CREATE PROCEDURE/FUNCTION`, `WITH RECURSIVE`, `GROUP BY`, window `OVER`, full-text
+`MATCH`; `validate_select_body` then refuses a vector ordering without `LIMIT`.
 
-The shipped pattern, `contains_token_outside_strings` in `src/parser.rs`:
+The vector declaration grammar lives here, as syntax only. On a `VECTOR(n)` column, after
+`WITH (quantization = ...)`, the clauses come in this fixed order, each at most once:
+`PARTITION_KEY (col, ...)`, `MAX_PARTITIONS n`, `SEARCH_MODE AUTO|EXACT|INDEXED`,
+`AUTO_INDEX_AT n`, `HNSW (M = v, EF_CONSTRUCTION = v, EF_SEARCH = v)` (any value may be
+`DEFAULT`), `CONSOLIDATION NONE | (CHANGE_PERCENT = v, TOMBSTONE_PERCENT = v)`. Online changes are
+`ALTER TABLE t ALTER COLUMN c SET MAX_PARTITIONS | SEARCH_MODE | AUTO_INDEX_AT | HNSW (...)|DEFAULT
+| CONSOLIDATION ...|DEFAULT`. Queries take `ORDER BY col <=> q [USE VECTOR mode] [USE RANK name]
+LIMIT k`. Store-level forms: `SET/SHOW MAINTENANCE_POLL_INTERVAL` (`MILLISECONDS|SECONDS`),
+`SHOW VECTOR_PARTITIONS [FOR table.column] [LIMIT n [OFFSET m]]`, `SHOW VECTOR_INDEXES`.
 
-```rust
-// `idx` is a char boundary, but `idx + token.len()` need not be: a
-// multi-byte character starting inside the fixed-width window would put
-// it mid-character. `get` returns None there instead of panicking, and
-// a window that ends mid-character can never equal an ASCII token.
-if is_word_boundary(input, idx.saturating_sub(1))
-    && input
-        .get(idx..idx + token.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(token))
-    && is_word_boundary(input, idx + token.len())
-{
-    return true;
-}
+Must not own: meaning. Whether `MAX_PARTITIONS` without `PARTITION_KEY` is legal, whether a column
+exists, whether a mode fits the column — those are the engine's semantic validation. Plan choice
+is the planner's. Keep the parser schema-blind.
+
+## Seams
+
+Below: `contextdb-core` (`Error`, `Result`, shared enums). Entry points: `parse(&str)`,
+`statement_effect(&Statement)`. Above: `contextdb-planner` (every statement), `contextdb-engine`
+(executes the AST and routes reads by `statement_effect`), `contextdb-cli` (re-parses a statement
+to register `:memory:` session callbacks).
+
+## Invariants and their guards
+
+| Invariant | Guard |
+|---|---|
+| Multi-byte UTF-8 anywhere in the input never panics `parse()` | `tests/utf8_multibyte_boundary_tests.rs::parse_never_panics_across_a_generated_utf8_width_and_offset_matrix` and its sixteen siblings |
+| Every statement is explicitly Read or Write (the match has no catch-all) | `tests/statement_effect_contract.rs::statement_effect_marks_only_the_ten_inspection_variants_as_reads` |
+| Vector clauses parse on `CREATE TABLE` and `ADD COLUMN` with defaults preserved | `tests/vector_partition_syntax_contract.rs::create_table_accepts_defaulted_and_explicit_partition_declarations`, `::vector_policy_spellings_preserve_values_and_defaults_on_create_add_and_alter` |
+| Reordered, repeated, empty or unknown vector clauses are refused | `tests/vector_partition_syntax_contract.rs::vector_declarations_and_queries_reject_reordered_or_repeated_clauses` |
+| `MAX_PARTITIONS` without a key is left to semantic validation | `tests/vector_partition_syntax_contract.rs::max_partitions_without_a_partition_key_reaches_semantic_validation` |
+| `ALTER ... SET MAX_PARTITIONS / SEARCH_MODE` parse | `tests/vector_partition_syntax_contract.rs::alter_column_accepts_online_partition_limit_and_search_mode_changes` |
+| `USE VECTOR` follows the vector ordering and precedes `USE RANK` and `LIMIT` | `tests/vector_partition_syntax_contract.rs::vector_search_override_follows_vector_ordering_and_precedes_rank_and_limit` |
+| `SHOW VECTOR_PARTITIONS FOR` needs both table and column | `tests/vector_partition_syntax_contract.rs::partition_inspection_requires_both_table_and_column_after_for` |
+| Vector-similarity detection follows nested queries and ignores string text | `tests/vector_partition_syntax_contract.rs::shared_vector_query_detection_follows_nested_queries_and_ignores_text` |
+| A vector ordering without `LIMIT` is refused | `tests/parser_tests.rs::rejection_unbounded_vector_search` |
+| Unsupported SQL is refused by name | `tests/parser_tests.rs::rejection_recursive_cte`, `::rejection_window_functions`, `::rejection_stored_procs`, `::rejection_full_text_match_operator` |
+| `PURGE` is its own statement, not a `DELETE` | `tests/purge_parser_contract_tests.rs::purge_from_where_parses_as_distinct_statement` |
+| The removed conflict-policy statements stay parse errors | `tests/legacy_conflict_policy_ddl_tests.rs::legacy_global_set_sync_conflict_policy_is_a_parse_error` |
+| A `WRITE` substring in a comment or quoted label does not split a scope-label list | `tests/scope_label_write_keyword_word_boundary_tests.rs::comment_containing_write_substring_inside_read_list_does_not_corrupt_labels` |
+| `SET/SHOW MAINTENANCE_POLL_INTERVAL` declare and read back through the engine | `crates/contextdb-engine/tests/vector_partition_declaration_contract.rs::consolidation_and_maintenance_poll_declarations_round_trip_and_reset` |
+
+**Char-boundary rule.** Never slice `&input[a..b]` on a window whose end you computed
+(`idx + token.len()` need not be a char boundary). Use `input.get(a..b)`, which returns `None`
+there — and a window ending mid-character can never equal an ASCII token. The shipped pattern is
+`contains_token_outside_strings`; `is_word_boundary` may read a byte because it bounds-checks
+first and only asks whether the byte is ASCII-alphanumeric or `_`. A new raw-text scanner joins
+the generated matrix in `utf8_multibyte_boundary_tests.rs`; never delete a case from it.
+
+## Where a change lives
+
+| Change | Where it lands |
+|---|---|
+| New statement | Rule in `grammar.pest`, variant in `ast.rs`, builder arm in `parse()`, an explicit arm in `statement_effect` (Read only if it changes nothing), then planner and engine. |
+| New vector clause | Its slot in the ordered clause list in `grammar.pest`, field on the AST column/alter shape, rejection cases in `vector_partition_syntax_contract.rs`; semantic checks go to the engine. |
+| New refused SQL feature | A pre-check in `parse()` returning a typed `Error`, boundary-safe. |
+| New scalar function | Nothing here — function calls parse generically; see the root guide. |
+
+## Fast test
+
+```bash
+cargo test -p contextdb-parser
 ```
-
-Note that `is_word_boundary` reads `s.as_bytes()[idx]` — that is safe *because* it is only ever
-called with an index it first bounds-checks (`idx >= s.len()` returns `true`), and it only asks
-"is this byte ASCII-alphanumeric or `_`". A continuation byte of a multi-byte character is neither,
-so it reads as a boundary, which is the right answer. Byte inspection is fine; byte *slicing* is not.
-
-Applies to any new scanner you add here — keyword sequence detection, literal skipping, comment
-skipping. Prefer iterating `char_indices()` and comparing characters over reconstructing substrings
-at all.
-
-### Regression coverage
-
-`tests/utf8_multibyte_boundary_tests.rs` carries a generated matrix that drives multi-byte
-characters through string literals, comments and identifiers at every offset around the scanner's
-lookahead window.
-A new scanner belongs in that matrix. Do not delete a case from it — see the mutation-evidence rule
-in the root file.

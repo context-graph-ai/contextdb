@@ -31,7 +31,7 @@ The same command works whether the store is idle or already owned by a live proc
 | Idle or missing store | `contextdb <path> --write` | Full read-write session; the store is created if missing. <!-- enforced by: read_cli_journeys_invocation::bare_path_on_a_missing_store_refuses_and_creates_nothing, read_cli_journeys_invocation::write_flag_creates_the_store_a_read_refused_to_create --> |
 | Live file-backed owner | `contextdb <path>` | Reading session over that owner's authenticated local channel. <!-- enforced by: read_cli_journeys_live_owner::a_reading_session_routes_through_the_live_owner_and_says_so_once --> |
 | Live file-backed owner | `contextdb <path> --write` | Refused with `held_by_writer`; the refusal says a read session (drop `--write`) reaches the live owner's channel. <!-- enforced by: read_cli_journeys_machine_surface::every_refusal_carries_its_ratified_class_and_kind --> |
-| Readers hydrating | `contextdb <path> --write` | Refused with `held_by_readers`, listing the hydrating readers when identifiable, else "N direct readers are hydrating this store; retry in a moment". <!-- enforced by: no wall test yet — a hydrating-readers race needs a second process holding the shared lock --> |
+| Readers hydrating | `contextdb <path> --write` | Refused with `held_by_readers`, listing the hydrating readers when identifiable, else "N direct readers are hydrating this store; retry in a moment". <!-- unbound: no wall test yet — a hydrating-readers race needs a second process holding the shared lock --> |
 
 ### Options
 
@@ -44,6 +44,8 @@ The same command works whether the store is idle or already owned by a live proc
 | `--sync-debounce-ms <MS>` | 500 | Writer-only: auto-sync batching window. |
 | `--memory-limit <SIZE>` | *(unlimited)* | Whole-session memory ceiling, read or write mode. Suffixes: `K`, `M`, `G`. |
 | `--disk-limit <SIZE>` | *(unlimited)* | File-backed session disk ceiling. Never authorizes writes; invalid for `:memory:`. |
+| `--maintenance <MODE>` | `engine-owned` | Maintenance schedule for this process: `engine-owned` starts the database worker when work is declared; `caller-driven` starts no worker and leaves scheduling to `.maintenance run` or the embedding host. Writer-only for file-backed stores. |
+| `--maintenance-poll-ms <MS>` | persisted value, else `60000` | Positive engine-owned poll interval in milliseconds. A supplied value is persisted for a file-backed database; omitting the flag uses that persisted value on later opens rather than overwriting it. Writer-only for file-backed stores. |
 
 Per-invocation read ceilings and deadlines (see [Declared Limits](#declared-limits)):
 
@@ -124,7 +126,7 @@ Every meta-command emits a document whose top-level key names its payload:
 | `.schema <table>` | `{"schema":{"table":…,"columns":[…],"primary_key":[…],"indexes":[…],…,"ddl":…}}` — the full declared contract, namespaced |
 | `.events status` | `{"events_status":{"items":[…],"has_more":bool,"continuation":"…"\|null}}` <!-- enforced by: read_cli_journeys_metadata::tables_under_json_is_a_namespaced_page_document, read_cli_journeys_metadata::events_status_pages_under_its_own_namespaced_key, read_cli_journeys_metadata::tables_resumes_through_its_own_continuation_until_exhausted, read_cli_journeys_metadata::a_human_metadata_page_prints_the_exact_follow_up_command, read_cli_journeys_metadata::a_continuation_is_refused_by_a_command_that_did_not_issue_it, read_cli_journeys_metadata::a_complete_metadata_response_that_does_not_fit_refuses_with_the_setting_that_would --> |
 | `.maintenance status` | `{"maintenance":{…}}` |
-| `.explain <sql>` | `{"explain":{"physical_plan":…,"runtime_trace":…,…}}` |
+| `.explain <sql>` | `{"explain":{"physical_plan":…,"runtime_trace":true|false,…}}` |
 | `.cursor open` / `.cursor fetch` | `{"cursor":{"columns":[…],"rows":[…],"has_more":bool}}` <!-- enforced by: read_cli_journeys_cursor::a_first_page_carries_its_columns --> |
 | `.cursor close` | `{"cursor":{"closed":true}}` |
 | `.owner status` | `{"owner":{"state":…,…}}` (see [Owner Inspection](#owner-inspection-owner-status)) |
@@ -175,9 +177,9 @@ refuses with `owner_limit_exceeded`, exit `1`. <!-- enforced by: read_cli_journe
 carries the refused statement verbatim (`detail.statement`) and teaches both escapes,
 route-aware: <!-- enforced by: read_cli_journeys_ordinary_results::the_refusal_carries_the_statement_and_a_copy_ready_cursor_command, read_cli_journeys_ordinary_results::the_file_route_refusal_names_raising_the_result_limits_as_the_export_escape -->
 
-- **File route:** raise `--read-result-rows` / `--read-result-bytes` for a deliberate one-shot
-  export (a very large export may then cross `--read-work` / `--read-active-ms` /
-  `--read-memory`; the refusal names whichever flag it crossed), or page with the cursor. The
+- **File route:** raise the matching `--read-*` ceiling for a deliberate one-shot
+  export (a work refusal names `--read-work` and does not suggest result paging), or page with the cursor when the
+  result row or byte ceiling is the limit. The
   detail carries the copy-ready `.cursor open <statement>` in `remedy_command`, and human mode
   prints the whole refusal as one line:
 
@@ -185,8 +187,10 @@ route-aware: <!-- enforced by: read_cli_journeys_ordinary_results::the_refusal_c
   Error: the answer went past the rows this read is allowed: 500 rows; .cursor open SELECT * FROM big; raise --read-result-rows / --read-result-bytes for a deliberate one-shot export
   ```
 - **Owner route:** the ceiling is owner-imposed — a caller can lower but never raise owner
-  policy. The refusal names the writer-side `--owner-read-result-rows` /
-  `--owner-read-result-bytes` change and offers `.cursor open` as the only in-session escape.
+  policy. The refusal names the matching writer-side `--owner-read-*` setting; a work refusal
+  names `--owner-read-work` and does not offer cursor paging as a remedy. A writer's own
+  reads use `--read-*`, including the default `--read-work` of 50,000; `--owner-read-*`
+  governs only the read service it exposes to other sessions.
   <!-- enforced by: read_cli_journeys_live_owner::the_owner_route_refusal_names_the_writer_side_change_and_the_cursor, read_cli_journeys_live_owner::the_owners_ceiling_applies_and_a_caller_cannot_raise_it -->
 
 Human mode renders a successful ordinary `SELECT` as a bordered `+---+` table — a rule line, the
@@ -204,19 +208,19 @@ The SQL dialect itself (types, functions, graph and vector clauses) is documente
 
 #### Large results: the session cursor
 
-One cursor per CLI session (piped sessions included): <!-- enforced by: read_cli_journeys_cursor::a_second_cursor_in_one_session_is_refused_until_the_first_closes, read_cli_journeys_cursor::independent_sessions_hold_independent_cursors, read_cli_journeys_cursor::the_cursor_accepts_exactly_one_read_only_select -->
+One cursor per CLI session (piped sessions included): <!-- enforced by: read_cli_journeys_cursor::a_second_cursor_in_one_session_is_refused_until_the_first_closes, read_cli_journeys_cursor::independent_sessions_hold_independent_cursors, read_cli_journeys_cursor::the_cursor_refuses_writes_and_unsupported_statements -->
 
-- `.cursor open <SELECT>` — opens one committed snapshot, returns the first page.
+- `.cursor open <SELECT or SHOW VECTOR_PARTITIONS statement>` — opens one committed snapshot, returns the first page.
 - `.cursor fetch [rows]` — next page; omitting `rows` uses `cursor_page_rows` (default 100); an
   explicit count above the effective `result_rows` refuses with `owner_limit_exceeded` **without
   ending the read** — the refusal carries the copy-ready `.cursor fetch <effective-limit>` that
   works, and running it pages on from exactly where the cursor stopped.
 - `.cursor close` — releases the cursor.
 
-`.cursor open` accepts exactly one read-only `SELECT`: a write refuses with
-`write_requires_flag`; anything else is `cursor_invalid_statement` and never executes. A second
+`.cursor open` accepts exactly one read-only `SELECT` or `SHOW VECTOR_PARTITIONS` statement. A write refuses with `write_requires_flag`; any other
+statement is `cursor_invalid_statement` and never executes. A second
 `.cursor open` refuses with `cursor_already_open` until the first closes; independent CLI
-sessions have independent cursors. <!-- enforced by: read_cli_journeys_cursor::a_second_cursor_in_one_session_is_refused_until_the_first_closes, read_cli_journeys_cursor::independent_sessions_hold_independent_cursors, read_cli_journeys_cursor::the_cursor_accepts_exactly_one_read_only_select -->
+sessions have independent cursors. <!-- enforced by: read_cli_journeys_cursor::a_second_cursor_in_one_session_is_refused_until_the_first_closes, read_cli_journeys_cursor::independent_sessions_hold_independent_cursors, read_cli_journeys_cursor::the_cursor_refuses_writes_and_unsupported_statements -->
 
 A page contains only complete rows and stops at the requested row count or `cursor_page_bytes`;
 a single row that cannot fit a page even alone refuses with `owner_limit_exceeded` naming
@@ -350,7 +354,7 @@ contextdb purge <PATH> --table <TABLE> --force
 
 Writes a `<PATH>.bak` backup of the untouched original FIRST, reads every
 row/edge/vector/DDL statement out of the legacy root, writes it into a fresh current-format
-root, then atomically swaps it in. Refuses (leaving the path untouched) on a root that is
+root, then performs the atomic swap. Refuses (leaving the path untouched) on a root that is
 already current-format; running it twice is a safe no-op. If migration fails partway, the
 original path is left as it was and the `.bak` backup remains.
 
@@ -457,11 +461,11 @@ Paste a meta-command's whole invocation, including any SQL argument, on one line
 | `.quit` / `.exit` | `\q` | session | Exit the REPL. |
 | `.tables [--continue <c>]` | `\dt` | read | List table names; large listings resume via continuation. |
 | `.schema <table>` | `\d <table>` | read | Show the table's full declared contract; complete-or-refuse. Per-column `IMMUTABLE`, vector quantization, and `RANK_POLICY` clauses render alongside `NOT NULL` / `PRIMARY KEY`. |
-| `.explain <sql>` | | read | Show the execution plan; never executes a write argument. <!-- enforced by: read_cli_journeys_session_shape::removed_aliases_are_not_accepted_spellings, read_cli_journeys_session_shape::conventional_aliases_keep_the_classification_of_the_commands_they_spell --> |
+| `.explain <sql>` | | read | Show the route: ordinary read-only queries execute through the bounded reader, vector similarity is inspected passively, and writes are only planned. <!-- enforced by: read_cli_journeys_session_shape::removed_aliases_are_not_accepted_spellings, read_cli_journeys_session_shape::conventional_aliases_keep_the_classification_of_the_commands_they_spell --> |
 | `.trace on` / `.trace off` | | session | Toggle one-line execution traces. |
 | `.events status [--continue <c>]` | | read | Bounded, resumable event/sink/route/schedule health. |
 | `.maintenance status` | | read | One complete bounded maintenance-state response. |
-| `.maintenance run` / `.maintenance compact` | | **write** | Cleanup and file-space reclamation. |
+| `.maintenance run` / `.maintenance compact` | | **write** | Advance one maintenance cycle / explicitly drain file compaction. |
 | `.cursor open/fetch/close` | | read | Bounded traversal beyond an ordinary-result ceiling. |
 | `.owner status` | | status | Owner policy and state; works at capacity. |
 | `.sync status` | | session | Current CLI session's sync state only. |
@@ -481,11 +485,19 @@ classification exactly:
 
 ### Trace vs Explain
 
-`.explain <sql>` shows the execution route: the physical strategy, chosen index, pushed
-predicates, rejected candidates. It never applies a statement — a read-only query is run to
-collect its real route; anything that would write is planned without execution, so
-`.explain DELETE FROM t` leaves the rows alone (`runtime_trace: false` under `--json`). Use
-`.trace on` for the runtime route and exact `rows_examined` after each successful statement.
+`.explain <sql>` has three deliberately different paths. An ordinary relational `SELECT` or `WITH`
+executes through the session's normal bounded read route, under the same row, byte, work, memory,
+deadline, and cancellation ceilings. Its explanation is the route that actually ran: human output
+shows the physical strategy, chosen index, pushed predicates, rejected candidates, and sort elision;
+JSON carries those route facts plus real `rows_examined` and reports `runtime_trace: true`.
+
+A vector nearest-neighbour query whose parsed `ORDER BY` uses `<=>` is passive. It reads only safe
+catalog, authorization, lifecycle, and policy metadata; it does not run the search, load graph or
+raw-vector pages, replay or build an index, start repair or compaction, or change residency and
+charges. Its complete redacted vector-route disclosure reports `runtime_trace: false`. A write is
+also planned without execution, so `.explain DELETE FROM t` and `.explain INSERT INTO t ...` never
+change rows and likewise report `runtime_trace: false`. Use `.trace on` to print the runtime trace
+after a statement you execute directly.
 
 The trace `.trace on` prints is the value a Rust caller reads from `QueryResult.trace`: the REPL
 renders that `QueryTrace` field of the executed statement's result and adds nothing to it, so a
@@ -527,6 +539,150 @@ Four things the printed DDL does not reproduce literally, and what to read inste
   declared a narrowed set of scopes gets every row instead of only its own. As with `CONTEXT_ID`,
   neither the printed DDL nor `--json` names this column today, so replaying `.schema` output
   alone silently drops the narrowing.
+
+### Vector inspection and recovery
+
+Use SQL `SHOW VECTOR_INDEXES` to inspect a vector column as a whole. It keeps the familiar
+`table`, `column`, `dimension`, `quantization`, `vector_count`, and `bytes` fields, and adds the
+declared partition key and effective limit, live and snapshot-retained layout counts, search mode,
+base range, pending inserts, tombstones, durable and charged vector/index bytes, query and
+maintenance state, work progress, unavailable/stalled counts, and broad-route state. `bytes` remains
+the compatibility total of charged vector bytes plus charged index bytes; do not add those three
+figures together.
+
+Use the detail view when one layout needs attention:
+
+```sql
+SHOW VECTOR_PARTITIONS;
+SHOW VECTOR_PARTITIONS LIMIT 50;
+SHOW VECTOR_PARTITIONS FOR vector_items.embedding;
+SHOW VECTOR_PARTITIONS FOR vector_items.embedding LIMIT 50 OFFSET 100;
+```
+
+The grammar is `SHOW VECTOR_PARTITIONS [FOR <table>.<column>] [LIMIT <count>
+[OFFSET <start>]]`. `LIMIT` works with or without `FOR`, and omitting `OFFSET` means zero. The
+unpaged form is an ordinary result: if it crosses the active result-row or result-byte ceiling,
+ContextDB refuses the complete result instead of truncating it. Page that same stable result with
+the ordinary cursor:
+
+```bash
+db="$(mktemp -d)/vector-inspection.db"
+contextdb "$db" --write --json --read-cursor-page-rows 1 <<'SQL'
+CREATE TABLE vector_items (
+  id INTEGER PRIMARY KEY,
+  scope INTEGER NOT NULL,
+  embedding VECTOR(3) PARTITION_KEY (scope)
+);
+INSERT INTO vector_items VALUES (1, 10, '[1,0,0]'), (2, 20, '[0,1,0]');
+.maintenance run
+.cursor open SHOW VECTOR_PARTITIONS FOR vector_items.embedding
+.cursor fetch
+SQL
+```
+
+A populated caller-driven result is immediately actionable; for example, a summary can report
+`vector_count=120`, `bytes=44064`, `charged_vector_bytes=15360`,
+`charged_index_bytes=28704`, `pending_inserts=3`, `tombstones=2`,
+`query_state=ready`, `maintenance_state=idle`, `broad_route=fanout`, and
+`broad_route_state=ready`. Its partition row can report
+`partition_key={"context_id":"camera-17"}`, `base_generation=4`, `base_tx=891`, the same pending
+counts for that route, `maintenance_reason=tombstones`, and
+`recovery_action=run_maintenance_cycle`. The compatibility `bytes` value is exactly
+`15360 + 28704`; durable byte columns are separate file-storage facts and are zero for an
+in-memory database.
+
+Rows are in stable `(table, column, canonical_partition_key)` order. Each reports its key, live and
+retained rows, serving base generation/transaction, tail and tombstone counts, durable and charged
+bytes, availability, maintenance state and progress checkpoint, and a recovery action. The empty
+key `{}` is the one unpartitioned layout; it appears even before its first vector. An empty
+partitioned column has no detail row until a key tuple receives a vector.
+
+`broad_route` is `fanout` when a broad filter searches the eligible partitions separately and `maintained` when it uses the maintained broad route. `broad_route_state` is `ready`, `partial`, or `unavailable`; `partial` reports maintained-route build progress and never permits a partial answer.
+
+`query_state` is `empty`, `ready`, or `unavailable` for a layout; the whole-index view can also say
+`partial`. A layout's `maintenance_state` is `idle`, `building`, `replaying`, `compacting`,
+`repairing`, or `stalled`. The whole-index summary is `idle` when every layout is idle; it reports
+`building`, `replaying`, `compacting`, or `repairing` only when all non-idle work has that one state;
+it reports `active` when several non-stalled activities coexist, `stalled` only when every busy
+layout is stalled, and `mixed` when stalled and live work coexist. Per-partition inspection reports
+desired topology (`desired_hnsw_m`, `desired_hnsw_ef_construction`) separately from the complete
+serving graph (`serving_hnsw_m`, `serving_hnsw_ef_construction`) and their policy revisions.
+`desired_hnsw_ef_search` is the current query policy resolved for inspection (`k = 1`);
+`serving_hnsw_ef_search` reports that same current breadth when a serving graph exists, and is
+`NULL` without one. It is not a frozen build setting. An actual query resolves breadth at its own
+`k`: explicit `EF_SEARCH` is raised only to `k`, while omission uses at least the profile and
+`10 * k`. Query-only changes therefore need not advance `serving_policy_revision`, which identifies
+the graph's build. A pending topology replacement remains visible in the desired/serving values. The response uses stable
+words, not free-form errors:
+
+- `availability_reason` is `none`, `initial_build`, `replay`, `corrupt_base`,
+  `corrupt_changes`, `incompatible_format`, `resource_stalled`, or `build_failure`.
+- `maintenance_reason` is `none`, `initial_build`, `new_changes`, `tombstones`, `corrupt_base`,
+  `corrupt_changes`, `incompatible_format`, `memory_limit`, `disk_limit`, or `build_failure`.
+- `recovery_action` is `none`, `wait_for_automatic_work`, `run_maintenance_cycle`,
+  `raise_memory_limit`, `raise_disk_limit_or_free_space`, or `inspect_build_failure`.
+
+`corrupt_base` identifies the serving-base artifact; `corrupt_changes` identifies committed changes
+after that base. A healthy, caught-up layout reports `maintenance_state=idle`, both reasons as
+`none`, and `recovery_action=none` under either maintenance policy. Real initial-build,
+`new_changes`, tombstone, replay, corruption, or incompatible-format work reports
+`wait_for_automatic_work` under engine-owned maintenance and `run_maintenance_cycle` under
+caller-driven maintenance (the CLI spelling is `.maintenance run`). A failed reservation or build
+overrides that policy advice with the action that can clear it: `memory_limit` maps to
+`raise_memory_limit`, `disk_limit` maps to `raise_disk_limit_or_free_space`, and `build_failure`
+maps to `inspect_build_failure`. These failure facts remain visible until a successful publication
+clears them or a policy change removes the work that failed.
+
+`.maintenance run` reports the vector counters from that cycle in text and under
+`maintenance_cycle.vector` in JSON: built and remaining indexes, plus nonempty, ready, built, and
+remaining partitions, and `first_failure` (`null` when every attempt succeeded). A partition-local
+failure does not discard successful counts or skip cycle-closing reclamation, retirement, and
+automatic-compaction work. Engine-owned maintenance is the default and polls every 60 seconds unless
+the database's persisted interval is changed with `SET MAINTENANCE_POLL_INTERVAL` or
+`--maintenance-poll-ms`. Each wake samples the finite backlog and advances every needy partition
+sequentially within the declared memory and work limits, with never-built partitions before
+previously built repair or consolidation work. There is no separate per-wake partition-count cap:
+the work is finite because the wake uses one fixed candidate sample. Caller-driven mode starts no maintenance thread; each
+`.maintenance run` applies that same all-needy sampled cycle. New writes or a resource refusal can
+still leave work for a later cycle.
+
+When `first_failure` is present, the text receipt and JSON `first_failure_details` retain a safe
+operation, message, recovery instruction, and the requested, available, current, and limit byte
+fields that apply. A memory refusal points to `SET MEMORY_LIMIT <SIZE>` or `--memory-limit <SIZE>`;
+a disk refusal points to `SET DISK_LIMIT <SIZE>`, `--disk-limit <SIZE>`, or freeing disk space.
+
+Inspection only reads lifecycle metadata: it never loads an evicted graph, replays a tail, builds a
+route, or starts repair. It reports current local lifecycle state and recovery advice.
+
+These `SHOW VECTOR_*` commands require the existing unrestricted admin database handle. A narrowed
+handle is refused rather than receiving partial totals. Use `.explain` for that caller's redacted
+route instead. Restricted explanations omit per-partition adaptive HNSW values as well as hidden
+keys and populations. Unrestricted explanations pair the snapshot's serving topology/build revision
+with the query's current `EF_SEARCH`; a stale build revision does not imply stale search breadth.
+When a partition limit blocks a write, raise it with `ALTER TABLE ... ALTER COLUMN
+... SET MAX_PARTITIONS ...`; lowering below live-plus-retained use is refused until retained
+snapshots finish.
+
+`SET MEMORY_LIMIT 2G` and CLI `--memory-limit 2G` both resolve to **2147483648 bytes**.
+`SHOW MEMORY_LIMIT` reports the resolved limit; it counts charged memory, which is separate from
+whole-process RSS. Under pressure, idle vector graphs are reclaimed in least-recently-used order
+only until the selected graph's complete load fits. Without `SET MEMORY_LIMIT` or
+`--memory-limit`, loaded graphs remain resident.
+
+### Vector column policy
+
+Use SQL to declare or change a vector column's `AUTO_INDEX_AT`, HNSW, and `CONSOLIDATION` policy;
+`CONSOLIDATION` controls when maintenance rebuilds a healthy graph, and its rules and defaults are
+in [Vector Similarity Search](query-language.md#vector-similarity-search). Foreground vector writes
+remain searchable while construction runs.
+`AUTO_INDEX_AT` and `EF_SEARCH` affect newly opened queries without a graph rebuild; changing `M`
+or `EF_CONSTRUCTION` schedules a replacement while the previous complete graph serves. The
+declarations persist with the schema. `SHOW VECTOR_INDEXES` and `SHOW VECTOR_PARTITIONS` expose
+declared, desired, and serving policy values and revisions. Their `declared_consolidation_mode` is
+`NULL` for a silent declaration, `thresholds` for explicit percentages, and `none` for explicit
+`CONSOLIDATION NONE`; the effective mode remains `thresholds` or `none`. See
+[Vector Similarity Search](query-language.md#vector-similarity-search) for canonical declarations,
+`ALTER ... SET ...` forms, default/silence rules, and numeric defaults.
 
 ### Sync Commands (write sessions)
 
@@ -687,7 +843,7 @@ teaching its recovery: <!-- enforced by: read_cli_journeys_machine_surface::ever
 | `invalid_continuation` | usage | A continuation was malformed or given to a command that did not issue it. |
 | `cursor_already_open` | sql | The session's cursor is still open; close it first. |
 | `cursor_transaction_active` | sql | `.cursor open` during an active write transaction. |
-| `cursor_invalid_statement` | usage | `.cursor open` received something other than one SELECT. |
+| `cursor_invalid_statement` | usage | `.cursor open` received something other than one SELECT or SHOW VECTOR_PARTITIONS statement. |
 | `cursor_expired` | io | Idle or lifetime crossed (`detail` names which); reopen with `.cursor open`. |
 | `cursor_not_found` | io | The cursor never existed, was explicitly closed, or is another connection's (a drained cursor answers an empty success page instead). |
 | `direct_read_requires_writer` | io | Safe decode found state needing a corrective writable open; close holders, rerun with `--write`. |

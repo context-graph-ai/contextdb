@@ -1,7 +1,7 @@
 //! Public rendering helpers used by both the CLI binary and the test suite.
 
 use crate::Database;
-use crate::database::QueryTrace;
+use crate::database::{ExplainOutput, QueryTrace};
 use crate::sync_types::Conflict;
 use contextdb_core::Value;
 use contextdb_core::table_meta::{ColumnType, TableMeta};
@@ -45,11 +45,10 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
             buf.push_str(",\n");
         }
         first = false;
-        // Reuse the canonical column renderer so `.schema` renders the full
-        // declared column contract (foreign-key REFERENCES and its ON STATE
-        // PROPAGATE SET form, UNIQUE, EXPIRES, quantization, immutability, rank
-        // policy) identically to the sync DDL emitter — author once.
-        let ty = crate::database::sql_type_for_meta_column(col, &meta.propagation_rules);
+        // Share canonical column rendering with synthesized sync DDL, including
+        // CONTEXT_ID and both SCOPE_LABEL forms. Authenticated original DDL is
+        // preserved separately by sync; this display is a metadata projection.
+        let ty = crate::database::sql_type_for_display_column(col, &meta.propagation_rules);
         write!(&mut buf, "  {} {}", col.name, ty).unwrap();
     }
     // A multi-column primary key is a table-level element, rendered after the
@@ -126,15 +125,10 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
     buf
 }
 
-/// What `.explain` shows about a statement's route: the plan it took, the
-/// index it went through, what it pushed into that index, what it turned down
-/// and why, and whether the ordering came for free.
-///
-/// One place owns this shape. `.explain` on a statement the CLI could run and
-/// `.explain` on one it could only plan are the same question about the same
-/// route, so an operator must not have to learn two answers -- and a caller
-/// that already HAS the result must not have to run the statement a second
-/// time to be told about it.
+/// Render the route receipt from an ordinary relational `.explain`: the plan
+/// that ran, its chosen index and pushdowns, rejected candidates, and whether
+/// its ordering came from the route. The caller has already executed the
+/// statement through the bounded read path that produced this trace.
 pub fn render_explain_trace(trace: &QueryTrace) -> String {
     let mut out = String::new();
     out.push_str(trace.physical_plan);
@@ -165,18 +159,73 @@ pub fn render_explain_trace(trace: &QueryTrace) -> String {
     if trace.sort_elided {
         out.push_str("  sort_elided: true\n");
     }
+    if let Some(vector_search) = &trace.vector_search {
+        writeln!(&mut out, "{vector_search}").unwrap();
+    }
     out
 }
 
-/// Render the `.explain <sql>` REPL output. Runs the SQL to populate the
-/// trace, then formats the physical plan + index-usage summary.
+/// Render passive vector `.explain` metadata or a statically planned write.
+/// These paths deliberately have no rows-examined or runtime-route fields.
+pub fn render_explain_output(explained: &ExplainOutput) -> String {
+    let mut out = String::new();
+    out.push_str(explained.physical_plan.trim_end());
+    if let Some(index) = &explained.index_used {
+        out.push_str(&format!(" {{ index: {index} }}"));
+    }
+    out.push('\n');
+    if !explained.predicates_pushed.is_empty() {
+        out.push_str("  predicates_pushed: [");
+        out.push_str(&explained.predicates_pushed.join(", "));
+        out.push_str("]\n");
+    }
+    if !explained.indexes_considered.is_empty() {
+        out.push_str("  indexes_considered: [");
+        for (position, candidate) in explained.indexes_considered.iter().enumerate() {
+            if position > 0 {
+                out.push_str(", ");
+            }
+            write!(
+                &mut out,
+                "{}: {}",
+                candidate.name, candidate.rejected_reason
+            )
+            .unwrap();
+        }
+        out.push_str("]\n");
+    }
+    if explained.sort_elided {
+        out.push_str("  sort_elided: true\n");
+    }
+    if let Some(vector_search) = &explained.vector_search {
+        writeln!(&mut out, "{vector_search}").unwrap();
+    }
+    out
+}
+
+/// Render `.explain <sql>` with its established split: execute an ordinary
+/// relational SELECT/WITH to report its real route, inspect vector similarity
+/// metadata without running the search, and only plan a write.
 pub fn render_explain(
     db: &Database,
     sql: &str,
     params: &std::collections::HashMap<String, Value>,
 ) -> contextdb_core::Result<String> {
-    let result = db.execute(sql, params)?;
-    Ok(render_explain_trace(&result.trace))
+    let statement = contextdb_parser::parse(sql)?;
+    match &statement {
+        contextdb_parser::Statement::Select(select)
+            if contextdb_parser::classification::select_contains_vector_similarity(select) =>
+        {
+            db.explain_output_with_params(sql, params)
+                .map(|explained| render_explain_output(&explained))
+        }
+        contextdb_parser::Statement::Select(_) => db
+            .execute(sql, params)
+            .map(|result| render_explain_trace(&result.trace)),
+        _ => db
+            .explain_output_with_params(sql, params)
+            .map(|explained| render_explain_output(&explained)),
+    }
 }
 
 pub fn render_query_trace(trace: &QueryTrace, rows_examined: u64) -> String {
@@ -195,6 +244,10 @@ pub fn render_query_trace(trace: &QueryTrace, rows_examined: u64) -> String {
         out.push(']');
     }
     out.push_str(&format!(" rows_examined={rows_examined}"));
+    if let Some(vector_search) = &trace.vector_search {
+        out.push(' ');
+        out.push_str(&vector_search.to_string());
+    }
     out
 }
 

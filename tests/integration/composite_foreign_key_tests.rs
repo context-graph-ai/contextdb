@@ -355,6 +355,17 @@ fn ddl_estimated_bytes_grows_with_each_descriptor_kind() {
         context_id: false,
         scope_label: None,
         acl_ref: None,
+        partition_key_columns: None,
+        max_partitions: None,
+        search_mode: contextdb_core::VectorSearchMode::Auto,
+        auto_index_at: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_ef_search: None,
+        vector_policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
+        consolidation_change_percent: None,
+        consolidation_tombstone_percent: None,
+        consolidation_disabled: false,
     });
     assert!(with_single_fk.estimated_bytes() > base.estimated_bytes());
 
@@ -2119,7 +2130,7 @@ fn ddl_sync_round_trip_distinguishes_pk_covered_from_unique_covered_fk() {
 
 #[test]
 fn protocol_version_bumps_for_structured_constraint_wire() {
-    assert_eq!(contextdb_server::protocol::PROTOCOL_VERSION, 6);
+    assert_eq!(contextdb_server::protocol::PROTOCOL_VERSION, 7);
     let envelope = Envelope {
         version: 3,
         message_type: MessageType::PullRequest,
@@ -2131,11 +2142,12 @@ fn protocol_version_bumps_for_structured_constraint_wire() {
         err,
         SyncError::ProtocolVersionMismatch {
             received: 3,
-            supported: 6
+            oldest_supported: 7,
+            newest_supported: 7,
         }
     ));
 
     let encoded = encode(MessageType::PullRequest, &()).unwrap();
     let decoded = decode(&encoded).unwrap();
-    assert_eq!(decoded.version, 6);
+    assert_eq!(decoded.version, 7);
 }

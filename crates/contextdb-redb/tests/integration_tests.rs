@@ -1,0 +1,2916 @@
+use rand::RngExt;
+use rand::prelude::SliceRandom;
+use redb::backends::FileBackend;
+use redb::{
+    AccessGuard, Builder, CompactionError, Database, Durability, Key, MultimapRange,
+    MultimapTableDefinition, MultimapValue, Range, ReadableDatabase, ReadableTable,
+    ReadableTableMetadata, SetDurabilityError, StorageBackend, TableDefinition, TableStats,
+    TransactionError, Value,
+};
+use redb::{DatabaseError, ReadableMultimapTable, SavepointError, StorageError, TableError};
+use std::borrow::Borrow;
+use std::fs;
+use std::io::{ErrorKind, Write};
+use std::marker::PhantomData;
+use std::ops::RangeBounds;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+const ELEMENTS: usize = 100;
+
+const SLICE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("slice");
+const SLICE_TABLE2: TableDefinition<&[u8], &[u8]> = TableDefinition::new("slice2");
+const STR_TABLE: TableDefinition<&str, &str> = TableDefinition::new("x");
+const U64_TABLE: TableDefinition<u64, u64> = TableDefinition::new("u64");
+
+fn create_tempfile() -> tempfile::NamedTempFile {
+    if cfg!(target_os = "wasi") {
+        tempfile::NamedTempFile::new_in("/tmp").unwrap()
+    } else {
+        tempfile::NamedTempFile::new().unwrap()
+    }
+}
+
+/// Returns pairs of key, value
+fn random_data(count: usize, key_size: usize, value_size: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut pairs = vec![];
+
+    for _ in 0..count {
+        let key: Vec<u8> = (0..key_size).map(|_| rand::rng().random()).collect();
+        let value: Vec<u8> = (0..value_size).map(|_| rand::rng().random()).collect();
+        pairs.push((key, value));
+    }
+
+    pairs
+}
+
+#[test]
+fn previous_io_error() {
+    #[derive(Debug)]
+    struct FailingBackend {
+        inner: FileBackend,
+        fail_flag: Arc<AtomicBool>,
+    }
+
+    impl FailingBackend {
+        fn new(backend: FileBackend, fail_flag: Arc<AtomicBool>) -> Self {
+            Self {
+                inner: backend,
+                fail_flag,
+            }
+        }
+    }
+
+    impl StorageBackend for FailingBackend {
+        fn len(&self) -> Result<u64, std::io::Error> {
+            self.inner.len()
+        }
+
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+            self.inner.read(offset, out)
+        }
+
+        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+            self.inner.set_len(len)
+        }
+
+        fn sync_data(&self) -> Result<(), std::io::Error> {
+            if self.fail_flag.load(Ordering::SeqCst) {
+                Err(std::io::Error::from(ErrorKind::Other))
+            } else {
+                self.inner.sync_data()
+            }
+        }
+
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+            self.inner.write(offset, data)
+        }
+    }
+
+    let tmpfile = create_tempfile();
+
+    let fail_flag = Arc::new(AtomicBool::new(false));
+    let backend = FailingBackend::new(
+        FileBackend::new(tmpfile.into_file()).unwrap(),
+        fail_flag.clone(),
+    );
+    let db = Database::builder().create_with_backend(backend).unwrap();
+    fail_flag.store(true, Ordering::SeqCst);
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(&0, &0).unwrap();
+    }
+    assert!(txn.commit().is_err());
+
+    assert!(matches!(
+        db.begin_write().err().unwrap(),
+        TransactionError::Storage(StorageError::PreviousIo)
+    ));
+}
+
+#[test]
+fn mixed_durable_commit() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(Durability::None).unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(&0, &0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+}
+
+#[test]
+fn non_durable_commit_persistence() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(Durability::None).unwrap();
+    let pairs = random_data(100, 16, 20);
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..ELEMENTS {
+            let (key, value) = &pairs[i % pairs.len()];
+            table.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Check that cleanly closing the database persists the non-durable commit
+    drop(db);
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(SLICE_TABLE).unwrap();
+
+    let mut key_order: Vec<usize> = (0..ELEMENTS).collect();
+    key_order.shuffle(&mut rand::rng());
+
+    {
+        for i in &key_order {
+            let (key, value) = &pairs[*i % pairs.len()];
+            assert_eq!(table.get(key.as_slice()).unwrap().unwrap().value(), value);
+        }
+    }
+}
+
+fn test_persistence(durability: Durability) {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(durability).unwrap();
+    let pairs = random_data(100, 16, 20);
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..ELEMENTS {
+            let (key, value) = &pairs[i % pairs.len()];
+            table.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    drop(db);
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(SLICE_TABLE).unwrap();
+
+    let mut key_order: Vec<usize> = (0..ELEMENTS).collect();
+    key_order.shuffle(&mut rand::rng());
+
+    {
+        for i in &key_order {
+            let (key, value) = &pairs[*i % pairs.len()];
+            assert_eq!(table.get(key.as_slice()).unwrap().unwrap().value(), value);
+        }
+    }
+}
+
+#[test]
+fn immediate_persistence() {
+    test_persistence(Durability::Immediate);
+}
+
+#[test]
+fn immediate_free() {
+    test_free(Durability::Immediate);
+}
+
+#[test]
+fn nondurable_free() {
+    test_free(Durability::None);
+}
+
+fn test_free(durability: Durability) {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(durability).unwrap();
+    {
+        let _table = txn.open_table(SLICE_TABLE).unwrap();
+        let mut table = txn.open_table(SLICE_TABLE2).unwrap();
+        table.insert([].as_slice(), [].as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(durability).unwrap();
+    {
+        let mut table = txn.open_table(SLICE_TABLE2).unwrap();
+        table.remove([].as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(durability).unwrap();
+    txn.commit().unwrap();
+
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(durability).unwrap();
+    let allocated_pages = txn.stats().unwrap().allocated_pages();
+
+    let key = vec![0; 100];
+    let value = vec![0u8; 1024];
+    let target_db_size = 8 * 1024 * 1024;
+    // Write 10% of db space each iteration
+    let num_writes = target_db_size / 10 / (key.len() + value.len());
+    // Make sure an internal index page is required
+    assert!(num_writes > 64);
+
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..num_writes {
+            let mut mut_key = key.clone();
+            mut_key.extend_from_slice(&(i as u64).to_le_bytes());
+            table.insert(mut_key.as_slice(), value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    {
+        let key_range: Vec<usize> = (0..num_writes).collect();
+        // Delete in chunks to be sure that we don't run out of pages due to temp allocations
+        for chunk in key_range.chunks(10) {
+            let mut txn = db.begin_write().unwrap();
+            txn.set_durability(durability).unwrap();
+            {
+                let mut table = txn.open_table(SLICE_TABLE).unwrap();
+                for i in chunk {
+                    let mut mut_key = key.clone();
+                    mut_key.extend_from_slice(&(*i as u64).to_le_bytes());
+                    table.remove(mut_key.as_slice()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+    }
+
+    // Extra commit to finalize the cleanup of the freed pages
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(durability).unwrap();
+    txn.commit().unwrap();
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(durability).unwrap();
+    assert_eq!(allocated_pages, txn.stats().unwrap().allocated_pages());
+    txn.abort().unwrap();
+}
+
+#[test]
+fn nondurable_live_and_free() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(0, 0).unwrap();
+    }
+    txn.commit().unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.remove(0).unwrap();
+    }
+    txn.commit().unwrap();
+    // Process frees
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+    let txn = db.begin_write().unwrap();
+    let allocated_pages = txn.stats().unwrap().allocated_pages();
+    txn.abort().unwrap();
+
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(Durability::None).unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(0, 1).unwrap();
+    }
+    txn.commit().unwrap();
+    let read_txn = db.begin_read().unwrap();
+
+    for i in 0..5 {
+        let mut txn = db.begin_write().unwrap();
+        txn.set_durability(Durability::None).unwrap();
+        {
+            let mut table = txn.open_table(U64_TABLE).unwrap();
+            table.insert(0, i).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    {
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.get(0).unwrap().unwrap().value(), 1);
+    }
+    drop(read_txn);
+
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(Durability::None).unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.remove(0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(Durability::None).unwrap();
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    // allocated * 2, because we can't free the original persisted pages
+    // + 2, because now we need freed trees to store those original pages to be freed
+    assert!(txn.stats().unwrap().allocated_pages() <= allocated_pages * 2 + 2);
+}
+
+#[test]
+fn large_values() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+
+    let mut key = vec![0u8; 1024];
+    let value = vec![0u8; 2_000_000];
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..5 {
+            key[0] = i;
+            table.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..5 {
+            key[0] = i;
+            table.remove(key.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+}
+
+// Note: this test requires > 3GiB of memory
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn value_too_large() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+
+    let small_value = vec![0u8; 1024];
+    let too_big_value = vec![0u8; 3 * 1024 * 1024 * 1024 + 1];
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        assert!(matches!(
+            table.insert(small_value.as_slice(), too_big_value.as_slice()),
+            Err(StorageError::ValueTooLarge(_))
+        ));
+        assert!(matches!(
+            table.insert(too_big_value.as_slice(), small_value.as_slice()),
+            Err(StorageError::ValueTooLarge(_))
+        ));
+        assert!(matches!(
+            table.insert(too_big_value.as_slice(), too_big_value.as_slice()),
+            Err(StorageError::ValueTooLarge(_))
+        ));
+        drop(too_big_value);
+        let almost_big_value = vec![0u8; 2 * 1024 * 1024 * 1024];
+        assert!(matches!(
+            table.insert(almost_big_value.as_slice(), almost_big_value.as_slice()),
+            Err(StorageError::ValueTooLarge(_))
+        ));
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(SLICE_TABLE).unwrap();
+    assert!(table.is_empty().unwrap());
+}
+
+#[test]
+fn small_db_is_small_file() {
+    let tmpfile = create_tempfile();
+    const TABLE: TableDefinition<u32, u32> = TableDefinition::new("TABLE");
+
+    let mut db = Database::create(tmpfile.path()).unwrap();
+    let wtx = db.begin_write().unwrap();
+    let mut table = wtx.open_table(TABLE).unwrap();
+    table.insert(0, 0).unwrap();
+    drop(table);
+    wtx.commit().unwrap();
+
+    db.compact().unwrap();
+
+    drop(db);
+    let metadata = tmpfile.as_file().metadata().unwrap();
+    assert!(
+        metadata.len() < 40 * 1024,
+        "File size: {:?}",
+        metadata.len()
+    );
+}
+
+#[test]
+fn many_pairs() {
+    let tmpfile = create_tempfile();
+    const TABLE: TableDefinition<u32, u32> = TableDefinition::new("TABLE");
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let wtx = db.begin_write().unwrap();
+
+    let mut table = wtx.open_table(TABLE).unwrap();
+
+    for i in 0..200_000 {
+        table.insert(i, i).unwrap();
+
+        if i % 10_000 == 0 {
+            eprintln!("{i}");
+        }
+    }
+
+    drop(table);
+
+    wtx.commit().unwrap();
+}
+
+#[test]
+fn explicit_close() {
+    let tmpfile = create_tempfile();
+    const TABLE: TableDefinition<u32, u32> = TableDefinition::new("TABLE");
+    let db = Database::create(tmpfile.path()).unwrap();
+    let wtx = db.begin_write().unwrap();
+    wtx.open_table(TABLE).unwrap();
+    wtx.commit().unwrap();
+
+    let tx = db.begin_read().unwrap();
+    let table = tx.open_table(TABLE).unwrap();
+    assert!(matches!(
+        tx.close(),
+        Err(TransactionError::ReadTransactionStillInUse(_))
+    ));
+    drop(table);
+
+    let tx2 = db.begin_read().unwrap();
+    tx2.close().unwrap();
+}
+
+#[test]
+fn large_keys() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+
+    let mut key = vec![0u8; 1024];
+    let value = vec![0u8; 1];
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..100 {
+            key[0] = i;
+            table.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..100 {
+            key[0] = i;
+            table.remove(key.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+}
+
+#[test]
+fn dynamic_growth() {
+    let tmpfile = create_tempfile();
+    let table_definition: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+    let big_value = vec![0u8; 1024];
+
+    let expected_size = 10 * 1024 * 1024;
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_definition).unwrap();
+        table.insert(&0, big_value.as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let initial_file_size = tmpfile.as_file().metadata().unwrap().len();
+    assert!(initial_file_size < (expected_size / 2) as u64);
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_definition).unwrap();
+        for i in 0..2048 {
+            table.insert(&i, big_value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    let file_size = tmpfile.as_file().metadata().unwrap().len();
+
+    assert!(file_size > initial_file_size);
+}
+
+#[test]
+fn multi_page_kv() {
+    let tmpfile = create_tempfile();
+    let elements = 4;
+    let page_size = 4096;
+
+    let db = Builder::new().create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+
+    let mut key = vec![0u8; page_size + 1];
+    let mut value = vec![0; page_size + 1];
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..elements {
+            key[0] = i;
+            value[0] = i;
+            table.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(SLICE_TABLE).unwrap();
+    for i in 0..elements {
+        key[0] = i;
+        value[0] = i;
+        assert_eq!(&value, table.get(key.as_slice()).unwrap().unwrap().value());
+    }
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..elements {
+            key[0] = i;
+            table.remove(key.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+}
+
+#[test]
+// Test for a bug in the deletion code, where deleting a key accidentally deleted other keys
+fn regression() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(&1, &1).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(&6, &9).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(&12, &10).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(&18, &27).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(&24, &33).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(&30, &14).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.remove(&30).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(U64_TABLE).unwrap();
+    let v = table.get(&6).unwrap().unwrap().value();
+    assert_eq!(v, 9);
+}
+
+#[test]
+// Test for a bug in table creation code, where multiple tables could end up with the same id
+fn regression2() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let tx = db.begin_write().unwrap();
+
+    let a_def: TableDefinition<&str, &str> = TableDefinition::new("a");
+    let b_def: TableDefinition<&str, &str> = TableDefinition::new("b");
+    let c_def: TableDefinition<&str, &str> = TableDefinition::new("c");
+
+    let _c = tx.open_table(c_def).unwrap();
+    let b = tx.open_table(b_def).unwrap();
+    let mut a = tx.open_table(a_def).unwrap();
+    a.insert("hi", "1").unwrap();
+    assert!(b.get("hi").unwrap().is_none());
+}
+
+#[test]
+// Test for a bug in deletion code, where deletions could delete neighboring keys in a leaf,
+// due to the partial leaf entries being dropped
+fn regression3() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(SLICE_TABLE).unwrap();
+        let big_value = vec![0u8; 1000];
+        for i in 0..20u8 {
+            t.insert([i].as_slice(), big_value.as_slice()).unwrap();
+        }
+        for i in (10..20u8).rev() {
+            t.remove([i].as_slice()).unwrap();
+            for j in 0..i {
+                assert!(t.get([j].as_slice()).unwrap().is_some());
+            }
+        }
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn regression7() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let big_value = vec![0u8; 4063];
+        t.insert(&35723, big_value.as_slice()).unwrap();
+        t.remove(&145278).unwrap();
+        t.remove(&145227).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let mut tx = db.begin_write().unwrap();
+    tx.set_durability(Durability::None).unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let v = vec![0u8; 47];
+        t.insert(&66469, v.as_slice()).unwrap();
+        let v = vec![0u8; 2414];
+        t.insert(&146255, v.as_slice()).unwrap();
+        let v = vec![0u8; 159];
+        t.insert(&153701, v.as_slice()).unwrap();
+        let v = vec![0u8; 1186];
+        t.insert(&145227, v.as_slice()).unwrap();
+        let v = vec![0u8; 223];
+        t.insert(&118749, v.as_slice()).unwrap();
+
+        t.remove(&145227).unwrap();
+
+        let mut iter = t.range(138763..(138763 + 232359)).unwrap().rev();
+        assert_eq!(iter.next().unwrap().unwrap().0.value(), 153701);
+        assert_eq!(iter.next().unwrap().unwrap().0.value(), 146255);
+        assert!(iter.next().is_none());
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn regression8() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+
+    let mut tx = db.begin_write().unwrap();
+    tx.set_durability(Durability::None).unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let v = vec![0u8; 1186];
+        t.insert(&145227, v.as_slice()).unwrap();
+        let v = vec![0u8; 1585];
+        t.insert(&565922, v.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let v = vec![0u8; 2040];
+        t.insert(&94937, v.as_slice()).unwrap();
+        let v = vec![0u8; 2058];
+        t.insert(&130571, v.as_slice()).unwrap();
+        t.remove(&145227).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let v = vec![0u8; 947];
+        t.insert(&118749, v.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    {
+        let t = tx.open_table(table_def).unwrap();
+        let mut iter = t.range(118749..142650).unwrap();
+        assert_eq!(iter.next().unwrap().unwrap().0.value(), 118749);
+        assert_eq!(iter.next().unwrap().unwrap().0.value(), 130571);
+        assert!(iter.next().is_none());
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn regression9() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let v = vec![0u8; 118665];
+        t.insert(&452, v.as_slice()).unwrap();
+        t.len().unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn regression10() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let v = vec![0u8; 1043];
+        t.insert(&118749, v.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let v = vec![0u8; 952];
+        t.insert(&118757, v.as_slice()).unwrap();
+    }
+    tx.abort().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    {
+        let t = tx.open_table(table_def).unwrap();
+        t.get(&829513).unwrap();
+    }
+    tx.abort().unwrap();
+}
+
+#[test]
+fn regression11() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let v = vec![0u8; 1204];
+        t.insert(&118749, v.as_slice()).unwrap();
+        let v = vec![0u8; 2062];
+        t.insert(&153697, v.as_slice()).unwrap();
+        let v = vec![0u8; 2980];
+        t.insert(&110557, v.as_slice()).unwrap();
+        let v = vec![0u8; 1999];
+        t.insert(&677853, v.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let v = vec![0u8; 691];
+        t.insert(&103591, v.as_slice()).unwrap();
+        let v = vec![0u8; 952];
+        t.insert(&118757, v.as_slice()).unwrap();
+    }
+    tx.abort().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
+// Test that for stale read bug when re-opening a table during a write
+fn regression12() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u64, u64> = TableDefinition::new("x");
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        t.insert(&0, &0).unwrap();
+        assert_eq!(t.get(&0).unwrap().unwrap().value(), 0);
+        drop(t);
+
+        let t2 = tx.open_table(table_def).unwrap();
+        assert_eq!(t2.get(&0).unwrap().unwrap().value(), 0);
+    }
+    tx.commit().unwrap();
+}
+
+#[test]
+fn regression13() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: MultimapTableDefinition<u64, &[u8]> = MultimapTableDefinition::new("x");
+
+    let mut tx = db.begin_write().unwrap();
+    tx.set_durability(Durability::None).unwrap();
+    {
+        let mut t = tx.open_multimap_table(table_def).unwrap();
+        let value = vec![0; 1026];
+        t.insert(&539717, value.as_slice()).unwrap();
+        let value = vec![0; 530];
+        t.insert(&539717, value.as_slice()).unwrap();
+    }
+    tx.abort().unwrap();
+}
+
+#[test]
+fn regression14() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: MultimapTableDefinition<u64, &[u8]> = MultimapTableDefinition::new("x");
+
+    let mut tx = db.begin_write().unwrap();
+    tx.set_durability(Durability::None).unwrap();
+    {
+        let mut t = tx.open_multimap_table(table_def).unwrap();
+        let value = vec![0; 1424];
+        t.insert(&539749, value.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let mut tx = db.begin_write().unwrap();
+    tx.set_durability(Durability::None).unwrap();
+    {
+        let mut t = tx.open_multimap_table(table_def).unwrap();
+        let value = vec![0; 2230];
+        t.insert(&776971, value.as_slice()).unwrap();
+
+        let mut iter = t.range(514043..(514043 + 514043)).unwrap().rev();
+        {
+            let (key, mut value_iter) = iter.next().unwrap().unwrap();
+            assert_eq!(key.value(), 776971);
+            assert_eq!(value_iter.next().unwrap().unwrap().value(), &[0; 2230]);
+        }
+        {
+            let (key, mut value_iter) = iter.next().unwrap().unwrap();
+            assert_eq!(key.value(), 539749);
+            assert_eq!(value_iter.next().unwrap().unwrap().value(), &[0; 1424]);
+        }
+    }
+    tx.abort().unwrap();
+}
+
+#[test]
+fn regression17() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::builder().create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+
+    let mut tx = db.begin_write().unwrap();
+    tx.set_durability(Durability::None).unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let value = vec![0; 4578];
+        t.insert(&671325, value.as_slice()).unwrap();
+
+        let mut value = t.insert_reserve(&723904, 2246).unwrap();
+        value.as_mut().fill(0xFF);
+    }
+    tx.abort().unwrap();
+}
+
+#[test]
+fn regression18() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::builder().create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+
+    let tx = db.begin_write().unwrap();
+    let savepoint0 = tx.ephemeral_savepoint().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let mut value = t.insert_reserve(&118749, 817).unwrap();
+        value.as_mut().fill(0xFF);
+    }
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    let savepoint1 = tx.ephemeral_savepoint().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let mut value = t.insert_reserve(&65373, 1807).unwrap();
+        value.as_mut().fill(0xFF);
+    }
+    tx.commit().unwrap();
+
+    let mut tx = db.begin_write().unwrap();
+    let savepoint2 = tx.ephemeral_savepoint().unwrap();
+
+    tx.restore_savepoint(&savepoint2).unwrap();
+    tx.commit().unwrap();
+
+    drop(savepoint0);
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let mut value = t.insert_reserve(&118749, 2494).unwrap();
+        value.as_mut().fill(0xFF);
+    }
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    let savepoint4 = tx.ephemeral_savepoint().unwrap();
+    tx.abort().unwrap();
+    drop(savepoint1);
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let mut value = t.insert_reserve(&429469, 667).unwrap();
+        value.as_mut().fill(0xFF);
+        drop(value);
+        let mut value = t.insert_reserve(&266845, 1614).unwrap();
+        value.as_mut().fill(0xFF);
+    }
+    tx.commit().unwrap();
+
+    let mut tx = db.begin_write().unwrap();
+    tx.restore_savepoint(&savepoint4).unwrap();
+    tx.commit().unwrap();
+
+    drop(savepoint2);
+    drop(savepoint4);
+}
+
+#[test]
+fn regression19() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::builder().create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let value = vec![0xFF; 100];
+        t.insert(&1, value.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    let savepoint0 = tx.ephemeral_savepoint().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let value = vec![0xFF; 101];
+        t.insert(&1, value.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    {
+        let mut t = tx.open_table(table_def).unwrap();
+        let value = vec![0xFF; 102];
+        t.insert(&1, value.as_slice()).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let mut tx = db.begin_write().unwrap();
+    tx.restore_savepoint(&savepoint0).unwrap();
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    tx.open_table(table_def).unwrap();
+}
+
+#[test]
+fn regression20() {
+    let tmpfile = create_tempfile();
+
+    let table_def: MultimapTableDefinition<'static, u128, u128> =
+        MultimapTableDefinition::new("some-table");
+
+    for _ in 0..3 {
+        let mut db = Database::builder().create(tmpfile.path()).unwrap();
+        db.check_integrity().unwrap();
+
+        let txn = db.begin_write().unwrap();
+        let mut table = txn.open_multimap_table(table_def).unwrap();
+
+        for i in 0..1024 {
+            table.insert(0, i).unwrap();
+        }
+        drop(table);
+
+        txn.commit().unwrap();
+    }
+}
+
+#[test]
+fn regression21() {
+    let tmpfile = create_tempfile();
+
+    let mut db = Database::create(tmpfile.path()).unwrap();
+
+    let write_tx = db.begin_write().unwrap();
+    let read_tx = db.begin_read().unwrap();
+
+    let mut write_table = write_tx
+        .open_table::<&str, &str>(TableDefinition::new("example"))
+        .unwrap();
+
+    write_table.insert("example", "example").unwrap();
+
+    drop(write_table);
+
+    write_tx.commit().unwrap();
+    assert!(matches!(
+        db.compact().unwrap_err(),
+        CompactionError::TransactionInProgress
+    ));
+    drop(read_tx);
+}
+
+#[test]
+fn regression22() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(0, 0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.remove(0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Extra commit to finalize the cleanup of the freed pages
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    let allocated_pages = txn.stats().unwrap().allocated_pages();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(0, 0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.remove(0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+
+    // Extra commit to finalize the cleanup of the freed pages. The read transaction should not
+    // block the freeing, but there was a bug where it did.
+    db.begin_write().unwrap().commit().unwrap();
+
+    drop(read_txn);
+
+    let txn = db.begin_write().unwrap();
+    assert_eq!(allocated_pages, txn.stats().unwrap().allocated_pages());
+}
+
+#[test]
+fn regression23() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        // List the savepoints to ensure the system table is created and occupies a page
+        #[allow(unused_must_use)]
+        {
+            txn.list_persistent_savepoints().unwrap();
+        }
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(0, 0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.remove(0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Extra commit to finalize the cleanup of the freed pages
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    let allocated_pages = txn.stats().unwrap().allocated_pages();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(0, 0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.remove(0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    let savepoint = txn.ephemeral_savepoint().unwrap();
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(0, 0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let mut txn = db.begin_write().unwrap();
+    txn.restore_savepoint(&savepoint).unwrap();
+    txn.commit().unwrap();
+    drop(savepoint);
+
+    // Extra commit to finalize the cleanup of the freed pages.
+    // There was a bug where the restoration of the savepoint would leak pages
+    db.begin_write().unwrap().commit().unwrap();
+    db.begin_write().unwrap().commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    assert_eq!(allocated_pages, txn.stats().unwrap().allocated_pages());
+}
+
+#[test]
+fn regression24() {
+    let tmpfile = create_tempfile();
+
+    let table_def: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("x");
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        // Touch the savepoints tables to be sure they get created, so that they occupy pages
+        let id = txn.persistent_savepoint().unwrap();
+        txn.delete_persistent_savepoint(id).unwrap();
+        // List the savepoints to ensure the system table is created and occupies a page
+        #[allow(unused_must_use)]
+        {
+            txn.list_persistent_savepoints().unwrap();
+        }
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        table.insert(0, 0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        txn.delete_table(U64_TABLE).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Extra commit to finalize the cleanup of the freed pages
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    let allocated_pages = txn.stats().unwrap().allocated_pages();
+    {
+        let mut table = txn.open_multimap_table(table_def).unwrap();
+        table.insert(0, 0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        txn.delete_multimap_table(table_def).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Extra commit to finalize the cleanup of the freed pages.
+    // There was a bug where deleting a multimap table leaked pages
+    db.begin_write().unwrap().commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    assert_eq!(allocated_pages, txn.stats().unwrap().allocated_pages());
+}
+
+#[test]
+fn regression25() {
+    let tmpfile = create_tempfile();
+    let table_def: TableDefinition<u16, (u64, u64, u64, u64)> = TableDefinition::new("issue_1108");
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    for i in 0..2730u16 {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(table_def).unwrap();
+            for j in 0..24u16 {
+                let key: u16 = i * 24 + j;
+                let value = key as u64;
+                table.insert(key, (value, value, value, value)).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+}
+
+#[test]
+fn regression26() {
+    let tmpfile = create_tempfile();
+    let table_def: TableDefinition<u64, (&str, &[u8])> = TableDefinition::new("issue_1117");
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_def).unwrap();
+        table.insert(0, ("name", &[0u8][..])).unwrap();
+    }
+    txn.commit().unwrap();
+
+    {
+        let txn = db.begin_write().unwrap();
+        let mut table = txn.open_table(table_def).unwrap();
+        let mut access = table.get_mut(&0).unwrap().unwrap();
+        let name = access.value().0.to_string();
+        let large_value = vec![1u8; 8192];
+        access.insert((&name[..], large_value.as_slice())).unwrap();
+        drop(access);
+        drop(table);
+        txn.commit().unwrap();
+    }
+}
+
+#[test]
+fn regression27() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let def: TableDefinition<&str, &[u8]> = TableDefinition::new("x");
+    let value = "world";
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(def).unwrap();
+        let mut reserved = table.insert_reserve("hello", value.len()).unwrap();
+        reserved.as_mut().copy_from_slice(value.as_bytes());
+        drop(reserved);
+        drop(table);
+        write_txn.commit().unwrap();
+    }
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(def).unwrap();
+    assert_eq!(
+        value.as_bytes(),
+        table.get("hello").unwrap().unwrap().value()
+    );
+}
+
+#[test]
+fn check_integrity_clean() {
+    let tmpfile = create_tempfile();
+
+    let table_def: TableDefinition<'static, u64, u64> = TableDefinition::new("x");
+
+    let mut db = Database::builder().create(tmpfile.path()).unwrap();
+    assert!(db.check_integrity().unwrap());
+
+    let txn = db.begin_write().unwrap();
+    let mut table = txn.open_table(table_def).unwrap();
+
+    for i in 0..10 {
+        table.insert(0, i).unwrap();
+    }
+    drop(table);
+
+    txn.commit().unwrap();
+    assert!(db.check_integrity().unwrap());
+    drop(db);
+
+    let mut db = Database::builder().create(tmpfile.path()).unwrap();
+    assert!(db.check_integrity().unwrap());
+    drop(db);
+
+    let mut db = Database::builder().open(tmpfile.path()).unwrap();
+    assert!(db.check_integrity().unwrap());
+}
+
+#[test]
+fn multimap_stats() {
+    let tmpfile = create_tempfile();
+    let db = Database::builder().create(tmpfile.path()).unwrap();
+
+    let table_def: MultimapTableDefinition<u128, u128> = MultimapTableDefinition::new("x");
+
+    let mut last_size = 0;
+    for i in 0..1000 {
+        let mut txn = db.begin_write().unwrap();
+        txn.set_durability(Durability::None).unwrap();
+        let mut table = txn.open_multimap_table(table_def).unwrap();
+        table.insert(0, i).unwrap();
+        drop(table);
+        txn.commit().unwrap();
+
+        let txn = db.begin_write().unwrap();
+        let bytes = txn.stats().unwrap().stored_bytes();
+        assert!(bytes > last_size, "{i}");
+        last_size = bytes;
+    }
+}
+
+#[test]
+fn no_downgrade_durability_with_savepoint() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let mut tx = db.begin_write().unwrap();
+    tx.persistent_savepoint().unwrap();
+    assert!(matches!(
+        tx.set_durability(Durability::None),
+        Err(SetDurabilityError::PersistentSavepointModified)
+    ));
+    assert!(matches!(tx.set_durability(Durability::Immediate), Ok(())));
+}
+
+#[test]
+fn no_savepoint_resurrection() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::builder()
+        .set_cache_size(41178283)
+        .create(tmpfile.path())
+        .unwrap();
+
+    let tx = db.begin_write().unwrap();
+    let persistent_savepoint = tx.persistent_savepoint().unwrap();
+    tx.commit().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    let savepoint2 = tx.ephemeral_savepoint().unwrap();
+    tx.delete_persistent_savepoint(persistent_savepoint)
+        .unwrap();
+    tx.commit().unwrap();
+
+    let mut tx = db.begin_write().unwrap();
+    tx.restore_savepoint(&savepoint2).unwrap();
+    tx.delete_persistent_savepoint(persistent_savepoint)
+        .unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
+fn non_durable_read_isolation() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let mut write_txn = db.begin_write().unwrap();
+    write_txn.set_durability(Durability::None).unwrap();
+    {
+        let mut table = write_txn.open_table(STR_TABLE).unwrap();
+        table.insert("hello", "world").unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let read_table = read_txn.open_table(STR_TABLE).unwrap();
+    assert_eq!("world", read_table.get("hello").unwrap().unwrap().value());
+
+    let mut write_txn = db.begin_write().unwrap();
+    write_txn.set_durability(Durability::None).unwrap();
+    {
+        let mut table = write_txn.open_table(STR_TABLE).unwrap();
+        table.remove("hello").unwrap();
+        table.insert("hello2", "world2").unwrap();
+        table.insert("hello3", "world3").unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn2 = db.begin_read().unwrap();
+    let read_table2 = read_txn2.open_table(STR_TABLE).unwrap();
+    assert!(read_table2.get("hello").unwrap().is_none());
+    assert_eq!(
+        "world2",
+        read_table2.get("hello2").unwrap().unwrap().value()
+    );
+    assert_eq!(
+        "world3",
+        read_table2.get("hello3").unwrap().unwrap().value()
+    );
+    assert_eq!(read_table2.len().unwrap(), 2);
+
+    assert_eq!("world", read_table.get("hello").unwrap().unwrap().value());
+    assert!(read_table.get("hello2").unwrap().is_none());
+    assert!(read_table.get("hello3").unwrap().is_none());
+    assert_eq!(read_table.len().unwrap(), 1);
+}
+
+#[test]
+fn range_query() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..10 {
+            table.insert(&i, &i).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(U64_TABLE).unwrap();
+    let mut iter = table.range(3..7).unwrap();
+    for i in 3..7u64 {
+        let (key, value) = iter.next().unwrap().unwrap();
+        assert_eq!(i, key.value());
+        assert_eq!(i, value.value());
+    }
+    assert!(iter.next().is_none());
+
+    let mut iter = table.range(3..=7).unwrap();
+    for i in 3..=7u64 {
+        let (key, value) = iter.next().unwrap().unwrap();
+        assert_eq!(i, key.value());
+        assert_eq!(i, value.value());
+    }
+    assert!(iter.next().is_none());
+
+    let total: u64 = table
+        .range(1..=3)
+        .unwrap()
+        .map(|item| item.unwrap().1.value())
+        .sum();
+    assert_eq!(total, 6);
+}
+
+#[test]
+fn range_query_reversed() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..10 {
+            table.insert(&i, &i).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(U64_TABLE).unwrap();
+    let mut iter = table.range(3..7).unwrap().rev();
+    for i in (3..7u64).rev() {
+        let (key, value) = iter.next().unwrap().unwrap();
+        assert_eq!(i, key.value());
+        assert_eq!(i, value.value());
+    }
+    assert!(iter.next().is_none());
+
+    // Test reversing multiple times
+    let mut iter = table.range(3..7).unwrap();
+    let (key, _) = iter.next().unwrap().unwrap();
+    assert_eq!(3, key.value());
+
+    let mut iter = iter.rev();
+    let (key, _) = iter.next().unwrap().unwrap();
+    assert_eq!(6, key.value());
+    let (key, _) = iter.next().unwrap().unwrap();
+    assert_eq!(5, key.value());
+
+    let mut iter = iter.rev();
+    let (key, _) = iter.next().unwrap().unwrap();
+    assert_eq!(4, key.value());
+
+    assert!(iter.next().is_none());
+}
+
+#[test]
+fn alias_table() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let write_txn = db.begin_write().unwrap();
+    let table = write_txn.open_table(STR_TABLE).unwrap();
+    let result = write_txn.open_table(STR_TABLE);
+    assert!(matches!(
+        result.err().unwrap(),
+        TableError::TableAlreadyOpen(_, _)
+    ));
+    drop(table);
+}
+
+#[test]
+fn delete_table() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let y_def: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("y");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(STR_TABLE).unwrap();
+        table.insert("hello", "world").unwrap();
+        let mut multitable = write_txn.open_multimap_table(y_def).unwrap();
+        multitable.insert("hello2", "world2").unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let write_txn = db.begin_write().unwrap();
+    assert!(write_txn.delete_table(STR_TABLE).unwrap());
+    assert!(!write_txn.delete_table(STR_TABLE).unwrap());
+    assert!(write_txn.delete_multimap_table(y_def).unwrap());
+    assert!(!write_txn.delete_multimap_table(y_def).unwrap());
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let result = read_txn.open_table(STR_TABLE);
+    assert!(result.is_err());
+    let result = read_txn.open_multimap_table(y_def);
+    assert!(result.is_err());
+}
+
+#[test]
+fn delete_all_tables() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let x_def: TableDefinition<&str, &str> = TableDefinition::new("x");
+    let y_def: TableDefinition<&str, &str> = TableDefinition::new("y");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(x_def).unwrap();
+        table.insert("hello", "world").unwrap();
+        let mut table = write_txn.open_table(y_def).unwrap();
+        table.insert("hello", "world").unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    assert_eq!(2, read_txn.list_tables().unwrap().count());
+
+    let write_txn = db.begin_write().unwrap();
+    for table in write_txn.list_tables().unwrap() {
+        write_txn.delete_table(table).unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    assert_eq!(0, read_txn.list_tables().unwrap().count());
+}
+
+#[test]
+fn dropped_write() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(STR_TABLE).unwrap();
+        table.insert("hello", "world").unwrap();
+    }
+    drop(write_txn);
+    let read_txn = db.begin_read().unwrap();
+    let result = read_txn.open_table(STR_TABLE);
+    assert!(matches!(result, Err(TableError::TableDoesNotExist(_))));
+}
+
+#[test]
+fn non_page_size_multiple() {
+    let tmpfile = create_tempfile();
+
+    let db = Database::create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+    let key = vec![0u8; 1024];
+    let value = vec![0u8; 1];
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        table.insert(key.as_slice(), value.as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(SLICE_TABLE).unwrap();
+    assert_eq!(table.len().unwrap(), 1);
+}
+
+#[test]
+fn does_not_exist() {
+    let tmpfile = create_tempfile();
+    fs::remove_file(tmpfile.path()).unwrap();
+    let result = Database::open(tmpfile.path());
+    if let Err(DatabaseError::Storage(StorageError::Io(e))) = result {
+        assert!(matches!(e.kind(), ErrorKind::NotFound));
+    } else {
+        panic!();
+    }
+
+    let tmpfile = create_tempfile();
+
+    let result = Database::open(tmpfile.path());
+    if let Err(DatabaseError::Storage(StorageError::Io(e))) = result {
+        assert!(matches!(e.kind(), ErrorKind::InvalidData));
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn invalid_database_file() {
+    let mut tmpfile = create_tempfile();
+    tmpfile.write_all(b"hi").unwrap();
+    let result = Database::open(tmpfile.path());
+    if let Err(DatabaseError::Storage(StorageError::Io(e))) = result {
+        assert!(matches!(e.kind(), ErrorKind::InvalidData));
+    } else {
+        panic!();
+    }
+
+    let result = Database::create(tmpfile.path());
+    if let Err(DatabaseError::Storage(StorageError::Io(e))) = result {
+        assert!(matches!(e.kind(), ErrorKind::InvalidData));
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn wrong_types() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u32, u32> = TableDefinition::new("x");
+    let wrong_definition: TableDefinition<u64, u64> = TableDefinition::new("x");
+
+    let txn = db.begin_write().unwrap();
+    txn.open_table(definition).unwrap();
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    assert!(matches!(
+        txn.open_table(wrong_definition),
+        Err(TableError::TableTypeMismatch { .. })
+    ));
+    txn.abort().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    txn.open_table(definition).unwrap();
+    assert!(matches!(
+        txn.open_table(wrong_definition),
+        Err(TableError::TableTypeMismatch { .. })
+    ));
+}
+
+#[test]
+fn tree_balance() {
+    const EXPECTED_ORDER: usize = 9;
+    fn expected_height(mut elements: usize) -> u32 {
+        // Root may have only 2 entries
+        let mut height = 1;
+        elements /= 2;
+
+        // Leaves may have only a single entry
+        height += 1;
+
+        // Each internal node half-full, plus 1 to round up
+        height += (elements as f32).log((EXPECTED_ORDER / 2) as f32) as usize + 1;
+
+        height.try_into().unwrap()
+    }
+
+    let tmpfile = create_tempfile();
+
+    // One for the last table id counter, and one for the "x" -> TableDefinition entry
+    let num_internal_entries = 2;
+
+    // Pages are 4kb, so use a key size such that 9 keys will fit
+    let key_size = 410;
+    let db = Database::builder().create(tmpfile.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+
+    let elements = (EXPECTED_ORDER / 2).pow(2) - num_internal_entries;
+
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in (0..elements).rev() {
+            let mut key = vec![0u8; key_size];
+            key[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            table.insert(key.as_slice(), b"".as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    let expected = expected_height(elements + num_internal_entries);
+    let txn = db.begin_write().unwrap();
+    let height = txn.stats().unwrap().tree_height();
+    assert!(height <= expected, "height={height} expected={expected}",);
+
+    let reduce_to = EXPECTED_ORDER / 2 - num_internal_entries;
+    {
+        let mut table = txn.open_table(SLICE_TABLE).unwrap();
+        for i in 0..(elements - reduce_to) {
+            let mut key = vec![0u8; key_size];
+            key[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            table.remove(key.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    let expected = expected_height(reduce_to + num_internal_entries);
+    let txn = db.begin_write().unwrap();
+    let height = txn.stats().unwrap().tree_height();
+    txn.abort().unwrap();
+    assert!(height <= expected, "height={height} expected={expected}",);
+}
+
+#[cfg(not(target_os = "wasi"))]
+#[test]
+fn database_lock() {
+    let tmpfile = create_tempfile();
+    let result = Database::create(tmpfile.path());
+    assert!(result.is_ok());
+    let result2 = Database::open(tmpfile.path());
+    assert!(
+        matches!(result2, Err(DatabaseError::DatabaseAlreadyOpen)),
+        "{result2:?}",
+    );
+    drop(result);
+    let result = Database::open(tmpfile.path());
+    assert!(result.is_ok());
+}
+
+#[test]
+fn persistent_savepoint() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let definition: TableDefinition<u32, &str> = TableDefinition::new("x");
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.insert(&0, "hello").unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    let savepoint_id = txn.persistent_savepoint().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.remove(&0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    drop(db);
+    let db = Database::create(tmpfile.path()).unwrap();
+    // Make sure running the GC doesn't invalidate the savepoint
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+
+    let mut txn = db.begin_write().unwrap();
+    let savepoint = txn.get_persistent_savepoint(savepoint_id).unwrap();
+
+    txn.restore_savepoint(&savepoint).unwrap();
+    txn.commit().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(definition).unwrap();
+    assert_eq!(table.get(&0).unwrap().unwrap().value(), "hello");
+}
+
+#[test]
+fn savepoint() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let definition: TableDefinition<u32, &str> = TableDefinition::new("x");
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.insert(&0, "hello").unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    let savepoint = txn.ephemeral_savepoint().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.remove(&0).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let mut txn = db.begin_write().unwrap();
+    let savepoint2 = txn.ephemeral_savepoint().unwrap();
+
+    txn.restore_savepoint(&savepoint).unwrap();
+
+    assert!(matches!(
+        txn.restore_savepoint(&savepoint2).err().unwrap(),
+        SavepointError::InvalidSavepoint
+    ));
+    txn.commit().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(definition).unwrap();
+    assert_eq!(table.get(&0).unwrap().unwrap().value(), "hello");
+
+    // Test that savepoints can be used multiple times
+    let mut txn = db.begin_write().unwrap();
+    txn.restore_savepoint(&savepoint).unwrap();
+    txn.commit().unwrap();
+}
+
+// Regression test: restore_savepoint() does not clear pending_table_updates in the
+// TableTreeMut. When a table is opened, modified, and closed (dropped) before
+// restore_savepoint(), the modification is staged in pending_table_updates. On commit,
+// flush_table_root_updates() re-applies these stale updates, effectively undoing the
+// savepoint restore and causing data loss.
+#[test]
+fn savepoint_restore_data_loss_pending_table_updates() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let definition: TableDefinition<u64, &str> = TableDefinition::new("data_loss_test");
+
+    // Step 1: Insert initial data and commit durably
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.insert(&1, "original").unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Step 2: In a new write transaction, create a savepoint BEFORE any modifications
+    let txn = db.begin_write().unwrap();
+    let savepoint = txn.ephemeral_savepoint().unwrap();
+
+    // Step 3: Open table, insert new data, then close (drop) the table handle.
+    // Dropping the table handle calls close_table() which stages the modified root
+    // into pending_table_updates via stage_update_table_root().
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.insert(&2, "should_be_rolled_back").unwrap();
+        table.insert(&3, "also_should_be_rolled_back").unwrap();
+    }
+
+    // Step 4: Restore the savepoint. This restores the table tree root to the
+    // pre-modification state, BUT does not clear pending_table_updates.
+    let mut txn = txn;
+    txn.restore_savepoint(&savepoint).unwrap();
+
+    // Step 5: Commit. During commit, flush_table_root_updates() drains
+    // pending_table_updates and re-applies the stale modification from Step 3,
+    // effectively undoing the savepoint restore.
+    txn.commit().unwrap();
+
+    // Step 6: Verify. After restoring the savepoint, keys 2 and 3 should NOT exist.
+    // Only key 1 ("original") should be present.
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(definition).unwrap();
+
+    // Key 1 should still exist (it was committed before the savepoint)
+    assert_eq!(table.get(&1).unwrap().unwrap().value(), "original");
+
+    // BUG: Keys 2 and 3 should NOT exist after savepoint restore, but they do
+    // because pending_table_updates re-applied the stale modification during commit.
+    // When the bug is fixed, these assertions will hold:
+    assert!(
+        table.get(&2).unwrap().is_none(),
+        "DATA LOSS BUG: key 2 should not exist after savepoint restore, \
+         but pending_table_updates re-applied stale modifications"
+    );
+    assert!(
+        table.get(&3).unwrap().is_none(),
+        "DATA LOSS BUG: key 3 should not exist after savepoint restore, \
+         but pending_table_updates re-applied stale modifications"
+    );
+
+    // Also verify the table length: should be 1, not 3
+    assert_eq!(
+        table.len().unwrap(),
+        1,
+        "DATA LOSS BUG: table should have 1 entry after savepoint restore, \
+         but has {} due to stale pending_table_updates",
+        table.len().unwrap()
+    );
+}
+
+#[test]
+fn compaction() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let definition: TableDefinition<u32, &[u8]> = TableDefinition::new("x");
+
+    let big_value = vec![0u8; 100 * 1024];
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        // Insert 10MiB of data
+        for i in 0..100 {
+            table.insert(&i, big_value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        // Delete 90% of it
+        for i in 0..90 {
+            table.remove(&i).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    // Second commit to trigger dynamic compaction
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+
+    // The values are > 1 page, so shouldn't get relocated. Therefore there should be a bunch of fragmented space,
+    // since we left the last 100 values in the db.
+    drop(db);
+    let file_size = tmpfile.as_file().metadata().unwrap().len();
+    let mut db = Database::open(tmpfile.path()).unwrap();
+
+    assert!(db.compact().unwrap());
+    drop(db);
+    let file_size2 = tmpfile.as_file().metadata().unwrap().len();
+    assert!(file_size2 < file_size);
+}
+
+fn require_send<T: Send>(_: &T) {}
+fn require_sync<T: Sync + Send>(_: &T) {}
+
+#[test]
+fn is_send() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let definition: TableDefinition<u32, &[u8]> = TableDefinition::new("x");
+
+    let txn = db.begin_write().unwrap();
+    {
+        let table = txn.open_table(definition).unwrap();
+        require_send(&table);
+        require_sync(&txn);
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(definition).unwrap();
+    require_sync(&table);
+    require_sync(&txn);
+}
+
+struct DelegatingTable<K: Key + 'static, V: Value + 'static, T: ReadableTable<K, V>> {
+    inner: T,
+    _key: PhantomData<K>,
+    _value: PhantomData<V>,
+}
+
+impl<K: Key + 'static, V: Value + 'static, T: ReadableTable<K, V>> ReadableTable<K, V>
+    for DelegatingTable<K, V, T>
+{
+    fn get<'a>(
+        &self,
+        key: impl Borrow<K::SelfType<'a>>,
+    ) -> redb::Result<Option<AccessGuard<'_, V>>> {
+        self.inner.get(key)
+    }
+
+    fn range<'a, KR>(&self, range: impl RangeBounds<KR> + 'a) -> redb::Result<Range<'_, K, V>>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        self.inner.range(range)
+    }
+
+    fn first(&self) -> redb::Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
+        self.inner.first()
+    }
+
+    fn last(&self) -> redb::Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
+        self.inner.last()
+    }
+}
+
+impl<K: Key + 'static, V: Value + 'static, T: ReadableTable<K, V>> ReadableTableMetadata
+    for DelegatingTable<K, V, T>
+{
+    fn stats(&self) -> redb::Result<TableStats> {
+        self.inner.stats()
+    }
+
+    fn len(&self) -> redb::Result<u64> {
+        self.inner.len()
+    }
+}
+
+struct DelegatingMultimapTable<K: Key + 'static, V: Key + 'static, T: ReadableMultimapTable<K, V>> {
+    inner: T,
+    _key: PhantomData<K>,
+    _value: PhantomData<V>,
+}
+
+impl<K: Key + 'static, V: Key + 'static, T: ReadableMultimapTable<K, V>> ReadableMultimapTable<K, V>
+    for DelegatingMultimapTable<K, V, T>
+{
+    fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> redb::Result<MultimapValue<'_, V>> {
+        self.inner.get(key)
+    }
+
+    fn range<'a, KR>(
+        &self,
+        range: impl RangeBounds<KR> + 'a,
+    ) -> redb::Result<MultimapRange<'_, K, V>>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        self.inner.range(range)
+    }
+}
+
+impl<K: Key + 'static, V: Key + 'static, T: ReadableMultimapTable<K, V>> ReadableTableMetadata
+    for DelegatingMultimapTable<K, V, T>
+{
+    fn stats(&self) -> redb::Result<TableStats> {
+        self.inner.stats()
+    }
+
+    fn len(&self) -> redb::Result<u64> {
+        self.inner.len()
+    }
+}
+
+#[test]
+fn custom_table_type() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let definition: TableDefinition<u32, &str> = TableDefinition::new("x");
+    let definition_multimap: MultimapTableDefinition<u32, &str> =
+        MultimapTableDefinition::new("multi");
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.insert(0, "hello").unwrap();
+        let mut table = txn.open_multimap_table(definition_multimap).unwrap();
+        table.insert(1, "world").unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    let table = DelegatingTable {
+        inner: txn.open_table(definition).unwrap(),
+        _key: Default::default(),
+        _value: Default::default(),
+    };
+    assert_eq!("hello", table.get(0).unwrap().unwrap().value());
+    let table = DelegatingMultimapTable {
+        inner: txn.open_multimap_table(definition_multimap).unwrap(),
+        _key: Default::default(),
+        _value: Default::default(),
+    };
+    assert_eq!(
+        "world",
+        table.get(1).unwrap().next().unwrap().unwrap().value()
+    );
+
+    let txn = db.begin_write().unwrap();
+    let table = DelegatingTable {
+        inner: txn.open_table(definition).unwrap(),
+        _key: Default::default(),
+        _value: Default::default(),
+    };
+    assert_eq!("hello", table.get(0).unwrap().unwrap().value());
+    let table = DelegatingMultimapTable {
+        inner: txn.open_multimap_table(definition_multimap).unwrap(),
+        _key: Default::default(),
+        _value: Default::default(),
+    };
+    assert_eq!(
+        "world",
+        table.get(1).unwrap().next().unwrap().unwrap().value()
+    );
+}
+
+// Regression test for a bug where renaming a table with pending (dirty) modifications
+// caused database corruption due to unfinalized checksums.
+//
+// Previously, `rename_table` wrote the table definition (with a DEFERRED placeholder
+// checksum) into the master btree AND kept the identical root in `pending_table_updates`.
+// During commit, `flush_table_root_updates()` compared the btree entry's root with the
+// pending update's root, found them equal, and skipped checksum finalization. The fix
+// adds an explicit dirty flag to pending updates so that checksum finalization is never
+// skipped for tables with uncommitted pages.
+#[test]
+fn rename_table_with_modifications_data_loss() {
+    let tmpfile = create_tempfile();
+
+    const ORIGINAL_TABLE: TableDefinition<u64, &str> = TableDefinition::new("original");
+    const RENAMED_TABLE: TableDefinition<u64, &str> = TableDefinition::new("renamed");
+
+    // Step 1: Create initial data in the "original" table and commit.
+    {
+        let db = Database::create(tmpfile.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(ORIGINAL_TABLE).unwrap();
+            table.insert(0, "initial_value_0").unwrap();
+            table.insert(1, "initial_value_1").unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    // Step 2: Modify the table and rename it in the same transaction.
+    {
+        let db = Database::create(tmpfile.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(ORIGINAL_TABLE).unwrap();
+            table.insert(2, "new_value_2").unwrap();
+            table.insert(3, "new_value_3").unwrap();
+            txn.rename_table(table, RENAMED_TABLE).unwrap();
+        }
+        txn.commit().unwrap();
+
+        // Verify data is accessible within the same session.
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(RENAMED_TABLE).unwrap();
+        assert_eq!(table.get(0).unwrap().unwrap().value(), "initial_value_0");
+        assert_eq!(table.get(1).unwrap().unwrap().value(), "initial_value_1");
+        assert_eq!(table.get(2).unwrap().unwrap().value(), "new_value_2");
+        assert_eq!(table.get(3).unwrap().unwrap().value(), "new_value_3");
+        assert_eq!(table.len().unwrap(), 4);
+    }
+
+    // Step 3: Reopen and verify data survives and integrity check passes.
+    {
+        let mut db = Database::builder().create(tmpfile.path()).unwrap();
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(RENAMED_TABLE).unwrap();
+        assert_eq!(table.get(0).unwrap().unwrap().value(), "initial_value_0");
+        assert_eq!(table.get(1).unwrap().unwrap().value(), "initial_value_1");
+        assert_eq!(table.get(2).unwrap().unwrap().value(), "new_value_2");
+        assert_eq!(table.get(3).unwrap().unwrap().value(), "new_value_3");
+        assert_eq!(table.len().unwrap(), 4);
+        drop(table);
+        drop(read_txn);
+        assert!(db.check_integrity().unwrap());
+    }
+}
+
+// Regression test: restore_savepoint() does not clear the freed_pages list in the
+// TableNamespace. When a table is modified (triggering copy-on-write B-tree operations)
+// and then the savepoint is restored, the old pages that were replaced during the
+// modification remain in freed_pages even though the restored tree root still references
+// them. On commit, these stale entries are stored in DATA_FREED_TABLE. In a subsequent
+// transaction, process_freed_pages() frees these pages from the allocator, even though
+// the committed tree still points to them. When those freed pages are reallocated and
+// overwritten by new data, the original table's B-tree becomes corrupted, causing data
+// loss.
+#[test]
+fn savepoint_restore_data_loss_stale_freed_pages() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_a: TableDefinition<u64, &[u8]> = TableDefinition::new("table_a");
+    let table_b: TableDefinition<u64, &[u8]> = TableDefinition::new("table_b");
+
+    // Step 1: Insert initial data into table_a and commit durably.
+    // This creates committed B-tree pages (leaves + branches) for table_a.
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_a).unwrap();
+        for i in 0..100u64 {
+            let value = vec![0u8; 200];
+            table.insert(&i, value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Verify initial data is correct
+    {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(table_a).unwrap();
+        for i in 0..100u64 {
+            let val = table.get(&i).unwrap().unwrap();
+            assert!(val.value().iter().all(|x| *x == 0));
+        }
+    }
+
+    // Step 2: In a new write transaction, create a savepoint, then modify all of
+    // table_a's data (triggering copy-on-write which adds old pages to freed_pages),
+    // then restore the savepoint and commit.
+    //
+    // BUG: restore_savepoint() resets the tree root but does NOT clear freed_pages.
+    // The old pages (which the restored root still references) remain in freed_pages.
+    // commit() stores them in DATA_FREED_TABLE, marking live pages for future freeing.
+    let txn = db.begin_write().unwrap();
+    let savepoint = txn.ephemeral_savepoint().unwrap();
+
+    {
+        let mut table = txn.open_table(table_a).unwrap();
+        // Modify every entry to force copy-on-write on all leaf pages.
+        // The old leaf pages go into freed_pages; new pages are allocated.
+        for i in 0..100u64 {
+            let overwrite = vec![0xFFu8; 200];
+            table.insert(&i, overwrite.as_slice()).unwrap();
+        }
+    }
+
+    // Restore the savepoint: resets the tree root to its pre-modification state,
+    // frees the newly allocated pages, but leaves freed_pages untouched.
+    let mut txn = txn;
+    txn.restore_savepoint(&savepoint).unwrap();
+    drop(savepoint);
+
+    // Commit: flush_and_close() drains freed_pages (which still contains the stale old
+    // pages) and stores them in DATA_FREED_TABLE[current_txn]. The committed user root
+    // still references those pages.
+    txn.commit().unwrap();
+
+    // Step 3: Commit an empty transaction. During durable_commit(),
+    // process_freed_pages() processes DATA_FREED_TABLE entries from Step 2 and frees the
+    // stale pages from the allocator. The committed tree root still points to them.
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+
+    // Step 4: Insert data into a DIFFERENT table (table_b) so that the allocator reuses
+    // the freed pages. This overwrites the old B-tree nodes of table_a with table_b data.
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_b).unwrap();
+        for i in 0..300u64 {
+            let filler = vec![0xBBu8; 200];
+            table.insert(&i, filler.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Step 5: Read table_a. If the bug is present, the original pages have been freed
+    // and overwritten by table_b's data. Reading table_a's B-tree will encounter
+    // corrupted nodes, leading to wrong values, missing keys, or read errors.
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(table_a).unwrap();
+
+    let mut data_loss_detected = false;
+    for i in 0..100u64 {
+        match table.get(&i) {
+            Ok(Some(val)) => {
+                let v = val.value();
+                if v.len() != 200 || v.iter().any(|x| *x != 0) {
+                    // Value is present but corrupted
+                    data_loss_detected = true;
+                    break;
+                }
+            }
+            Ok(None) => {
+                // Key is missing entirely
+                data_loss_detected = true;
+                break;
+            }
+            Err(_) => {
+                // Storage error due to corrupted B-tree pages
+                data_loss_detected = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        !data_loss_detected,
+        "DATA LOSS: table_a data is corrupted after savepoint restore. \
+         restore_savepoint() did not clear freed_pages, causing the old pages \
+         (still referenced by the committed tree root) to be stored in DATA_FREED_TABLE \
+         and later freed by process_freed_pages(). When those pages were reused by table_b, \
+         table_a's B-tree became corrupted."
+    );
+}
+
+#[test]
+fn restore_savepoint_from_foreign_database_panics() {
+    let tmpfile1 = create_tempfile();
+    let tmpfile2 = create_tempfile();
+    let db1 = Database::create(tmpfile1.path()).unwrap();
+    let db2 = Database::create(tmpfile2.path()).unwrap();
+
+    let txn1 = db1.begin_write().unwrap();
+    let foreign_savepoint = txn1.ephemeral_savepoint().unwrap();
+    txn1.commit().unwrap();
+
+    let mut txn2 = db2.begin_write().unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        txn2.restore_savepoint(&foreign_savepoint)
+    }));
+    assert!(result.is_ok());
+    assert!(matches!(
+        result.unwrap(),
+        Err(SavepointError::InvalidSavepoint)
+    ));
+}
+
+#[test]
+fn delete_table_panic_after_modification() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table_a: TableDefinition<u64, &[u8]> = TableDefinition::new("table_a");
+
+    // Step 1: Insert several pages worth of committed data into table_a.
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_a).unwrap();
+        for i in 0..100u64 {
+            table.insert(&i, &vec![0u8; 200][..]).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Verify the data is present and durable before we attempt the destructive operation.
+    {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(table_a).unwrap();
+        assert_eq!(table.len().unwrap(), 100);
+    }
+
+    // Step 2: In a single transaction, create an ephemeral savepoint (which enables allocation
+    // tracking via DATA_ALLOCATED_TABLE), modify entries in table_a to force copy-on-write
+    // (allocating new uncommitted pages), and then delete the table.
+    let txn = db.begin_write().unwrap();
+    let _savepoint = txn.ephemeral_savepoint().unwrap();
+    {
+        let mut table = txn.open_table(table_a).unwrap();
+        for i in 0..100u64 {
+            table.insert(&i, &vec![0xFFu8; 200][..]).unwrap();
+        }
+    }
+    let deleted = txn.delete_table(table_a).unwrap();
+    assert!(deleted);
+
+    let commit_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| txn.commit()));
+    assert!(commit_result.is_ok() && commit_result.as_ref().unwrap().is_ok());
+}
+
+// Regression test for an unbounded page leak when a persistent savepoint is created in
+// a write transaction and then the transaction is aborted.
+#[test]
+fn persistent_savepoint_abort_unbounded_leak() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table: TableDefinition<u64, u64> = TableDefinition::new("data");
+
+    // Warm up the persistent-savepoint system tables so that later measurements
+    // reflect only the effect of the aborted savepoint, not one-time initialization.
+    {
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.delete_persistent_savepoint(id).unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Populate some data so that subsequent updates have something to copy-on-write.
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            for i in 0..20u64 {
+                t.insert(i, i).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    // Drain any pending freed pages so the baseline is stable.
+    for _ in 0..3 {
+        db.begin_write().unwrap().commit().unwrap();
+    }
+    let txn = db.begin_write().unwrap();
+    let baseline = txn.stats().unwrap().allocated_pages();
+    txn.abort().unwrap();
+
+    // Repeat: create persistent savepoint, abort, do one modifying write, drain.
+    // Each iteration permanently leaks pages because the aborted savepoint's
+    // TransactionTracker state is never cleaned up.
+    const ITERATIONS: u64 = 20;
+    for round in 0..ITERATIONS {
+        // Create a persistent savepoint and abort the transaction.
+        {
+            let txn = db.begin_write().unwrap();
+            let _id = txn.persistent_savepoint().unwrap();
+            txn.abort().unwrap();
+        }
+
+        // Perform a modification. Its freed pages cannot be reclaimed because the
+        // ghost savepoint from the aborted transaction still pins an old
+        // oldest_live_read_transaction value.
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(table).unwrap();
+                t.insert(0, round).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        for _ in 0..3 {
+            db.begin_write().unwrap().commit().unwrap();
+        }
+    }
+
+    let txn = db.begin_write().unwrap();
+    let after = txn.stats().unwrap().allocated_pages();
+    txn.abort().unwrap();
+
+    assert_eq!(
+        baseline,
+        after,
+        "After {} iterations of persistent_savepoint+abort+modify, page usage grew \
+         from {} to {} ({} pages leaked). Because the leak per iteration is \
+         independent of N, running N iterations leaks O(N) pages.",
+        ITERATIONS,
+        baseline,
+        after,
+        after.saturating_sub(baseline),
+    );
+}
+
+#[test]
+fn check_integrity_with_live_read_transaction() {
+    let tmpfile = create_tempfile();
+    let mut db = Database::create(tmpfile.path()).unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        for i in 0..10u64 {
+            table.insert(&i, &i).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Hold a ReadTransaction, which keeps an Arc<TransactionalMemory> alive.
+    // Note: ReadTransaction does not borrow the Database, so we can still call
+    // `&mut self` methods on `db` while `read_txn` is alive.
+    let read_txn = db.begin_read().unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.check_integrity()));
+    assert!(result.is_ok(), "check_integrity() should not panic");
+    assert!(matches!(
+        result.unwrap(),
+        Err(DatabaseError::TransactionInProgress)
+    ));
+
+    // After the transaction is dropped, check_integrity() should succeed.
+    drop(read_txn);
+    assert!(db.check_integrity().unwrap());
+}
+
+// Regression test: restore_savepoint() must not partially revert in-memory state
+// when it cannot complete.
+#[test]
+fn restore_savepoint_partial_revert_commits_as_data_loss() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let tab: TableDefinition<u64, u64> = TableDefinition::new("t");
+
+    // k1 at the state we will restore to later.
+    let txn = db.begin_write().unwrap();
+    {
+        let mut t = txn.open_table(tab).unwrap();
+        t.insert(1u64, 1u64).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Persistent savepoint PS1 captures the {k1} state.
+    let txn = db.begin_write().unwrap();
+    let ps1 = txn.persistent_savepoint().unwrap();
+    txn.commit().unwrap();
+
+    // k2 (durably committed).
+    let txn = db.begin_write().unwrap();
+    {
+        let mut t = txn.open_table(tab).unwrap();
+        t.insert(2u64, 2u64).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Persistent savepoint PS2 with id > PS1. Its existence is what makes the
+    // failed-restore path trigger.
+    let txn = db.begin_write().unwrap();
+    let _ps2 = txn.persistent_savepoint().unwrap();
+    txn.commit().unwrap();
+
+    // k3 (durably committed).
+    let txn = db.begin_write().unwrap();
+    {
+        let mut t = txn.open_table(tab).unwrap();
+        t.insert(3u64, 3u64).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Sanity: all three keys are durable before we start.
+    {
+        let rt = db.begin_read().unwrap();
+        let t = rt.open_table(tab).unwrap();
+        assert_eq!(t.get(1u64).unwrap().unwrap().value(), 1);
+        assert_eq!(t.get(2u64).unwrap().unwrap().value(), 2);
+        assert_eq!(t.get(3u64).unwrap().unwrap().value(), 3);
+    }
+
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(Durability::None).unwrap();
+    let sp = txn.get_persistent_savepoint(ps1).unwrap();
+
+    let restore_result = txn.restore_savepoint(&sp);
+    assert!(
+        matches!(
+            restore_result,
+            Err(SavepointError::ImmediateDurabilityRequired)
+        ),
+        "restore_savepoint() should fail with ImmediateDurabilityRequired when \
+         durability != Immediate and newer persistent savepoints exist, got: {restore_result:?}"
+    );
+
+    // A caller that ignores the restore error and commits anyway durably
+    // persists the partially-reverted state.
+    txn.commit().unwrap();
+
+    // If restore_savepoint() were transactional on failure, k2 and k3 would
+    // still be present. With the bug, the in-memory tree root was reverted by
+    // the failing restore_savepoint() call and then durably committed, so k2
+    // and k3 are gone.
+    let rt = db.begin_read().unwrap();
+    let t = rt.open_table(tab).unwrap();
+    let k1 = t.get(1u64).unwrap().map(|v| v.value());
+    let k2 = t.get(2u64).unwrap().map(|v| v.value());
+    let k3 = t.get(3u64).unwrap().map(|v| v.value());
+    assert_eq!(k1, Some(1));
+    assert_eq!(k2, Some(2));
+    assert_eq!(k3, Some(3));
+}
+
+// Regression test for a page leak when a transaction that attempts to
+// restore_savepoint() an older savepoint is aborted instead of committed.
+#[test]
+fn restore_savepoint_abort_unbounded_leak() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table: TableDefinition<u64, u64> = TableDefinition::new("data");
+
+    // Warm up the persistent-savepoint system tables so the baseline is stable.
+    {
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.delete_persistent_savepoint(id).unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Populate some data so that later writes have something to copy-on-write.
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            for i in 0..50u64 {
+                t.insert(i, i).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    // Drain pending freed pages so the baseline is stable.
+    for _ in 0..3 {
+        db.begin_write().unwrap().commit().unwrap();
+    }
+    let txn = db.begin_write().unwrap();
+    let baseline = txn.stats().unwrap().allocated_pages();
+    txn.abort().unwrap();
+
+    // Create an older persistent savepoint that will be restored (then aborted).
+    let older = {
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+        id
+    };
+
+    // One modifying write between the two savepoints, so the newer savepoint
+    // references a different tree root than the older one.
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            t.insert(0, u64::MAX).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    // The newer persistent savepoint: restore_savepoint(older) tries to
+    // invalidate this one, and the abort leaves it as a ghost.
+    let newer = {
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+        id
+    };
+
+    {
+        let mut txn = db.begin_write().unwrap();
+        let sp = txn.get_persistent_savepoint(older).unwrap();
+        txn.restore_savepoint(&sp).unwrap();
+        drop(sp);
+        txn.abort().unwrap();
+    }
+
+    {
+        let txn = db.begin_write().unwrap();
+        txn.delete_persistent_savepoint(older).unwrap();
+        txn.commit().unwrap();
+    }
+
+    const ITERATIONS: u64 = 100;
+    for round in 0..ITERATIONS {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            t.insert(0, round).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    drop(db);
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    {
+        let mut txn = db.begin_write().unwrap();
+        let sp = txn.get_persistent_savepoint(newer).unwrap();
+        txn.restore_savepoint(&sp).unwrap();
+        drop(sp);
+        txn.commit().unwrap();
+    }
+    {
+        let txn = db.begin_write().unwrap();
+        txn.delete_persistent_savepoint(newer).unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Drain pending freed pages so the final measurement is stable.
+    for _ in 0..3 {
+        db.begin_write().unwrap().commit().unwrap();
+    }
+    let txn = db.begin_write().unwrap();
+    let after = txn.stats().unwrap().allocated_pages();
+    txn.abort().unwrap();
+
+    assert_eq!(
+        baseline,
+        after,
+        "After {} iterations of insert+commit between an aborted \
+         restore_savepoint and the next restore_savepoint, page usage grew \
+         from {} to {} ({} pages leaked). The leak per iteration is independent \
+         of N, so running N iterations leaks O(N) pages.",
+        ITERATIONS,
+        baseline,
+        after,
+        after.saturating_sub(baseline),
+    );
+}
+
+#[test]
+fn restore_savepoint_abort_after_ephemeral_drop() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table: TableDefinition<u64, u64> = TableDefinition::new("data");
+
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            for i in 0..20u64 {
+                t.insert(i, i).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    let older = {
+        let txn = db.begin_write().unwrap();
+        let sp = txn.ephemeral_savepoint().unwrap();
+        txn.commit().unwrap();
+        sp
+    };
+
+    let newer = {
+        let txn = db.begin_write().unwrap();
+        let sp = txn.ephemeral_savepoint().unwrap();
+        txn.commit().unwrap();
+        sp
+    };
+
+    {
+        let mut txn = db.begin_write().unwrap();
+        txn.restore_savepoint(&older).unwrap();
+        drop(newer);
+        txn.abort().unwrap();
+    }
+
+    {
+        let mut txn = db.begin_write().unwrap();
+        txn.restore_savepoint(&older).unwrap();
+        txn.commit().unwrap();
+    }
+    drop(older);
+    for _ in 0..3 {
+        db.begin_write().unwrap().commit().unwrap();
+    }
+
+    assert!(
+        db.begin_read()
+            .unwrap()
+            .open_table(table)
+            .unwrap()
+            .get(&0u64)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn extract_if_next_then_next_back_panic() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table_def: TableDefinition<u64, u64> = TableDefinition::new("t");
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_def).unwrap();
+        table.insert(&1u64, &10u64).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_def).unwrap();
+        let mut iter = table.extract_if(|_, _| true).unwrap();
+
+        let first = iter.next();
+        assert!(first.is_some());
+        let first = first.unwrap();
+        assert!(first.is_ok());
+
+        assert!(iter.next().is_none());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next_back()));
+        assert!(result.is_ok());
+    }
+    txn.abort().unwrap();
+}
+
+#[test]
+fn multimap_value_next_back_does_not_update_len() {
+    const TABLE: MultimapTableDefinition<u32, u32> = MultimapTableDefinition::new("m");
+
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_multimap_table(TABLE).unwrap();
+        for i in 0..5u32 {
+            table.insert(&1u32, &i).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_multimap_table(TABLE).unwrap();
+    let mut iter = table.get(&1u32).unwrap();
+    assert_eq!(iter.len(), 5);
+    assert!(!iter.is_empty());
+
+    let _ = iter.next_back().unwrap().unwrap();
+    assert_eq!(iter.len(), 4);
+
+    for expected_remaining in (0..4).rev() {
+        iter.next_back().unwrap().unwrap();
+        assert_eq!(iter.len(), expected_remaining as u64);
+    }
+    assert!(iter.is_empty());
+    assert!(iter.next_back().is_none());
+}
+
+#[test]
+#[should_panic(expected = "assertion failed: !name.is_empty()")]
+fn table_definition_new_panics_on_empty_name() {
+    let name = String::new();
+    let _def: TableDefinition<u64, u64> = TableDefinition::new(&name);
+}
+
+#[test]
+#[should_panic(expected = "assertion failed: !name.is_empty()")]
+fn multimap_table_definition_new_panics_on_empty_name() {
+    let name = String::new();
+    let _def: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new(&name);
+}

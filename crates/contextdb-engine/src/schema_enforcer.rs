@@ -1,6 +1,6 @@
 use crate::database::Database;
 use contextdb_core::{ColumnType, Error, Result, Value};
-use contextdb_parser::ast::{Expr, Literal};
+use contextdb_parser::ast::{Expr, Literal, UnaryOp};
 use contextdb_planner::PhysicalPlan;
 use std::collections::HashMap;
 
@@ -93,7 +93,9 @@ pub fn validate_dml(
                             .ok_or_else(|| {
                                 Error::PlanError("column/value count mismatch".to_string())
                             })
-                            .and_then(|expr| resolve_expr(expr, params))?;
+                            .and_then(|expr| {
+                                resolve_required_expr(expr, params, &p.table, &column.name)
+                            })?;
                         if value == Value::Null {
                             return Err(Error::Other(format!(
                                 "NOT NULL constraint violated: {}.{}",
@@ -115,7 +117,16 @@ pub fn validate_dml(
     }
 }
 
-fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
+/// Resolve the subset of INSERT expressions needed to check a required value
+/// before staging the row. Expressions that need a row are deliberately
+/// rejected here with the destination column, rather than being reported as
+/// an unrelated unsupported-expression implementation detail.
+fn resolve_required_expr(
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    table: &str,
+    column: &str,
+) -> Result<Value> {
     match expr {
         Expr::Literal(l) => Ok(match l {
             Literal::Null => Value::Null,
@@ -131,13 +142,26 @@ fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
             }
             Literal::Vector(v) => Value::Vector(v.clone()),
         }),
-        Expr::Parameter(p) => params
-            .get(p)
+        Expr::Parameter(parameter) => params
+            .get(parameter)
             .cloned()
-            .ok_or_else(|| Error::NotFound(format!("missing parameter: {}", p))),
-        Expr::Column(c) => Ok(Value::Text(c.column.clone())),
-        _ => Err(Error::PlanError(
-            "unsupported expression in schema enforcer".to_string(),
-        )),
+            .ok_or_else(|| Error::NotFound(format!("missing parameter: {parameter}"))),
+        Expr::UnaryOp {
+            op: UnaryOp::Neg,
+            operand,
+        } => match resolve_required_expr(operand, params, table, column)? {
+            Value::Int64(value) => value.checked_neg().map(Value::Int64).ok_or_else(|| {
+                Error::Other(format!(
+                    "cannot resolve required INSERT value for {table}.{column}: integer literal is out of range"
+                ))
+            }),
+            Value::Float64(value) => Ok(Value::Float64(-value)),
+            _ => Err(Error::Other(format!(
+                "cannot resolve required INSERT value for {table}.{column}: unary - requires an INTEGER or REAL literal or parameter"
+            ))),
+        },
+        _ => Err(Error::Other(format!(
+            "cannot resolve required INSERT value for {table}.{column}: this expression requires row context; use a literal or bound parameter"
+        ))),
     }
 }

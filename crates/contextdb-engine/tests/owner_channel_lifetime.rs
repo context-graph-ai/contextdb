@@ -97,13 +97,20 @@ fn open_against_silent_channel_after_first_waiter(
         })
     });
 
+    // Between two deadlines route selection may do real work of any length --
+    // opening the idle file once the silent candidate has timed out -- so
+    // only the opener itself ends this wait, by registering its next deadline
+    // or by finishing. The patience never judges speed; it only turns an
+    // opener that does neither into a failure instead of a hang.
+    let patience = std::time::Duration::from_secs(60);
     let mut deadlines_driven = 0u64;
     let mut after_first_waiter = Some(after_first_waiter);
     while deadlines_driven < 4 && !opening.is_finished() {
-        for _ in 0..100_000 {
-            if clock.registered_waiter_count() == 1 || opening.is_finished() {
-                break;
-            }
+        let waiting_since = std::time::Instant::now();
+        while clock.registered_waiter_count() != 1
+            && !opening.is_finished()
+            && waiting_since.elapsed() < patience
+        {
             std::thread::yield_now();
         }
         if opening.is_finished() {
@@ -113,7 +120,9 @@ fn open_against_silent_channel_after_first_waiter(
             clock.advance_to(u64::MAX / 2);
             opening.thread().unpark();
             let _ = opening.join();
-            panic!("the silent owner candidate did not register its response deadline");
+            panic!(
+                "the silent owner candidate neither registered its response deadline nor finished"
+            );
         }
         if let Some(after_first_waiter) = after_first_waiter.take() {
             after_first_waiter();

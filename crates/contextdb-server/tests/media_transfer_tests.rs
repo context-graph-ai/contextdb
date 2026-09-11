@@ -582,7 +582,10 @@ async fn tampered_bytes_are_caught_by_hash_verify() {
     let consumer_node = node_id_of(&consumer_key);
     let content = marked("GENUINE-5e5e", 200 * 1024);
     let h = BlobHash::of(&content);
-    let tampered = marked("TAMPERED-5f5f", 200 * 1024);
+    // Preserve every earlier Bao leaf so rejection happens only after the
+    // final payload leaf arrives, independent of provider/consumer scheduling.
+    let mut tampered = content.clone();
+    *tampered.last_mut().expect("nonempty payload") ^= 1;
     assert_ne!(BlobHash::of(&tampered), h);
 
     let holder_db = Arc::new(Database::open_memory());
@@ -596,6 +599,7 @@ async fn tampered_bytes_are_caught_by_hash_verify() {
         holder_key.clone(),
     );
     holder.set_test_clock(T0);
+    holder.ingest_bytes(&content).expect("ingest genuine blob");
     holder
         .serve_wrong_bytes_for_test(&h, &tampered)
         .expect("install tamper");
@@ -629,6 +633,9 @@ async fn tampered_bytes_are_caught_by_hash_verify() {
         "unverified bytes must never reach the caller-facing worker sink"
     );
     assert_eq!(holder.fetch_requests_received_for_test(), 1);
+    within(holder.wait_for_completed_serves_for_test(1))
+        .await
+        .expect("the holder must finish its provider accounting after the consumer rejects tampered bytes");
     assert_eq!(
         holder.payload_bytes_emitted_for_test(),
         tampered.len() as u64,

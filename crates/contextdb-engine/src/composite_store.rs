@@ -1,13 +1,18 @@
 use crate::memory_accounting::MemoryAccountant;
 use crate::sync_types::{DdlChange, NaturalKey, natural_key_from_row_values};
 use contextdb_core::{
-    EdgeType, Lsn, NodeId, Result, RowId, TableMeta, TableName, Value, VectorIndexRef, VersionedRow,
+    ColumnDef, ColumnType, EdgeType, Error, Lsn, NodeId, Result, RowId, SnapshotId, TableMeta,
+    TableName, TxId, Value, VectorIndexRef, VectorPartitionDeclarationIssue, VectorPartitionKey,
+    VersionedRow,
 };
 use contextdb_graph::GraphStore;
 use contextdb_relational::RelationalStore;
 use contextdb_relational::store::SyncSourceKind;
 use contextdb_tx::{WriteSet, WriteSetApplicator};
-use contextdb_vector::VectorStore;
+use contextdb_vector::{
+    PartitionedVectorDelete, PartitionedVectorEntry, PartitionedVectorMove,
+    PreparedPartitionedVectorBatch, VectorStore,
+};
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -35,6 +40,147 @@ pub(crate) type ChangeLogTableIndex = HashMap<TableName, Vec<(Lsn, RowId)>>;
 /// cheap first-key lookup, not a scan).
 pub(crate) type ChangeLogLsnRefcounts = BTreeMap<Lsn, u64>;
 
+/// The exact registered-snapshot set captured by Database while its active
+/// removal guard is held, staged under the commit LSN that the erased store
+/// applicator will receive. Absence means "no retirement authority"; a
+/// present empty vector means the guard proved that no active snapshot needs
+/// an emptied maintained partition.
+pub(crate) type VectorPartitionSnapshotStageRegistry = Arc<Mutex<HashMap<Lsn, Arc<[SnapshotId]>>>>;
+
+/// The exact row/declaration pair from which one local partition identity was
+/// derived. This is deliberately an engine sidecar: neither `VectorEntry` nor
+/// any synchronization payload acquires a partition key.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PreparedVectorPartitionBinding {
+    pub(crate) row: VersionedRow,
+    /// The table declaration the key columns' types were read from, so the
+    /// identity can be re-derived from this binding alone.
+    pub(crate) table_meta: TableMeta,
+    pub(crate) declaration: ColumnDef,
+    pub(crate) partition_key: VectorPartitionKey,
+    pub(crate) vector_created_tx: contextdb_core::TxId,
+    pub(crate) vector_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+// Inline bindings deliberately retain the exact pre-durability rows and
+// declarations needed to apply one validated vector mutation atomically.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PreparedVectorPartitionMutation {
+    Delete {
+        index: VectorIndexRef,
+        before: PreparedVectorPartitionBinding,
+        deleted_tx: contextdb_core::TxId,
+    },
+    Insert {
+        index: VectorIndexRef,
+        after: PreparedVectorPartitionBinding,
+        entry: contextdb_core::VectorEntry,
+    },
+    Move {
+        index: VectorIndexRef,
+        before: PreparedVectorPartitionBinding,
+        after: PreparedVectorPartitionBinding,
+        moved_tx: contextdb_core::TxId,
+    },
+}
+
+/// One pre-durability projection consumed by both Redb and the in-memory
+/// vector registry. The vector-store token contains the cap/membership
+/// validation result; `mutations` retains the exact accepted rows and schema
+/// declarations needed by persistence.
+pub(crate) struct PreparedVectorPartitionMutationBatch {
+    pub(crate) commit_lsn: Lsn,
+    pub(crate) mutations: Vec<PreparedVectorPartitionMutation>,
+    vector_publication: Option<PreparedPartitionedVectorBatch>,
+    memberships: contextdb_relational::store::PreparedMembershipBatch,
+    retention_expiries: Vec<contextdb_relational::store::PreparedRetentionExpiry>,
+}
+
+impl PreparedVectorPartitionMutationBatch {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.mutations.is_empty()
+    }
+}
+
+/// The single row-to-partition encoder used by ordinary commits and complete
+/// received-schema replacement. The core key supplies the durable canonical
+/// byte encoding; this function resolves the declared columns in order and
+/// stores only components of each key column's declared type, so a stored
+/// key and a predicate literal meet under the same `=` the row filter
+/// applies. A key value no component of the declared type is `=`-equal to
+/// is refused rather than stored as a partition no query can name.
+pub(crate) fn vector_partition_key_for_row(
+    index: &VectorIndexRef,
+    meta: &TableMeta,
+    declaration: &ColumnDef,
+    row: &VersionedRow,
+) -> Result<VectorPartitionKey> {
+    if !matches!(&declaration.column_type, ColumnType::Vector(_)) {
+        return Err(Error::InvalidVectorPartitionDeclaration {
+            index: index.clone(),
+            issue: VectorPartitionDeclarationIssue::RequiresVectorColumn,
+        });
+    }
+    let Some(columns) = declaration.partition_key_columns.as_ref() else {
+        return Ok(VectorPartitionKey::unpartitioned());
+    };
+    if columns.is_empty() {
+        return Err(Error::InvalidVectorPartitionDeclaration {
+            index: index.clone(),
+            issue: VectorPartitionDeclarationIssue::EmptyPartitionKey,
+        });
+    }
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        let Some(value) = row.values.get(column) else {
+            return Err(Error::InvalidVectorPartitionDeclaration {
+                index: index.clone(),
+                issue: VectorPartitionDeclarationIssue::UnknownPartitionKeyColumn,
+            });
+        };
+        if matches!(value, Value::Null) {
+            return Err(Error::InvalidVectorPartitionDeclaration {
+                index: index.clone(),
+                issue: VectorPartitionDeclarationIssue::NullablePartitionKeyColumn,
+            });
+        }
+        let Some(key_column) = meta
+            .columns
+            .iter()
+            .find(|candidate| &candidate.name == column)
+        else {
+            return Err(Error::InvalidVectorPartitionDeclaration {
+                index: index.clone(),
+                issue: VectorPartitionDeclarationIssue::UnknownPartitionKeyColumn,
+            });
+        };
+        match crate::executor::partition_key_literal(&key_column.column_type, value) {
+            crate::executor::PartitionKeyLiteral::Exact(component) => values.push(component),
+            // The declaration is fine; the VALUE written to this key column
+            // is not of the type it declares. That is a refusal of the write,
+            // named by column and never by value, and it is deliberately not
+            // reported as a declaration problem the developer would search a
+            // sound `CREATE TABLE` for. Ordinary writes and synced rows both
+            // arrive here, so both get this one refusal.
+            crate::executor::PartitionKeyLiteral::NoPartition
+            | crate::executor::PartitionKeyLiteral::Unresolved
+            | crate::executor::PartitionKeyLiteral::Unbound => {
+                return Err(Error::VectorPartitionKeyValueTypeMismatch {
+                    index: index.clone(),
+                    column: column.clone(),
+                });
+            }
+        }
+    }
+    VectorPartitionKey::from_values(&values).ok_or_else(|| {
+        Error::InvalidVectorPartitionDeclaration {
+            index: index.clone(),
+            issue: VectorPartitionDeclarationIssue::UnsupportedPartitionKeyColumnType,
+        }
+    })
+}
+
 /// Record newly-appended entries into both aux structures, in the SAME
 /// order they land in `change_log` -- called once, right where
 /// `change_log` itself is extended, so the two never observe a different
@@ -57,6 +203,23 @@ pub(crate) fn record_change_log_entries(
                 .push((*lsn, *row_id));
         }
     }
+}
+
+pub(crate) const RETENTION_EXPIRY_PREFIX: &str = "retention_expiry.v1.";
+
+pub(crate) fn retention_expiry_key(table: &str, row: RowId, created: TxId) -> String {
+    format!(
+        "{RETENTION_EXPIRY_PREFIX}{}:{table}:{}:{}",
+        table.len(),
+        row.0,
+        created.0
+    )
+}
+
+fn is_retention_expiry(ws: &WriteSet) -> bool {
+    ws.config_writes
+        .iter()
+        .any(|(key, _)| key.starts_with(RETENTION_EXPIRY_PREFIX))
 }
 
 pub(crate) type SyncSourceLsnClear = (TableName, RowId);
@@ -233,6 +396,7 @@ pub struct CompositeStore {
     pub change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
     pub change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     pub ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
+    vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
     accountant: Arc<MemoryAccountant>,
     apply_phase_pause: Arc<ApplyPhasePause>,
 }
@@ -284,6 +448,15 @@ impl ApplyPhasePause {
         state.generation == generation && state.reached
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn wait_until_reached_blocking(&self, generation: u64) -> bool {
+        let mut state = self.state.lock();
+        while state.generation == generation && state.armed && !state.reached {
+            self.waiters.wait(&mut state);
+        }
+        state.generation == generation && state.reached
+    }
+
     pub(crate) fn release(&self, generation: u64) {
         let mut state = self.state.lock();
         if state.generation == generation && state.armed {
@@ -329,6 +502,7 @@ impl CompositeStore {
             change_log_table_index,
             change_log_lsn_refcounts,
             ddl_log,
+            Arc::new(Mutex::new(HashMap::new())),
             accountant,
             Arc::new(ApplyPhasePause::new()),
         )
@@ -343,6 +517,7 @@ impl CompositeStore {
         change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
         change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
+        vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
         accountant: Arc<MemoryAccountant>,
         apply_phase_pause: Arc<ApplyPhasePause>,
     ) -> Self {
@@ -355,18 +530,10 @@ impl CompositeStore {
             change_log_table_index,
             change_log_lsn_refcounts,
             ddl_log,
+            vector_partition_snapshot_stages,
             accountant,
             apply_phase_pause,
         }
-    }
-
-    pub(crate) fn build_change_log_entries(&self, ws: &WriteSet) -> Vec<ChangeLogEntry> {
-        if ws.relational_deletes.is_empty() {
-            return self.build_change_log_entries_with_snapshots(ws, None, None);
-        }
-        let table_meta = self.relational.table_meta.read().clone();
-        let deleted_rows = self.deleted_rows_snapshot_for_write_set(ws);
-        self.build_change_log_entries_with_snapshots(ws, Some(&table_meta), deleted_rows.as_ref())
     }
 
     pub(crate) fn build_change_log_entries_with_snapshots(
@@ -375,6 +542,10 @@ impl CompositeStore {
         table_meta_snapshot: Option<&HashMap<String, TableMeta>>,
         deleted_rows_snapshot: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
     ) -> Vec<ChangeLogEntry> {
+        // Local expiry is not an outbound user deletion.
+        if is_retention_expiry(ws) {
+            return Vec::new();
+        }
         let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
         let mut log_entries = Vec::new();
 
@@ -508,40 +679,509 @@ impl CompositeStore {
         NaturalKey::single("id".to_string(), Value::Int64(row_id.0 as i64))
     }
 
+    fn vector_table_meta<'meta>(
+        table_meta: &'meta HashMap<String, TableMeta>,
+        index: &VectorIndexRef,
+    ) -> Result<&'meta TableMeta> {
+        table_meta
+            .get(&index.table)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })
+    }
+
+    fn vector_declaration(
+        table_meta: &HashMap<String, TableMeta>,
+        index: &VectorIndexRef,
+    ) -> Result<ColumnDef> {
+        table_meta
+            .get(&index.table)
+            .and_then(|meta| {
+                meta.columns
+                    .iter()
+                    .find(|column| column.name == index.column)
+            })
+            .filter(|column| matches!(&column.column_type, ColumnType::Vector(_)))
+            .cloned()
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })
+    }
+
+    fn validate_registered_vector_declaration(
+        &self,
+        index: &VectorIndexRef,
+        declaration: &ColumnDef,
+    ) -> Result<()> {
+        let expected =
+            crate::database::vector_index_layout_from_column(declaration).ok_or_else(|| {
+                Error::InvalidVectorPartitionDeclaration {
+                    index: index.clone(),
+                    issue: VectorPartitionDeclarationIssue::RequiresVectorColumn,
+                }
+            })?;
+        if self.vector.index_layout(index)? != expected {
+            return Err(Error::Other(format!(
+                "registered vector layout does not match the durable declaration for {}.{}",
+                index.table, index.column
+            )));
+        }
+        Ok(())
+    }
+
+    fn old_accepted_row(
+        &self,
+        table: &str,
+        row_id: RowId,
+        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+    ) -> Option<VersionedRow> {
+        deleted_rows
+            .and_then(|by_table| by_table.get(table))
+            .and_then(|by_row| by_row.get(&row_id))
+            .cloned()
+            .or_else(|| self.relational.live_row_by_id(table, row_id))
+    }
+
+    fn current_vector_for_partition(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        row_id: RowId,
+    ) -> Result<Option<contextdb_core::VectorEntry>> {
+        let Some(current_key) = self.vector.current_partition_for_row(index, row_id) else {
+            return Ok(None);
+        };
+        if &current_key != partition_key {
+            return Err(Error::Other(format!(
+                "vector partition membership disagrees with the accepted row for {}.{}",
+                index.table, index.column
+            )));
+        }
+        self.vector
+            .ensure_raw_partition_loaded(index, partition_key)?;
+        Ok(self.vector.live_entry_for_row_in_partition(
+            index,
+            partition_key,
+            row_id,
+            SnapshotId::from_raw_wire(u64::MAX),
+        ))
+    }
+
+    fn prepared_binding(
+        index: &VectorIndexRef,
+        meta: &TableMeta,
+        declaration: ColumnDef,
+        row: VersionedRow,
+        vector_created_tx: contextdb_core::TxId,
+        vector_lsn: Lsn,
+    ) -> Result<PreparedVectorPartitionBinding> {
+        let partition_key = vector_partition_key_for_row(index, meta, &declaration, &row)?;
+        Ok(PreparedVectorPartitionBinding {
+            row,
+            table_meta: meta.clone(),
+            declaration,
+            partition_key,
+            vector_created_tx,
+            vector_lsn,
+        })
+    }
+
+    /// Resolve every vector write against the finalized rows and declaration,
+    /// then ask the vector store to validate the complete keyed batch without
+    /// mutating it. A relational key-only replacement synthesizes a local
+    /// move for each unchanged live vector column.
+    pub(crate) fn prepare_vector_partition_mutations(
+        &self,
+        ws: &WriteSet,
+        table_meta: &HashMap<String, TableMeta>,
+        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+    ) -> Result<PreparedVectorPartitionMutationBatch> {
+        self.prepare_vector_partition_mutations_with_reclamation(
+            ws,
+            table_meta,
+            deleted_rows,
+            HashSet::new(),
+            None,
+        )
+    }
+
+    /// Database supplies only states it has proved reclaimable while holding
+    /// its snapshot-removal guard through durable and memory publication.
+    /// This layer never infers that proof from current rows.
+    pub(crate) fn prepare_vector_partition_mutations_with_reclaimable_partitions(
+        &self,
+        ws: &WriteSet,
+        table_meta: &HashMap<String, TableMeta>,
+        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+        reclaimable_partitions: HashSet<contextdb_vector::VectorPartitionRef>,
+    ) -> Result<PreparedVectorPartitionMutationBatch> {
+        self.prepare_vector_partition_mutations_with_reclamation(
+            ws,
+            table_meta,
+            deleted_rows,
+            reclaimable_partitions,
+            None,
+        )
+    }
+
+    pub(crate) fn prepare_vector_partition_mutations_with_registered_snapshots(
+        &self,
+        ws: &WriteSet,
+        table_meta: &HashMap<String, TableMeta>,
+        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+        registered_snapshots: &[SnapshotId],
+    ) -> Result<PreparedVectorPartitionMutationBatch> {
+        self.prepare_vector_partition_mutations_with_reclamation(
+            ws,
+            table_meta,
+            deleted_rows,
+            HashSet::new(),
+            Some(registered_snapshots),
+        )
+    }
+
+    pub(crate) fn take_vector_partition_snapshot_stage(
+        &self,
+        commit_lsn: Option<Lsn>,
+    ) -> Option<Arc<[SnapshotId]>> {
+        commit_lsn.and_then(|lsn| self.vector_partition_snapshot_stages.lock().remove(&lsn))
+    }
+
+    fn prepare_vector_partition_mutations_with_reclamation(
+        &self,
+        ws: &WriteSet,
+        table_meta: &HashMap<String, TableMeta>,
+        deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
+        reclaimable_partitions: HashSet<contextdb_vector::VectorPartitionRef>,
+        registered_snapshots: Option<&[SnapshotId]>,
+    ) -> Result<PreparedVectorPartitionMutationBatch> {
+        let commit_lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+        let new_rows = ws
+            .relational_inserts
+            .iter()
+            .map(|(table, row)| ((table.clone(), row.row_id), row.clone()))
+            .collect::<HashMap<_, _>>();
+        let accepted_new_row = |table: &str, row_id: RowId| {
+            new_rows
+                .get(&(table.to_owned(), row_id))
+                .cloned()
+                .or_else(|| self.relational.live_row_by_id(table, row_id))
+        };
+
+        let mut mutations = Vec::new();
+        let mut keyed_deletes = Vec::with_capacity(ws.vector_deletes.len());
+        let mut keyed_inserts = Vec::with_capacity(ws.vector_inserts.len());
+        let mut keyed_moves = Vec::with_capacity(ws.vector_moves.len());
+        let mut explicit_touches = HashSet::<(VectorIndexRef, RowId)>::new();
+        let mut checked_declarations = HashSet::<VectorIndexRef>::new();
+
+        for (index, row_id, deleted_tx) in &ws.vector_deletes {
+            let meta = Self::vector_table_meta(table_meta, index)?;
+            let declaration = Self::vector_declaration(table_meta, index)?;
+            if checked_declarations.insert(index.clone()) {
+                self.validate_registered_vector_declaration(index, &declaration)?;
+            }
+            let row = self
+                .old_accepted_row(&index.table, *row_id, deleted_rows)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "accepted source row is missing for vector delete on {}.{}",
+                        index.table, index.column
+                    ))
+                })?;
+            let partition_key = vector_partition_key_for_row(index, meta, &declaration, &row)?;
+            let vector = self
+                .current_vector_for_partition(index, &partition_key, *row_id)?
+                .ok_or_else(|| Error::NotFound(format!("vector row {row_id}")))?;
+            let before = Self::prepared_binding(
+                index,
+                meta,
+                declaration,
+                row,
+                vector.created_tx,
+                vector.lsn,
+            )?;
+            keyed_deletes.push(PartitionedVectorDelete::new(
+                index.clone(),
+                before.partition_key.clone(),
+                *row_id,
+                *deleted_tx,
+            ));
+            mutations.push(PreparedVectorPartitionMutation::Delete {
+                index: index.clone(),
+                before,
+                deleted_tx: *deleted_tx,
+            });
+            explicit_touches.insert((index.clone(), *row_id));
+        }
+
+        for entry in &ws.vector_inserts {
+            let meta = Self::vector_table_meta(table_meta, &entry.index)?;
+            let declaration = Self::vector_declaration(table_meta, &entry.index)?;
+            if checked_declarations.insert(entry.index.clone()) {
+                self.validate_registered_vector_declaration(&entry.index, &declaration)?;
+            }
+            let row = accepted_new_row(&entry.index.table, entry.row_id).ok_or_else(|| {
+                Error::Other(format!(
+                    "accepted destination row is missing for vector insert on {}.{}",
+                    entry.index.table, entry.index.column
+                ))
+            })?;
+            let after = Self::prepared_binding(
+                &entry.index,
+                meta,
+                declaration,
+                row,
+                entry.created_tx,
+                entry.lsn,
+            )?;
+            keyed_inserts.push(PartitionedVectorEntry::new(
+                after.partition_key.clone(),
+                entry.clone(),
+            ));
+            mutations.push(PreparedVectorPartitionMutation::Insert {
+                index: entry.index.clone(),
+                after,
+                entry: entry.clone(),
+            });
+            explicit_touches.insert((entry.index.clone(), entry.row_id));
+        }
+
+        for (index, old_row_id, new_row_id, moved_tx) in &ws.vector_moves {
+            let meta = Self::vector_table_meta(table_meta, index)?;
+            let declaration = Self::vector_declaration(table_meta, index)?;
+            if checked_declarations.insert(index.clone()) {
+                self.validate_registered_vector_declaration(index, &declaration)?;
+            }
+            let old_row = self
+                .old_accepted_row(&index.table, *old_row_id, deleted_rows)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "accepted source row is missing for vector move on {}.{}",
+                        index.table, index.column
+                    ))
+                })?;
+            let new_row = accepted_new_row(&index.table, *new_row_id).ok_or_else(|| {
+                Error::Other(format!(
+                    "accepted destination row is missing for vector move on {}.{}",
+                    index.table, index.column
+                ))
+            })?;
+            let source_key = vector_partition_key_for_row(index, meta, &declaration, &old_row)?;
+            let vector = self
+                .current_vector_for_partition(index, &source_key, *old_row_id)?
+                .ok_or_else(|| Error::NotFound(format!("vector row {old_row_id}")))?;
+            let before = Self::prepared_binding(
+                index,
+                meta,
+                declaration.clone(),
+                old_row,
+                vector.created_tx,
+                vector.lsn,
+            )?;
+            let after =
+                Self::prepared_binding(index, meta, declaration, new_row, *moved_tx, commit_lsn)?;
+            keyed_moves.push(PartitionedVectorMove::new(
+                index.clone(),
+                before.partition_key.clone(),
+                after.partition_key.clone(),
+                *old_row_id,
+                *new_row_id,
+                *moved_tx,
+            ));
+            mutations.push(PreparedVectorPartitionMutation::Move {
+                index: index.clone(),
+                before,
+                after,
+                moved_tx: *moved_tx,
+            });
+            explicit_touches.insert((index.clone(), *old_row_id));
+            explicit_touches.insert((index.clone(), *new_row_id));
+        }
+
+        // A row-only replacement has no new vector payload. Advance its local
+        // vector owner binding even when the partition key stays the same:
+        // later delete/move preparation names the newly accepted row version.
+        for (table, new_row) in &ws.relational_inserts {
+            let Some(old_row) = deleted_rows
+                .and_then(|by_table| by_table.get(table))
+                .and_then(|by_row| by_row.get(&new_row.row_id))
+                .cloned()
+                .or_else(|| self.relational.live_row_by_id(table, new_row.row_id))
+            else {
+                continue;
+            };
+            let Some(meta) = table_meta.get(table) else {
+                continue;
+            };
+            for declaration in meta
+                .columns
+                .iter()
+                .filter(|column| matches!(&column.column_type, ColumnType::Vector(_)))
+            {
+                let index = VectorIndexRef::new(table.clone(), declaration.name.clone());
+                if explicit_touches.contains(&(index.clone(), new_row.row_id)) {
+                    continue;
+                }
+                let old_key = vector_partition_key_for_row(&index, meta, declaration, &old_row)?;
+                let new_key = vector_partition_key_for_row(&index, meta, declaration, new_row)?;
+                if old_key == new_key
+                    && old_row.created_tx == new_row.created_tx
+                    && old_row.lsn == new_row.lsn
+                {
+                    continue;
+                }
+                if checked_declarations.insert(index.clone()) {
+                    self.validate_registered_vector_declaration(&index, declaration)?;
+                }
+                let Some(vector) =
+                    self.current_vector_for_partition(&index, &old_key, new_row.row_id)?
+                else {
+                    continue;
+                };
+                let before = Self::prepared_binding(
+                    &index,
+                    meta,
+                    declaration.clone(),
+                    old_row.clone(),
+                    vector.created_tx,
+                    vector.lsn,
+                )?;
+                // No vector payload arrived, but the local move versions the
+                // unchanged bytes at this commit so old and new snapshots keep
+                // disjoint source/destination memberships.
+                let after = Self::prepared_binding(
+                    &index,
+                    meta,
+                    declaration.clone(),
+                    new_row.clone(),
+                    new_row.created_tx,
+                    commit_lsn,
+                )?;
+                keyed_moves.push(
+                    PartitionedVectorMove::new(
+                        index.clone(),
+                        before.partition_key.clone(),
+                        after.partition_key.clone(),
+                        new_row.row_id,
+                        new_row.row_id,
+                        new_row.created_tx,
+                    )
+                    .replacing_row_version(),
+                );
+                mutations.push(PreparedVectorPartitionMutation::Move {
+                    index,
+                    before,
+                    after,
+                    moved_tx: new_row.created_tx,
+                });
+            }
+        }
+
+        let memberships = self.relational.prepare_memberships(
+            &ws.relational_deletes,
+            &ws.relational_inserts,
+            self.accountant.clone(),
+        )?;
+        let vector_publication = if mutations.is_empty() {
+            None
+        } else {
+            let expected_moves = keyed_moves.len();
+            let prepared = match registered_snapshots {
+                Some(registered_snapshots) => self
+                    .vector
+                    .prepare_partitioned_batch_with_registered_snapshots(
+                        keyed_deletes,
+                        keyed_inserts,
+                        keyed_moves,
+                        registered_snapshots,
+                    )?,
+                None => self.vector.prepare_partitioned_batch(
+                    keyed_deletes,
+                    keyed_inserts,
+                    keyed_moves,
+                    reclaimable_partitions,
+                )?,
+            };
+            if prepared.valid_move_count() != expected_moves {
+                return Err(Error::Other(
+                    "prepared vector partition batch lost a validated move source".to_string(),
+                ));
+            }
+            Some(prepared)
+        };
+        let retention_identities = ws
+            .config_writes
+            .iter()
+            .filter(|(key, _)| key.starts_with(RETENTION_EXPIRY_PREFIX))
+            .map(|(_, bytes)| crate::persistence::RedbPersistence::decode_config_value(bytes))
+            .collect::<Result<Vec<(TableName, RowId, TxId, Lsn)>>>()?;
+        let retention_expiries = self
+            .relational
+            .prepare_retention_expiries(retention_identities, self.accountant.clone())?;
+        Ok(PreparedVectorPartitionMutationBatch {
+            memberships,
+            retention_expiries,
+            commit_lsn,
+            mutations,
+            vector_publication,
+        })
+    }
+
     pub(crate) fn apply_exact(&self, ws: &WriteSet) -> Result<()> {
-        let log_entries = self.build_change_log_entries(ws);
-        self.apply_exact_with_log_entries(ws, log_entries)
+        let registered_snapshots = self.take_vector_partition_snapshot_stage(ws.commit_lsn);
+        let table_meta = self.relational.table_meta.read().clone();
+        let deleted_rows = self.deleted_rows_snapshot_for_write_set(ws);
+        let log_entries = self.build_change_log_entries_with_snapshots(
+            ws,
+            Some(&table_meta),
+            deleted_rows.as_ref(),
+        );
+        let partition_mutations = match registered_snapshots.as_deref() {
+            Some(registered_snapshots) => self
+                .prepare_vector_partition_mutations_with_registered_snapshots(
+                    ws,
+                    &table_meta,
+                    deleted_rows.as_ref(),
+                    registered_snapshots,
+                )?,
+            None => {
+                self.prepare_vector_partition_mutations(ws, &table_meta, deleted_rows.as_ref())?
+            }
+        };
+        self.apply_exact_with_log_entries(ws, log_entries, partition_mutations)
     }
 
     pub(crate) fn apply_exact_with_log_entries(
         &self,
         ws: &WriteSet,
         log_entries: Vec<ChangeLogEntry>,
+        partition_mutations: PreparedVectorPartitionMutationBatch,
     ) -> Result<()> {
-        // Statement 17b: erase the old image after durable success, before ordinary writes publish.
+        // Erase the old image after durable success, before ordinary writes publish.
         let erasure = ws
             .commit_lsn
             .and_then(|lsn| self.local_erasure_stages.lock().remove(&lsn));
         if let Some(stage) = erasure {
             (stage.publish)();
         }
-        if ws.relational_deletes.is_empty() || ws.relational_inserts.is_empty() {
-            self.relational.apply_deletes_ref(&ws.relational_deletes);
-            self.relational.apply_inserts_ref(&ws.relational_inserts);
-        } else {
-            self.relational
-                .apply_replacements_ref(&ws.relational_deletes, &ws.relational_inserts);
-        }
+        self.relational.apply_prepared_rows(
+            &ws.relational_deletes,
+            &ws.relational_inserts,
+            partition_mutations.memberships,
+        );
+        self.relational
+            .publish_retention_expiries(partition_mutations.retention_expiries);
         self.apply_phase_pause.maybe_pause();
         self.graph.apply_deletes_ref(&ws.adj_deletes);
         self.graph.apply_inserts_ref(&ws.adj_inserts);
-        self.vector.apply_changes_with_accountant_ref(
-            &ws.vector_deletes,
-            &ws.vector_inserts,
-            &ws.vector_moves,
-            ws.commit_lsn.unwrap_or(Lsn(0)),
-            Some(&*self.accountant),
-        );
+        if let Some(publication) = partition_mutations.vector_publication {
+            self.vector.publish_prepared_partitioned_batch(
+                publication,
+                partition_mutations.commit_lsn,
+                Some(&*self.accountant),
+            );
+        }
         let (clear_source_lsns, set_source_lsns) = sync_source_lsn_updates(ws);
         if !clear_source_lsns.is_empty() {
             self.relational.clear_sync_source_lsns(clear_source_lsns);
@@ -580,6 +1220,10 @@ impl CompositeStore {
 pub(crate) fn sync_source_lsn_updates(
     ws: &WriteSet,
 ) -> (Vec<SyncSourceLsnClear>, Vec<SyncSourceLsnSet>) {
+    // Expiry keeps accepted-source provenance until physical reclamation.
+    if is_retention_expiry(ws) {
+        return (Vec::new(), Vec::new());
+    }
     let mut clear = ws
         .relational_deletes
         .iter()

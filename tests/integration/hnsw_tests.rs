@@ -1,6 +1,6 @@
 use contextdb_core::RowId;
 use contextdb_core::*;
-use contextdb_engine::Database;
+use contextdb_engine::{Database, MaintenancePolicy};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -107,11 +107,25 @@ fn measure_avg_recall(
 }
 
 fn setup_items_table(db: &Database, dimension: usize) {
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         &format!("CREATE TABLE items (id UUID PRIMARY KEY, embedding VECTOR({dimension}))"),
         &HashMap::new(),
     )
     .expect("create table");
+}
+
+fn drive_hnsw_maintenance(db: &Database) {
+    let index = VectorIndexRef::new("items", "embedding");
+    let expected = db.scan("items", db.snapshot()).unwrap().len();
+    for _ in 0..32 {
+        if db.__debug_vector_hnsw_len(index.clone()) == Some(expected) {
+            return;
+        }
+        db.run_maintenance_cycle()
+            .expect("one finite caller-driven maintenance cycle succeeds");
+    }
+    panic!("caller-driven maintenance did not publish items.embedding");
 }
 
 fn insert_items(db: &Database, count: u64, start_seed: u64) -> Vec<(RowId, Vec<f32>)> {
@@ -173,6 +187,7 @@ fn h02_at_threshold_explain_shows_hnsw_search() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     insert_items(&db, 1_000, 0);
+    drive_hnsw_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -207,6 +222,7 @@ fn h03_transition_across_threshold_switches_explain() {
     )
     .expect("insert vector");
     db.commit(tx).expect("commit");
+    drive_hnsw_maintenance(&db);
     let explain_after = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("explain after");
@@ -221,6 +237,7 @@ fn h04_hnsw_recall_is_at_least_ninety_five_percent() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_500, 0);
+    drive_hnsw_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -238,6 +255,7 @@ fn h05_hnsw_recall_is_stable_after_reopen() {
     let db = Database::open(&path).expect("open");
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_500, 0);
+    drive_hnsw_maintenance(&db);
     db.close().expect("close");
 
     let db2 = Database::open(&path).expect("reopen");
@@ -255,6 +273,7 @@ fn h06_deleted_vectors_are_excluded_under_hnsw() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_200, 0);
+    drive_hnsw_maintenance(&db);
     let all_rids = all_vectors.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
 
     let tx = db.begin_or_panic();
@@ -269,6 +288,10 @@ fn h06_deleted_vectors_are_excluded_under_hnsw() {
         .expect("delete vector");
     }
     db.commit(tx).expect("commit");
+    for _ in 0..32 {
+        db.run_maintenance_cycle()
+            .expect("one finite caller-driven maintenance cycle applies the deletions");
+    }
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -316,6 +339,7 @@ fn h07_snapshot_isolation_uses_only_rows_visible_in_snapshot() {
         tx1_rids.insert(rid);
     }
     db.commit(tx1).expect("commit tx1");
+    drive_hnsw_maintenance(&db);
     let snap_after_tx1 = db.snapshot();
 
     let tx2 = db.begin_or_panic();
@@ -362,6 +386,7 @@ fn h08_prefiltered_search_respects_candidate_bitmap() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_200, 0);
+    drive_hnsw_maintenance(&db);
 
     let mut candidates = RoaringTreemap::new();
     for (rid, _) in all_vectors.iter().step_by(2) {
@@ -435,6 +460,7 @@ fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
         .expect("insert vector");
     }
     db.commit(tx).expect("commit");
+    drive_hnsw_maintenance(&db);
 
     let pre_results = db
         .query_vector(
@@ -529,6 +555,7 @@ fn h11_concurrent_reads_during_hnsw_search_do_not_panic() {
     let db = Arc::new(Database::open_memory());
     setup_items_table(&db, DIMENSION);
     insert_items(&db, 1_100, 0);
+    drive_hnsw_maintenance(&db);
 
     let mut handles = Vec::new();
     for t in 0..4 {
@@ -559,6 +586,7 @@ fn h12_insert_after_hnsw_activation_is_searchable() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     insert_items(&db, 1_000, 0);
+    drive_hnsw_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -602,6 +630,7 @@ fn h13_exact_threshold_has_hnsw_and_high_recall() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_000, 0);
+    drive_hnsw_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -617,6 +646,7 @@ fn h14_all_deleted_vectors_return_empty_results() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
     let all_vectors = insert_items(&db, 1_100, 0);
+    drive_hnsw_maintenance(&db);
     let all_rids = all_vectors.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
 
     let tx = db.begin_or_panic();
@@ -684,6 +714,7 @@ fn h15_single_surviving_vector_is_returned() {
         all_rids.push(rid);
     }
     db.commit(tx1).expect("commit tx1");
+    drive_hnsw_maintenance(&db);
 
     let tx2 = db.begin_or_panic();
     for rid in &all_rids {
@@ -802,6 +833,7 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
         item_uuids.push(uuid);
     }
     db.commit(tx).expect("commit");
+    drive_hnsw_maintenance(&db);
 
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -938,6 +970,7 @@ fn h20_hnsw_and_other_data_persist_across_reopen() {
         all_uuids.push(uuid);
     }
     db.commit(tx).expect("commit");
+    drive_hnsw_maintenance(&db);
 
     let explain_pre = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")

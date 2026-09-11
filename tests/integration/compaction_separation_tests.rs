@@ -172,6 +172,16 @@ fn the_automatic_compaction_path_is_interval_gated_not_per_cycle() {
         first.compaction
     );
 
+    // The interval starts when the bounded sweep finishes. Each intervening
+    // cycle advances real durable work and releases foreground access.
+    for _ in 0..2048 {
+        if !db.__storage_compaction_progress_for_test().0 {
+            break;
+        }
+        assert!(db.run_maintenance_cycle().unwrap().compaction.ran);
+    }
+    assert!(!db.__storage_compaction_progress_for_test().0);
+
     // More churn, still well past the threshold -- but the default interval
     // (one hour) has not elapsed since the compaction above, so a SECOND
     // cycle right after must NOT recompact. This is the defect: before the

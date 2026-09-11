@@ -1857,16 +1857,16 @@ const RELAY_PUSH_ONLY_DDL: &str =
     "CREATE TABLE relay_notes (id INTEGER PRIMARY KEY, body TEXT) SYNC PUSH ONLY";
 
 fn insert_relay(db: &Database, ids: std::ops::Range<i64>) {
+    // One committed group is one request: lose its reply only after all of
+    // these rows have actually reached the hub.
+    let tx = db.begin_or_panic();
     for id in ids {
         let mut row = p();
         row.insert("id".to_string(), Value::Int64(id));
         row.insert("body".to_string(), Value::Text(format!("relay-{id}")));
-        db.execute(
-            "INSERT INTO relay_notes (id, body) VALUES ($id, $body)",
-            &row,
-        )
-        .expect("relay insert");
+        db.insert_row(tx, "relay_notes", row).expect("relay insert");
     }
+    db.commit(tx).expect("relay batch commit");
 }
 
 fn expect_relay(ids: std::ops::Range<i64>) -> std::collections::BTreeSet<String> {
@@ -1963,11 +1963,10 @@ impl ClientTransport for ForwardPushThenAlterThenDropAck {
 /// An ordinary, non-reincarnated edge pushes a delivering batch that the hub
 /// applies and commits; the acknowledgement is lost AND the table is switched to
 /// `SYNC OFF` between the send and the lost-ack reconciliation. The reconciliation
-/// must still confirm the landed batch: its ceiling has to be the set that was
-/// actually transmitted (captured before the send), not a value recomputed from
-/// the table's post-change direction.
+/// retains the transmitted ceiling and reads the exact committed response.
+/// Recovery does not depend on the table retaining a pull leg.
 #[tokio::test]
-async fn fixa_concurrent_direction_change_does_not_reject_a_landed_push() {
+async fn a_lost_push_only_reply_after_direction_change_recovers_its_committed_acceptance() {
     let broker = InProcessBroker::new();
     // Empty hub; it learns the delivering table from the push itself.
     let hub_db = Arc::new(Database::open_memory());
@@ -2004,16 +2003,10 @@ async fn fixa_concurrent_direction_change_does_not_reject_a_landed_push() {
     );
     assert!(
         outcome.is_ok(),
-        "the batch landed and was committed on the hub; a direction change \
-         racing the lost acknowledgement must not turn a genuine landing into an \
-         unconfirmed push, got {outcome:?}"
+        "the exact committed reply proves acceptance: {outcome:?}"
     );
-    assert_eq!(
-        client.push_watermark(),
-        frontier,
-        "the confirmed push advances the edge watermark to its own transmitted \
-         frontier"
-    );
+    assert_eq!(client.push_watermark(), frontier);
+    assert!(edge.sync_watermark() > frontier);
 
     hub.stop().await;
 }
@@ -2577,7 +2570,7 @@ async fn g5_established_edge_landed_but_ack_lost_still_confirms() {
     assert_eq!(
         fixb_bodies(&hub_db),
         both(expect_fixb(1..4), expect_fixb(10..14)),
-        "the batch reached the hub and committed"
+        "the batch reached the hub and committed; observed outcome: {outcome:?}"
     );
     assert!(
         outcome.is_ok(),

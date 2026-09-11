@@ -297,7 +297,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         endpoint.close().await;
         return Ok(());
     }
-    // Statement 11: retain publication ordering through the established constructor.
+    // Retain publication ordering through the established constructor.
     let server = publish_then_activate(&args, db, &endpoint, |db, endpoint, tenant| {
         Ok(SyncServer::new(db, endpoint, tenant))
     })?;

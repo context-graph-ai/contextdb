@@ -458,6 +458,125 @@ impl Database {
         self.read_allowed_for_row_cached_in_tx(None, table, meta, row, snapshot, None)
     }
 
+    /// Borrow resident access metadata; no row/vector body or hidden candidate
+    /// set is copied. An indexed Context constraint probes only the requested
+    /// Context postings, irrespective of the hidden population.
+    pub(super) fn visit_authorized_row_metadata(
+        &self,
+        table: &str,
+        snapshot: SnapshotId,
+        mut visit: impl FnMut(&VersionedRow) -> Result<()>,
+    ) -> Result<()> {
+        self.assert_table_read_allowed(table)?;
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let tables = self.relational_store.tables.read();
+        let rows = tables
+            .get(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let mut admit = |row: &VersionedRow| -> Result<()> {
+            if row.visible_at(snapshot)
+                && self.bounded_read_allowed_for_row_in_tables(
+                    None,
+                    &tables,
+                    table,
+                    &meta,
+                    row,
+                    snapshot,
+                    |_| Ok::<(), Error>(()),
+                )?
+            {
+                visit(row)?;
+            }
+            Ok(())
+        };
+        if let (Some(contexts), Some(column)) = (&self.access.contexts, self.context_column(&meta))
+        {
+            let indexes = self.relational_store.indexes.read();
+            if let Some(storage) = indexes.get(table).and_then(|indexes| {
+                indexes.values().find(|storage| {
+                    storage.columns.len() == 1 && storage.columns[0].0 == column.name
+                })
+            }) {
+                for context in contexts {
+                    let key = contextdb_relational::index_key_from_values(
+                        &storage.columns,
+                        &[Value::Uuid(context.0)],
+                    );
+                    if let Some(postings) = storage.exact_postings(&key) {
+                        for posting in postings.iter().filter(|entry| entry.visible_at(snapshot)) {
+                            if let Some(position) = self.relational_store.visible_version_position(
+                                table,
+                                rows,
+                                posting.row_id,
+                                snapshot,
+                            ) {
+                                admit(&rows[position])?;
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+        // Unindexed access metadata remains borrowed one row at a time. In
+        // particular, no whole vector directory or source list is enumerated
+        // or reserved before authorization, including for principal-only reads.
+        for row in rows {
+            admit(row)?;
+        }
+        Ok(())
+    }
+
+    /// Declarable row restrictions can narrow a vector source, independently
+    /// of the SQL predicate. The row gate still verifies every admitted id.
+    pub(crate) fn vector_access_predicate(
+        &self,
+        table: &str,
+    ) -> Result<Option<contextdb_parser::ast::Expr>> {
+        use contextdb_parser::ast::{BinOp, ColumnRef, Expr, Literal};
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let mut terms = Vec::new();
+        if let (Some(contexts), Some(column)) = (&self.access.contexts, self.context_column(&meta))
+        {
+            terms.push(Expr::InList {
+                expr: Box::new(Expr::Column(ColumnRef {
+                    table: None,
+                    column: column.name.clone(),
+                })),
+                list: contexts
+                    .iter()
+                    .map(|id| Expr::Literal(Literal::Text(id.0.to_string())))
+                    .collect(),
+                negated: false,
+            });
+        }
+        if let (Some(labels), Some(column)) = (&self.access.scope_labels, self.scope_column(&meta))
+            && let Some(ScopeLabelKind::Split { read_labels, .. }) = &column.scope_label
+        {
+            terms.push(Expr::InList {
+                expr: Box::new(Expr::Column(ColumnRef {
+                    table: None,
+                    column: column.name.clone(),
+                })),
+                list: labels
+                    .iter()
+                    .filter(|label| read_labels.contains(&label.0))
+                    .map(|label| Expr::Literal(Literal::Text(label.0.clone())))
+                    .collect(),
+                negated: false,
+            });
+        }
+        Ok(terms.into_iter().reduce(|left, right| Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinOp::And,
+            right: Box::new(right),
+        }))
+    }
+
     pub(crate) fn bounded_read_requires_candidate_filter(&self, table: &str) -> Result<bool> {
         if self.access_is_admin() {
             return Ok(false);
@@ -1059,15 +1178,6 @@ impl Database {
         Ok(out)
     }
 
-    pub(crate) fn filter_rows_for_anchor_read(
-        &self,
-        table: &str,
-        rows: Vec<VersionedRow>,
-        snapshot: SnapshotId,
-    ) -> Result<Vec<VersionedRow>> {
-        self.filter_rows_for_anchor_read_in_tx(None, table, rows, snapshot)
-    }
-
     pub(crate) fn filter_rows_for_anchor_read_in_tx(
         &self,
         tx: Option<TxId>,
@@ -1509,17 +1619,28 @@ impl Database {
         snapshot: SnapshotId,
         candidates: Option<&RoaringTreemap>,
     ) -> Result<Option<RoaringTreemap>> {
-        let Some(readable) = self.readable_row_id_filter(table, snapshot)? else {
-            return Ok(candidates.cloned());
-        };
-        Ok(Some(match candidates {
-            Some(existing) => {
-                let mut merged = existing.clone();
-                merged &= readable;
-                merged
+        if let Some(candidates) = candidates {
+            if !self.table_has_read_gate(table)? {
+                return Ok(Some(candidates.clone()));
             }
-            None => readable,
-        }))
+            let mut readable = RoaringTreemap::new();
+            for id in candidates.iter() {
+                if let Some(row) = self.relational_store.row_by_id(table, RowId(id), snapshot)
+                    && self.read_allowed_for_row(
+                        table,
+                        &self
+                            .table_meta(table)
+                            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?,
+                        &row,
+                        snapshot,
+                    )?
+                {
+                    readable.insert(id);
+                }
+            }
+            return Ok(Some(readable));
+        }
+        self.readable_row_id_filter(table, snapshot)
     }
 
     fn indexed_rows_for_values(

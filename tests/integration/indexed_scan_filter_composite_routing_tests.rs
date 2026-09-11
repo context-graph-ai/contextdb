@@ -1531,7 +1531,11 @@ fn lc_upsert_then_requery_examined_contract() {
         old_key.rows,
         vec![vec![Value::Uuid(tid(0x801))], vec![Value::Uuid(tid(0x802))]]
     );
-    assert_eq!(db.__rows_examined(), 3);
+    assert_eq!(
+        db.__rows_examined(),
+        2,
+        "the captured current membership excludes the rekeyed retired posting"
+    );
     let new_key = db
         .execute(
             "SELECT id FROM t WHERE col IN ($s) AND col2 = $newx AND col3 = $hop",
@@ -1573,7 +1577,11 @@ fn lc_delete_then_requery_tombstone_examined() {
             vec![Value::Uuid(tid(0x803))]
         ]
     );
-    assert_eq!(db.__rows_examined(), 4);
+    assert_eq!(
+        db.__rows_examined(),
+        3,
+        "a current membership read never visits the deleted posting"
+    );
 }
 
 #[test]

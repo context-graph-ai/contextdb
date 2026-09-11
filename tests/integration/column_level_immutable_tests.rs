@@ -938,6 +938,17 @@ fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
                             context_id: c.context_id,
                             scope_label: None,
                             acl_ref: None,
+                            partition_key_columns: None,
+                            max_partitions: None,
+                            search_mode: contextdb_core::VectorSearchMode::Auto,
+                            auto_index_at: None,
+                            hnsw_m: None,
+                            hnsw_ef_construction: None,
+                            hnsw_ef_search: None,
+                            vector_policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
+                            consolidation_change_percent: None,
+                            consolidation_tombstone_percent: None,
+                            consolidation_disabled: false,
                         })
                         .collect(),
                     ..TableMeta::default()

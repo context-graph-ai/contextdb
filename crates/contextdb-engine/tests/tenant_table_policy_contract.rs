@@ -174,7 +174,7 @@ fn declared_axes(meta: &TableMeta) -> DeclaredAxes {
     )
 }
 
-/// Statement 5: forwards a real authenticated hub pull, then replaces only
+/// Forwards a real authenticated hub pull, then replaces only
 /// its received representation with the otherwise-unproducible bound-table
 /// declaration. This fixture is deliberately transport-local: production
 /// hubs must never manufacture this invalid policy.
@@ -185,7 +185,7 @@ struct AdversarialBoundTablePull {
 impl AdversarialBoundTablePull {
     fn alter_received_pull(&self, bytes: Vec<u8>) -> TransportResult<Vec<u8>> {
         let envelope = decode(&bytes).map_err(|error| TransportError::Other(error.to_string()))?;
-        // Statement 5 adapter: the ordinary route may carry dependency-complete
+        // Adapter: the ordinary route may carry dependency-complete
         // units. Preserve those real units and mutate their received DDL only.
         let mut complete = if envelope.message_type == MessageType::DependencyCompletePullResponse {
             Some(rmp_serde::from_slice::<contextdb_server::protocol::DependencyCompletePullResponse>(&envelope.payload)
@@ -213,9 +213,7 @@ impl AdversarialBoundTablePull {
             .first()
             .map(|row| row.lsn)
             .ok_or_else(|| {
-                TransportError::Other(
-                    "Statement 5 fixture requires the real unrelated hub row".to_string(),
-                )
+                TransportError::Other("fixture requires the real unrelated hub row".to_string())
             })?;
         let ddl: WireDdlChange = DdlChange::CreateTable {
             name: "records".into(),
@@ -313,7 +311,7 @@ impl ClientTransport for AdversarialBoundTablePull {
 
 // ---------------------------------------------------------------------------
 
-// Statement 1: The hub declares durable table policy; an edge must be refused.
+// The hub declares durable table policy; an edge must be refused.
 #[tokio::test]
 async fn a_declaration_persists_across_restart_and_restore_renders_with_version_and_digest_and_is_refused_on_an_edge()
  {
@@ -473,7 +471,7 @@ async fn a_declaration_persists_across_restart_and_restore_renders_with_version_
     hub.stop().await;
 }
 
-// Statement 2: The first binding freezes a declaration; earlier replacement advances its version.
+// The first binding freezes a declaration; earlier replacement advances its version.
 #[tokio::test]
 async fn the_first_binding_freezes_the_declaration_and_replacement_before_any_binding_bumps_the_version()
  {
@@ -539,7 +537,7 @@ async fn the_first_binding_freezes_the_declaration_and_replacement_before_any_bi
     hub.stop().await;
 }
 
-// Statement 3: Binding compares declared clauses and repeats without changing schema or rows.
+// Binding compares declared clauses and repeats without changing schema or rows.
 #[tokio::test]
 async fn a_matching_expectation_binds_a_differing_clause_and_an_undeclared_table_are_typed_refusals_and_none_writes_on_either_side()
  {
@@ -698,7 +696,7 @@ async fn a_matching_expectation_binds_a_differing_clause_and_an_undeclared_table
     hub.stop().await;
 }
 
-// Statement 4: Only the registered hub installs a binding, which survives restart.
+// Only the registered hub installs a binding, which survives restart.
 #[tokio::test]
 async fn a_binding_reply_from_a_foreign_node_is_refused_and_a_persisted_binding_survives_restart_and_renders_without_rows()
  {
@@ -708,7 +706,7 @@ async fn a_binding_reply_from_a_foreign_node_is_refused_and_a_persisted_binding_
     let registered = start_hub(root.path(), "hub", tenant).await;
     // A second, fully working hub serving the same tenant and holding the same
     // declaration. Its answer is correct in every respect except who sent it.
-    // Statement 4: its existing in-process exchange ledger witnesses that the
+    // Its existing in-process exchange ledger witnesses that the
     // edge refuses before the bind request can reach this foreign hub.
     let foreign_broker = InProcessBroker::new();
     let foreign_identity = Arc::new(FabricIdentity::generate());
@@ -769,7 +767,7 @@ async fn a_binding_reply_from_a_foreign_node_is_refused_and_a_persisted_binding_
     );
     assert!(
         foreign_broker.recorded_exchanges().is_empty(),
-        "Statement 4 premise: no foreign exchange occurred before the refused bind"
+        "premise: no foreign exchange occurred before the refused bind"
     );
     let refusal = within(
         foreign_client.bind_application_table_policy(expectation(&[("records", ROOT_CLAUSES)])),
@@ -781,7 +779,7 @@ async fn a_binding_reply_from_a_foreign_node_is_refused_and_a_persisted_binding_
     );
     assert!(
         foreign_broker.recorded_exchanges().is_empty(),
-        "Statement 4: the foreign authoritative hub received no bind exchange"
+        "the foreign authoritative hub received no bind exchange"
     );
     assert!(
         shown(&edge, "SHOW SYNC BINDINGS").1.is_empty(),
@@ -841,7 +839,7 @@ async fn a_binding_reply_from_a_foreign_node_is_refused_and_a_persisted_binding_
         .expect("foreign hub stops cleanly");
 }
 
-// Statement 5: Both DDL doors enforce bound clauses while other tables still apply.
+// Both DDL doors enforce bound clauses while other tables still apply.
 #[tokio::test]
 async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_table_while_other_tables_keep_applying()
  {
@@ -954,7 +952,7 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
         )
         .expect("a row on the unbound table");
 
-    // Statement 5: the hub remains the source of the unrelated row. A local
+    // The hub remains the source of the unrelated row. A local
     // authenticated adapter changes only that real pull response to carry the
     // adversarial DDL that an honest hub cannot create, so SyncClient's actual
     // receive handler applies both entries in the same exchange.
@@ -1017,7 +1015,7 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
     assert_eq!(
         refusal.reason.as_deref(),
         Some(expected.as_str()),
-        "Statement 5: arriving DDL reports TableBindingMismatch for records.conflict"
+        "arriving DDL reports TableBindingMismatch for records.conflict"
     );
     assert!(
         refusal.table.is_none(),
@@ -1046,7 +1044,7 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
         broker.recorded_exchanges().iter().any(|exchange| {
             exchange.subject == contextdb_server::subjects::pull_subject(tenant)
         }),
-        "Statement 5: the result came through one authenticated hub-to-edge pull"
+        "the result came through one authenticated hub-to-edge pull"
     );
 
     within(adversarial_client.shutdown()).await;
@@ -1058,7 +1056,7 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
     hub.stop().await;
 }
 
-// Statement 6: Explicit local policy survives arriving DDL; undeclared policy adopts and relays.
+// Explicit local policy survives arriving DDL; undeclared policy adopts and relays.
 #[tokio::test]
 async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undeclared_table_still_adopts_and_relays()
  {
@@ -1152,7 +1150,7 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
     assert_eq!(
         refusal.reason.as_deref(),
         Some(expected.as_str()),
-        "Statement 6: arriving DDL reports DeclaredPolicyPreserved for notes.conflict"
+        "arriving DDL reports DeclaredPolicyPreserved for notes.conflict"
     );
     assert!(
         refusal.table.is_none(),
@@ -1195,7 +1193,7 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
     );
     within(relay.shutdown()).await;
 
-    // Statement 6/root 26: DECLARE protects a name before CREATE and before binding.
+    // DECLARE protects a name before CREATE and before binding.
     declare(&hub.db, "records", ROOT_CLAUSES).unwrap();
     declare(&hub.db, "record_parts", MEMBER_CLAUSES).unwrap();
     let declared = shown(&hub.db, "SHOW TENANT TABLE POLICY");

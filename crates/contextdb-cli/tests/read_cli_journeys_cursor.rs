@@ -325,7 +325,7 @@ fn independent_sessions_hold_independent_cursors() {
 }
 
 #[test]
-fn the_cursor_accepts_exactly_one_read_only_select() {
+fn the_cursor_refuses_writes_and_unsupported_statements() {
     let store = paged_store(3);
     let before = store.contents();
 
@@ -347,10 +347,15 @@ fn the_cursor_accepts_exactly_one_read_only_select() {
         ".cursor open not a statement\n",
     );
     let error = refusal(&nonsense, "cursor_invalid_statement");
+    assert!(
+        nonsense.stderr.contains("SHOW VECTOR_PARTITIONS"),
+        "cursor misuse advice must name the supported SHOW form: {}",
+        nonsense.describe()
+    );
     assert_eq!(
         error.get("class").and_then(|c| c.as_str()),
         Some("usage"),
-        "anything that is not one SELECT is command misuse and is never executed: {error}"
+        "an unsupported statement is command misuse and is never executed: {error}"
     );
     assert_eq!(
         before,

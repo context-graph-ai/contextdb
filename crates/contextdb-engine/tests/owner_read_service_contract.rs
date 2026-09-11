@@ -19,19 +19,49 @@ use contextdb_engine::local_transport::{
 use contextdb_engine::owner_read::{
     CursorEntry, CursorIdentifierAllocator, OwnerBoundedExecutionObserver, OwnerBoundedOperation,
     OwnerClient, OwnerReadResourceSnapshot, OwnerReadScaffoldError, OwnerReadService,
-    OwnerServiceSpec, ValidatedOwnerListener,
+    OwnerServicePublicationObserver, OwnerServiceSpec, ValidatedOwnerListener,
 };
 use contextdb_engine::read_contract::{
-    cursor_page_encoded_size, decode_cursor_page, decode_metadata_page, decode_query_result,
-    query_result_encoded_size,
+    cursor_page_encoded_size, decode_cursor_page, decode_metadata_body, decode_metadata_page,
+    decode_query_result, query_result_encoded_size,
 };
-use contextdb_engine::{Database, OwnerReadConfig, OwnerReadTestHooks};
+use contextdb_engine::{
+    Database, MaintenancePolicy, MetadataBody, OwnerReadConfig, OwnerReadTestHooks, cli_render,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+
+/// Every condvar wait in this file is bounded: a wait that never sees its
+/// condition become true fails naming itself, instead of hanging the run.
+const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn wait_bounded<'a, T, F>(
+    changed: &Condvar,
+    mut guard: std::sync::MutexGuard<'a, T>,
+    name: &str,
+    mut satisfied: F,
+) -> std::sync::MutexGuard<'a, T>
+where
+    F: FnMut(&T) -> bool,
+{
+    let deadline = std::time::Instant::now() + WAIT_BOUND;
+    while !satisfied(&guard) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("{name} did not complete within {WAIT_BOUND:?}");
+        }
+        let (next_guard, timed_out) = changed.wait_timeout(guard, remaining).expect(name);
+        guard = next_guard;
+        if timed_out.timed_out() && !satisfied(&guard) {
+            panic!("{name} did not complete within {WAIT_BOUND:?}");
+        }
+    }
+    guard
+}
 
 struct FutureSignal {
     ready: Mutex<bool>,
@@ -64,10 +94,8 @@ fn block_on<F: Future>(future: F) -> F::Output {
         if let Poll::Ready(output) = Pin::as_mut(&mut future).poll(&mut context) {
             return output;
         }
-        let mut ready = signal.ready.lock().expect("future signal state");
-        while !*ready {
-            ready = signal.changed.wait(ready).expect("future signal wait");
-        }
+        let ready = signal.ready.lock().expect("future signal state");
+        let mut ready = wait_bounded(&signal.changed, ready, "future signal wait", |ready| *ready);
         *ready = false;
     }
 }
@@ -121,10 +149,13 @@ struct GatedHandler {
 impl GatedHandler {
     fn wait_for_entered(&self, count: usize) {
         let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("custom handler state");
-        while state.entered < count {
-            state = changed.wait(state).expect("custom handler entry wait");
-        }
+        let state = lock.lock().expect("custom handler state");
+        drop(wait_bounded(
+            changed,
+            state,
+            "custom handler entry wait",
+            |state| state.entered >= count,
+        ));
     }
 
     fn release(&self) {
@@ -140,10 +171,13 @@ impl GatedHandler {
 
     fn wait_for_cancellation(&self, count: usize) {
         let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("custom handler state");
-        while state.cancellation_observed < count {
-            state = changed.wait(state).expect("custom cancellation wait");
-        }
+        let state = lock.lock().expect("custom handler state");
+        drop(wait_bounded(
+            changed,
+            state,
+            "custom cancellation wait",
+            |state| state.cancellation_observed >= count,
+        ));
     }
 
     fn invocations(&self) -> usize {
@@ -185,13 +219,25 @@ impl OwnerRequestHandler for GatedHandler {
             state.entered += 1;
             changed.notify_all();
             let mut reported_cancellation = false;
+            let release_deadline = std::time::Instant::now() + WAIT_BOUND;
             while !state.released {
                 if cancellation.is_cancelled() && !reported_cancellation {
                     state.cancellation_observed += 1;
                     reported_cancellation = true;
                     changed.notify_all();
                 }
-                state = changed.wait(state).expect("custom handler release wait");
+                let remaining =
+                    release_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    panic!("custom handler release wait did not complete within {WAIT_BOUND:?}");
+                }
+                let (next_state, timed_out) = changed
+                    .wait_timeout(state, remaining)
+                    .expect("custom handler release wait");
+                state = next_state;
+                if timed_out.timed_out() && !state.released {
+                    panic!("custom handler release wait did not complete within {WAIT_BOUND:?}");
+                }
             }
             if cancellation.is_cancelled() && !reported_cancellation {
                 state.cancellation_observed += 1;
@@ -312,6 +358,91 @@ impl Harness {
             drain_started: drain_started_at,
             clients: Mutex::new(BTreeMap::new()),
             client_timeouts,
+        }
+    }
+
+    /// A second constructor, additive alongside `start`/`new`: wires a
+    /// publication observer too, which `start` has no parameter for. Kept
+    /// separate rather than widening `start`'s signature so every existing
+    /// call site -- ten of them, across this file -- is untouched.
+    fn new_with_publication_observer(
+        owner_limits: ReadLimits,
+        concurrency: u64,
+        execution_observer: Option<Arc<dyn OwnerBoundedExecutionObserver>>,
+        publication_observer: Arc<dyn OwnerServicePublicationObserver>,
+    ) -> Self {
+        let mut config = OwnerReadConfig {
+            enabled: true,
+            limits: OwnerReadLimits {
+                limits: owner_limits,
+                concurrency,
+            },
+            timeouts: OwnerServiceTimeouts {
+                request_ms: 10,
+                shutdown_drain_ms: 10,
+            },
+            runtime_dir: None,
+            handler: None,
+            test_hooks: None,
+        };
+        let directory = tempfile::tempdir().expect("task-scoped owner-read directory");
+        let database_path = directory.path().join("owner-service.db");
+        let database = Arc::new(Database::open(&database_path).expect("open owner database"));
+        database
+            .set_memory_limit(Some(64 * 1024 * 1024))
+            .expect("declare database memory for complete owner status proof");
+        let owner_user = LocalUserIdentity(nix::unistd::Uid::effective().as_raw() as u64);
+        let handshake = LocalHandshake::current(
+            DatabaseIdentity([0x31; 16]),
+            WriterRunNumber([0x42; 16]),
+            owner_user,
+        );
+        let (drain_started, drain_started_at) = std::sync::mpsc::channel();
+        let clock = ManualDeadlineClock::at(100);
+        config.runtime_dir = Some(directory.path().to_path_buf());
+        config.test_hooks = Some(OwnerReadTestHooks {
+            clock: Arc::new(clock.clone()),
+            drain_started,
+        });
+        let listener = ValidatedOwnerListener::new(ChannelPathFacts {
+            path: directory.path().join("owner.sock"),
+            runtime_directory: directory.path().to_path_buf(),
+            is_socket: true,
+            owner: owner_user,
+            mode: 0o700,
+        });
+        let mut spec = OwnerServiceSpec::new(
+            Arc::clone(&database),
+            listener,
+            handshake.clone(),
+            OwnerReadStatus {
+                state: OwnerServingState::Serving,
+                reason: None,
+            },
+            config,
+            LocalConfigurationSource::Override,
+            Arc::new(clock.clone()),
+        );
+        if let Some(observer) = execution_observer {
+            spec = spec.with_execution_observer_for_test(observer);
+        }
+        spec = spec.with_publication_observer_for_test(publication_observer);
+        let service = OwnerReadService::start(spec)
+            .expect("all production prerequisites must start the owner service");
+        Self {
+            _directory: directory,
+            database,
+            service,
+            handshake,
+            owner_user,
+            clock,
+            drain_started: drain_started_at,
+            clients: Mutex::new(BTreeMap::new()),
+            client_timeouts: ReadClientTimeouts {
+                connect_ms: 1_000,
+                routing_retry_ms: 1_000,
+                response_ms: 11_000,
+            },
         }
     }
 
@@ -542,6 +673,181 @@ fn cursor_page(responses: Vec<LocalResponse>) -> CursorPageResponse {
     page.clone()
 }
 
+/// Deterministic settlement log shared between the two observers below. No
+/// sleep, retry loop, or elapsed-time bound is used anywhere in this proof:
+/// every entry is pushed by the production code itself, at the exact moment
+/// each event happens, and the assertion below blocks on that real signal --
+/// never on a guess about how long settlement takes.
+#[derive(Default)]
+struct SettlementLog {
+    events: Mutex<Vec<&'static str>>,
+    changed: Condvar,
+}
+
+impl SettlementLog {
+    fn record(&self, event: &'static str) {
+        self.events.lock().expect("settlement log").push(event);
+        self.changed.notify_all();
+    }
+
+    fn reset(&self) {
+        self.events.lock().expect("settlement log").clear();
+    }
+
+    /// Block until at least `expected` events have been recorded, then
+    /// return everything recorded so far. A real completion signal from the
+    /// production code, not a sleep and not a bounded retry loop.
+    fn wait_for(&self, expected: usize) -> Vec<&'static str> {
+        let events = self.events.lock().expect("settlement log");
+        let events = wait_bounded(&self.changed, events, "settlement log wait", |events| {
+            events.len() >= expected
+        });
+        events.clone()
+    }
+}
+
+struct SettlementExecutionObserver {
+    log: Arc<SettlementLog>,
+}
+
+impl OwnerBoundedExecutionObserver for SettlementExecutionObserver {
+    fn before_operation(
+        &self,
+        _operation: OwnerBoundedOperation,
+        _effective_limits: ReadLimits,
+        _cancellation: OwnerReadCancellation,
+    ) {
+    }
+
+    fn before_work(&self, _source: TestWorkSource, _completed_work: u64) {}
+
+    fn cancellation_observed(&self, _completed_work: u64) {}
+
+    fn request_finished(&self) {
+        self.log.record("request_finished");
+    }
+}
+
+struct SettlementPublicationObserver {
+    log: Arc<SettlementLog>,
+}
+
+impl OwnerServicePublicationObserver for SettlementPublicationObserver {
+    fn before_cursor_page_publication(&self, _request_ordinal: u64) {}
+
+    fn cancellation_received(&self, _request_ordinal: u64) {}
+
+    fn cursor_page_published(&self, _request_ordinal: u64) {
+        self.log.record("cursor_page_published");
+    }
+}
+
+/// A test suite must not fail on timing: `active_cancellations` (part of
+/// `OwnerReadResourceSnapshot`) is reproducibly wrong 2 of 6 runs on
+/// unchanged code, because `finish_active_request` (owner_read/service.rs)
+/// clears a connection's cancellation registration only once
+/// `active_cursor_fetch`'s guard drops -- and the ordinary, uncancelled
+/// cursor-fetch publication path never takes that guard early the way the
+/// two CANCELLED-fetch paths do. So a caller that reads the counter
+/// immediately after receiving an ordinary page can still see the
+/// just-finished request counted.
+///
+/// This proof does not race the engine to catch that: it observes both
+/// settlement events through the production observer seams that already
+/// exist for exactly this purpose (`OwnerBoundedExecutionObserver::
+/// request_finished`, `OwnerServicePublicationObserver::cursor_page_published`),
+/// blocks on the production code's own completion signal for both, and
+/// asserts their ORDER -- pinning the state deterministically rather than
+/// sampling a counter at an arbitrary moment.
+#[test]
+fn a_settled_cursor_fetch_clears_its_connections_in_flight_registration_before_its_page_goes_out() {
+    let log = Arc::new(SettlementLog::default());
+    let execution_observer: Arc<dyn OwnerBoundedExecutionObserver> =
+        Arc::new(SettlementExecutionObserver {
+            log: Arc::clone(&log),
+        });
+    let publication_observer: Arc<dyn OwnerServicePublicationObserver> =
+        Arc::new(SettlementPublicationObserver {
+            log: Arc::clone(&log),
+        });
+
+    let mut owner_limits = limits();
+    owner_limits.result_rows = 10;
+    owner_limits.cursor_page_rows = 1;
+    let harness = Harness::new_with_publication_observer(
+        owner_limits,
+        4,
+        Some(execution_observer),
+        publication_observer,
+    );
+    harness
+        .database
+        .execute(
+            "CREATE TABLE settlement_cursor (id INTEGER PRIMARY KEY)",
+            &HashMap::new(),
+        )
+        .expect("create cursor fixture");
+    for id in 1..=3_i64 {
+        harness
+            .database
+            .execute(
+                "INSERT INTO settlement_cursor VALUES ($id)",
+                &HashMap::from([("id".to_owned(), Value::Int64(id))]),
+            )
+            .expect("insert cursor fixture row");
+    }
+
+    let opened = cursor_opened(
+        harness
+            .request(
+                60,
+                owner_limits,
+                LocalRequest::CursorOpen {
+                    statement: "SELECT id FROM settlement_cursor ORDER BY id".to_owned(),
+                    params: BTreeMap::new(),
+                },
+            )
+            .expect("cursor open returns its first complete page"),
+    );
+    assert!(
+        decode_cursor_page(&opened.payload)
+            .expect("decode the first page")
+            .has_more,
+        "the fixture must leave a second page for the fetch this proof exercises"
+    );
+    // CursorOpen's own admission and its own page publication are not the
+    // request under proof; only the settlement of the CursorFetch below is.
+    log.reset();
+
+    let fetched = harness
+        .request(
+            60,
+            owner_limits,
+            LocalRequest::CursorFetch {
+                cursor_id: opened.cursor_id,
+                rows: None,
+            },
+        )
+        .expect("an ordinary, uncancelled cursor fetch publishes its page");
+    let _ = cursor_page(fetched);
+
+    // Both events this one fetch produces have now certainly happened: this
+    // blocks on the production code's own completion signal, never on a
+    // sleep or a bounded retry loop.
+    let order = log.wait_for(2);
+    assert_eq!(
+        order,
+        vec!["request_finished", "cursor_page_published"],
+        "a settled cursor fetch's connection must stop counting as in-flight work BEFORE its \
+         answer is handed back, not after -- finish_active_request (owner_read/service.rs) \
+         clears the connection's cancellation registration only once active_cursor_fetch's \
+         guard drops, and the ordinary (uncancelled) publication path never takes that guard \
+         early the way the two cancelled-fetch paths do, so a caller reading the counter \
+         immediately after receiving a page can still see the just-finished request counted: \
+         observed order = {order:?}"
+    );
+}
+
 fn metadata_payload(responses: Vec<LocalResponse>) -> Vec<u8> {
     let [LocalResponse::Metadata { metadata }] = responses.as_slice() else {
         panic!("metadata must publish one complete response");
@@ -662,10 +968,13 @@ impl ProductionObserver {
 
     fn wait_until_blocked(&self) {
         let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("bounded observer state");
-        while !state.blocked {
-            state = changed.wait(state).expect("bounded observer block wait");
-        }
+        let state = lock.lock().expect("bounded observer state");
+        drop(wait_bounded(
+            changed,
+            state,
+            "bounded observer block wait",
+            |state| state.blocked,
+        ));
     }
 
     fn release_block(&self) {
@@ -700,34 +1009,64 @@ impl ProductionObserver {
 
     fn wait_for_disconnect_signal(&self, expected: u64) {
         let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("bounded observer state");
-        while state.disconnect_signals < expected {
-            state = changed.wait(state).expect("disconnect signal wait");
-        }
+        let state = lock.lock().expect("bounded observer state");
+        drop(wait_bounded(
+            changed,
+            state,
+            "disconnect signal wait",
+            |state| state.disconnect_signals >= expected,
+        ));
     }
 
     fn wait_for_shutdown_signal(&self, expected: u64) {
         let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("bounded observer state");
-        while state.shutdown_signals < expected {
-            state = changed.wait(state).expect("shutdown signal wait");
-        }
+        let state = lock.lock().expect("bounded observer state");
+        drop(wait_bounded(
+            changed,
+            state,
+            "shutdown signal wait",
+            |state| state.shutdown_signals >= expected,
+        ));
     }
 
     fn wait_for_request_deadline_signal(&self, expected: u64) {
         let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("bounded observer state");
-        while state.request_deadline_signals < expected {
-            state = changed.wait(state).expect("request deadline signal wait");
-        }
+        let state = lock.lock().expect("bounded observer state");
+        drop(wait_bounded(
+            changed,
+            state,
+            "request deadline signal wait",
+            |state| state.request_deadline_signals >= expected,
+        ));
+    }
+
+    /// Either legitimate cancellation ordering counts: when the client's own
+    /// response deadline crosses at the same instant as the owner's request
+    /// deadline, the client's shutdown can win the race and the owner never
+    /// gets to signal its own request-deadline cancellation
+    /// (`service.rs` returns `ConnectionEnded` before it would call
+    /// `signal_request_timeout`). The work is still cancelled exactly once
+    /// either way.
+    fn wait_for_request_deadline_or_disconnect_signal(&self, expected: u64) {
+        let (lock, changed) = &*self.state;
+        let state = lock.lock().expect("bounded observer state");
+        drop(wait_bounded(
+            changed,
+            state,
+            "request deadline or disconnect signal wait",
+            |state| state.request_deadline_signals + state.disconnect_signals >= expected,
+        ));
     }
 
     fn wait_for_finished_requests(&self, expected: u64) {
         let (lock, changed) = &*self.state;
-        let mut state = lock.lock().expect("bounded observer state");
-        while state.finished_requests < expected {
-            state = changed.wait(state).expect("request finish wait");
-        }
+        let state = lock.lock().expect("bounded observer state");
+        drop(wait_bounded(
+            changed,
+            state,
+            "request finish wait",
+            |state| state.finished_requests >= expected,
+        ));
     }
 
     fn max_work(&self) -> u64 {
@@ -809,10 +1148,13 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
         }
         if should_block {
             let (lock, changed) = &*self.state;
-            let mut state = lock.lock().expect("bounded observer state");
-            while !state.released {
-                state = changed.wait(state).expect("bounded operation release wait");
-            }
+            let state = lock.lock().expect("bounded observer state");
+            drop(wait_bounded(
+                changed,
+                state,
+                "bounded operation release wait",
+                |state| state.released,
+            ));
         }
     }
 
@@ -1217,7 +1559,18 @@ fn prove_request_and_response_deadline_jump(jump_to_ms: u64) {
     handler.wait_for_entered(1);
 
     harness.clock.advance_to(jump_to_ms);
-    observer.wait_for_request_deadline_signal(1);
+    // At the exact request deadline (110) only the owner's deadline has
+    // crossed, so the owner always signals its own request-deadline
+    // cancellation. At the response deadline's "plus one" jump (112) both
+    // deadlines cross at once, and the client's own shutdown can win that
+    // race, in which case the owner reports the connection ended instead
+    // of signalling a request-deadline cancellation. Both are legitimate
+    // cancellation orderings that still cancel the work exactly once.
+    if jump_to_ms == 110 {
+        observer.wait_for_request_deadline_signal(1);
+    } else {
+        observer.wait_for_request_deadline_or_disconnect_signal(1);
+    }
     handler.pulse();
     handler.wait_for_cancellation(1);
     assert_eq!(harness.service.cancellation_signal_count(), 1);
@@ -3040,10 +3393,8 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
         changed.notify_one();
     });
     let (lock, changed) = &*writer_done;
-    let mut done = lock.lock().expect("writer progress state");
-    while !*done {
-        done = changed.wait(done).expect("writer progress wait");
-    }
+    let done = lock.lock().expect("writer progress state");
+    let done = wait_bounded(changed, done, "writer progress wait", |done| *done);
     drop(done);
     writer.join().expect("writer progress thread joins");
     harness
@@ -3291,4 +3642,128 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
         .database
         .execute("SELECT id FROM shutdown_rows", &HashMap::new())
         .expect("owner service drain never closes Database");
+}
+
+/// Bound partition keys must have the same redacted count and route locally and
+/// over the owner channel. The real socket carries LocalRequest::Explain with
+/// parameters; the service forwards those parameters to passive planning. A
+/// populated two-partition fixture makes dropping a binding change the answer.
+#[cfg(feature = "test-seams")]
+#[test]
+fn remote_explain_of_a_bound_partition_key_reports_the_bound_scopes_count_and_route() {
+    const SCOPE: &str = "alpha-scope";
+
+    let harness = Harness::new(limits(), 4, None);
+    harness
+        .database
+        .execute(
+            "CREATE TABLE bound_docs (\
+                id UUID PRIMARY KEY, \
+                scope_id TEXT NOT NULL, \
+                embedding VECTOR(3) PARTITION_KEY (scope_id) \
+                    MAX_PARTITIONS 8 SEARCH_MODE AUTO\
+            )",
+            &HashMap::new(),
+        )
+        .expect("declare a partitioned AUTO-mode vector column");
+    for (offset, scope, vector) in [
+        (0_u128, SCOPE, vec![1.0, 0.0, 0.0]),
+        (1_u128, SCOPE, vec![0.9, 0.1, 0.0]),
+        (2_u128, "bravo-scope", vec![0.0, 1.0, 0.0]),
+        (3_u128, "bravo-scope", vec![0.0, 0.9, 0.1]),
+    ] {
+        harness
+            .database
+            .execute(
+                "INSERT INTO bound_docs (id, scope_id, embedding) VALUES ($id, $scope, $embedding)",
+                &HashMap::from([
+                    (
+                        "id".to_owned(),
+                        Value::Uuid(uuid::Uuid::from_u128(
+                            0xB0B0_0000_0000_0000_0000_0000_0000_0000 + offset,
+                        )),
+                    ),
+                    ("scope".to_owned(), Value::Text(scope.to_owned())),
+                    ("embedding".to_owned(), Value::Vector(vector)),
+                ]),
+            )
+            .expect("commit one fixture row");
+    }
+    harness
+        .database
+        .set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    for _ in 0..32 {
+        let partitions = harness
+            .database
+            .execute(
+                "SHOW VECTOR_PARTITIONS FOR bound_docs.embedding",
+                &HashMap::new(),
+            )
+            .expect("SHOW VECTOR_PARTITIONS is an admin inspection surface");
+        let state_col = partitions
+            .columns
+            .iter()
+            .position(|name| name == "query_state")
+            .expect("partition inspection names query_state");
+        if (0..partitions.rows.len()).all(|row| {
+            matches!(&partitions.rows[row][state_col], Value::Text(state) if state == "ready")
+        }) {
+            break;
+        }
+        harness
+            .database
+            .run_maintenance_cycle()
+            .expect("one caller-driven maintenance batch returns");
+    }
+
+    let sql = "SELECT id FROM bound_docs WHERE scope_id = $scope \
+               ORDER BY embedding <=> [1.0,0.0,0.0] USE VECTOR AUTO LIMIT 2";
+
+    // Local ground truth: the same parameter-aware passive-planning path the
+    // CLI's `.explain <sql>` command uses, with the key actually bound.
+    let bound_params = HashMap::from([("scope".to_owned(), Value::Text(SCOPE.to_owned()))]);
+    let local_rendered = cli_render::render_explain(&harness.database, sql, &bound_params)
+        .expect("explaining a bound statement locally must succeed");
+    let local_vector_search_line = local_rendered
+        .lines()
+        .find(|line| line.starts_with("vector_search "))
+        .unwrap_or_else(|| {
+            panic!("a vector-similarity SELECT discloses vector_search: {local_rendered}")
+        })
+        .to_owned();
+
+    // The identical statement and binding, over the real owner-read wire.
+    // `LocalRequest::Explain` already carries a `params` map for exactly this.
+    let remote_params: BTreeMap<String, Value> =
+        BTreeMap::from([("scope".to_owned(), Value::Text(SCOPE.to_owned()))]);
+    let responses = harness
+        .request(
+            60,
+            limits(),
+            LocalRequest::Explain {
+                statement: sql.to_owned(),
+                params: remote_params,
+            },
+        )
+        .expect("the owner explains a bound statement");
+    let [LocalResponse::Explain { payload }] = responses.as_slice() else {
+        panic!("explain publishes one complete response: {responses:?}");
+    };
+    let body = decode_metadata_body(payload)
+        .expect("decode the canonical explain body the owner published");
+    let MetadataBody::Explain { vector_search, .. } = body else {
+        panic!("asked for an explain and got {body:?}");
+    };
+    let remote_disclosure = vector_search
+        .expect("a vector-similarity SELECT reports a vector disclosure over the owner route too");
+    let remote_rendered = remote_disclosure.to_string();
+
+    assert_eq!(
+        remote_rendered, local_vector_search_line,
+        "a Context-, scope-label-, or principal-constrained handle's `.explain` over the \
+         owner-read route must report the same count and route its own bound query reports \
+         locally -- a redacted .explain for its own query -- so the owner route must plan \
+         with the caller's bound `params` (LocalRequest::Explain), never unbound: \
+         local={local_vector_search_line:?} remote={remote_rendered:?}"
+    );
 }

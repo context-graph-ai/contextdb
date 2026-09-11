@@ -1,5 +1,5 @@
 use crate::Direction;
-use crate::types::{Value, Wallclock};
+use crate::types::{Value, VectorSearchMode, Wallclock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -720,12 +720,66 @@ pub struct ColumnDef {
     pub scope_label: Option<ScopeLabelKind>,
     #[serde(default)]
     pub acl_ref: Option<AclRef>,
+    /// Ordered columns forming this vector column's local partition identity.
+    /// `None` is the unpartitioned declaration.
+    #[serde(default)]
+    pub partition_key_columns: Option<Vec<String>>,
+    /// The effective positive partition-state cap. This is `None` exactly for
+    /// an unpartitioned declaration; DDL omission on a partitioned column is
+    /// normalized to [`DEFAULT_VECTOR_MAX_PARTITIONS`].
+    #[serde(default)]
+    pub max_partitions: Option<u32>,
+    /// The durable default route contract for this vector column.
+    #[serde(default)]
+    pub search_mode: VectorSearchMode,
+    /// The explicit aggregate allowed-vector count where `AUTO` chooses the
+    /// maintained indexed route. `None` preserves the compatibility profile
+    /// and remains silent in rendered schema.
+    #[serde(default)]
+    pub auto_index_at: Option<u32>,
+    /// Explicit HNSW neighbour-link count. `None` preserves the compatibility
+    /// profile and remains silent in rendered schema.
+    #[serde(default)]
+    pub hnsw_m: Option<u32>,
+    #[serde(default)]
+    /// Explicit HNSW build candidate-work setting. `None` preserves the
+    /// compatibility profile and remains silent in rendered schema.
+    pub hnsw_ef_construction: Option<u32>,
+    #[serde(default)]
+    /// Explicit HNSW query candidate-work setting. `None` preserves the
+    /// compatibility profile and remains silent in rendered schema.
+    pub hnsw_ef_search: Option<u32>,
+    /// Durable desired topology revision. AUTO_INDEX_AT and EF_SEARCH do not
+    /// advance it; M and EF_CONSTRUCTION changes do.
+    #[serde(default)]
+    pub vector_policy_revision: u64,
+    /// Percentage of the partition population that must accumulate as
+    /// post-generation inserts or deletes before maintenance consolidates it.
+    /// `None` selects the silent compatibility default.
+    #[serde(default)]
+    pub consolidation_change_percent: Option<u32>,
+    /// Percentage of the partition population that must accumulate as
+    /// post-generation tombstones before maintenance consolidates it.
+    /// `None` selects the silent compatibility default.
+    #[serde(default)]
+    pub consolidation_tombstone_percent: Option<u32>,
+    /// Explicitly disables threshold-driven consolidation while preserving
+    /// the maintained index and its operator-driven repair path.
+    #[serde(default)]
+    pub consolidation_disabled: bool,
 }
 
-// Custom `Deserialize` that tolerates prior on-disk schemas missing the
-// trailing fields (backward-compat, I5). JSON / other formats that distinguish
-// "missing field" from "required field" continue to work via `serde(default)`
-// on the fields themselves.
+/// The effective `MAX_PARTITIONS` value for a partitioned vector declaration
+/// that omits the clause.
+pub const DEFAULT_VECTOR_MAX_PARTITIONS: u32 = 256;
+pub const DEFAULT_VECTOR_POLICY_REVISION: u64 = 1;
+pub const DEFAULT_VECTOR_CONSOLIDATION_CHANGE_PERCENT: u32 = 20;
+pub const DEFAULT_VECTOR_CONSOLIDATION_TOMBSTONE_PERCENT: u32 = 10;
+
+// Hand-written `Deserialize` keeps the positional field order paired with the
+// derived serializer and gives map-based formats the declared field defaults.
+// The positional bincode compatibility floor is intentionally stricter; its
+// exact boundary is documented in `visit_seq` below.
 impl<'de> serde::Deserialize<'de> for ColumnDef {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -787,6 +841,23 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     .next_element::<Option<ScopeLabelKind>>()?
                     .unwrap_or_default();
                 let acl_ref = seq.next_element::<Option<AclRef>>()?.unwrap_or_default();
+                let partition_key_columns = seq
+                    .next_element::<Option<Vec<String>>>()?
+                    .unwrap_or_default();
+                let max_partitions = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let search_mode = seq.next_element::<VectorSearchMode>()?.unwrap_or_default();
+                let auto_index_at = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let hnsw_m = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let hnsw_ef_construction = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let hnsw_ef_search = seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let vector_policy_revision = seq
+                    .next_element::<u64>()?
+                    .unwrap_or(DEFAULT_VECTOR_POLICY_REVISION);
+                let consolidation_change_percent =
+                    seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let consolidation_tombstone_percent =
+                    seq.next_element::<Option<u32>>()?.unwrap_or_default();
+                let consolidation_disabled = seq.next_element::<bool>()?.unwrap_or_default();
                 Ok(ColumnDef {
                     name,
                     column_type,
@@ -802,6 +873,17 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     context_id,
                     scope_label,
                     acl_ref,
+                    partition_key_columns,
+                    max_partitions,
+                    search_mode,
+                    auto_index_at,
+                    hnsw_m,
+                    hnsw_ef_construction,
+                    hnsw_ef_search,
+                    vector_policy_revision,
+                    consolidation_change_percent,
+                    consolidation_tombstone_percent,
+                    consolidation_disabled,
                 })
             }
 
@@ -823,6 +905,17 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let mut context_id: Option<bool> = None;
                 let mut scope_label: Option<Option<ScopeLabelKind>> = None;
                 let mut acl_ref: Option<Option<AclRef>> = None;
+                let mut partition_key_columns: Option<Option<Vec<String>>> = None;
+                let mut max_partitions: Option<Option<u32>> = None;
+                let mut search_mode: Option<VectorSearchMode> = None;
+                let mut auto_index_at: Option<Option<u32>> = None;
+                let mut hnsw_m: Option<Option<u32>> = None;
+                let mut hnsw_ef_construction: Option<Option<u32>> = None;
+                let mut hnsw_ef_search: Option<Option<u32>> = None;
+                let mut vector_policy_revision: Option<u64> = None;
+                let mut consolidation_change_percent: Option<Option<u32>> = None;
+                let mut consolidation_tombstone_percent: Option<Option<u32>> = None;
+                let mut consolidation_disabled: Option<bool> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -840,6 +933,25 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                         "context_id" => context_id = Some(map.next_value()?),
                         "scope_label" => scope_label = Some(map.next_value()?),
                         "acl_ref" => acl_ref = Some(map.next_value()?),
+                        "partition_key_columns" => partition_key_columns = Some(map.next_value()?),
+                        "max_partitions" => max_partitions = Some(map.next_value()?),
+                        "search_mode" => search_mode = Some(map.next_value()?),
+                        "auto_index_at" => auto_index_at = Some(map.next_value()?),
+                        "hnsw_m" => hnsw_m = Some(map.next_value()?),
+                        "hnsw_ef_construction" => hnsw_ef_construction = Some(map.next_value()?),
+                        "hnsw_ef_search" => hnsw_ef_search = Some(map.next_value()?),
+                        "vector_policy_revision" => {
+                            vector_policy_revision = Some(map.next_value()?)
+                        }
+                        "consolidation_change_percent" => {
+                            consolidation_change_percent = Some(map.next_value()?)
+                        }
+                        "consolidation_tombstone_percent" => {
+                            consolidation_tombstone_percent = Some(map.next_value()?)
+                        }
+                        "consolidation_disabled" => {
+                            consolidation_disabled = Some(map.next_value()?)
+                        }
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -864,6 +976,19 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     context_id: context_id.unwrap_or_default(),
                     scope_label: scope_label.unwrap_or_default(),
                     acl_ref: acl_ref.unwrap_or_default(),
+                    partition_key_columns: partition_key_columns.unwrap_or_default(),
+                    max_partitions: max_partitions.unwrap_or_default(),
+                    search_mode: search_mode.unwrap_or_default(),
+                    auto_index_at: auto_index_at.unwrap_or_default(),
+                    hnsw_m: hnsw_m.unwrap_or_default(),
+                    hnsw_ef_construction: hnsw_ef_construction.unwrap_or_default(),
+                    hnsw_ef_search: hnsw_ef_search.unwrap_or_default(),
+                    vector_policy_revision: vector_policy_revision
+                        .unwrap_or(DEFAULT_VECTOR_POLICY_REVISION),
+                    consolidation_change_percent: consolidation_change_percent.unwrap_or_default(),
+                    consolidation_tombstone_percent: consolidation_tombstone_percent
+                        .unwrap_or_default(),
+                    consolidation_disabled: consolidation_disabled.unwrap_or_default(),
                 })
             }
         }
@@ -883,6 +1008,17 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
             "context_id",
             "scope_label",
             "acl_ref",
+            "partition_key_columns",
+            "max_partitions",
+            "search_mode",
+            "auto_index_at",
+            "hnsw_m",
+            "hnsw_ef_construction",
+            "hnsw_ef_search",
+            "vector_policy_revision",
+            "consolidation_change_percent",
+            "consolidation_tombstone_percent",
+            "consolidation_disabled",
         ];
         deserializer.deserialize_struct("ColumnDef", FIELDS, ColumnDefVisitor)
     }
@@ -1054,6 +1190,25 @@ impl StateMachineConstraint {
 }
 
 impl ColumnDef {
+    /// The cap this declaration enforces. Unpartitioned columns have no cap;
+    /// a partitioned declaration whose SQL omitted `MAX_PARTITIONS` gets the
+    /// frozen effective default.
+    pub fn effective_max_partitions(&self) -> Option<u32> {
+        self.partition_key_columns
+            .as_ref()
+            .map(|_| self.max_partitions.unwrap_or(DEFAULT_VECTOR_MAX_PARTITIONS))
+    }
+
+    pub fn effective_consolidation_change_percent(&self) -> u32 {
+        self.consolidation_change_percent
+            .unwrap_or(DEFAULT_VECTOR_CONSOLIDATION_CHANGE_PERCENT)
+    }
+
+    pub fn effective_consolidation_tombstone_percent(&self) -> u32 {
+        self.consolidation_tombstone_percent
+            .unwrap_or(DEFAULT_VECTOR_CONSOLIDATION_TOMBSTONE_PERCENT)
+    }
+
     fn estimated_bytes(&self) -> usize {
         let default_bytes = self
             .default
@@ -1104,6 +1259,16 @@ impl ColumnDef {
             .as_ref()
             .map(|acl| 32 + acl.ref_table.len() * 16 + acl.ref_column.len() * 16)
             .unwrap_or(0);
+        let partition_key_bytes = self
+            .partition_key_columns
+            .as_ref()
+            .map(|columns| {
+                24 + columns
+                    .iter()
+                    .map(|column| 16 + column.len() * 16)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
         8 + self.name.len() * 16
             + self.column_type.estimated_bytes()
             + default_bytes
@@ -1111,11 +1276,21 @@ impl ColumnDef {
             + rank_policy_bytes
             + scope_label_bytes
             + acl_ref_bytes
-            + 8
+            + partition_key_bytes
+            + 24
     }
 }
 
 impl ColumnType {
+    /// Whether this type has the exact, stable equality required for a vector
+    /// partition-key component.
+    pub const fn is_vector_partition_key_type(&self) -> bool {
+        matches!(
+            self,
+            Self::Uuid | Self::Text | Self::Integer | Self::Boolean | Self::Timestamp | Self::TxId
+        )
+    }
+
     fn estimated_bytes(&self) -> usize {
         match self {
             ColumnType::Integer => 16,
@@ -1127,6 +1302,121 @@ impl ColumnType {
             ColumnType::Vector(_) => 24,
             ColumnType::Timestamp => 16,
             ColumnType::TxId => 8,
+        }
+    }
+}
+
+#[cfg(test)]
+mod vector_declaration_tests {
+    use super::*;
+
+    fn vector_column() -> ColumnDef {
+        ColumnDef {
+            name: "embedding".to_owned(),
+            column_type: ColumnType::Vector(3),
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            default: None,
+            references: None,
+            expires: false,
+            immutable: false,
+            quantization: VectorQuantization::SQ8,
+            rank_policy: None,
+            context_id: false,
+            scope_label: None,
+            acl_ref: None,
+            partition_key_columns: Some(vec!["scope_id".to_owned(), "kind".to_owned()]),
+            max_partitions: Some(32),
+            search_mode: VectorSearchMode::Indexed,
+            auto_index_at: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_ef_search: None,
+            vector_policy_revision: DEFAULT_VECTOR_POLICY_REVISION,
+            consolidation_change_percent: None,
+            consolidation_tombstone_percent: None,
+            consolidation_disabled: false,
+        }
+    }
+
+    #[test]
+    fn vector_declarations_survive_encoding_and_participate_in_identity() {
+        let declared = vector_column();
+        let bytes = bincode::serde::encode_to_vec(&declared, bincode::config::standard())
+            .expect("vector declaration must encode");
+        let (decoded, consumed): (ColumnDef, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("vector declaration must decode");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, declared);
+
+        let mut different_mode = declared.clone();
+        different_mode.search_mode = VectorSearchMode::Exact;
+        assert_ne!(different_mode, declared);
+
+        let mut different_key = declared.clone();
+        different_key.partition_key_columns = Some(vec!["scope_id".to_owned()]);
+        assert_ne!(different_key, declared);
+
+        let mut different_limit = declared.clone();
+        different_limit.max_partitions = Some(64);
+        assert_ne!(different_limit, declared);
+    }
+
+    #[test]
+    fn omitted_map_fields_take_the_frozen_defaults() {
+        #[derive(serde::Serialize)]
+        struct DeclarationBeforeVectorRouting {
+            name: String,
+            column_type: ColumnType,
+            nullable: bool,
+            primary_key: bool,
+        }
+
+        let encoded = serde_json::to_value(DeclarationBeforeVectorRouting {
+            name: "embedding".to_owned(),
+            column_type: ColumnType::Vector(3),
+            nullable: true,
+            primary_key: false,
+        })
+        .expect("map-form declaration must encode");
+        let decoded: ColumnDef =
+            serde_json::from_value(encoded).expect("map-form declaration must decode");
+
+        assert_eq!(decoded.partition_key_columns, None);
+        assert_eq!(decoded.max_partitions, None);
+        assert_eq!(decoded.search_mode, VectorSearchMode::Auto);
+    }
+
+    #[test]
+    fn partitioned_columns_have_the_effective_default_but_unpartitioned_columns_do_not() {
+        let mut declared = vector_column();
+        declared.max_partitions = None;
+        assert_eq!(
+            declared.effective_max_partitions(),
+            Some(DEFAULT_VECTOR_MAX_PARTITIONS)
+        );
+
+        declared.partition_key_columns = None;
+        assert_eq!(declared.effective_max_partitions(), None);
+    }
+
+    #[test]
+    fn only_exact_identity_column_types_are_partition_key_types() {
+        for allowed in [
+            ColumnType::Uuid,
+            ColumnType::Text,
+            ColumnType::Integer,
+            ColumnType::Boolean,
+            ColumnType::Timestamp,
+            ColumnType::TxId,
+        ] {
+            assert!(allowed.is_vector_partition_key_type(), "{allowed:?}");
+        }
+
+        for refused in [ColumnType::Real, ColumnType::Json, ColumnType::Vector(3)] {
+            assert!(!refused.is_vector_partition_key_type(), "{refused:?}");
         }
     }
 }

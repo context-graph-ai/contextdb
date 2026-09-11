@@ -248,7 +248,7 @@ fn stage_fixture_rows(
     Ok(tx)
 }
 
-/// Statements 9/10: a damaged committed unit enters the actual ordinary push receiver.
+/// A damaged committed unit enters the actual ordinary push receiver.
 async fn replay_push(
     broker: &InProcessBroker,
     tenant: &str,
@@ -281,14 +281,14 @@ fn bind_spec(identity_path: &Path) -> String {
     format!("iroh:?identity={}", identity_path.display())
 }
 
-// Statement 7: Observe today's canonical encoding locally, without adding a public accessor
+// Observe today's canonical encoding locally, without adding a public accessor
 // or making its byte layout a product contract. These fixtures contain only UUID/text values.
 fn canonical_string(bytes: &mut Vec<u8>, value: &str) {
     bytes.extend((value.len() as u64).to_be_bytes());
     bytes.extend(value.as_bytes());
 }
 
-// Statement 7: Independently hash every application column read from the committed row.
+// Independently hash every application column read from the committed row.
 fn committed_row_digest(db: &Database, table: &str, id: Uuid) -> [u8; 32] {
     let result = db
         .execute(
@@ -319,7 +319,7 @@ fn committed_row_digest(db: &Database, table: &str, id: Uuid) -> [u8; 32] {
     *blake3::hash(&bytes).as_bytes()
 }
 
-// Statement 7: Read real root/member references and digests from the encoded wire manifest.
+// Read real root/member references and digests from the encoded wire manifest.
 fn assert_manifest_row_digests(
     db: &Database,
     manifest: &WireDeliveryManifest,
@@ -372,7 +372,7 @@ fn assert_manifest_row_digests(
     }
 }
 
-// Statement 7: Rows and explicit membership commit atomically with engine-computed whole-row digests.
+// Rows and explicit membership commit atomically with engine-computed whole-row digests.
 #[tokio::test]
 async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_value_and_an_empty_member_set_has_its_own_digest()
  {
@@ -480,7 +480,7 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
         Some(ROOT_TABLE),
         "the manifest names the declared root table"
     );
-    // Statement 7: Counts and a unit digest alone cannot prove the required row digests.
+    // Counts and a unit digest alone cannot prove the required row digests.
     assert_manifest_row_digests(&edge_db, two_member, root_id, &[member_a, member_b]);
     assert_manifest_row_digests(&edge_db, empty_member, empty_root, &[]);
     assert!(two_member.unit_digest_for_test().is_some());
@@ -545,7 +545,7 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
         .iter()
         .find(|manifest| manifest.member_count_for_test() == Some(0))
         .expect("the second edge's memberless manifest crosses the wire");
-    // Statement 7: Reversing registration order preserves actual ordered references and row digests.
+    // Reversing registration order preserves actual ordered references and row digests.
     assert_manifest_row_digests(
         &other_edge_db,
         other_two_member,
@@ -591,7 +591,7 @@ async fn a_manifest_commits_with_its_rows_carries_engine_digests_and_no_column_v
     hub.stop().await;
 }
 
-// Statement 8: Illegal registration aborts the entire writing transaction.
+// Illegal registration aborts the entire writing transaction.
 #[tokio::test]
 async fn registering_a_manifest_for_an_undeclared_root_an_unnamed_member_table_an_absent_member_or_a_wrong_foreign_key_aborts_the_transaction()
  {
@@ -825,7 +825,7 @@ async fn registering_a_manifest_for_an_undeclared_root_an_unnamed_member_table_a
     hub.stop().await;
 }
 
-// Statement 9: An exact manifested unit uses ordinary or oversized push and never leaks to pulling peers.
+// An exact manifested unit uses ordinary or oversized push and never leaks to pulling peers.
 #[tokio::test]
 async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_staging_path_and_is_never_served_to_a_pulling_peer()
  {
@@ -842,7 +842,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
         .await
         .expect("the edge binds before it writes");
     declare_edge_tables(&edge_db);
-    // Statements 9/14: a manifested unit and ordinary accepted/conflicting rows
+    // A manifested unit and ordinary accepted/conflicting rows
     // actually share one source transaction and one authenticated push envelope.
     for db in [&edge_db, &hub.db] {
         db.execute("CREATE TABLE ordinary_siblings (id UUID PRIMARY KEY, body TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST", &p()).unwrap();
@@ -995,7 +995,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
         );
     }
 
-    // Statement 9 ordinary neighbour: keep-first refusal remains component-complete
+    // Ordinary neighbour: keep-first refusal remains component-complete
     // while a same-transaction manifested unit and an unrelated sibling progress.
     for db in [&edge_db, &hub.db] {
         db.execute("CREATE TABLE ordinary_parents (id UUID PRIMARY KEY, body TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST",&p()).unwrap();
@@ -1238,7 +1238,7 @@ async fn receiver_refusal(case: &str) {
     within(edge.__seed_application_table_policy_binding_for_test(source_policy))
         .await
         .unwrap();
-    // Statement 10: bind the edge's actual root declaration to a policy that
+    // Bind the edge's actual root declaration to a policy that
     // differs from the hub's declaration before installing its manifested unit.
     // The existing signed binding fixture makes this an authenticated source
     // prerequisite, not an omitted member binding.
@@ -1317,7 +1317,7 @@ async fn receiver_refusal(case: &str) {
         "binding_mismatch" => {}
         _ => unreachable!(),
     }
-    // Statement 10 adapter: add the same-transaction ordinary row and its real
+    // Adapter: add the same-transaction ordinary row and its real
     // authenticated lineage to the deliberately incomplete unit request.
     let all = edge.__ordinary_push_request_for_test().unwrap();
     request.changeset.rows.extend(
@@ -1337,7 +1337,7 @@ async fn receiver_refusal(case: &str) {
         0,
         "{case} cannot commit a member prefix"
     );
-    // Statement 10: the ordinary response adjudicates the unit, including semantic refusals.
+    // The ordinary response adjudicates the unit, including semantic refusals.
     assert!(
         response.result.is_some(),
         "the public receiver must adjudicate {case}, got {:?}",
@@ -1374,7 +1374,7 @@ async fn receiver_refusal(case: &str) {
     assert_eq!(row_count(&reopened, MEMBER_TABLE), 0);
 }
 
-// Statement 10: The hub verifies complete membership, every row digest, and binding before any apply.
+// The hub verifies complete membership, every row digest, and binding before any apply.
 #[tokio::test]
 async fn the_hub_verifies_complete_membership_content_and_binding_before_applying_any_row() {
     for cause in [

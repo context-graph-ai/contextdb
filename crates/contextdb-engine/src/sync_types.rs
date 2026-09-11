@@ -8,8 +8,62 @@ use contextdb_core::{
 };
 use serde::de::VariantAccess;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
+
+/// The newer schema behavior an older peer must gain before one held table
+/// can safely cross sync as SQL text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SchemaSyncCapability {
+    VectorPartitioning,
+    VectorSearchMode,
+    VectorAutoIndexAt,
+    VectorHnswPolicy,
+}
+
+impl std::fmt::Display for SchemaSyncCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::VectorPartitioning => "vector partitioning",
+            Self::VectorSearchMode => "declared vector search mode",
+            Self::VectorAutoIndexAt => "declared vector AUTO_INDEX_AT policy",
+            Self::VectorHnswPolicy => "declared vector HNSW policy",
+        })
+    }
+}
+
+/// One actionable per-table compatibility message. It is inspection state,
+/// not a whole-sync error: compatible tables continue to move.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SchemaSyncHoldback {
+    pub table: String,
+    pub capability: SchemaSyncCapability,
+    pub node_to_upgrade: String,
+}
+
+/// One sender's restart-safe private progress while an older peer cannot read
+/// one or more table declarations. `through` is the confirmed compatible
+/// frontier. A pull sender additionally records `held_through`, the stable
+/// frontier its later recovery image must cover. Keeping these separate lets a
+/// lost compatible response be replayed without forgetting held-table work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableSchemaSyncHoldback {
+    pub peer_node_id: String,
+    pub capabilities: BTreeMap<String, std::collections::BTreeSet<SchemaSyncCapability>>,
+    pub through: Lsn,
+    #[serde(default)]
+    pub held_through: Lsn,
+}
+
+impl std::fmt::Display for SchemaSyncHoldback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "table '{}' is waiting for {}; upgrade node '{}' and sync resumes automatically",
+            self.table, self.capability, self.node_to_upgrade
+        )
+    }
+}
 
 /// The durable direction declarations that governed each table generation.
 ///
@@ -152,10 +206,12 @@ impl ChangeSet {
 
         for group in self.split_by_data_lsn() {
             if group.has_create_trigger_ddl() && group.data_entry_count() == 0 {
-                if !current.is_empty() {
+                if current.data_entry_count() > 0 {
                     batches.push(std::mem::take(&mut current));
                 }
-                batches.push(group);
+                current.ddl.extend(group.ddl);
+                current.ddl_lsn.extend(group.ddl_lsn);
+                batches.push(std::mem::take(&mut current));
                 continue;
             }
             current.rows.extend(group.rows);
@@ -273,6 +329,118 @@ impl ChangeSet {
             // transition that closes a formerly delivering table.
             ddl: self.ddl.clone(),
             ddl_lsn: self.ddl_lsn.clone(),
+        }
+    }
+
+    /// Keep only work owned by `tables`. Graph edges have no table identity and
+    /// therefore never enter a per-table schema recovery image.
+    pub(crate) fn only_tables(&self, tables: &HashSet<String>) -> ChangeSet {
+        self.filter_schema_tables(tables, true)
+    }
+
+    /// Remove only work owned by `tables`. Graph edges and global declarations
+    /// remain compatible work and continue to flow.
+    pub(crate) fn without_tables(&self, tables: &HashSet<String>) -> ChangeSet {
+        self.filter_schema_tables(tables, false)
+    }
+
+    /// Keep source work newer than the sender's private compatibility
+    /// frontier. The public sync watermark stays behind a held table, while
+    /// this filter prevents already delivered compatible work from crossing
+    /// again on every later push.
+    pub(crate) fn after_lsn(&self, frontier: Lsn) -> ChangeSet {
+        self.filter_by_lsn_and_table(|_, lsn| lsn > frontier)
+    }
+
+    /// Keep only work at or before a stable sender-owned recovery frontier.
+    /// Writes committed after the held image was frozen remain ordinary sync
+    /// work and cross after the receiver acknowledges the final recovery page.
+    pub(crate) fn through_lsn(&self, frontier: Lsn) -> ChangeSet {
+        self.filter_by_lsn_and_table(|_, lsn| lsn <= frontier)
+    }
+
+    /// Recover every held table from the public watermark while taking only
+    /// newer work for tables that already crossed under the older protocol.
+    pub(crate) fn for_schema_recovery(
+        &self,
+        held_tables: &HashSet<String>,
+        compatible_through: Lsn,
+    ) -> ChangeSet {
+        self.filter_by_lsn_and_table(|table, lsn| {
+            table.is_some_and(|table| held_tables.contains(table)) || lsn > compatible_through
+        })
+    }
+
+    fn filter_schema_tables(&self, tables: &HashSet<String>, keep_matches: bool) -> ChangeSet {
+        let mut ddl = Vec::new();
+        let mut ddl_lsn = Vec::new();
+        for (index, change) in self.ddl.iter().enumerate() {
+            let matches = change
+                .table_name()
+                .is_some_and(|table| tables.contains(table));
+            if matches == keep_matches {
+                ddl.push(change.clone());
+                if let Some(lsn) = self.ddl_lsn.get(index) {
+                    ddl_lsn.push(*lsn);
+                }
+            }
+        }
+        ChangeSet {
+            rows: self
+                .rows
+                .iter()
+                .filter(|row| tables.contains(&row.table) == keep_matches)
+                .cloned()
+                .collect(),
+            edges: if keep_matches {
+                Vec::new()
+            } else {
+                self.edges.clone()
+            },
+            vectors: self
+                .vectors
+                .iter()
+                .filter(|vector| tables.contains(&vector.index.table) == keep_matches)
+                .cloned()
+                .collect(),
+            ddl,
+            ddl_lsn,
+        }
+    }
+
+    fn filter_by_lsn_and_table(&self, keep: impl Fn(Option<&str>, Lsn) -> bool) -> ChangeSet {
+        let mut ddl = Vec::new();
+        let mut ddl_lsn = Vec::new();
+        for (index, change) in self.ddl.iter().enumerate() {
+            let Some(lsn) = self.ddl_lsn.get(index).copied() else {
+                continue;
+            };
+            if keep(change.table_name(), lsn) {
+                ddl.push(change.clone());
+                ddl_lsn.push(lsn);
+            }
+        }
+        ChangeSet {
+            rows: self
+                .rows
+                .iter()
+                .filter(|row| keep(Some(&row.table), row.lsn))
+                .cloned()
+                .collect(),
+            edges: self
+                .edges
+                .iter()
+                .filter(|edge| keep(None, edge.lsn))
+                .cloned()
+                .collect(),
+            vectors: self
+                .vectors
+                .iter()
+                .filter(|vector| keep(Some(&vector.index.table), vector.lsn))
+                .cloned()
+                .collect(),
+            ddl,
+            ddl_lsn,
         }
     }
 }
@@ -632,6 +800,24 @@ pub enum DdlChange {
         table: String,
         on_events: Vec<String>,
     },
+}
+
+impl DdlChange {
+    pub(crate) fn table_name(&self) -> Option<&str> {
+        match self {
+            Self::CreateTable { name, .. }
+            | Self::DropTable { name }
+            | Self::AlterTable { name, .. } => Some(name),
+            Self::CreateIndex { table, .. }
+            | Self::DropIndex { table, .. }
+            | Self::CreateTrigger { table, .. }
+            | Self::CreateEventType { table, .. }
+            | Self::CreateRoute { table, .. }
+            | Self::DropRoute { table, .. }
+            | Self::CreateTriggerIncludingSync { table, .. } => Some(table),
+            Self::DropTrigger { .. } | Self::CreateSink { .. } => None,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for DdlChange {

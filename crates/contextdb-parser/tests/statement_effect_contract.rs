@@ -1,8 +1,47 @@
 use contextdb_parser::{Statement, StatementEffect, parse, statement_effect};
 use std::collections::HashSet;
 
-// Statements 1/17b/19: custody adds two writes and three metadata reads.
-const STATEMENT_VARIANT_COUNT: usize = 32;
+// Custody adds two writes and three metadata reads; vector inspection and the
+// maintenance cadence add two reads, and the cadence declaration adds a write.
+const STATEMENT_VARIANT_COUNT: usize = 35;
+
+#[test]
+fn binary_memory_declaration_accepts_quoted_and_unquoted_sizes() {
+    for sql in ["SET MEMORY_LIMIT 2G", "SET MEMORY_LIMIT '2G'"] {
+        assert!(matches!(
+            parse(sql).unwrap(),
+            Statement::SetMemoryLimit(contextdb_parser::SetMemoryLimitValue::Bytes(2147483648))
+        ));
+    }
+    for sql in ["SET MEMORY_LIMIT NONE", "SET MEMORY_LIMIT 'none'"] {
+        assert!(matches!(
+            parse(sql).unwrap(),
+            Statement::SetMemoryLimit(contextdb_parser::SetMemoryLimitValue::None)
+        ));
+    }
+    for sql in ["SET DISK_LIMIT 2G", "SET DISK_LIMIT '2G'"] {
+        assert!(matches!(
+            parse(sql).unwrap(),
+            Statement::SetDiskLimit(contextdb_parser::SetDiskLimitValue::Bytes(2147483648))
+        ));
+    }
+    for sql in ["SET DISK_LIMIT NONE", "SET DISK_LIMIT 'none'"] {
+        assert!(matches!(
+            parse(sql).unwrap(),
+            Statement::SetDiskLimit(contextdb_parser::SetDiskLimitValue::None)
+        ));
+    }
+    for sql in [
+        "SET MEMORY_LIMIT '2G",
+        "SET MEMORY_LIMIT 2G'",
+        "SET MEMORY_LIMIT 2Gjunk",
+    ] {
+        assert!(
+            parse(sql).is_err(),
+            "malformed declaration must refuse: {sql}"
+        );
+    }
+}
 
 fn statement_variant(statement: &Statement) -> &'static str {
     match statement {
@@ -28,8 +67,11 @@ fn statement_variant(statement: &Statement) -> &'static str {
         Statement::ShowMemoryLimit => "SHOW MEMORY_LIMIT",
         Statement::SetDiskLimit(_) => "SET DISK_LIMIT",
         Statement::ShowDiskLimit => "SHOW DISK_LIMIT",
+        Statement::SetMaintenancePollInterval(_) => "SET MAINTENANCE_POLL_INTERVAL",
+        Statement::ShowMaintenancePollInterval => "SHOW MAINTENANCE_POLL_INTERVAL",
         Statement::ShowSyncConflictPolicy => "SHOW SYNC_CONFLICT_POLICY",
         Statement::ShowVectorIndexes => "SHOW VECTOR_INDEXES",
+        Statement::ShowVectorPartitions { .. } => "SHOW VECTOR_PARTITIONS",
         Statement::CreateSchedule { .. } => "CREATE SCHEDULE",
         Statement::DropSchedule { .. } => "DROP SCHEDULE",
         Statement::CreateTrigger { .. } => "CREATE TRIGGER",
@@ -42,7 +84,7 @@ fn statement_variant(statement: &Statement) -> &'static str {
 }
 
 #[test]
-fn statement_effect_marks_only_the_eight_inspection_variants_as_reads() {
+fn statement_effect_marks_only_the_ten_inspection_variants_as_reads() {
     let cases = [
         (
             "DISCARD",
@@ -131,6 +173,16 @@ fn statement_effect_marks_only_the_eight_inspection_variants_as_reads() {
         ),
         ("SHOW DISK_LIMIT", "SHOW DISK_LIMIT", StatementEffect::Read),
         (
+            "SET MAINTENANCE_POLL_INTERVAL",
+            "SET MAINTENANCE_POLL_INTERVAL '5 SECONDS'",
+            StatementEffect::Write,
+        ),
+        (
+            "SHOW MAINTENANCE_POLL_INTERVAL",
+            "SHOW MAINTENANCE_POLL_INTERVAL",
+            StatementEffect::Read,
+        ),
+        (
             "SHOW SYNC_CONFLICT_POLICY",
             "SHOW SYNC_CONFLICT_POLICY",
             StatementEffect::Read,
@@ -138,6 +190,11 @@ fn statement_effect_marks_only_the_eight_inspection_variants_as_reads() {
         (
             "SHOW VECTOR_INDEXES",
             "SHOW VECTOR_INDEXES",
+            StatementEffect::Read,
+        ),
+        (
+            "SHOW VECTOR_PARTITIONS",
+            "SHOW VECTOR_PARTITIONS FOR entries.embedding LIMIT 50 OFFSET 100",
             StatementEffect::Read,
         ),
         (
@@ -225,12 +282,12 @@ fn statement_effect_marks_only_the_eight_inspection_variants_as_reads() {
         .filter(|(_, expected_effect, _)| *expected_effect == StatementEffect::Read)
         .count();
     assert_eq!(
-        declared_read_count, 8,
-        "exactly eight current Statement variants are declared reads"
+        declared_read_count, 10,
+        "exactly ten current Statement variants are declared reads"
     );
     assert_eq!(
         parsed_cases.len() - declared_read_count,
-        24,
+        25,
         "every other current Statement variant is declared a write"
     );
 

@@ -13,7 +13,75 @@ Earlier versions: see git tags.
   A listed `SYNC OFF` table delivers its self-contained predicate and bound values so each edge
   erases its own matching keys atomically; subqueries on those tables are refused before selection.
   Custody joins the shared v7 vocabulary; protocol and ALPN constants are unchanged.
+- **Sync compatibility.** This release emits and accepts sync **protocol 7**. When a later release
+  adds schema vocabulary, a peer that cannot read it holds back only the table that declares it,
+  with a diagnostic naming the table, capability, and node to upgrade, while other tables keep
+  syncing. The supported skew window is the current protocol plus the two previous released
+  protocols.
 
+- **Distribution and maintenance.** The engine's registry dependency is the maintained
+  `contextdb-redb` 4.1.0 package, retaining library name `redb`, published before the engine.
+  The fork carries the complete upstream integration suite and locked dev dependencies. Release
+  requires its standalone format, lint and test gates plus an actual unpacked-engine build against
+  the unpacked fork; the tag publication job must depend on those checks for the same commit.
+  `crates/contextdb-redb/MAINTENANCE.md` records upstream identity, the reproducible source delta,
+  upgrades, and the upstream-proposal path. The HNSW engine is the maintained `contextdb-hnsw`
+  package (library name `hnsw_rs`), published before `contextdb-vector`;
+  `crates/contextdb-hnsw/MAINTENANCE.md` records its upstream identity and source delta.
+- **Behavior change.** Automatic file compaction runs as resumable sweeps that relocate at most 64
+  pages per batch, started once dead space reaches 50% by a retention pass that pruned rows or by a
+  maintenance cycle at least an hour after the last completed sweep, instead of one synchronous whole-file compaction inside the
+  retention pass. Reads overlap an
+  active batch and foreground writes interleave between batches; later maintenance cycles resume
+  the sweep. `.maintenance compact` (`Database::compact_now()`) still compacts immediately.
+- **Behavior change.** When a push's acknowledgement is lost and the edge retries,
+  `SyncClient::push` now returns the hub's original outcome for the already-committed unit — its
+  `applied_rows` and `new_lsn` — instead of reporting zero applied rows. The hub still applies the
+  unit exactly once.
+- **Fixed.** Maintaining a vector index partition whose every row was deleted or purged no longer
+  panics while loading the partition's graph with no points. After a reopen, the first
+  maintenance cycle (including the engine-owned background worker) used to stop with
+  "called `Option::unwrap()` on a `None` value"; the emptied partition now serves no rows and
+  accepts new ones.
+- **Fixed.** Full-schema sync restores preserve authored `CONTEXT_ID`, `SCOPE_LABEL`, and
+  `SCOPE_LABEL_READ ... WRITE ...` declarations, so restored peers enforce the same Context and
+  scope rules. Rendered `.schema` now preserves those declarations too. Authenticated original DDL
+  remains unchanged; metadata-derived display and sync DDL do not discard the access policy.
+- **Fixed.** A missing parameter for a required `INSERT` value returns the existing
+  `Error::NotFound` before staging a row, rather than a generic error or an implicit `NULL`.
+- **Clarified.** Memory-limit sizes use binary suffixes: `SET MEMORY_LIMIT 2G` and the CLI
+  `--memory-limit 2G` both resolve to exactly 2147483648 bytes. Whole-process RSS, including
+  lifecycle work, remains separate from charged memory.
+- **Maintenance.** Initial vector graph construction and repair run only through maintenance.
+  Declarations, writes, open and queries never wait for a full build. Loaded graph generations stay
+  immutable; deleted/replaced versions are excluded by visibility and tombstones until replacement.
+  Retention preserves already-open snapshots and defers physical reclamation while readers need
+  the retained row, vector and graph state.
+- **Maintenance visibility.** `.maintenance run` reports existing vector build and remaining-work
+  counters in text and JSON. Engine-owned maintenance polls at a configurable interval (60 seconds
+  by default); each wake takes one fixed finite candidate sample and advances every needy
+  partition in that sample sequentially within the declared limits.
+- **Fixed.** `SET MEMORY_LIMIT` and `SET DISK_LIMIT` accept the same quoted or unquoted binary
+  size and `NONE` forms.
+- **Added.** Vector columns can now declare a local `PARTITION_KEY`, `MAX_PARTITIONS`, and
+  `SEARCH_MODE` in canonical schema order. A partition is local search layout only — it neither
+  grants access nor names a tenant nor changes sync direction. The effective partition limit is
+  256 when declared without `MAX_PARTITIONS`; it counts live and snapshot-retained layouts. Sync
+  keeps its existing vector-change shape: a receiver derives local membership from the row it
+  accepts. `AUTO`, `EXACT`, and `INDEXED` are available as a declared default or a per-query
+  `USE VECTOR` override. `SHOW VECTOR_INDEXES` gains lifecycle/accounting summaries and
+  `SHOW VECTOR_PARTITIONS` exposes per-layout state and recovery.
+- **Added.** A vector column may now declare `AUTO_INDEX_AT` and grouped HNSW `M`,
+  `EF_CONSTRUCTION`, and `EF_SEARCH` workload policy. Default silence keeps the compatibility
+  profile; `AUTO_INDEX_AT` and `EF_SEARCH` affect newly opened queries without a graph rebuild,
+  while `M` or `EF_CONSTRUCTION` schedule a replacement graph and the current complete graph
+  remains available. Inspection separates desired topology from the serving build revision;
+  `EF_SEARCH` follows current query policy immediately. Restricted explanations omit per-partition
+  adaptive settings. The query-language reference is the canonical syntax and defaults.
+- **Behavior change.** Filtered `AUTO` vector search may now use a bounded approximate indexed
+  route for a broad allowed set. `EXACT` intentionally retains its exhaustive answer over the
+  stored column values; when a broad filter has no bounded candidate route, indexed search refuses
+  rather than quietly scanning the whole table or omitting results.
 - **Behavior change.** A bare `CREATE TABLE` naming a table that already exists is now refused
   instead of silently replacing that table's schema — the old behavior dropped the values in
   every column the new declaration omitted. `CREATE TABLE IF NOT EXISTS` is the spelling that
@@ -112,8 +180,7 @@ Earlier versions: see git tags.
   `SyncClient::pull_default`/the ordinary initial-sync path. The public
   in-memory policy maps, policy/direction setters, caller-supplied apply maps,
   and arbitrary-transport constructors were removed; authenticated endpoint
-  construction remains the production path and transport injection is a
-  test-seam-only capability.
+  construction remains the only production path.
 - **Breaking.** Mutable `MemoryAccountant` attachment and raw accounting access
   were removed from the public Database API. Use the durable
   `Database::set_memory_limit` for live configuration. For a non-raisable

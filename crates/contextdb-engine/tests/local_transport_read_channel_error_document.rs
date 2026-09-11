@@ -16,17 +16,21 @@
 //! a declared memory ceiling; and a class the channel has no tag for still
 //! arrives carrying its name and its words.
 
-use contextdb_core::Error;
 use contextdb_core::read_contract::{
     OwnerLimitExceededDetail, ReadFailure, ReadFailureDetail, ReadFailureKind, ReadFailureLimit,
     ReadLimits,
 };
 use contextdb_core::types::{ContextId, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
+use contextdb_core::{Error, VectorPartitionDeclarationIssue};
 use contextdb_engine::local_transport::{
     ALL_TAGS, BodyField, LocalEngineFailure, ReadChannelError, TAG_ACL_DENIED,
     TAG_BFS_DEPTH_EXCEEDED, TAG_BFS_VISITED_EXCEEDED, TAG_COLUMN_NOT_FOUND,
-    TAG_MEMORY_BUDGET_EXCEEDED, TAG_READ_CANCELLED, TAG_SCOPE_LABEL_VIOLATION, TAG_TABLE_NOT_FOUND,
-    TAG_UNKNOWN, body_grammar, decode_message_exact, encode_message,
+    TAG_INVALID_VECTOR_PARTITION_DECLARATION, TAG_MEMORY_BUDGET_EXCEEDED, TAG_READ_CANCELLED,
+    TAG_SCOPE_LABEL_VIOLATION, TAG_TABLE_NOT_FOUND, TAG_UNKNOWN,
+    TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER, TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
+    TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE, TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE,
+    TAG_VECTOR_PARTITION_LIMIT_EXCEEDED, TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, body_grammar,
+    decode_message_exact, encode_message,
 };
 use std::collections::BTreeSet;
 
@@ -96,6 +100,28 @@ fn one_answer_per_named_class() -> Vec<Error> {
         },
         Error::UseRankRequiresVectorOrder,
         Error::UseRankRequiresLimit,
+        Error::UseVectorRequiresVectorOrder,
+        Error::InvalidVectorPartitionDeclaration {
+            index: VectorIndexRef::new("widgets", "embedding"),
+            issue: VectorPartitionDeclarationIssue::NullablePartitionKeyColumn,
+        },
+        Error::VectorPartitionLimitExceeded {
+            index: VectorIndexRef::new("widgets", "embedding"),
+            max_partitions: 256,
+        },
+        Error::VectorExactSearchBudgetExceeded {
+            index: VectorIndexRef::new("widgets", "embedding"),
+            required_bytes: 4096,
+            available_bytes: 2048,
+        },
+        Error::VectorIndexedRouteUnavailable {
+            index: VectorIndexRef::new("widgets", "embedding"),
+        },
+        Error::VectorFilteredRouteUnavailable {
+            index: VectorIndexRef::new("widgets", "embedding"),
+            predicate_columns: vec!["context_id".to_owned()],
+        },
+        Error::VectorWholeIndexInspectionDenied,
         Error::RankPolicyNotFound {
             index: "widgets_embedding".to_owned(),
             sort_key: "freshness".to_owned(),
@@ -375,6 +401,134 @@ fn the_document_has_literal_bytes_for_each_body_shape() {
             b'm',
         ],
         "an answer this channel has no tag for still carries its class name and its words",
+    );
+}
+
+/// Each new vector refusal has a written, append-only tag and carries only
+/// public schema names and declared limits. It never serializes a query vector,
+/// a bound predicate, or a caller's row values.
+#[test]
+fn vector_refusal_tags_and_declaration_issue_codes_are_literal_and_stable() {
+    assert_eq!(TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER, 49);
+    assert_eq!(TAG_INVALID_VECTOR_PARTITION_DECLARATION, 50);
+    assert_eq!(TAG_VECTOR_PARTITION_LIMIT_EXCEEDED, 51);
+    assert_eq!(TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED, 52);
+    assert_eq!(TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE, 53);
+    assert_eq!(TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE, 54);
+    assert_eq!(TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, 55);
+
+    assert_eq!(
+        document_bytes(&Error::UseVectorRequiresVectorOrder),
+        vec![TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER as u8],
+    );
+    for (issue, code) in [
+        (VectorPartitionDeclarationIssue::RequiresVectorColumn, 0),
+        (VectorPartitionDeclarationIssue::EmptyPartitionKey, 1),
+        (
+            VectorPartitionDeclarationIssue::UnknownPartitionKeyColumn,
+            2,
+        ),
+        (
+            VectorPartitionDeclarationIssue::NullablePartitionKeyColumn,
+            3,
+        ),
+        (
+            VectorPartitionDeclarationIssue::UnsupportedPartitionKeyColumnType,
+            4,
+        ),
+        (
+            VectorPartitionDeclarationIssue::DuplicatePartitionKeyColumn,
+            5,
+        ),
+        (
+            VectorPartitionDeclarationIssue::VectorColumnInPartitionKey,
+            6,
+        ),
+        (
+            VectorPartitionDeclarationIssue::MaxPartitionsWithoutPartitionKey,
+            7,
+        ),
+        (VectorPartitionDeclarationIssue::MaxPartitionsNotPositive, 8),
+        (VectorPartitionDeclarationIssue::MaxPartitionsOutOfRange, 9),
+    ] {
+        let answer = Error::InvalidVectorPartitionDeclaration {
+            index: VectorIndexRef::new("t", "v"),
+            issue,
+        };
+        assert_eq!(
+            document_bytes(&answer),
+            vec![
+                TAG_INVALID_VECTOR_PARTITION_DECLARATION as u8,
+                1,
+                b't',
+                1,
+                b'v',
+                code,
+            ],
+            "declaration issues travel as fixed codes, not caller-provided words",
+        );
+        assert_eq!(
+            format!("{:?}", over_the_channel(&answer)),
+            format!("{answer:?}"),
+            "the reader receives the same declaration issue it was sent",
+        );
+    }
+    assert_eq!(
+        document_bytes(&Error::VectorPartitionLimitExceeded {
+            index: VectorIndexRef::new("t", "v"),
+            max_partitions: 256,
+        }),
+        vec![
+            TAG_VECTOR_PARTITION_LIMIT_EXCEEDED as u8,
+            1,
+            b't',
+            1,
+            b'v',
+            0xfb,
+            0,
+            1
+        ],
+    );
+    assert_eq!(
+        document_bytes(&Error::VectorExactSearchBudgetExceeded {
+            index: VectorIndexRef::new("t", "v"),
+            required_bytes: 7,
+            available_bytes: 3,
+        }),
+        vec![
+            TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED as u8,
+            1,
+            b't',
+            1,
+            b'v',
+            7,
+            3,
+        ],
+    );
+    for (answer, tag) in [
+        (
+            Error::VectorIndexedRouteUnavailable {
+                index: VectorIndexRef::new("t", "v"),
+            },
+            TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE,
+        ),
+        (
+            Error::VectorFilteredRouteUnavailable {
+                index: VectorIndexRef::new("t", "v"),
+                predicate_columns: Vec::new(),
+            },
+            TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE,
+        ),
+    ] {
+        let mut expected = vec![tag as u8, 1, b't', 1, b'v'];
+        if tag == TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE {
+            expected.push(0);
+        }
+        assert_eq!(document_bytes(&answer), expected);
+    }
+    assert_eq!(
+        document_bytes(&Error::VectorWholeIndexInspectionDenied),
+        vec![TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED as u8],
     );
 }
 

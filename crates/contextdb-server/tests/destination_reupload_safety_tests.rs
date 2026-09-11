@@ -422,7 +422,7 @@ impl ClientTransport for PauseAfterPushReply {
                     &SyncStatusResponse {
                         applied_push_watermark: Some(self.status_frontier),
                         server_current_lsn: Some(self.status_frontier),
-                        // Statement 13: ordinary lost-ack fixtures have no custody binding.
+                        // Ordinary lost-ack fixtures have no custody binding.
                         hub_incarnation: None,
                     },
                 )
@@ -440,7 +440,7 @@ impl ClientTransport for PauseAfterPushReply {
                         }),
                         error: None,
                         application_error: None,
-                        // Statement 13: ordinary response lane compile prerequisite.
+                        // Ordinary response lane compile prerequisite.
                         ..Default::default()
                     },
                 )

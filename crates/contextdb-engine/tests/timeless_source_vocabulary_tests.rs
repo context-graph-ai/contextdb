@@ -1,6 +1,9 @@
-//! Tracked implementation prose must describe durable behavior, not a past
-//! execution session.  The one user-facing CLI phrase below is deliberately
-//! excluded: it names the current command invocation rather than project work.
+//! Tracked source, tests, tooling, and documentation must describe durable
+//! behavior, not a past execution session, the planning documents behind it,
+//! or the build workspace that produced it: a promise is stated in product
+//! terms rather than cited by clause number or checklist letter.  The one
+//! user-facing CLI phrase below is deliberately excluded: it names the current
+//! command invocation rather than project work.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -21,6 +24,48 @@ fn historical_phrases() -> Vec<String> {
     ]
 }
 
+/// Phrases that cite a planning document, a build workspace, or a past
+/// execution instead of stating the behavior itself. Assembled from
+/// fragments so this file does not flag its own dictionary.
+fn planning_citation_phrases() -> Vec<String> {
+    vec![
+        ["approved", "intent"].join(" "),
+        ["vector-search", "intent"].join(" "),
+        ["root", "intent"].join(" "),
+        ["of", "the", "intent"].join(" "),
+        ["intent", "statement"].join(" "),
+        ["design", "brief"].join(" "),
+        ["the", "brief's"].join(" "),
+        ["this", "brief"].join(" "),
+        ["per", "the", "brief"].join(" "),
+        ["receipts", "and", "failures"].join(" "),
+        ["decimal", "ceiling"].join("-"),
+        ["execution", "lane"].join("-"),
+        ["execution", "lane"].join(" "),
+        ["this", "lane"].join(" "),
+        ["the", "lane's"].join(" "),
+        ["lane", "target"].join(" "),
+        ["fixture", "lane"].join(" "),
+        ["concurrent", "lane"].join(" "),
+        [".claude", "plans"].join("/"),
+    ]
+}
+
+/// Top-level paths whose tracked text is product source, tests, tooling, or
+/// user documentation.
+const SCANNED_TOP_LEVEL: [&str; 10] = [
+    "crates",
+    "tests",
+    "docs",
+    "skills",
+    "scripts",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "README.md",
+    ".gitignore",
+];
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -29,17 +74,43 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// `git ls-files` scoped to the same three top-level directories, walked
-/// directly off the filesystem. Used only when the source tree is not a git
-/// repository (e.g. a `git archive` export) -- git stays the primary source
-/// because it honors `.gitignore`, so this fallback is only reached when git
-/// itself cannot answer.
+/// Whether a tracked path's text is scanned: crate sources, tests and
+/// documentation; every skill and script file; the top-level and
+/// per-crate documentation; and ignore files, which name every directory the
+/// repository expects to exist beside its sources. Examples and benchmarks
+/// are programs whose output names their own current invocation.
+fn is_scanned_text(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    if name == ".gitignore" {
+        return true;
+    }
+    let text = [".rs", ".md", ".py", ".sh"]
+        .iter()
+        .any(|extension| name.ends_with(extension));
+    let code_scope = rel.contains("/src/")
+        || rel.contains("/tests/")
+        || rel.starts_with("tests/")
+        || rel.starts_with("docs/")
+        || rel.starts_with("skills/")
+        || rel.starts_with("scripts/");
+    let documentation =
+        name.ends_with(".md") && (!rel.contains('/') || rel.split('/').count() == 3);
+    text && (code_scope || documentation)
+}
+
+/// `git ls-files` over the same scanned top-level paths, walked directly off
+/// the filesystem. Used only when the source tree is not a git repository
+/// (e.g. a `git archive` export) -- git stays the primary source because it
+/// honors `.gitignore`, so this fallback is only reached when git itself
+/// cannot answer.
 fn walk_tracked_like_paths(root: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
-    for top in ["crates", "tests", "docs"] {
-        let dir = root.join(top);
-        if dir.is_dir() {
-            walk_dir_into(&dir, root, &mut out);
+    for top in SCANNED_TOP_LEVEL {
+        let path = root.join(top);
+        if path.is_dir() {
+            walk_dir_into(&path, root, &mut out);
+        } else if path.is_file() {
+            out.push(top.to_string());
         }
     }
     out.sort();
@@ -54,7 +125,7 @@ fn walk_dir_into(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<St
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.') || name == "target" {
+        if (name.starts_with('.') && name != ".gitignore") || name == "target" {
             continue;
         }
         if path.is_dir() {
@@ -242,17 +313,145 @@ fn contains_spelled_out_round_tag(value: &str) -> bool {
     false
 }
 
+/// A numbered clause of a planning document ("statement" or "statements"
+/// followed by a number), cited in place of the promise it stands for.
+fn contains_numbered_statement_citation(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    lower.match_indices("statement").any(|(start, matched)| {
+        if start > 0 && is_identifier_byte(bytes[start - 1]) {
+            return false;
+        }
+        let mut cursor = start + matched.len();
+        if bytes.get(cursor) == Some(&b's') {
+            cursor += 1;
+        }
+        let spaces_start = cursor;
+        while bytes.get(cursor).is_some_and(|byte| *byte == b' ') {
+            cursor += 1;
+        }
+        cursor > spaces_start && bytes.get(cursor).is_some_and(u8::is_ascii_digit)
+    })
+}
+
+/// A numbered section of a planning document ("section" followed by a
+/// dotted number such as 6.2).
+fn contains_numbered_section_citation(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    lower.match_indices("section ").any(|(start, matched)| {
+        if start > 0 && is_identifier_byte(bytes[start - 1]) {
+            return false;
+        }
+        let mut cursor = start + matched.len();
+        let major = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        cursor > major
+            && bytes.get(cursor) == Some(&b'.')
+            && bytes.get(cursor + 1).is_some_and(u8::is_ascii_digit)
+    })
+}
+
+/// A lettered checklist label ("Assertion" followed by a capital letter)
+/// standing in for the behavior the assertion pins.
+fn contains_lettered_assertion_label(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let label = ["Assert", "ion "].concat();
+    value.match_indices(label.as_str()).any(|(start, matched)| {
+        let letter = start + matched.len();
+        (start == 0 || !is_identifier_byte(bytes[start - 1]))
+            && bytes.get(letter).is_some_and(u8::is_ascii_uppercase)
+            && has_token_boundary(bytes, letter + 1)
+    })
+}
+
+/// A hyphenated correction- or review-round number.
+fn contains_hyphenated_round_id(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    ["correction-", "review-"].iter().any(|prefix| {
+        lower.match_indices(prefix).any(|(start, matched)| {
+            if start > 0 && is_identifier_byte(bytes[start - 1]) {
+                return false;
+            }
+            let mut cursor = start + matched.len();
+            let digits_start = cursor;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                cursor += 1;
+            }
+            cursor > digits_start && has_token_boundary(bytes, cursor)
+        })
+    })
+}
+
+fn contains_phrase(lower: &str, phrase_lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    lower.match_indices(phrase_lower).any(|(start, matched)| {
+        let before = start.checked_sub(1).and_then(|index| bytes.get(index));
+        let after = bytes.get(start + matched.len());
+        !before.is_some_and(u8::is_ascii_alphanumeric)
+            && !after.is_some_and(u8::is_ascii_alphanumeric)
+    })
+}
+
+#[test]
+fn planning_citation_detectors_match_citations_and_spare_product_prose() {
+    assert!(contains_numbered_statement_citation(
+        &["the refusal (statement", " 7) stays typed"].concat()
+    ));
+    assert!(contains_numbered_statement_citation(
+        &["Statement", " 17a: purge"].concat()
+    ));
+    assert!(!contains_numbered_statement_citation(
+        "a prepared statement binds parameters"
+    ));
+    assert!(contains_numbered_statement_citation(
+        &["Statement", "s 9/13: slots"].concat()
+    ));
+    assert!(!contains_numbered_statement_citation("statementsx 3"));
+    assert!(contains_numbered_section_citation(
+        &["an open question (section", " 6.2)"].concat()
+    ));
+    assert!(!contains_numbered_section_citation("the section 6 header"));
+    let label = ["Assert", "ion G"].concat();
+    assert!(contains_lettered_assertion_label(&format!(
+        "/// {label} -- refusal"
+    )));
+    assert!(!contains_lettered_assertion_label("Assertion failed"));
+    assert!(contains_hyphenated_round_id(
+        &["see ", "correction", "-15/"].concat()
+    ));
+    assert!(!contains_hyphenated_round_id(
+        "a review-ready preview-2 build"
+    ));
+    let phrase = ["approved", "intent"].join(" ");
+    assert!(contains_phrase(&format!("the {phrase}, clause"), &phrase));
+    assert!(!contains_phrase(&format!("the {phrase}s"), &phrase));
+    let lane = ["this", "lane"].join(" ");
+    assert!(!contains_phrase(
+        "the trailing purge lane keeps its slot",
+        &lane
+    ));
+}
+
 #[test]
 fn tracked_implementation_prose_has_no_execution_session_vocabulary() {
     let root = repo_root();
     let historical_phrases = historical_phrases();
+    let planning_phrases: Vec<String> = planning_citation_phrases()
+        .iter()
+        .map(|phrase| phrase.to_ascii_lowercase())
+        .collect();
     let invocation_phrase = ["this", "run"].join(" ");
     let invocation_failure_phrase = ["failure", "of", "this", "run"].join(" ");
     let commit_phrase = ["own", "commit"].join(" ");
     let output = Command::new("git")
         .arg("-C")
         .arg(&root)
-        .args(["ls-files", "-z", "crates", "tests", "docs"])
+        .args(["ls-files", "-z", "--"])
+        .args(SCANNED_TOP_LEVEL)
         // The not-a-repo detection matches git's English message; pin the
         // locale so a translated git cannot change the failure mode.
         .env("LC_ALL", "C")
@@ -286,7 +485,7 @@ fn tracked_implementation_prose_has_no_execution_session_vocabulary() {
     // nothing yet exits 0. A green audit must mean files were actually read.
     assert!(
         !rel_paths.is_empty(),
-        "vocabulary audit found no files to scan under crates/tests/docs"
+        "vocabulary audit found no tracked files to scan"
     );
 
     let mut hits = Vec::new();
@@ -297,11 +496,7 @@ fn tracked_implementation_prose_has_no_execution_session_vocabulary() {
                 "{rel}: execution-campaign vocabulary in tracked path"
             ));
         }
-        let scoped = rel.contains("/src/")
-            || rel.contains("/tests/")
-            || rel.starts_with("tests/")
-            || rel.starts_with("docs/");
-        if !scoped || !(rel.ends_with(".rs") || rel.ends_with(".md")) {
+        if !is_scanned_text(rel) {
             continue;
         }
         let path = root.join(rel);
@@ -383,6 +578,38 @@ fn tracked_implementation_prose_has_no_execution_session_vocabulary() {
                     line_number + 1
                 ));
             }
+            for phrase in &planning_phrases {
+                if contains_phrase(&lower, phrase) {
+                    hits.push(format!(
+                        "{rel}:{}: planning or build-workspace citation `{phrase}`: {line}",
+                        line_number + 1
+                    ));
+                }
+            }
+            if contains_numbered_statement_citation(line) {
+                hits.push(format!(
+                    "{rel}:{}: numbered planning-statement citation: {line}",
+                    line_number + 1
+                ));
+            }
+            if contains_numbered_section_citation(line) {
+                hits.push(format!(
+                    "{rel}:{}: numbered planning-section citation: {line}",
+                    line_number + 1
+                ));
+            }
+            if contains_lettered_assertion_label(line) {
+                hits.push(format!(
+                    "{rel}:{}: lettered assertion label: {line}",
+                    line_number + 1
+                ));
+            }
+            if contains_hyphenated_round_id(line) {
+                hits.push(format!(
+                    "{rel}:{}: correction/review round id: {line}",
+                    line_number + 1
+                ));
+            }
         }
     }
     assert!(
@@ -402,7 +629,8 @@ fn filesystem_walk_fallback_is_a_superset_of_git_tracked_paths() {
     let output = Command::new("git")
         .arg("-C")
         .arg(&root)
-        .args(["ls-files", "-z", "crates", "tests", "docs"])
+        .args(["ls-files", "-z", "--"])
+        .args(SCANNED_TOP_LEVEL)
         // The not-a-repo detection matches git's English message; pin the
         // locale so a translated git cannot change the failure mode.
         .env("LC_ALL", "C")
@@ -426,7 +654,13 @@ fn filesystem_walk_fallback_is_a_superset_of_git_tracked_paths() {
     let walk_paths: std::collections::BTreeSet<String> =
         walk_tracked_like_paths(&root).into_iter().collect();
 
-    let missing: Vec<&String> = git_paths.difference(&walk_paths).collect();
+    // A required owner-directed deletion can remain in Git's index while the
+    // path is intentionally absent from a candidate filesystem. Such a path
+    // is not scannable in an archive/export and must not make parity fail.
+    let missing: Vec<&String> = git_paths
+        .difference(&walk_paths)
+        .filter(|path| root.join(path).exists())
+        .collect();
     assert!(
         missing.is_empty(),
         "filesystem walk fallback missed git-tracked paths that a git-free export must still scan: {missing:?}"

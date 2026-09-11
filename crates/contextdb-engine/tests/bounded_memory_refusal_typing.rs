@@ -1,11 +1,8 @@
 //! How a read that runs out of memory says so.
 //!
-//! A bounded read is refused in one vocabulary: a typed refusal carrying the
-//! ceiling that was crossed, so a caller can branch on it and an operator can
-//! be told which setting to raise.  Running out of memory is a refusal like any
-//! other, and it stays a refusal whether the memory the read wanted was denied
-//! by its own ceiling or by the database's standing budget.  An internal engine
-//! string in that position tells the caller nothing it can act on.
+//! A request ceiling and the store's shared budget are distinct owners. A
+//! refusal names the budget that actually denied the allocation, so a reader
+//! never gets sent to raise a request ceiling that its work did not cross.
 
 #![cfg(feature = "test-seams")]
 
@@ -154,7 +151,7 @@ fn a_read_that_exhausts_its_own_memory_ceiling_is_refused_in_the_read_vocabulary
 
 /// The database's standing budget.
 #[test]
-fn a_read_that_exhausts_the_database_memory_budget_is_refused_in_the_read_vocabulary() {
+fn a_read_that_exhausts_the_database_memory_budget_preserves_the_store_refusal() {
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let db = Database::open_memory_with_accountant(Arc::clone(&accountant));
     let start = graph_fixture(&db);
@@ -169,7 +166,8 @@ fn a_read_that_exhausts_the_database_memory_budget_is_refused_in_the_read_vocabu
         roomy_limits(),
         Arc::new(FrozenClock),
     );
-    let outcome = bounded::execute(&db, &request);
+    let session = db.read_session(roomy_limits()).unwrap();
+    let outcome = session.execute(&request.sql, &request.params);
     let error = match outcome {
         Ok(_) => {
             accountant
@@ -185,5 +183,23 @@ fn a_read_that_exhausts_the_database_memory_budget_is_refused_in_the_read_vocabu
     accountant
         .set_budget(None)
         .expect("restore the database budget");
-    assert_memory_refusal(error, "the database budget");
+    let contextdb_core::Error::MemoryBudgetExceeded {
+        subsystem,
+        requested_bytes,
+        budget_limit_bytes,
+        available_bytes,
+        ..
+    } = error
+    else {
+        panic!("the shared store budget must keep its own typed refusal, got {error:?}");
+    };
+    assert_eq!(subsystem, "bounded_read");
+    assert_eq!(budget_limit_bytes, settled + 4 * 1024);
+    assert!(requested_bytes > available_bytes);
+    assert!(
+        requested_bytes < roomy_limits().memory as usize,
+        "the reader's 16 MiB ceiling did not refuse this allocation"
+    );
+    assert_eq!(accountant.usage().used, settled);
+    assert_eq!(accountant.underflow_count_for_test(), 0);
 }

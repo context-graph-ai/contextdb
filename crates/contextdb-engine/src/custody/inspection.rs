@@ -1,10 +1,10 @@
-//! Statements 7/12/14/19: custody accounting reads durable metadata only.
+//! Custody accounting reads durable metadata only.
 use super::records::*;
 use crate::{Database, custody_types::*};
 use contextdb_core::{Result, SyncDirection};
 use std::collections::BTreeMap;
 
-// Statements 15/19: expired authority records remain private journal evidence,
+// Expired authority records remain private journal evidence,
 // never current credit in either per-root or administrative inspection.
 struct CurrentAuthority<'a> {
     destination: Option<&'a Namespace>,
@@ -276,7 +276,7 @@ pub(crate) fn show(
     Ok(result)
 }
 
-// Statement 19: each route projects the same durable record through its scoped database.
+// Each route projects the same durable record through its scoped database.
 pub(crate) fn metadata(
     db: &Database,
     request: crate::direct_file_reader::DirectMetadataRequest,

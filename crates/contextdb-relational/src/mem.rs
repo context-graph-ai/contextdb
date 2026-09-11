@@ -1,4 +1,5 @@
 use crate::store::{RelationalStore, index_key_from_values};
+use contextdb_core::read_memory::ReadMemoryBudget;
 use contextdb_core::*;
 use contextdb_tx::{TransactionManager, WriteSetApplicator, row_matches_delete_predicates};
 use std::collections::{HashMap, HashSet};
@@ -49,6 +50,9 @@ impl BoundedIndexCursor {
 #[derive(Debug, Clone)]
 pub struct BoundedOrderedRowCursor {
     index: Option<String>,
+    image: Option<Option<crate::membership::MembershipImage>>,
+    identities_only: bool,
+    image_components: usize,
     key: Option<IndexKey>,
     last_row_id: Option<RowId>,
     reverse: bool,
@@ -74,6 +78,9 @@ impl Default for BoundedOrderedRowCursor {
     fn default() -> Self {
         Self {
             index: None,
+            image: None,
+            identities_only: false,
+            image_components: 0,
             key: None,
             last_row_id: None,
             reverse: false,
@@ -88,9 +95,17 @@ impl Default for BoundedOrderedRowCursor {
 }
 
 impl BoundedOrderedRowCursor {
+    /// The caller has proved that this membership alone decides its filter.
+    pub fn select_identities_only(&mut self) {
+        self.identities_only = true;
+    }
+
     pub fn for_index(index: String, reverse: bool) -> Self {
         Self {
             index: Some(index),
+            image: None,
+            identities_only: false,
+            image_components: 0,
             key: None,
             last_row_id: None,
             reverse,
@@ -101,6 +116,117 @@ impl BoundedOrderedRowCursor {
             key_generation: 0,
             exhausted: false,
         }
+    }
+
+    /// Bind the physical membership before this source can be suspended.
+    /// A snapshot older than the current root is reconstructed from retained
+    /// postings once; it never reopens a mutable index by name on later pulls.
+    pub fn capture<E>(
+        &mut self,
+        store: &RelationalStore,
+        table: &str,
+        snapshot: SnapshotId,
+        budget: Arc<dyn ReadMemoryBudget>,
+        mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<Error>,
+    {
+        let indexes = store.indexes.read();
+        let name = self
+            .index
+            .as_deref()
+            .ok_or_else(|| E::from(Error::Other("ordered source has no index".into())))?;
+        let storage = indexes
+            .get(table)
+            .and_then(|indexes| indexes.get(name))
+            .ok_or_else(|| {
+                E::from(Error::IndexNotFound {
+                    table: table.into(),
+                    index: name.into(),
+                })
+            })?;
+        self.image_components = storage.columns.len();
+        if let Some(image) = storage
+            .current_image(snapshot)
+            .cloned()
+            .or_else(|| store.captured_membership(table, name, snapshot))
+        {
+            self.image = Some(Some(image));
+            return Ok(());
+        }
+        let mut image = crate::membership::MembershipImage::with_budget(budget);
+        let mut collect =
+            |key: &IndexKey, postings: &[crate::store::IndexEntry]| -> std::result::Result<(), E> {
+                for posting in postings {
+                    before_touch()?;
+                    store.bump_index_entries_touched(1);
+                    if posting.visible_at(snapshot) {
+                        let mut entry = posting.clone();
+                        entry.deleted_tx = None;
+                        image.insert(key, entry).map_err(E::from)?;
+                    }
+                }
+                Ok(())
+            };
+        // Borrow each run independently: no copy of all historical keys and
+        // no walk through the gaps of an IN-list.
+        for (start, end) in std::iter::once((&self.run_start, &self.run_end))
+            .chain(self.pending_runs.iter().map(|(start, end)| (start, end)))
+        {
+            let near = if self.reverse { end } else { start };
+            let seek = if self.reverse && self.image_components != 1 {
+                Bound::Unbounded
+            } else {
+                match near {
+                    Bound::Unbounded => Bound::Unbounded,
+                    Bound::Included(edge) => Bound::Included(std::slice::from_ref(edge)),
+                    Bound::Excluded(edge) => Bound::Excluded(std::slice::from_ref(edge)),
+                }
+            };
+            let inside = |key: &IndexKey| {
+                let Some(leading) = key.first() else {
+                    return true;
+                };
+                match if self.reverse { start } else { end } {
+                    Bound::Unbounded => true,
+                    Bound::Included(edge) => {
+                        if self.reverse {
+                            leading >= edge
+                        } else {
+                            leading <= edge
+                        }
+                    }
+                    Bound::Excluded(edge) => {
+                        if self.reverse {
+                            leading > edge
+                        } else {
+                            leading < edge
+                        }
+                    }
+                }
+            };
+            if self.reverse {
+                for (key, postings) in storage
+                    .tree
+                    .range::<[DirectedValue], _>((Bound::Unbounded, seek))
+                    .rev()
+                    .take_while(|(key, _)| inside(key))
+                {
+                    collect(key, postings)?;
+                }
+            } else {
+                for (key, postings) in storage
+                    .tree
+                    .range::<[DirectedValue], _>((seek, Bound::Unbounded))
+                    .take_while(|(key, _)| inside(key))
+                {
+                    collect(key, postings)?;
+                }
+            }
+        }
+        self.image = Some(Some(image));
+        Ok(())
     }
 
     /// Declare the run of index keys this cursor answers for, in tree order.
@@ -203,7 +329,7 @@ impl BoundedOrderedRowCursor {
     /// cannot express "this value followed by anything" on the far side; the
     /// walk therefore seeks only from the side it starts on and stops at the
     /// other by inspecting one key past the run.
-    fn seek_from(&self, components: usize) -> Bound<IndexKey> {
+    fn seek_from(&self, components: usize) -> Bound<&[DirectedValue]> {
         let near_end = if self.reverse {
             if components != 1 {
                 return Bound::Unbounded;
@@ -214,8 +340,8 @@ impl BoundedOrderedRowCursor {
         };
         match near_end {
             Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(edge) => Bound::Included(vec![edge.clone()]),
-            Bound::Excluded(edge) => Bound::Excluded(vec![edge.clone()]),
+            Bound::Included(edge) => Bound::Included(std::slice::from_ref(edge)),
+            Bound::Excluded(edge) => Bound::Excluded(std::slice::from_ref(edge)),
         }
     }
 
@@ -304,6 +430,9 @@ fn next_posting_run(
 /// bounded by its widest key, not by the sum of them.
 pub struct BoundedExactIndexCursor {
     keys: std::collections::VecDeque<IndexKey>,
+    image: Option<Option<crate::membership::MembershipImage>>,
+    identities_only: bool,
+    last_row_id: Option<RowId>,
     postings: Vec<crate::store::IndexEntry>,
     position: usize,
     retained_bytes: usize,
@@ -311,14 +440,70 @@ pub struct BoundedExactIndexCursor {
 }
 
 impl BoundedExactIndexCursor {
+    /// The caller has proved that this membership alone decides its filter.
+    pub fn select_identities_only(&mut self) {
+        self.identities_only = true;
+    }
+
     pub fn for_keys(keys: impl IntoIterator<Item = IndexKey>) -> Self {
         Self {
             keys: keys.into_iter().collect(),
+            image: None,
+            identities_only: false,
+            last_row_id: None,
             postings: Vec::new(),
             position: 0,
             retained_bytes: 0,
             exhausted: false,
         }
+    }
+
+    /// Own the snapshot's membership before the first pull, including when a
+    /// commit has already advanced the current root beyond that snapshot.
+    pub fn capture<E>(
+        &mut self,
+        store: &RelationalStore,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
+        budget: Arc<dyn ReadMemoryBudget>,
+        mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<Error>,
+    {
+        let indexes = store.indexes.read();
+        let storage = indexes
+            .get(table)
+            .and_then(|indexes| indexes.get(index))
+            .ok_or_else(|| {
+                E::from(Error::IndexNotFound {
+                    table: table.into(),
+                    index: index.into(),
+                })
+            })?;
+        if let Some(image) = storage
+            .current_image(snapshot)
+            .cloned()
+            .or_else(|| store.captured_membership(table, index, snapshot))
+        {
+            self.image = Some(Some(image));
+            return Ok(());
+        }
+        let mut image = crate::membership::MembershipImage::with_budget(budget);
+        for key in &self.keys {
+            for posting in storage.exact_postings(key).into_iter().flatten() {
+                before_touch()?;
+                store.bump_index_entries_touched(1);
+                if posting.visible_at(snapshot) {
+                    let mut entry = posting.clone();
+                    entry.deleted_tx = None;
+                    image.insert(key, entry).map_err(E::from)?;
+                }
+            }
+        }
+        self.image = Some(Some(image));
+        Ok(())
     }
 
     pub fn is_exhausted(&self) -> bool {
@@ -334,6 +519,30 @@ impl BoundedExactIndexCursor {
         self.postings = Vec::new();
         self.position = 0;
         std::mem::take(&mut self.retained_bytes)
+    }
+}
+
+fn membership_row<E>(
+    store: &RelationalStore,
+    table: &str,
+    entry: &crate::store::IndexEntry,
+    snapshot: SnapshotId,
+    identities_only: bool,
+    before_clone: impl FnOnce(&VersionedRow) -> std::result::Result<(), E>,
+) -> std::result::Result<Option<VersionedRow>, E> {
+    if identities_only {
+        let row = VersionedRow {
+            row_id: entry.row_id,
+            values: HashMap::new(),
+            created_tx: entry.created_tx,
+            deleted_tx: None,
+            lsn: Lsn(0),
+            created_at: None,
+        };
+        before_clone(&row)?;
+        Ok(Some(row))
+    } else {
+        store.row_by_id_before_clone(table, entry.row_id, snapshot, before_clone)
     }
 }
 
@@ -664,6 +873,38 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         if cursor.exhausted {
             return Ok(None);
         }
+        if let Some(Some(image)) = cursor.image.as_ref() {
+            loop {
+                let Some(key) = cursor.keys.front() else {
+                    cursor.exhausted = true;
+                    return Ok(None);
+                };
+                let after = cursor.last_row_id.map(|row| (key.as_slice(), row));
+                let selected = image
+                    .next(after, Bound::Included(key.as_slice()), false)
+                    .filter(|(found, _)| *found == key);
+                let Some((_, entry)) = selected else {
+                    cursor.keys.pop_front();
+                    cursor.last_row_id = None;
+                    continue;
+                };
+                before_touch()?;
+                self.store.bump_index_entries_touched(1);
+                let row = membership_row(
+                    &self.store,
+                    table,
+                    entry,
+                    snapshot,
+                    cursor.identities_only,
+                    |row| before_clone(row.estimated_bytes()),
+                )?;
+                cursor.last_row_id = Some(entry.row_id);
+                if row.is_some() {
+                    return Ok(row);
+                }
+            }
+        }
+
         let indexes = self.store.indexes.read();
         let table_indexes = indexes
             .get(table)
@@ -675,13 +916,30 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             })
         })?;
 
+        if cursor.image.is_none() {
+            cursor.image = Some(storage.current_image(snapshot).cloned());
+            if matches!(cursor.image, Some(Some(_))) {
+                drop(indexes);
+                return self.bounded_exact_index_row_next(
+                    table,
+                    index,
+                    snapshot,
+                    cursor,
+                    before_touch,
+                    before_retain,
+                    release_retained,
+                    before_clone,
+                );
+            }
+        }
+
         loop {
             while cursor.position < cursor.postings.len() {
                 let entry = cursor.postings[cursor.position].clone();
-                cursor.position += 1;
                 before_touch()?;
                 self.store.bump_index_entries_touched(1);
                 if !entry.visible_at(snapshot) {
+                    cursor.position += 1;
                     continue;
                 }
                 // A posting names a ROW, and the row is read at the
@@ -706,6 +964,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                         .row_by_id_before_clone(table, entry.row_id, snapshot, |row| {
                             before_clone(row.estimated_bytes())
                         })?;
+                cursor.position += 1;
                 let Some(row) = row else {
                     // The posting outlived every version of its row that this
                     // snapshot can see. There is nothing here for this reader,
@@ -722,13 +981,13 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             if released > 0 {
                 release_retained(released)?;
             }
-            let Some(key) = cursor.keys.pop_front() else {
+            let Some(key) = cursor.keys.front() else {
                 cursor.exhausted = true;
                 return Ok(None);
             };
             let postings = storage
-                .exact_postings(&key)
-                .map(|postings| postings.to_vec())
+                .exact_postings(key)
+                .map(Vec::as_slice)
                 .unwrap_or_default();
             let retained = postings
                 .len()
@@ -739,7 +998,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     ))
                 })?;
             before_retain(retained)?;
-            cursor.postings = postings;
+            cursor.postings = postings.to_vec();
+            cursor.keys.pop_front();
             cursor.position = 0;
             cursor.retained_bytes = retained;
         }
@@ -761,6 +1021,79 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     {
         if cursor.exhausted {
             return Ok(None);
+        }
+
+        if let Some(Some(image)) = cursor.image.as_ref() {
+            let image = image.clone();
+            let seek = cursor.seek_from(cursor.image_components);
+            let after = cursor
+                .key
+                .as_ref()
+                .zip(cursor.last_row_id)
+                .map(|(key, row)| (key.as_slice(), row));
+            let selected = image
+                .next(after, seek, cursor.reverse)
+                .filter(|(key, _)| cursor.inside_declared_run(key));
+            let Some((key, entry)) = selected else {
+                if !cursor.advance_to_next_run() {
+                    cursor.exhausted = true;
+                }
+                return Ok(None);
+            };
+            before_touch()?;
+            self.store.bump_index_entries_touched(1);
+            let key_changed = cursor.key.as_ref() != Some(key);
+            let key_bytes = if key_changed {
+                bounded_index_key_heap_bytes(key).map_err(E::from)?
+            } else {
+                0
+            };
+            let generation = if key_changed {
+                cursor.key_generation.checked_add(1).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded ordered key generation overflow".to_string(),
+                    ))
+                })?
+            } else {
+                cursor.key_generation
+            };
+            let mut before_clone = Some(before_clone);
+            let row = membership_row(
+                &self.store,
+                table,
+                entry,
+                snapshot,
+                cursor.identities_only,
+                |row| {
+                    let bytes = row
+                        .estimated_bytes()
+                        .checked_add(key_bytes)
+                        .ok_or_else(|| {
+                            E::from(Error::Other(
+                                "bounded ordered clone size overflow".to_string(),
+                            ))
+                        })?;
+                    before_clone.take().expect("one membership row charge")(bytes)
+                },
+            )?;
+            if let Some(before_clone) = before_clone.take() {
+                before_clone(key_bytes)?;
+            }
+            if key_changed {
+                cursor.key = Some(key.clone());
+                cursor.retained_key_bytes = key_bytes;
+                cursor.key_generation = generation;
+            }
+            cursor.last_row_id = Some(entry.row_id);
+            let more = image
+                .next(
+                    Some((key.as_slice(), entry.row_id)),
+                    Bound::Unbounded,
+                    cursor.reverse,
+                )
+                .is_some_and(|(key, _)| cursor.inside_declared_run(key));
+            cursor.exhausted = !more && cursor.pending_runs.is_empty();
+            return Ok(row);
         }
 
         let indexes = self.store.indexes.read();
@@ -795,15 +1128,27 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             ))));
         }
 
+        if cursor.image.is_none() {
+            cursor.image_components = storage.columns.len();
+            cursor.image = Some(storage.current_image(snapshot).cloned());
+            if matches!(cursor.image, Some(Some(_))) {
+                drop(indexes);
+                return self.bounded_ordered_row_next(
+                    table,
+                    column,
+                    direction,
+                    snapshot,
+                    cursor,
+                    before_touch,
+                    before_clone,
+                );
+            }
+        }
+
         // The predicate names where the answer starts and where it ends, so
         // the walk seeks to the first key inside the declared run and stops at
         // the first key past it rather than reading the index end to end.
         let seek_from = cursor.seek_from(storage.columns.len());
-        let seek_from = match &seek_from {
-            Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(edge) => Bound::Included(edge.as_slice()),
-            Bound::Excluded(edge) => Bound::Excluded(edge.as_slice()),
-        };
         let selected = if let Some(key) = cursor.key.as_ref() {
             let same_key = storage.tree.get(key).and_then(|entries| {
                 next_posting_run(entries, cursor.last_row_id, cursor.reverse)
@@ -869,25 +1214,17 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             return Ok(None);
         };
         let run_row_id = entries[run_start].row_id;
-        // The run is this ROW's postings, and which VERSION of it the reader
-        // sees is the snapshot's answer, not the postings'. A posting whose
-        // key never changed is never rewritten -- an update that leaves every
-        // indexed column alone deliberately does not touch the index -- so it
-        // goes on carrying the creating transaction of the version it was
-        // written for. Letting the postings' own version windows decide
-        // whether this row is offered at all dropped a row the reader could
-        // plainly see: the walk skipped it and moved on, and the caller got a
-        // short answer with nothing said about it.
-        //
-        // So the run decides only WHICH ROW is next. Every posting in it is
-        // still charged, because reading it is work the request is paying for,
-        // and the row is resolved once below -- one row per run, so nothing is
-        // handed out twice.
+        // Historical posting windows decide whether this row belongs at this
+        // key. Resolve the row version separately: an unchanged indexed key
+        // can retain a posting created before the visible row version. Charge
+        // every retained posting examined, but return the row once per key.
         for _ in &entries[run_start..run_end] {
             before_touch()?;
             self.store.bump_index_entries_touched(1);
         }
-        let visible_entry = entries.get(run_start);
+        let visible_entry = entries[run_start..run_end]
+            .iter()
+            .find(|entry| entry.visible_at(snapshot));
         let key_changed = cursor
             .key
             .as_ref()
@@ -1156,14 +1493,24 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     })
             })?;
             let key = index_key_from_values(&storage.columns[..1], std::slice::from_ref(value));
-            storage.exact_postings(&key).and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| {
-                        !deleted_row_ids.contains(&entry.row_id) && entry.visible_at(snapshot)
-                    })
-                    .map(|entry| entry.row_id)
-            })
+            if let Some(image) = storage.current_image(snapshot) {
+                image
+                    .range(
+                        Bound::Included(key.as_slice()),
+                        Bound::Included(key.as_slice()),
+                    )
+                    .map(|(_, entry)| entry.row_id)
+                    .find(|row| !deleted_row_ids.contains(row))
+            } else {
+                storage.exact_postings(&key).and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|entry| {
+                            !deleted_row_ids.contains(&entry.row_id) && entry.visible_at(snapshot)
+                        })
+                        .map(|entry| entry.row_id)
+                })
+            }
         };
         Some(row_id.and_then(|row_id| self.store.row_by_id(table, row_id, snapshot)))
     }

@@ -147,7 +147,7 @@ Two policy declarations decide by themselves whether your data survives — pick
 
 ### Verification gate
 
-All five must pass before any commit, release, or "done" claim. The fifth installs isolated
+All nine must pass before any commit, release, or "done" claim. The last installs isolated
 release binaries and drives the production ticketed-Iroh durability smoke.
 
 **Run `cargo fmt --all` before you consider yourself done — formatting is the gate's first
@@ -157,8 +157,12 @@ when you start and again as the last thing you do.
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check
+cargo clippy --manifest-path crates/contextdb-redb/Cargo.toml --all-targets -- -D warnings
 cargo test --workspace
+cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
 cargo build --release
+bash scripts/verify-packaged-engine.sh
 install_root="$(mktemp -d)"
 cargo install --locked --path crates/contextdb-cli --root "$install_root"
 cargo install --locked --path crates/contextdb-server --root "$install_root" \
@@ -169,9 +173,9 @@ CONTEXTDB_SERVER="$install_root/bin/contextdb-server" \
   scripts/installed-release-durable-sync-smoke.sh
 ```
 
-`CONTRIBUTING.md` lists the same five steps for outside contributors; the two documents agree.
+`CONTRIBUTING.md` lists the same nine steps for outside contributors; the two documents agree.
 Read the disk and single-build rules in [Safety boundaries](#one-cargo-build-at-a-time-and-check-the-disk-first)
-before you start the third command. Narrower suites while iterating:
+before you start `cargo test --workspace`. Narrower suites while iterating:
 `cargo test -p contextdb-engine --test acceptance`, `--test integration`, `--test sql_surface_tests`.
 
 ### Where a change lives
@@ -191,6 +195,10 @@ Describe the capability, then go to the crate that owns it — do not go looking
 | How a read is actually executed and charged against its budgets | Engine crate, `executor/bounded.rs` — the one execution kernel both routes share. Never give a consumer its own execution semantics. |
 | The trusted companion, the claim window, reader holds, published reader identities | Engine crate, `persistence.rs`. |
 | A refusal class or kind a reader can branch on | Core crate, `read_contract.rs` — the shared typed vocabulary. Never define a second refusal type downstream of it. |
+| Vector search: routes, partition layouts, the global top-k merge, generation lifecycle, per-column vector policy | Vector crate (`store.rs`, `hnsw.rs`, `mem.rs`). Where generation bytes are stored and when maintenance runs stay in the engine crate. |
+| A graph primitive vector search cannot build on top of the HNSW fork | HNSW crate, as the smallest upstream-shaped change, plus its `upstream-0.3.4.patch` and `MAINTENANCE.md`. Anything composable goes in the vector crate's `hnsw.rs` instead. |
+| A storage primitive (compaction step, read admission) the engine cannot build on top of redb | redb fork crate, same rule: smallest change, patch and `MAINTENANCE.md` updated. Compaction policy stays in the engine's `persistence.rs`. |
+| A `contextdb-server` flag, exit code, automatic push trigger, or worker poll loop | Server crate (`main.rs`, `exit_codes.rs`, `sync_plugin.rs`, `work_ledger.rs`). |
 | Anything else | [`docs/architecture.md`](docs/architecture.md#crate-map) maps all 11 crates and the dependency direction. |
 
 ### Testing discipline
@@ -215,15 +223,27 @@ Describe the capability, then go to the crate that owns it — do not go looking
 - **Deleting or merging tests requires mutation-testing evidence that coverage is preserved**
   (compare per-mutant results before and after, not summary counts).
 
-### Crate-local rules
+### Crate guides
 
-Only two crates carry rules beyond the above, and they add to this file rather than override it.
-Read the matching one before you edit that crate.
+Ten crates carry a guide: what the crate owns and must not own, its seams, each invariant with
+the test that guards it, where a change lands, and the fast test command. A guide adds to this file
+rather than overriding it. Read the matching one before you edit that crate.
 
-| Crate | Rule |
-|---|---|
-| [`crates/contextdb-parser/AGENTS.md`](crates/contextdb-parser/AGENTS.md) | Char-boundary discipline: every fixed-width lookahead over input must be boundary-safe, or multi-byte UTF-8 panics the parser. |
-| [`crates/contextdb-engine/AGENTS.md`](crates/contextdb-engine/AGENTS.md) | Clock-seam discipline: every persisted timestamp goes through `Wallclock::now()`; the test-estate ratchet audit enforces it. |
+| Crate | Guide | Rule to know before editing |
+|---|---|---|
+| `contextdb-cli` | [`crates/contextdb-cli/AGENTS.md`](crates/contextdb-cli/AGENTS.md) | The CLI and REPL surface; behavior belongs to the engine. |
+| `contextdb-core` | [`crates/contextdb-core/AGENTS.md`](crates/contextdb-core/AGENTS.md) | Shared types, errors and the read-contract vocabulary; the workspace audits live in its `tests/`. |
+| `contextdb-engine` | [`crates/contextdb-engine/AGENTS.md`](crates/contextdb-engine/AGENTS.md) | Clock-seam discipline: every persisted timestamp goes through `Wallclock::now()`; the test-estate ratchet audit enforces it. |
+| `contextdb-hnsw` | [`crates/contextdb-hnsw/AGENTS.md`](crates/contextdb-hnsw/AGENTS.md) | Maintained fork of `hnsw_rs` 0.3.4: the delta stays minimal and additive code lives in `contextdb-vector`; see its `MAINTENANCE.md`. |
+| `contextdb-parser` | [`crates/contextdb-parser/AGENTS.md`](crates/contextdb-parser/AGENTS.md) | Char-boundary discipline: every fixed-width lookahead over input must be boundary-safe, or multi-byte UTF-8 panics the parser. |
+| `contextdb-planner` | [`crates/contextdb-planner/AGENTS.md`](crates/contextdb-planner/AGENTS.md) | Turns the parsed statement into a physical plan. |
+| `contextdb-redb` | [`crates/contextdb-redb/AGENTS.md`](crates/contextdb-redb/AGENTS.md) | Maintained fork of redb 4.1.0, outside the workspace: the delta stays minimal and additive code lives in the engine; see its `MAINTENANCE.md`. |
+| `contextdb-relational` | [`crates/contextdb-relational/AGENTS.md`](crates/contextdb-relational/AGENTS.md) | Row storage, scan, insert, upsert and delete. |
+| `contextdb-server` | [`crates/contextdb-server/AGENTS.md`](crates/contextdb-server/AGENTS.md) | The sync mover: sync semantics are the engine's and re-exported; never a mirror module. |
+| `contextdb-vector` | [`crates/contextdb-vector/AGENTS.md`](crates/contextdb-vector/AGENTS.md) | Partitioned maintained vector search; most of its tests need `--features test-seams`. |
+
+`contextdb-graph` and `contextdb-tx` have no guide; [`docs/architecture.md`](docs/architecture.md#crate-map)
+maps every crate and the dependency direction.
 
 ### Releases
 

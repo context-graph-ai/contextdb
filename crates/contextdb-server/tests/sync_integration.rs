@@ -118,7 +118,7 @@ async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
                         }),
                         error: None,
                         application_error: None,
-                        // Statement 13: ordinary response lane compile prerequisite.
+                        // Ordinary response lane compile prerequisite.
                         ..Default::default()
                     },
                 )

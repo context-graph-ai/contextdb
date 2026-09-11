@@ -1,4 +1,4 @@
-//! Statements 12/16: a held complete unit can predate its first custody terminal.
+//! A held complete unit can predate its first custody terminal.
 use super::*;
 use crate::custody::{
     canonical::*,
@@ -23,7 +23,7 @@ impl Database {
             return Ok(Some(manifest.seal.unit_digest));
         }
         let (_, values) = self
-            .row_change_values_from_row(&root.table, &row)
+            .row_change_values_from_row(&root.table, &row)?
             .ok_or_else(invalid)?;
         let parent = RowChange {
             table: root.table.clone(),
@@ -47,7 +47,7 @@ impl Database {
                 .scan_filter_with_tx(None, table, snapshot, &|_| true)?
             {
                 let (key, values) = self
-                    .row_change_values_from_row(table, &row)
+                    .row_change_values_from_row(table, &row)?
                     .ok_or_else(invalid)?;
                 let child = RowChange {
                     table: table.clone(),

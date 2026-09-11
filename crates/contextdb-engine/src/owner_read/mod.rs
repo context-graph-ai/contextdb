@@ -18,6 +18,10 @@
 //! execution path — it carries requests to the same kernel a direct file read
 //! uses and carries the answers back.
 
+// This private production module is a public façade only for `test-seams`
+// integration proofs, so its reexports are intentionally unused by the
+// default build.
+#![cfg_attr(not(feature = "test-seams"), allow(unused_imports))]
 #![allow(dead_code)]
 
 mod admission;
@@ -33,7 +37,9 @@ pub use service::{
     OwnerReadService, OwnerServiceSpec, ValidatedOwnerListener,
 };
 #[cfg(feature = "test-seams")]
-pub use service::{OwnerBoundedExecutionObserver, OwnerBoundedOperation};
+pub use service::{
+    OwnerBoundedExecutionObserver, OwnerBoundedOperation, OwnerServicePublicationObserver,
+};
 
 use crate::local_transport::LocalTransportError;
 use crate::local_transport::{LocalRequest, LocalResponseExpectation, PayloadViolation};

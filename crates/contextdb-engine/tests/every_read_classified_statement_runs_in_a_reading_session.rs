@@ -166,6 +166,7 @@ fn explaining_a_write_answers_its_plan_and_leaves_the_rows_alone() {
             .metadata(
                 MetadataRequest::Explain {
                     sql: statement.to_owned(),
+                    params: HashMap::new(),
                 },
                 None,
             )
@@ -217,6 +218,7 @@ fn a_live_owner_explains_a_write_over_its_channel_and_leaves_the_rows_alone() {
         .metadata(
             MetadataRequest::Explain {
                 sql: "DELETE FROM documents WHERE id = 1".to_owned(),
+                params: HashMap::new(),
             },
             None,
         )

@@ -7,11 +7,15 @@ use crate::local_transport::{
     preflight_canonical_query_result, preflight_cursor_page_payload,
     preflight_metadata_page_payload,
 };
-use crate::{QueryResult, QueryTrace};
+use crate::{
+    QueryResult, QueryTrace, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
+    VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
+    VectorSearchScopeShape, VectorSearchTailState,
+};
 use bincode::config::standard;
 use bincode::serde::{decode_from_slice, encode_to_vec};
 use contextdb_core::read_contract::{CursorPage, MetadataPage, ReadLimits};
-use contextdb_core::{Value, VectorIndexRef};
+use contextdb_core::{Value, VectorIndexRef, VectorSearchMode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +33,166 @@ pub struct CanonicalQueryTrace {
     pub indexes_considered: Vec<CanonicalIndexCandidate>,
     pub sort_elided: bool,
     pub query_vector_source: Option<VectorIndexRef>,
+    pub vector_search: Option<CanonicalVectorSearchDisclosure>,
     pub rows_examined: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalVectorPartitionHnswDisclosure {
+    pub partition: String,
+    pub hnsw_m: u64,
+    pub hnsw_ef_construction: u64,
+    pub hnsw_ef_search: u64,
+    pub ef_search_source: String,
+    pub policy_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalVectorSearchDisclosure {
+    pub requested_mode: String,
+    pub resolved_mode: String,
+    pub aggregate_allowed_vectors: Option<u64>,
+    pub effective_auto_index_at: u64,
+    pub auto_index_at_source: String,
+    pub partition_key_columns: Vec<String>,
+    pub scope: String,
+    pub route: Option<String>,
+    pub base: String,
+    pub change: String,
+    pub tail: String,
+    pub residual: String,
+    pub fallback: Option<String>,
+    pub refusal: Option<String>,
+    pub recovery: Option<String>,
+    pub query_source: String,
+    pub partition_hnsw: Vec<CanonicalVectorPartitionHnswDisclosure>,
+}
+
+impl From<&VectorSearchDisclosure> for CanonicalVectorSearchDisclosure {
+    fn from(disclosure: &VectorSearchDisclosure) -> Self {
+        Self {
+            requested_mode: disclosure.requested_mode.as_str().to_owned(),
+            resolved_mode: disclosure.resolved_mode.as_str().to_owned(),
+            aggregate_allowed_vectors: disclosure
+                .aggregate_allowed_vectors
+                .map(|count| count as u64),
+            effective_auto_index_at: disclosure.effective_auto_index_at as u64,
+            auto_index_at_source: disclosure.auto_index_at_source.clone(),
+            partition_key_columns: disclosure.partition_key_columns.clone(),
+            scope: disclosure.scope.as_str().to_owned(),
+            route: disclosure.route.map(|route| route.as_str().to_owned()),
+            base: disclosure.base.as_str().to_owned(),
+            change: disclosure.change.as_str().to_owned(),
+            tail: disclosure.tail.as_str().to_owned(),
+            residual: disclosure.residual.as_str().to_owned(),
+            fallback: disclosure.fallback.clone(),
+            refusal: disclosure.refusal.clone(),
+            recovery: disclosure.recovery.clone(),
+            query_source: disclosure.query_source.as_str().to_owned(),
+            partition_hnsw: disclosure
+                .partition_hnsw
+                .iter()
+                .map(|partition| CanonicalVectorPartitionHnswDisclosure {
+                    partition: partition.partition.clone(),
+                    hnsw_m: partition.hnsw_m as u64,
+                    hnsw_ef_construction: partition.hnsw_ef_construction as u64,
+                    hnsw_ef_search: partition.hnsw_ef_search as u64,
+                    ef_search_source: partition.ef_search_source.clone(),
+                    policy_revision: partition.policy_revision,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
+    type Error = ();
+
+    fn try_from(disclosure: CanonicalVectorSearchDisclosure) -> Result<Self, Self::Error> {
+        let mode = |mode: &str| match mode {
+            "AUTO" => Ok(VectorSearchMode::Auto),
+            "EXACT" => Ok(VectorSearchMode::Exact),
+            "INDEXED" => Ok(VectorSearchMode::Indexed),
+            _ => Err(()),
+        };
+        let scope = match disclosure.scope.as_str() {
+            "one" => VectorSearchScopeShape::One,
+            "several" => VectorSearchScopeShape::Few,
+            "all" => VectorSearchScopeShape::All,
+            _ => return Err(()),
+        };
+        let route = disclosure
+            .route
+            .as_deref()
+            .map(|route| match route {
+                "exact" => Ok(VectorSearchRoute::Exact),
+                "indexed" => Ok(VectorSearchRoute::Indexed),
+                "filtered-indexed" => Ok(VectorSearchRoute::FilteredIndexed),
+                _ => Err(()),
+            })
+            .transpose()?;
+        let layer = |layer: &str| match layer {
+            "present" => Ok(VectorSearchLayerPresence::Present),
+            "absent" => Ok(VectorSearchLayerPresence::Absent),
+            _ => Err(()),
+        };
+        let tail = match disclosure.tail.as_str() {
+            "present" => VectorSearchTailState::Present,
+            "empty" => VectorSearchTailState::Empty,
+            _ => return Err(()),
+        };
+        let residual = match disclosure.residual.as_str() {
+            "none" => VectorSearchResidual::None,
+            "bounded" => VectorSearchResidual::Bounded,
+            "unsupported" => VectorSearchResidual::Unsupported,
+            _ => return Err(()),
+        };
+        let query_source = match disclosure.query_source.as_str() {
+            "<vector>" => VectorQuerySourceDisclosure::Vector,
+            "<redacted>" => VectorQuerySourceDisclosure::RedactedRowKey,
+            "unknown" => VectorQuerySourceDisclosure::Unknown,
+            _ => return Err(()),
+        };
+        Ok(Self {
+            requested_mode: mode(&disclosure.requested_mode)?,
+            resolved_mode: mode(&disclosure.resolved_mode)?,
+            aggregate_allowed_vectors: disclosure
+                .aggregate_allowed_vectors
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| ())?,
+            effective_auto_index_at: usize::try_from(disclosure.effective_auto_index_at)
+                .map_err(|_| ())?,
+            auto_index_at_source: disclosure.auto_index_at_source,
+            partition_key_columns: disclosure.partition_key_columns,
+            scope,
+            route,
+            base: layer(&disclosure.base)?,
+            change: layer(&disclosure.change)?,
+            tail,
+            residual,
+            fallback: disclosure.fallback,
+            refusal: disclosure.refusal,
+            recovery: disclosure.recovery,
+            query_source,
+            partition_hnsw: disclosure
+                .partition_hnsw
+                .into_iter()
+                .map(|partition| {
+                    Ok(VectorPartitionHnswDisclosure {
+                        partition: partition.partition,
+                        hnsw_m: usize::try_from(partition.hnsw_m).map_err(|_| ())?,
+                        hnsw_ef_construction: usize::try_from(partition.hnsw_ef_construction)
+                            .map_err(|_| ())?,
+                        hnsw_ef_search: usize::try_from(partition.hnsw_ef_search)
+                            .map_err(|_| ())?,
+                        ef_search_source: partition.ef_search_source,
+                        policy_revision: partition.policy_revision,
+                    })
+                })
+                .collect::<Result<Vec<_>, ()>>()?,
+        })
+    }
 }
 
 impl From<&QueryTrace> for CanonicalQueryTrace {
@@ -52,6 +215,7 @@ impl From<&QueryTrace> for CanonicalQueryTrace {
                 .collect(),
             sort_elided: trace.sort_elided,
             query_vector_source: trace.query_vector_source.clone(),
+            vector_search: trace.vector_search.as_ref().map(Into::into),
             rows_examined: trace.rows_examined,
         }
     }

@@ -90,6 +90,7 @@ pub(crate) mod read_contract;
 #[doc(hidden)]
 pub mod read_contract;
 mod read_image;
+mod read_image_memory;
 #[cfg(feature = "test-seams")]
 mod read_probe;
 mod read_progress;
@@ -135,6 +136,12 @@ pub use contextdb_core::read_contract::{
     CursorPage, OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus, OwnerRequestHandler,
     OwnerServiceTimeouts, ReadClientTimeouts, ReadLimits, ReadRoute,
 };
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub use contextdb_vector::{
+    VectorGraphCallbackPhaseForTest, VectorJournalTruncationPhaseForTest,
+    VectorMaintenancePreparationPhaseForTest, VectorMemoryWorkspacePhaseForTest,
+};
 pub use custody_types::{
     ApplicationTablePolicy, ApplicationTablePolicyExpectation, AuthenticatedTenantPolicyBinding,
     BoundTablePolicy, DeliveryManifest, DeliveryOutcome, DeliveryOutcomeCursor,
@@ -150,7 +157,10 @@ pub use database::{
     TriggerContext, TriggerDeclaration, TriggerEvent,
 };
 pub use database::{
-    CascadeReport, Database, ExportReport, IndexCandidate, QueryResult, QueryTrace,
+    CascadeReport, Database, ExplainOutput, ExportReport, IndexCandidate, QueryResult, QueryTrace,
+    VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,
+    VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute, VectorSearchScopeShape,
+    VectorSearchTailState,
 };
 pub use database::{
     CompactionReport, MaintenancePolicy, MaintenanceReport, MaintenanceStatus, PruningReport,
@@ -158,6 +168,13 @@ pub use database::{
     TableSizeEstimate,
 };
 pub use database::{SearchResult, SemanticQuery};
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub use database::{
+    VectorMaintenanceWorkerClockGuardForTest, VectorMaintenanceWorkerCycleForTest,
+    VectorMemoryOwnershipReceiptForTest, VectorPartitionGenerationRetentionForTest,
+    VectorPartitionJournalFileForTest,
+};
 pub use direct_file_reader::{
     DirectChangeState, DirectColumnReference, DirectConfigurationState, DirectEventTypeStatus,
     DirectEventsStatus, DirectImageMetadataKind, DirectImageState, DirectIndexColumn,
@@ -170,6 +187,9 @@ pub use direct_file_reader::{
 };
 #[cfg(feature = "sync-orchestration")]
 pub use identity::FabricIdentity;
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub use persistence::VectorGenerationCatalogRecordFaultForTest;
 pub use plugin::DatabasePlugin;
 pub use read_progress::{ReadPhase, ReadProgress, ReadProgressObserver};
 #[cfg(feature = "test-seams")]
@@ -192,3 +212,6 @@ pub use sync_types::{
 };
 
 pub(crate) mod custody;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod vector_observations;

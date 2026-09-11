@@ -18,6 +18,8 @@ pub enum Statement {
     ShowMemoryLimit,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
+    SetMaintenancePollInterval(u64),
+    ShowMaintenancePollInterval,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicy),
@@ -26,6 +28,12 @@ pub enum Statement {
     },
     ShowSyncBindings,
     ShowDeliveryOutcomes(ShowDeliveryOutcomes),
+    ShowVectorPartitions {
+        table: Option<String>,
+        column: Option<String>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    },
     CreateSchedule {
         name: String,
         every: String,
@@ -174,6 +182,7 @@ pub struct SelectBody {
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
+    pub use_vector: Option<VectorSearchMode>,
     pub use_rank: Option<String>,
     pub limit: Option<u64>,
 }
@@ -401,7 +410,7 @@ pub struct AlterTable {
 
 #[derive(Debug, Clone)]
 pub enum AlterAction {
-    AddColumn(ColumnDef),
+    AddColumn(Box<ColumnDef>),
     DropColumn {
         column: String,
         cascade: bool,
@@ -409,6 +418,33 @@ pub enum AlterAction {
     RenameColumn {
         from: String,
         to: String,
+    },
+    SetVectorMaxPartitions {
+        column: String,
+        /// Kept as written so semantic validation can type zero, negative, and
+        /// values wider than the persisted range without a parser overflow.
+        max_partitions: String,
+    },
+    SetVectorSearchMode {
+        column: String,
+        search_mode: VectorSearchMode,
+    },
+    SetVectorAutoIndexAt {
+        column: String,
+        /// `None` is the explicit `DEFAULT` spelling.
+        auto_index_at: Option<String>,
+    },
+    SetVectorHnsw {
+        column: String,
+        /// `None` is `HNSW DEFAULT`; otherwise omitted members retain their
+        /// current declarations and member `DEFAULT` values clear one member.
+        hnsw: Option<VectorHnswOptions>,
+    },
+    SetVectorConsolidation {
+        column: String,
+        /// `None` is `CONSOLIDATION DEFAULT`; otherwise omitted members
+        /// retain their current declarations.
+        consolidation: Option<VectorConsolidationOptions>,
     },
     SetRetain {
         duration_seconds: u64,
@@ -459,10 +495,42 @@ pub struct ColumnDef {
     pub expires: bool,
     pub immutable: bool,
     pub quantization: VectorQuantization,
+    pub partition_key_columns: Vec<String>,
+    /// Kept as written; validity and persisted numeric range belong to DDL
+    /// semantic validation rather than syntax parsing.
+    pub max_partitions: Option<String>,
+    pub search_mode: Option<VectorSearchMode>,
+    pub auto_index_at: Option<String>,
+    pub hnsw: VectorHnswOptions,
+    pub consolidation: VectorConsolidationOptions,
     pub rank_policy: Option<Box<RankPolicyAst>>,
     pub context_id: bool,
     pub scope_label: Option<Box<ScopeLabelConstraint>>,
     pub acl_ref: Option<Box<AclConstraint>>,
+}
+
+/// One parsed grouped HNSW declaration. The outer option on each member
+/// distinguishes omission (retain the current declaration) from a named
+/// value; a named `DEFAULT` is represented by [`VectorPolicyValue::Default`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorHnswOptions {
+    pub m: Option<VectorPolicyValue>,
+    pub ef_construction: Option<VectorPolicyValue>,
+    pub ef_search: Option<VectorPolicyValue>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorConsolidationOptions {
+    pub change_percent: Option<VectorPolicyValue>,
+    pub tombstone_percent: Option<VectorPolicyValue>,
+    /// Explicit `CONSOLIDATION NONE`; distinct from an omitted/default group.
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorPolicyValue {
+    Value(String),
+    Default,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -537,6 +605,13 @@ pub enum VectorQuantization {
     F32,
     SQ8,
     SQ4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorSearchMode {
+    Auto,
+    Exact,
+    Indexed,
 }
 
 #[derive(Debug, Clone)]

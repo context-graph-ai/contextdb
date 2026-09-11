@@ -678,7 +678,7 @@ impl BlobStore {
     }
 
     /// Harness seam (precedent: the shipped `split_changeset_for_test`):
-    /// make the holder SERVE `bytes` under `claimed` even though they do not
+    /// make the holder SERVE `bytes` under an ingested `claimed` even though they do not
     /// content-address to it — the consumer's verification is what must
     /// catch the lie.
     #[cfg(any(test, feature = "test-seams"))]
@@ -694,7 +694,7 @@ impl BlobStore {
     }
 
     /// Test seam: the exact PAYLOAD bytes (not wire/framing bytes) this
-    /// holder has served across every successfully completed transfer.
+    /// holder has handed to the network, including a subsequently aborted transfer.
     /// Zero when the local store never opened.
     #[cfg(any(test, feature = "test-seams"))]
     pub fn payload_bytes_emitted_for_test(&self) -> u64 {
@@ -709,6 +709,17 @@ impl BlobStore {
         self.store()
             .map(|s| s.fetch_requests_received())
             .unwrap_or(0)
+    }
+
+    /// Wait for the holder's provider task to finish its terminal accounting.
+    /// This is a test-only synchronization point for assertions that inspect
+    /// holder counters after a consumer-side verification failure.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub async fn wait_for_completed_serves_for_test(&self, completed: u64) -> Result<()> {
+        self.store()?
+            .wait_for_completed_serves_for_test(completed)
+            .await;
+        Ok(())
     }
 
     /// Harness seam: dial the holder's blob door via the STOCK fetch path,

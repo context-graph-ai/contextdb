@@ -1,4 +1,4 @@
-//! Statements 9/15: hidden custody rows never become pull progress or history-sized pages.
+//! Hidden custody rows never become pull progress or history-sized pages.
 //! This is a discardable scan optimization, not restore evidence. The signed
 //! image-prefix checkpoint remains mandatory even when this index is warm.
 use super::*;

@@ -85,8 +85,14 @@ fn sync_protocol_types_roundtrip_under_rmp_serde() {
     #[derive(serde::Serialize)]
     struct PullRequestMirror {
         since_lsn: u64,
+        max_entries: Option<u32>,
+        schema_recovery: Option<contextdb_server::protocol::SchemaRecoveryRequest>,
     }
-    let mirror = PullRequestMirror { since_lsn: 42 };
+    let mirror = PullRequestMirror {
+        since_lsn: 42,
+        max_entries: None,
+        schema_recovery: None,
+    };
     let mirror_bytes = rmp_serde::to_vec(&mirror).expect("PullRequestMirror encode");
     let decoded_as_typed: PullRequest = rmp_serde::from_slice(&mirror_bytes)
         .expect("typed PullRequest must decode from u64-mirror bytes");

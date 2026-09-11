@@ -1,8 +1,7 @@
 //! The store companion lock is named by APPENDING `.lock` to the full store
 //! filename, never by swapping the store's own extension.
 //!
-//! Authority: `.claude/plans/contextdb/active/contextdb-read-intent.md`,
-//! "Stable companion lock" -- `alpha.db` -> `alpha.db.lock`, never
+//! The companion lock name is stable: `alpha.db` -> `alpha.db.lock`, never
 //! `alpha.lock`. A downstream consumer (vigil) hand-derived this name with
 //! `Path::with_extension`, which is wrong whenever the store's own filename
 //! already carries an extension: it replaces that extension instead of

@@ -27,7 +27,7 @@ contextdb replaces all three with one embedded database. One transaction atomica
 
 | Capability | SQLite + extensions | contextdb |
 |---|---|---|
-| Vector search | sqlite-vec (separate extension, no unified transactions with relational data) | Built-in, auto-HNSW at 1K vectors, pre-filtered search, same MVCC transaction as rows |
+| Vector search | sqlite-vec (separate extension, no unified transactions with relational data) | Built-in maintained search with per-column policy, pre-filtered search, same MVCC transaction as rows <!-- enforced by: vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/hnsw_tests.rs::h08_prefiltered_search_respects_candidate_bitmap, tests/integration/hnsw_tests.rs::h19_relational_graph_and_vector_atomicity_hold_under_hnsw --> |
 | Graph traversal | Recursive CTEs (unbounded, no cycle detection) | SQL/PGQ-style MATCH with bounded BFS, typed edges |
 | State machines | CHECK constraints + validation triggers (bypassable) | `STATE MACHINE` in DDL, enforced by the database engine |
 | Atomic cross-model updates | Application-level coordination | Single MVCC transaction across relational + graph + vector |

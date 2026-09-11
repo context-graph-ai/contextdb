@@ -1,4 +1,4 @@
-//! Statements 1/3/7/13/14: runnable declare/bind/push/read recipe (see skills/sync).
+//! Runnable declare/bind/push/read recipe (see skills/sync).
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::sync_types::NaturalKey;
 use contextdb_engine::{ApplicationTablePolicyExpectation, Database, DeliveryManifest, SyncClient};

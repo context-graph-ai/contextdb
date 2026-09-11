@@ -19,7 +19,7 @@ const ROOT_CLAUSES: &str = "SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE \
      DELIVERY MANIFEST OVER record_parts";
 const MEMBER_CLAUSES: &str = "SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE";
 
-// Statement 19: Both conflicting sources and their incumbent use the declared application schema.
+// Both conflicting sources and their incumbent use the declared application schema.
 const ROOT_DDL: &str = "CREATE TABLE records (id UUID PRIMARY KEY, body TEXT) \
     SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE DELIVERY MANIFEST OVER record_parts";
 const MEMBER_DDL: &str = "CREATE TABLE record_parts \
@@ -40,21 +40,25 @@ fn bind_spec(identity_path: &Path) -> String {
     format!("iroh:?identity={}", identity_path.display())
 }
 
-/// The exact binary this lane built. Cargo hands it to a test target of the
-/// package that declares it; every other target reads the same value out of the
-/// environment the gate exports. A binary found by guessing at a target
-/// directory is not admissible here, so there is no third branch.
+#[path = "../../../tests/support/binary_path.rs"]
+mod binary_path;
+
+/// The `contextdb` CLI binary under test. Cargo only hands `CARGO_BIN_EXE_contextdb`
+/// to a test target of the package that declares that binary
+/// (`contextdb-cli`); `contextdb-engine`'s own test targets, this one
+/// included, are a different package, so an explicit env override always
+/// wins where the caller set one, and every other caller -- an ordinary
+/// contributor or CI running `cargo test --workspace` with neither variable
+/// exported -- falls back to the same freshly-built-workspace-binary
+/// resolution the acceptance and integration suites already use.
 fn cli_binary() -> PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_contextdb") {
         return PathBuf::from(path);
     }
-    match std::env::var_os("CARGO_BIN_EXE_contextdb") {
-        Some(path) => PathBuf::from(path),
-        None => panic!(
-            "this case runs the contextdb command-line binary and must be told which \
-             one: build it and export CARGO_BIN_EXE_contextdb with its exact path"
-        ),
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_contextdb") {
+        return PathBuf::from(path);
     }
+    binary_path::resolve_workspace_binary("contextdb")
 }
 
 /// Runs one command-line session over `path` and returns `(stdout, stderr)`.
@@ -171,7 +175,7 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
     }
 }
 
-// Statement 19: Administrative SHOW and CLI metadata reads are complete, constrained safely, and read-only.
+// Administrative SHOW and CLI metadata reads are complete, constrained safely, and read-only.
 #[tokio::test]
 async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_refuse_a_constrained_handle_and_render_json()
  {
@@ -193,12 +197,12 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
         )
         .expect("install durable declaration prerequisites for inspection");
 
-    // Statement 19: Install matching hub tables before either fixture binding; inspection
+    // Install matching hub tables before either fixture binding; inspection
     // does not depend on the separate arriving-DDL policy adoption target.
     hub.db.execute(ROOT_DDL, &p()).unwrap();
     hub.db.execute(MEMBER_DDL, &p()).unwrap();
 
-    // Statement 19: Prepare both actual verdict kinds before exercising inspection.
+    // Prepare both actual verdict kinds before exercising inspection.
     // An enrolled edge that has bound, written a unit and had it answered, so
     // all three questions have something real to answer with.
     let edge_identity = root.path().join("edge.db.fabric-identity.key");
@@ -219,7 +223,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
     )
     .await
     .expect("the edge binds both declared tables");
-    // Statement 19: The accepted source uses the same policy as the real incumbent.
+    // The accepted source uses the same policy as the real incumbent.
     edge.execute(ROOT_DDL, &p())
         .expect("the edge installs the bound root table");
     edge.execute(MEMBER_DDL, &p())
@@ -260,7 +264,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
     .await
     .expect("canonical committed outcome before inspection");
 
-    // Statement 19: A second edge loses a real same-key keep-first conflict. The existing
+    // A second edge loses a real same-key keep-first conflict. The existing
     // prerequisite seam verifies the differing incumbent and commits a signed refusal;
     // it cannot manufacture this outcome without an actual conflicting hub row.
     let refused_path = root.path().join("refused.db");
@@ -284,7 +288,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
     )
     .await
     .unwrap();
-    // Statement 19: Only row content differs on the refused source, never its bound policy.
+    // Only row content differs on the refused source, never its bound policy.
     refused.execute(ROOT_DDL, &p()).unwrap();
     refused.execute(MEMBER_DDL, &p()).unwrap();
     let key = contextdb_engine::sync_types::NaturalKey::single("id".into(), Value::Uuid(root_key));
@@ -315,7 +319,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
     ))
     .await
     .expect("a genuine conflicting incumbent produces the refusal fixture");
-    // Statement 19: Observe the real persisted terminal through the existing read adapter,
+    // Observe the real persisted terminal through the existing read adapter,
     // keeping inspection independent of the separate public delivery_outcome target.
     let refusals = refused.__delivery_prerequisite_wires_for_test().unwrap();
     assert_eq!(refusals.len(), 1);
@@ -330,13 +334,11 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
             .unwrap()
             .rows,
         vec![vec![Value::Text("root row".into())]],
-        "Statement 19: refusal leaves the actual incumbent unchanged"
+        "refusal leaves the actual incumbent unchanged"
     );
-    eprintln!(
-        "Statement 19 fixture: committed genuine keep_first_refused terminal; incumbent unchanged"
-    );
+    eprintln!("fixture: committed genuine keep_first_refused terminal; incumbent unchanged");
 
-    // Statement 19: Keep the original policy assertions after both real outcomes are prepared.
+    // Keep the original policy assertions after both real outcomes are prepared.
     let (policy_columns, policy_rows) = shown(&hub.db, "SHOW TENANT TABLE POLICY");
     for name in [
         "table",
@@ -352,7 +354,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
     assert_eq!(policy_rows.len(), 2, "both declared tables render");
 
     // ---- metadata only: repeat every question and compare what it touched --
-    // Statement 19: Repeated reads preserve both accepted and refused durable metadata.
+    // Repeated reads preserve both accepted and refused durable metadata.
     for db in [hub.db.as_ref(), edge.as_ref(), refused.as_ref()] {
         let before = untouchable_state(db, tenant);
         let first_policy = shown(db, "SHOW TENANT TABLE POLICY");
@@ -411,7 +413,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
     assert_eq!(
         hub_outcome_rows.len(),
         2,
-        "Statement 19: the hub renders one terminal outcome for each edge"
+        "the hub renders one terminal outcome for each edge"
     );
     let accepted = hub_outcome_rows
         .iter()
@@ -425,12 +427,12 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
     assert_eq!(rejected[cause_column], "Text(\"keep_first_refused\")");
     assert_ne!(
         accepted[edge_column], rejected[edge_column],
-        "Statement 19: hub outcomes retain the two submitting edge identities"
+        "hub outcomes retain the two submitting edge identities"
     );
     for row in &hub_outcome_rows {
         assert!(
             !row.iter().any(|cell| cell.contains("root row")),
-            "Statement 19: hub outcome metadata contains no row content: {row:?}"
+            "hub outcome metadata contains no row content: {row:?}"
         );
     }
     let (_, outcome_rows) = shown(&edge, "SHOW DELIVERY OUTCOMES FOR records");
@@ -492,14 +494,14 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
         }
     }
     drop(constrained);
-    // Statement 19: Release the refused CLI store after its authenticated fixture exchanges.
+    // Release the refused CLI store after its authenticated fixture exchanges.
     within(refused_client.shutdown()).await;
     drop(refused_client);
     drop(refused);
     drop(edge);
     hub.stop().await;
 
-    // Statement 19: the released file route enforces the same ceilings as the live owner.
+    // The released file route enforces the same ceilings as the live owner.
     assert_custody_read_limits(&hub_path, &edge_path);
 
     // ---- the command line, on a session that has no sync client at all ------
@@ -598,7 +600,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
         "no rendered document carries a row's content"
     );
 
-    // Statement 19: Observe the actual CLI JSON cause, including presence, exact spelling
+    // Observe the actual CLI JSON cause, including presence, exact spelling
     // and a nonempty value. Accepted/null above remains a separate required observation.
     let (refused_stdout, _) = run_cli(&refused_path, ".sync outcomes FOR records\n", false);
     let refused_results = result_documents(&refused_stdout);
@@ -621,7 +623,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
     for output in [&stdout, &edge_stdout, &refused_stdout] {
         assert!(
             !output.contains("root row"),
-            "Statement 19: metadata never discloses either row body"
+            "metadata never discloses either row body"
         );
     }
 
@@ -638,7 +640,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
     );
 }
 
-// Statement 19: custody SHOW uses ordinary row and byte ceilings, on both read routes.
+// Custody SHOW uses ordinary row and byte ceilings, on both read routes.
 fn assert_custody_read_limits(hub: &Path, edge: &Path) {
     use contextdb_core::read_contract::{ReadFailureKind, ReadLimits};
     use contextdb_engine::{ReadSession, ReadSessionOptions};

@@ -13,7 +13,7 @@
 
 #![cfg(all(unix, feature = "test-seams"))]
 
-use contextdb_core::{Lsn, TxId};
+use contextdb_core::{Lsn, TxId, VectorSearchMode};
 use contextdb_engine::read_contract::{decode_metadata_body, encode_metadata_body};
 use contextdb_engine::{
     DdlChange, DirectColumnReference, DirectEventTypeStatus, DirectEventsStatus, DirectImageState,
@@ -21,7 +21,9 @@ use contextdb_engine::{
     DirectRankPolicy, DirectReferencePropagation, DirectRetainPolicy, DirectRouteStatus,
     DirectScheduleStatus, DirectSchema, DirectSchemaColumn, DirectSchemaIndex,
     DirectScopeLabelKind, DirectSinkStatus, DirectStateMachine, DirectVectorQuantization,
-    MetadataBody,
+    MetadataBody, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
+    VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
+    VectorSearchScopeShape, VectorSearchTailState,
 };
 use std::collections::BTreeMap;
 
@@ -67,6 +69,9 @@ fn a_schema_with_every_corner_filled() -> DirectSchema {
                     }),
                 }),
                 quantization: None,
+                partition_key_columns: Vec::new(),
+                max_partitions: None,
+                search_mode: contextdb_core::VectorSearchMode::Auto,
                 rank: Some(DirectRankPolicy {
                     sort_key: "score".to_owned(),
                     formula: "recency".to_owned(),
@@ -105,6 +110,9 @@ fn a_schema_with_every_corner_filled() -> DirectSchema {
                     propagation: None,
                 }),
                 quantization: Some(DirectVectorQuantization::F32),
+                partition_key_columns: Vec::new(),
+                max_partitions: None,
+                search_mode: contextdb_core::VectorSearchMode::Auto,
                 rank: None,
                 // The other side of the tag: the Simple form, one label set.
                 scope_label: Some(DirectScopeLabelKind::Simple {
@@ -123,6 +131,9 @@ fn a_schema_with_every_corner_filled() -> DirectSchema {
                 default: None,
                 references: None,
                 quantization: Some(DirectVectorQuantization::Sq8),
+                partition_key_columns: vec!["scope_id".to_owned(), "kind".to_owned()],
+                max_partitions: Some(17),
+                search_mode: contextdb_core::VectorSearchMode::Indexed,
                 rank: None,
                 scope_label: None,
                 acl_ref: None,
@@ -138,6 +149,9 @@ fn a_schema_with_every_corner_filled() -> DirectSchema {
                 default: None,
                 references: None,
                 quantization: Some(DirectVectorQuantization::Sq4),
+                partition_key_columns: Vec::new(),
+                max_partitions: None,
+                search_mode: contextdb_core::VectorSearchMode::Exact,
                 rank: None,
                 scope_label: None,
                 acl_ref: None,
@@ -223,6 +237,9 @@ fn a_schema_with_nothing_optional() -> DirectSchema {
             default: None,
             references: None,
             quantization: None,
+            partition_key_columns: Vec::new(),
+            max_partitions: None,
+            search_mode: contextdb_core::VectorSearchMode::Auto,
             rank: None,
             scope_label: None,
             acl_ref: None,
@@ -313,11 +330,44 @@ fn an_explained_statement_survives_the_wire() {
         sql: "SELECT id FROM documents WHERE body = $body".to_owned(),
         physical_plan: "IndexScan".to_owned(),
         index: Some("by_body".to_owned()),
+        vector_search: None,
     });
     survives_the_wire(&MetadataBody::Explain {
         sql: "SELECT id FROM documents".to_owned(),
         physical_plan: "Scan".to_owned(),
         index: None,
+        vector_search: None,
+    });
+    survives_the_wire(&MetadataBody::Explain {
+        sql: "SELECT id FROM documents ORDER BY embedding <=> $query LIMIT 2".to_owned(),
+        physical_plan: "Project -> HNSWSearch".to_owned(),
+        index: None,
+        vector_search: Some(VectorSearchDisclosure {
+            requested_mode: VectorSearchMode::Auto,
+            resolved_mode: VectorSearchMode::Indexed,
+            aggregate_allowed_vectors: Some(1_024),
+            effective_auto_index_at: 1_000,
+            auto_index_at_source: "declared".to_owned(),
+            partition_key_columns: vec!["scope_id".to_owned()],
+            scope: VectorSearchScopeShape::Few,
+            route: Some(VectorSearchRoute::FilteredIndexed),
+            base: VectorSearchLayerPresence::Present,
+            change: VectorSearchLayerPresence::Present,
+            tail: VectorSearchTailState::Present,
+            residual: VectorSearchResidual::Bounded,
+            fallback: Some("exact tail".to_owned()),
+            refusal: None,
+            recovery: Some("run vector maintenance and retry".to_owned()),
+            query_source: VectorQuerySourceDisclosure::RedactedRowKey,
+            partition_hnsw: vec![VectorPartitionHnswDisclosure {
+                partition: "<redacted:1>".to_owned(),
+                hnsw_m: 24,
+                hnsw_ef_construction: 240,
+                hnsw_ef_search: 96,
+                ef_search_source: "declared".to_owned(),
+                policy_revision: 7,
+            }],
+        }),
     });
 }
 

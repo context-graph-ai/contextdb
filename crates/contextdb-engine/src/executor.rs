@@ -1,6 +1,7 @@
 use crate::database::{
-    Database, InsertRowResult, QueryResult, QueryTrace, UpdateReplacementContext,
-    UpsertIntentDetails, rank_index_name,
+    Database, InsertRowResult, MaintenancePolicy, QueryResult, QueryTrace,
+    UpdateReplacementContext, UpsertIntentDetails, VectorSearchDisclosure, rank_index_name,
+    retained_row_bytes_for_meta,
 };
 use crate::rank_formula::RankFormula;
 use crate::sync_types::{DdlChange, natural_key_from_row_values};
@@ -22,7 +23,6 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -47,6 +47,19 @@ pub(crate) type BoundedRowVectorClone = (Vec<f32>, usize);
 
 /// Scored vector candidates, with the bytes their scores retain.
 pub(crate) type BoundedVectorCandidates = (Vec<(RowId, f32)>, usize);
+
+/// A complete maintained answer, or the explicit reason the caller must not
+/// publish graph rows. The vector layer keeps the detailed maintenance
+/// reason; this seam keeps the route decision that the SQL operator must
+/// honour for the already-resolved search mode.
+#[derive(Debug)]
+pub(crate) enum BoundedVectorSearchOutcome {
+    CompleteEmpty,
+    Complete(BoundedVectorCandidates),
+    ExactRequired,
+    Unavailable,
+    Incomplete,
+}
 
 /// The store a bounded read runs against.
 ///
@@ -124,12 +137,10 @@ pub(crate) struct TransactionVectorOverlay {
     /// Where this index's staged vectors sit in the write set, newest version
     /// per row, in the order the transaction staged them.
     pub(crate) staged_positions: Vec<usize>,
-    /// How many entries this index can be searched over once the
-    /// transaction's own vectors are counted in. A source that stops at the
-    /// statement's LIMIT would truncate before the overlay has had its say --
-    /// dropping a row this transaction removed still leaves the answer one
-    /// short, and a row it staged never gets to compete at all -- so the
-    /// source is asked for this many and the truncation happens after.
+    /// How many transaction-delta entries can remove, move, or add to the
+    /// source answer. A source that stops at the statement's LIMIT would
+    /// truncate before the overlay has had its say, so this many extra
+    /// committed candidates are requested and final truncation happens after.
     pub(crate) searchable_entry_count: usize,
     /// What holding the above costs.
     pub(crate) bytes: usize,
@@ -153,14 +164,28 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// The value a row's vector column holds, taken from the store that holds
     /// it. A column declared with space-saving storage keeps its value there
     /// and nowhere else, so a read that names such a column asks here.
-    fn row_vector_for_column(
+    fn load_row_vector_for_column(
         &self,
+        tx: Option<TxId>,
         table: &str,
         column: &str,
         row_id: RowId,
         lsn: Lsn,
         snapshot: SnapshotId,
-    ) -> Option<Vec<f32>>;
+    ) -> Result<Option<Vec<f32>>>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_score_committed_vector_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        query: &[f32],
+        before_checkpoint: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<f32>, BoundedExecutionError>;
 
     /// Which of a table's vector columns keep their value in the store alone.
     fn quantized_vector_columns(&self, table: &str) -> Vec<String>;
@@ -211,17 +236,33 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     }
 
     /// The plan the engine WOULD run for this statement, rendered without
-    /// running it.
-    ///
-    /// Explaining a read runs it, because the route a read really takes is
-    /// only known once it has taken it. Explaining a write cannot run it, so
-    /// what it answers is the plan itself -- planning reads schema and
-    /// chooses a strategy, and changes nothing.
+    /// running it. Executed-route facts are exposed by the query trace, not by
+    /// this metadata operation.
     fn explain_plan_without_running_it(&self, sql: &str) -> Result<String> {
         let _ = sql;
         Err(Error::PlanError(
             "bounded execution accepts read-only SELECT plans".to_string(),
         ))
+    }
+
+    /// Structured passive explanation used by metadata and CLI surfaces,
+    /// planned against the caller's own binding: a partition scope resolves
+    /// only once its key binds, so the binding decides the route explained.
+    fn explain_output_without_running_it(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<crate::database::ExplainOutput> {
+        let _ = params;
+        self.explain_plan_without_running_it(sql)
+            .map(|physical_plan| crate::database::ExplainOutput {
+                physical_plan,
+                index_used: None,
+                predicates_pushed: Vec::new(),
+                indexes_considered: Vec::new(),
+                sort_elided: false,
+                vector_search: None,
+            })
     }
 
     /// The transaction this target has open, if it has one.
@@ -280,6 +321,13 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         Ok(None)
     }
 
+    #[cfg(feature = "test-seams")]
+    fn note_vector_candidate_materialized(&self);
+
+    fn capture_read_schema(&self) -> crate::database::SchemaPublicationGuard<'_>;
+
+    fn relational_membership_store(&self) -> &contextdb_relational::RelationalStore;
+
     fn bounded_read_snapshot_registration(
         &self,
         withdrawn: &OwnerReadCancellation,
@@ -295,6 +343,18 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn assert_table_read_allowed(&self, table: &str) -> Result<()>;
 
     fn bounded_read_requires_candidate_filter(&self, table: &str) -> Result<bool>;
+
+    fn vector_access_predicate(&self, table: &str) -> Result<Option<Expr>>;
+
+    fn bounded_vector_visit_visible_ids(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        before_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+        visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError>;
 
     fn bounded_read_allowed_for_row(
         &self,
@@ -425,12 +485,39 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         actual: usize,
     ) -> Result<()>;
 
+    #[allow(clippy::too_many_arguments)]
     fn bounded_vector_candidate_k(
         &self,
         index: &VectorIndexRef,
         requested: usize,
         sort_key: Option<&str>,
-    ) -> Result<usize>;
+        snapshot: SnapshotId,
+        candidates: Option<&[u64]>,
+        before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        acquire: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release: &mut dyn FnMut(usize),
+    ) -> std::result::Result<usize, BoundedExecutionError>;
+
+    fn bounded_vector_entry_count(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> usize;
+
+    /// The structural account of the route this vector read actually used.
+    /// Values and authorization decisions have no representation in it, so a
+    /// cursor can retain and republish it without retaining caller secrets.
+    #[allow(clippy::too_many_arguments)]
+    fn completed_vector_search_disclosure(
+        &self,
+        index: VectorIndexRef,
+        k: usize,
+        restricted_candidates: bool,
+        candidates: Option<&PhysicalPlan>,
+        search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
+        query_expr: &Expr,
+        snapshot: SnapshotId,
+        params: &HashMap<String, Value>,
+        aggregate_allowed_vectors: usize,
+        authorized_sorted_ids: Option<&[u64]>,
+        used_hnsw: bool,
+    ) -> Result<VectorSearchDisclosure>;
 
     /// The copy the caller makes while the row is still borrowed under the
     /// schema read, reported with the bytes it charged for.
@@ -471,6 +558,16 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         release_retained: &mut dyn FnMut(usize),
     ) -> std::result::Result<contextdb_vector::mem::BoundedVectorStep, BoundedExecutionError>;
 
+    fn bounded_authorized_visible_vector_count(
+        &self,
+        index: &VectorIndexRef,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<usize, BoundedExecutionError>;
+
     #[allow(clippy::too_many_arguments)]
     fn bounded_hnsw_vector_search(
         &self,
@@ -479,23 +576,14 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         k: usize,
         candidates: Option<&[u64]>,
         snapshot: SnapshotId,
+        mode: VectorSearchMode,
+        aggregate_allowed_count: usize,
+        allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
-    ) -> std::result::Result<Option<BoundedVectorCandidates>, BoundedExecutionError>;
-
-    /// Build this index's approximate graph if this snapshot is entitled to
-    /// one, and answer whether a graph is now there to search.
-    ///
-    /// A search does not build on its own terms: it asks the store, which
-    /// builds under its own maintenance lock and its own rules. Without this,
-    /// a store searched only through this door would never build a graph at
-    /// all -- every search would score every row, and say so.
-    fn bounded_ensure_hnsw_built(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> bool {
-        let _ = (index, snapshot);
-        false
-    }
+    ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError>;
 
     /// The standing visited ceiling a traversal keeps when the caller declared
     /// no budget of its own, and `None` when it declared one -- a declared
@@ -879,15 +967,41 @@ impl BoundedCursorTarget {
 /// these questions.
 #[allow(clippy::too_many_arguments)]
 impl ReadExecutionTarget for Database {
-    fn row_vector_for_column(
+    fn load_row_vector_for_column(
         &self,
+        tx: Option<TxId>,
         table: &str,
         column: &str,
         row_id: RowId,
         lsn: Lsn,
         snapshot: SnapshotId,
-    ) -> Option<Vec<f32>> {
-        Database::row_vector_for_column(self, table, column, row_id, lsn, snapshot)
+    ) -> Result<Option<Vec<f32>>> {
+        Database::load_row_vector_for_column(self, tx, table, column, row_id, lsn, snapshot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_score_committed_vector_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        query: &[f32],
+        before_checkpoint: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<f32>, BoundedExecutionError> {
+        Database::bounded_score_committed_vector_row(
+            self,
+            index,
+            row_id,
+            snapshot,
+            query,
+            before_checkpoint,
+            before_distance,
+            before_retain,
+            release_retained,
+        )
     }
 
     fn quantized_vector_columns(&self, table: &str) -> Vec<String> {
@@ -947,6 +1061,14 @@ impl ReadExecutionTarget for Database {
         Database::explain(self, sql)
     }
 
+    fn explain_output_without_running_it(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<crate::database::ExplainOutput> {
+        Database::explain_output_with_params(self, sql, params)
+    }
+
     fn active_read_transaction(&self) -> Option<TxId> {
         Database::active_read_transaction(self)
     }
@@ -983,6 +1105,19 @@ impl ReadExecutionTarget for Database {
         Database::transaction_staged_vector(self, tx, position, before_touch, before_clone)
     }
 
+    #[cfg(feature = "test-seams")]
+    fn note_vector_candidate_materialized(&self) {
+        self.__bump_candidate_rows_materialized_for_test(1);
+    }
+
+    fn capture_read_schema(&self) -> crate::database::SchemaPublicationGuard<'_> {
+        Database::capture_read_schema(self)
+    }
+
+    fn relational_membership_store(&self) -> &contextdb_relational::RelationalStore {
+        self.relational_store()
+    }
+
     fn bounded_read_snapshot_registration(
         &self,
         withdrawn: &OwnerReadCancellation,
@@ -1005,6 +1140,30 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_read_requires_candidate_filter(&self, table: &str) -> Result<bool> {
         Database::bounded_read_requires_candidate_filter(self, table)
+    }
+
+    fn vector_access_predicate(&self, table: &str) -> Result<Option<Expr>> {
+        Database::vector_access_predicate(self, table)
+    }
+
+    fn bounded_vector_visit_visible_ids(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        before_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+        visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        Database::bounded_vector_visit_visible_ids(
+            self,
+            index,
+            snapshot,
+            before_entry,
+            before_retain,
+            release_retained,
+            visit,
+        )
     }
 
     fn bounded_read_allowed_for_row(
@@ -1195,13 +1354,63 @@ impl ReadExecutionTarget for Database {
         Database::validate_vector_under_schema_read(self, index, actual)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bounded_vector_candidate_k(
         &self,
         index: &VectorIndexRef,
         requested: usize,
         sort_key: Option<&str>,
-    ) -> Result<usize> {
-        Database::bounded_vector_candidate_k(self, index, requested, sort_key)
+        snapshot: SnapshotId,
+        candidates: Option<&[u64]>,
+        before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        acquire: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release: &mut dyn FnMut(usize),
+    ) -> std::result::Result<usize, BoundedExecutionError> {
+        Database::bounded_vector_candidate_k(
+            self,
+            index,
+            requested,
+            sort_key,
+            snapshot,
+            candidates,
+            before_source,
+            acquire,
+            release,
+        )
+    }
+
+    fn bounded_vector_entry_count(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> usize {
+        Database::vector_entry_count(self, index, snapshot)
+    }
+
+    fn completed_vector_search_disclosure(
+        &self,
+        index: VectorIndexRef,
+        k: usize,
+        restricted_candidates: bool,
+        candidates: Option<&PhysicalPlan>,
+        search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
+        query_expr: &Expr,
+        snapshot: SnapshotId,
+        params: &HashMap<String, Value>,
+        aggregate_allowed_vectors: usize,
+        authorized_sorted_ids: Option<&[u64]>,
+        used_hnsw: bool,
+    ) -> Result<VectorSearchDisclosure> {
+        Database::completed_vector_search_disclosure(
+            self,
+            index,
+            k,
+            restricted_candidates,
+            candidates,
+            search_mode,
+            query_expr,
+            snapshot,
+            params,
+            aggregate_allowed_vectors,
+            authorized_sorted_ids,
+            used_hnsw,
+        )
     }
 
     fn with_bounded_row_vector(
@@ -1218,7 +1427,7 @@ impl ReadExecutionTarget for Database {
             BoundedExecutionError,
         >,
     ) -> std::result::Result<Option<BoundedRowVectorClone>, BoundedExecutionError> {
-        Database::with_bounded_row_vector(
+        Database::with_row_vector_source(
             self,
             index,
             row_id,
@@ -1272,6 +1481,26 @@ impl ReadExecutionTarget for Database {
         )
     }
 
+    fn bounded_authorized_visible_vector_count(
+        &self,
+        index: &VectorIndexRef,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<usize, BoundedExecutionError> {
+        Database::bounded_authorized_visible_vector_count(
+            self,
+            index,
+            candidates,
+            snapshot,
+            before_source_entry,
+            before_retain,
+            release_retained,
+        )
+    }
+
     fn bounded_hnsw_vector_search(
         &self,
         index: &VectorIndexRef,
@@ -1279,11 +1508,14 @@ impl ReadExecutionTarget for Database {
         k: usize,
         candidates: Option<&[u64]>,
         snapshot: SnapshotId,
+        mode: VectorSearchMode,
+        aggregate_allowed_count: usize,
+        allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
-    ) -> std::result::Result<Option<BoundedVectorCandidates>, BoundedExecutionError> {
+    ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError> {
         Database::bounded_hnsw_vector_search(
             self,
             index,
@@ -1291,15 +1523,14 @@ impl ReadExecutionTarget for Database {
             k,
             candidates,
             snapshot,
+            mode,
+            aggregate_allowed_count,
+            allowed_search_limits,
             before_source_entry,
             before_distance,
             before_retain,
             release_retained,
         )
-    }
-
-    fn bounded_ensure_hnsw_built(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> bool {
-        Database::bounded_ensure_hnsw_built(self, index, snapshot)
     }
 
     fn bounded_legacy_visited_cap(&self, declares_no_ceilings: bool) -> Option<usize> {
@@ -1792,6 +2023,7 @@ impl From<Error> for BoundedExecutionError {
             // what moved underneath it, stays a refusal the caller can branch
             // on rather than collapsing into an engine fault.
             Error::ReadFailure(failure) => Self::Refused(failure),
+            Error::ReadCancelled => Self::Cancelled,
             other => Self::Engine(other),
         }
     }
@@ -1846,6 +2078,7 @@ pub(crate) enum BoundedSourceTouch {
     /// themselves, which is what the executor reports as examined.
     AdjacencyEntry,
     BruteForceVectorCandidate,
+    #[cfg(feature = "test-seams")]
     HnswCandidate,
     RankCandidate,
     AccessRow,
@@ -1866,6 +2099,7 @@ pub(crate) struct BoundedExecutionTelemetry {
 #[derive(Debug)]
 pub(crate) struct BoundedExecutionResult {
     pub(crate) result: QueryResult,
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub(crate) telemetry: BoundedExecutionTelemetry,
 }
 
@@ -1885,6 +2119,7 @@ pub(crate) struct BoundedCursorHandle {
 pub(crate) struct BoundedCursorOpen {
     pub(crate) cursor: BoundedCursorHandle,
     pub(crate) first_page: CursorPage,
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
     pub(crate) telemetry: BoundedExecutionTelemetry,
 }
 
@@ -1961,6 +2196,8 @@ pub(crate) fn observe_bounded_rank_candidate() {
 /// immediately before returning the cancellation refusal.
 #[cfg(feature = "test-seams")]
 pub(crate) trait BoundedExecutionProbe: Send + Sync {
+    fn after_snapshot_registration(&self) {}
+    fn after_source_capture(&self) {}
     fn before_work(&self, source: BoundedWorkSource, completed_work: u64);
     fn before_source_touch(&self, touch: BoundedSourceTouch, completed_items: u64);
     /// This callback can only arrive through the vector crate's sealed
@@ -1990,6 +2227,860 @@ pub(crate) trait BoundedExecutionProbe: Send + Sync {
 #[doc(hidden)]
 pub mod bounded_read_test_support;
 
+const VECTOR_INDEX_INSPECTION_COLUMNS: &[&str] = &[
+    "table",
+    "column",
+    "dimension",
+    "quantization",
+    "vector_count",
+    "bytes",
+    "partition_key_columns",
+    "max_partitions",
+    "live_partitions",
+    "retained_partitions",
+    "search_mode",
+    "declared_auto_index_at",
+    "effective_auto_index_at",
+    "declared_hnsw_m",
+    "declared_hnsw_ef_construction",
+    "declared_hnsw_ef_search",
+    "declared_consolidation_mode",
+    "declared_consolidation_change_percent",
+    "declared_consolidation_tombstone_percent",
+    "effective_consolidation_mode",
+    "effective_consolidation_change_percent",
+    "effective_consolidation_tombstone_percent",
+    "oldest_base_tx",
+    "newest_base_tx",
+    "pending_inserts",
+    "tombstones",
+    "durable_vector_bytes",
+    "charged_vector_bytes",
+    "durable_index_bytes",
+    "charged_index_bytes",
+    "query_state",
+    "maintenance_state",
+    "maintenance_vectors_total",
+    "maintenance_vectors_done",
+    "maintenance_vectors_remaining",
+    "unavailable_partitions",
+    "stalled_partitions",
+    "broad_route",
+    "broad_route_state",
+    "broad_route_base_tx",
+    "broad_route_vectors_total",
+    "broad_route_vectors_done",
+    "broad_route_vectors_remaining",
+    "broad_route_reason",
+    "broad_route_recovery_action",
+];
+
+const VECTOR_PARTITION_INSPECTION_COLUMNS: &[&str] = &[
+    "table",
+    "column",
+    "partition_key",
+    "live_rows",
+    "retained_rows",
+    "base_generation",
+    "base_tx",
+    "pending_inserts",
+    "tombstones",
+    "durable_vector_bytes",
+    "charged_vector_bytes",
+    "durable_index_bytes",
+    "charged_index_bytes",
+    "query_state",
+    "availability_reason",
+    "maintenance_state",
+    "maintenance_reason",
+    "maintenance_vectors_total",
+    "maintenance_vectors_done",
+    "maintenance_vectors_remaining",
+    "maintenance_checkpoint_tx",
+    "desired_hnsw_m",
+    "desired_hnsw_ef_construction",
+    "desired_hnsw_ef_search",
+    "serving_hnsw_m",
+    "serving_hnsw_ef_construction",
+    "serving_hnsw_ef_search",
+    "declared_consolidation_mode",
+    "declared_consolidation_change_percent",
+    "declared_consolidation_tombstone_percent",
+    "effective_consolidation_mode",
+    "effective_consolidation_change_percent",
+    "effective_consolidation_tombstone_percent",
+    "desired_policy_revision",
+    "serving_policy_revision",
+    "recovery_action",
+];
+
+fn vector_inspection_columns(columns: &[&str]) -> Vec<String> {
+    columns.iter().map(|column| (*column).to_owned()).collect()
+}
+
+fn vector_inspection_usize(value: usize, field: &str) -> Result<Value> {
+    i64::try_from(value).map(Value::Int64).map_err(|_| {
+        Error::Other(format!(
+            "vector inspection field '{field}' exceeds the SQL INTEGER range"
+        ))
+    })
+}
+
+fn vector_inspection_u64(value: u64, field: &str) -> Result<Value> {
+    i64::try_from(value).map(Value::Int64).map_err(|_| {
+        Error::Other(format!(
+            "vector inspection field '{field}' exceeds the SQL INTEGER range"
+        ))
+    })
+}
+
+fn vector_inspection_optional_usize(value: Option<usize>, field: &str) -> Result<Value> {
+    value
+        .map(|value| vector_inspection_usize(value, field))
+        .transpose()
+        .map(|value| value.unwrap_or(Value::Null))
+}
+
+fn vector_inspection_optional_tx(value: Option<TxId>, field: &str) -> Result<Value> {
+    value
+        .map(|value| vector_inspection_u64(value.0, field))
+        .transpose()
+        .map(|value| value.unwrap_or(Value::Null))
+}
+
+fn vector_inspection_partition_sum(
+    partitions: &[contextdb_vector::store::VectorPartitionInfo],
+    field: &str,
+    value: impl Fn(&contextdb_vector::store::VectorPartitionInfo) -> usize,
+) -> Result<usize> {
+    partitions.iter().try_fold(0usize, |total, partition| {
+        total
+            .checked_add(value(partition))
+            .ok_or_else(|| Error::Other(format!("vector inspection {field} overflow")))
+    })
+}
+
+fn vector_partition_component_json(component: &VectorPartitionComponent) -> serde_json::Value {
+    match component {
+        VectorPartitionComponent::Uuid(value) => serde_json::Value::String(value.to_string()),
+        VectorPartitionComponent::Text(value) => serde_json::Value::String(value.clone()),
+        VectorPartitionComponent::Integer(value) => serde_json::Value::Number((*value).into()),
+        VectorPartitionComponent::Boolean(value) => serde_json::Value::Bool(*value),
+        VectorPartitionComponent::Timestamp(value) => serde_json::Value::Number((*value).into()),
+        VectorPartitionComponent::TxId(value) => serde_json::Value::Number(value.0.into()),
+    }
+}
+
+fn vector_partition_key_json(columns: &[String], key: &VectorPartitionKey) -> Result<Value> {
+    if columns.len() != key.components().len() {
+        return Err(Error::Other(
+            "vector partition key does not match its declared column shape".to_owned(),
+        ));
+    }
+    let mut object = serde_json::Map::new();
+    for (column, component) in columns.iter().zip(key.components()) {
+        object.insert(column.clone(), vector_partition_component_json(component));
+    }
+    Ok(Value::Json(serde_json::Value::Object(object)))
+}
+
+fn vector_partition_query_state(
+    partition: &contextdb_vector::store::VectorPartitionInfo,
+) -> &'static str {
+    if partition.quarantine_reason.is_some() {
+        "unavailable"
+    } else if partition.live_rows == 0 {
+        "empty"
+    } else if partition.graph_available {
+        "ready"
+    } else {
+        "unavailable"
+    }
+}
+
+fn vector_index_query_state(
+    partitions: &[contextdb_vector::store::VectorPartitionInfo],
+) -> &'static str {
+    let mut routes = 0usize;
+    let mut ready = 0usize;
+    for partition in partitions {
+        if partition.live_rows == 0 && partition.quarantine_reason.is_none() {
+            continue;
+        }
+        routes = routes.saturating_add(1);
+        if partition.graph_available && partition.quarantine_reason.is_none() {
+            ready = ready.saturating_add(1);
+        }
+    }
+    match (routes, ready) {
+        (0, _) => "empty",
+        (routes, ready) if routes == ready => "ready",
+        (_, 0) => "unavailable",
+        _ => "partial",
+    }
+}
+
+fn vector_maintenance_recovery_action(policy: MaintenancePolicy) -> &'static str {
+    match policy {
+        MaintenancePolicy::CallerDriven => "run_maintenance_cycle",
+        MaintenancePolicy::EngineOwned => "wait_for_automatic_work",
+    }
+}
+
+fn published_vector_maintenance_reason(reason: &'static str) -> &'static str {
+    match reason {
+        // Storage retains this implementation label in active progress while
+        // inspection publishes the settled lifecycle vocabulary.
+        "policy_replacement" => "new_changes",
+        published => published,
+    }
+}
+
+fn vector_unavailable_failure_reason(
+    failure: contextdb_vector::store::VectorMaintenanceFailure,
+) -> &'static str {
+    match failure {
+        contextdb_vector::store::VectorMaintenanceFailure::MemoryLimit
+        | contextdb_vector::store::VectorMaintenanceFailure::DiskLimit => "resource_stalled",
+        contextdb_vector::store::VectorMaintenanceFailure::BuildFailure => "build_failure",
+    }
+}
+
+fn vector_maintenance_failure_lifecycle(
+    failure: contextdb_vector::store::VectorMaintenanceFailure,
+    graph_available: bool,
+    checkpoint_tx: Option<TxId>,
+) -> VectorInspectionLifecycle {
+    VectorInspectionLifecycle {
+        availability_reason: if graph_available {
+            "none"
+        } else {
+            vector_unavailable_failure_reason(failure)
+        },
+        maintenance_state: "stalled",
+        maintenance_reason: failure.reason(),
+        vectors_total: None,
+        vectors_done: None,
+        vectors_remaining: None,
+        checkpoint_tx,
+        recovery_action: failure.recovery_action(),
+    }
+}
+
+fn broad_route_recovery_action(
+    lifecycle: &[VectorInspectionLifecycle],
+    broad_route_reason: &str,
+) -> &'static str {
+    lifecycle
+        .iter()
+        .find(|lifecycle| lifecycle.availability_reason == broad_route_reason)
+        .filter(|_| broad_route_reason != "none")
+        .map(|lifecycle| lifecycle.recovery_action)
+        .unwrap_or("none")
+}
+
+fn whole_index_maintenance_state(lifecycle: &[VectorInspectionLifecycle]) -> &'static str {
+    let mut has_stalled = false;
+    let mut common_live_activity = None;
+    let mut several_live_activities = false;
+
+    for lifecycle in lifecycle {
+        match lifecycle.maintenance_state {
+            "idle" => {}
+            "stalled" => has_stalled = true,
+            activity => match common_live_activity {
+                None => common_live_activity = Some(activity),
+                Some(common) if common == activity => {}
+                Some(_) => several_live_activities = true,
+            },
+        }
+    }
+
+    match (has_stalled, common_live_activity, several_live_activities) {
+        (false, None, _) => "idle",
+        (false, Some(activity), false) => activity,
+        (false, Some(_), true) => "active",
+        (true, None, _) => "stalled",
+        (true, Some(_), _) => "mixed",
+    }
+}
+
+fn fanout_broad_route_state(
+    partitions: &[contextdb_vector::store::VectorPartitionInfo],
+) -> &'static str {
+    match vector_index_query_state(partitions) {
+        "empty" => "ready",
+        state => state,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct VectorInspectionLifecycle {
+    availability_reason: &'static str,
+    maintenance_state: &'static str,
+    maintenance_reason: &'static str,
+    vectors_total: Option<usize>,
+    vectors_done: Option<usize>,
+    vectors_remaining: Option<usize>,
+    checkpoint_tx: Option<TxId>,
+    recovery_action: &'static str,
+}
+
+#[cfg(test)]
+mod vector_inspection_aggregation_tests {
+    use super::*;
+
+    fn lifecycle(maintenance_state: &'static str) -> VectorInspectionLifecycle {
+        VectorInspectionLifecycle {
+            availability_reason: "none",
+            maintenance_state,
+            maintenance_reason: "none",
+            vectors_total: None,
+            vectors_done: None,
+            vectors_remaining: None,
+            checkpoint_tx: None,
+            recovery_action: "none",
+        }
+    }
+
+    #[test]
+    fn whole_index_maintenance_keeps_live_and_stalled_work_distinct() {
+        for (states, expected) in [
+            (&["idle", "idle"][..], "idle"),
+            (&["idle", "building", "building"][..], "building"),
+            (&["idle", "replaying", "replaying"][..], "replaying"),
+            (&["compacting", "compacting"][..], "compacting"),
+            (&["repairing", "idle"][..], "repairing"),
+            (&["building", "replaying"][..], "active"),
+            (&["idle", "stalled", "stalled"][..], "stalled"),
+            (&["stalled", "building"][..], "mixed"),
+        ] {
+            let lifecycle = states.iter().copied().map(lifecycle).collect::<Vec<_>>();
+            assert_eq!(whole_index_maintenance_state(&lifecycle), expected);
+        }
+    }
+
+    #[test]
+    fn an_empty_fanout_is_ready_while_the_index_stays_empty() {
+        let partitions = Vec::<contextdb_vector::store::VectorPartitionInfo>::new();
+        assert_eq!(vector_index_query_state(&partitions), "empty");
+        assert_eq!(fanout_broad_route_state(&partitions), "ready");
+    }
+
+    #[test]
+    fn healthy_and_failed_layout_actions_use_only_published_recovery_words() {
+        let healthy = lifecycle("idle");
+        assert_eq!(broad_route_recovery_action(&[healthy], "none"), "none");
+
+        for (failure, available, maintenance_reason, action) in [
+            (
+                contextdb_vector::store::VectorMaintenanceFailure::MemoryLimit,
+                "resource_stalled",
+                "memory_limit",
+                "raise_memory_limit",
+            ),
+            (
+                contextdb_vector::store::VectorMaintenanceFailure::DiskLimit,
+                "resource_stalled",
+                "disk_limit",
+                "raise_disk_limit_or_free_space",
+            ),
+            (
+                contextdb_vector::store::VectorMaintenanceFailure::BuildFailure,
+                "build_failure",
+                "build_failure",
+                "inspect_build_failure",
+            ),
+        ] {
+            let stalled = vector_maintenance_failure_lifecycle(failure, false, Some(TxId(7)));
+            assert_eq!(stalled.availability_reason, available);
+            assert_eq!(stalled.maintenance_reason, maintenance_reason);
+            assert_eq!(stalled.recovery_action, action);
+            assert_eq!(broad_route_recovery_action(&[stalled], available), action);
+
+            let serving = vector_maintenance_failure_lifecycle(failure, true, Some(TxId(7)));
+            assert_eq!(serving.availability_reason, "none");
+            assert_eq!(serving.maintenance_reason, maintenance_reason);
+            assert_eq!(serving.recovery_action, action);
+            assert_eq!(broad_route_recovery_action(&[serving], "none"), "none");
+        }
+
+        assert_eq!(
+            contextdb_vector::store::VectorRouteQuarantineReason::CorruptChanges.as_str(),
+            "corrupt_changes"
+        );
+        assert_eq!(
+            published_vector_maintenance_reason("policy_replacement"),
+            "new_changes"
+        );
+    }
+}
+
+/// The store snapshot distinguishes an empty partition, a partition with a
+/// complete maintained route, and a populated partition that has not yet had
+/// its first route built.  Do not turn the last case into a generic failure:
+/// a newly written partition is waiting for ordinary maintenance, and the
+/// operator needs that answer without causing a build by inspecting it.
+fn vector_partition_inspection_lifecycle(
+    layout: &contextdb_vector::store::VectorIndexLayout,
+    partition: &contextdb_vector::store::VectorPartitionInfo,
+    maintenance_policy: MaintenancePolicy,
+) -> VectorInspectionLifecycle {
+    let recovery_action = vector_maintenance_recovery_action(maintenance_policy);
+    let maintenance_need = layout.maintenance_need(partition);
+    let maintenance_failure = partition
+        .maintenance_failure
+        .filter(|_| maintenance_need.is_some());
+    let availability_reason = if let Some(reason) = partition.quarantine_reason {
+        reason.as_str()
+    } else if partition.graph_available || partition.live_rows == 0 {
+        "none"
+    } else if let Some(failure) = maintenance_failure {
+        vector_unavailable_failure_reason(failure)
+    } else {
+        "initial_build"
+    };
+    if let Some(progress) = partition.maintenance_progress {
+        let reason = published_vector_maintenance_reason(progress.reason);
+        return VectorInspectionLifecycle {
+            availability_reason,
+            maintenance_state: progress.state,
+            maintenance_reason: reason,
+            vectors_total: Some(progress.vectors_total),
+            vectors_done: Some(progress.vectors_done),
+            vectors_remaining: Some(progress.vectors_total.saturating_sub(progress.vectors_done)),
+            checkpoint_tx: Some(progress.checkpoint_tx),
+            recovery_action,
+        };
+    }
+    if let Some(failure) = maintenance_failure
+        && matches!(
+            failure,
+            contextdb_vector::store::VectorMaintenanceFailure::MemoryLimit
+                | contextdb_vector::store::VectorMaintenanceFailure::DiskLimit
+        )
+    {
+        let mut lifecycle = vector_maintenance_failure_lifecycle(
+            failure,
+            partition.graph_available,
+            partition.base_tx,
+        );
+        lifecycle.availability_reason = availability_reason;
+        return lifecycle;
+    }
+    if let Some(reason) = partition.quarantine_reason {
+        return VectorInspectionLifecycle {
+            availability_reason,
+            maintenance_state: "stalled",
+            maintenance_reason: reason.as_str(),
+            vectors_total: None,
+            vectors_done: None,
+            vectors_remaining: None,
+            checkpoint_tx: partition.base_tx,
+            recovery_action,
+        };
+    }
+    if partition.live_rows == 0 {
+        return VectorInspectionLifecycle {
+            availability_reason,
+            maintenance_state: "idle",
+            maintenance_reason: "none",
+            vectors_total: None,
+            vectors_done: None,
+            vectors_remaining: None,
+            checkpoint_tx: None,
+            recovery_action: "none",
+        };
+    }
+    if let Some(failure) = maintenance_failure {
+        return vector_maintenance_failure_lifecycle(
+            failure,
+            partition.graph_available,
+            partition.base_tx,
+        );
+    }
+    if partition.maintenance_policy_revision.is_some() {
+        return VectorInspectionLifecycle {
+            availability_reason: if partition.graph_available {
+                "none"
+            } else {
+                "initial_build"
+            },
+            maintenance_state: "building",
+            maintenance_reason: maintenance_need.map_or("none", |need| need.reason()),
+            vectors_total: Some(partition.live_rows),
+            vectors_done: Some(0),
+            vectors_remaining: Some(partition.live_rows),
+            checkpoint_tx: partition.base_tx,
+            recovery_action,
+        };
+    }
+    if partition.graph_available {
+        let maintenance_reason = maintenance_need.map_or("none", |need| need.reason());
+        let recovery_action = if maintenance_reason == "none" {
+            "none"
+        } else {
+            recovery_action
+        };
+        return VectorInspectionLifecycle {
+            availability_reason: "none",
+            maintenance_state: "idle",
+            maintenance_reason,
+            vectors_total: None,
+            vectors_done: None,
+            vectors_remaining: None,
+            checkpoint_tx: partition.base_tx,
+            recovery_action,
+        };
+    }
+
+    // A maintained partition is omitted from this inspection surface once it
+    // has been retired for historical-only reads.  Therefore a listed,
+    // populated partition without a graph is the first build still pending,
+    // rather than a retired or partially usable graph.
+    VectorInspectionLifecycle {
+        availability_reason: "initial_build",
+        maintenance_state: "idle",
+        maintenance_reason: "initial_build",
+        vectors_total: None,
+        vectors_done: None,
+        vectors_remaining: None,
+        checkpoint_tx: None,
+        recovery_action,
+    }
+}
+
+fn vector_index_inspection_row(
+    declaration: &ColumnDef,
+    info: contextdb_vector::store::VectorIndexLayoutInfo,
+    partitions: &[contextdb_vector::store::VectorPartitionInfo],
+    maintenance_policy: MaintenancePolicy,
+) -> Result<Vec<Value>> {
+    let vector_count =
+        vector_inspection_partition_sum(partitions, "live-row count", |row| row.live_rows)?;
+    let live_partitions = partitions
+        .iter()
+        .filter(|partition| partition.live_rows != 0)
+        .count();
+    let retained_partitions = partitions
+        .iter()
+        .filter(|partition| partition.retained_rows != 0)
+        .count();
+    let unavailable_partitions = partitions
+        .iter()
+        .filter(|partition| {
+            partition.quarantine_reason.is_some()
+                || (partition.live_rows != 0 && !partition.graph_available)
+        })
+        .count();
+    let lifecycle = partitions
+        .iter()
+        .map(|partition| {
+            vector_partition_inspection_lifecycle(&info.layout, partition, maintenance_policy)
+        })
+        .collect::<Vec<_>>();
+    let stalled_partitions = lifecycle
+        .iter()
+        .filter(|lifecycle| lifecycle.maintenance_state == "stalled")
+        .count();
+    let maintenance_state = whole_index_maintenance_state(&lifecycle);
+    let active_progress = lifecycle
+        .iter()
+        .filter(|lifecycle| lifecycle.vectors_total.is_some())
+        .copied()
+        .collect::<Vec<_>>();
+    let maintenance_vectors_total = if active_progress.is_empty() {
+        None
+    } else {
+        Some(
+            active_progress
+                .iter()
+                .try_fold(0usize, |total, lifecycle| {
+                    total
+                        .checked_add(lifecycle.vectors_total.unwrap_or(0))
+                        .ok_or_else(|| Error::Other("vector maintenance total overflow".to_owned()))
+                })?,
+        )
+    };
+    let maintenance_vectors_done = if active_progress.is_empty() {
+        None
+    } else {
+        Some(
+            active_progress
+                .iter()
+                .try_fold(0usize, |total, lifecycle| {
+                    total
+                        .checked_add(lifecycle.vectors_done.unwrap_or(0))
+                        .ok_or_else(|| Error::Other("vector maintenance done overflow".to_owned()))
+                })?,
+        )
+    };
+    let maintenance_vectors_remaining = if active_progress.is_empty() {
+        None
+    } else {
+        Some(
+            active_progress
+                .iter()
+                .try_fold(0usize, |total, lifecycle| {
+                    total
+                        .checked_add(lifecycle.vectors_remaining.unwrap_or(0))
+                        .ok_or_else(|| {
+                            Error::Other("vector maintenance remaining overflow".to_owned())
+                        })
+                })?,
+        )
+    };
+    let oldest_base_tx = partitions.iter().filter_map(|row| row.base_tx).min();
+    let newest_base_tx = partitions.iter().filter_map(|row| row.base_tx).max();
+    let pending_inserts =
+        vector_inspection_partition_sum(partitions, "pending inserts", |row| row.pending_inserts)?;
+    let tombstones =
+        vector_inspection_partition_sum(partitions, "tombstones", |row| row.tombstones)?;
+    let durable_vector_bytes =
+        vector_inspection_partition_sum(partitions, "durable vector bytes", |row| {
+            row.durable_vector_bytes
+        })?;
+    let charged_vector_bytes =
+        vector_inspection_partition_sum(partitions, "charged vector bytes", |row| {
+            row.charged_vector_bytes
+        })?;
+    let durable_index_bytes =
+        vector_inspection_partition_sum(partitions, "durable index bytes", |row| {
+            row.durable_index_bytes
+        })?;
+    let charged_index_bytes =
+        vector_inspection_partition_sum(partitions, "charged index bytes", |row| {
+            row.charged_index_bytes
+        })?;
+    let bytes = charged_vector_bytes
+        .checked_add(charged_index_bytes)
+        .ok_or_else(|| Error::Other("vector inspection charged byte total overflow".to_owned()))?;
+    let broad_route_state = fanout_broad_route_state(partitions);
+    let broad_route_reason = lifecycle
+        .iter()
+        .map(|lifecycle| lifecycle.availability_reason)
+        .find(|reason| *reason != "none")
+        .unwrap_or("none");
+    let broad_route_recovery_action = broad_route_recovery_action(&lifecycle, broad_route_reason);
+    let partition_key_columns = serde_json::Value::Array(
+        declaration
+            .partition_key_columns
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect(),
+    );
+
+    // Every value below comes from the one passive partition snapshot. The
+    // row builder aggregates it without loading a vector or graph page and
+    // leaves facts absent when the store has no represented value.
+    Ok(vec![
+        Value::Text(info.index.table),
+        Value::Text(info.index.column),
+        vector_inspection_usize(info.layout.dimension, "dimension")?,
+        Value::Text(info.layout.quantization.as_str().to_owned()),
+        vector_inspection_usize(vector_count, "vector_count")?,
+        vector_inspection_usize(bytes, "bytes")?,
+        Value::Json(partition_key_columns),
+        declaration
+            .max_partitions
+            .map(|value| Value::Int64(i64::from(value)))
+            .unwrap_or(Value::Null),
+        vector_inspection_usize(live_partitions, "live_partitions")?,
+        vector_inspection_usize(retained_partitions, "retained_partitions")?,
+        Value::Text(declaration.search_mode.as_str().to_owned()),
+        declaration
+            .auto_index_at
+            .map(|value| Value::Int64(i64::from(value)))
+            .unwrap_or(Value::Null),
+        vector_inspection_usize(
+            info.layout.effective_auto_index_at(),
+            "effective_auto_index_at",
+        )?,
+        declaration
+            .hnsw_m
+            .map(|value| Value::Int64(i64::from(value)))
+            .unwrap_or(Value::Null),
+        declaration
+            .hnsw_ef_construction
+            .map(|value| Value::Int64(i64::from(value)))
+            .unwrap_or(Value::Null),
+        declaration
+            .hnsw_ef_search
+            .map(|value| Value::Int64(i64::from(value)))
+            .unwrap_or(Value::Null),
+        if declaration.consolidation_disabled {
+            Value::Text("none".to_owned())
+        } else if declaration.consolidation_change_percent.is_some()
+            || declaration.consolidation_tombstone_percent.is_some()
+        {
+            Value::Text("thresholds".to_owned())
+        } else {
+            Value::Null
+        },
+        declaration
+            .consolidation_change_percent
+            .map(|value| Value::Int64(i64::from(value)))
+            .unwrap_or(Value::Null),
+        declaration
+            .consolidation_tombstone_percent
+            .map(|value| Value::Int64(i64::from(value)))
+            .unwrap_or(Value::Null),
+        Value::Text(
+            if info.layout.consolidation_disabled {
+                "none"
+            } else {
+                "thresholds"
+            }
+            .to_owned(),
+        ),
+        if info.layout.consolidation_disabled {
+            Value::Null
+        } else {
+            Value::Int64(i64::from(
+                info.layout.effective_consolidation_change_percent(),
+            ))
+        },
+        if info.layout.consolidation_disabled {
+            Value::Null
+        } else {
+            Value::Int64(i64::from(
+                info.layout.effective_consolidation_tombstone_percent(),
+            ))
+        },
+        vector_inspection_optional_tx(oldest_base_tx, "oldest_base_tx")?,
+        vector_inspection_optional_tx(newest_base_tx, "newest_base_tx")?,
+        vector_inspection_usize(pending_inserts, "pending_inserts")?,
+        vector_inspection_usize(tombstones, "tombstones")?,
+        vector_inspection_usize(durable_vector_bytes, "durable_vector_bytes")?,
+        vector_inspection_usize(charged_vector_bytes, "charged_vector_bytes")?,
+        vector_inspection_usize(durable_index_bytes, "durable_index_bytes")?,
+        vector_inspection_usize(charged_index_bytes, "charged_index_bytes")?,
+        Value::Text(vector_index_query_state(partitions).to_owned()),
+        Value::Text(maintenance_state.to_owned()),
+        vector_inspection_optional_usize(maintenance_vectors_total, "maintenance_vectors_total")?,
+        vector_inspection_optional_usize(maintenance_vectors_done, "maintenance_vectors_done")?,
+        vector_inspection_optional_usize(
+            maintenance_vectors_remaining,
+            "maintenance_vectors_remaining",
+        )?,
+        vector_inspection_usize(unavailable_partitions, "unavailable_partitions")?,
+        vector_inspection_usize(stalled_partitions, "stalled_partitions")?,
+        Value::Text("fanout".to_owned()),
+        Value::Text(broad_route_state.to_owned()),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Text(broad_route_reason.to_owned()),
+        Value::Text(broad_route_recovery_action.to_owned()),
+    ])
+}
+
+fn vector_partition_inspection_row(
+    partition_key_columns: &[String],
+    layout: &contextdb_vector::store::VectorIndexLayout,
+    partition: contextdb_vector::store::VectorPartitionInfo,
+    maintenance_policy: MaintenancePolicy,
+) -> Result<Vec<Value>> {
+    let query_state = vector_partition_query_state(&partition);
+    let lifecycle = vector_partition_inspection_lifecycle(layout, &partition, maintenance_policy);
+    let desired = partition.desired_policy;
+    let serving = partition.serving_policy;
+    Ok(vec![
+        Value::Text(partition.partition.index.table),
+        Value::Text(partition.partition.index.column),
+        vector_partition_key_json(partition_key_columns, &partition.partition.partition_key)?,
+        vector_inspection_usize(partition.live_rows, "live_rows")?,
+        vector_inspection_usize(partition.retained_rows, "retained_rows")?,
+        partition
+            .base_generation
+            .map(|generation| vector_inspection_u64(generation, "base_generation"))
+            .transpose()?
+            .unwrap_or(Value::Null),
+        vector_inspection_optional_tx(partition.base_tx, "base_tx")?,
+        vector_inspection_usize(partition.pending_inserts, "pending_inserts")?,
+        vector_inspection_usize(partition.tombstones, "tombstones")?,
+        vector_inspection_usize(partition.durable_vector_bytes, "durable_vector_bytes")?,
+        vector_inspection_usize(partition.charged_vector_bytes, "charged_vector_bytes")?,
+        vector_inspection_usize(partition.durable_index_bytes, "durable_index_bytes")?,
+        vector_inspection_usize(partition.charged_index_bytes, "charged_index_bytes")?,
+        Value::Text(query_state.to_owned()),
+        Value::Text(lifecycle.availability_reason.to_owned()),
+        Value::Text(lifecycle.maintenance_state.to_owned()),
+        Value::Text(lifecycle.maintenance_reason.to_owned()),
+        vector_inspection_optional_usize(lifecycle.vectors_total, "maintenance_vectors_total")?,
+        vector_inspection_optional_usize(lifecycle.vectors_done, "maintenance_vectors_done")?,
+        vector_inspection_optional_usize(
+            lifecycle.vectors_remaining,
+            "maintenance_vectors_remaining",
+        )?,
+        vector_inspection_optional_tx(lifecycle.checkpoint_tx, "maintenance_checkpoint_tx")?,
+        vector_inspection_usize(desired.hnsw_m, "desired_hnsw_m")?,
+        vector_inspection_usize(desired.hnsw_ef_construction, "desired_hnsw_ef_construction")?,
+        vector_inspection_usize(desired.hnsw_ef_search, "desired_hnsw_ef_search")?,
+        serving
+            .map(|policy| vector_inspection_usize(policy.hnsw_m, "serving_hnsw_m"))
+            .transpose()?
+            .unwrap_or(Value::Null),
+        serving
+            .map(|policy| {
+                vector_inspection_usize(policy.hnsw_ef_construction, "serving_hnsw_ef_construction")
+            })
+            .transpose()?
+            .unwrap_or(Value::Null),
+        serving
+            .map(|_| vector_inspection_usize(desired.hnsw_ef_search, "serving_hnsw_ef_search"))
+            .transpose()?
+            .unwrap_or(Value::Null),
+        if layout.consolidation_disabled {
+            Value::Text("none".to_owned())
+        } else if layout.consolidation_change_percent.is_some()
+            || layout.consolidation_tombstone_percent.is_some()
+        {
+            Value::Text("thresholds".to_owned())
+        } else {
+            Value::Null
+        },
+        layout
+            .consolidation_change_percent
+            .map(|value| Value::Int64(i64::from(value)))
+            .unwrap_or(Value::Null),
+        layout
+            .consolidation_tombstone_percent
+            .map(|value| Value::Int64(i64::from(value)))
+            .unwrap_or(Value::Null),
+        Value::Text(
+            if layout.consolidation_disabled {
+                "none"
+            } else {
+                "thresholds"
+            }
+            .to_owned(),
+        ),
+        if layout.consolidation_disabled {
+            Value::Null
+        } else {
+            Value::Int64(i64::from(layout.effective_consolidation_change_percent()))
+        },
+        if layout.consolidation_disabled {
+            Value::Null
+        } else {
+            Value::Int64(i64::from(
+                layout.effective_consolidation_tombstone_percent(),
+            ))
+        },
+        vector_inspection_u64(desired.policy_revision, "desired_policy_revision")?,
+        serving
+            .map(|policy| vector_inspection_u64(policy.policy_revision, "serving_policy_revision"))
+            .transpose()?
+            .unwrap_or(Value::Null),
+        Value::Text(lifecycle.recovery_action.to_owned()),
+    ])
+}
+
 fn execute_plan_once(
     db: &Database,
     plan: &PhysicalPlan,
@@ -1997,7 +3088,7 @@ fn execute_plan_once(
     tx: Option<TxId>,
 ) -> Result<QueryResult> {
     match plan {
-        // Statements 1/2/4/19: the SQL doors read and write the canonical authority journal.
+        // The SQL doors read and write the canonical authority journal.
         PhysicalPlan::DeclareTenantTablePolicy(p) => {
             crate::custody::policy::declare(db, &p.declaration)
         }
@@ -2141,19 +3232,20 @@ fn execute_plan_once(
                 columns: p
                     .columns
                     .iter()
-                    .map(|c| {
+                    .map(|c| -> Result<contextdb_core::ColumnDef> {
                         let mut column = core_column_from_ast(
+                            &p.name,
                             c,
                             resolved_policies
                                 .get(&c.name)
                                 .map(|resolved| resolved.policy.clone()),
-                        );
+                        )?;
                         if p.primary_key_columns.contains(&c.name) {
                             column.nullable = false;
                         }
-                        column
+                        Ok(column)
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
                 immutable: p.immutable,
                 state_machine: p.state_machine.as_ref().map(|sm| StateMachineConstraint {
                     column: sm.column.clone(),
@@ -2186,6 +3278,7 @@ fn execute_plan_once(
                 delivery_manifest_tables: p.delivery_manifest_tables.clone(),
                 edge_discard: p.edge_discard,
             };
+            validate_vector_partition_declarations(&p.name, &meta)?;
             // The policy half of the reserved-name door (the column-shape
             // half already ran above): an EXPLICIT axis this local CREATE
             // declares that differs from one of the four tables' canonical
@@ -2193,7 +3286,7 @@ fn execute_plan_once(
             // sync-apply doors judge the identical question -- silence is
             // still tolerated (a legacy pre-declaration root, or this file's
             // own reconcile-heal tests, construct exactly that shape).
-            // Statement 5: validate before publishing any local CREATE.
+            // Validate before publishing any local CREATE.
             crate::custody::policy::check_binding(db, &p.name, &meta)?;
             refuse_engine_owned_policy_axes(&p.name, &meta)?;
             // The narrower SYNC-CONFLICT-only counterpart of the axis door
@@ -2271,7 +3364,7 @@ fn execute_plan_once(
                     }
                     if let Some(table_meta) = db.table_meta(&p.name) {
                         for column in &table_meta.columns {
-                            db.register_vector_index_for_column(&p.name, column);
+                            db.register_vector_index_for_column(&p.name, column)?;
                         }
                     }
                     for (column, resolved) in resolved_policies {
@@ -2347,6 +3440,7 @@ fn execute_plan_once(
             // then transparently re-run validation if any schema writer won.
             let validated_schema = store.table_meta.read().clone();
             let metadata_only_projection: Option<(TableMeta, TableMeta)>;
+            let mut vector_layout_update = None;
             match &p.action {
                 AlterAction::AddColumn(col) => {
                     // Existence first, like every other ALTER clause in this
@@ -2406,18 +3500,20 @@ fn execute_plan_once(
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
-                    all_columns.push(col.clone());
+                    all_columns.push((**col).clone());
                     let resolved_policy =
                         validate_rank_policy_for_column(db, &p.table, col, &all_columns)?;
                     let core_col = core_column_from_ast(
+                        &p.table,
                         col,
                         resolved_policy
                             .as_ref()
                             .map(|resolved| resolved.policy.clone()),
-                    );
+                    )?;
                     if let Some(existing_meta) = db.table_meta(&p.table) {
                         let mut candidate_meta = existing_meta;
                         candidate_meta.columns.push(core_col.clone());
+                        validate_vector_partition_declarations(&p.table, &candidate_meta)?;
                         let candidate_lookup = candidate_meta.clone();
                         validate_exact_constraint_keys_for_meta(&p.table, &candidate_meta)?;
                         validate_single_column_foreign_keys_for_meta(
@@ -2468,30 +3564,37 @@ fn execute_plan_once(
                             .get(&p.table)
                             .cloned()
                             .unwrap_or_default();
-                        let projected_vectors = db.vector_entries_for_ddl_projection();
                         let ddl = vec![db.alter_table_ddl_for_meta(
                             &p.table,
                             &projected_meta,
                             Vec::new(),
                         )];
+                        let mut memory_swap = db.prepare_local_table_projection_memory(
+                            &p.table,
+                            &old_meta,
+                            &projected_meta,
+                            &projected_rows,
+                        )?;
+                        let projected_indexes =
+                            db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
                         db.persist_local_table_projection_and_ddl(
                             &p.table,
                             &projected_meta,
                             &projected_rows,
-                            &projected_vectors,
                             lsn,
                             &ddl,
                         )?;
                         db.publish_local_table_projection_and_ddl(
                             &p.table,
-                            &old_meta,
                             projected_meta.clone(),
                             projected_rows.clone(),
                             lsn,
                             &ddl,
+                            projected_indexes,
                         )?;
+                        memory_swap.commit_after_swap();
                         if added_vector {
-                            db.register_vector_index_for_column(&p.table, &core_col);
+                            db.register_vector_index_for_column(&p.table, &core_col)?;
                         }
                         if let Some(resolved) = &resolved_policy {
                             db.register_rank_formula(&p.table, &col.name, resolved.formula.clone());
@@ -2510,6 +3613,10 @@ fn execute_plan_once(
                         return Err(Error::Other(format!("table '{}' not found", p.table)));
                     }
                     refuse_engine_owned_reserved_name_column_alter(&p.table)?;
+                    if let Some(block) = vector_partition_key_component_blocker(db, &p.table, name)
+                    {
+                        return Err(block);
+                    }
                     if let Some(block) = rank_policy_drop_column_blocker(db, &p.table, name) {
                         return Err(block);
                     }
@@ -2635,12 +3742,6 @@ fn execute_plan_once(
                                 row
                             })
                             .collect::<Vec<_>>();
-                        let mut projected_vectors = db.vector_entries_for_ddl_projection();
-                        if dropped_vector_column {
-                            projected_vectors.retain(|entry| {
-                                entry.index.table != p.table || entry.index.column != *name
-                            });
-                        }
                         let mut ddl = dependent_user_indexes
                             .iter()
                             .filter(|index_name| *cascade && dependent_indexes.contains(index_name))
@@ -2654,22 +3755,30 @@ fn execute_plan_once(
                             &projected_meta,
                             Vec::new(),
                         ));
+                        let mut memory_swap = db.prepare_local_table_projection_memory(
+                            &p.table,
+                            &old_meta,
+                            &projected_meta,
+                            &projected_rows,
+                        )?;
+                        let projected_indexes =
+                            db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
                         db.persist_local_table_projection_and_ddl(
                             &p.table,
                             &projected_meta,
                             &projected_rows,
-                            &projected_vectors,
                             lsn,
                             &ddl,
                         )?;
                         db.publish_local_table_projection_and_ddl(
                             &p.table,
-                            &old_meta,
                             projected_meta.clone(),
                             projected_rows.clone(),
                             lsn,
                             &ddl,
+                            projected_indexes,
                         )?;
+                        memory_swap.commit_after_swap();
                         db.remove_rank_formula(&p.table, name);
                         if dropped_vector_column {
                             db.deregister_vector_index(&p.table, name);
@@ -2697,6 +3806,10 @@ fn execute_plan_once(
                         return Err(Error::Other(format!("table '{}' not found", p.table)));
                     }
                     refuse_engine_owned_reserved_name_column_alter(&p.table)?;
+                    if let Some(block) = vector_partition_key_component_blocker(db, &p.table, from)
+                    {
+                        return Err(block);
+                    }
                     if let Some(block) = rank_policy_drop_column_blocker(db, &p.table, from) {
                         return Err(block);
                     }
@@ -2809,14 +3922,6 @@ fn execute_plan_once(
                                 row
                             })
                             .collect::<Vec<_>>();
-                        let mut projected_vectors = db.vector_entries_for_ddl_projection();
-                        if renamed_vector_column {
-                            for entry in &mut projected_vectors {
-                                if entry.index.table == p.table && entry.index.column == *from {
-                                    entry.index.column = to.clone();
-                                }
-                            }
-                        }
                         let ddl = vec![db.alter_table_ddl_for_meta(
                             &p.table,
                             &projected_meta,
@@ -2826,22 +3931,30 @@ fn execute_plan_once(
                                 Vec::new()
                             },
                         )];
+                        let mut memory_swap = db.prepare_local_table_projection_memory(
+                            &p.table,
+                            &old_meta,
+                            &projected_meta,
+                            &projected_rows,
+                        )?;
+                        let projected_indexes =
+                            db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
                         db.persist_local_table_projection_and_ddl(
                             &p.table,
                             &projected_meta,
                             &projected_rows,
-                            &projected_vectors,
                             lsn,
                             &ddl,
                         )?;
                         db.publish_local_table_projection_and_ddl(
                             &p.table,
-                            &old_meta,
                             projected_meta.clone(),
                             projected_rows.clone(),
                             lsn,
                             &ddl,
+                            projected_indexes,
                         )?;
+                        memory_swap.commit_after_swap();
                         if renamed_vector_column {
                             db.rename_vector_index(&p.table, from, to)?;
                         }
@@ -2849,6 +3962,88 @@ fn execute_plan_once(
                     })?;
                     db.clear_statement_cache();
                     return Ok(QueryResult::empty_with_affected(0));
+                }
+                AlterAction::SetVectorMaxPartitions {
+                    column,
+                    max_partitions,
+                } => {
+                    let old_meta = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    refuse_engine_owned_reserved_name_column_alter(&p.table)?;
+                    let mut table_meta = old_meta.clone();
+                    set_vector_max_partitions(&p.table, column, max_partitions, &mut table_meta)?;
+                    validate_vector_partition_declarations(&p.table, &table_meta)?;
+                    vector_layout_update =
+                        Some(VectorIndexRef::new(p.table.clone(), column.clone()));
+                    metadata_only_projection = Some((old_meta, table_meta));
+                }
+                AlterAction::SetVectorSearchMode {
+                    column,
+                    search_mode,
+                } => {
+                    let old_meta = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    refuse_engine_owned_reserved_name_column_alter(&p.table)?;
+                    let mut table_meta = old_meta.clone();
+                    set_vector_search_mode(&p.table, column, *search_mode, &mut table_meta)?;
+                    validate_vector_partition_declarations(&p.table, &table_meta)?;
+                    vector_layout_update =
+                        Some(VectorIndexRef::new(p.table.clone(), column.clone()));
+                    metadata_only_projection = Some((old_meta, table_meta));
+                }
+                AlterAction::SetVectorAutoIndexAt {
+                    column,
+                    auto_index_at,
+                } => {
+                    let old_meta = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    refuse_engine_owned_reserved_name_column_alter(&p.table)?;
+                    let mut table_meta = old_meta.clone();
+                    set_vector_auto_index_at(
+                        &p.table,
+                        column,
+                        auto_index_at.as_deref(),
+                        &mut table_meta,
+                    )?;
+                    validate_vector_partition_declarations(&p.table, &table_meta)?;
+                    vector_layout_update =
+                        Some(VectorIndexRef::new(p.table.clone(), column.clone()));
+                    metadata_only_projection = Some((old_meta, table_meta));
+                }
+                AlterAction::SetVectorHnsw { column, hnsw } => {
+                    let old_meta = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    refuse_engine_owned_reserved_name_column_alter(&p.table)?;
+                    let mut table_meta = old_meta.clone();
+                    set_vector_hnsw(&p.table, column, hnsw.as_ref(), &mut table_meta)?;
+                    validate_vector_partition_declarations(&p.table, &table_meta)?;
+                    vector_layout_update =
+                        Some(VectorIndexRef::new(p.table.clone(), column.clone()));
+                    metadata_only_projection = Some((old_meta, table_meta));
+                }
+                AlterAction::SetVectorConsolidation {
+                    column,
+                    consolidation,
+                } => {
+                    let old_meta = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    refuse_engine_owned_reserved_name_column_alter(&p.table)?;
+                    let mut table_meta = old_meta.clone();
+                    set_vector_consolidation(
+                        &p.table,
+                        column,
+                        consolidation.as_ref(),
+                        &mut table_meta,
+                    )?;
+                    validate_vector_partition_declarations(&p.table, &table_meta)?;
+                    vector_layout_update =
+                        Some(VectorIndexRef::new(p.table.clone(), column.clone()));
+                    metadata_only_projection = Some((old_meta, table_meta));
                 }
                 AlterAction::SetRetain {
                     duration_seconds,
@@ -3028,13 +4223,27 @@ fn execute_plan_once(
                 }
             }
             if let Some((old_meta, projected_meta)) = metadata_only_projection {
-                // Statement 5: ALTER must retain every bound clause.
+                // ALTER must retain every bound clause.
                 crate::custody::policy::check_binding(db, &p.table, &projected_meta)?;
+                let _vector_schema = vector_layout_update
+                    .as_ref()
+                    .map(|index| db.vector_schema_write(index))
+                    .transpose()?;
                 db.allocate_ddl_lsn(|lsn| {
                     db.table_meta(&p.table)
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
                     if !schema_snapshot_matches(db, &validated_schema) {
                         return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
+                    }
+                    if let Some(index) = &vector_layout_update {
+                        let column = projected_meta
+                            .columns
+                            .iter()
+                            .find(|column| column.name == index.column)
+                            .ok_or_else(|| Error::UnknownVectorIndex {
+                                index: index.clone(),
+                            })?;
+                        db.validate_vector_layout_policy_for_ddl(index, column)?;
                     }
                     let projected_rows = store
                         .tables
@@ -3042,25 +4251,43 @@ fn execute_plan_once(
                         .get(&p.table)
                         .cloned()
                         .unwrap_or_default();
-                    let projected_vectors = db.vector_entries_for_ddl_projection();
                     let ddl =
                         vec![db.alter_table_ddl_for_meta(&p.table, &projected_meta, Vec::new())];
+                    let mut memory_swap = db.prepare_local_table_projection_memory(
+                        &p.table,
+                        &old_meta,
+                        &projected_meta,
+                        &projected_rows,
+                    )?;
+                    let projected_indexes =
+                        db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
                     db.persist_local_table_projection_and_ddl(
                         &p.table,
                         &projected_meta,
                         &projected_rows,
-                        &projected_vectors,
                         lsn,
                         &ddl,
                     )?;
                     db.publish_local_table_projection_and_ddl(
                         &p.table,
-                        &old_meta,
                         projected_meta.clone(),
                         projected_rows.clone(),
                         lsn,
                         &ddl,
-                    )
+                        projected_indexes,
+                    )?;
+                    memory_swap.commit_after_swap();
+                    if let Some(index) = &vector_layout_update {
+                        let column = projected_meta
+                            .columns
+                            .iter()
+                            .find(|column| column.name == index.column)
+                            .ok_or_else(|| Error::UnknownVectorIndex {
+                                index: index.clone(),
+                            })?;
+                        db.register_vector_index_for_column(&p.table, column)?;
+                    }
+                    Ok(())
                 })?;
             }
             db.clear_statement_cache();
@@ -3147,6 +4374,7 @@ fn execute_plan_once(
                         indexes_considered: considered,
                         sort_elided: false,
                         query_vector_source: None,
+                        vector_search: None,
                         rows_examined: 0,
                     };
                     return Ok(result);
@@ -3169,6 +4397,7 @@ fn execute_plan_once(
                         indexes_considered: considered,
                         sort_elided: false,
                         query_vector_source: None,
+                        vector_search: None,
                         rows_examined: 0,
                     };
                     return Ok(result);
@@ -3566,6 +4795,8 @@ fn execute_plan_once(
             k,
             candidates,
             sort_key,
+            search_mode,
+            materialized_columns,
             ..
         }
         | PhysicalPlan::HnswSearch {
@@ -3575,22 +4806,98 @@ fn execute_plan_once(
             k,
             candidates,
             sort_key,
+            search_mode,
+            materialized_columns,
             ..
         } => {
             let snapshot = db.snapshot_for_read();
             let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
+            let mut resolved_search_mode =
+                db.resolved_vector_search_mode(&index, (*search_mode).map(map_vector_search_mode))?;
+            bind_vector_search_parameters(query_expr, candidates.as_deref(), params)?;
+            let route = vector_candidate_route(db, &index, candidates.as_deref(), params)?;
+            let partition_scope = route.scope;
+            let complete_relational_route = route.complete;
+            let access_candidates = route.candidates;
+            // Decide this before executing the candidate subtree.  Otherwise
+            // INDEXED can quietly turn a broad WHERE clause into a table scan
+            // and only then search the graph, despite promising a maintained
+            // indexed route for the whole answer.
+            if resolved_search_mode == contextdb_core::VectorSearchMode::Indexed
+                && !complete_relational_route
+            {
+                return Err(Error::VectorFilteredRouteUnavailable {
+                    index: index.clone(),
+                    predicate_columns: vector_candidate_refusal_columns(
+                        db,
+                        &index,
+                        access_candidates.as_ref(),
+                        route.access_filter,
+                    ),
+                });
+            }
+            if resolved_search_mode == contextdb_core::VectorSearchMode::Auto
+                && candidates.is_some()
+                && !complete_relational_route
+            {
+                let exact_score_bytes = db
+                    .vector_entry_count(&index, snapshot)
+                    .saturating_mul(std::mem::size_of::<(contextdb_core::RowId, f32)>());
+                if crate::memory_accounting::ScopedMemoryReservation::try_new_for(
+                    db.accountant(),
+                    exact_score_bytes,
+                    "vector_search",
+                    "preflight_filtered_exact_scores",
+                    "Add a relational index for the filter, reduce vector volume, or raise MEMORY_LIMIT.",
+                )
+                .is_err()
+                {
+                    return Err(Error::VectorFilteredRouteUnavailable {
+                        index: index.clone(),
+            predicate_columns: vector_candidate_refusal_columns(db, &index, access_candidates.as_ref(), route.access_filter),
+                    });
+                }
+            }
+            if resolved_search_mode == contextdb_core::VectorSearchMode::Auto
+                && !complete_relational_route
+            {
+                resolved_search_mode = contextdb_core::VectorSearchMode::Exact;
+            }
             let mut candidate_trace = None;
-            let unrestricted_scan_candidates = candidates
-                .as_deref()
-                .is_some_and(|plan| is_unrestricted_scan_for_table(plan, table));
+            let unrestricted_scan_candidates = !route.access_filter
+                && (partition_scope
+                    .as_ref()
+                    .is_some_and(VectorPartitionScope::covers_filter_for_execution)
+                    || candidates
+                        .as_deref()
+                        .is_some_and(|plan| is_unrestricted_scan_for_table(plan, table)));
             let candidate_bitmap = if unrestricted_scan_candidates {
                 candidate_trace = Some(QueryTrace::scan());
                 None
-            } else if let Some(cands_plan) = candidates {
+            } else if route.directory_route {
+                let mut source = candidates.as_deref();
+                while let Some(PhysicalPlan::Project { input, .. }) = source {
+                    source = Some(input);
+                }
+                let filter = match source {
+                    Some(PhysicalPlan::Scan { filter, .. }) => filter.as_ref(),
+                    _ => None,
+                };
+                Some(db.vector_directory_candidate_bitmap(
+                    tx,
+                    &index,
+                    snapshot,
+                    filter,
+                    params,
+                    partition_scope.as_ref(),
+                )?)
+            } else if let Some(cands_plan) = access_candidates.as_ref() {
                 let qr = db.with_snapshot_override(snapshot, || {
                     execute_plan(db, cands_plan, params, tx)
                 })?;
                 candidate_trace = Some(qr.trace.clone());
+                #[cfg(any(test, feature = "test-seams"))]
+                db.__bump_candidate_rows_materialized_for_test(qr.rows.len() as u64);
                 let mut bm = RoaringTreemap::new();
                 let row_id_idx = qr.columns.iter().position(|column| {
                     column == "row_id" || column.rsplit('.').next() == Some("row_id")
@@ -3645,13 +4952,28 @@ fn execute_plan_once(
                     *k as usize,
                 );
                 semantic_query.sort_key = Some(sort_key.clone());
-                let res = db.with_snapshot_override(snapshot, || {
-                    db.semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
-                        tx,
-                        semantic_query,
-                        candidate_bitmap,
+                semantic_query.search_mode = Some(resolved_search_mode);
+                let search = || {
+                    db.with_snapshot_override(snapshot, || {
+                        db.semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
+                            tx,
+                            semantic_query,
+                            candidate_bitmap,
+                        )
+                    })
+                };
+                let res = if let Some(prefixes) = partition_scope
+                    .as_ref()
+                    .and_then(VectorPartitionScope::resolved_prefixes)
+                {
+                    contextdb_vector::mem::with_selected_partition_prefixes(
+                        &index,
+                        prefixes.to_vec(),
+                        search,
                     )
-                });
+                } else {
+                    search()
+                };
                 let (results, used_hnsw) = res?;
                 drop(_vector_memory);
                 let schema_columns = db.table_meta(table).map(|meta| {
@@ -3683,36 +5005,73 @@ fn execute_plan_once(
                         out
                     })
                     .collect();
+                let mut trace = vector_search_trace_with_source(
+                    if used_hnsw {
+                        "HNSWSearch"
+                    } else {
+                        "VectorSearch"
+                    },
+                    candidate_trace,
+                    query_vector_source,
+                );
+                trace.vector_search =
+                    Some(db.vector_search_disclosure_for_runtime(
+                        index.clone(),
+                        *k as usize,
+                        candidates.as_deref().is_some_and(|candidate| {
+                            !is_unrestricted_scan_for_table(candidate, table)
+                        }),
+                        candidates.as_deref(),
+                        *search_mode,
+                        query_expr,
+                        snapshot,
+                        params,
+                        used_hnsw,
+                    )?);
                 return Ok(QueryResult {
                     columns,
                     rows,
                     rows_affected: 0,
-                    trace: vector_search_trace_with_source(
-                        if used_hnsw {
-                            "HNSWSearch"
-                        } else {
-                            "VectorSearch"
-                        },
-                        candidate_trace,
-                        query_vector_source,
-                    ),
+                    trace,
                     cascade: None,
                 });
             }
-            let res = db.query_vector_strict_in_tx_with_strategy(
-                tx,
-                index.clone(),
-                &query_vec,
-                *k as usize,
-                candidate_bitmap.as_ref(),
-                snapshot,
-            );
+            let search = || {
+                db.query_vector_strict_in_tx_with_strategy(
+                    tx,
+                    index.clone(),
+                    &query_vec,
+                    *k as usize,
+                    candidate_bitmap.as_ref(),
+                    snapshot,
+                    resolved_search_mode,
+                )
+            };
+            let res = if let Some(prefixes) = partition_scope
+                .as_ref()
+                .and_then(VectorPartitionScope::resolved_prefixes)
+            {
+                contextdb_vector::mem::with_selected_partition_prefixes(
+                    &index,
+                    prefixes.to_vec(),
+                    search,
+                )
+            } else {
+                search()
+            };
             let (res, used_hnsw) = res?;
             drop(_vector_memory);
 
             // Re-materialize: look up actual rows by row_id so SELECT * returns user columns
             let result_row_ids = res.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
-            let result_rows = rows_by_row_id(db, table, &result_row_ids, snapshot, tx)?;
+            let result_rows = rows_by_row_id(
+                db,
+                table,
+                &result_row_ids,
+                snapshot,
+                tx,
+                materialized_columns.as_deref(),
+            )?;
             let schema_columns = db.table_meta(table).map(|meta| {
                 meta.columns
                     .into_iter()
@@ -3752,19 +5111,35 @@ fn execute_plan_once(
                 })
                 .collect();
 
+            let mut trace = vector_search_trace_with_source(
+                if used_hnsw {
+                    "HNSWSearch"
+                } else {
+                    "VectorSearch"
+                },
+                candidate_trace,
+                query_vector_source,
+            );
+            trace.vector_search = Some(
+                db.vector_search_disclosure_for_runtime(
+                    index,
+                    *k as usize,
+                    candidates
+                        .as_deref()
+                        .is_some_and(|candidate| !is_unrestricted_scan_for_table(candidate, table)),
+                    candidates.as_deref(),
+                    *search_mode,
+                    query_expr,
+                    snapshot,
+                    params,
+                    used_hnsw,
+                )?,
+            );
             Ok(QueryResult {
                 columns,
                 rows,
                 rows_affected: 0,
-                trace: vector_search_trace_with_source(
-                    if used_hnsw {
-                        "HNSWSearch"
-                    } else {
-                        "VectorSearch"
-                    },
-                    candidate_trace,
-                    query_vector_source,
-                ),
+                trace,
                 cascade: None,
             })
         }
@@ -4120,6 +5495,19 @@ fn execute_plan_once(
                 cascade: None,
             })
         }
+        PhysicalPlan::SetMaintenancePollInterval(milliseconds) => {
+            db.set_maintenance_poll_interval(std::time::Duration::from_millis(*milliseconds))?;
+            Ok(QueryResult::empty())
+        }
+        PhysicalPlan::ShowMaintenancePollInterval => Ok(QueryResult {
+            columns: vec!["milliseconds".to_string()],
+            rows: vec![vec![Value::Int64(
+                i64::try_from(db.maintenance_poll_interval().as_millis()).unwrap_or(i64::MAX),
+            )]],
+            rows_affected: 0,
+            trace: crate::database::QueryTrace::scan(),
+            cascade: None,
+        }),
         PhysicalPlan::ShowSyncConflictPolicy => {
             // The per-table policy is DECLARED on each table's meta (via
             // `CREATE ... SYNC CONFLICT ...`), which is what the sync apply
@@ -4189,29 +5577,71 @@ fn execute_plan_once(
             })
         }
         PhysicalPlan::ShowVectorIndexes => {
+            let maintenance_policy = db.maintenance_policy();
             let rows = db
-                .vector_index_infos()
+                .vector_inspection_infos(None)?
                 .into_iter()
-                .map(|info| {
-                    vec![
-                        Value::Text(info.index.table),
-                        Value::Text(info.index.column),
-                        Value::Int64(info.dimension as i64),
-                        Value::Text(info.quantization.as_str().to_string()),
-                        Value::Int64(info.vector_count as i64),
-                        Value::Int64(info.bytes as i64),
-                    ]
+                .map(|(declaration, info, partitions)| {
+                    vector_index_inspection_row(&declaration, info, &partitions, maintenance_policy)
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             Ok(QueryResult {
-                columns: vec![
-                    "table".to_string(),
-                    "column".to_string(),
-                    "dimension".to_string(),
-                    "quantization".to_string(),
-                    "vector_count".to_string(),
-                    "bytes".to_string(),
-                ],
+                columns: vector_inspection_columns(VECTOR_INDEX_INSPECTION_COLUMNS),
+                rows,
+                rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
+            })
+        }
+        PhysicalPlan::ShowVectorPartitions {
+            table,
+            column,
+            limit,
+            offset,
+        } => {
+            let target = match (table.as_deref(), column.as_deref()) {
+                (Some(table), Some(column)) => Some(VectorIndexRef::new(table, column)),
+                (Some(_), None) | (None, None) => None,
+                _ => {
+                    return Err(Error::PlanError(
+                        "vector partition inspection target requires both table and column"
+                            .to_owned(),
+                    ));
+                }
+            };
+            let maintenance_policy = db.maintenance_policy();
+            let mut rows = Vec::new();
+            for (declaration, info, partitions) in db.vector_inspection_infos(target.as_ref())? {
+                if table
+                    .as_deref()
+                    .is_some_and(|table| info.index.table != table)
+                {
+                    continue;
+                }
+                let partition_key_columns = declaration
+                    .partition_key_columns
+                    .as_deref()
+                    .unwrap_or_default();
+                for partition in partitions {
+                    rows.push(vector_partition_inspection_row(
+                        partition_key_columns,
+                        &info.layout,
+                        partition,
+                        maintenance_policy,
+                    )?);
+                }
+            }
+            let offset = match offset {
+                Some(value) => usize::try_from(*value).unwrap_or(usize::MAX),
+                None => 0,
+            };
+            let limit = match limit {
+                Some(value) => usize::try_from(*value).unwrap_or(usize::MAX),
+                None => usize::MAX,
+            };
+            let rows = rows.into_iter().skip(offset).take(limit).collect();
+            Ok(QueryResult {
+                columns: vector_inspection_columns(VECTOR_PARTITION_INSPECTION_COLUMNS),
                 rows,
                 rows_affected: 0,
                 trace: crate::database::QueryTrace::scan(),
@@ -4450,9 +5880,10 @@ fn exec_insert(
         if !vector_columns.is_empty() {
             validate_vector_columns(db, &p.table, &values)?;
         }
-        let row_bytes = retained_row_bytes_for_meta(&values, &insert_meta, false);
-        db.accountant().try_allocate_for(
-            row_bytes,
+        let row_bytes = db.admit_retained_row_bytes(
+            &p.table,
+            &values,
+            &insert_meta,
             "insert",
             "row_insert",
             "Reduce row size or raise MEMORY_LIMIT before inserting more data.",
@@ -4583,15 +6014,12 @@ fn exec_insert(
                         }
                         if db.has_live_vector(existing_row.row_id, db.snapshot_for_read()) {
                             for index in vector_indexes_for_table(db, &p.table) {
-                                if db
-                                    .vector_store_live_entry_for_row(
-                                        &index,
-                                        existing_row.row_id,
-                                        db.snapshot_for_read(),
-                                    )
-                                    .is_some()
-                                    && let Err(err) =
-                                        db.delete_vector(txid, index, existing_row.row_id)
+                                if db.vector_store_has_live_entry_for_row(
+                                    &index,
+                                    existing_row.row_id,
+                                    db.snapshot_for_read(),
+                                ) && let Err(err) =
+                                    db.delete_vector(txid, index, existing_row.row_id)
                                 {
                                     db.accountant().release(row_bytes);
                                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
@@ -4679,7 +6107,7 @@ fn exec_insert(
     Ok(QueryResult::empty_with_affected(rows_affected))
 }
 
-// Statement 17b: mode and direction refusal precede all selection sources.
+// Mode and direction refusal precede all selection sources.
 fn exec_discard(
     db: &Database,
     p: &contextdb_planner::DiscardPlan,
@@ -4748,7 +6176,7 @@ fn exec_purge(
         return Err(Error::PurgeRequiresStandaloneExecution);
     }
 
-    // Statement 17a: every table is validated before any selection source runs.
+    // Every table is validated before any selection source runs.
     let mut names = BTreeSet::new();
     let mut node_local = Vec::new();
     for selection in &p.selections {
@@ -4834,10 +6262,7 @@ fn exec_delete(
 
     for row in &matched {
         for index in vector_indexes_for_table(db, &p.table) {
-            if db
-                .vector_store_live_entry_for_row(&index, row.row_id, snapshot)
-                .is_some()
-            {
+            if db.vector_store_has_live_entry_for_row(&index, row.row_id, snapshot) {
                 db.delete_vector(txid, index, row.row_id)?;
             }
         }
@@ -5138,9 +6563,10 @@ fn exec_update(
             if !skip_trigger_access_checks {
                 db.assert_row_write_allowed(&p.table, row.row_id, &values, snapshot)?;
             }
-            let new_row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
-            db.accountant().try_allocate_for(
-                new_row_bytes,
+            let new_row_bytes = admit_table_row_bytes(
+                db,
+                &p.table,
+                &values,
                 "update",
                 "row_replace",
                 "Reduce row growth or raise MEMORY_LIMIT before updating this row.",
@@ -5308,9 +6734,10 @@ fn exec_update(
         let assigned_vector_values = plan.assigned_vector_values;
         let assigned_vector_columns = plan.assigned_vector_columns;
         let conditional_predicates = plan.conditional_predicates;
-        let new_row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
-        db.accountant().try_allocate_for(
-            new_row_bytes,
+        let new_row_bytes = admit_table_row_bytes(
+            db,
+            &p.table,
+            &values,
             "update",
             "row_replace",
             "Reduce row growth or raise MEMORY_LIMIT before updating this row.",
@@ -6196,28 +7623,36 @@ fn exec_create_index(
             .get(&plan.table)
             .cloned()
             .unwrap_or_default();
-        let projected_vectors = db.vector_entries_for_ddl_projection();
         let ddl = vec![DdlChange::CreateIndex {
             table: plan.table.clone(),
             name: plan.name.clone(),
             columns: plan.columns.clone(),
         }];
+        let mut memory_swap = db.prepare_local_table_projection_memory(
+            &plan.table,
+            &old_meta,
+            &projected_meta,
+            &projected_rows,
+        )?;
+        let projected_indexes =
+            db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
         db.persist_local_table_projection_and_ddl(
             &plan.table,
             &projected_meta,
             &projected_rows,
-            &projected_vectors,
             lsn,
             &ddl,
         )?;
         db.publish_local_table_projection_and_ddl(
             &plan.table,
-            &old_meta,
             projected_meta,
             projected_rows,
             lsn,
             &ddl,
-        )
+            projected_indexes,
+        )?;
+        memory_swap.commit_after_swap();
+        Ok(())
     })?;
 
     db.clear_statement_cache();
@@ -6268,27 +7703,35 @@ fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Re
             .get(&plan.table)
             .cloned()
             .unwrap_or_default();
-        let projected_vectors = db.vector_entries_for_ddl_projection();
         let ddl = vec![DdlChange::DropIndex {
             table: plan.table.clone(),
             name: plan.name.clone(),
         }];
+        let mut memory_swap = db.prepare_local_table_projection_memory(
+            &plan.table,
+            &old_meta,
+            &projected_meta,
+            &projected_rows,
+        )?;
+        let projected_indexes =
+            db.prepare_local_index_projection(&projected_meta, &projected_rows)?;
         db.persist_local_table_projection_and_ddl(
             &plan.table,
             &projected_meta,
             &projected_rows,
-            &projected_vectors,
             lsn,
             &ddl,
         )?;
         db.publish_local_table_projection_and_ddl(
             &plan.table,
-            &old_meta,
             projected_meta,
             projected_rows,
             lsn,
             &ddl,
-        )
+            projected_indexes,
+        )?;
+        memory_swap.commit_after_swap();
+        Ok(())
     })?;
     db.clear_statement_cache();
     Ok(QueryResult::empty_with_affected(0))
@@ -6300,15 +7743,23 @@ pub(crate) fn reserved_index_prefix(name: &str) -> Option<&'static str> {
         .find(|prefix| name.starts_with(prefix))
 }
 
-fn estimate_table_row_bytes(
+/// Admit a replacement row version's retained bytes through the engine's
+/// one row-admission door, so an F32 vector column's projection is charged
+/// under its own `vector_insert@<table>.<column>` tag. Returns the whole
+/// admitted amount, which is what the caller releases if the statement
+/// fails afterwards.
+fn admit_table_row_bytes(
     db: &Database,
     table: &str,
     values: &HashMap<String, Value>,
+    subsystem: &str,
+    operation: &str,
+    hint: &str,
 ) -> Result<usize> {
     let meta = db
         .table_meta(table)
         .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
-    Ok(retained_row_bytes_for_meta(values, &meta, false))
+    db.admit_retained_row_bytes(table, values, &meta, subsystem, operation, hint)
 }
 
 // ========================= Index scan planning + execution =========================
@@ -6386,6 +7837,134 @@ fn auto_exact_index_supports_pick(
 struct IndexAnalysis {
     pick: Option<IndexPick>,
     considered: Vec<crate::database::IndexCandidate>,
+}
+
+/// The relational route a plan would take, derived without touching rows.
+///
+/// This is deliberately distinct from [`QueryTrace`]: it is planning
+/// metadata, not a receipt for work that happened. The analysis below reuses
+/// the executor's index chooser and sort-elision predicates so passive
+/// `.explain` and a later execution cannot drift into separate routing rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PassiveRelationalRoute {
+    pub physical_plan: String,
+    pub index_used: Option<String>,
+    pub predicates_pushed: Vec<String>,
+    pub indexes_considered: Vec<crate::database::IndexCandidate>,
+    pub sort_elided: bool,
+}
+
+/// Analyze the ordinary relational route for `plan` without executing it.
+///
+/// `None` means the plan is not an ordinary relational read whose runtime
+/// trace is represented by the scan/index fields (for example a write, graph
+/// traversal, or vector search). Schema metadata and supplied parameter
+/// values are the only inputs; no row, graph, vector, or plugin path is
+/// reachable from this function.
+pub(crate) fn analyze_passive_relational_route(
+    db: &Database,
+    plan: &PhysicalPlan,
+    params: &HashMap<String, Value>,
+) -> Option<PassiveRelationalRoute> {
+    match plan {
+        PhysicalPlan::Scan { table, filter, .. } => {
+            let indexes = db
+                .table_meta(table)
+                .map(|meta| meta.indexes)
+                .unwrap_or_default();
+            let analysis = filter
+                .as_ref()
+                .filter(|_| !indexes.is_empty())
+                .map(|filter| analyze_filter_for_index(filter, &indexes, params));
+
+            match analysis {
+                Some(IndexAnalysis {
+                    pick: Some(pick),
+                    considered,
+                }) => {
+                    let chosen_name = pick.name;
+                    Some(PassiveRelationalRoute {
+                        physical_plan: "IndexScan".to_owned(),
+                        index_used: Some(chosen_name.clone()),
+                        predicates_pushed: pick.pushed_columns,
+                        indexes_considered: considered
+                            .into_iter()
+                            .filter(|candidate| candidate.name != chosen_name)
+                            .collect(),
+                        sort_elided: false,
+                    })
+                }
+                Some(IndexAnalysis {
+                    pick: None,
+                    considered,
+                }) => Some(PassiveRelationalRoute {
+                    physical_plan: "Scan".to_owned(),
+                    index_used: None,
+                    predicates_pushed: Vec::new(),
+                    indexes_considered: considered,
+                    sort_elided: false,
+                }),
+                None => Some(PassiveRelationalRoute {
+                    physical_plan: "Scan".to_owned(),
+                    index_used: None,
+                    predicates_pushed: Vec::new(),
+                    indexes_considered: Vec::new(),
+                    sort_elided: false,
+                }),
+            }
+        }
+        PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. } => {
+            analyze_passive_relational_route(db, input, params)
+        }
+        PhysicalPlan::Sort { input, keys } => {
+            // Runtime sort path A walks a matching index directly when the
+            // underlying scan has no filter. Ask the same predicate here.
+            if let Some(index) = sort_elision_index_decl(db, input, keys) {
+                let pushed = index
+                    .columns
+                    .first()
+                    .map(|(column, _)| vec![column.clone()])
+                    .unwrap_or_default();
+                return Some(PassiveRelationalRoute {
+                    physical_plan: "IndexScan".to_owned(),
+                    index_used: Some(index.name),
+                    predicates_pushed: pushed,
+                    indexes_considered: Vec::new(),
+                    sort_elided: true,
+                });
+            }
+
+            let mut route = analyze_passive_relational_route(db, input, params)?;
+            // Runtime sort path B keeps an already-selected index when its
+            // order satisfies the requested key prefix.
+            if route.physical_plan == "IndexScan"
+                && route
+                    .index_used
+                    .as_deref()
+                    .is_some_and(|index| sort_keys_match_index_prefix(db, input, index, keys))
+            {
+                route.sort_elided = true;
+                return Some(route);
+            }
+            if !trace_label_survives_sort(&route.physical_plan) {
+                route.physical_plan = "Sort".to_owned();
+            }
+            route.sort_elided = false;
+            Some(route)
+        }
+        PhysicalPlan::IndexScan { index, .. } => Some(PassiveRelationalRoute {
+            physical_plan: "IndexScan".to_owned(),
+            index_used: Some(index.clone()),
+            predicates_pushed: Vec::new(),
+            indexes_considered: Vec::new(),
+            sort_elided: false,
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7061,6 +8640,10 @@ fn extract_simple_col_ref(expr: &Expr) -> Option<String> {
 fn is_literal_or_param(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::UnaryOp {
+            op: UnaryOp::Neg,
+            operand,
+        } => is_literal_or_param(operand),
         Expr::FunctionCall { name, args } => {
             // Arithmetic-of-literals (e.g., `0.0 / 0.0`, `1 + 2`) counts as
             // a const RHS for planning purposes; we evaluate at execute time.
@@ -7082,6 +8665,14 @@ fn resolve_simple_rhs(expr: &Expr, params: &HashMap<String, Value>) -> Option<Va
             Literal::Vector(_) => return None,
         }),
         Expr::Parameter(name) => params.get(name).cloned(),
+        Expr::UnaryOp {
+            op: UnaryOp::Neg,
+            operand,
+        } => match resolve_simple_rhs(operand, params)? {
+            Value::Int64(value) => value.checked_neg().map(Value::Int64),
+            Value::Float64(value) => Some(Value::Float64(-value)),
+            _ => None,
+        },
         Expr::FunctionCall { name, args }
             if matches!(name.as_str(), "__add" | "__sub" | "__mul" | "__div") =>
         {
@@ -7363,7 +8954,11 @@ fn execute_index_scan(
         if range_is_empty(&lower, &upper) {
             return;
         }
-        for (_k, entries) in storage.tree.range((lower, upper)) {
+        for (_k, entries) in storage.read_range(
+            snapshot,
+            lower.as_ref().map(|key| key.as_slice()),
+            upper.as_ref().map(|key| key.as_slice()),
+        ) {
             for e in entries {
                 *examined += 1;
                 if e.visible_at(snapshot) {
@@ -7377,9 +8972,8 @@ fn execute_index_scan(
     let collect_prefix = |postings: &mut Vec<contextdb_relational::IndexEntry>,
                           examined: &mut u64,
                           prefix: &[DirectedValue]| {
-        for (key, entries) in storage
-            .tree
-            .range::<[DirectedValue], _>((Bound::Included(prefix), Bound::Unbounded))
+        for (key, entries) in
+            storage.read_range(snapshot, Bound::Included(prefix), Bound::Unbounded)
         {
             if !key.starts_with(prefix) {
                 break;
@@ -7477,7 +9071,11 @@ fn execute_index_scan(
                     // Composite + range on the leading column cannot push suffix
                     // equalities; walk the ordered leading range and stop once
                     // the first component is beyond the upper bound.
-                    for (key, entries) in storage.tree.range((lower_key, Bound::Unbounded)) {
+                    for (key, entries) in storage.read_range(
+                        snapshot,
+                        lower_key.as_ref().map(|key| key.as_slice()),
+                        Bound::Unbounded,
+                    ) {
                         let Some(first) = key.first() else { continue };
                         let in_lower = match phys_lower {
                             Bound::Unbounded => true,
@@ -7532,7 +9130,8 @@ fn execute_index_scan(
                 // Full walk; skip exact key. For IndexScan-trace we still attribute
                 // all postings touched to __rows_examined (trace counts postings).
                 let except_key = vec![wrap(v.clone())];
-                for (k, entries) in storage.tree.iter() {
+                for (k, entries) in storage.read_range(snapshot, Bound::Unbounded, Bound::Unbounded)
+                {
                     if *k == except_key {
                         continue;
                     }
@@ -7562,7 +9161,8 @@ fn execute_index_scan(
             IndexPredicateShape::IsNotNull => {
                 // Everything except NULL partition.
                 let null_key = vec![wrap(Value::Null)];
-                for (k, entries) in storage.tree.iter() {
+                for (k, entries) in storage.read_range(snapshot, Bound::Unbounded, Bound::Unbounded)
+                {
                     if *k == null_key {
                         continue;
                     }
@@ -7790,6 +9390,7 @@ fn run_index_scan_with_order(
         indexes_considered: Default::default(),
         sort_elided: true,
         query_vector_source: None,
+        vector_search: None,
         rows_examined: 0,
     };
     Ok(Some(result))
@@ -7988,36 +9589,6 @@ fn validate_update_state_transition(
     )))
 }
 
-/// What a row costs the store that KEEPS it: an index over any of its columns
-/// keeps a whole clone of the value, so the memory a limit governs is
-/// `ROW_VALUE_RETENTIONS` copies of what one copy occupies.
-fn retained_row_bytes_for_meta(
-    values: &HashMap<String, Value>,
-    meta: &TableMeta,
-    include_vectors: bool,
-) -> usize {
-    estimate_row_bytes_for_meta(values, meta, include_vectors).saturating_mul(ROW_VALUE_RETENTIONS)
-}
-
-fn estimate_row_bytes_for_meta(
-    values: &HashMap<String, Value>,
-    meta: &TableMeta,
-    include_vectors: bool,
-) -> usize {
-    let mut bytes = 96usize;
-    for column in &meta.columns {
-        let Some(value) = values.get(&column.name) else {
-            continue;
-        };
-        if !include_vectors && matches!(column.column_type, ColumnType::Vector(_)) {
-            continue;
-        }
-        bytes =
-            bytes.saturating_add(estimate_value_key_bytes(&column.name) + value.estimated_bytes());
-    }
-    bytes
-}
-
 pub(crate) fn estimate_vector_search_bytes(dimension: usize, k: usize) -> usize {
     k.saturating_mul(3)
         .saturating_mul(dimension)
@@ -8068,19 +9639,30 @@ pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
     let meta = db.table_meta(table);
     let metadata_bytes = meta.as_ref().map(TableMeta::estimated_bytes).unwrap_or(0);
     let snapshot = db.snapshot();
-    let rows = db.scan(table, snapshot).unwrap_or_default();
-    let row_bytes = rows.iter().fold(0usize, |acc, row| {
-        acc.saturating_add(meta.as_ref().map_or_else(
-            || row.estimated_bytes(),
-            |meta| retained_row_bytes_for_meta(&row.values, meta, false),
-        ))
-    });
-    let vector_bytes = rows
-        .iter()
-        .filter_map(|row| db.live_vector_entry(row.row_id, snapshot))
-        .fold(0usize, |acc, entry| {
-            acc.saturating_add(entry.estimated_bytes())
+    // Only a live version still owns a charge: a superseded or deleted
+    // version handed its bytes back at the commit that stamped its
+    // `deleted_tx`, so releasing it again here would credit the same bytes
+    // twice and leave the ceiling below what the surviving tables still
+    // hold. This fold mirrors the live-set charge exactly (the same
+    // `deleted_tx.is_none()` filter and estimate `account_loaded_state`
+    // uses), so dropping a table gives back exactly what holding it took.
+    let row_bytes = db
+        .relational_store()
+        .tables
+        .read()
+        .get(table)
+        .map_or(0usize, |versions| {
+            versions
+                .iter()
+                .filter(|row| row.deleted_tx.is_none())
+                .fold(0usize, |acc, row| {
+                    acc.saturating_add(meta.as_ref().map_or_else(
+                        || row.estimated_bytes(),
+                        |meta| retained_row_bytes_for_meta(&row.values, meta, true),
+                    ))
+                })
         });
+    let rows = db.scan(table, snapshot).unwrap_or_default();
     let edge_bytes = if meta.as_ref().is_some_and(has_edge_columns) {
         rows.iter().fold(0usize, |acc, row| {
             match (
@@ -8110,7 +9692,6 @@ pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
     };
     metadata_bytes
         .saturating_add(row_bytes)
-        .saturating_add(vector_bytes)
         .saturating_add(edge_bytes)
 }
 
@@ -8169,7 +9750,7 @@ fn scan_rows_for_select(
     } else {
         db.scan(table, snapshot)?
     };
-    db.supplement_quantized_vectors(table, snapshot, &mut rows);
+    db.supplement_quantized_vectors(table, snapshot, &mut rows)?;
     Ok(rows)
 }
 
@@ -8179,6 +9760,7 @@ fn rows_by_row_id(
     row_ids: &[RowId],
     snapshot: SnapshotId,
     tx: Option<TxId>,
+    materialized_columns: Option<&[String]>,
 ) -> Result<Vec<VersionedRow>> {
     if row_ids.is_empty() {
         return Ok(Vec::new());
@@ -8190,7 +9772,7 @@ fn rows_by_row_id(
             rows.push(row);
         }
     }
-    db.supplement_quantized_vectors(table, snapshot, &mut rows);
+    db.supplement_selected_vector_columns(table, snapshot, tx, materialized_columns, &mut rows)?;
     Ok(rows)
 }
 
@@ -8266,6 +9848,608 @@ fn is_unrestricted_scan_for_table(plan: &PhysicalPlan, table: &str) -> bool {
             ..
         } if scan_table == table
     )
+}
+
+/// A finite set of typed partition prefixes derived without reading a table
+/// row. `covers_filter` means the candidate scan is redundant: the vector
+/// reader's selected states are exactly the SQL predicate's possible states.
+/// It is structural: true whenever the partition key covers the predicate,
+/// whether or not every key identity is bound yet, so a passive explain of a
+/// prepared statement reports the same residual and route shape as the same
+/// statement with its literal inlined. Whether a reader may actually skip
+/// the row filter is `covers_filter_for_execution`.
+#[derive(Debug, Clone)]
+pub(crate) struct VectorPartitionScope {
+    prefixes: Vec<VectorPartitionKey>,
+    /// Combinations whose every key component is constrained by equality but
+    /// whose identity is not yet bound. Non-zero only on the passive explain
+    /// path; every executing door binds its parameters first.
+    unbound_prefixes: usize,
+    pub(crate) covers_filter: bool,
+}
+
+impl VectorPartitionScope {
+    /// Prefixes a reader may narrow by. `None` when an identity is unbound:
+    /// the shape is known, the identity is not, so no reader may narrow.
+    pub(crate) fn resolved_prefixes(&self) -> Option<&[VectorPartitionKey]> {
+        (self.unbound_prefixes == 0).then_some(self.prefixes.as_slice())
+    }
+
+    /// How many partitions this predicate names, bound or not.
+    pub(crate) fn selected_partitions(&self) -> usize {
+        self.prefixes.len() + self.unbound_prefixes
+    }
+
+    /// Whether a reader may skip the row filter: covering AND fully bound.
+    pub(crate) fn covers_filter_for_execution(&self) -> bool {
+        self.covers_filter && self.unbound_prefixes == 0
+    }
+}
+
+#[derive(Clone, Default)]
+struct PartitionPredicateTerm {
+    values: BTreeMap<String, Vec<PartitionKeyLiteral>>,
+    residual: bool,
+}
+
+fn partition_column_name(expr: &Expr, table: &str, keys: &[String]) -> Option<String> {
+    let Expr::Column(column) = expr else {
+        return None;
+    };
+    if column.table.as_deref().is_some_and(|named| named != table)
+        || !keys.iter().any(|key| key == &column.column)
+    {
+        return None;
+    }
+    Some(column.column.clone())
+}
+
+/// Intersect an AND's two literal lists for one key column. Both sides are
+/// already canonical, so `Exact` meets `Exact` under the same `=` the row
+/// filter applies. An unknown identity on either side (`Unresolved`,
+/// `Unbound`) is the whole answer: an AND cannot shrink an unknown identity
+/// below one. `NoPartition` equals nothing, so it drops out.
+fn merge_partition_values(
+    left: Vec<PartitionKeyLiteral>,
+    right: Vec<PartitionKeyLiteral>,
+) -> Vec<PartitionKeyLiteral> {
+    let has = |predicate: fn(&PartitionKeyLiteral) -> bool| {
+        left.iter().chain(right.iter()).any(predicate)
+    };
+    if has(|literal| matches!(literal, PartitionKeyLiteral::Unresolved)) {
+        return vec![PartitionKeyLiteral::Unresolved];
+    }
+    if has(|literal| matches!(literal, PartitionKeyLiteral::Unbound)) {
+        return vec![PartitionKeyLiteral::Unbound];
+    }
+    left.into_iter()
+        .filter(|literal| {
+            let PartitionKeyLiteral::Exact(value) = literal else {
+                return false;
+            };
+            right.iter().any(|other| {
+                matches!(
+                    other,
+                    PartitionKeyLiteral::Exact(other)
+                        if compare_values(value, other) == Some(Ordering::Equal)
+                )
+            })
+        })
+        .collect()
+}
+
+/// One side of a key predicate, resolved against the declared key type. A
+/// bare placeholder with no binding is an unknown identity, never an error;
+/// any other expression that fails to resolve is a real planning error.
+fn partition_predicate_literal(
+    expr: &Expr,
+    declared: &ColumnType,
+    params: &HashMap<String, Value>,
+) -> Result<PartitionKeyLiteral> {
+    if let Expr::Parameter(name) = expr
+        && !params.contains_key(name)
+    {
+        return Ok(PartitionKeyLiteral::Unbound);
+    }
+    let value = resolve_expr(expr, params)?;
+    Ok(partition_key_literal(declared, &value))
+}
+
+fn partition_predicate_terms(
+    expr: &Expr,
+    table: &str,
+    keys: &[String],
+    key_types: &BTreeMap<String, ColumnType>,
+    params: &HashMap<String, Value>,
+) -> Result<Vec<PartitionPredicateTerm>> {
+    let residual_term = || PartitionPredicateTerm {
+        residual: true,
+        ..Default::default()
+    };
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Or,
+            right,
+        } => {
+            let mut terms = partition_predicate_terms(left, table, keys, key_types, params)?;
+            terms.extend(partition_predicate_terms(
+                right, table, keys, key_types, params,
+            )?);
+            Ok(terms)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let left_terms = partition_predicate_terms(left, table, keys, key_types, params)?;
+            let right_terms = partition_predicate_terms(right, table, keys, key_types, params)?;
+            let mut combined = Vec::new();
+            for left in left_terms {
+                for right in &right_terms {
+                    let mut term = left.clone();
+                    term.residual |= right.residual;
+                    for (column, values) in &right.values {
+                        match term.values.remove(column) {
+                            Some(existing) => {
+                                term.values.insert(
+                                    column.clone(),
+                                    merge_partition_values(existing, values.clone()),
+                                );
+                            }
+                            None => {
+                                term.values.insert(column.clone(), values.clone());
+                            }
+                        }
+                    }
+                    combined.push(term);
+                }
+            }
+            Ok(combined)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => {
+            let (column, other) = if let Some(column) = partition_column_name(left, table, keys) {
+                (column, right)
+            } else if let Some(column) = partition_column_name(right, table, keys) {
+                (column, left)
+            } else {
+                return Ok(vec![residual_term()]);
+            };
+            let Some(declared) = key_types.get(&column) else {
+                return Ok(vec![residual_term()]);
+            };
+            let literal = partition_predicate_literal(other, declared, params)?;
+            Ok(vec![PartitionPredicateTerm {
+                values: BTreeMap::from([(column, vec![literal])]),
+                residual: false,
+            }])
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let Some(column) = partition_column_name(expr, table, keys) else {
+                return Ok(vec![residual_term()]);
+            };
+            let Some(declared) = key_types.get(&column) else {
+                return Ok(vec![residual_term()]);
+            };
+            let values = list
+                .iter()
+                .map(|value| partition_predicate_literal(value, declared, params))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(vec![PartitionPredicateTerm {
+                values: BTreeMap::from([(column, values)]),
+                residual: false,
+            }])
+        }
+        _ => Ok(vec![residual_term()]),
+    }
+}
+
+/// Bind every placeholder a vector search names in its query expression and
+/// candidate predicate before any partition scope or route availability is
+/// judged. Partition scope resolves after parameters are bound, so a
+/// forgotten binding is the ordinary missing-parameter refusal, never a route
+/// refusal that sends the caller to add a relational index or change modes.
+/// Every executing reader calls this first; the passive explain path does
+/// not, because it binds nothing and reports the shape.
+pub(crate) fn bind_vector_search_parameters(
+    query_expr: &Expr,
+    candidates: Option<&PhysicalPlan>,
+    params: &HashMap<String, Value>,
+) -> Result<()> {
+    match first_unbound_parameter(query_expr, params)
+        .or_else(|| candidates.and_then(|plan| first_unbound_plan_parameter(plan, params)))
+    {
+        Some(name) => Err(Error::NotFound(format!("missing parameter: {name}"))),
+        None => Ok(()),
+    }
+}
+
+/// The first placeholder in a candidate plan's predicates with no binding.
+/// The planner places a table scan carrying the statement's WHERE clause, or
+/// a filter over one, below a vector search; an index scan carries already
+/// resolved values, and any other shape reports its own missing parameter
+/// when it runs.
+fn first_unbound_plan_parameter<'a>(
+    plan: &'a PhysicalPlan,
+    params: &HashMap<String, Value>,
+) -> Option<&'a str> {
+    match plan {
+        PhysicalPlan::Scan {
+            filter: Some(filter),
+            ..
+        } => first_unbound_parameter(filter, params),
+        PhysicalPlan::Filter { input, predicate } => first_unbound_parameter(predicate, params)
+            .or_else(|| first_unbound_plan_parameter(input, params)),
+        _ => None,
+    }
+}
+
+/// The first placeholder in an expression with no binding, in evaluation
+/// order. A subquery body is left to its own execution.
+fn first_unbound_parameter<'a>(expr: &'a Expr, params: &HashMap<String, Value>) -> Option<&'a str> {
+    let unbound = |expr: &'a Expr| first_unbound_parameter(expr, params);
+    match expr {
+        Expr::Parameter(name) => (!params.contains_key(name)).then_some(name.as_str()),
+        Expr::Column(_) | Expr::Literal(_) => None,
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            unbound(left).or_else(|| unbound(right))
+        }
+        Expr::UnaryOp { operand, .. } => unbound(operand),
+        Expr::FunctionCall { args, .. } => args.iter().find_map(unbound),
+        Expr::RowVectorSource { key, .. } => unbound(key),
+        Expr::InList { expr, list, .. } => unbound(expr).or_else(|| list.iter().find_map(unbound)),
+        Expr::Like { expr, pattern, .. } => unbound(expr).or_else(|| unbound(pattern)),
+        Expr::InSubquery { expr, .. } | Expr::IsNull { expr, .. } => unbound(expr),
+    }
+}
+
+/// Recovery names columns, never predicate values or bound parameters.
+pub(crate) fn vector_filter_columns(candidates: Option<&PhysicalPlan>) -> Vec<String> {
+    let Some(mut plan) = candidates else {
+        return Vec::new();
+    };
+    while let PhysicalPlan::Project { input, .. } = plan {
+        plan = input;
+    }
+    let mut columns = std::collections::BTreeSet::new();
+    if let PhysicalPlan::Scan {
+        filter: Some(filter),
+        ..
+    } = plan
+    {
+        let _ = walk_predicate_columns(filter, &mut |column| {
+            columns.insert(column.column.clone());
+            Ok(())
+        });
+    }
+    columns.into_iter().collect()
+}
+
+pub(crate) fn vector_candidates_with_access(
+    db: &dyn ReadExecutionTarget,
+    table: &str,
+    candidates: Option<&PhysicalPlan>,
+) -> Result<Option<PhysicalPlan>> {
+    let Some(access) = db.vector_access_predicate(table)? else {
+        return Ok(candidates.cloned());
+    };
+    let mut candidate = candidates.cloned().unwrap_or_else(|| PhysicalPlan::Scan {
+        table: table.to_owned(),
+        alias: None,
+        filter: None,
+    });
+    let mut source = &mut candidate;
+    while let PhysicalPlan::Project { input, .. } = source {
+        source = input;
+    }
+    if let PhysicalPlan::Scan { filter, .. } = source {
+        *filter = Some(match filter.take() {
+            Some(left) => Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::And,
+                right: Box::new(access),
+            },
+            None => access,
+        });
+    }
+    Ok(Some(candidate))
+}
+
+pub(crate) fn vector_partition_scope_for_candidates(
+    db: &dyn ReadExecutionTarget,
+    index: &VectorIndexRef,
+    candidates: Option<&PhysicalPlan>,
+    params: &HashMap<String, Value>,
+) -> Result<Option<VectorPartitionScope>> {
+    let candidates = candidates.map(|mut plan| {
+        while let PhysicalPlan::Project { input, .. } = plan {
+            plan = input;
+        }
+        plan
+    });
+    let Some(PhysicalPlan::Scan {
+        table,
+        filter: Some(filter),
+        ..
+    }) = candidates
+    else {
+        return Ok(None);
+    };
+    if table != &index.table {
+        return Ok(None);
+    }
+    let Some(meta) = db.table_meta(&index.table) else {
+        return Ok(None);
+    };
+    let Some(column) = meta
+        .columns
+        .iter()
+        .find(|column| column.name == index.column)
+    else {
+        return Ok(None);
+    };
+    let Some(keys) = column.partition_key_columns.as_ref() else {
+        return Ok(None);
+    };
+    // Every literal is canonicalized to the declared key type where it is
+    // collected, so a prefix below is always a component the write side
+    // stores.
+    let mut key_types = BTreeMap::new();
+    for key in keys {
+        let Some(declared) = meta.columns.iter().find(|column| &column.name == key) else {
+            return Ok(None);
+        };
+        key_types.insert(key.clone(), declared.column_type.clone());
+    }
+    let terms = partition_predicate_terms(filter, &index.table, keys, &key_types, params)?;
+    let mut prefixes = BTreeSet::new();
+    let mut unbound_prefixes = 0usize;
+    let mut covers_filter = true;
+    for term in terms {
+        if term.residual {
+            covers_filter = false;
+        }
+        let mut combinations: Vec<Vec<&PartitionKeyLiteral>> = vec![Vec::new()];
+        let mut gap = false;
+        for key in keys {
+            let Some(values) = term.values.get(key) else {
+                gap = true;
+                continue;
+            };
+            if gap {
+                covers_filter = false;
+                continue;
+            }
+            let mut next = Vec::new();
+            for combination in &combinations {
+                for value in values {
+                    let mut candidate = combination.clone();
+                    candidate.push(value);
+                    next.push(candidate);
+                }
+            }
+            combinations = next;
+        }
+        if combinations.first().is_some_and(Vec::is_empty) {
+            return Ok(None);
+        }
+        for literals in combinations {
+            // An identity that names more than one component cannot be
+            // narrowed by any prefix: the row filter only sees candidates
+            // fetched from selected partitions, so the only non-lossy answer
+            // is no narrowing at all.
+            if literals
+                .iter()
+                .any(|literal| matches!(literal, PartitionKeyLiteral::Unresolved))
+            {
+                return Ok(None);
+            }
+            // A component no key of the declared type can equal names a
+            // provably empty scope: it contributes no prefix and the
+            // predicate is still covered, so the reader searches nothing and
+            // plain `=` returns nothing.
+            if literals
+                .iter()
+                .any(|literal| matches!(literal, PartitionKeyLiteral::NoPartition))
+            {
+                continue;
+            }
+            if literals
+                .iter()
+                .any(|literal| matches!(literal, PartitionKeyLiteral::Unbound))
+            {
+                unbound_prefixes += 1;
+                continue;
+            }
+            let values = literals
+                .into_iter()
+                .filter_map(|literal| match literal {
+                    PartitionKeyLiteral::Exact(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let key = VectorPartitionKey::from_values(&values).ok_or_else(|| {
+                Error::PlanError(
+                    "partition key literal canonicalized to a component the key encoder cannot represent"
+                        .to_string(),
+                )
+            })?;
+            prefixes.insert(key);
+        }
+    }
+    Ok(
+        (!prefixes.is_empty() || unbound_prefixes > 0 || covers_filter).then_some(
+            VectorPartitionScope {
+                prefixes: prefixes.into_iter().collect(),
+                unbound_prefixes,
+                covers_filter,
+            },
+        ),
+    )
+}
+
+/// Whether a vector search can obtain every row its relational side admits
+/// without first walking the table.  INDEXED promises that an unavailable
+/// maintained vector route is a refusal, not an excuse to do unbounded work;
+/// the same has to be true of the relational side that narrows that route.
+///
+/// This deliberately asks the existing relational index chooser rather than
+/// making a second idea of which predicates are usable.  The candidate plan
+/// the planner places below a vector search is the table scan carrying the
+/// statement's WHERE clause.  An unrestricted scan needs no candidate set
+/// unless the read target requires one for authorization.  A filtered scan is
+/// complete only when that chooser can supply an index walk (or can prove the
+/// predicate empty) before any table row is read.
+pub(crate) struct VectorCandidateRoute {
+    pub candidates: Option<PhysicalPlan>,
+    pub scope: Option<VectorPartitionScope>,
+    pub access_filter: bool,
+    pub directory_route: bool,
+    pub complete: bool,
+}
+
+pub(crate) fn vector_candidate_route(
+    db: &dyn ReadExecutionTarget,
+    index: &VectorIndexRef,
+    candidates: Option<&PhysicalPlan>,
+    params: &HashMap<String, Value>,
+) -> Result<VectorCandidateRoute> {
+    let access_filter = db.bounded_read_requires_candidate_filter(&index.table)?;
+    let sql_scope = vector_partition_scope_for_candidates(db, index, candidates, params)?;
+    let candidates = vector_candidates_with_access(db, &index.table, candidates)?;
+    let scope = vector_partition_scope_for_candidates(db, index, candidates.as_ref(), params)?
+        .or(sql_scope.clone());
+    let directory_route = sql_scope
+        .as_ref()
+        .is_some_and(VectorPartitionScope::covers_filter_for_execution)
+        || scope
+            .as_ref()
+            .is_some_and(VectorPartitionScope::covers_filter_for_execution);
+    let indexed = vector_candidate_plan_has_complete_relational_route(
+        db,
+        candidates.as_ref(),
+        index,
+        params,
+        true,
+    )?;
+    // Partition keys can supply a bounded identity directory. Every identity
+    // still passes the real row gate; selecting a tuple never grants access.
+    let complete = (!access_filter
+        && candidates
+            .as_ref()
+            .is_none_or(|plan| is_unrestricted_scan_for_table(plan, &index.table)))
+        || indexed
+        || (scope
+            .as_ref()
+            .is_some_and(VectorPartitionScope::covers_filter_for_execution)
+            && (!access_filter
+                || !db
+                    .table_meta(&index.table)
+                    .is_some_and(|meta| meta.columns.iter().any(|c| c.acl_ref.is_some()))));
+    let mut source = candidates.as_ref();
+    while let Some(PhysicalPlan::Project { input, .. }) = source {
+        source = Some(input);
+    }
+    let directory_route = !indexed
+        && (directory_route
+            || (access_filter && matches!(source, Some(PhysicalPlan::Scan { .. }))));
+    Ok(VectorCandidateRoute {
+        candidates,
+        scope,
+        access_filter,
+        directory_route,
+        complete,
+    })
+}
+
+pub(crate) fn vector_candidate_refusal_columns(
+    db: &dyn ReadExecutionTarget,
+    index: &VectorIndexRef,
+    candidates: Option<&PhysicalPlan>,
+    access_filter: bool,
+) -> Vec<String> {
+    let mut columns = vector_filter_columns(candidates);
+    if access_filter && let Some(meta) = db.table_meta(&index.table) {
+        columns.extend(
+            meta.columns
+                .iter()
+                .filter(|c| c.context_id || c.scope_label.is_some() || c.acl_ref.is_some())
+                .map(|c| c.name.clone()),
+        );
+    }
+    columns.sort();
+    columns.dedup();
+    columns
+}
+
+pub(crate) fn vector_candidate_plan_has_complete_relational_route(
+    db: &dyn ReadExecutionTarget,
+    candidates: Option<&PhysicalPlan>,
+    index: &VectorIndexRef,
+    params: &HashMap<String, Value>,
+    access_filter: bool,
+) -> Result<bool> {
+    let table = &index.table;
+    if !access_filter
+        && vector_partition_scope_for_candidates(db, index, candidates, params)?
+            .is_some_and(|scope| scope.covers_filter_for_execution())
+    {
+        return Ok(true);
+    }
+    let Some(candidates) = candidates else {
+        return Ok(!access_filter);
+    };
+    if is_unrestricted_scan_for_table(candidates, table) {
+        return Ok(!access_filter);
+    }
+    match candidates {
+        // Projection changes values, not the source's candidate enumeration.
+        PhysicalPlan::Project { input, .. } => vector_candidate_plan_has_complete_relational_route(
+            db,
+            Some(input),
+            index,
+            params,
+            access_filter,
+        ),
+        // The planner already produced a direct index source.  It is a
+        // complete relational answer by construction; executing it is still
+        // left to the ordinary kernel so authorization is intersected there.
+        PhysicalPlan::IndexScan {
+            table: candidate_table,
+            ..
+        } if candidate_table == table => Ok(true),
+        PhysicalPlan::Scan {
+            table: candidate_table,
+            filter: Some(filter),
+            ..
+        } if candidate_table == table => {
+            let Some(meta) = db.table_meta(table) else {
+                return Ok(false);
+            };
+            let Some(_) = analyze_filter_for_index(filter, &meta.indexes, params).pick else {
+                return Ok(false);
+            };
+            // The scan kernel coerces this same pick when it opens the index
+            // cursor.  If a bound value cannot be coerced, that kernel proves
+            // an empty answer rather than reading the table, which is still a
+            // complete candidate route here.
+            Ok(true)
+        }
+        // A join, CTE, or another compound plan may be a valid relational
+        // query, but this vector operator has no proof that it can enumerate
+        // its complete allowed-row set without a broad scan.  Do not guess:
+        // INDEXED reports the typed route refusal before any source runs.
+        _ => Ok(false),
+    }
 }
 
 pub(crate) fn row_matches(
@@ -8460,6 +10644,86 @@ fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Null, _) | (_, Value::Null) => None,
         _ => None,
     }
+}
+
+/// How a value resolves against a declared partition-key column type.
+#[derive(Debug, Clone)]
+pub(crate) enum PartitionKeyLiteral {
+    /// The one component of the declared type this value is `=`-equal to.
+    Exact(Value),
+    /// No component of the declared type can be `=`-equal to this value:
+    /// a provably empty scope, not an error.
+    NoPartition,
+    /// More than one distinct component of the declared type is `=`-equal to
+    /// this value, so the predicate names no finite key set. No narrowing.
+    Unresolved,
+    /// A placeholder with no binding. The shape is known, the identity is
+    /// not.
+    Unbound,
+}
+
+/// Resolve a value to the one partition component of the declared key type
+/// it is `=`-equal to, so a stored key and a predicate literal meet under the
+/// same equality the row filter applies. Every arm below verifies itself by
+/// calling `compare_values`; no arm restates an equality in its own words. An
+/// arm only forms a candidate component and, where the declared type has
+/// neighbouring components that could also be equal, names them, and
+/// `unique_component` proves equality and uniqueness by asking
+/// `compare_values`.
+pub(crate) fn partition_key_literal(declared: &ColumnType, value: &Value) -> PartitionKeyLiteral {
+    match (declared, value) {
+        (ColumnType::Uuid, Value::Uuid(_))
+        | (ColumnType::Integer, Value::Int64(_))
+        | (ColumnType::Timestamp, Value::Timestamp(_))
+        | (ColumnType::TxId, Value::TxId(_))
+        | (ColumnType::Boolean, Value::Bool(_))
+        | (ColumnType::Text, Value::Text(_)) => unique_component(value.clone(), value, &[]),
+        (ColumnType::Uuid, Value::Text(text)) => match text.parse::<uuid::Uuid>() {
+            Ok(parsed) => unique_component(Value::Uuid(parsed), value, &[]),
+            Err(_) => PartitionKeyLiteral::NoPartition,
+        },
+        (ColumnType::Integer, Value::Float64(float)) => {
+            if !float.is_finite() {
+                return PartitionKeyLiteral::NoPartition;
+            }
+            // `as` saturates, so an out-of-range float forms a candidate that
+            // `compare_values` then refuses. Above 2^53 several integers are
+            // `=`-equal to one float; the neighbours make that visible.
+            let candidate = *float as i64;
+            let neighbours = [candidate.checked_sub(1), candidate.checked_add(1)]
+                .into_iter()
+                .flatten()
+                .map(Value::Int64)
+                .collect::<Vec<_>>();
+            unique_component(Value::Int64(candidate), value, &neighbours)
+        }
+        (ColumnType::Timestamp, Value::Int64(n)) => {
+            unique_component(Value::Timestamp(*n), value, &[])
+        }
+        (ColumnType::TxId, Value::Int64(n)) => {
+            // A negative integer forms a candidate `compare_values` refuses.
+            unique_component(Value::TxId(contextdb_core::TxId(*n as u64)), value, &[])
+        }
+        // Many text spellings are `=`-equal to one UUID while unequal to each
+        // other, so no single text component names this value.
+        (ColumnType::Text, Value::Uuid(_)) => PartitionKeyLiteral::Unresolved,
+        _ => PartitionKeyLiteral::NoPartition,
+    }
+}
+
+/// `candidate` is the declared-type component for `value` exactly when
+/// `compare_values` says they are equal and says no neighbouring component is.
+fn unique_component(candidate: Value, value: &Value, neighbours: &[Value]) -> PartitionKeyLiteral {
+    if compare_values(&candidate, value) != Some(Ordering::Equal) {
+        return PartitionKeyLiteral::NoPartition;
+    }
+    if neighbours
+        .iter()
+        .any(|neighbour| compare_values(neighbour, value) == Some(Ordering::Equal))
+    {
+        return PartitionKeyLiteral::Unresolved;
+    }
+    PartitionKeyLiteral::Exact(candidate)
 }
 
 fn eval_bool_expr(
@@ -8909,10 +11173,7 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value> {
 /// a caller that has already identified the function calls this instead, so
 /// no scratch is allocated outside whatever budget governs it.
 fn now_timestamp_seconds() -> Result<i64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| Error::PlanError(err.to_string()))?
-        .as_secs() as i64)
+    Ok((Wallclock::now().0 / 1_000) as i64)
 }
 
 fn like_matches(value: &str, pattern: &str) -> bool {
@@ -10500,15 +12761,21 @@ fn resolve_row_vector_source(
             index: index.clone(),
             key: key_label.clone(),
         })?;
-    db.assert_row_id_read_allowed_for_change(tx, &index.table, row_id, snapshot)?;
-    let entry = db
-        .vector_entry_for_row_in_tx(tx, index, row_id, snapshot)?
+    let vector = db
+        .with_row_vector_source(
+            index,
+            row_id,
+            snapshot,
+            tx,
+            |_| Ok::<(), Error>(()),
+            |vector| Ok::<Vec<f32>, Error>(vector.to_vec()),
+        )?
         .ok_or_else(|| Error::PersistedRowVectorCellNull {
             index: index.clone(),
             key: key_label,
         })?;
-    db.validate_vector_under_schema_read(index, entry.vector.len())?;
-    Ok(entry.vector)
+    db.validate_vector_under_schema_read(index, vector.len())?;
+    Ok(vector)
 }
 
 fn row_vector_key_label(value: &Value) -> String {
@@ -11456,6 +13723,12 @@ fn column_def_matches_canonical(
         expires,
         immutable,
         quantization,
+        partition_key_columns,
+        max_partitions,
+        search_mode,
+        auto_index_at,
+        hnsw,
+        consolidation,
         rank_policy,
         context_id,
         scope_label,
@@ -11473,6 +13746,12 @@ fn column_def_matches_canonical(
         && *expires == canonical.expires
         && *immutable == canonical.immutable
         && *quantization == canonical.quantization
+        && *partition_key_columns == canonical.partition_key_columns
+        && *max_partitions == canonical.max_partitions
+        && *search_mode == canonical.search_mode
+        && *auto_index_at == canonical.auto_index_at
+        && *hnsw == canonical.hnsw
+        && *consolidation == canonical.consolidation
         && rank_policy.is_none()
         && canonical.rank_policy.is_none()
         && *context_id == canonical.context_id
@@ -12734,10 +15013,23 @@ struct ResolvedRankPolicy {
 }
 
 pub(crate) fn core_column_from_ast(
+    table: &str,
     col: &contextdb_parser::ast::ColumnDef,
     rank_policy: Option<contextdb_core::RankPolicy>,
-) -> contextdb_core::ColumnDef {
-    contextdb_core::ColumnDef {
+) -> Result<contextdb_core::ColumnDef> {
+    let (
+        partition_key_columns,
+        max_partitions,
+        search_mode,
+        auto_index_at,
+        hnsw_m,
+        hnsw_ef_construction,
+        hnsw_ef_search,
+        consolidation_change_percent,
+        consolidation_tombstone_percent,
+        consolidation_disabled,
+    ) = normalized_ast_vector_declaration(table, col)?;
+    Ok(contextdb_core::ColumnDef {
         name: col.name.clone(),
         column_type: map_column_type(&col.data_type),
         // SQL primary-key columns are implicitly NOT NULL even when the
@@ -12775,10 +15067,23 @@ pub(crate) fn core_column_from_ast(
             ref_table: acl.ref_table.clone(),
             ref_column: acl.ref_column.clone(),
         }),
-    }
+        partition_key_columns,
+        max_partitions,
+        search_mode,
+        auto_index_at,
+        hnsw_m,
+        hnsw_ef_construction,
+        hnsw_ef_search,
+        vector_policy_revision: contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
+        consolidation_change_percent,
+        consolidation_tombstone_percent,
+        consolidation_disabled,
+    })
 }
 
 fn ast_column_from_core(col: contextdb_core::ColumnDef) -> contextdb_parser::ast::ColumnDef {
+    let is_vector = matches!(&col.column_type, ColumnType::Vector(_));
+    let effective_max_partitions = col.effective_max_partitions();
     contextdb_parser::ast::ColumnDef {
         name: col.name,
         data_type: match col.column_type {
@@ -12810,11 +15115,719 @@ fn ast_column_from_core(col: contextdb_core::ColumnDef) -> contextdb_parser::ast
                 contextdb_parser::ast::VectorQuantization::SQ4
             }
         },
+        partition_key_columns: if is_vector {
+            col.partition_key_columns.unwrap_or_default()
+        } else {
+            Vec::new()
+        },
+        max_partitions: is_vector
+            .then_some(effective_max_partitions)
+            .flatten()
+            .map(|value| value.to_string()),
+        search_mode: is_vector.then_some(map_core_vector_search_mode(col.search_mode)),
+        auto_index_at: col.auto_index_at.map(|value| value.to_string()),
+        hnsw: contextdb_parser::ast::VectorHnswOptions {
+            m: col
+                .hnsw_m
+                .map(|value| contextdb_parser::ast::VectorPolicyValue::Value(value.to_string())),
+            ef_construction: col
+                .hnsw_ef_construction
+                .map(|value| contextdb_parser::ast::VectorPolicyValue::Value(value.to_string())),
+            ef_search: col
+                .hnsw_ef_search
+                .map(|value| contextdb_parser::ast::VectorPolicyValue::Value(value.to_string())),
+        },
+        consolidation: contextdb_parser::ast::VectorConsolidationOptions {
+            change_percent: col
+                .consolidation_change_percent
+                .map(|value| contextdb_parser::ast::VectorPolicyValue::Value(value.to_string())),
+            tombstone_percent: col
+                .consolidation_tombstone_percent
+                .map(|value| contextdb_parser::ast::VectorPolicyValue::Value(value.to_string())),
+            disabled: col.consolidation_disabled,
+        },
         rank_policy: None,
         context_id: col.context_id,
         scope_label: None,
         acl_ref: None,
     }
+}
+
+fn invalid_vector_partition_declaration(
+    table: &str,
+    column: &str,
+    issue: VectorPartitionDeclarationIssue,
+) -> Error {
+    Error::InvalidVectorPartitionDeclaration {
+        index: VectorIndexRef::new(table, column),
+        issue,
+    }
+}
+
+pub(crate) fn map_vector_search_mode(
+    mode: contextdb_parser::ast::VectorSearchMode,
+) -> contextdb_core::VectorSearchMode {
+    match mode {
+        contextdb_parser::ast::VectorSearchMode::Auto => contextdb_core::VectorSearchMode::Auto,
+        contextdb_parser::ast::VectorSearchMode::Exact => contextdb_core::VectorSearchMode::Exact,
+        contextdb_parser::ast::VectorSearchMode::Indexed => {
+            contextdb_core::VectorSearchMode::Indexed
+        }
+    }
+}
+
+fn map_core_vector_search_mode(
+    mode: contextdb_core::VectorSearchMode,
+) -> contextdb_parser::ast::VectorSearchMode {
+    match mode {
+        contextdb_core::VectorSearchMode::Auto => contextdb_parser::ast::VectorSearchMode::Auto,
+        contextdb_core::VectorSearchMode::Exact => contextdb_parser::ast::VectorSearchMode::Exact,
+        contextdb_core::VectorSearchMode::Indexed => {
+            contextdb_parser::ast::VectorSearchMode::Indexed
+        }
+    }
+}
+
+fn parse_vector_max_partitions(table: &str, column: &str, raw: &str) -> Result<u32> {
+    let raw = raw.trim();
+    if raw.starts_with('-') {
+        return Err(invalid_vector_partition_declaration(
+            table,
+            column,
+            VectorPartitionDeclarationIssue::MaxPartitionsNotPositive,
+        ));
+    }
+    match raw.parse::<u128>() {
+        Ok(0) => Err(invalid_vector_partition_declaration(
+            table,
+            column,
+            VectorPartitionDeclarationIssue::MaxPartitionsNotPositive,
+        )),
+        Ok(value) => u32::try_from(value).map_err(|_| {
+            invalid_vector_partition_declaration(
+                table,
+                column,
+                VectorPartitionDeclarationIssue::MaxPartitionsOutOfRange,
+            )
+        }),
+        Err(_) => Err(invalid_vector_partition_declaration(
+            table,
+            column,
+            VectorPartitionDeclarationIssue::MaxPartitionsOutOfRange,
+        )),
+    }
+}
+
+fn invalid_vector_policy_declaration(
+    table: &str,
+    column: &str,
+    issue: contextdb_core::VectorPolicyDeclarationIssue,
+) -> Error {
+    Error::InvalidVectorPolicyDeclaration {
+        index: VectorIndexRef::new(table, column),
+        issue,
+    }
+}
+
+fn parse_vector_policy_u32(
+    table: &str,
+    column: &str,
+    raw: &str,
+    auto_index_at: bool,
+) -> Result<u32> {
+    use contextdb_core::VectorPolicyDeclarationIssue as Issue;
+
+    let raw = raw.trim();
+    let not_positive = if auto_index_at {
+        Issue::AutoIndexAtNotPositive
+    } else {
+        Issue::HnswValueNotPositive
+    };
+    let out_of_range = if auto_index_at {
+        Issue::AutoIndexAtOutOfRange
+    } else {
+        Issue::HnswValueOutOfRange
+    };
+    if raw.starts_with('-') {
+        return Err(invalid_vector_policy_declaration(
+            table,
+            column,
+            not_positive,
+        ));
+    }
+    match raw.parse::<u128>() {
+        Ok(0) => Err(invalid_vector_policy_declaration(
+            table,
+            column,
+            not_positive,
+        )),
+        Ok(value) => u32::try_from(value)
+            .map_err(|_| invalid_vector_policy_declaration(table, column, out_of_range)),
+        Err(_) => Err(invalid_vector_policy_declaration(
+            table,
+            column,
+            out_of_range,
+        )),
+    }
+}
+
+fn parsed_hnsw_member(
+    table: &str,
+    column: &str,
+    member: Option<&contextdb_parser::ast::VectorPolicyValue>,
+) -> Result<Option<u32>> {
+    match member {
+        None | Some(contextdb_parser::ast::VectorPolicyValue::Default) => Ok(None),
+        Some(contextdb_parser::ast::VectorPolicyValue::Value(raw)) => {
+            parse_vector_policy_u32(table, column, raw, false).map(Some)
+        }
+    }
+}
+
+fn parsed_consolidation_member(
+    table: &str,
+    column: &str,
+    member: Option<&contextdb_parser::ast::VectorPolicyValue>,
+) -> Result<Option<u32>> {
+    match member {
+        None | Some(contextdb_parser::ast::VectorPolicyValue::Default) => Ok(None),
+        Some(contextdb_parser::ast::VectorPolicyValue::Value(raw)) => {
+            let parsed = raw.trim().parse::<u32>().ok();
+            match parsed.filter(|value| (1..=100).contains(value)) {
+                Some(value) => Ok(Some(value)),
+                None => Err(invalid_vector_policy_declaration(
+                    table,
+                    column,
+                    contextdb_core::VectorPolicyDeclarationIssue::ConsolidationPercentOutOfRange,
+                )),
+            }
+        }
+    }
+}
+
+fn validate_resolved_hnsw_policy(
+    table: &str,
+    column: &str,
+    quantization: contextdb_core::VectorQuantization,
+    hnsw_m: Option<u32>,
+    hnsw_ef_construction: Option<u32>,
+    hnsw_ef_search: Option<u32>,
+) -> Result<()> {
+    let layout = contextdb_vector::store::VectorIndexLayout::new(
+        1,
+        quantization,
+        Vec::new(),
+        None,
+        contextdb_core::VectorSearchMode::Auto,
+    )
+    .with_policy(
+        None,
+        hnsw_m,
+        hnsw_ef_construction,
+        hnsw_ef_search,
+        contextdb_core::DEFAULT_VECTOR_POLICY_REVISION,
+    );
+    if layout.hnsw_policy_is_valid() {
+        Ok(())
+    } else {
+        Err(invalid_vector_policy_declaration(
+            table,
+            column,
+            contextdb_core::VectorPolicyDeclarationIssue::EfConstructionBelowM,
+        ))
+    }
+}
+
+type NormalizedAstVectorDeclaration = (
+    Option<Vec<String>>,
+    Option<u32>,
+    contextdb_core::VectorSearchMode,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    bool,
+);
+
+fn normalized_ast_vector_declaration(
+    table: &str,
+    col: &contextdb_parser::ast::ColumnDef,
+) -> Result<NormalizedAstVectorDeclaration> {
+    let has_partition_clause = !col.partition_key_columns.is_empty()
+        || col.max_partitions.is_some()
+        || col.search_mode.is_some();
+    let has_policy_clause = col.auto_index_at.is_some()
+        || col.hnsw != contextdb_parser::ast::VectorHnswOptions::default()
+        || col.consolidation != contextdb_parser::ast::VectorConsolidationOptions::default();
+    if !matches!(col.data_type, DataType::Vector(_)) {
+        if has_policy_clause {
+            return Err(invalid_vector_policy_declaration(
+                table,
+                &col.name,
+                contextdb_core::VectorPolicyDeclarationIssue::RequiresVectorColumn,
+            ));
+        }
+        if has_partition_clause {
+            return Err(invalid_vector_partition_declaration(
+                table,
+                &col.name,
+                VectorPartitionDeclarationIssue::RequiresVectorColumn,
+            ));
+        }
+        return Ok((
+            None,
+            None,
+            contextdb_core::VectorSearchMode::Auto,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ));
+    }
+
+    let partition_key_columns =
+        (!col.partition_key_columns.is_empty()).then(|| col.partition_key_columns.clone());
+    if partition_key_columns.is_none() && col.max_partitions.is_some() {
+        return Err(invalid_vector_partition_declaration(
+            table,
+            &col.name,
+            VectorPartitionDeclarationIssue::MaxPartitionsWithoutPartitionKey,
+        ));
+    }
+    let max_partitions = if partition_key_columns.is_some() {
+        Some(match col.max_partitions.as_deref() {
+            Some(raw) => parse_vector_max_partitions(table, &col.name, raw)?,
+            None => DEFAULT_VECTOR_MAX_PARTITIONS,
+        })
+    } else {
+        None
+    };
+    let search_mode = col
+        .search_mode
+        .map(map_vector_search_mode)
+        .unwrap_or(contextdb_core::VectorSearchMode::Auto);
+    let auto_index_at = col
+        .auto_index_at
+        .as_deref()
+        .map(|raw| parse_vector_policy_u32(table, &col.name, raw, true))
+        .transpose()?;
+    let hnsw_m = parsed_hnsw_member(table, &col.name, col.hnsw.m.as_ref())?;
+    let hnsw_ef_construction =
+        parsed_hnsw_member(table, &col.name, col.hnsw.ef_construction.as_ref())?;
+    let hnsw_ef_search = parsed_hnsw_member(table, &col.name, col.hnsw.ef_search.as_ref())?;
+    let consolidation_change_percent =
+        parsed_consolidation_member(table, &col.name, col.consolidation.change_percent.as_ref())?;
+    let consolidation_tombstone_percent = parsed_consolidation_member(
+        table,
+        &col.name,
+        col.consolidation.tombstone_percent.as_ref(),
+    )?;
+    let consolidation_disabled = col.consolidation.disabled;
+    validate_resolved_hnsw_policy(
+        table,
+        &col.name,
+        map_vector_quantization(col.quantization),
+        hnsw_m,
+        hnsw_ef_construction,
+        hnsw_ef_search,
+    )?;
+    Ok((
+        partition_key_columns,
+        max_partitions,
+        search_mode,
+        auto_index_at,
+        hnsw_m,
+        hnsw_ef_construction,
+        hnsw_ef_search,
+        consolidation_change_percent,
+        consolidation_tombstone_percent,
+        consolidation_disabled,
+    ))
+}
+
+pub(crate) fn validate_create_table_vector_declarations(
+    table: &str,
+    create: &contextdb_parser::ast::CreateTable,
+) -> Result<()> {
+    let mut columns = create
+        .columns
+        .iter()
+        .map(|column| core_column_from_ast(table, column, None))
+        .collect::<Result<Vec<_>>>()?;
+    for column in &mut columns {
+        if create.primary_key_columns.contains(&column.name) {
+            column.nullable = false;
+        }
+    }
+    validate_vector_partition_declarations(
+        table,
+        &TableMeta {
+            columns,
+            ..TableMeta::default()
+        },
+    )
+}
+
+pub(crate) fn validate_vector_partition_declarations(table: &str, meta: &TableMeta) -> Result<()> {
+    for vector in &meta.columns {
+        if !matches!(vector.column_type, ColumnType::Vector(_)) {
+            if vector.partition_key_columns.is_some()
+                || vector.max_partitions.is_some()
+                || vector.search_mode != contextdb_core::VectorSearchMode::Auto
+                || vector.auto_index_at.is_some()
+                || vector.hnsw_m.is_some()
+                || vector.hnsw_ef_construction.is_some()
+                || vector.hnsw_ef_search.is_some()
+                || vector.consolidation_change_percent.is_some()
+                || vector.consolidation_tombstone_percent.is_some()
+                || vector.consolidation_disabled
+            {
+                return Err(invalid_vector_policy_declaration(
+                    table,
+                    &vector.name,
+                    contextdb_core::VectorPolicyDeclarationIssue::RequiresVectorColumn,
+                ));
+            }
+            continue;
+        }
+
+        if vector.auto_index_at == Some(0) {
+            return Err(invalid_vector_policy_declaration(
+                table,
+                &vector.name,
+                contextdb_core::VectorPolicyDeclarationIssue::AutoIndexAtNotPositive,
+            ));
+        }
+        if vector.hnsw_m == Some(0)
+            || vector.hnsw_ef_construction == Some(0)
+            || vector.hnsw_ef_search == Some(0)
+        {
+            return Err(invalid_vector_policy_declaration(
+                table,
+                &vector.name,
+                contextdb_core::VectorPolicyDeclarationIssue::HnswValueNotPositive,
+            ));
+        }
+        validate_resolved_hnsw_policy(
+            table,
+            &vector.name,
+            vector.quantization,
+            vector.hnsw_m,
+            vector.hnsw_ef_construction,
+            vector.hnsw_ef_search,
+        )?;
+        if vector
+            .consolidation_change_percent
+            .is_some_and(|value| !(1..=100).contains(&value))
+            || vector
+                .consolidation_tombstone_percent
+                .is_some_and(|value| !(1..=100).contains(&value))
+        {
+            return Err(invalid_vector_policy_declaration(
+                table,
+                &vector.name,
+                contextdb_core::VectorPolicyDeclarationIssue::ConsolidationPercentOutOfRange,
+            ));
+        }
+
+        let Some(partition_key_columns) = vector.partition_key_columns.as_ref() else {
+            if vector.max_partitions.is_some() {
+                return Err(invalid_vector_partition_declaration(
+                    table,
+                    &vector.name,
+                    VectorPartitionDeclarationIssue::MaxPartitionsWithoutPartitionKey,
+                ));
+            }
+            continue;
+        };
+        if partition_key_columns.is_empty() {
+            return Err(invalid_vector_partition_declaration(
+                table,
+                &vector.name,
+                VectorPartitionDeclarationIssue::EmptyPartitionKey,
+            ));
+        }
+        if vector.max_partitions == Some(0) {
+            return Err(invalid_vector_partition_declaration(
+                table,
+                &vector.name,
+                VectorPartitionDeclarationIssue::MaxPartitionsNotPositive,
+            ));
+        }
+
+        let mut seen = HashSet::new();
+        for component_name in partition_key_columns {
+            if !seen.insert(component_name.as_str()) {
+                return Err(invalid_vector_partition_declaration(
+                    table,
+                    &vector.name,
+                    VectorPartitionDeclarationIssue::DuplicatePartitionKeyColumn,
+                ));
+            }
+            if component_name == &vector.name {
+                return Err(invalid_vector_partition_declaration(
+                    table,
+                    &vector.name,
+                    VectorPartitionDeclarationIssue::VectorColumnInPartitionKey,
+                ));
+            }
+            let Some(component) = meta
+                .columns
+                .iter()
+                .find(|column| column.name == *component_name)
+            else {
+                return Err(invalid_vector_partition_declaration(
+                    table,
+                    &vector.name,
+                    VectorPartitionDeclarationIssue::UnknownPartitionKeyColumn,
+                ));
+            };
+            if component.nullable {
+                return Err(invalid_vector_partition_declaration(
+                    table,
+                    &vector.name,
+                    VectorPartitionDeclarationIssue::NullablePartitionKeyColumn,
+                ));
+            }
+            if !component.column_type.is_vector_partition_key_type() {
+                return Err(invalid_vector_partition_declaration(
+                    table,
+                    &vector.name,
+                    VectorPartitionDeclarationIssue::UnsupportedPartitionKeyColumnType,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn vector_partition_key_component_blocker(
+    db: &Database,
+    table: &str,
+    component: &str,
+) -> Option<Error> {
+    let meta = db.table_meta(table)?;
+    let vector = meta.columns.iter().find(|column| {
+        matches!(column.column_type, ColumnType::Vector(_))
+            && column
+                .partition_key_columns
+                .as_ref()
+                .is_some_and(|key| key.iter().any(|name| name == component))
+    })?;
+    Some(Error::VectorPartitionKeyInUse {
+        table: table.to_owned(),
+        column: component.to_owned(),
+        index: vector.name.clone(),
+    })
+}
+
+pub(crate) fn set_vector_max_partitions(
+    table: &str,
+    column: &str,
+    raw: &str,
+    meta: &mut TableMeta,
+) -> Result<()> {
+    let vector = meta
+        .columns
+        .iter_mut()
+        .find(|candidate| candidate.name == column)
+        .ok_or_else(|| Error::ColumnNotFound {
+            table: table.to_owned(),
+            column: column.to_owned(),
+        })?;
+    if !matches!(vector.column_type, ColumnType::Vector(_)) {
+        return Err(invalid_vector_partition_declaration(
+            table,
+            column,
+            VectorPartitionDeclarationIssue::RequiresVectorColumn,
+        ));
+    }
+    if vector.partition_key_columns.is_none() {
+        return Err(invalid_vector_partition_declaration(
+            table,
+            column,
+            VectorPartitionDeclarationIssue::MaxPartitionsWithoutPartitionKey,
+        ));
+    }
+    let max_partitions = parse_vector_max_partitions(table, column, raw)?;
+    vector.max_partitions = Some(max_partitions);
+    Ok(())
+}
+
+pub(crate) fn set_vector_search_mode(
+    table: &str,
+    column: &str,
+    mode: contextdb_parser::ast::VectorSearchMode,
+    meta: &mut TableMeta,
+) -> Result<()> {
+    let vector = meta
+        .columns
+        .iter_mut()
+        .find(|candidate| candidate.name == column)
+        .ok_or_else(|| Error::ColumnNotFound {
+            table: table.to_owned(),
+            column: column.to_owned(),
+        })?;
+    if !matches!(vector.column_type, ColumnType::Vector(_)) {
+        return Err(invalid_vector_partition_declaration(
+            table,
+            column,
+            VectorPartitionDeclarationIssue::RequiresVectorColumn,
+        ));
+    }
+    vector.search_mode = map_vector_search_mode(mode);
+    Ok(())
+}
+
+pub(crate) fn set_vector_auto_index_at(
+    table: &str,
+    column: &str,
+    raw: Option<&str>,
+    meta: &mut TableMeta,
+) -> Result<()> {
+    let vector = meta
+        .columns
+        .iter_mut()
+        .find(|candidate| candidate.name == column)
+        .ok_or_else(|| Error::ColumnNotFound {
+            table: table.to_owned(),
+            column: column.to_owned(),
+        })?;
+    if !matches!(vector.column_type, ColumnType::Vector(_)) {
+        return Err(invalid_vector_policy_declaration(
+            table,
+            column,
+            contextdb_core::VectorPolicyDeclarationIssue::RequiresVectorColumn,
+        ));
+    }
+    vector.auto_index_at = raw
+        .map(|raw| parse_vector_policy_u32(table, column, raw, true))
+        .transpose()?;
+    Ok(())
+}
+
+pub(crate) fn set_vector_hnsw(
+    table: &str,
+    column: &str,
+    changes: Option<&contextdb_parser::ast::VectorHnswOptions>,
+    meta: &mut TableMeta,
+) -> Result<()> {
+    let vector = meta
+        .columns
+        .iter_mut()
+        .find(|candidate| candidate.name == column)
+        .ok_or_else(|| Error::ColumnNotFound {
+            table: table.to_owned(),
+            column: column.to_owned(),
+        })?;
+    if !matches!(vector.column_type, ColumnType::Vector(_)) {
+        return Err(invalid_vector_policy_declaration(
+            table,
+            column,
+            contextdb_core::VectorPolicyDeclarationIssue::RequiresVectorColumn,
+        ));
+    }
+
+    let old_topology = (vector.hnsw_m, vector.hnsw_ef_construction);
+    match changes {
+        None => {
+            vector.hnsw_m = None;
+            vector.hnsw_ef_construction = None;
+            vector.hnsw_ef_search = None;
+        }
+        Some(changes) => {
+            if let Some(member) = changes.m.as_ref() {
+                vector.hnsw_m = parsed_hnsw_member(table, column, Some(member))?;
+            }
+            if let Some(member) = changes.ef_construction.as_ref() {
+                vector.hnsw_ef_construction = parsed_hnsw_member(table, column, Some(member))?;
+            }
+            if let Some(member) = changes.ef_search.as_ref() {
+                vector.hnsw_ef_search = parsed_hnsw_member(table, column, Some(member))?;
+            }
+        }
+    }
+    validate_resolved_hnsw_policy(
+        table,
+        column,
+        vector.quantization,
+        vector.hnsw_m,
+        vector.hnsw_ef_construction,
+        vector.hnsw_ef_search,
+    )?;
+    if old_topology != (vector.hnsw_m, vector.hnsw_ef_construction) {
+        vector.vector_policy_revision = next_vector_policy_revision(vector.vector_policy_revision)
+            .ok_or_else(|| {
+                invalid_vector_policy_declaration(
+                    table,
+                    column,
+                    contextdb_core::VectorPolicyDeclarationIssue::HnswValueOutOfRange,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn set_vector_consolidation(
+    table: &str,
+    column: &str,
+    changes: Option<&contextdb_parser::ast::VectorConsolidationOptions>,
+    meta: &mut TableMeta,
+) -> Result<()> {
+    let vector = meta
+        .columns
+        .iter_mut()
+        .find(|candidate| candidate.name == column)
+        .ok_or_else(|| Error::ColumnNotFound {
+            table: table.to_owned(),
+            column: column.to_owned(),
+        })?;
+    if !matches!(vector.column_type, ColumnType::Vector(_)) {
+        return Err(invalid_vector_policy_declaration(
+            table,
+            column,
+            contextdb_core::VectorPolicyDeclarationIssue::RequiresVectorColumn,
+        ));
+    }
+    match changes {
+        None => {
+            vector.consolidation_change_percent = None;
+            vector.consolidation_tombstone_percent = None;
+            vector.consolidation_disabled = false;
+        }
+        Some(changes) => {
+            if changes.disabled {
+                vector.consolidation_change_percent = None;
+                vector.consolidation_tombstone_percent = None;
+                vector.consolidation_disabled = true;
+                return Ok(());
+            }
+            vector.consolidation_disabled = false;
+            if let Some(member) = changes.change_percent.as_ref() {
+                vector.consolidation_change_percent =
+                    parsed_consolidation_member(table, column, Some(member))?;
+            }
+            if let Some(member) = changes.tombstone_percent.as_ref() {
+                vector.consolidation_tombstone_percent =
+                    parsed_consolidation_member(table, column, Some(member))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The next desired topology revision after `M` or `EF_CONSTRUCTION` changed,
+/// shared by the local ALTER door and the synced-schema receiver so both
+/// advance on exactly the same axes. `None` only on u64 overflow.
+pub(crate) fn next_vector_policy_revision(current: u64) -> Option<u64> {
+    current
+        .max(contextdb_core::DEFAULT_VECTOR_POLICY_REVISION)
+        .checked_add(1)
 }
 
 fn validate_rank_policy_for_column(
@@ -13289,16 +16302,41 @@ fn release_accounted_bytes(db: &Database, bytes: &[usize]) {
 }
 
 impl ReadExecutionTarget for BoundedCursorTarget {
-    fn row_vector_for_column(
+    fn load_row_vector_for_column(
         &self,
+        tx: Option<TxId>,
         table: &str,
         column: &str,
         row_id: RowId,
         lsn: Lsn,
         snapshot: SnapshotId,
-    ) -> Option<Vec<f32>> {
+    ) -> Result<Option<Vec<f32>>> {
         self.store
-            .row_vector_for_column(table, column, row_id, lsn, snapshot)
+            .load_row_vector_for_column(tx, table, column, row_id, lsn, snapshot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_score_committed_vector_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        query: &[f32],
+        before_checkpoint: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<Option<f32>, BoundedExecutionError> {
+        self.store.bounded_score_committed_vector_row(
+            index,
+            row_id,
+            snapshot,
+            query,
+            before_checkpoint,
+            before_distance,
+            before_retain,
+            release_retained,
+        )
     }
 
     fn quantized_vector_columns(&self, table: &str) -> Vec<String> {
@@ -13318,6 +16356,14 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn explain_plan_without_running_it(&self, sql: &str) -> Result<String> {
         self.store.explain_plan_without_running_it(sql)
+    }
+
+    fn explain_output_without_running_it(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<crate::database::ExplainOutput> {
+        self.store.explain_output_without_running_it(sql, params)
     }
 
     fn plugin(&self) -> &dyn crate::plugin::DatabasePlugin {
@@ -13356,6 +16402,19 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         self.store.bounded_read_accountant()
     }
 
+    #[cfg(feature = "test-seams")]
+    fn note_vector_candidate_materialized(&self) {
+        self.store.note_vector_candidate_materialized();
+    }
+
+    fn capture_read_schema(&self) -> crate::database::SchemaPublicationGuard<'_> {
+        self.store.capture_read_schema()
+    }
+
+    fn relational_membership_store(&self) -> &contextdb_relational::RelationalStore {
+        self.store.relational_membership_store()
+    }
+
     fn bounded_read_snapshot_registration(
         &self,
         withdrawn: &OwnerReadCancellation,
@@ -13379,6 +16438,29 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_read_requires_candidate_filter(&self, table: &str) -> Result<bool> {
         self.store.bounded_read_requires_candidate_filter(table)
+    }
+
+    fn vector_access_predicate(&self, table: &str) -> Result<Option<Expr>> {
+        self.store.vector_access_predicate(table)
+    }
+
+    fn bounded_vector_visit_visible_ids(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        before_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+        visit: &mut dyn FnMut(RowId) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        self.store.bounded_vector_visit_visible_ids(
+            index,
+            snapshot,
+            before_entry,
+            before_retain,
+            release_retained,
+            visit,
+        )
     }
 
     fn bounded_read_allowed_for_row(
@@ -13502,14 +16584,61 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         self.store.validate_vector_under_schema_read(index, actual)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bounded_vector_candidate_k(
         &self,
         index: &VectorIndexRef,
         requested: usize,
         sort_key: Option<&str>,
-    ) -> Result<usize> {
-        self.store
-            .bounded_vector_candidate_k(index, requested, sort_key)
+        snapshot: SnapshotId,
+        candidates: Option<&[u64]>,
+        before_source: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        acquire: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release: &mut dyn FnMut(usize),
+    ) -> std::result::Result<usize, BoundedExecutionError> {
+        self.store.bounded_vector_candidate_k(
+            index,
+            requested,
+            sort_key,
+            snapshot,
+            candidates,
+            before_source,
+            acquire,
+            release,
+        )
+    }
+
+    fn bounded_vector_entry_count(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> usize {
+        self.store.bounded_vector_entry_count(index, snapshot)
+    }
+
+    fn completed_vector_search_disclosure(
+        &self,
+        index: VectorIndexRef,
+        k: usize,
+        restricted_candidates: bool,
+        candidates: Option<&PhysicalPlan>,
+        search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
+        query_expr: &Expr,
+        snapshot: SnapshotId,
+        params: &HashMap<String, Value>,
+        aggregate_allowed_vectors: usize,
+        authorized_sorted_ids: Option<&[u64]>,
+        used_hnsw: bool,
+    ) -> Result<VectorSearchDisclosure> {
+        self.store.completed_vector_search_disclosure(
+            index,
+            k,
+            restricted_candidates,
+            candidates,
+            search_mode,
+            query_expr,
+            snapshot,
+            params,
+            aggregate_allowed_vectors,
+            authorized_sorted_ids,
+            used_hnsw,
+        )
     }
 
     fn with_bounded_row_vector(
@@ -13577,6 +16706,25 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         )
     }
 
+    fn bounded_authorized_visible_vector_count(
+        &self,
+        index: &VectorIndexRef,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+        release_retained: &mut dyn FnMut(usize),
+    ) -> std::result::Result<usize, BoundedExecutionError> {
+        self.store.bounded_authorized_visible_vector_count(
+            index,
+            candidates,
+            snapshot,
+            before_source_entry,
+            before_retain,
+            release_retained,
+        )
+    }
+
     fn bounded_hnsw_vector_search(
         &self,
         index: &VectorIndexRef,
@@ -13584,17 +16732,23 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         k: usize,
         candidates: Option<&[u64]>,
         snapshot: SnapshotId,
+        mode: VectorSearchMode,
+        aggregate_allowed_count: usize,
+        allowed_search_limits: contextdb_vector::hnsw::HnswAllowedSearchLimits,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_distance: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
-    ) -> std::result::Result<Option<BoundedVectorCandidates>, BoundedExecutionError> {
+    ) -> std::result::Result<BoundedVectorSearchOutcome, BoundedExecutionError> {
         self.store.bounded_hnsw_vector_search(
             index,
             query,
             k,
             candidates,
             snapshot,
+            mode,
+            aggregate_allowed_count,
+            allowed_search_limits,
             before_source_entry,
             before_distance,
             before_retain,
@@ -13915,6 +17069,120 @@ mod tests {
     use super::*;
     use contextdb_planner::GraphStepPlan;
     use uuid::Uuid;
+
+    #[test]
+    fn eager_and_pull_vector_routes_share_restricted_refusal_and_recovery() {
+        use crate::database::{VectorSearchResidual, VectorSearchRoute};
+        use contextdb_core::{ContextId, VectorSearchMode};
+        use std::collections::BTreeSet;
+        let db = Database::open_memory();
+        db.set_maintenance_policy(crate::database::MaintenancePolicy::CallerDriven);
+        db.execute("CREATE TABLE readable_vectors (id INT PRIMARY KEY, context UUID CONTEXT_ID, embedding VECTOR(2) AUTO_INDEX_AT 1)", &HashMap::new()).unwrap();
+        for (id, context, vector) in [(1, 1, vec![0.8, 0.6]), (2, 2, vec![1.0, 0.0])] {
+            db.execute(
+                "INSERT INTO readable_vectors VALUES ($id,$context,$vector)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("context".into(), Value::Uuid(Uuid::from_u128(context))),
+                    ("vector".into(), Value::Vector(vector)),
+                ]),
+            )
+            .unwrap();
+        }
+        for _ in 0..8 {
+            db.run_maintenance_cycle().unwrap();
+        }
+        let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(Uuid::from_u128(1))]));
+        let sql = "SELECT id FROM readable_vectors ORDER BY embedding <=> [1.0,0.0] USE VECTOR INDEXED LIMIT 1";
+        let passive = |sql: &str| {
+            let memory = db.accountant().usage().used;
+            let scans = db.__relational_scan_rows_touched();
+            let activity = db.__vector_passive_activity_counters_for_test();
+            let explained = scoped.explain_output(sql).unwrap();
+            assert_eq!(db.accountant().usage().used, memory);
+            assert_eq!(db.__relational_scan_rows_touched(), scans);
+            assert_eq!(db.__vector_passive_activity_counters_for_test(), activity);
+            let rendered = crate::cli_render::render_explain_output(&explained);
+            for context in [1, 2] {
+                assert!(!rendered.contains(&Uuid::from_u128(context).to_string()));
+            }
+            let disclosure = explained.vector_search.unwrap();
+            assert_eq!(disclosure.aggregate_allowed_vectors, Some(1));
+            assert!(disclosure.partition_hnsw.is_empty());
+            disclosure
+        };
+        let refused = passive(sql);
+        assert_eq!(refused.route, Some(VectorSearchRoute::FilteredIndexed));
+        assert_eq!(refused.residual, VectorSearchResidual::Unsupported);
+        assert_eq!(
+            refused.refusal.as_deref(),
+            Some("filtered_route_unavailable")
+        );
+        assert_eq!(
+            refused.recovery.as_deref(),
+            Some("CREATE INDEX readable_vectors_context_idx ON readable_vectors (context)")
+        );
+        let plan = contextdb_planner::plan(&contextdb_parser::parse(sql).unwrap()).unwrap();
+        let eager = execute_plan(&scoped, &plan, &HashMap::new(), None).unwrap_err();
+        let pull = scoped.execute(sql, &HashMap::new()).unwrap_err();
+        assert!(matches!(
+            eager,
+            Error::VectorFilteredRouteUnavailable { .. }
+        ));
+        assert_eq!(eager.to_string(), pull.to_string());
+        db.execute(
+            "CREATE INDEX readable_context ON readable_vectors(context)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let eager = execute_plan(&scoped, &plan, &HashMap::new(), None).unwrap();
+        let pull = scoped.execute(sql, &HashMap::new()).unwrap();
+        assert_eq!(eager.rows, pull.rows);
+        assert_eq!(pull.rows, vec![vec![Value::Int64(1)]]);
+        assert!(scoped.__debug_last_query_vector_used_hnsw_for_test());
+        let ready = passive(sql);
+        assert_eq!(ready.route, Some(VectorSearchRoute::FilteredIndexed));
+        assert_eq!(ready.residual, VectorSearchResidual::Bounded);
+        assert_eq!(ready.refusal, None);
+        assert_eq!(ready.recovery, None);
+        for result in [&eager, &pull] {
+            let disclosure = result.trace.vector_search.as_ref().unwrap();
+            assert_eq!(disclosure, &ready);
+        }
+        let auto = sql.replace("INDEXED", "AUTO");
+        let auto_ready = passive(&auto);
+        assert_eq!(auto_ready.resolved_mode, VectorSearchMode::Indexed);
+        assert_eq!(auto_ready.route, Some(VectorSearchRoute::FilteredIndexed));
+        assert_eq!(auto_ready.residual, VectorSearchResidual::Bounded);
+        assert_eq!(auto_ready.fallback, None);
+        let auto_plan = contextdb_planner::plan(&contextdb_parser::parse(&auto).unwrap()).unwrap();
+        for result in [
+            execute_plan(&scoped, &auto_plan, &HashMap::new(), None).unwrap(),
+            scoped.execute(&auto, &HashMap::new()).unwrap(),
+        ] {
+            assert_eq!(result.rows, pull.rows);
+            assert_eq!(result.trace.vector_search.as_ref(), Some(&auto_ready));
+        }
+
+        db.execute(
+            "DROP INDEX readable_context ON readable_vectors",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let auto = sql.replace("INDEXED", "AUTO");
+        let plan = contextdb_planner::plan(&contextdb_parser::parse(&auto).unwrap()).unwrap();
+        let auto_exact = passive(&auto);
+        assert_eq!(auto_exact.resolved_mode, VectorSearchMode::Exact);
+        assert_eq!(auto_exact.route, Some(VectorSearchRoute::Exact));
+        assert_eq!(auto_exact.fallback.as_deref(), Some("filtered_route_exact"));
+        assert_eq!(passive(sql).refusal, refused.refusal);
+        let eager = execute_plan(&scoped, &plan, &HashMap::new(), None).unwrap();
+        assert!(!scoped.__debug_last_query_vector_used_hnsw_for_test());
+        let pull = scoped.execute(&auto, &HashMap::new()).unwrap();
+        assert_eq!(eager.rows, pull.rows);
+        assert_eq!(eager.trace.vector_search.as_ref(), Some(&auto_exact));
+        assert_eq!(pull.trace.vector_search.as_ref(), Some(&auto_exact));
+    }
 
     #[test]
     fn graph_01_frontier_projection_requires_complete_bindings() {

@@ -1,4 +1,4 @@
-//! Statements 1–6/19: declared authority, authenticated binding, and metadata inspection.
+//! Declared authority, authenticated binding, and metadata inspection.
 use super::{canonical::*, preparation::*, records::*};
 use crate::{Database, custody_types::*, database::QueryResult};
 use contextdb_core::{Error, Result, TableMeta, TenantId, Value};
@@ -155,7 +155,7 @@ pub(crate) fn check_binding(db: &Database, table: &str, candidate: &TableMeta) -
     Ok(())
 }
 
-// Statement 6/root policy 26: DECLARE protects even a name not installed yet.
+// DECLARE protects even a name not installed yet.
 pub(crate) fn check_declared(db: &Database, table: &str, candidate: &TableMeta) -> Result<()> {
     let candidate = normalized(table, from_meta(candidate))?;
     for record in db.custody_authority()? {
@@ -289,7 +289,7 @@ pub(crate) fn show_bindings(db: &Database) -> Result<QueryResult> {
     let mut tables = BTreeMap::new();
     let records = db.custody_authority()?;
     let hub = db.retention_sync_peer();
-    // Statements 4/15/19: render the active binding, never an arbitrary former incarnation.
+    // Render the active binding, never an arbitrary former incarnation.
     let destination = records.iter().find_map(|r| match r {
         Record::Destination(d) if Some(d.namespace.hub_node.as_str()) == hub.as_deref() => {
             Some(&d.namespace)

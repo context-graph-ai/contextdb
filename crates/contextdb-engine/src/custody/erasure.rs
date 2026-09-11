@@ -1,10 +1,10 @@
-//! Statements 17/17a/17b: custody ownership is erased with the selected row lives.
+//! Custody ownership is erased with the selected row lives.
 use super::{authority::object_digest, records::*};
 use crate::Database;
 use contextdb_core::Result;
 use std::collections::BTreeSet;
 
-// Statement 17a extends the list result without changing the singular result.
+// A multi-table purge extends the list result without changing the singular result.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PurgeReportShape {
     None,
@@ -12,7 +12,7 @@ pub(crate) enum PurgeReportShape {
     PerTable,
 }
 
-// Statement 17: every authenticated source copy of the selected key belongs
+// Every authenticated source copy of the selected key belongs
 // to its purge, including equivalent and refused submissions with local lives.
 pub(crate) fn lineage_roots(
     db: &Database,

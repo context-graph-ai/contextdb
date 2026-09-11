@@ -49,6 +49,8 @@ impl BoundedReadRequest {
 /// Hook used by deterministic production-path tests.  Implementations advance
 /// the injected clock or cancel the supplied token without a blocking wait.
 pub trait ExecutionProbe: Send + Sync {
+    fn after_snapshot_registration(&self) {}
+    fn after_source_capture(&self) {}
     fn before_work(&self, source: TestWorkSource, completed_work: u64);
     fn before_source_touch(&self, _touch: TestSourceTouch, _completed_items: u64) {}
     fn before_temporary_reservation(
@@ -71,6 +73,12 @@ pub trait ExecutionProbe: Send + Sync {
 struct ProbeAdapter(Arc<dyn ExecutionProbe>);
 
 impl BoundedExecutionProbe for ProbeAdapter {
+    fn after_snapshot_registration(&self) {
+        self.0.after_snapshot_registration();
+    }
+    fn after_source_capture(&self) {
+        self.0.after_source_capture();
+    }
     fn before_work(&self, source: BoundedWorkSource, completed_work: u64) {
         self.0.before_work(source.into(), completed_work);
     }

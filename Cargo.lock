@@ -778,6 +778,7 @@ dependencies = [
  "contextdb-graph",
  "contextdb-parser",
  "contextdb-planner",
+ "contextdb-redb",
  "contextdb-relational",
  "contextdb-server",
  "contextdb-tx",
@@ -798,7 +799,6 @@ dependencies = [
  "parking_lot",
  "proc-macro2",
  "range-collections",
- "redb",
  "regex",
  "rmp-serde",
  "roaring",
@@ -870,6 +870,13 @@ version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "contextdb-parser",
+]
+
+[[package]]
+name = "contextdb-redb"
+version = "4.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -4063,15 +4070,6 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
-]
-
-[[package]]
-name = "redb"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
-dependencies = [
- "libc",
 ]
 
 [[package]]

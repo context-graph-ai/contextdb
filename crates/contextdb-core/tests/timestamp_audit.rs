@@ -37,8 +37,8 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
             "tests/integration/indexed_scan_filter_tests.rs".to_string(),
             2920u32,
         ),
-        ("tests/integration/retention_tests.rs".to_string(), 1652u32),
-        ("tests/integration/retention_tests.rs".to_string(), 1698u32),
+        ("tests/integration/retention_tests.rs".to_string(), 2207u32),
+        ("tests/integration/retention_tests.rs".to_string(), 2253u32),
     ]
     .into_iter()
     .collect();
@@ -59,7 +59,16 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
 
     let mut hits: BTreeSet<(String, u32)> = BTreeSet::new();
 
-    for entry in WalkDir::new(&scan_root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(&scan_root)
+        .into_iter()
+        // Hidden directories (`.git` and any local tooling state) and build
+        // output hold no workspace source.
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            entry.depth() == 0 || !(name.starts_with('.') || name == "target")
+        })
+        .filter_map(Result::ok)
+    {
         let p = entry.path();
         if !p.is_file() {
             continue;

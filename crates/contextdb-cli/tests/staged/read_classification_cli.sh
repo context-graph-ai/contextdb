@@ -75,7 +75,7 @@ readonly -a META_COMMAND_DECLARATIONS=(
     'StoreRead|.cursor open'
     'StoreRead|.cursor fetch'
     'StoreRead|.cursor close'
-    # Statement 19: the three custody inspections are canonical metadata reads.
+    # The three custody inspections are canonical metadata reads.
     'StoreRead|.sync policy'
     'StoreRead|.sync bindings'
     'StoreRead|.sync outcomes'
@@ -160,6 +160,7 @@ readonly -a AST_READ_STATEMENTS=(
     'show-disk-limit|SHOW DISK_LIMIT'
     'show-sync-conflict-policy|SHOW SYNC_CONFLICT_POLICY'
     'show-vector-indexes|SHOW VECTOR_INDEXES'
+    "show-vector-partitions|SHOW VECTOR_PARTITIONS FOR $read_vector_table.embedding"
 )
 
 # The third field is a same-session writable transcript.  It proves that the
@@ -197,8 +198,8 @@ fail_plain() {
     exit 1
 }
 
-if (( ${#AST_READ_STATEMENTS[@]} != 5 || ${#AST_WRITE_STATEMENTS[@]} != 22 )); then
-    fail_plain 'the production matrix must contain all 27 parser Statement variants'
+if (( ${#AST_READ_STATEMENTS[@]} != 6 || ${#AST_WRITE_STATEMENTS[@]} != 22 )); then
+    fail_plain 'the production matrix must contain all 28 parser Statement variants'
 fi
 
 file_digest() {
@@ -702,10 +703,64 @@ for case_row in "${AST_READ_STATEMENTS[@]}"; do
             read_assertion='
                 length == 1 and .[0] == {
                     "result": {
-                        "columns": ["table", "column", "dimension", "quantization", "vector_count", "bytes"],
+                        "columns": ["table", "column", "dimension", "quantization", "vector_count", "bytes", "partition_key_columns", "max_partitions", "live_partitions", "retained_partitions", "search_mode", "declared_auto_index_at", "effective_auto_index_at", "declared_hnsw_m", "declared_hnsw_ef_construction", "declared_hnsw_ef_search", "declared_consolidation_mode", "declared_consolidation_change_percent", "declared_consolidation_tombstone_percent", "effective_consolidation_mode", "effective_consolidation_change_percent", "effective_consolidation_tombstone_percent", "oldest_base_tx", "newest_base_tx", "pending_inserts", "tombstones", "durable_vector_bytes", "charged_vector_bytes", "durable_index_bytes", "charged_index_bytes", "query_state", "maintenance_state", "maintenance_vectors_total", "maintenance_vectors_done", "maintenance_vectors_remaining", "unavailable_partitions", "stalled_partitions", "broad_route", "broad_route_state", "broad_route_base_tx", "broad_route_vectors_total", "broad_route_vectors_done", "broad_route_vectors_remaining", "broad_route_reason", "broad_route_recovery_action"],
                         "rows": [{
                             "table": $vector_table, "column": "embedding", "dimension": 3,
-                            "quantization": "F32", "vector_count": 0, "bytes": 0
+                            "quantization": "F32", "vector_count": 0, "bytes": 24,
+                            "partition_key_columns": [], "max_partitions": null,
+                            "live_partitions": 0, "retained_partitions": 0, "search_mode": "AUTO",
+                            "declared_auto_index_at": null, "effective_auto_index_at": 1000,
+                            "declared_hnsw_m": null, "declared_hnsw_ef_construction": null,
+                            "declared_hnsw_ef_search": null,
+                            "declared_consolidation_mode": null,
+                            "declared_consolidation_change_percent": null,
+                            "declared_consolidation_tombstone_percent": null,
+                            "effective_consolidation_mode": "thresholds",
+                            "effective_consolidation_change_percent": 20,
+                            "effective_consolidation_tombstone_percent": 10,
+                            "oldest_base_tx": null,
+                            "newest_base_tx": null, "pending_inserts": 0, "tombstones": 0,
+                            "durable_vector_bytes": 0, "charged_vector_bytes": 0,
+                            "durable_index_bytes": 0, "charged_index_bytes": 24,
+                            "query_state": "empty", "maintenance_state": "idle",
+                            "maintenance_vectors_total": null, "maintenance_vectors_done": null,
+                            "maintenance_vectors_remaining": null, "unavailable_partitions": 0,
+                            "stalled_partitions": 0, "broad_route": "fanout",
+                            "broad_route_state": "ready", "broad_route_base_tx": null,
+                            "broad_route_vectors_total": null, "broad_route_vectors_done": null,
+                            "broad_route_vectors_remaining": null, "broad_route_reason": "none",
+                            "broad_route_recovery_action": "none"
+                        }]
+                    }
+                }
+            '
+            ;;
+        ast-read-show-vector-partitions)
+            read_assertion='
+                length == 1 and .[0] == {
+                    "result": {
+                        "columns": ["table", "column", "partition_key", "live_rows", "retained_rows", "base_generation", "base_tx", "pending_inserts", "tombstones", "durable_vector_bytes", "charged_vector_bytes", "durable_index_bytes", "charged_index_bytes", "query_state", "availability_reason", "maintenance_state", "maintenance_reason", "maintenance_vectors_total", "maintenance_vectors_done", "maintenance_vectors_remaining", "maintenance_checkpoint_tx", "desired_hnsw_m", "desired_hnsw_ef_construction", "desired_hnsw_ef_search", "serving_hnsw_m", "serving_hnsw_ef_construction", "serving_hnsw_ef_search", "declared_consolidation_mode", "declared_consolidation_change_percent", "declared_consolidation_tombstone_percent", "effective_consolidation_mode", "effective_consolidation_change_percent", "effective_consolidation_tombstone_percent", "desired_policy_revision", "serving_policy_revision", "recovery_action"],
+                        "rows": [{
+                            "table": $vector_table, "column": "embedding", "partition_key": {},
+                            "live_rows": 0, "retained_rows": 0, "base_generation": null,
+                            "base_tx": null, "pending_inserts": 0, "tombstones": 0,
+                            "durable_vector_bytes": 0, "charged_vector_bytes": 0,
+                            "durable_index_bytes": 0, "charged_index_bytes": 24,
+                            "query_state": "empty", "availability_reason": "none",
+                            "maintenance_state": "idle", "maintenance_reason": "none",
+                            "maintenance_vectors_total": null, "maintenance_vectors_done": null,
+                            "maintenance_vectors_remaining": null, "maintenance_checkpoint_tx": null,
+                            "desired_hnsw_m": 16, "desired_hnsw_ef_construction": 200,
+                            "desired_hnsw_ef_search": 200, "serving_hnsw_m": null,
+                            "serving_hnsw_ef_construction": null, "serving_hnsw_ef_search": null,
+                            "declared_consolidation_mode": null,
+                            "declared_consolidation_change_percent": null,
+                            "declared_consolidation_tombstone_percent": null,
+                            "effective_consolidation_mode": "thresholds",
+                            "effective_consolidation_change_percent": 20,
+                            "effective_consolidation_tombstone_percent": 10,
+                            "desired_policy_revision": 1, "serving_policy_revision": null,
+                            "recovery_action": "none"
                         }]
                     }
                 }
@@ -973,7 +1028,7 @@ printf '%s\n' \
         "$output_dir/maintenance-empty-seed.stdout" \
         "$output_dir/maintenance-empty-seed.stderr"
 
-# Statement 19: include the declared custody reads in this exact CLI inventory.
+# Include the declared custody reads in this exact CLI inventory.
 # This empty fixture checks read classification, shape, and SQL/meta parity;
 # nonempty custody metadata is exercised by the custody inspection contract.
 for inspection in policy bindings outcomes; do
@@ -1600,6 +1655,12 @@ help_signature_entry() {
             '- '*) signature="${signature#- }" ;;
             '* '*) signature="${signature#\* }" ;;
         esac
+        # SQL templates use `...` as a placeholder. It is prose, not a
+        # dot-command signature; only a single leading dot can introduce a
+        # command the registry must account for.
+        if [[ "$signature" == "..."* ]]; then
+            return 0
+        fi
         if [[ "$signature" != .* && "$signature" != \\* && "$signature" != --all* ]]; then
             for command in "${expected_operational_commands[@]}" repair; do
                 if [[ "$signature" == "$command" || "$signature" == "$command "* ]]; then

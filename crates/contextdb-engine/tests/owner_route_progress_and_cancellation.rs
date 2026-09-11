@@ -13,10 +13,23 @@
 #![cfg(feature = "test-seams")]
 
 use contextdb_core::read_contract::{
-    OwnerReadCancellation, OwnerReadLimits, OwnerServiceTimeouts, OwnerServingState,
-    ReadClientTimeouts, ReadLimits, ReadRoute,
+    DatabaseIdentity, DeadlineClock, LocalUserIdentity, OwnerReadCancellation, OwnerReadLimits,
+    OwnerReadStatus, OwnerServiceTimeouts, OwnerServingState, ReadClientTimeouts, ReadLimits,
+    ReadRoute, WriterRunNumber,
 };
 use contextdb_core::{Error, Value};
+#[cfg(unix)]
+use contextdb_engine::local_transport::{
+    ChannelPathFacts, LocalConfigurationSource, LocalHandshake, LocalRequest, LocalRequestEnvelope,
+    LocalResponse, MonotonicDeadlineClock,
+};
+#[cfg(unix)]
+use contextdb_engine::owner_read::{
+    OwnerClient, OwnerReadScaffoldError, OwnerReadService, OwnerServicePublicationObserver,
+    OwnerServiceSpec, ValidatedOwnerListener,
+};
+#[cfg(unix)]
+use contextdb_engine::read_contract::decode_cursor_page;
 use contextdb_engine::read_session::{
     ReadKernelCancellationEvent, ReadKernelSource, ReadKernelSourceEvent, ReadKernelTestObserver,
     ReadSessionOperation,
@@ -26,9 +39,17 @@ use contextdb_engine::{
     ReadSession, ReadSessionOptions,
 };
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::future::Future;
+#[cfg(unix)]
+use std::num::NonZeroU64;
 use std::path::Path;
+#[cfg(unix)]
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
+#[cfg(unix)]
+use std::task::{Context, Poll, Wake, Waker};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -140,6 +161,56 @@ fn seed_progress_rows(database: &Database) {
     }
 }
 
+#[cfg(unix)]
+fn seed_ordered_rows(database: &Database) {
+    database
+        .execute(
+            "CREATE TABLE owner_publication_rows (id INTEGER PRIMARY KEY, marker TEXT)",
+            &HashMap::new(),
+        )
+        .expect("create the owner publication fixture table");
+    let selected = [200_i64, 2_500, 3_500];
+    let mut next = 0_i64;
+    while next < FIXTURE_ROWS {
+        let tx = database
+            .begin()
+            .expect("begin an owner publication fixture batch");
+        let last = (next + INSERT_BATCH).min(FIXTURE_ROWS);
+        while next < last {
+            let marker = if selected.contains(&next) {
+                "needle"
+            } else {
+                "hay"
+            };
+            database
+                .execute_in_tx(
+                    tx,
+                    "INSERT INTO owner_publication_rows (id, marker) VALUES ($id, $marker)",
+                    &HashMap::from([
+                        ("id".to_owned(), Value::Int64(next)),
+                        ("marker".to_owned(), Value::Text(marker.to_owned())),
+                    ]),
+                )
+                .unwrap_or_else(|error| panic!("insert owner publication row {next}: {error}"));
+            next += 1;
+        }
+        database
+            .commit(tx)
+            .expect("commit an owner publication fixture batch");
+    }
+}
+
+#[cfg(unix)]
+fn one_page_id(page: &contextdb_core::read_contract::CursorPage) -> i64 {
+    let [row] = page.rows.as_slice() else {
+        panic!("the one-row cursor page returned {:?}", page.rows);
+    };
+    let [Value::Int64(id)] = row.as_slice() else {
+        panic!("the cursor id projection returned {row:?}");
+    };
+    *id
+}
+
 /// Everything one observer was told.
 #[derive(Default)]
 struct Recorder {
@@ -175,6 +246,149 @@ impl Recorder {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+    }
+}
+
+#[cfg(unix)]
+struct FutureSignal {
+    ready: Mutex<bool>,
+    changed: Condvar,
+}
+
+#[cfg(unix)]
+impl Wake for FutureSignal {
+    fn wake(self: Arc<Self>) {
+        let mut ready = self.ready.lock().expect("future signal state");
+        *ready = true;
+        self.changed.notify_one();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let mut ready = self.ready.lock().expect("future signal state");
+        *ready = true;
+        self.changed.notify_one();
+    }
+}
+
+#[cfg(unix)]
+fn block_on<F: Future>(future: F) -> F::Output {
+    let signal = Arc::new(FutureSignal {
+        ready: Mutex::new(true),
+        changed: Condvar::new(),
+    });
+    let waker = Waker::from(Arc::clone(&signal));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        if let Poll::Ready(output) = Pin::as_mut(&mut future).poll(&mut context) {
+            return output;
+        }
+        let mut ready = signal.ready.lock().expect("future signal state");
+        while !*ready {
+            ready = signal.changed.wait(ready).expect("future signal wait");
+        }
+        *ready = false;
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct WaitableRecorder {
+    reports: Mutex<Vec<ReadProgress>>,
+    changed: Condvar,
+}
+
+#[cfg(unix)]
+impl WaitableRecorder {
+    fn wait_for_report(&self) {
+        let mut reports = self.reports.lock().expect("progress report state");
+        while reports.is_empty() {
+            reports = self.changed.wait(reports).expect("progress report wait");
+        }
+    }
+}
+
+#[cfg(unix)]
+impl ReadProgressObserver for WaitableRecorder {
+    fn progress(&self, progress: ReadProgress) {
+        self.reports
+            .lock()
+            .expect("progress report state")
+            .push(progress);
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct PublicationGateState {
+    before: Vec<u64>,
+    cancellations: Vec<u64>,
+    published: Vec<u64>,
+}
+
+/// Holds only the first completed fetch at the carrier boundary. The owner
+/// reader remains free to receive the cancellation and releases this wait by
+/// recording that receipt; no elapsed-time race decides the test.
+#[cfg(unix)]
+#[derive(Default)]
+struct PublicationGate {
+    state: Mutex<PublicationGateState>,
+    changed: Condvar,
+}
+
+#[cfg(unix)]
+impl PublicationGate {
+    fn wait_for_boundary(&self) -> u64 {
+        let mut state = self.state.lock().expect("publication gate state");
+        while state.before.is_empty() {
+            state = self.changed.wait(state).expect("publication boundary wait");
+        }
+        state.before[0]
+    }
+
+    fn assert_first_page_was_withdrawn(&self, request_ordinal: u64) {
+        let state = self.state.lock().expect("publication gate state");
+        assert!(state.cancellations.contains(&request_ordinal));
+        assert!(
+            !state.published.contains(&request_ordinal),
+            "the cancelled cursor page must never cross the carrier publication boundary"
+        );
+    }
+}
+
+#[cfg(unix)]
+impl OwnerServicePublicationObserver for PublicationGate {
+    fn before_cursor_page_publication(&self, request_ordinal: u64) {
+        let mut state = self.state.lock().expect("publication gate state");
+        state.before.push(request_ordinal);
+        self.changed.notify_all();
+        if state.before.len() == 1 {
+            while !state.cancellations.contains(&request_ordinal) {
+                state = self
+                    .changed
+                    .wait(state)
+                    .expect("publication cancellation receipt wait");
+            }
+        }
+    }
+
+    fn cancellation_received(&self, request_ordinal: u64) {
+        self.state
+            .lock()
+            .expect("publication gate state")
+            .cancellations
+            .push(request_ordinal);
+        self.changed.notify_all();
+    }
+
+    fn cursor_page_published(&self, request_ordinal: u64) {
+        self.state
+            .lock()
+            .expect("publication gate state")
+            .published
+            .push(request_ordinal);
+        self.changed.notify_all();
     }
 }
 
@@ -558,6 +772,272 @@ fn cancelling_a_cursor_fetch_from_inside_the_owner_channel_observer_leaves_the_c
         0,
         "closing the cursor returns the owner's reader count to zero"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_replays_the_page() {
+    let directory = tempfile::TempDir::new().expect("task-scoped publication directory");
+    let path = directory.path().join("owner-publication.db");
+    let runtime_root = secure_runtime_root(&directory, "owner-publication-runtime");
+    let database = Arc::new(
+        Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                owner_reads: OwnerReadConfig {
+                    enabled: false,
+                    ..OwnerReadConfig::default()
+                },
+                ..DatabaseOpenOptions::default()
+            },
+        )
+        .expect("open the publication fixture without a second owner service"),
+    );
+    seed_ordered_rows(&database);
+
+    let owner_user = LocalUserIdentity(nix::unistd::Uid::effective().as_raw() as u64);
+    let handshake = LocalHandshake::current(
+        DatabaseIdentity([0x61; 16]),
+        WriterRunNumber([0x72; 16]),
+        owner_user,
+    );
+    let listener = ValidatedOwnerListener::new(ChannelPathFacts {
+        path: runtime_root.join("owner.sock"),
+        runtime_directory: runtime_root.clone(),
+        is_socket: true,
+        owner: owner_user,
+        mode: 0o700,
+    });
+    let clock: Arc<dyn DeadlineClock> = Arc::new(MonotonicDeadlineClock::new());
+    let gate = Arc::new(PublicationGate::default());
+    let gate_observer: Arc<dyn OwnerServicePublicationObserver> = gate.clone();
+    let service = OwnerReadService::start(
+        OwnerServiceSpec::new(
+            Arc::clone(&database),
+            listener,
+            handshake.clone(),
+            OwnerReadStatus {
+                state: OwnerServingState::Serving,
+                reason: None,
+            },
+            roomy_owner_options(runtime_root).owner_reads,
+            LocalConfigurationSource::Override,
+            Arc::clone(&clock),
+        )
+        .with_publication_observer_for_test(gate_observer),
+    )
+    .expect("start the observed production owner service");
+    let timeouts = ReadClientTimeouts {
+        connect_ms: 60_000,
+        routing_retry_ms: 60_000,
+        response_ms: 60_000,
+    };
+    let mut client = block_on(OwnerClient::connect(
+        service.channel_path(),
+        handshake,
+        timeouts,
+        Arc::clone(&clock),
+    ))
+    .expect("connect through the observed owner carrier");
+    let limits = one_row_page_reader_options().limits;
+    let baseline = service.resources();
+
+    let opened = block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::CursorOpen {
+            statement: "SELECT id FROM owner_publication_rows WHERE marker = $marker".to_owned(),
+            params: std::collections::BTreeMap::from([(
+                "marker".to_owned(),
+                Value::Text("needle".to_owned()),
+            )]),
+        },
+    }))
+    .expect("open the publication cursor");
+    let [LocalResponse::CursorOpened { opened }] = opened.as_slice() else {
+        panic!("cursor open must return one complete response: {opened:?}");
+    };
+    let cursor_id = opened.cursor_id;
+    let first_page = decode_cursor_page(&opened.payload).expect("decode the first cursor page");
+    assert_eq!(one_page_id(&first_page), 200);
+    assert!(first_page.has_more);
+    let after_open = service.resources();
+    assert_eq!(after_open.cursor_count, 1);
+    assert_eq!(after_open.active_slots, 1);
+    assert_eq!(after_open.active_cancellations, 0);
+
+    let progress = Arc::new(WaitableRecorder::default());
+    let progress_observer: Arc<dyn ReadProgressObserver> = progress.clone();
+    let cancellation = OwnerReadCancellation::new();
+    let fetch_cancellation = cancellation.clone();
+    let fetch = std::thread::spawn(move || {
+        let result = block_on(client.request_watching(
+            LocalRequestEnvelope {
+                limits,
+                request: LocalRequest::CursorFetch {
+                    cursor_id,
+                    rows: NonZeroU64::new(2),
+                },
+            },
+            Some(&progress_observer),
+            Some(&fetch_cancellation),
+        ));
+        (client, result)
+    });
+
+    let request_ordinal = gate.wait_for_boundary();
+    progress.wait_for_report();
+    cancellation.cancel();
+    let (mut client, cancelled) = fetch.join().expect("cancelled publication fetch joins");
+    assert!(
+        matches!(
+            cancelled,
+            Err(OwnerReadScaffoldError::Database(Error::ReadCancelled))
+        ),
+        "owner publication cancellation keeps the route-neutral typed result: {cancelled:?}"
+    );
+    gate.assert_first_page_was_withdrawn(request_ordinal);
+
+    // A status request can only run after the prior request's publication
+    // guard and cancellation registration have both been released.
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::OwnerStatus,
+    }))
+    .expect("the cancelled request releases the owner connection");
+    let after_cancellation = service.resources();
+    assert_eq!(after_cancellation.cursor_count, 1);
+    assert_eq!(after_cancellation.active_slots, after_open.active_slots);
+    assert_eq!(after_cancellation.active_cancellations, 0);
+    assert!(after_cancellation.cursor_retained_bytes > 0);
+    assert_eq!(
+        i128::from(after_cancellation.accountant_used_bytes)
+            - i128::from(after_open.accountant_used_bytes),
+        i128::from(after_cancellation.cursor_retained_bytes)
+            - i128::from(after_open.cursor_retained_bytes),
+        "the pending page moves the database and owner cursor accounts by the same bytes"
+    );
+
+    let replayed = block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::CursorFetch {
+            cursor_id,
+            rows: NonZeroU64::new(1),
+        },
+    }))
+    .expect("the same cursor publishes its withdrawn page on the next fetch");
+    let [LocalResponse::CursorPage { page: replayed }] = replayed.as_slice() else {
+        panic!("cursor replay must return one complete page: {replayed:?}");
+    };
+    let replayed = decode_cursor_page(&replayed.payload).expect("decode the replayed page");
+    assert_eq!(
+        one_page_id(&replayed),
+        2_500,
+        "no withheld row may be skipped"
+    );
+    assert!(replayed.has_more);
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::OwnerStatus,
+    }))
+    .expect("the replayed fetch releases its request registration");
+    let after_partial_replay = service.resources();
+    assert_eq!(after_partial_replay.cursor_count, 1);
+    assert_eq!(after_partial_replay.active_slots, 1);
+    assert_eq!(after_partial_replay.active_cancellations, 0);
+    assert_eq!(
+        after_cancellation
+            .cursor_retained_bytes
+            .checked_sub(after_partial_replay.cursor_retained_bytes),
+        after_cancellation
+            .accountant_used_bytes
+            .checked_sub(after_partial_replay.accountant_used_bytes),
+        "publishing part of a replay releases the same exact bytes from both accounts"
+    );
+
+    let next = block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::CursorFetch {
+            cursor_id,
+            rows: None,
+        },
+    }))
+    .expect("fetch after the replay resumes the bounded continuation");
+    let [LocalResponse::CursorPage { page: next }] = next.as_slice() else {
+        panic!("cursor continuation must return one complete page: {next:?}");
+    };
+    let next = decode_cursor_page(&next.payload).expect("decode the continued page");
+    assert_eq!(
+        one_page_id(&next),
+        3_500,
+        "the replay must not duplicate a row"
+    );
+    assert!(!next.has_more);
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::OwnerStatus,
+    }))
+    .expect("the final replay fetch releases its request registration");
+    assert_eq!(
+        service.resources(),
+        baseline,
+        "publishing the final replay row returns the cursor and its remaining charge"
+    );
+
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::CursorClose { cursor_id },
+    }))
+    .expect("close the replayed cursor");
+    assert_eq!(
+        service.resources(),
+        baseline,
+        "closing the replayed cursor returns every slot and memory charge exactly once"
+    );
+
+    let direct_directory = tempfile::TempDir::new().expect("task-scoped direct parity directory");
+    let direct_path = direct_directory.path().join("direct-publication.db");
+    let direct_runtime = secure_runtime_root(&direct_directory, "direct-publication-runtime");
+    let direct_database = Database::open_with_options(
+        &direct_path,
+        DatabaseOpenOptions {
+            owner_reads: OwnerReadConfig {
+                enabled: false,
+                ..OwnerReadConfig::default()
+            },
+            ..DatabaseOpenOptions::default()
+        },
+    )
+    .expect("open the direct parity fixture");
+    seed_ordered_rows(&direct_database);
+    direct_database
+        .close()
+        .expect("release the direct parity fixture for file reading");
+    let direct = ReadSession::with_runtime_directory_for_test(&direct_runtime, || {
+        ReadSession::open_with_options(&direct_path, one_row_page_reader_options())
+    })
+    .expect("the idle parity fixture selects the direct route");
+    assert_eq!(direct.route(), ReadRoute::File);
+    let mut direct_cursor = direct
+        .open_cursor(
+            "SELECT id FROM owner_publication_rows WHERE marker = $marker",
+            &HashMap::from([("marker".to_owned(), Value::Text("needle".to_owned()))]),
+        )
+        .expect("open the direct parity cursor");
+    let direct_cancellation = OwnerReadCancellation::new();
+    direct_cancellation.cancel();
+    let direct_cancelled = direct_cursor.fetch_with_cancellation(None, &direct_cancellation);
+    assert!(
+        matches!(direct_cancelled, Err(Error::ReadCancelled)),
+        "direct and owner fetch cancellation must retain the same typed result: \
+         {direct_cancelled:?}"
+    );
+    let direct_replay = direct_cursor
+        .fetch(None)
+        .expect("the direct cursor also remains usable after typed cancellation");
+    assert_eq!(one_page_id(&direct_replay), 2_500);
+    direct_cursor
+        .close()
+        .expect("close the direct parity cursor");
 }
 
 #[test]

@@ -64,8 +64,6 @@ fn select_sql(table: &str) -> String {
 fn a_quantized_column_reads_the_same_warm_reopened_and_through_the_file() {
     let root = tempfile::tempdir().expect("scratch directory");
     let path = root.path().join("quantized.db");
-    let runtime = root.path().join("runtime");
-    std::fs::create_dir(&runtime).expect("runtime directory");
     let table = "quantized_agreement";
 
     let original_compact = awkward_vector(6, 0.317_43);
@@ -134,7 +132,7 @@ fn a_quantized_column_reads_the_same_warm_reopened_and_through_the_file() {
 
     let reader = open_for_test(
         &path,
-        DirectReaderConfig::new(generous_limits(), Arc::new(StoppedClock), runtime.clone()),
+        DirectReaderConfig::new(generous_limits(), Arc::new(StoppedClock)),
     )
     .unwrap_or_else(|error| panic!("direct reader hydrates the closed store: {error}"));
     let direct = reader

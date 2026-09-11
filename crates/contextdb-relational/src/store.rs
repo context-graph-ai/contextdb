@@ -1,11 +1,15 @@
+use crate::membership::MembershipImage;
+use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
 use contextdb_core::{
-    DirectedValue, IndexKey, IndexKind, Lsn, RowId, SortDirection, TableMeta, TableName,
-    TotalOrdAsc, TotalOrdDesc, TxId, Value, VersionedRow,
+    ColumnType, DirectedValue, IndexKey, IndexKind, Lsn, RowId, SortDirection, TableMeta,
+    TableName, TotalOrdAsc, TotalOrdDesc, TxId, Value, VersionedRow,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::hash::BuildHasherDefault;
 use std::hash::{Hash, Hasher};
+use std::ops::Bound;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,10 +25,96 @@ impl IndexEntry {
     }
 }
 
+/// A parameter-bound relational predicate which may be answered solely from
+/// ordinary index postings.  This is deliberately not an authorization
+/// predicate: callers must intersect its result with their own scope and
+/// principal decision.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnauthorisedCandidatePredicate {
+    Equality {
+        column: String,
+        value: Value,
+    },
+    FiniteIn {
+        column: String,
+        values: Vec<Value>,
+    },
+    Range {
+        column: String,
+        lower: Option<(Value, bool)>,
+        upper: Option<(Value, bool)>,
+    },
+    And(Vec<Self>),
+    Or(Vec<Self>),
+}
+
+/// Deterministic work charged while deriving relational candidates.  The
+/// bounded reader can charge memory/work and cancel at every event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnauthorisedCandidateWork {
+    pub index_probes: u64,
+    pub index_entries: u64,
+    pub set_operations: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnauthorisedCandidateWorkKind {
+    IndexProbe,
+    IndexEntry,
+    SetOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnauthorisedCandidateControl {
+    Continue,
+    Cancel,
+}
+
+/// The only successful route is complete with respect to the supplied
+/// predicate.  It says nothing about authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnauthorisedCandidateRoute {
+    Complete {
+        row_ids: Vec<RowId>,
+        row_count: u64,
+        work: UnauthorisedCandidateWork,
+    },
+    ProvablyEmpty {
+        work: UnauthorisedCandidateWork,
+    },
+    /// No table rows were read. `recommended_columns` contains only predicate
+    /// structure, so an explain surface can safely suggest CREATE INDEX.
+    UnsupportedBeforeScan {
+        recommended_columns: Vec<String>,
+        work: UnauthorisedCandidateWork,
+    },
+    Cancelled {
+        work: UnauthorisedCandidateWork,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct ExactBucket {
     key: IndexKey,
     postings: Vec<IndexEntry>,
+}
+
+pub enum IndexReadRange<'a> {
+    Current(crate::membership::MembershipRange<'a>),
+    Historical(std::collections::btree_map::Range<'a, IndexKey, Vec<IndexEntry>>),
+}
+impl<'a> Iterator for IndexReadRange<'a> {
+    type Item = (&'a IndexKey, &'a [IndexEntry]);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Current(entries) => entries
+                .next()
+                .map(|(key, entry)| (key, std::slice::from_ref(entry))),
+            Self::Historical(entries) => entries
+                .next()
+                .map(|(key, entries)| (key, entries.as_slice())),
+        }
+    }
 }
 
 type ExactMap = HashMap<u64, Vec<ExactBucket>, BuildHasherDefault<IdentityHasher>>;
@@ -172,6 +262,8 @@ pub struct IndexStorage {
     exact: ExactMap,
     exact_filter: Box<[u64; EXACT_FILTER_WORDS]>,
     exact_only: bool,
+    current: MembershipImage,
+    maintain_current: bool,
 }
 
 /// A complete, already-indexed replacement for one table.  Received-schema
@@ -200,6 +292,32 @@ pub struct PreparedRelationalPublication {
     sync_source_kinds: HashMap<TableName, HashMap<RowId, SyncSourceKind>>,
 }
 
+impl PreparedRelationalPublication {
+    pub fn admit_current_memberships(
+        &mut self,
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
+        for indexes in self.indexes.values_mut() {
+            for storage in indexes.values_mut() {
+                storage.admit_current(budget.clone())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TableProjection {
+    pub fn admit_current_memberships(
+        &mut self,
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
+        for storage in self.indexes.values_mut() {
+            storage.admit_current(budget.clone())?;
+        }
+        Ok(())
+    }
+}
+
 impl Default for IndexStorage {
     fn default() -> Self {
         Self::new(Vec::new())
@@ -222,6 +340,8 @@ impl IndexStorage {
             exact: ExactMap::default(),
             exact_filter: Box::new([0; EXACT_FILTER_WORDS]),
             exact_only,
+            current: MembershipImage::default(),
+            maintain_current: true,
         }
     }
 
@@ -262,19 +382,37 @@ impl IndexStorage {
 
     /// Insert a posting at the given key, placing it in row_id-ascending order.
     pub fn insert_posting(&mut self, key: IndexKey, entry: IndexEntry) {
+        self.try_insert_posting(key, entry)
+            .expect("unbudgeted index insertion");
+    }
+
+    fn try_insert_posting(
+        &mut self,
+        key: IndexKey,
+        entry: IndexEntry,
+    ) -> contextdb_core::Result<()> {
+        if !self.exact_only && self.maintain_current {
+            self.current.insert(&key, entry.clone())?;
+        }
         if self.exact_only {
             self.insert_exact_posting(key, entry);
-            return;
+            return Ok(());
         }
         let vec = self.tree.entry(key).or_default();
         let pos = vec
             .binary_search_by(|e| e.row_id.cmp(&entry.row_id))
             .unwrap_or_else(|i| i);
         vec.insert(pos, entry);
+        Ok(())
     }
 
     /// Stamp `deleted_tx` on the posting matching `row_id` at `key`.
     pub fn tombstone_posting(&mut self, key: &IndexKey, row_id: RowId, deleted_tx: TxId) {
+        if !self.exact_only && self.maintain_current {
+            self.current
+                .remove(key, row_id, deleted_tx)
+                .expect("detached membership construction has no budget");
+        }
         if self.exact_only {
             self.tombstone_exact_posting(key, row_id, deleted_tx);
             return;
@@ -341,6 +479,35 @@ impl IndexStorage {
         self.tree.get(key)
     }
 
+    pub fn current_image(&self, snapshot: contextdb_core::SnapshotId) -> Option<&MembershipImage> {
+        (!self.exact_only && self.current.visible_at(snapshot)).then_some(&self.current)
+    }
+
+    pub fn admit_current(
+        &mut self,
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
+        if !self.exact_only {
+            self.current.admit(budget)?;
+        }
+        Ok(())
+    }
+
+    /// Both ordinary and bounded readers select the same physical image.
+    pub fn read_range<'a>(
+        &'a self,
+        snapshot: contextdb_core::SnapshotId,
+        lower: Bound<&'a [DirectedValue]>,
+        upper: Bound<&'a [DirectedValue]>,
+    ) -> IndexReadRange<'a> {
+        match self.current_image(snapshot) {
+            Some(image) => IndexReadRange::Current(image.range(lower, upper)),
+            None => {
+                IndexReadRange::Historical(self.tree.range::<[DirectedValue], _>((lower, upper)))
+            }
+        }
+    }
+
     pub fn exact_only(&self) -> bool {
         self.exact_only
     }
@@ -386,7 +553,54 @@ pub enum SyncSourceKind {
     AcceptedLocalPending,
 }
 
+type CapturedIndexRoots = BTreeMap<TxId, CapturedMembership>;
+type CapturedTableRoots = HashMap<String, CapturedIndexRoots>;
+type RetentionExpiryKey = (TableName, RowId, TxId);
+type RetentionExpiryOwner = (Lsn, ReadCredit);
+pub type PreparedRetentionExpiry = (RetentionExpiryKey, RetentionExpiryOwner);
+
+#[derive(Default)]
+struct MembershipCaptures {
+    readers: usize,
+    preparations: usize,
+    roots: HashMap<TableName, CapturedTableRoots>,
+}
+
+struct CapturedMembership {
+    image: MembershipImage,
+    _credit: ReadCredit,
+}
+
+impl MembershipCaptures {
+    fn release_unused(&mut self) {
+        if self.readers == 0 && self.preparations == 0 {
+            self.roots = HashMap::new();
+        }
+    }
+}
+
+/// Protect current roots before sampling a read snapshot. Commits retain their
+/// predecessor roots until every concurrent source has captured its image.
+pub struct MembershipCaptureGuard(Arc<Mutex<MembershipCaptures>>);
+impl Drop for MembershipCaptureGuard {
+    fn drop(&mut self) {
+        let mut captures = self.0.lock();
+        captures.readers -= 1;
+        captures.release_unused();
+    }
+}
+
+struct MembershipCapturePreparation(Arc<Mutex<MembershipCaptures>>);
+impl Drop for MembershipCapturePreparation {
+    fn drop(&mut self) {
+        let mut captures = self.0.lock();
+        captures.preparations -= 1;
+        captures.release_unused();
+    }
+}
+
 pub struct RelationalStore {
+    membership_captures: Arc<Mutex<MembershipCaptures>>,
     pub tables: RwLock<HashMap<TableName, Vec<VersionedRow>>>,
     row_positions: RwLock<HashMap<(TableName, RowId), usize>>,
     row_version_positions: RwLock<HashMap<(TableName, RowId), Vec<usize>>>,
@@ -412,7 +626,16 @@ pub struct RelationalStore {
     /// show: a read served entirely through an index touches no scanned rows
     /// at all.
     pub index_entries_touched: AtomicU64,
+    retention_expiries: RwLock<HashMap<RetentionExpiryKey, RetentionExpiryOwner>>,
     next_row_id: AtomicU64,
+}
+
+/// Prepared current roots. The engine owns the commit gate between preparation
+/// and publication, alongside its prepared vector and durable row changes.
+pub struct PreparedMembershipBatch {
+    _capture_preparation: MembershipCapturePreparation,
+    roots: Vec<(TableName, String, MembershipImage)>,
+    _credit: ReadCredit,
 }
 
 impl Default for RelationalStore {
@@ -436,7 +659,544 @@ impl RelationalStore {
             open_index_maintenance_visits: AtomicU64::new(0),
             scan_rows_touched: AtomicU64::new(0),
             index_entries_touched: AtomicU64::new(0),
+            retention_expiries: RwLock::new(HashMap::new()),
+            membership_captures: Arc::new(Mutex::new(MembershipCaptures::default())),
             next_row_id: AtomicU64::new(1),
+        }
+    }
+
+    pub fn begin_membership_capture(&self) -> MembershipCaptureGuard {
+        self.membership_captures.lock().readers += 1;
+        MembershipCaptureGuard(self.membership_captures.clone())
+    }
+
+    pub fn captured_membership(
+        &self,
+        table: &str,
+        index: &str,
+        snapshot: contextdb_core::SnapshotId,
+    ) -> Option<MembershipImage> {
+        self.membership_captures
+            .lock()
+            .roots
+            .get(table)?
+            .get(index)?
+            .range(..=TxId(snapshot.0))
+            .next_back()
+            .map(|(_, root)| root.image.clone())
+    }
+
+    pub fn prepare_retention_expiries(
+        &self,
+        identities: Vec<(TableName, RowId, TxId, Lsn)>,
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) -> contextdb_core::Result<Vec<PreparedRetentionExpiry>> {
+        identities
+            .into_iter()
+            .map(|identity| {
+                let credit =
+                    membership_credit(budget.clone(), identity.0.len().saturating_add(192))?;
+                Ok(((identity.0, identity.1, identity.2), (identity.3, credit)))
+            })
+            .collect()
+    }
+
+    pub fn publish_retention_expiries(&self, prepared: Vec<PreparedRetentionExpiry>) {
+        self.retention_expiries.write().extend(prepared);
+    }
+
+    pub fn is_retention_expired(&self, table: &str, row: RowId, created: TxId) -> bool {
+        self.retention_expiries
+            .read()
+            .contains_key(&(table.to_owned(), row, created))
+    }
+
+    pub fn reclaimed_retention_expiry_lsns(
+        &self,
+        removed: &HashMap<TableName, HashSet<(RowId, TxId)>>,
+    ) -> Vec<Lsn> {
+        let expiries = self.retention_expiries.read();
+        let mut reclaimed = HashSet::new();
+        let mut surviving = HashSet::new();
+        for ((table, row, created), (lsn, _)) in expiries.iter() {
+            if removed
+                .get(table)
+                .is_some_and(|rows| rows.contains(&(*row, *created)))
+            {
+                reclaimed.insert(*lsn);
+            } else {
+                surviving.insert(*lsn);
+            }
+        }
+        reclaimed.difference(&surviving).copied().collect()
+    }
+
+    pub fn prepare_memberships(
+        &self,
+        deletes: &[(TableName, RowId, TxId)],
+        inserts: &[(TableName, VersionedRow)],
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) -> contextdb_core::Result<PreparedMembershipBatch> {
+        let affected_count = deletes.len().saturating_add(inserts.len());
+        let _affected_credit = membership_credit(
+            budget.clone(),
+            affected_count.saturating_mul(std::mem::size_of::<&str>()),
+        )?;
+        let mut affected = Vec::with_capacity(affected_count);
+        affected.extend(deletes.iter().map(|(table, _, _)| table.as_str()));
+        affected.extend(inserts.iter().map(|(table, _)| table.as_str()));
+        affected.sort_unstable();
+        affected.dedup();
+        let indexes = self.indexes.read();
+        let mut root_count = 0usize;
+        let mut root_bytes = 0usize;
+        for table in &affected {
+            if let Some(table_indexes) = indexes.get(*table) {
+                for (name, storage) in table_indexes {
+                    if !storage.exact_only {
+                        root_count += 1;
+                        root_bytes = root_bytes
+                            .saturating_add(
+                                std::mem::size_of::<(TableName, String, MembershipImage)>(),
+                            )
+                            .saturating_add(table.len())
+                            .saturating_add(name.len());
+                    }
+                }
+            }
+        }
+        let root_credit = membership_credit(budget.clone(), root_bytes)?;
+        let mut roots = Vec::with_capacity(root_count);
+        for table in affected {
+            let Some(table_indexes) = indexes.get(table) else {
+                continue;
+            };
+            for (name, storage) in table_indexes {
+                if storage.exact_only {
+                    continue;
+                }
+                let mut image = storage.current.clone();
+                image.admit(budget.clone())?;
+                for (deleted_table, row_id, tx) in deletes {
+                    if deleted_table != table {
+                        continue;
+                    }
+                    let _probe_credit = membership_credit(budget.clone(), table.len())?;
+                    self.with_live_row(table, *row_id, |row| {
+                        let _key_credit =
+                            membership_key_credit(&storage.columns, &row.values, budget.clone())?;
+                        let key = index_key_for_row(&storage.columns, &row.values);
+                        image.remove(&key, *row_id, *tx)
+                    })?;
+                }
+                for (inserted_table, row) in inserts {
+                    if inserted_table != table {
+                        continue;
+                    }
+                    let _key_credit =
+                        membership_key_credit(&storage.columns, &row.values, budget.clone())?;
+                    let key = index_key_for_row(&storage.columns, &row.values);
+                    image.insert(
+                        &key,
+                        IndexEntry {
+                            row_id: row.row_id,
+                            created_tx: row.created_tx,
+                            deleted_tx: row.deleted_tx,
+                        },
+                    )?;
+                }
+                roots.push((table.to_owned(), name.clone(), image));
+            }
+        }
+        // Retain before durability even if no reader has started yet: one
+        // may register while this prepared batch is awaiting publication.
+        self.membership_captures.lock().preparations += 1;
+        let capture_preparation = MembershipCapturePreparation(self.membership_captures.clone());
+        {
+            let mut captures = self.membership_captures.lock();
+            for (table, name, _) in &roots {
+                let old = &indexes[table][name].current;
+                // New maps allocate spare buckets and a full B-tree node.
+                // Reserve that capacity before retaining the first root too.
+                let credit = membership_credit(
+                    budget.clone(),
+                    16 * std::mem::size_of::<(TxId, CapturedMembership)>()
+                        + 8 * std::mem::size_of::<(String, CapturedTableRoots)>()
+                        + 8 * std::mem::size_of::<(String, CapturedIndexRoots)>()
+                        + table.len()
+                        + name.len(),
+                )?;
+                captures
+                    .roots
+                    .entry(table.clone())
+                    .or_default()
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(
+                        old.since(),
+                        CapturedMembership {
+                            image: old.clone(),
+                            _credit: credit,
+                        },
+                    );
+            }
+        }
+        Ok(PreparedMembershipBatch {
+            roots,
+            _credit: root_credit,
+            _capture_preparation: capture_preparation,
+        })
+    }
+
+    /// No allocation or admission of current membership happens after durability.
+    pub fn apply_prepared_rows(
+        &self,
+        deletes: &[(TableName, RowId, TxId)],
+        inserts: &[(TableName, VersionedRow)],
+        prepared: PreparedMembershipBatch,
+    ) {
+        {
+            let mut indexes = self.indexes.write();
+            for (table, name, _) in &prepared.roots {
+                indexes
+                    .get_mut(table)
+                    .and_then(|indexes| indexes.get_mut(name))
+                    .expect("prepared index remains under commit gate")
+                    .maintain_current = false;
+            }
+        }
+        self.apply_replacements_ref(deletes, inserts);
+        self.publish_memberships(prepared);
+    }
+
+    pub fn publish_memberships(&self, prepared: PreparedMembershipBatch) {
+        let mut indexes = self.indexes.write();
+        for (table, name, image) in prepared.roots {
+            let storage = indexes
+                .get_mut(&table)
+                .and_then(|indexes| indexes.get_mut(&name))
+                .expect("prepared index remains under commit gate");
+            storage.current = image;
+            storage.maintain_current = true;
+        }
+    }
+
+    /// Derive row ids from ordinary relational indexes after parameter binding.
+    ///
+    /// This method never reads `tables`, never evaluates ACL/scope/principal
+    /// policy, and never upgrades an unsupported predicate into a scan.  The
+    /// returned ids are sorted and de-duplicated so callers can intersect them
+    /// with authorization and pass them directly to a bounded vector reader.
+    pub fn unauthorised_index_candidates<F>(
+        &self,
+        table: &str,
+        snapshot: contextdb_core::SnapshotId,
+        predicate: &UnauthorisedCandidatePredicate,
+        observe: F,
+    ) -> UnauthorisedCandidateRoute
+    where
+        F: FnMut(UnauthorisedCandidateWorkKind, u64) -> UnauthorisedCandidateControl,
+    {
+        struct State<F> {
+            work: UnauthorisedCandidateWork,
+            observe: F,
+            cancelled: bool,
+        }
+        impl<F> State<F>
+        where
+            F: FnMut(UnauthorisedCandidateWorkKind, u64) -> UnauthorisedCandidateControl,
+        {
+            fn charge(&mut self, kind: UnauthorisedCandidateWorkKind, amount: u64) -> bool {
+                match kind {
+                    UnauthorisedCandidateWorkKind::IndexProbe => {
+                        self.work.index_probes = self.work.index_probes.saturating_add(amount)
+                    }
+                    UnauthorisedCandidateWorkKind::IndexEntry => {
+                        self.work.index_entries = self.work.index_entries.saturating_add(amount)
+                    }
+                    UnauthorisedCandidateWorkKind::SetOperation => {
+                        self.work.set_operations = self.work.set_operations.saturating_add(amount)
+                    }
+                }
+                self.cancelled |= matches!(
+                    (self.observe)(kind, amount),
+                    UnauthorisedCandidateControl::Cancel
+                );
+                !self.cancelled
+            }
+        }
+
+        fn safe_value(value: &Value) -> bool {
+            !value.is_null() && !matches!(value, Value::Float64(number) if number.is_nan())
+        }
+
+        fn matches_index_column_type(value: &Value, column_type: &ColumnType) -> bool {
+            matches!(
+                (value, column_type),
+                (Value::Int64(_), ColumnType::Integer)
+                    | (Value::Float64(_), ColumnType::Real)
+                    | (Value::Text(_), ColumnType::Text)
+                    | (Value::Bool(_), ColumnType::Boolean)
+                    | (Value::Uuid(_), ColumnType::Uuid)
+                    | (Value::Timestamp(_), ColumnType::Timestamp)
+                    | (Value::TxId(_), ColumnType::TxId)
+            )
+        }
+
+        enum ResultSet {
+            Complete(BTreeMap<RowId, ()>),
+            Empty,
+            Unsupported(Vec<String>),
+            Cancelled,
+        }
+
+        fn combine<F>(
+            parts: &[UnauthorisedCandidatePredicate],
+            conjunction: bool,
+            table: &str,
+            snapshot: contextdb_core::SnapshotId,
+            store: &RelationalStore,
+            state: &mut State<F>,
+        ) -> ResultSet
+        where
+            F: FnMut(UnauthorisedCandidateWorkKind, u64) -> UnauthorisedCandidateControl,
+        {
+            let mut accumulated: Option<BTreeMap<RowId, ()>> = None;
+            for part in parts {
+                let next = evaluate(part, table, snapshot, store, state);
+                let next = match next {
+                    ResultSet::Complete(set) => set,
+                    ResultSet::Empty if conjunction => return ResultSet::Empty,
+                    ResultSet::Empty => continue,
+                    other @ ResultSet::Unsupported(_) | other @ ResultSet::Cancelled => {
+                        return other;
+                    }
+                };
+                let Some(current) = accumulated.take() else {
+                    accumulated = Some(next);
+                    continue;
+                };
+                if !state.charge(
+                    UnauthorisedCandidateWorkKind::SetOperation,
+                    current.len().saturating_add(next.len()) as u64,
+                ) {
+                    return ResultSet::Cancelled;
+                }
+                let combined = if conjunction {
+                    current
+                        .into_iter()
+                        .filter(|(id, _)| next.contains_key(id))
+                        .collect()
+                } else {
+                    current.into_iter().chain(next).collect()
+                };
+                accumulated = Some(combined);
+            }
+            match accumulated {
+                Some(set) if set.is_empty() => ResultSet::Empty,
+                Some(set) => ResultSet::Complete(set),
+                None => ResultSet::Empty,
+            }
+        }
+
+        fn evaluate<F>(
+            predicate: &UnauthorisedCandidatePredicate,
+            table: &str,
+            snapshot: contextdb_core::SnapshotId,
+            store: &RelationalStore,
+            state: &mut State<F>,
+        ) -> ResultSet
+        where
+            F: FnMut(UnauthorisedCandidateWorkKind, u64) -> UnauthorisedCandidateControl,
+        {
+            match predicate {
+                UnauthorisedCandidatePredicate::And(parts) => {
+                    return combine(parts, true, table, snapshot, store, state);
+                }
+                UnauthorisedCandidatePredicate::Or(parts) => {
+                    return combine(parts, false, table, snapshot, store, state);
+                }
+                _ => {}
+            }
+            let (column, values, range) = match predicate {
+                UnauthorisedCandidatePredicate::Equality { column, value } => {
+                    if !safe_value(value) {
+                        return ResultSet::Empty;
+                    }
+                    (column, vec![value.clone()], None)
+                }
+                UnauthorisedCandidatePredicate::FiniteIn { column, values } => (
+                    column,
+                    values
+                        .iter()
+                        .filter(|value| safe_value(value))
+                        .cloned()
+                        .collect(),
+                    None,
+                ),
+                UnauthorisedCandidatePredicate::Range {
+                    column,
+                    lower,
+                    upper,
+                } => {
+                    if lower.as_ref().is_some_and(|(value, _)| !safe_value(value))
+                        || upper.as_ref().is_some_and(|(value, _)| !safe_value(value))
+                    {
+                        return ResultSet::Empty;
+                    }
+                    (column, Vec::new(), Some((lower, upper)))
+                }
+                _ => unreachable!("compound predicate handled above"),
+            };
+            if values.is_empty() && range.is_none() {
+                return ResultSet::Empty;
+            }
+
+            let meta = match store.table_meta(table) {
+                Some(meta) => meta,
+                None => return ResultSet::Unsupported(vec![column.clone()]),
+            };
+            let Some(column_def) = meta
+                .columns
+                .iter()
+                .find(|candidate| candidate.name == *column)
+            else {
+                return ResultSet::Unsupported(vec![column.clone()]);
+            };
+            // The binding layer must apply ordinary SQL coercion before this
+            // index-only route. Refusing an uncoerced value as empty avoids a
+            // cross-variant B-tree comparison and preserves typed equality.
+            let type_matches = values
+                .iter()
+                .all(|value| matches_index_column_type(value, &column_def.column_type))
+                && range.as_ref().is_none_or(|(lower, upper)| {
+                    lower.as_ref().is_none_or(|(value, _)| {
+                        matches_index_column_type(value, &column_def.column_type)
+                    }) && upper.as_ref().is_none_or(|(value, _)| {
+                        matches_index_column_type(value, &column_def.column_type)
+                    })
+                });
+            if !type_matches {
+                return ResultSet::Empty;
+            }
+            // Only ordinary declared indexes make this a vector candidate route.
+            let declaration = meta.indexes.iter().find(|index| {
+                index.kind == IndexKind::UserDeclared
+                    && index.columns.len() == 1
+                    && index.columns[0].0 == *column
+            });
+            let Some(declaration) = declaration else {
+                return ResultSet::Unsupported(vec![column.clone()]);
+            };
+            let indexes = store.indexes.read();
+            let Some(storage) = indexes
+                .get(table)
+                .and_then(|table_indexes| table_indexes.get(&declaration.name))
+            else {
+                return ResultSet::Unsupported(vec![column.clone()]);
+            };
+            if range.is_some() && storage.exact_only() {
+                return ResultSet::Unsupported(vec![column.clone()]);
+            }
+
+            let mut output = BTreeMap::new();
+            let direction = declaration.columns[0].1;
+            let key = |value: Value| index_key_from_values(&declaration.columns, &[value]);
+            let mut collect = |entries: &[IndexEntry], state: &mut State<F>| -> bool {
+                for entry in entries {
+                    if !state.charge(UnauthorisedCandidateWorkKind::IndexEntry, 1) {
+                        return false;
+                    }
+                    if entry.visible_at(snapshot) {
+                        output.insert(entry.row_id, ());
+                    }
+                }
+                true
+            };
+            if let Some((lower, upper)) = range {
+                if !state.charge(UnauthorisedCandidateWorkKind::IndexProbe, 1) {
+                    return ResultSet::Cancelled;
+                }
+                let directed = |value: Value| match direction {
+                    SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value)),
+                    SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value)),
+                };
+                let lower = match lower {
+                    Some((value, true)) => Bound::Included(vec![directed(value.clone())]),
+                    Some((value, false)) => Bound::Excluded(vec![directed(value.clone())]),
+                    None => Bound::Unbounded,
+                };
+                let upper = match upper {
+                    Some((value, true)) => Bound::Included(vec![directed(value.clone())]),
+                    Some((value, false)) => Bound::Excluded(vec![directed(value.clone())]),
+                    None => Bound::Unbounded,
+                };
+                // Descending index keys reverse the SQL comparison direction.
+                let (lower, upper) = match direction {
+                    SortDirection::Asc => (lower, upper),
+                    SortDirection::Desc => (upper, lower),
+                };
+                if let (
+                    Bound::Included(left) | Bound::Excluded(left),
+                    Bound::Included(right) | Bound::Excluded(right),
+                ) = (&lower, &upper)
+                    && left > right
+                {
+                    return ResultSet::Empty;
+                }
+                for (_, entries) in storage.read_range(
+                    snapshot,
+                    lower.as_ref().map(|v| v.as_slice()),
+                    upper.as_ref().map(|v| v.as_slice()),
+                ) {
+                    if !collect(entries, state) {
+                        return ResultSet::Cancelled;
+                    }
+                }
+            } else {
+                for value in values {
+                    if !state.charge(UnauthorisedCandidateWorkKind::IndexProbe, 1) {
+                        return ResultSet::Cancelled;
+                    }
+                    let key = key(value);
+                    for (_, entries) in storage.read_range(
+                        snapshot,
+                        Bound::Included(key.as_slice()),
+                        Bound::Included(key.as_slice()),
+                    ) {
+                        if !collect(entries, state) {
+                            return ResultSet::Cancelled;
+                        }
+                    }
+                }
+            }
+            if output.is_empty() {
+                ResultSet::Empty
+            } else {
+                ResultSet::Complete(output)
+            }
+        }
+
+        let mut state = State {
+            work: UnauthorisedCandidateWork::default(),
+            observe,
+            cancelled: false,
+        };
+        match evaluate(predicate, table, snapshot, self, &mut state) {
+            ResultSet::Complete(ids) => {
+                let row_count = ids.len() as u64;
+                UnauthorisedCandidateRoute::Complete {
+                    row_ids: ids.into_keys().collect(),
+                    row_count,
+                    work: state.work,
+                }
+            }
+            ResultSet::Empty => UnauthorisedCandidateRoute::ProvablyEmpty { work: state.work },
+            ResultSet::Unsupported(columns) => UnauthorisedCandidateRoute::UnsupportedBeforeScan {
+                recommended_columns: columns,
+                work: state.work,
+            },
+            ResultSet::Cancelled => UnauthorisedCandidateRoute::Cancelled { work: state.work },
         }
     }
 
@@ -707,7 +1467,7 @@ impl RelationalStore {
         self.table_meta.write().insert(name.to_string(), meta);
     }
 
-    pub fn insert_loaded_row(&self, name: &str, row: VersionedRow) {
+    pub fn insert_loaded_row(&self, name: &str, row: VersionedRow) -> contextdb_core::Result<()> {
         // Row-load during Database::open: populate every index (user-declared
         // + auto) so the rebuild stays in lockstep. Rows arrive in row_id
         // ascending order, satisfying I18.
@@ -727,7 +1487,7 @@ impl RelationalStore {
                     };
                     visits = visits.saturating_add(1);
                     let key = index_key_for_row(&idx.columns, &row.values);
-                    idx.insert_posting(key, entry.clone());
+                    idx.try_insert_posting(key, entry.clone())?;
                 }
             }
             if visits > 0 {
@@ -746,6 +1506,7 @@ impl RelationalStore {
             .or_default()
             .push(row_position);
         rows.push(row);
+        Ok(())
     }
 
     fn index_names_for_table(&self, table: &str) -> Vec<String> {
@@ -903,6 +1664,24 @@ impl RelationalStore {
             .cloned()
     }
 
+    fn with_live_row(
+        &self,
+        table: &str,
+        row_id: RowId,
+        visit: impl FnOnce(&VersionedRow) -> contextdb_core::Result<()>,
+    ) -> contextdb_core::Result<()> {
+        let tables = self.tables.read();
+        let positions = self.row_positions.read();
+        if let Some(row) = positions
+            .get(&(table.to_owned(), row_id))
+            .and_then(|position| tables.get(table)?.get(*position))
+            .filter(|row| row.row_id == row_id && row.deleted_tx.is_none())
+        {
+            visit(row)?;
+        }
+        Ok(())
+    }
+
     pub fn live_rows_by_id(
         &self,
         keys: &[(TableName, RowId)],
@@ -1018,9 +1797,17 @@ impl RelationalStore {
             return;
         };
         rows.retain(|row| !versions.contains(&(row.row_id, row.created_tx)));
+        self.retention_expiries
+            .write()
+            .retain(|(name, row, created), _| {
+                name != table || !versions.contains(&(*row, *created))
+            });
         let remaining_live_row_ids = rows
             .iter()
-            .filter(|row| row.deleted_tx.is_none())
+            .filter(|row| {
+                row.deleted_tx.is_none()
+                    || self.is_retention_expired(table, row.row_id, row.created_tx)
+            })
             .map(|row| row.row_id)
             .collect::<HashSet<_>>();
         {
@@ -1079,6 +1866,9 @@ impl RelationalStore {
     }
 
     pub fn drop_table(&self, name: &str) {
+        self.retention_expiries
+            .write()
+            .retain(|(table, _, _), _| table != name);
         self.table_meta.write().remove(name);
         // Drop all indexes whose key-table matches; releases BTreeMap storage.
         let mut indexes = self.indexes.write();
@@ -1108,6 +1898,22 @@ impl RelationalStore {
             .entry(table.to_string())
             .or_default()
             .insert(name.to_string(), IndexStorage::new(columns));
+    }
+
+    pub fn create_index_storage_with_budget(
+        &self,
+        table: &str,
+        name: &str,
+        columns: Vec<(String, SortDirection)>,
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) {
+        let mut storage = IndexStorage::new(columns);
+        storage.current = MembershipImage::with_budget(budget);
+        self.indexes
+            .write()
+            .entry(table.to_owned())
+            .or_default()
+            .insert(name.to_owned(), storage);
     }
 
     pub fn create_exact_index_storage(
@@ -1145,6 +1951,14 @@ impl RelationalStore {
     /// before the executor sees queries. Iterates in row_id-ascending order
     /// to preserve I18 tie-break stability.
     pub fn rebuild_index(&self, table: &str, name: &str) {
+        self.rebuild_index_inner(table, name, false);
+    }
+
+    pub fn rebuild_index_preserving_current(&self, table: &str, name: &str) {
+        self.rebuild_index_inner(table, name, true);
+    }
+
+    fn rebuild_index_inner(&self, table: &str, name: &str, preserve_current: bool) {
         let mut indexes = self.indexes.write();
         let Some(table_indexes) = indexes.get_mut(table) else {
             return;
@@ -1158,6 +1972,10 @@ impl RelationalStore {
         } else {
             IndexStorage::new(columns.clone())
         };
+        if preserve_current {
+            rebuilt.current = existing.current.clone();
+            rebuilt.maintain_current = false;
+        }
         let tables = self.tables.read();
         if let Some(rows) = tables.get(table) {
             let mut sorted: Vec<&VersionedRow> = rows.iter().collect();
@@ -1174,6 +1992,7 @@ impl RelationalStore {
                 );
             }
         }
+        rebuilt.maintain_current = true;
         table_indexes.insert(name.to_string(), rebuilt);
     }
 
@@ -1185,6 +2004,22 @@ impl RelationalStore {
         meta: &TableMeta,
         rows: &[VersionedRow],
     ) -> HashMap<String, IndexStorage> {
+        Self::projected_index_storage_inner(meta, rows, None).expect("unbudgeted index projection")
+    }
+
+    pub fn projected_index_storage_with_budget(
+        meta: &TableMeta,
+        rows: &[VersionedRow],
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) -> contextdb_core::Result<HashMap<String, IndexStorage>> {
+        Self::projected_index_storage_inner(meta, rows, Some(budget))
+    }
+
+    fn projected_index_storage_inner(
+        meta: &TableMeta,
+        rows: &[VersionedRow],
+        budget: Option<Arc<dyn ReadMemoryBudget>>,
+    ) -> contextdb_core::Result<HashMap<String, IndexStorage>> {
         let mut indexes = HashMap::new();
         for decl in &meta.indexes {
             // Match create_exact_index_storage: duplicate auto constraint
@@ -1197,10 +2032,13 @@ impl RelationalStore {
             {
                 continue;
             }
-            let storage = match decl.kind {
+            let mut storage = match decl.kind {
                 IndexKind::Auto => IndexStorage::new_exact_only(decl.columns.clone()),
                 IndexKind::UserDeclared => IndexStorage::new(decl.columns.clone()),
             };
+            if let Some(budget) = &budget {
+                storage.current = MembershipImage::with_budget(budget.clone());
+            }
             indexes.insert(decl.name.clone(), storage);
         }
 
@@ -1209,17 +2047,17 @@ impl RelationalStore {
         for storage in indexes.values_mut() {
             for row in &sorted {
                 let key = index_key_for_row(&storage.columns, &row.values);
-                storage.insert_posting(
+                storage.try_insert_posting(
                     key,
                     IndexEntry {
                         row_id: row.row_id,
                         created_tx: row.created_tx,
                         deleted_tx: row.deleted_tx,
                     },
-                );
+                )?;
             }
         }
-        indexes
+        Ok(indexes)
     }
 
     /// Construct one complete table replacement while no relational write
@@ -1330,6 +2168,14 @@ impl RelationalStore {
         let mut source_kinds = self.sync_source_kinds.write();
         *indexes = publication.indexes;
         *tables = publication.tables;
+        self.retention_expiries
+            .write()
+            .retain(|(table, row, created), _| {
+                tables.get(table).is_some_and(|rows| {
+                    rows.iter()
+                        .any(|entry| entry.row_id == *row && entry.created_tx == *created)
+                })
+            });
         *table_meta = publication.table_meta;
         *positions = publication.row_positions;
         *version_positions = publication.row_version_positions;
@@ -1618,6 +2464,34 @@ impl RelationalStore {
     }
 }
 
+fn membership_key_credit(
+    columns: &[(String, SortDirection)],
+    values: &HashMap<String, Value>,
+    budget: Arc<dyn ReadMemoryBudget>,
+) -> contextdb_core::Result<ReadCredit> {
+    let bytes = columns
+        .iter()
+        .fold(std::mem::size_of::<IndexKey>(), |bytes, (column, _)| {
+            bytes
+                .saturating_add(std::mem::size_of::<DirectedValue>())
+                .saturating_add(values.get(column).map_or(0, Value::estimated_bytes))
+        });
+    membership_credit(budget, bytes)
+}
+
+fn membership_credit(
+    budget: Arc<dyn ReadMemoryBudget>,
+    bytes: usize,
+) -> contextdb_core::Result<ReadCredit> {
+    ReadCredit::try_new(
+        budget,
+        bytes,
+        "relational_index",
+        "membership",
+        "Release old readers or raise MEMORY_LIMIT before changing indexed rows.",
+    )
+}
+
 /// Build the directed IndexKey for a row's values given the index's column
 /// declaration. Missing columns map to `Value::Null` (NULL partition).
 pub fn index_key_for_row(
@@ -1667,9 +2541,15 @@ mod tests {
     #[test]
     fn remove_row_versions_preserves_sorted_same_row_positions() {
         let store = RelationalStore::new();
-        store.insert_loaded_row("items", row(RowId(1), TxId(3), None, "live"));
-        store.insert_loaded_row("items", row(RowId(1), TxId(2), Some(TxId(3)), "old"));
-        store.insert_loaded_row("items", row(RowId(2), TxId(1), None, "other"));
+        store
+            .insert_loaded_row("items", row(RowId(1), TxId(3), None, "live"))
+            .unwrap();
+        store
+            .insert_loaded_row("items", row(RowId(1), TxId(2), Some(TxId(3)), "old"))
+            .unwrap();
+        store
+            .insert_loaded_row("items", row(RowId(2), TxId(1), None, "other"))
+            .unwrap();
         store.rebuild_row_position_maps();
 
         let pruned = HashSet::from([(RowId(2), TxId(1))]);

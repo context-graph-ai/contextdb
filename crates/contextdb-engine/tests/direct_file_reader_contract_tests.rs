@@ -49,7 +49,6 @@ use std::os::unix::fs::PermissionsExt;
 
 const CHILD_ROLE_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_ROLE";
 const CHILD_PATH_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_PATH";
-const CHILD_RUNTIME_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_RUNTIME";
 const CHILD_SQL_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_SQL";
 const CHILD_ID_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_ID";
 const CHILD_PAYLOAD_ENV: &str = "CONTEXTDB_DIRECT_FILE_CHILD_PAYLOAD";
@@ -112,16 +111,12 @@ fn generous_limits() -> ReadLimits {
     }
 }
 
-fn reader_config(
-    clock: Arc<ManualClock>,
-    runtime_directory: &Path,
-    limits: ReadLimits,
-) -> DirectReaderConfig {
-    DirectReaderConfig::new(limits, clock, runtime_directory.to_path_buf())
+fn reader_config(clock: Arc<ManualClock>, limits: ReadLimits) -> DirectReaderConfig {
+    DirectReaderConfig::new(limits, clock)
 }
 
-fn default_reader_config(clock: Arc<ManualClock>, runtime_directory: &Path) -> DirectReaderConfig {
-    reader_config(clock, runtime_directory, generous_limits())
+fn default_reader_config(clock: Arc<ManualClock>) -> DirectReaderConfig {
+    reader_config(clock, generous_limits())
 }
 
 #[derive(Default)]
@@ -180,7 +175,6 @@ struct Fixture {
     identity_seed: String,
     token: String,
     root: PathBuf,
-    runtime_directory: PathBuf,
     path: PathBuf,
     parent_table: String,
     outcomes_table: String,
@@ -346,6 +340,9 @@ fn schema_from_meta(table: &str, meta: &TableMeta) -> DirectSchema {
                     }),
                 quantization: matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
                     .then(|| direct_quantization(column.quantization)),
+                partition_key_columns: column.partition_key_columns.clone().unwrap_or_default(),
+                max_partitions: column.effective_max_partitions(),
+                search_mode: column.search_mode,
                 rank: column.rank_policy.as_ref().map(|rank| DirectRankPolicy {
                     sort_key: rank.sort_key.clone(),
                     formula: rank.formula.clone(),
@@ -553,9 +550,7 @@ fn seed_fixture_from_seed(
     let schedule = format!("schedule_{token}");
     let callback = format!("callback_{token}");
     let root = outer_root.join(format!("source_{token}"));
-    let runtime_directory = outer_root.join(format!("runtime_{token}"));
     fs::create_dir(&root).expect("create dynamic source directory");
-    fs::create_dir(&runtime_directory).expect("create dynamic runtime directory");
     let nested = root.join(format!("nested_{token}"));
     fs::create_dir(&nested).expect("create recursive manifest directory");
     let identity_file = nested.join(format!("identity_{token}.txt"));
@@ -900,7 +895,7 @@ fn seed_fixture_from_seed(
             &explain_sql,
             &HashMap::from([("id".to_owned(), Value::Uuid(rows[0].id))]),
         )
-        .expect("capture exact explain route");
+        .expect("capture the ordinary explain route");
     let explain_physical_plan = explain_result.trace.physical_plan.to_owned();
     let explain_index = explain_result.trace.index_used;
 
@@ -1216,7 +1211,6 @@ fn seed_fixture_from_seed(
         identity_seed: identity_seed.to_owned(),
         token,
         root,
-        runtime_directory,
         path,
         parent_table,
         outcomes_table,
@@ -1267,11 +1261,7 @@ fn direct_open_with_limits(
     clock: Arc<ManualClock>,
     limits: ReadLimits,
 ) -> DirectFileReader {
-    open_for_test(
-        &fixture.path,
-        reader_config(clock, &fixture.runtime_directory, limits),
-    )
-    .unwrap_or_else(|error| {
+    open_for_test(&fixture.path, reader_config(clock, limits)).unwrap_or_else(|error| {
         panic!(
             "direct file route must hydrate the committed image for {}: {error}",
             fixture.path.display()
@@ -1343,6 +1333,7 @@ fn metadata_responses(fixture: &Fixture, reader: &DirectFileReader) -> Vec<Direc
     let explain = reader
         .metadata(DirectMetadataRequest::Explain {
             sql: fixture.explain_sql.clone(),
+            params: fixture.relation_params(),
         })
         .unwrap_or_else(|error| panic!("project explain: {error}"));
     assert_eq!(
@@ -1351,6 +1342,7 @@ fn metadata_responses(fixture: &Fixture, reader: &DirectFileReader) -> Vec<Direc
             sql: fixture.explain_sql.clone(),
             physical_plan: fixture.explain_physical_plan.clone(),
             index: fixture.explain_index.clone(),
+            vector_search: None,
         }
     );
     responses.push(explain);
@@ -1734,7 +1726,7 @@ fn released_image_is_the_first_gate_and_survives_complete_source_removal() {
         let observer = Arc::new(RecordingObserver::default());
         let reader = open_with_hydration_observer_for_test(
             &fixture.path,
-            default_reader_config(Arc::new(ManualClock::default()), &fixture.runtime_directory),
+            default_reader_config(Arc::new(ManualClock::default())),
             Arc::clone(&observer) as Arc<dyn HydrationObserver>,
         )
         .unwrap_or_else(|error| panic!("publish released image: {error}"));
@@ -1842,6 +1834,12 @@ impl PathCollector {
 }
 
 impl<'ast> Visit<'ast> for PathCollector {
+    fn visit_attribute(&mut self, _attribute: &'ast syn::Attribute) {
+        // Attributes are not module dependencies. Conditional attributes are
+        // audited independently by CfgAttributeCollector, and lint attributes
+        // must not make the dependency collector report the lint name.
+    }
+
     fn visit_path(&mut self, path: &'ast syn::Path) {
         self.paths.push(
             path.segments
@@ -2020,7 +2018,6 @@ fn legal_direct_dependency(path: &[String]) -> bool {
                 | "release_receipt"
                 | "request"
                 | "rows"
-                | "runtime_directory"
                 | "scope_labels"
                 | "self"
                 | "sql"
@@ -2076,6 +2073,7 @@ fn legal_direct_dependency(path: &[String]) -> bool {
             &["contextdb_core", "TxId"][..],
             &["contextdb_core", "Value"][..],
             &["contextdb_core", "VectorIndexRef"][..],
+            &["contextdb_core", "VectorSearchMode"][..],
             &["contextdb_core", "read_contract"][..],
             &["contextdb_core", "read_contract", "CursorPage"][..],
             &["contextdb_core", "read_contract", "DeadlineClock"][..],
@@ -2118,12 +2116,17 @@ fn legal_direct_dependency(path: &[String]) -> bool {
                 | "fmt"
         );
     }
-    // Statement 19: exact data-only custody results, not their constructors or services.
+    // Exact data-only custody results, not their constructors or services.
     if path_equals(path, &["crate", "DeliveryOutcome"])
         || path_equals(path, &["crate", "DeliveryStatusCounts"])
         || path_equals(path, &["crate", "QueryResult"])
-        || path_equals(path, &["crate", "persistence", "load_read_image"])
+        || path_equals(path, &["crate", "database", "VectorSearchDisclosure"])
+        || path_equals(
+            path,
+            &["crate", "persistence", "load_read_image_with_memory"],
+        )
         || path_equals(path, &["crate", "executor", "ReadExecutionTarget"])
+        || path_equals(path, &["crate", "read_image_memory", "ImageMemory"])
     {
         return true;
     }
@@ -2367,8 +2370,20 @@ fn assert_core_has_no_cfg_or_macro_dependency_bypass(source: &Path, syntax: &syn
         }
         let mut cfg = CfgAttributeCollector::default();
         cfg.visit_item(item);
+        let sanctioned_lint_only_cfg_attr = source.file_name().is_some_and(|name| {
+            name == "direct_file_reader.rs"
+                && matches!(item, Item::Struct(item) if item.ident == "DirectReaderConfig")
+        }) && matches!(
+            cfg.cfg_attributes.as_slice(),
+            [attribute]
+                if attribute
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>()
+                    == "not(feature=\"test-seams\"),allow(dead_code)"
+        );
         assert!(
-            cfg.cfg_attributes.is_empty(),
+            cfg.cfg_attributes.is_empty() || sanctioned_lint_only_cfg_attr,
             "{} core item {} changes by cfg: {:?}",
             source.display(),
             item_identity(item).unwrap_or_else(|| "<anonymous>".to_owned()),
@@ -2762,7 +2777,7 @@ fn assert_no_writable_subsystems(counters: &DirectReaderCounters) {
 
 #[test]
 fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
-    // Statement 19: inspecting custody data does not open a constructor or writer escape.
+    // Inspecting custody data does not open a constructor or writer escape.
     for forbidden in [
         &["crate", "DeliveryOutcome", "new"][..],
         &["crate", "DeliveryStatusCounts", "default"][..],
@@ -2790,7 +2805,10 @@ fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
         collector.visit_file(&syntax);
         let mut illegal_dependencies = BTreeSet::new();
         for dependency in collector.paths {
-            if path_equals(&dependency, &["crate", "persistence", "load_read_image"]) {
+            if path_equals(
+                &dependency,
+                &["crate", "persistence", "load_read_image_with_memory"],
+            ) {
                 loader_calls += 1;
             }
             if !legal_direct_dependency(&dependency) {
@@ -2821,11 +2839,12 @@ fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
                 let ImplItem::Fn(method) = item else { continue };
                 let mut paths = PathCollector::default();
                 paths.visit_block(&method.block);
-                if paths
-                    .paths
-                    .iter()
-                    .any(|path| path_equals(path, &["crate", "persistence", "load_read_image"]))
-                {
+                if paths.paths.iter().any(|path| {
+                    path_equals(
+                        path,
+                        &["crate", "persistence", "load_read_image_with_memory"],
+                    )
+                }) {
                     assert_eq!(method.sig.ident, "open_inner");
                 }
             }
@@ -2915,10 +2934,6 @@ fn child_path() -> PathBuf {
     PathBuf::from(std::env::var_os(CHILD_PATH_ENV).expect("child store path"))
 }
 
-fn child_runtime_directory() -> PathBuf {
-    PathBuf::from(std::env::var_os(CHILD_RUNTIME_ENV).expect("child runtime directory"))
-}
-
 #[test]
 fn direct_file_reader_child() {
     if std::env::var(CHILD_ROLE_ENV).ok().as_deref() != Some("reader") {
@@ -2930,7 +2945,7 @@ fn direct_file_reader_child() {
     arm_read_image_hydration_pause_for_test();
     let reader = open_with_hydration_observer_for_test(
         child_path(),
-        default_reader_config(Arc::new(ManualClock::default()), &child_runtime_directory()),
+        default_reader_config(Arc::new(ManualClock::default())),
         Arc::new(PipeHydrationObserver),
     )
     .unwrap_or_else(|error| panic!("child direct hydration: {error}"));
@@ -3016,18 +3031,13 @@ impl Drop for ChildReader {
     }
 }
 
-fn spawn_child_reader_with_runtime_and_payload(
-    fixture: &Fixture,
-    runtime_directory: &Path,
-    expected_payload: &str,
-) -> ChildReader {
+fn spawn_child_reader_with_payload(fixture: &Fixture, expected_payload: &str) -> ChildReader {
     let mut child = Command::new(std::env::current_exe().expect("current test binary"))
         .arg("--exact")
         .arg("direct_file_reader_child")
         .arg("--nocapture")
         .env(CHILD_ROLE_ENV, "reader")
         .env(CHILD_PATH_ENV, &fixture.path)
-        .env(CHILD_RUNTIME_ENV, runtime_directory)
         .env(
             CHILD_SQL_ENV,
             format!(
@@ -3053,12 +3063,10 @@ fn spawn_child_reader_with_runtime_and_payload(
 /// Start a child reader whose DEFAULT per-user runtime location is the
 /// pathname given.
 ///
-/// A reader writes itself down in that default, whatever runtime directory it
-/// was handed for the owner channel, so the default is the only thing that
-/// decides whether it can publish a breadcrumb at all. A journey that needs
-/// publication to genuinely fail has to make THAT location unusable; pointing
-/// only the handed directory at something unusable leaves the reader
-/// publishing normally in the default and proves nothing.
+/// A reader writes itself down in that default, so the default is the only
+/// thing that decides whether it can publish a breadcrumb at all. A journey
+/// that needs publication to genuinely fail has to make THAT location
+/// unusable.
 fn spawn_child_reader_with_default_runtime_location(
     fixture: &Fixture,
     default_runtime_location: &Path,
@@ -3069,7 +3077,6 @@ fn spawn_child_reader_with_default_runtime_location(
         .arg("--nocapture")
         .env(CHILD_ROLE_ENV, "reader")
         .env(CHILD_PATH_ENV, &fixture.path)
-        .env(CHILD_RUNTIME_ENV, default_runtime_location)
         .env("XDG_RUNTIME_DIR", default_runtime_location)
         .env(
             CHILD_SQL_ENV,
@@ -3094,11 +3101,7 @@ fn spawn_child_reader_with_default_runtime_location(
 }
 
 fn spawn_child_reader(fixture: &Fixture) -> ChildReader {
-    spawn_child_reader_with_runtime_and_payload(
-        fixture,
-        &fixture.runtime_directory,
-        &fixture.first_row().payload,
-    )
+    spawn_child_reader_with_payload(fixture, &fixture.first_row().payload)
 }
 
 fn assert_writer_is_held_by_hydrating_readers(path: &Path) -> (u64, usize) {
@@ -3206,8 +3209,7 @@ fn one_reader_releases_the_real_writer_lock_before_external_publication() {
     reader.send(CHILD_QUERY);
     reader.wait_for(CHILD_QUERY_OK);
 
-    let mut fresh =
-        spawn_child_reader_with_runtime_and_payload(&fixture, &fixture.runtime_directory, &changed);
+    let mut fresh = spawn_child_reader_with_payload(&fixture, &changed);
     let _ = fresh.wait_for_prefix(CHILD_HYDRATION_STARTED);
     let _ = assert_writer_is_held_by_hydrating_readers(&fixture.path);
     fresh.send(CHILD_FINISH_HYDRATION);
@@ -3488,7 +3490,7 @@ fn direct_file_damage_child() {
     let case = parse_damage(&std::env::var(CHILD_DAMAGE_ENV).expect("child damage case"));
     let error = match open_for_test(
         child_path(),
-        default_reader_config(Arc::new(ManualClock::default()), &child_runtime_directory()),
+        default_reader_config(Arc::new(ManualClock::default())),
     ) {
         Ok(_) => panic!("damaged store must not open directly"),
         Err(error) => error,
@@ -3525,7 +3527,6 @@ fn every_damage_case_is_durable_and_diagnosed_in_a_fresh_process_without_repair(
             .arg("--nocapture")
             .env(CHILD_ROLE_ENV, "damage")
             .env(CHILD_PATH_ENV, &fixture.path)
-            .env(CHILD_RUNTIME_ENV, &fixture.runtime_directory)
             .env(CHILD_DAMAGE_ENV, damage_wire(case))
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -4011,7 +4012,6 @@ fn manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources(
 /// that touches the file afterwards.
 struct AbsentEmbeddingStore {
     root: PathBuf,
-    runtime_directory: PathBuf,
     path: PathBuf,
     table: String,
     column: String,
@@ -4039,9 +4039,7 @@ fn seed_embedding_store(
     let table = format!("evidence_{token}");
     let column = format!("embedding_{token}");
     let root = outer_root.join(format!("source_{token}"));
-    let runtime_directory = outer_root.join(format!("runtime_{token}"));
     fs::create_dir(&root).expect("create source directory");
-    fs::create_dir(&runtime_directory).expect("create runtime directory");
     let path = root.join(format!("store_{token}.db"));
     let embedded_id = seeded_uuid(&identity_seed, &["absent-embedding", "embedded"]);
     let absent_id = seeded_uuid(&identity_seed, &["absent-embedding", "absent"]);
@@ -4088,7 +4086,6 @@ fn seed_embedding_store(
 
     AbsentEmbeddingStore {
         root,
-        runtime_directory,
         path,
         table,
         column,
@@ -4138,7 +4135,7 @@ fn a_row_with_no_embedding_keeps_the_store_directly_readable() {
 
     let reader = open_for_test(
         &store.path,
-        default_reader_config(Arc::new(ManualClock::default()), &store.runtime_directory),
+        default_reader_config(Arc::new(ManualClock::default())),
     )
     .unwrap_or_else(|error| {
         panic!("a row without an embedding keeps the store directly readable: {error:?}")
@@ -4207,7 +4204,7 @@ fn a_vector_column_holding_a_non_vector_value_still_refuses_a_direct_read() {
 
     match open_for_test(
         &store.path,
-        default_reader_config(Arc::new(ManualClock::default()), &store.runtime_directory),
+        default_reader_config(Arc::new(ManualClock::default())),
     ) {
         Err(DirectFileReaderError::DirectReadRequiresWriter { failure, cause }) => {
             assert_eq!(failure.kind(), ReadFailureKind::DirectReadRequiresWriter);
@@ -4244,7 +4241,7 @@ fn a_row_with_no_embedding_does_not_hide_a_diverged_vector() {
 
     match open_for_test(
         &store.path,
-        default_reader_config(Arc::new(ManualClock::default()), &store.runtime_directory),
+        default_reader_config(Arc::new(ManualClock::default())),
     ) {
         Err(DirectFileReaderError::DirectReadRequiresWriter { failure, cause }) => {
             assert_eq!(failure.kind(), ReadFailureKind::DirectReadRequiresWriter);
@@ -4285,7 +4282,7 @@ fn a_null_in_a_required_vector_cell_still_needs_a_writer() {
 
     match open_for_test(
         &store.path,
-        default_reader_config(Arc::new(ManualClock::default()), &store.runtime_directory),
+        default_reader_config(Arc::new(ManualClock::default())),
     ) {
         Err(DirectFileReaderError::DirectReadRequiresWriter { failure, cause }) => {
             assert_eq!(failure.kind(), ReadFailureKind::DirectReadRequiresWriter);
@@ -4316,10 +4313,7 @@ fn a_required_vector_column_and_a_nullable_one_are_told_apart_by_their_declarati
         seed_absent_embedding_store(scratch.path(), "nullable-beside-required", Value::Null);
     let reader = open_for_test(
         &nullable.path,
-        default_reader_config(
-            Arc::new(ManualClock::default()),
-            &nullable.runtime_directory,
-        ),
+        default_reader_config(Arc::new(ManualClock::default())),
     )
     .unwrap_or_else(|error| panic!("a nullable vector column still reads directly: {error:?}"));
     let image = owned_image_for_test(&reader).expect("observe the owned image");
@@ -4385,7 +4379,7 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
 
         let reader = open_for_test(
             &store.path,
-            default_reader_config(Arc::new(ManualClock::default()), &store.runtime_directory),
+            default_reader_config(Arc::new(ManualClock::default())),
         )
         .unwrap_or_else(|error| {
             panic!("a required {word} column reads back through the direct reader: {error:?}")
@@ -4470,7 +4464,7 @@ fn a_nullable_quantized_column_with_no_embedding_stays_directly_readable() {
 
         let reader = open_for_test(
             &store.path,
-            default_reader_config(Arc::new(ManualClock::default()), &store.runtime_directory),
+            default_reader_config(Arc::new(ManualClock::default())),
         )
         .unwrap_or_else(|error| panic!("a nullable {word} column still reads directly: {error:?}"));
         let image = owned_image_for_test(&reader).expect("observe the owned image");
@@ -4544,7 +4538,7 @@ fn a_required_quantized_column_without_its_durable_vector_still_needs_a_writer()
 
         match open_for_test(
             &store.path,
-            default_reader_config(Arc::new(ManualClock::default()), &store.runtime_directory),
+            default_reader_config(Arc::new(ManualClock::default())),
         ) {
             Err(DirectFileReaderError::DirectReadRequiresWriter { failure, .. }) => {
                 assert_eq!(failure.kind(), ReadFailureKind::DirectReadRequiresWriter);

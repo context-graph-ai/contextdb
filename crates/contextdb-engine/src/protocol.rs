@@ -10,7 +10,11 @@ use contextdb_engine::sync_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-pub const PROTOCOL_VERSION: u8 = 6;
+/// The schema-vocabulary protocol this build emits.
+pub const PROTOCOL_VERSION: u8 = 7;
+/// The first release has no released predecessor. The support window grows
+/// only as protocol versions are released, never from development revisions.
+pub const OLDEST_SUPPORTED_PROTOCOL_VERSION: u8 = 7;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -48,7 +52,7 @@ pub enum MessageType {
     /// to the status subject; old clients never send the request).
     StatusRequest,
     StatusResponse,
-    // Statements 9/13: manifested units use the existing push request and response.
+    // Manifested units use the existing push request and response.
     BindApplicationTablePolicyRequest,
     BindApplicationTablePolicyResponse,
     FetchDeliveryOutcomesRequest,
@@ -69,7 +73,7 @@ pub struct PushRequest {
 pub struct PushResponse {
     pub result: Option<WireApplyResult>,
     pub error: Option<String>,
-    // Statements 9/13: optional slots precede the ordinary outcome lane.
+    // Optional slots precede the ordinary outcome lane.
     #[serde(default)]
     pub application_error: Option<WirePushError>,
     #[serde(default)]
@@ -78,7 +82,7 @@ pub struct PushResponse {
     pub hub_incarnation: Option<Incarnation>,
 }
 
-// Statements 9/13/15: populate ordinary response lanes without shifting optional slots.
+// Populate ordinary response lanes without shifting optional slots.
 impl Serialize for PushResponse {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -122,45 +126,40 @@ pub enum WirePushError {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub since_lsn: Lsn,
     pub max_entries: Option<u32>,
+    /// Continuation or acknowledgement for a table image the sender withheld
+    /// while this peer lacked its schema capability. The first capable request
+    /// omits this field; the sender finds its durable per-peer holdback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_recovery: Option<SchemaRecoveryRequest>,
 }
 
-impl<'de> serde::Deserialize<'de> for PullRequest {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{SeqAccess, Visitor};
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaRecoveryRequest {
+    /// Ask for the next held-table page after the last page durably applied by
+    /// this receiver. `target_lsn` binds the continuation to the sender image
+    /// announced on the first page.
+    Continue { target_lsn: Lsn, after_lsn: Lsn },
+    /// The receiver sends this only after the final held-table page committed.
+    /// Once this request arrives, retaining the holdback is no longer needed;
+    /// a lost acknowledgement can safely retry the same request.
+    Acknowledge { target_lsn: Lsn },
+}
 
-        struct PullRequestVisitor;
-
-        impl<'de> Visitor<'de> for PullRequestVisitor {
-            type Value = PullRequest;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("PullRequest with 1 or 2 elements")
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let since_lsn: Lsn = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let max_entries: Option<u32> = seq.next_element()?.unwrap_or(None);
-                Ok(PullRequest {
-                    since_lsn,
-                    max_entries,
-                })
-            }
-        }
-
-        deserializer.deserialize_tuple(2, PullRequestVisitor)
-    }
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaRecoveryPage {
+    /// Stable source frontier covered by this recovery image. Work committed
+    /// after it remains ordinary sync work and follows after acknowledgement.
+    pub target_lsn: Lsn,
+    /// Private cursor for the next held-table page. It never replaces the
+    /// receiver's public pull cursor.
+    pub next_lsn: Lsn,
+    /// True only on the final data page. The receiver still sends an explicit
+    /// acknowledgement request after durably applying that page.
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -171,10 +170,13 @@ pub struct PullResponse {
     /// The serving store's per-tenant incarnation, so a puller can bind its
     /// cursor to the specific store that issued it — a served page from a
     /// store other than the one the cursor addresses is discarded, never
-    /// partially trusted (`SyncClient::pull`). Defaulted so decoding an older
-    /// peer's reply is unaffected.
+    /// partially trusted (`SyncClient::pull`). An absent source remains unknown;
+    /// it is never replaced by a fabricated store identity.
     #[serde(default)]
     pub source: Option<Incarnation>,
+    /// Progress for a bounded held-table recovery after a capability upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_recovery: Option<SchemaRecoveryPage>,
 }
 
 /// A pull page that carries one or more connected final-state units beside
@@ -218,14 +220,14 @@ pub struct WireChangeSet {
     /// Deliberate fleet-removal instructions are a distinct wire category.
     /// This slice carries and refuses edge-originated instructions; no apply
     /// path is enabled here.
-    // Statement 9: purges keep their slot when the following manifests lane is populated.
+    // Purges keep their slot when the following manifests lane is populated.
     #[serde(default)]
     pub purges: Vec<WirePurgeChange>,
     #[serde(default)]
     pub manifests: Vec<WireDeliveryManifest>,
 }
 
-// Statement 9: only populated new lanes extend ordinary changesets. An empty purge slot
+// Only populated new lanes extend ordinary changesets. An empty purge slot
 // still precedes manifests, so positional encoding cannot mistake manifests for purges.
 impl Serialize for WireChangeSet {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -267,8 +269,8 @@ pub struct WireDdlProvenance {
     pub digest: Vec<u8>,
 }
 
-/// Private wire-to-apply handoff.  The server mirror owns the same private
-/// type, so the engine's public schema API never exposes transport identity.
+/// Private wire-to-apply handoff. The engine's public schema API never
+/// exposes transport identity.
 #[derive(Debug, Clone)]
 pub(crate) struct ReceivedDdlContext {
     pub tenant_id: contextdb_core::TenantId,
@@ -295,8 +297,8 @@ pub struct WireRowChange {
     pub deleted: bool,
     pub lsn: Lsn,
     /// The row's birth time on the node that wrote it, so retention judges a
-    /// replicated row by the age it actually has. Defaulted, so a peer built
-    /// before this field decodes as "no stamp" and the receiver stamps its own.
+    /// replicated row by the age it actually has. An absent stamp lets the
+    /// receiver stamp its own time.
     #[serde(default)]
     pub created_at: Option<contextdb_core::Wallclock>,
     /// The row's ordering position — this row's sync provenance sidecar on
@@ -306,14 +308,12 @@ pub struct WireRowChange {
     /// compares this, never `lsn` (which is the sender's own unrelated local
     /// clock): an incoming row with no arrival always wins, one carrying an
     /// arrival at or below the stored position is a stale echo, and one
-    /// above it wins. Defaulted so decoding an older peer's row is
-    /// unaffected — that peer is refused outright by the protocol version
-    /// check before this ever matters.
+    /// above it wins. An absent ordering position denotes unstamped work;
+    /// protocol acceptance is checked before decoding this payload.
     #[serde(default)]
     pub arrival: Option<Lsn>,
-    /// Immutable creation provenance. Decode accepts an absent field only so
-    /// older bytes can be parsed deterministically; current validation rejects it
-    /// before any sync mutation.
+    /// Immutable creation provenance. Current validation rejects absent
+    /// provenance before any sync mutation.
     #[serde(default)]
     pub lineage: Option<WireRowLineage>,
 }
@@ -458,7 +458,7 @@ pub struct WirePurgeChange {
     pub natural_key: WireNaturalKey,
     pub purged_lineage_roots: Vec<String>,
     pub purge_frontier: Lsn,
-    /// Statement 17a: opaque self-contained selection for a listed node-local table.
+    /// Opaque self-contained selection for a listed node-local table.
     #[serde(default)]
     pub node_local_predicate: Option<Vec<u8>>,
 }
@@ -517,9 +517,25 @@ impl From<WireRefusalCause> for RefusalCause {
 }
 
 pub fn encode<T: Serialize>(msg_type: MessageType, msg: &T) -> Result<Vec<u8>, SyncError> {
-    let payload = rmp_serde::to_vec(msg).map_err(|e| SyncError::Serde(e.to_string()))?;
+    encode_for_version(PROTOCOL_VERSION, msg_type, msg)
+}
+
+/// Encode one response/request only at an accepted protocol version.
+pub fn encode_for_version<T: Serialize>(
+    version: u8,
+    msg_type: MessageType,
+    msg: &T,
+) -> Result<Vec<u8>, SyncError> {
+    if !supports_protocol_version(version) {
+        return Err(SyncError::ProtocolVersionMismatch {
+            received: version,
+            oldest_supported: OLDEST_SUPPORTED_PROTOCOL_VERSION,
+            newest_supported: PROTOCOL_VERSION,
+        });
+    }
+    let payload = rmp_serde::to_vec(msg).map_err(|error| SyncError::Serde(error.to_string()))?;
     let envelope = Envelope {
-        version: PROTOCOL_VERSION,
+        version,
         message_type: msg_type,
         payload,
     };
@@ -541,13 +557,32 @@ pub fn encode_named<T: Serialize>(msg_type: MessageType, msg: &T) -> Result<Vec<
 pub fn decode(data: &[u8]) -> Result<Envelope, SyncError> {
     let envelope: Envelope =
         rmp_serde::from_slice(data).map_err(|e| SyncError::Serde(e.to_string()))?;
-    if envelope.version != PROTOCOL_VERSION {
+    if !supports_protocol_version(envelope.version) {
         return Err(SyncError::ProtocolVersionMismatch {
             received: envelope.version,
-            supported: PROTOCOL_VERSION,
+            oldest_supported: OLDEST_SUPPORTED_PROTOCOL_VERSION,
+            newest_supported: PROTOCOL_VERSION,
         });
     }
     Ok(envelope)
+}
+
+/// Decode a reply only when it mirrors the version used for the request. This
+/// keeps negotiation explicit instead of accepting an unexplained downgrade.
+pub fn decode_for_version(data: &[u8], expected: u8) -> Result<Envelope, SyncError> {
+    let envelope = decode(data)?;
+    if envelope.version != expected {
+        return Err(SyncError::ProtocolVersionMismatch {
+            received: envelope.version,
+            oldest_supported: expected,
+            newest_supported: expected,
+        });
+    }
+    Ok(envelope)
+}
+
+pub const fn supports_protocol_version(version: u8) -> bool {
+    version == PROTOCOL_VERSION
 }
 
 impl From<ChangeSet> for WireChangeSet {
@@ -557,7 +592,7 @@ impl From<ChangeSet> for WireChangeSet {
             ddl_lsn: value.ddl_lsn,
             ddl_provenance: Vec::new(),
             purges: Vec::new(),
-            // Statement 9: ordinary unmanifested changes start with an empty lane.
+            // Ordinary unmanifested changes start with an empty lane.
             manifests: Vec::new(),
             rows: value.rows.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
@@ -570,7 +605,7 @@ impl TryFrom<WireChangeSet> for ChangeSet {
     type Error = SyncError;
 
     fn try_from(value: WireChangeSet) -> Result<Self, Self::Error> {
-        // Statements 9/10: row-only conversion must never discard unverified manifests.
+        // Row-only conversion must never discard unverified manifests.
         if !value.manifests.is_empty() {
             return Err(SyncError::Protocol(
                 "delivery manifest verification is not implemented".to_string(),
@@ -602,6 +637,8 @@ impl TryFrom<WireChangeSet> for ChangeSet {
 /// Canonical digest for one schema entry.  The source identity itself is
 /// carried by the authenticated request/response context; this bytestring
 /// binds the sender's LSN, ordinal, DDL spelling, and schema generation.
+/// The digest domain is an identity-format label, independent of the envelope
+/// protocol version. Renaming it would change authenticated schema identities.
 pub fn canonical_ddl_provenance_digest(
     ddl: &WireDdlChange,
     source_ddl_lsn: Lsn,
@@ -1170,11 +1207,11 @@ pub struct SyncStatusResponse {
     /// The server's current LSN clock (contract item 4, pull-side resume).
     #[serde(default)]
     pub server_current_lsn: Option<Lsn>,
-    // Statement 15: ordinary status reports the current custody authority.
+    // Ordinary status reports the current custody authority.
     #[serde(default)]
     pub hub_incarnation: Option<Incarnation>,
 }
-// Statement 9: manifests live directly in the ordinary changeset.
+// Manifests live directly in the ordinary changeset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireDeliveryManifest {
@@ -1257,7 +1294,7 @@ impl WireDeliveryOutcome {
     }
 }
 
-// Statements 9/13: no separate delivery push request, wrapper, or result.
+// No separate delivery push request, wrapper, or result.
 fn required_custody_field<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,

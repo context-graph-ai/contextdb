@@ -1,7 +1,10 @@
 use contextdb_core::{Lsn, RowId, TxId, Wallclock};
 use contextdb_core::{Value, VersionedRow};
-use contextdb_engine::{Database, QueryResult};
+use contextdb_engine::plugin::DatabasePlugin;
+use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
 use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -1256,9 +1259,21 @@ fn r28_concurrent_prune_and_insert() {
 
     // Run pruning concurrently
     let pruned = db.run_pruning_cycle();
-    assert!(pruned > 0, "old rows must be pruned");
-
+    // A concurrent registered statement can still own the expired versions.
+    // New statements must see expiry immediately; reclamation follows release.
+    assert_eq!(
+        db.execute("SELECT id FROM obs WHERE id < 100", &p())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
     inserter.join().expect("inserter thread must not panic");
+    let reclaimed_after_release = db.run_pruning_cycle();
+    assert!(
+        pruned + reclaimed_after_release > 0,
+        "old rows must be reclaimed after the concurrent statement releases its snapshot"
+    );
 
     // All newly inserted rows must survive (they are young)
     let count = row_count(&db, "obs");
@@ -1506,36 +1521,93 @@ fn mr3_lsn_stamped_and_sync_safe_pruning() {
     assert_eq!(row_count(&db, "obs"), 0);
 }
 
+/// The number of rows the physical-reclaim-defers-to-live-readers proofs
+/// below seed and expire. A derived name, never a literal repeated at each
+/// assertion.
+const EXPIRING_ROWS: usize = 100;
+
+/// Blocks in [`DatabasePlugin::on_query`] — before planning and before any
+/// scan, inside the statement's own snapshot registration — so a paused
+/// statement holds that registration live for retention to see. `arm`
+/// registers one fresh blocking pause for an exact SQL string; the next
+/// query executing that string blocks in `on_query` until released, and the
+/// arming is one-shot (a later query with the same text runs straight
+/// through). Blocking `send`/`recv` only: no timeout, no sleep, no elapsed
+/// time. This is a hook change from the pause this replaces: pausing in
+/// `on_query` holds the statement's registration across its whole
+/// execution, including every scan, where pausing in `post_query` — after
+/// every scan already ran — could not.
+type QueryPauseChannels = (SyncSender<()>, Receiver<()>);
+
+struct PauseOnQuery {
+    pauses: Mutex<HashMap<String, QueryPauseChannels>>,
+}
+
+impl PauseOnQuery {
+    fn new() -> Self {
+        Self {
+            pauses: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn arm(&self, sql: &str) -> (Receiver<()>, SyncSender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        self.pauses
+            .lock()
+            .unwrap()
+            .insert(sql.to_string(), (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+}
+
+impl DatabasePlugin for PauseOnQuery {
+    fn on_query(&self, sql: &str) -> contextdb_core::Result<()> {
+        let armed = self.pauses.lock().unwrap().remove(sql);
+        if let Some((reached, release)) = armed {
+            reached
+                .send(())
+                .expect("retention proof must still be waiting for the paused query");
+            release
+                .recv()
+                .expect("retention proof must release the paused query");
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
-// MR4 — RED: Pruning under concurrent read
-// A SELECT running during pruning must see a consistent snapshot.
-// RED: run_pruning_cycle is a no-op.
+// Physical reclaim waits for an in-flight two-pass statement.
+// A statement that re-reads a RETAIN table inside its own single execution
+// (a self-join / `IN (SELECT ...)`) registers its snapshot once, before
+// either scan, and holds it for the statement's whole duration: retention
+// must not reclaim expired rows between the two scans just because they
+// belong to the same registered read, while logical expiry itself keeps
+// advancing for anyone else.
 // ---------------------------------------------------------------------------
 #[test]
-fn mr4_pruning_under_concurrent_read() {
-    use std::sync::Arc;
+fn retention_defers_physical_reclaim_to_a_two_pass_statement() {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     use contextdb_core::Wallclock;
 
-    // The reader thread below only runs SELECTs (no row-stamp writes) and its own
-    // pacing sleep, so the thread-local mock clock on this test thread governs all
-    // row stamping and the synchronous prune drive.
+    const TWO_PASS_SELECT: &str = "SELECT id, data FROM obs WHERE id IN (SELECT id FROM obs)";
+    let plugin = Arc::new(PauseOnQuery::new());
     let mock_now = Arc::new(AtomicU64::new(1_000_000));
     let _clock = {
         let mock_now = Arc::clone(&mock_now);
         Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
     };
 
-    let db = Arc::new(Database::open_memory());
+    let db = Arc::new(Database::open_memory_with_plugin(plugin.clone()).unwrap());
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
         &p(),
     )
     .unwrap();
 
-    // Insert rows that will expire.
-    for i in 0..100 {
+    for i in 0..EXPIRING_ROWS {
         db.execute(
             &format!("INSERT INTO obs (id, data) VALUES ({i}, 'data-{i}')"),
             &p(),
@@ -1546,31 +1618,514 @@ fn mr4_pruning_under_concurrent_read() {
     // Advance 2 s past the rows' stamped time — beyond the 1 s TTL.
     mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
 
-    // Spawn reader that does SELECT while pruning runs.
-    let db2 = db.clone();
+    let (reached, release) = plugin.arm(TWO_PASS_SELECT);
+    let reader_db = Arc::clone(&db);
     let reader = thread::spawn(move || {
-        let mut read_count = 0;
-        for _ in 0..20 {
-            let result = db2.execute("SELECT * FROM obs", &p());
-            assert!(
-                result.is_ok(),
-                "SELECT must not error during concurrent prune"
-            );
-            read_count += 1;
-            thread::sleep(Duration::from_millis(10));
+        reader_db
+            .execute(TWO_PASS_SELECT, &p())
+            .expect("the two-pass statement must complete from the snapshot it registered")
+    });
+    reached
+        .recv()
+        .expect("the two-pass statement must reach its registration barrier");
+
+    // Assertion 1: the statement's registration, taken before either scan,
+    // must defer every expired row rather than let physical reclaim run
+    // underneath a read still in progress.
+    let first_cycle = db
+        .run_pruning_cycle_checked()
+        .expect("retention cycle must succeed while the statement is registered");
+    assert_eq!(
+        first_cycle.pruned_rows, 0,
+        "physical reclaim must wait for the in-flight two-pass statement"
+    );
+    assert_eq!(
+        first_cycle.rows_deferred_for_readers, EXPIRING_ROWS as u64,
+        "every expired row must be counted as deferred to the live statement"
+    );
+
+    // Assertion 2: expiry itself is not deferred — a fresh read opened after
+    // the stamp must already see the rows as logically gone.
+    let fresh = db
+        .execute("SELECT * FROM obs", &p())
+        .expect("a fresh SELECT must succeed even though reclaim is deferred");
+    assert_eq!(
+        fresh.rows.len(),
+        0,
+        "logical expiry must have advanced under the live two-pass statement"
+    );
+
+    release
+        .send(())
+        .expect("the two-pass statement must still be waiting for release");
+    let original = reader.join().expect("reader thread must not panic");
+
+    // Assertion 3: the statement's own two scans must still see the
+    // complete, intact row set it registered against — one statement, one
+    // view.
+    assert_eq!(
+        original.rows.len(),
+        EXPIRING_ROWS,
+        "the two-pass statement must return every row from the snapshot it registered"
+    );
+    let id = col_idx(&original, "id");
+    let data = col_idx(&original, "data");
+    let mut original_rows = original.rows;
+    original_rows.sort_by_key(|row| match &row[id] {
+        Value::Int64(value) => *value,
+        other => panic!("selected id must be an integer, got {other:?}"),
+    });
+    for (expected, row) in original_rows.iter().enumerate() {
+        assert_eq!(row[id], Value::Int64(expected as i64));
+        assert_eq!(row[data], Value::Text(format!("data-{expected}")));
+    }
+
+    // Assertion 4: once the statement returns, the next cycle reclaims what
+    // it deferred.
+    let second_cycle = db
+        .run_pruning_cycle_checked()
+        .expect("retention cycle must succeed after the statement returns");
+    assert_eq!(
+        second_cycle.pruned_rows, EXPIRING_ROWS as u64,
+        "the second cycle must reclaim every row the first cycle deferred"
+    );
+    assert_eq!(
+        second_cycle.rows_deferred_for_readers, 0,
+        "nothing remains registered once the statement has returned"
+    );
+    assert_eq!(row_count(&db, "obs"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// MR4 — Pruning makes bounded progress under continuous reads
+// A table declaring RETAIN keeps its disk bound even while the store serves
+// ordinary reads continuously: logical expiry advances under a live reader
+// without waiting for it, and physical reclaim catches up once every
+// registration that predates the stamp has returned.
+//
+// A cycle must not report `pruned_rows == 100` WHILE a statement
+// registration is still live: that would buy the disk bound by letting a
+// two-pass statement observe a torn row set — rows present on its first
+// scan and gone on its second. The same bounded-disk promise holds without
+// that tear: reclaim lags by at most one cycle behind a reader that
+// predates the stamp, a reader that registers after the stamp is never
+// entitled to see the rows or to defer their reclaim, and none of this
+// depends on reads ever pausing.
+//
+// ---------------------------------------------------------------------------
+#[test]
+fn mr4_pruning_under_concurrent_read() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    const READER_A_SELECT: &str = "SELECT id, data FROM obs";
+    const READER_B_SELECT: &str = "SELECT id FROM obs";
+    const LOOP_SELECT: &str = "SELECT data FROM obs";
+
+    let plugin = Arc::new(PauseOnQuery::new());
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
+    let db = Arc::new(Database::open_memory_with_plugin(plugin.clone()).unwrap());
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    db.execute(
+        "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
+        &p(),
+    )
+    .unwrap();
+
+    for i in 0..EXPIRING_ROWS {
+        db.execute(
+            &format!("INSERT INTO obs (id, data) VALUES ({i}, 'data-{i}')"),
+            &p(),
+        )
+        .unwrap();
+    }
+
+    // Advance 2 s past the rows' stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
+
+    // A continuous stream of ordinary reads. It carries no verdict of its
+    // own — its only job is to make the premise ("reads never stop") true
+    // for every assertion below, on a SQL string distinct from both parked
+    // readers so the barrier never catches it.
+    let stop_loop = Arc::new(AtomicBool::new(false));
+    let (loop_done_tx, loop_done_rx) = std::sync::mpsc::channel::<()>();
+    let loop_db = Arc::clone(&db);
+    let loop_stop = Arc::clone(&stop_loop);
+    let loop_thread = thread::spawn(move || {
+        while !loop_stop.load(AtomicOrdering::SeqCst) {
+            loop_db
+                .execute(LOOP_SELECT, &p())
+                .expect("the continuous read loop must not error");
+            loop_done_tx
+                .send(())
+                .expect("the loop's completion channel must still be open");
         }
-        read_count
     });
 
-    // Run pruning concurrently.
-    let pruned = db.run_pruning_cycle();
-    assert!(pruned > 0, "old rows must be pruned");
+    // Step 1: park reader A before the stamp; its snapshot precedes expiry.
+    let (a_reached, a_release) = plugin.arm(READER_A_SELECT);
+    let reader_a_db = Arc::clone(&db);
+    let reader_a = thread::spawn(move || {
+        reader_a_db
+            .execute(READER_A_SELECT, &p())
+            .expect("reader A must complete from the snapshot it registered")
+    });
+    a_reached
+        .recv()
+        .expect("reader A must reach its registration barrier");
 
-    let reads = reader.join().expect("reader thread must not panic");
-    assert!(reads > 0, "reader must have completed reads");
+    let cycle_1 = db
+        .run_pruning_cycle_checked()
+        .expect("retention cycle must succeed while reader A is registered");
+    assert_eq!(
+        cycle_1.pruned_rows, 0,
+        "physical reclaim must wait for reader A's pre-stamp registration"
+    );
+    assert_eq!(
+        cycle_1.rows_deferred_for_readers, EXPIRING_ROWS as u64,
+        "every expired row must be counted as deferred to reader A"
+    );
 
-    // After pruning + reads complete, rows should be gone.
-    assert_eq!(row_count(&db, "obs"), 0, "all expired rows must be pruned");
+    // Step 2: disk comes back logically while reads never stop.
+    let fresh_after_cycle_1 = db
+        .execute("SELECT * FROM obs", &p())
+        .expect("a fresh SELECT must succeed while reads continue");
+    assert_eq!(
+        fresh_after_cycle_1.rows.len(),
+        0,
+        "logical expiry must have advanced while the continuous read loop kept running"
+    );
+
+    // Step 3: release and join reader A; it must still return every row it
+    // registered.
+    a_release
+        .send(())
+        .expect("reader A must still be waiting for release");
+    let reader_a_result = reader_a.join().expect("reader A thread must not panic");
+    assert_eq!(
+        reader_a_result.rows.len(),
+        EXPIRING_ROWS,
+        "reader A must return every row from the snapshot it registered"
+    );
+
+    // Step 4: park reader B — a different SQL string, so the barrier catches
+    // only it — with a snapshot at or after the published expiry, and run a
+    // second cycle while it and the loop are both still live.
+    let (b_reached, b_release) = plugin.arm(READER_B_SELECT);
+    let reader_b_db = Arc::clone(&db);
+    let reader_b = thread::spawn(move || {
+        reader_b_db
+            .execute(READER_B_SELECT, &p())
+            .expect("reader B must complete from the snapshot it registered")
+    });
+    b_reached
+        .recv()
+        .expect("reader B must reach its registration barrier");
+
+    let cycle_2 = db
+        .run_pruning_cycle_checked()
+        .expect("retention cycle must succeed while reader B is registered");
+    assert_eq!(
+        cycle_2.pruned_rows, EXPIRING_ROWS as u64,
+        "the second cycle must reclaim what the first cycle deferred, even with reader B live"
+    );
+    assert_eq!(
+        cycle_2.rows_deferred_for_readers, 0,
+        "reader B registered after expiry and is not entitled to defer reclaim"
+    );
+    assert_eq!(row_count(&db, "obs"), 0);
+
+    // Step 5: release and join reader B; a reader that registered after
+    // expiry never sees the rows.
+    b_release
+        .send(())
+        .expect("reader B must still be waiting for release");
+    let reader_b_result = reader_b.join().expect("reader B thread must not panic");
+    assert_eq!(
+        reader_b_result.rows.len(),
+        0,
+        "reader B registered after expiry must return zero rows"
+    );
+
+    // Step 6: stop the continuous read loop; it must have made progress
+    // throughout the whole proof.
+    stop_loop.store(true, AtomicOrdering::SeqCst);
+    loop_thread
+        .join()
+        .expect("the read loop thread must not panic");
+    let completions = loop_done_rx.try_iter().count();
+    assert!(
+        completions >= 1,
+        "the continuous read loop must have completed at least one statement"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A deferred expiry does not break vector search, and the
+// vector tombstone rides the same transaction id as the row's.
+// ---------------------------------------------------------------------------
+#[test]
+fn retention_defers_reclaim_without_breaking_vector_search() {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    const SEEDED_VECTOR_ROWS: usize = 5;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
+    let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    db.execute(
+        "CREATE TABLE obs (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3)) RETAIN 1 SECONDS",
+        &p(),
+    )
+    .unwrap();
+
+    for i in 0..SEEDED_VECTOR_ROWS {
+        let params = super::helpers::make_params(vec![
+            ("id", Value::Uuid(uuid::Uuid::new_v4())),
+            ("data", Value::Text(format!("row-{i}"))),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ]);
+        db.execute(
+            "INSERT INTO obs (id, data, embedding) VALUES ($id, $data, $embedding)",
+            &params,
+        )
+        .unwrap();
+    }
+
+    let snapshot = db.snapshot();
+    let pin = db.pin_snapshot(snapshot);
+
+    // Advance 2 s past the rows' stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
+
+    // Assertion 1: reclaim defers to the pin.
+    let deferred = db
+        .run_pruning_cycle_checked()
+        .expect("retention cycle must succeed while the pin is held");
+    assert_eq!(deferred.pruned_rows, 0);
+    assert_eq!(
+        deferred.rows_deferred_for_readers,
+        SEEDED_VECTOR_ROWS as u64
+    );
+
+    // A vector search at the CURRENT
+    // snapshot must succeed and return zero rows — the row is logically
+    // expired even though its version has not been physically reclaimed
+    // yet. If only the relational row were stamped, this fails loudly with
+    // `NotFound("row N in table obs")` instead of an empty result.
+    let search_params =
+        super::helpers::make_params(vec![("q", Value::Vector(vec![1.0, 0.0, 0.0]))]);
+    let current_search = db
+        .execute(
+            "SELECT id FROM obs ORDER BY embedding <=> $q LIMIT 5",
+            &search_params,
+        )
+        .expect("vector search over a stamped-but-unreclaimed row must succeed, not error");
+    assert_eq!(
+        current_search.rows.len(),
+        0,
+        "vector search must not return a logically expired row"
+    );
+
+    // Assertion 3: the pinned snapshot still sees every seeded row — the
+    // vector tombstone sits at the expiry id, above the pin's snapshot, not
+    // a physical removal and not a stamp at too low an id.
+    let pinned_search = db
+        .execute_at_snapshot(
+            "SELECT id FROM obs ORDER BY embedding <=> $q LIMIT 5",
+            &search_params,
+            snapshot,
+        )
+        .expect("vector search at the pinned snapshot must succeed");
+    assert_eq!(
+        pinned_search.rows.len(),
+        SEEDED_VECTOR_ROWS,
+        "the pinned snapshot must still see every seeded row"
+    );
+
+    // Assertion 4: releasing the pin lets a LATER cycle physically reclaim —
+    // the case r19/mr1 never reach, because there the stamp and the reclaim
+    // happen inside the same cycle.
+    drop(pin);
+    let reclaimed = db
+        .run_pruning_cycle_checked()
+        .expect("retention cycle must succeed after the pin releases");
+    assert_eq!(reclaimed.pruned_rows, SEEDED_VECTOR_ROWS as u64);
+    assert_eq!(reclaimed.rows_deferred_for_readers, 0);
+    assert_eq!(row_count(&db, "obs"), 0);
+    let search_after_reclaim = db
+        .execute(
+            "SELECT id FROM obs ORDER BY embedding <=> $q LIMIT 5",
+            &search_params,
+        )
+        .expect("vector search must still succeed after physical reclaim");
+    assert_eq!(search_after_reclaim.rows.len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The logical expiry stamp survives a reopen: both halves,
+// the relational tombstone and the vector tombstone, must be durable at the
+// same transaction id.
+// ---------------------------------------------------------------------------
+#[test]
+fn retention_expiry_stamp_survives_reopen() {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    const SEEDED_VECTOR_ROWS: usize = 5;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retention_expiry_stamp_survives_reopen.db");
+    let search_params =
+        super::helpers::make_params(vec![("q", Value::Vector(vec![1.0, 0.0, 0.0]))]);
+
+    // Phase 1: seed, expire, pin, defer one cycle, release the pin, close.
+    {
+        let db = Database::open(&path).unwrap();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.execute(
+            "CREATE TABLE obs (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3)) RETAIN 1 SECONDS",
+            &p(),
+        )
+        .unwrap();
+
+        for i in 0..SEEDED_VECTOR_ROWS {
+            let params = super::helpers::make_params(vec![
+                ("id", Value::Uuid(uuid::Uuid::new_v4())),
+                ("data", Value::Text(format!("row-{i}"))),
+                ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+            ]);
+            db.execute(
+                "INSERT INTO obs (id, data, embedding) VALUES ($id, $data, $embedding)",
+                &params,
+            )
+            .unwrap();
+        }
+
+        let snapshot = db.snapshot();
+        let pin = db.pin_snapshot(snapshot);
+        mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
+
+        let deferred = db
+            .run_pruning_cycle_checked()
+            .expect("retention cycle must succeed while the pin is held");
+        assert_eq!(deferred.pruned_rows, 0);
+        assert_eq!(
+            deferred.rows_deferred_for_readers,
+            SEEDED_VECTOR_ROWS as u64
+        );
+
+        drop(pin);
+    }
+
+    // Phase 2: reopen. BEFORE running any cycle, the stamp from phase 1
+    // must already be visible on disk — proving both the relational and the
+    // vector halves persisted at the same transaction id.
+    {
+        let db = Database::open(&path).unwrap();
+        let rows = db
+            .execute("SELECT * FROM obs", &p())
+            .expect("SELECT must succeed immediately after reopen");
+        assert_eq!(
+            rows.rows.len(),
+            0,
+            "the logical expiry stamp must survive a reopen with no cycle run yet"
+        );
+        let search = db
+            .execute(
+                "SELECT id FROM obs ORDER BY embedding <=> $q LIMIT 5",
+                &search_params,
+            )
+            .expect("vector search must succeed immediately after reopen");
+        assert_eq!(
+            search.rows.len(),
+            0,
+            "the vector tombstone must survive a reopen with no cycle run yet"
+        );
+
+        // Phase 3: a cycle now reclaims the stamped rows.
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        let reclaimed = db
+            .run_pruning_cycle_checked()
+            .expect("retention cycle must succeed after reopen");
+        assert_eq!(reclaimed.pruned_rows, SEEDED_VECTOR_ROWS as u64);
+        assert_eq!(reclaimed.rows_deferred_for_readers, 0);
+    }
+
+    // A second reopen must still show the table and the search as empty.
+    {
+        let db = Database::open(&path).unwrap();
+        assert_eq!(row_count(&db, "obs"), 0);
+        let search = db
+            .execute(
+                "SELECT id FROM obs ORDER BY embedding <=> $q LIMIT 5",
+                &search_params,
+            )
+            .expect("vector search must succeed after the second reopen");
+        assert_eq!(search.rows.len(), 0);
+    }
+}
+
+#[test]
+fn retention_keeps_rows_an_explicit_snapshot_pin_is_entitled_to() {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
+    let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    db.execute(
+        "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
+        &p(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO obs (id, data) VALUES (1, 'pinned')", &p())
+        .unwrap();
+    let snapshot = db.snapshot();
+    let pin = db.pin_snapshot(snapshot);
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
+
+    let deferred = db
+        .run_pruning_cycle_checked()
+        .expect("retention with a snapshot pin must succeed");
+    assert_eq!(deferred.pruned_rows, 0);
+    assert_eq!(deferred.rows_deferred_for_readers, 1);
+    let pinned = db
+        .execute_at_snapshot("SELECT data FROM obs", &p(), snapshot)
+        .expect("the pinned snapshot must remain readable across calls");
+    assert_eq!(pinned.rows, vec![vec![Value::Text("pinned".to_string())]]);
+
+    drop(pin);
+    let reclaimed = db
+        .run_pruning_cycle_checked()
+        .expect("retention after releasing the snapshot pin must succeed");
+    assert_eq!(reclaimed.pruned_rows, 1);
+    assert_eq!(reclaimed.rows_deferred_for_readers, 0);
+    assert_eq!(row_count(&db, "obs"), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,4 +2281,87 @@ fn retention_tolerates_ntp_backward_jump() {
         Value::Int64(1),
         "row with created_at > now must survive pruning (saturating_sub semantics)"
     );
+}
+
+#[test]
+fn retention_expiry_budget_refusal_publishes_nothing_and_ownership_releases_once() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let now = Arc::new(AtomicU64::new(1_000_000));
+    let source = now.clone();
+    let _clock = Wallclock::test_clock_guard(move || source.load(Ordering::SeqCst));
+    let root = tempfile::tempdir().unwrap();
+    let accountant = Arc::new(contextdb_engine::memory_accounting::MemoryAccountant::no_limit());
+    let db = Database::open_with_config(
+        root.path().join("expiry.redb"),
+        Arc::new(contextdb_engine::plugin::CorePlugin),
+        accountant.clone(),
+    )
+    .unwrap();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    db.execute(
+        "CREATE TABLE expiring (id INTEGER PRIMARY KEY, embedding VECTOR(2)) RETAIN 1 SECONDS",
+        &p(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO expiring (id, embedding) VALUES (1, [1,0])",
+        &p(),
+    )
+    .unwrap();
+    let snapshot = db.snapshot();
+    let pin = db.pin_snapshot(snapshot);
+    now.fetch_add(2_000, Ordering::SeqCst);
+    let before = accountant.usage().used;
+    accountant.set_budget(Some(before)).unwrap();
+    let refused = db
+        .run_pruning_cycle_checked()
+        .expect_err("expiry must admit its workspace before publishing");
+    assert!(matches!(
+        refused,
+        contextdb_core::Error::MemoryBudgetExceeded { .. }
+    ));
+    assert_eq!(
+        accountant.usage().used,
+        before,
+        "failed expiry returns every temporary reservation"
+    );
+    accountant.set_budget(None).unwrap();
+    assert_eq!(
+        row_count(&db, "expiring"),
+        1,
+        "a refused expiry leaves the current row visible"
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id FROM expiring ORDER BY embedding <=> [1,0] LIMIT 1",
+            &p()
+        )
+        .unwrap()
+        .rows
+        .len(),
+        1
+    );
+    let deferred = db.run_pruning_cycle_checked().unwrap();
+    assert_eq!(deferred.rows_deferred_for_readers, 1);
+    assert_eq!(row_count(&db, "expiring"), 0);
+    assert_eq!(
+        db.execute_at_snapshot(
+            "SELECT id FROM expiring ORDER BY embedding <=> [1,0] LIMIT 1",
+            &p(),
+            snapshot
+        )
+        .unwrap()
+        .rows
+        .len(),
+        1
+    );
+    drop(pin);
+    assert_eq!(db.run_pruning_cycle_checked().unwrap().pruned_rows, 1);
+    drop(db);
+    assert_eq!(
+        accountant.usage().used,
+        0,
+        "final ownership returns every retained and temporary byte"
+    );
+    assert_eq!(accountant.underflow_count_for_test(), 0);
 }

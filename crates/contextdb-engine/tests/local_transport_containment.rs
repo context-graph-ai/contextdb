@@ -296,7 +296,7 @@ fn resolve_aliases(path: &[String], aliases: &BTreeMap<String, Vec<String>>) -> 
 }
 
 fn forbidden_dependency(path: &[String]) -> bool {
-    // Statement 19: the exact key value crosses the typed metadata request boundary.
+    // The exact key value crosses the typed metadata request boundary.
     // Qualified constructors and every other sync subsystem path remain forbidden.
     if path
         .iter()

@@ -3,7 +3,7 @@ use contextdb_core::{Direction, Error, PropagationRule, Result};
 use contextdb_parser::ast::{
     AstPropagationRule, Cte, Expr, FromItem, SelectBody, SelectStatement, SortDirection, Statement,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 const DEFAULT_MATCH_DEPTH: u32 = 5;
 const ENGINE_MAX_BFS_DEPTH: u32 = 10;
@@ -90,6 +90,10 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         Statement::ShowMemoryLimit => Ok(PhysicalPlan::ShowMemoryLimit),
         Statement::SetDiskLimit(val) => Ok(PhysicalPlan::SetDiskLimit(val.clone())),
         Statement::ShowDiskLimit => Ok(PhysicalPlan::ShowDiskLimit),
+        Statement::SetMaintenancePollInterval(milliseconds) => {
+            Ok(PhysicalPlan::SetMaintenancePollInterval(*milliseconds))
+        }
+        Statement::ShowMaintenancePollInterval => Ok(PhysicalPlan::ShowMaintenancePollInterval),
         Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
         Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
         Statement::DeclareTenantTablePolicy(declaration) => Ok(
@@ -106,6 +110,17 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
                 query: query.clone(),
             },
         )),
+        Statement::ShowVectorPartitions {
+            table,
+            column,
+            limit,
+            offset,
+        } => Ok(PhysicalPlan::ShowVectorPartitions {
+            table: table.clone(),
+            column: column.clone(),
+            limit: *limit,
+            offset: *offset,
+        }),
         Statement::CreateSchedule { .. }
         | Statement::DropSchedule { .. }
         | Statement::CreateTrigger { .. }
@@ -335,6 +350,9 @@ fn plan_select_body(
     if body.use_rank.is_some() && !uses_vector_search {
         return Err(Error::UseRankRequiresVectorOrder);
     }
+    if body.use_vector.is_some() && !uses_vector_search {
+        return Err(Error::UseVectorRequiresVectorOrder);
+    }
 
     if let Some(order) = body.order_by.first()
         && matches!(order.direction, SortDirection::CosineDistance)
@@ -357,6 +375,8 @@ fn plan_select_body(
             k,
             candidates: Some(Box::new(current)),
             sort_key: body.use_rank.clone(),
+            search_mode: body.use_vector,
+            materialized_columns: selected_row_columns(&body.columns),
         };
     }
 
@@ -394,13 +414,7 @@ fn plan_select_body(
         };
     }
 
-    let is_select_star = matches!(
-        body.columns.as_slice(),
-        [contextdb_parser::ast::SelectColumn {
-            expr: Expr::Column(contextdb_parser::ast::ColumnRef { table: None, column }),
-            alias: None
-        }] if column == "*"
-    );
+    let is_select_star = selected_row_columns(&body.columns).is_none();
     if !is_select_star {
         current = PhysicalPlan::Project {
             input: Box::new(current),
@@ -431,6 +445,60 @@ fn plan_select_body(
     }
 
     Ok(current)
+}
+
+/// The row values an explicit SELECT list needs from its input. Vector search
+/// uses this to avoid materialising a stored embedding merely because the
+/// physical search node exposes the table's complete schema to its parent.
+/// A wildcard deliberately returns `None`: every declared value is wanted.
+fn selected_row_columns(columns: &[contextdb_parser::ast::SelectColumn]) -> Option<Vec<String>> {
+    if matches!(
+        columns,
+        [contextdb_parser::ast::SelectColumn {
+            expr: Expr::Column(contextdb_parser::ast::ColumnRef { table: None, column }),
+            alias: None
+        }] if column == "*"
+    ) {
+        return None;
+    }
+
+    let mut selected = BTreeSet::new();
+    for column in columns {
+        collect_row_columns(&column.expr, &mut selected);
+    }
+    Some(selected.into_iter().collect())
+}
+
+fn collect_row_columns(expr: &Expr, selected: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Column(reference) => {
+            selected.insert(reference.column.clone());
+        }
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            collect_row_columns(left, selected);
+            collect_row_columns(right, selected);
+        }
+        Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+            collect_row_columns(operand, selected);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for argument in args {
+                collect_row_columns(argument, selected);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_row_columns(expr, selected);
+            for item in list {
+                collect_row_columns(item, selected);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_row_columns(expr, selected);
+            collect_row_columns(pattern, selected);
+        }
+        Expr::InSubquery { expr, .. } => collect_row_columns(expr, selected),
+        Expr::RowVectorSource { .. } | Expr::Literal(_) | Expr::Parameter(_) => {}
+    }
 }
 
 /// Resolve a bare `ORDER BY` name against the SELECT-list output names, as

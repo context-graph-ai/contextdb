@@ -17,7 +17,7 @@
 
 use contextdb_core::Value;
 use contextdb_core::read_contract::ReadLimits;
-use contextdb_engine::{Database, QueryResult};
+use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -50,6 +50,7 @@ fn roomy() -> ReadLimits {
 /// A thousand exactly is not enough -- the store still scores every document
 /// at that size -- so this sits above the point where the route changes.
 const DOCUMENTS: usize = 1_024;
+const MAX_BUILD_MAINTENANCE_CYCLES: usize = 64;
 
 fn doc(ordinal: u128) -> Uuid {
     Uuid::from_u128(0x007E_0000_0000_0000_0000_0000_0000_0000 + ordinal)
@@ -74,13 +75,18 @@ fn scattered(ordinal: usize) -> Vec<f32> {
 
 fn plain_documents() -> Database {
     let database = Database::open_memory();
+    database.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     database
         .execute(
-            "CREATE TABLE docs (id UUID PRIMARY KEY, label TEXT, embedding VECTOR(3))",
+            "CREATE TABLE docs (id UUID PRIMARY KEY, bucket TEXT, label TEXT, embedding VECTOR(3))",
             &empty(),
         )
         .expect("create the document table");
+    database
+        .execute("CREATE INDEX docs_bucket ON docs (bucket)", &empty())
+        .expect("create the candidate-route index");
     insert_documents(&database);
+    publish_document_index(&database);
     database
 }
 
@@ -88,6 +94,7 @@ fn plain_documents() -> Database {
 /// on a column whose answer is a weighted score rather than raw distance.
 fn ranked_documents() -> Database {
     let database = Database::open_memory();
+    database.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     database
         .execute(
             "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID, success_rate REAL)",
@@ -104,6 +111,7 @@ fn ranked_documents() -> Database {
         .execute(
             "CREATE TABLE docs (
                 id UUID PRIMARY KEY,
+                bucket TEXT,
                 label TEXT,
                 embedding VECTOR(3) RANK_POLICY (
                     JOIN outcomes ON decision_id,
@@ -114,6 +122,9 @@ fn ranked_documents() -> Database {
             &empty(),
         )
         .expect("create the ranked document table");
+    database
+        .execute("CREATE INDEX docs_bucket ON docs (bucket)", &empty())
+        .expect("create the candidate-route index");
     insert_documents(&database);
     for ordinal in 0..DOCUMENTS {
         database
@@ -131,7 +142,19 @@ fn ranked_documents() -> Database {
             )
             .expect("record an outcome for a document");
     }
+    publish_document_index(&database);
     database
+}
+
+/// HNSW publication is caller-driven work. The route comparison starts only
+/// once finite maintenance has made the route the executor is entitled to
+/// choose; the assertions below still reject a brute-force trace.
+fn publish_document_index(database: &Database) {
+    for _ in 0..MAX_BUILD_MAINTENANCE_CYCLES {
+        database
+            .run_maintenance_cycle()
+            .expect("one finite caller-driven maintenance cycle completes");
+    }
 }
 
 fn insert_documents(database: &Database) {
@@ -143,9 +166,11 @@ fn insert_documents(database: &Database) {
         };
         database
             .execute(
-                "INSERT INTO docs (id, label, embedding) VALUES ($id, $label, $embedding)",
+                "INSERT INTO docs (id, bucket, label, embedding) \
+                 VALUES ($id, $bucket, $label, $embedding)",
                 &params(vec![
                     ("id", Value::Uuid(doc(1 + ordinal as u128))),
+                    ("bucket", Value::Text("all-documents".to_owned())),
                     ("label", Value::Text(format!("doc-{ordinal}"))),
                     ("embedding", Value::Vector(embedding)),
                 ]),
@@ -161,10 +186,10 @@ fn described(result: &QueryResult) -> String {
     )
 }
 
-const FILTERED_PERSISTED: &str = "SELECT id FROM docs WHERE id != $source \
+const FILTERED_PERSISTED: &str = "SELECT id FROM docs WHERE bucket = $bucket \
                                   ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$source) \
                                   LIMIT 5";
-const FILTERED_LITERAL: &str = "SELECT id FROM docs WHERE id != $source \
+const FILTERED_LITERAL: &str = "SELECT id FROM docs WHERE bucket = $bucket \
                                 ORDER BY embedding <=> $query LIMIT 5";
 const RANKED_PERSISTED: &str = "SELECT id, score FROM docs \
                                 ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$source) \
@@ -173,17 +198,24 @@ const RANKED_LITERAL: &str = "SELECT id, score FROM docs ORDER BY embedding <=> 
                               USE RANK weighted LIMIT 5";
 
 fn source_params() -> HashMap<String, Value> {
-    params(vec![("source", Value::Uuid(source()))])
+    params(vec![
+        ("source", Value::Uuid(source())),
+        ("bucket", Value::Text("all-documents".to_owned())),
+    ])
 }
 
 fn query_params() -> HashMap<String, Value> {
-    params(vec![("query", Value::Vector(source_vector()))])
+    params(vec![
+        ("query", Value::Vector(source_vector())),
+        ("bucket", Value::Text("all-documents".to_owned())),
+    ])
 }
 
 fn both_sources() -> HashMap<String, Value> {
     params(vec![
         ("source", Value::Uuid(source())),
         ("query", Value::Vector(source_vector())),
+        ("bucket", Value::Text("all-documents".to_owned())),
     ])
 }
 

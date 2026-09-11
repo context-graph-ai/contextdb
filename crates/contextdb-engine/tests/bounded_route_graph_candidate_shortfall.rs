@@ -19,8 +19,8 @@ use contextdb_core::read_contract::{
     DeadlineClock, DeadlineWait, ReadFailureDetail, ReadFailureKind, ReadFailureLimit, ReadLimits,
 };
 use contextdb_core::{Value, VectorIndexRef};
-use contextdb_engine::Database;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
+use contextdb_engine::{Database, MaintenancePolicy};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,6 +119,7 @@ fn query_params() -> HashMap<String, Value> {
 /// every enrolled row visible at the read's snapshot.
 fn enrolled_vector_index() -> Database {
     let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         "CREATE TABLE neighbourhoods (id UUID PRIMARY KEY, embedding VECTOR(3))",
         &HashMap::new(),
@@ -137,10 +138,20 @@ fn enrolled_vector_index() -> Database {
         )
         .expect("enroll a vector row");
     }
-    // The first read builds the graph. A shortfall needs a graph to fall short
-    // of, so the fixture is not in the regime it claims until this has run.
-    db.execute(VECTOR_SQL, &query_params())
-        .expect("the first nearest-neighbour read builds the index graph");
+    // Queries never build an index. Drive the declared finite maintenance
+    // owner until this fixture really has the graph whose shortfall it tests.
+    let index = VectorIndexRef::new("neighbourhoods", "embedding");
+    for _ in 0..32 {
+        if db.vector_store_for_test().has_hnsw_index_for(&index) {
+            break;
+        }
+        db.run_maintenance_cycle()
+            .expect("one caller-driven vector maintenance batch succeeds");
+    }
+    assert!(
+        db.vector_store_for_test().has_hnsw_index_for(&index),
+        "the finite maintenance fixture publishes its graph"
+    );
     db
 }
 

@@ -46,7 +46,7 @@ fn seed(db: &Database, values: &[f64]) {
     }
 }
 
-/// Green guard, checked FIRST per the brief: a plain `INSERT` of `NaN` into
+/// Green guard, checked first: a plain `INSERT` of `NaN` into
 /// an INDEXED REAL column does not panic and does not itself refuse --
 /// `NaN` is a structurally valid `REAL` value to store, the defect is only
 /// in a later RANGE QUERY against it. This is not the bug; it establishes
@@ -76,8 +76,8 @@ fn inserting_nan_into_an_indexed_real_column_does_not_panic() {
 
 /// Green guard: the same bounded range query with a NaN lower bound,
 /// against a table with NO index on `score`, does not panic -- it returns
-/// an empty result set. This is the "presumably sane" behavior the brief
-/// asks to pin consistency with.
+/// an empty result set. This is the sane behavior the indexed column must
+/// stay consistent with.
 #[test]
 fn between_query_with_nan_lower_bound_on_a_non_indexed_real_column_returns_empty() {
     let db = Database::open_memory();

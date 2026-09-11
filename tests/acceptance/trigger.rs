@@ -1,14 +1,15 @@
 use super::common::{count_rows, empty_params};
 use contextdb_core::{
     CallbackKind, ContextId, Error, Lsn, Principal, Result, RowId, ScopeLabel, SortDirection, TxId,
-    UpsertResult, Value, VectorIndexRef, VersionedRow,
+    UpsertResult, Value, VectorIndexRef, VectorPartitionKey, VersionedRow,
 };
 use contextdb_engine::sync_types::{
     ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
     VectorChange,
 };
 use contextdb_engine::{
-    Database, TriggerAuditFilter, TriggerAuditStatus, TriggerAuditStatusFilter, TriggerEvent,
+    Database, MaintenancePolicy, TriggerAuditFilter, TriggerAuditStatus, TriggerAuditStatusFilter,
+    TriggerEvent,
 };
 use contextdb_server::protocol::{
     WireChangeSet, WireDdlProvenance, canonical_ddl_provenance_digest,
@@ -247,15 +248,30 @@ fn hnsw_baseline_failure(
     expected: &HnswBaseline,
     label: &str,
 ) -> Option<String> {
-    let warm = db.query_vector(index.clone(), &[0.0, 0.0, 1.0], 10, None, db.snapshot());
-    let Some(stats) = db.__debug_vector_hnsw_stats(index.clone()) else {
-        return Some(format!("{label} raw HNSW graph is missing for {index:?}"));
+    let warm = db.execute(
+        &format!(
+            "SELECT id FROM {} ORDER BY {} <=> $query USE VECTOR INDEXED LIMIT 10",
+            index.table, index.column
+        ),
+        &HashMap::from([("query".to_string(), Value::Vector(vec![0.0, 0.0, 1.0]))]),
+    );
+    let Some(info) = db
+        .vector_store_for_test()
+        .partition_info(&index, &VectorPartitionKey::unpartitioned())
+    else {
+        return Some(format!(
+            "{label} maintained vector partition is missing for {index:?}"
+        ));
     };
     let actual = HnswBaseline {
-        point_count: stats.point_count,
-        layer0_points: stats.layer0_points,
-        dimension: stats.dimension,
-        has_layer0_edges: stats.layer0_neighbor_edges > 0,
+        point_count: info.live_rows,
+        layer0_points: info.live_rows,
+        dimension: db
+            .vector_store_for_test()
+            .index_layout(&index)
+            .map(|layout| layout.dimension)
+            .unwrap_or(0),
+        has_layer0_edges: info.graph_available,
         raw_entry_counts: expected
             .row_ids()
             .into_iter()
@@ -268,7 +284,12 @@ fn hnsw_baseline_failure(
             })
             .collect(),
     };
-    if warm.as_ref().map(|hits| hits.is_empty()).unwrap_or(true) || &actual != expected {
+    if warm
+        .as_ref()
+        .map(|hits| hits.rows.is_empty())
+        .unwrap_or(true)
+        || &actual != expected
+    {
         let raw_mismatches = expected
             .raw_entry_counts
             .iter()
@@ -278,7 +299,9 @@ fn hnsw_baseline_failure(
             .collect::<Vec<_>>();
         return Some(format!(
             "{label} raw HNSW baseline changed for {index:?}; warm_empty={}, expected={expected:?}, actual={actual:?}, raw_mismatches_sample={raw_mismatches:?}",
-            warm.as_ref().map(|hits| hits.is_empty()).unwrap_or(true)
+            warm.as_ref()
+                .map(|hits| hits.rows.is_empty())
+                .unwrap_or(true)
         ));
     }
     None
@@ -383,32 +406,49 @@ fn warm_hnsw_fixture(
     baseline_row_ids: Vec<RowId>,
     label: &str,
 ) -> HnswBaseline {
+    for _ in 0..16 {
+        if db
+            .__debug_vector_hnsw_stats(index.clone())
+            .is_some_and(|stats| stats.point_count == expected_rows)
+        {
+            break;
+        }
+        db.run_maintenance_cycle()
+            .expect("deterministically materialize fixture HNSW");
+    }
     let warm = db
-        .query_vector(index.clone(), &[0.0, 0.0, 1.0], 10, None, db.snapshot())
+        .execute(
+            &format!(
+                "SELECT id FROM {} ORDER BY {} <=> $query USE VECTOR INDEXED LIMIT 10",
+                index.table, index.column
+            ),
+            &HashMap::from([("query".to_string(), Value::Vector(vec![0.0, 0.0, 1.0]))]),
+        )
         .unwrap();
     assert!(
-        !warm.is_empty(),
+        !warm.rows.is_empty(),
         "{label} HNSW warmup query must return fixture rows"
     );
-    let stats = db
-        .__debug_vector_hnsw_stats(index.clone())
-        .expect("fixture must build a raw HNSW graph");
+    let info = db
+        .vector_store_for_test()
+        .partition_info(&index, &VectorPartitionKey::unpartitioned())
+        .expect("fixture must publish a maintained vector partition");
     assert_eq!(
-        stats.point_count, expected_rows,
-        "{label} fixture must exercise raw HNSW, not just MVCC vector entries; stats={stats:?}"
-    );
-    assert_eq!(
-        stats.layer0_points, expected_rows,
-        "{label} fixture must put every point into layer 0; stats={stats:?}"
+        info.live_rows, expected_rows,
+        "{label} fixture must retain every maintained vector row; info={info:?}"
     );
     assert!(
-        stats.layer0_neighbor_edges > 0,
-        "{label} fixture must expose real HNSW neighbor edges; stats={stats:?}"
+        info.graph_available,
+        "{label} fixture must publish a maintained graph generation; info={info:?}"
     );
     let baseline = HnswBaseline {
-        point_count: stats.point_count,
-        layer0_points: stats.layer0_points,
-        dimension: stats.dimension,
+        point_count: info.live_rows,
+        layer0_points: info.live_rows,
+        dimension: db
+            .vector_store_for_test()
+            .index_layout(&index)
+            .unwrap()
+            .dimension,
         has_layer0_edges: true,
         raw_entry_counts: baseline_row_ids
             .into_iter()
@@ -425,13 +465,14 @@ fn warm_hnsw_fixture(
         baseline
             .raw_entry_counts
             .iter()
-            .all(|(_, count)| *count == 1),
-        "{label} every fixture row must have exactly one raw HNSW entry; baseline={baseline:?}"
+            .all(|(_, count)| *count == 0),
+        "{label} sealed maintained generation must not retain a duplicate mutable HNSW entry; baseline={baseline:?}"
     );
     baseline
 }
 
 fn seed_sibling_hnsw_vectors(db: &Database) -> (usize, u64, HnswBaseline) {
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     for idx in 0..HNSW_FIXTURE_ROWS {
         db.execute(
             "INSERT INTO sibling_vectors (id, content, embedding) VALUES ($id, $content, $embedding)",
@@ -469,6 +510,7 @@ fn seed_sibling_hnsw_vectors(db: &Database) -> (usize, u64, HnswBaseline) {
 }
 
 fn seed_host_audit_hnsw(db: &Database) -> (usize, u64, HnswBaseline) {
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     for idx in 0..HNSW_FIXTURE_ROWS {
         db.execute(
             "INSERT INTO host_audits (id, write_id, note, embedding) VALUES ($id, $write_id, $note, $embedding)",

@@ -1,8 +1,7 @@
 //! The store companion lock is named by APPENDING `.lock` to the full store
 //! filename, never by swapping the store's own extension.
 //!
-//! Authority: `.claude/plans/contextdb/active/contextdb-read-intent.md`,
-//! "Stable companion lock" -- `alpha.db` -> `alpha.db.lock`, never
+//! The companion lock name is stable: `alpha.db` -> `alpha.db.lock`, never
 //! `alpha.lock`. contextdb-core is the ONE source of truth for this name:
 //! vigil links contextdb-core unconditionally but contextdb-engine only
 //! behind its `fabric` feature, so the helper must live where every

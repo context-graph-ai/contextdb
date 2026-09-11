@@ -311,14 +311,22 @@ fn bounded_limits_are_data_derived_exact_and_return_typed_refusals() {
             baseline.saturating_add(dual_peak_bytes).saturating_sub(1),
         ))
         .expect("one-byte-short database-wide headroom");
-    assert_limit(
-        bounded::execute(
-            &dual_charge,
-            &request(dual_sql, HashMap::new(), roomy_limits(), &clock),
-        )
-        .expect_err("a per-read success may not overdraw database-wide memory"),
-        ReadFailureLimit::Memory,
-        roomy_limits().memory,
+    let limit = baseline.saturating_add(dual_peak_bytes).saturating_sub(1);
+    let error = dual_charge
+        .read_session(roomy_limits())
+        .unwrap()
+        .execute(dual_sql, &HashMap::new())
+        .expect_err("a per-read success may not overdraw database-wide memory");
+    assert!(
+        matches!(error, contextdb_core::Error::MemoryBudgetExceeded {
+        budget_limit_bytes, requested_bytes, available_bytes, ..
+    } if budget_limit_bytes == limit && requested_bytes > available_bytes),
+        "the STORE budget that actually refused is preserved: {error:?}"
+    );
+    assert_eq!(
+        accountant.usage().used,
+        baseline,
+        "refusal releases all temporary state"
     );
 }
 
@@ -1051,6 +1059,7 @@ fn assert_scoped_candidate_limits(
 fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
     let clock = ManualClock::default();
     let brute = Database::open_memory();
+    brute.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     create_vector_table(&brute, "brute_vectors", false);
     let brute_ids = seed_vectors(&brute, "brute_vectors", 37, None, 101);
     let brute_sql = "SELECT id FROM brute_vectors ORDER BY embedding <=> $query LIMIT 3";
@@ -1093,12 +1102,12 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
     );
 
     let hnsw = Database::open_memory();
+    hnsw.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     create_vector_table(&hnsw, "hnsw_vectors", false);
     let hnsw_ids = seed_vectors(&hnsw, "hnsw_vectors", 1_003, None, 102);
     let hnsw_sql = "SELECT id FROM hnsw_vectors ORDER BY embedding <=> $query LIMIT 5";
-    hnsw.execute(hnsw_sql, &params([("query", Value::Vector(vector_for(0)))]))
-        .expect("prebuild persistent HNSW state before the bounded request");
-    assert!(hnsw.__debug_last_query_vector_used_hnsw_for_test());
+    hnsw.run_maintenance_cycle()
+        .expect("build the maintained graph before measuring query work");
     let hnsw_outcome = bounded_success(
         &hnsw,
         &request(
@@ -1125,6 +1134,7 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
     );
 
     let ranked = Database::open_memory();
+    ranked.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     let ranked_ids = create_rank_candidate_fixture(&ranked);
     let ranked_outcome = bounded_success(
         &ranked,
@@ -1239,6 +1249,7 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
     let scoped =
         Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(visible_context)]))
             .expect("scoped open");
+    scoped.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
     let scoped_relational = bounded_success(
         &scoped,
         &request(
@@ -1363,6 +1374,16 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
             .unwrap_or_default()
             > 0
     );
+    // Point lookups hydrate relational vector cells. Probe the measured
+    // source before those control reads change the materialization work.
+    assert_scoped_candidate_limits(
+        &scoped,
+        "SELECT id FROM secured_vectors ORDER BY embedding <=> $query LIMIT 5",
+        params([("query", Value::Vector(vector_for(0)))]),
+        bounded::TestWorkSource::VectorCandidates,
+        &secured,
+        &clock,
+    );
     for id in uuid_ids(&secured.result) {
         let row = scoped
             .point_lookup("secured_vectors", "id", &Value::Uuid(id), scoped.snapshot())
@@ -1373,14 +1394,6 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
             Some(&Value::Uuid(visible_context))
         );
     }
-    assert_scoped_candidate_limits(
-        &scoped,
-        "SELECT id FROM secured_vectors ORDER BY embedding <=> $query LIMIT 5",
-        params([("query", Value::Vector(vector_for(0)))]),
-        bounded::TestWorkSource::VectorCandidates,
-        &secured,
-        &clock,
-    );
 }
 
 struct ExactLimitMatrixCase<'db> {
@@ -1884,6 +1897,22 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
     seed_vectors(&db, "matrix_brute_vectors", 37, None, 105);
     create_vector_table(&db, "matrix_hnsw_vectors", false);
     seed_vectors(&db, "matrix_hnsw_vectors", 1_003, None, 106);
+    let matrix_hnsw_index = VectorIndexRef::new("matrix_hnsw_vectors", "embedding");
+    for _ in 0..64 {
+        if db
+            .__debug_vector_hnsw_build_serial_for_test(matrix_hnsw_index.clone())
+            .is_some()
+        {
+            break;
+        }
+        db.run_maintenance_cycle()
+            .expect("one finite caller-driven maintenance cycle completes");
+    }
+    assert!(
+        db.__debug_vector_hnsw_build_serial_for_test(matrix_hnsw_index.clone())
+            .is_some(),
+        "the matrix must exercise a published maintained graph, not AUTO's exact fallback"
+    );
     create_rank_candidate_fixture(&db);
 
     let visible_context = graph_uuid(42);
@@ -1918,8 +1947,15 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
     db.execute(hnsw_sql, &params([("query", Value::Vector(vector_for(0)))]))
         .expect("prebuild persistent HNSW state outside the bounded request");
     assert!(db.__debug_last_query_vector_used_hnsw_for_test());
-    let hnsw_index = VectorIndexRef::new("matrix_hnsw_vectors", "embedding");
-    assert_eq!(db.__debug_vector_hnsw_len(hnsw_index.clone()), Some(1_003));
+    let hnsw_trace = db
+        .__debug_last_query_vector_trace_for_test()
+        .expect("the ordinary prebuild publishes the graph it actually searched");
+    assert_eq!(hnsw_trace.index, matrix_hnsw_index);
+    assert!(hnsw_trace.used_hnsw);
+    assert!(
+        hnsw_trace.hnsw_len.is_some(),
+        "the prebuild records the HNSW layer that executed rather than probing a retired slot"
+    );
     let retained_index_baseline = accountant.usage().used;
 
     let cases = [
@@ -2003,11 +2039,6 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
         accountant.usage().used,
         retained_index_baseline,
         "bounded request cleanup preserves the prebuilt persistent HNSW cache"
-    );
-    assert_eq!(
-        db.__debug_vector_hnsw_len(hnsw_index),
-        Some(1_003),
-        "request cleanup must not discard the retained HNSW graph"
     );
 }
 

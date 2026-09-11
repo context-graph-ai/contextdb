@@ -1,4 +1,4 @@
-//! Frozen wire-bytes regression guard for the completed `PROTOCOL_VERSION` 6.
+//! Frozen wire-bytes regression guard for the first released `PROTOCOL_VERSION` 7.
 //!
 //! Pure encode/decode against fixed, fully deterministic fixtures — no
 //! server and no async runtime. It lives in its own auto-discovered test
@@ -6,19 +6,19 @@
 
 use contextdb_core::{Incarnation, Lsn, Value};
 use contextdb_server::protocol::{
-    MessageType, PullRequest, PullResponse, PushRequest, PushResponse, WireApplyResult,
-    WireChangeSet, WireConflict, WireDdlChange, WireDdlProvenance, WireNaturalKey, WirePushError,
-    WireRefusalCause, WireRowChange, canonical_ddl_provenance_digest, decode, encode,
-    validate_wire_ddl_provenance,
+    MessageType, PROTOCOL_VERSION, PullRequest, PullResponse, PushRequest, PushResponse,
+    SchemaRecoveryPage, SchemaRecoveryRequest, WireApplyResult, WireChangeSet, WireConflict,
+    WireDeliveryManifest, WireDeliveryOutcome, WireNaturalKey, WirePushError, WireRefusalCause,
+    WireRowChange, decode, encode,
 };
 use std::collections::HashMap;
 
-// ======== sr7 — REGRESSION GUARD: the wire bytes are frozen at protocol v6 ========
+// ======== REGRESSION GUARD: the wire bytes are frozen at protocol 7 ========
 //
-// The greenfield v6 surface includes a distinct trailing PURGE lane, keeps its
+// The greenfield protocol-7 surface includes a distinct trailing PURGE lane, keeps its
 // schema-provenance slot present even when empty so later positional slots stay
 // stable, and lets `PushResponse` carry a structured authority error. No v6 peer
-// shipped before this completed shape. The six constants below freeze it.
+// shipped before this completed shape. The constants below freeze it.
 
 fn wire_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -31,116 +31,9 @@ fn hex_bytes(hex: &str) -> Vec<u8> {
         .collect()
 }
 
-#[test]
-fn nonempty_schema_provenance_round_trips_and_validates() {
-    let ddl = WireDdlChange::CreateTable {
-        name: "empty_recreated".to_string(),
-        columns: vec![("id".to_string(), "INTEGER".to_string())],
-        constraints: vec!["PRIMARY KEY (id)".to_string()],
-        foreign_keys: Vec::new(),
-        composite_foreign_keys: Vec::new(),
-        composite_unique: Vec::new(),
-    };
-    let provenance = WireDdlProvenance {
-        source_ddl_lsn: Lsn(9),
-        ordinal: 0,
-        table: Some("empty_recreated".to_string()),
-        table_generation: Some(2),
-        digest: canonical_ddl_provenance_digest(&ddl, Lsn(9), 0, Some("empty_recreated"), Some(2))
-            .unwrap(),
-    };
-    let wire = WireChangeSet {
-        ddl: vec![ddl],
-        ddl_lsn: vec![Lsn(9)],
-        rows: Vec::new(),
-        edges: Vec::new(),
-        vectors: Vec::new(),
-        ddl_provenance: vec![provenance],
-        purges: Vec::new(),
-        // Statement 9: ordinary manifest lane compile prerequisite.
-        manifests: Vec::new(),
-    };
-    validate_wire_ddl_provenance(&wire).unwrap();
-    let bytes = rmp_serde::to_vec(&wire).unwrap();
-    let decoded: WireChangeSet = rmp_serde::from_slice(&bytes).unwrap();
-    assert_eq!(decoded, wire);
-    validate_wire_ddl_provenance(&decoded).unwrap();
-}
-
-#[test]
-fn schema_provenance_rejects_missing_source_lsn_before_ordinal_lookup() {
-    let ddl = WireDdlChange::DropTable {
-        name: "memories".to_string(),
-    };
-    let wire = WireChangeSet {
-        ddl: vec![ddl.clone()],
-        ddl_lsn: Vec::new(),
-        rows: Vec::new(),
-        edges: Vec::new(),
-        vectors: Vec::new(),
-        ddl_provenance: vec![WireDdlProvenance {
-            source_ddl_lsn: Lsn(9),
-            ordinal: 0,
-            table: Some("memories".to_string()),
-            table_generation: Some(2),
-            digest: canonical_ddl_provenance_digest(&ddl, Lsn(9), 0, Some("memories"), Some(2))
-                .unwrap(),
-        }],
-        purges: Vec::new(),
-        // Statement 9: ordinary manifest lane compile prerequisite.
-        manifests: Vec::new(),
-    };
-
-    let error = validate_wire_ddl_provenance(&wire)
-        .expect_err("schema provenance without its source LSN must be rejected");
-    assert!(
-        error.to_string().contains("ddl_lsn length"),
-        "cardinality error must be reported before ordinal lookup: {error}"
-    );
-}
-
-#[test]
-fn filtered_schema_entry_keeps_its_original_nonzero_ordinal() {
-    let ddl = WireDdlChange::CreateTable {
-        name: "pulled_memories".to_string(),
-        columns: vec![("id".to_string(), "INTEGER".to_string())],
-        constraints: vec!["PRIMARY KEY (id)".to_string()],
-        foreign_keys: Vec::new(),
-        composite_foreign_keys: Vec::new(),
-        composite_unique: Vec::new(),
-    };
-    let wire = WireChangeSet {
-        ddl: vec![ddl.clone()],
-        ddl_lsn: vec![Lsn(17)],
-        rows: Vec::new(),
-        edges: Vec::new(),
-        vectors: Vec::new(),
-        ddl_provenance: vec![WireDdlProvenance {
-            source_ddl_lsn: Lsn(17),
-            ordinal: 1,
-            table: Some("pulled_memories".to_string()),
-            table_generation: Some(1),
-            digest: canonical_ddl_provenance_digest(
-                &ddl,
-                Lsn(17),
-                1,
-                Some("pulled_memories"),
-                Some(1),
-            )
-            .unwrap(),
-        }],
-        purges: Vec::new(),
-        // Statement 9: ordinary manifest lane compile prerequisite.
-        manifests: Vec::new(),
-    };
-
-    validate_wire_ddl_provenance(&wire)
-        .expect("direction filtering must not renumber the surviving schema identity");
-}
-
-const PUSH_REQUEST_WIRE: &str = "9306ab5075736852657175657374dc002ccc92cc96cc90cc90cc91cc98cca174cc93cca26964cc81cca5496e74363407cc90cc81cca26964cc81cca5496e74363407ccc207ccc0ccc0ccc0cc90cc90cc90cc920000";
-const PUSH_RESPONSE_WIRE: &str = "9306ac50757368526573706f6e7365dc007acc92cc940101cc91cc98cc93cca26964cc81cca5496e74363407cc90ccaa6b6565705f6669727374ccaa6b6565705f6669727374cca56e6f746573cca465646974ccd9406162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616229ccc007ccc0";
-const AUTHORITY_ERROR_PUSH_RESPONSE_WIRE: &str = "9306ac50757368526573706f6e7365dc0065cc93ccc0ccc0cc81ccbd50757267655265717569726573417574686f7269746174697665487562cc91ccd94063646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364";
+const PUSH_REQUEST_WIRE: &str = "9307ab5075736852657175657374dc002ccc92cc96cc90cc90cc91cc98cca174cc93cca26964cc81cca5496e74363407cc90cc81cca26964cc81cca5496e74363407ccc207ccc0ccc0ccc0cc90cc90cc90cc920000";
+const PUSH_RESPONSE_WIRE: &str = "9307ac50757368526573706f6e7365dc007acc92cc940101cc91cc98cc93cca26964cc81cca5496e74363407cc90ccaa6b6565705f6669727374ccaa6b6565705f6669727374cca56e6f746573cca465646974ccd9406162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616229ccc007ccc0";
+const AUTHORITY_ERROR_PUSH_RESPONSE_WIRE: &str = "9307ac50757368526573706f6e7365dc0065cc93ccc0ccc0cc81ccbd50757267655265717569726573417574686f7269746174697665487562cc91ccd94063646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364";
 const GAPPED_CONFLICT_WIRE: &str =
     "9893a2696481a5496e7436340790aa6b6565705f6669727374a57075726765a56e6f746573a57075726765c029c0";
 const CAUSED_CONFLICT_WIRE: &str = "9893a2696481a5496e7436340990aa6b6565705f6669727374bb646570656e64656e63795f636f6d706c6574655f72656675736564ab6e6f74655f67726f757073a465646974c0c092a56e6f74657393a2696481a5496e7436340790";
@@ -148,12 +41,75 @@ const CAUSED_CONFLICT_WIRE: &str = "9893a2696481a5496e7436340990aa6b6565705f6669
 /// slot is proven to still decode.
 const CONFLICT_WITHOUT_CAUSE_SLOT_WIRE: &str =
     "9793a2696481a5496e7436340790aa6b6565705f6669727374a57075726765a56e6f746573a57075726765c029";
-const PULL_REQUEST_WIRE: &str = "9306ab50756c6c5265717565737495cc922acccd01ccf4";
+const PULL_REQUEST_WIRE: &str = "9307ab50756c6c5265717565737495cc922acccd01ccf4";
 const PULL_RESPONSE_WIRE: &str =
-    "9306ac50756c6c526573706f6e73659bcc94cc96cc90cc90cc90cc90cc90cc90ccc22accc0";
+    "9307ac50756c6c526573706f6e73659bcc94cc96cc90cc90cc90cc90cc90cc90ccc22accc0";
+const SCHEMA_RECOVERY_PULL_REQUEST_WIRE: &str =
+    "9307ab50756c6c52657175657374dc0012cc935acccd01ccf4cc81cca8436f6e74696e7565cc925a28";
+const SCHEMA_RECOVERY_PULL_RESPONSE_WIRE: &str = "9307ac50756c6c526573706f6e7365dc0011cc95cc96cc90cc90cc90cc90cc90cc90ccc35acc92002acc935a28ccc2";
+const POPULATED_CUSTODY_PUSH_REQUEST_WIRE: &str = "9307ab5075736852657175657374dc0036cc92cc98cc90cc90cc90cc90cc90cc90cc90cc91cc9bccc403010203ccc4020405cc92cc9106cc920708ccc40109ccc4020a0bcc91cc920c0d02ccc4010eccc4020f10ccc40111cc921213cc920017";
+const POPULATED_CUSTODY_PUSH_RESPONSE_WIRE: &str = "9307ac50757368526573706f6e7365dc005dcc95ccc0ccc0ccc0cc91cc96ccc4021415ccdc00201616161616161616161616161616161616161616161616161616161616161616ccdc00201717171717171717171717171717171717171717171717171717171717171717ccc40118ccc402191accc4011bcc92001d";
 
 #[test]
-fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
+fn protocol_seven_populated_custody_lanes_are_frozen() {
+    let request = PushRequest {
+        changeset: WireChangeSet {
+            manifests: vec![WireDeliveryManifest {
+                submission_id: vec![1, 2, 3],
+                seal: vec![4, 5],
+                life_evidence: vec![vec![6], vec![7, 8]],
+                materialization_projection: vec![9],
+                policy_evidence: vec![10, 11],
+                retained_slots: vec![vec![12, 13]],
+                erased_slot_count: 2,
+                submission_signature: vec![14],
+                disclosure: vec![15, 16],
+                disclosure_signature: vec![17],
+                erasure_authorization: Some(vec![18, 19]),
+            }],
+            ..WireChangeSet::default()
+        },
+        incarnation: Incarnation(23),
+    };
+    let request_bytes = encode(MessageType::PushRequest, &request).unwrap();
+    assert_eq!(
+        wire_hex(&request_bytes),
+        POPULATED_CUSTODY_PUSH_REQUEST_WIRE,
+        "protocol-seven populated manifest bytes changed without a protocol review"
+    );
+    let decoded: PushRequest =
+        rmp_serde::from_slice(&decode(&request_bytes).unwrap().payload).unwrap();
+    assert_eq!(decoded, request);
+
+    let response = PushResponse {
+        outcomes: vec![WireDeliveryOutcome {
+            lookup_submission: vec![20, 21],
+            lookup_seal_digest: [22; 32],
+            lookup_origin_life_digest: [23; 32],
+            lookup_source: vec![24],
+            signed_core: vec![25, 26],
+            diagnostic_body: vec![27],
+        }],
+        hub_incarnation: Some(Incarnation(29)),
+        ..PushResponse::default()
+    };
+    let response_bytes = encode(MessageType::PushResponse, &response).unwrap();
+    assert_eq!(
+        wire_hex(&response_bytes),
+        POPULATED_CUSTODY_PUSH_RESPONSE_WIRE,
+        "protocol-seven populated outcome and hub incarnation bytes changed without a protocol review"
+    );
+    let decoded: PushResponse =
+        rmp_serde::from_slice(&decode(&response_bytes).unwrap().payload).unwrap();
+    assert_eq!(decoded, response);
+}
+
+#[test]
+fn protocol_seven_push_and_pull_wire_bytes_are_frozen() {
+    assert_eq!(
+        PROTOCOL_VERSION, 7,
+        "these fixtures belong to the current protocol-seven surface"
+    );
     // PushRequest: one row, single-entry values map (deterministic encoding).
     let row = WireRowChange {
         table: "t".to_string(),
@@ -178,7 +134,7 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
             edges: Vec::new(),
             vectors: Vec::new(),
             purges: Vec::new(),
-            // Statement 9: ordinary manifest lane compile prerequisite.
+            // Ordinary manifest lane compile prerequisite.
             manifests: Vec::new(),
         },
         incarnation: Incarnation::default(),
@@ -187,7 +143,7 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
     assert_eq!(
         wire_hex(&push_request_bytes),
         PUSH_REQUEST_WIRE,
-        "protocol v6 PushRequest wire bytes changed without an explicit version review"
+        "protocol-seven PushRequest wire bytes changed without an explicit version review"
     );
     let envelope = decode(&push_request_bytes).unwrap();
     let decoded: PushRequest = rmp_serde::from_slice(&envelope.payload).unwrap();
@@ -219,14 +175,14 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
         }),
         error: None,
         application_error: None,
-        // Statement 13: ordinary response lane compile prerequisite.
+        // Ordinary response lane compile prerequisite.
         ..Default::default()
     };
     let push_response_bytes = encode(MessageType::PushResponse, &push_response).unwrap();
     assert_eq!(
         wire_hex(&push_response_bytes),
         PUSH_RESPONSE_WIRE,
-        "protocol v6 PushResponse wire bytes changed without an explicit version review"
+        "protocol-seven PushResponse wire bytes changed without an explicit version review"
     );
     let envelope = decode(&push_response_bytes).unwrap();
     let decoded: PushResponse = rmp_serde::from_slice(&envelope.payload).unwrap();
@@ -241,14 +197,14 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
         application_error: Some(WirePushError::PurgeRequiresAuthoritativeHub {
             hub_node_id: "cd".repeat(32),
         }),
-        // Statement 13: ordinary response lane compile prerequisite.
+        // Ordinary response lane compile prerequisite.
         ..Default::default()
     };
     let authority_error_bytes = encode(MessageType::PushResponse, &authority_error).unwrap();
     assert_eq!(
         wire_hex(&authority_error_bytes),
         AUTHORITY_ERROR_PUSH_RESPONSE_WIRE,
-        "protocol v6 structured purge-authority refusal bytes changed without an explicit version review"
+        "protocol-seven structured purge-authority refusal bytes changed without an explicit version review"
     );
     let envelope = decode(&authority_error_bytes).unwrap();
     let decoded: PushResponse = rmp_serde::from_slice(&envelope.payload).unwrap();
@@ -315,12 +271,13 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
     let pull_request = PullRequest {
         since_lsn: Lsn(42),
         max_entries: Some(500),
+        schema_recovery: None,
     };
     let pull_request_bytes = encode(MessageType::PullRequest, &pull_request).unwrap();
     assert_eq!(
         wire_hex(&pull_request_bytes),
         PULL_REQUEST_WIRE,
-        "protocol v6 PullRequest wire bytes changed without an explicit version review"
+        "protocol-seven plain PullRequest wire bytes changed without an explicit version review"
     );
     let envelope = decode(&pull_request_bytes).unwrap();
     let decoded: PullRequest = rmp_serde::from_slice(&envelope.payload).unwrap();
@@ -335,12 +292,13 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
         has_more: false,
         cursor: Some(Lsn(42)),
         source: None,
+        schema_recovery: None,
     };
     let pull_response_bytes = encode(MessageType::PullResponse, &pull_response).unwrap();
     assert_eq!(
         wire_hex(&pull_response_bytes),
         PULL_RESPONSE_WIRE,
-        "protocol v6 PullResponse wire bytes changed without an explicit version review"
+        "protocol-seven plain PullResponse wire bytes changed without an explicit version review"
     );
     let envelope = decode(&pull_response_bytes).unwrap();
     let decoded: PullResponse = rmp_serde::from_slice(&envelope.payload).unwrap();
@@ -348,4 +306,57 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
         decoded, pull_response,
         "pinned PullResponse bytes must round-trip"
     );
+}
+
+#[test]
+fn protocol_seven_schema_recovery_present_wire_bytes_are_frozen() {
+    assert_eq!(
+        PROTOCOL_VERSION, 7,
+        "these fixtures belong to the current protocol-seven surface"
+    );
+
+    let request = PullRequest {
+        since_lsn: Lsn(90),
+        max_entries: Some(500),
+        schema_recovery: Some(SchemaRecoveryRequest::Continue {
+            target_lsn: Lsn(90),
+            after_lsn: Lsn(40),
+        }),
+    };
+    let request_bytes = encode(MessageType::PullRequest, &request).unwrap();
+
+    let response = PullResponse {
+        changeset: WireChangeSet::default(),
+        has_more: true,
+        cursor: Some(Lsn(90)),
+        source: Some(Incarnation(42)),
+        schema_recovery: Some(SchemaRecoveryPage {
+            target_lsn: Lsn(90),
+            next_lsn: Lsn(40),
+            complete: false,
+        }),
+    };
+    let response_bytes = encode(MessageType::PullResponse, &response).unwrap();
+
+    assert_eq!(
+        format!(
+            "request={} response={}",
+            wire_hex(&request_bytes),
+            wire_hex(&response_bytes)
+        ),
+        format!(
+            "request={SCHEMA_RECOVERY_PULL_REQUEST_WIRE} \
+             response={SCHEMA_RECOVERY_PULL_RESPONSE_WIRE}"
+        ),
+        "protocol-seven present schema-recovery request/response bytes changed without an \
+         explicit version review"
+    );
+
+    let request_envelope = decode(&request_bytes).unwrap();
+    let decoded_request: PullRequest = rmp_serde::from_slice(&request_envelope.payload).unwrap();
+    assert_eq!(decoded_request, request);
+
+    let response_envelope = decode(&response_bytes).unwrap();
+    let decoded_response: PullResponse = rmp_serde::from_slice(&response_envelope.payload).unwrap();
+    assert_eq!(decoded_response, response);
 }

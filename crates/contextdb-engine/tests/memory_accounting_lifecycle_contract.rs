@@ -245,6 +245,73 @@ fn expiring_a_row_whose_edge_is_live_returns_the_edge_bytes_exactly_once() {
     );
 }
 
+/// DROP TABLE must release only what the table is still standing charged
+/// for, not bytes a superseded or deleted version already handed back when
+/// the write that superseded or deleted it committed. A churned table still
+/// physically retains its superseded and tombstoned versions on disk
+/// (HISTORY ALL keeps them by design), but their charge was already returned
+/// when each commit superseded or deleted them; crediting that same charge
+/// again on DROP TABLE releases more than the table is actually costing and
+/// leaves the accountant below what the surviving table still holds.
+#[test]
+fn dropping_a_churned_table_releases_only_its_standing_charge_not_its_tombstones_again() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE survivor (id INTEGER PRIMARY KEY, body TEXT)",
+        &p(),
+    )
+    .expect("declare a table that outlives the drop");
+    let mut survivor_row = HashMap::new();
+    survivor_row.insert("id".to_string(), Value::Int64(0));
+    survivor_row.insert("b".to_string(), Value::Text(body(0)));
+    db.execute(
+        "INSERT INTO survivor (id, body) VALUES ($id, $b)",
+        &survivor_row,
+    )
+    .expect("insert the row that must still be standing after the drop");
+    let baseline = charged(&db);
+
+    db.execute(
+        "CREATE TABLE churned (id INTEGER PRIMARY KEY, body TEXT)",
+        &p(),
+    )
+    .expect("declare the table that will be churned and then dropped");
+    for row in 0..CHURNED_ROWS {
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), Value::Int64(row as i64));
+        params.insert("b".to_string(), Value::Text(body(row)));
+        db.execute("INSERT INTO churned (id, body) VALUES ($id, $b)", &params)
+            .expect("insert a row that will be churned");
+    }
+    for row in 0..CHURNED_ROWS {
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), Value::Int64(row as i64));
+        params.insert("b".to_string(), Value::Text(body(row + CHURNED_ROWS)));
+        db.execute("UPDATE churned SET body = $b WHERE id = $id", &params)
+            .expect("supersede every row once, leaving a tombstoned version behind");
+    }
+    for row in 0..(CHURNED_ROWS / 2) {
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), Value::Int64(row as i64));
+        db.execute("DELETE FROM churned WHERE id = $id", &params)
+            .expect("delete half the rows, leaving a delete tombstone behind");
+    }
+
+    db.execute("DROP TABLE churned", &p())
+        .expect("drop the churned table through the public DDL door");
+
+    assert_eq!(
+        charged(&db),
+        baseline,
+        "dropping a table releases exactly its own standing charge; a table \
+         that saw updates and deletes already returned those superseded and \
+         tombstoned versions' bytes when each superseding or deleting write \
+         committed, so crediting them a second time on DROP TABLE releases \
+         more than the table was actually costing and strands the \
+         accountant below the surviving table's own charge"
+    );
+}
+
 enum EdgeFate {
     DeletedBeforeExpiry,
     LiveAtExpiry,
