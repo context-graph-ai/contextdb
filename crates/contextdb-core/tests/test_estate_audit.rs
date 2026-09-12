@@ -50,12 +50,12 @@ const SLEEP_RATCHET: &[(&str, usize, &str)] = &[
         "upstream redb 4.1.0 write-transaction blocking regression; the maintained upstream suite stays byte-identical, including this one synchronization sleep",
     ),
     (
-        "crates/contextdb-engine/tests/checkpoint_export_tests.rs",
+        "crates/contextdb-engine/tests/engine/checkpoint_export_tests.rs",
         6,
         RSN_SYNC_BARRIER,
     ),
     (
-        "crates/contextdb-engine/tests/sql_surface_tests.rs",
+        "crates/contextdb-engine/tests/sql_surface/sql_surface_other.rs",
         3,
         "one site waits out a real 1s TTL before asserting pruning (needs paused time); two \
          sites are cross-process file-based barrier polls between a parent and a spawned child \
@@ -201,7 +201,7 @@ const RAW_CLOCK_RATCHET: &[(&str, usize, &str)] = &[
     // 2 (a scratch-dir naming site); removed in favor of `tempfile`, which
     // needs no raw clock read at all — lowered to 0 (absent from this list).
     (
-        "crates/contextdb-engine/tests/sql_surface_tests.rs",
+        "crates/contextdb-engine/tests/sql_surface/sql_surface_tests.rs",
         4,
         "asserts the SQL NOW()/CURRENT_TIMESTAMP function's output against the real wall clock; \
          needs an actual system-time reference for the comparison, not a sync barrier",

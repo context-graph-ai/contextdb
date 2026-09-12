@@ -111,7 +111,7 @@ Inputs are either carried inline (the `&[I]` argument, small payloads) or refere
 ### Worked example 2 — a job whose input is a blob reference, not inline bytes
 
 The shape for media/large-payload work (from the shipped test suite,
-`crates/contextdb-engine/tests/blob_ref_ledger.rs`) — no `&[u8]` payload travels through the
+`crates/contextdb-engine/tests/engine/blob_ref_ledger.rs`) — no `&[u8]` payload travels through the
 ledger at all, only the hash:
 
 ```rust

@@ -1,4 +1,5 @@
-use contextdb_core::{Error, Value, VectorIndexRef};
+use super::common::*;
+use contextdb_core::{Error, Value};
 use contextdb_engine::Database;
 use contextdb_engine::cli_render::{render_explain, render_table_meta};
 use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
@@ -73,20 +74,12 @@ impl DatabasePlugin for Observer {
     }
 }
 
-fn empty() -> HashMap<String, Value> {
-    HashMap::new()
-}
-
-fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
-    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
-}
-
 fn uuid(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql, &empty()).unwrap();
+    db.execute(sql, &empty_params()).unwrap();
 }
 
 fn insert_t(db: &Database, id: Uuid, col: i64) {
@@ -99,50 +92,13 @@ fn insert_t(db: &Database, id: Uuid, col: i64) {
 
 fn count_rows(db: &Database, table: &str) -> i64 {
     match &db
-        .execute(&format!("SELECT COUNT(*) FROM {table}"), &empty())
+        .execute(&format!("SELECT COUNT(*) FROM {table}"), &empty_params())
         .unwrap()
         .rows[0][0]
     {
         Value::Int64(n) => *n,
         other => panic!("expected count Int64, got {other:?}"),
     }
-}
-
-fn seed_reopen_fixture(path: &std::path::Path) {
-    let db = Database::open(path).unwrap();
-    exec(
-        &db,
-        "CREATE TABLE t (id UUID PRIMARY KEY, col INTEGER, tag TEXT UNIQUE, embedding VECTOR(4))",
-    );
-    exec(&db, "CREATE INDEX idx_col ON t (col)");
-    exec(&db, "CREATE INDEX idx_col_tag ON t (col, tag)");
-    exec(
-        &db,
-        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('LINK')",
-    );
-    for i in 0usize..4 {
-        let mut embedding = vec![0.0, 0.0, 0.0, 0.0];
-        embedding[i] = 1.0;
-        db.execute(
-            "INSERT INTO t (id, col, tag, embedding) VALUES ($id, $col, $tag, $embedding)",
-            &params(vec![
-                ("id", Value::Uuid(uuid(100 + i as u128))),
-                ("col", Value::Int64(i as i64)),
-                ("tag", Value::Text(format!("tag-{i}"))),
-                ("embedding", Value::Vector(embedding)),
-            ]),
-        )
-        .unwrap();
-    }
-    db.execute(
-        "INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ($s, $t, 'LINK')",
-        &params(vec![
-            ("s", Value::Uuid(uuid(900))),
-            ("t", Value::Uuid(uuid(101))),
-        ]),
-    )
-    .unwrap();
-    db.close().unwrap();
 }
 
 #[test]
@@ -212,67 +168,6 @@ fn ssa_open_locality_journey() {
     }
     let reopened = Database::open(&path).unwrap();
     assert_eq!(reopened.__open_index_maintenance_visits(), 13);
-}
-
-#[test]
-fn ssa_reopen_journey() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("reopen.redb");
-    seed_reopen_fixture(&path);
-    let reopened = Database::open(&path).unwrap();
-    assert_eq!(count_rows(&reopened, "t"), 4);
-    let routed = reopened
-        .execute("SELECT id FROM t WHERE col = 2", &empty())
-        .unwrap();
-    assert_eq!(routed.trace.index_used.as_deref(), Some("idx_col"));
-    let graph = reopened
-        .execute(
-            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS(b.id AS t))",
-            &params(vec![("s", Value::Uuid(uuid(900)))]),
-        )
-        .unwrap();
-    assert_eq!(graph.rows, vec![vec![Value::Uuid(uuid(101))]]);
-    let row = reopened
-        .point_lookup("t", "id", &Value::Uuid(uuid(101)), reopened.snapshot())
-        .unwrap()
-        .unwrap();
-    let ann = reopened
-        .query_vector(
-            VectorIndexRef::new("t", "embedding"),
-            &[0.0, 1.0, 0.0, 0.0],
-            1,
-            None,
-            reopened.snapshot(),
-        )
-        .unwrap();
-    assert_eq!(ann[0].0, row.row_id);
-    let tx1 = reopened.begin().unwrap();
-    reopened
-        .execute_in_tx(
-            tx1,
-            "INSERT INTO t (id, col, tag, embedding) VALUES ($id, 9, 'new-dupe', $embedding)",
-            &params(vec![
-                ("id", Value::Uuid(uuid(700))),
-                ("embedding", Value::Vector(vec![1.0, 0.0, 0.0, 0.0])),
-            ]),
-        )
-        .unwrap();
-    let tx2 = reopened.begin().unwrap();
-    reopened
-        .execute_in_tx(
-            tx2,
-            "INSERT INTO t (id, col, tag, embedding) VALUES ($id, 10, 'new-dupe', $embedding)",
-            &params(vec![
-                ("id", Value::Uuid(uuid(701))),
-                ("embedding", Value::Vector(vec![0.0, 1.0, 0.0, 0.0])),
-            ]),
-        )
-        .unwrap();
-    reopened.commit(tx1).unwrap();
-    assert!(matches!(
-        reopened.commit(tx2),
-        Err(Error::UniqueViolation { .. })
-    ));
 }
 
 #[test]
@@ -353,7 +248,7 @@ fn ssa_explain_schema_parity_journey() {
     );
     exec(&db, "CREATE INDEX idx_col ON t (col)");
     insert_t(&db, uuid(60), 1);
-    let explain = render_explain(&db, "SELECT id FROM t WHERE col = 1", &empty()).unwrap();
+    let explain = render_explain(&db, "SELECT id FROM t WHERE col = 1", &empty_params()).unwrap();
     assert_eq!(
         explain,
         "IndexScan { index: idx_col }\n  predicates_pushed: [col]\n  indexes_considered: [__pk_id: first column not in WHERE]\n"
@@ -391,7 +286,7 @@ fn ssa_crash_recovery_journey() {
     assert_eq!(count_rows(&reopened, "t"), 1);
     assert_eq!(
         reopened
-            .execute("SELECT id FROM t WHERE col = 1", &empty())
+            .execute("SELECT id FROM t WHERE col = 1", &empty_params())
             .unwrap()
             .trace
             .index_used

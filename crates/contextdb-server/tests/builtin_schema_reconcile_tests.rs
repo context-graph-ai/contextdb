@@ -43,7 +43,7 @@
 //! operator (or a peer) just opted out" — and the reconcile arms below could
 //! not tell the two apart, so they silently re-declared the engine's policy
 //! over an operator's own explicit choice. See
-//! `crates/contextdb-engine/tests/engine_owned_ledger_policy_tests.rs` for
+//! `crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs` for
 //! that door's own coverage; this file stays scoped to proving the
 //! reconcile heals a genuine legacy root end to end.
 

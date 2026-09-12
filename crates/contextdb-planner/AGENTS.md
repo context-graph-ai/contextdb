@@ -40,7 +40,7 @@ Never add a catalog handle here to make a plan "smarter".
 | A hop count over the engine cap is refused | `tests/planner_tests.rs::depth_over_cap_rejected` |
 | `PURGE` keeps its own plan, never lowered to `Delete` | `tests/purge_planner_contract_tests.rs::purge_plan_remains_distinct_from_ordinary_delete` |
 | Static explain never prints the key that selects a `ROW_VECTOR` source | `tests/vector_explain_redaction_contract.rs::static_vector_explain_redacts_every_supported_row_vector_source_key_shape` |
-| `USE VECTOR` on a query without a vector ordering is refused | `crates/contextdb-engine/tests/vector_partition_query_contract.rs::every_use_vector_mode_refuses_a_non_vector_ordering_query` |
+| `USE VECTOR` on a query without a vector ordering is refused | `crates/contextdb-engine/tests/vector/vector_partition_query_contract.rs::every_use_vector_mode_refuses_a_non_vector_ordering_query` |
 | `USE RANK` without a vector ordering, or without `LIMIT`, is refused | unguarded here (the variants appear only in engine wire-value documents) |
 | A `ROW_VECTOR` ordering must be the only `ORDER BY` item | unguarded |
 

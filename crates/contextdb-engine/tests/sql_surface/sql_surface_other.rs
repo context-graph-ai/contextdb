@@ -1,0 +1,10349 @@
+#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
+use contextdb_core::{ContextId, Error, Lsn, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
+use contextdb_engine::memory_accounting::MemoryAccountant;
+use contextdb_engine::{Database, sync_types as sync};
+use std::collections::{BTreeSet, HashMap};
+#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
+use std::sync::{atomic::{AtomicBool, Ordering}, mpsc::{self, TryRecvError}, Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+use uuid::Uuid;
+
+fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
+    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+}
+
+fn empty() -> HashMap<String, Value> {
+    HashMap::new()
+}
+
+fn disk_limit_kib_for_path(path: &std::path::Path, extra_kib: u64) -> u64 {
+    let bytes = std::fs::metadata(path).expect("metadata").len();
+    bytes.div_ceil(1024) + extra_kib
+}
+
+#[test]
+fn sql_01b_default_integer_literal_applies_on_omitted_insert() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, qty INTEGER DEFAULT 5)",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO items (id) VALUES ($id)",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT qty FROM items WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Int64(5));
+}
+
+#[test]
+fn sql_01c_default_real_literal_applies_on_omitted_insert() {
+    // This is docs/query-language.md's own canonical `tasks` example column:
+    // `confidence REAL DEFAULT 0.0`.
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE tasks (id UUID PRIMARY KEY, confidence REAL DEFAULT 0.0)",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO tasks (id) VALUES ($id)",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT confidence FROM tasks WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Float64(0.0));
+}
+
+#[test]
+fn sql_01d_numeric_defaults_survive_persisted_reopen() {
+    // The bug is in the PERSISTED representation of the default (the string
+    // written into table metadata), not just the in-session Expr. Prove the
+    // fix holds after a real close/reopen round-trip through the on-disk
+    // table metadata, not only against the freshly-created in-memory table.
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("sql_01d.db");
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.execute(
+            "CREATE TABLE tasks (id UUID PRIMARY KEY, confidence REAL DEFAULT 0.0, qty INTEGER DEFAULT 5)",
+            &empty(),
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+
+    let reopened = Database::open(&db_path).unwrap();
+    let id = Uuid::new_v4();
+    reopened
+        .execute(
+            "INSERT INTO tasks (id) VALUES ($id)",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+
+    let result = reopened
+        .execute(
+            "SELECT confidence, qty FROM tasks WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Float64(0.0));
+    assert_eq!(result.rows[0][1], Value::Int64(5));
+}
+
+#[test]
+fn sql_02_edge_insert_routes_to_graph_once() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    for _ in 0..2 {
+        db.execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("source_id", Value::Uuid(source)),
+                ("target_id", Value::Uuid(target)),
+                ("edge_type", Value::Text("RELATES_TO".to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let result = db
+        .execute(
+            "SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:RELATES_TO]->(b) WHERE a.id = $source_id COLUMNS (b.id AS b_id))",
+            &params(vec![("source_id", Value::Uuid(source))]),
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "graph traversal should see exactly one reachable target after duplicate SQL edge inserts"
+    );
+    assert_eq!(result.rows[0][0], Value::Uuid(target));
+}
+
+#[test]
+fn sql_03_group_by_clean_error() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, tag TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let err = db
+        .execute("SELECT tag, COUNT(*) FROM items GROUP BY tag", &empty())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("GROUP BY") && err.contains("not supported"),
+        "expected a clean GROUP BY not-supported error, got: {err}"
+    );
+}
+
+#[test]
+fn sql_04_join_ambiguous_column_error() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE left_t (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE right_t (id UUID PRIMARY KEY, name TEXT, value INT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO left_t (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("left".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO right_t (id, name, value) VALUES ($id, $name, $value)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("right".into())),
+            ("value", Value::Int64(1)),
+        ]),
+    )
+    .unwrap();
+
+    let err = db
+        .execute(
+            "SELECT name FROM left_t INNER JOIN right_t ON left_t.id = right_t.id",
+            &empty(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("ambiguous"),
+        "expected ambiguous column error, got: {err}"
+    );
+}
+
+#[test]
+fn sql_05_scenario3_multi_hop_cascade() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT, status TEXT) STATE MACHINE (status: active -> [archived, paused, superseded])",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated, embedding VECTOR(128)) STATE MACHINE (status: active -> [invalidated, superseded]) PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES')",
+        &empty(),
+    )
+    .unwrap();
+
+    let intention_id = Uuid::new_v4();
+    let decision_a = Uuid::new_v4();
+    let decision_b = Uuid::new_v4();
+
+    db.execute(
+        "INSERT INTO intentions (id, description, status) VALUES ($id, $description, $status)",
+        &params(vec![
+            ("id", Value::Uuid(intention_id)),
+            ("description", Value::Text("root".into())),
+            ("status", Value::Text("active".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO decisions (id, description, status, intention_id) VALUES ($id, $description, $status, $intention_id)",
+        &params(vec![
+            ("id", Value::Uuid(decision_a)),
+            ("description", Value::Text("a".into())),
+            ("status", Value::Text("active".into())),
+            ("intention_id", Value::Uuid(intention_id)),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO decisions (id, description, status, intention_id) VALUES ($id, $description, $status, $intention_id)",
+        &params(vec![
+            ("id", Value::Uuid(decision_b)),
+            ("description", Value::Text("b".into())),
+            ("status", Value::Text("active".into())),
+            ("intention_id", Value::Uuid(intention_id)),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(decision_b)),
+            ("target_id", Value::Uuid(decision_a)),
+            ("edge_type", Value::Text("CITES".into())),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "UPDATE intentions SET status = 'archived' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(intention_id))]),
+    )
+    .unwrap();
+
+    let decision_a_row = db
+        .execute(
+            "SELECT status FROM decisions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(decision_a))]),
+        )
+        .unwrap();
+    let decision_b_row = db
+        .execute(
+            "SELECT status FROM decisions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(decision_b))]),
+        )
+        .unwrap();
+    assert_eq!(decision_a_row.rows[0][0], Value::Text("invalidated".into()));
+    assert_eq!(decision_b_row.rows[0][0], Value::Text("invalidated".into()));
+}
+
+#[test]
+fn sql_06_uuid_column_validation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let result = db.execute("INSERT INTO items VALUES ('not-a-uuid', 'test')", &empty());
+    assert!(
+        result.is_err(),
+        "invalid UUID literal should be rejected, but insert succeeded"
+    );
+}
+
+#[test]
+fn sql_07_join_double_qualification() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE employees (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE orders (id UUID PRIMARY KEY, name TEXT, employee_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+
+    let employee_id = Uuid::new_v4();
+    let order_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO employees (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(employee_id)),
+            ("name", Value::Text("employee".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO orders (id, name, employee_id) VALUES ($id, $name, $employee_id)",
+        &params(vec![
+            ("id", Value::Uuid(order_id)),
+            ("name", Value::Text("order".into())),
+            ("employee_id", Value::Uuid(employee_id)),
+        ]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT e.name, o.name FROM employees e INNER JOIN orders o ON e.id = o.employee_id",
+            &empty(),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Text("employee".into()));
+    assert_eq!(result.rows[0][1], Value::Text("order".into()));
+}
+
+#[test]
+fn sql_08_distinct_not_quadratic() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, tag TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    for i in 0..1_000 {
+        let tag = format!("tag-{}", i % 100);
+        db.execute(
+            "INSERT INTO items (id, tag) VALUES ($id, $tag)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("tag", Value::Text(tag)),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let result = db
+        .execute("SELECT DISTINCT tag FROM items", &empty())
+        .unwrap();
+    assert_eq!(result.rows.len(), 100);
+}
+
+#[test]
+fn jn_04_cte_graph_join_relational() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let eid1 = Uuid::new_v4();
+    let eid2 = Uuid::new_v4();
+    let eid3 = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO entities (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(eid1)),
+            ("name", Value::Text("root".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO entities (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(eid2)),
+            ("name", Value::Text("child".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO entities (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(eid3)),
+            ("name", Value::Text("orphan".into())),
+        ]),
+    )
+    .unwrap();
+
+    // Insert edge via transaction (graph subsystem)
+    let tx = db.begin_or_panic();
+    db.insert_edge(tx, eid1, eid2, "DEPENDS_ON".into(), HashMap::new())
+        .unwrap();
+    // Also insert into edges table for relational consistency
+    db.insert_row(tx, "edges", {
+        let mut m = HashMap::new();
+        m.insert("id".to_string(), Value::Uuid(Uuid::new_v4()));
+        m.insert("source_id".to_string(), Value::Uuid(eid1));
+        m.insert("target_id".to_string(), Value::Uuid(eid2));
+        m.insert("edge_type".to_string(), Value::Text("DEPENDS_ON".into()));
+        m
+    })
+    .unwrap();
+    db.commit(tx).unwrap();
+
+    let result = db
+        .execute(
+            "WITH reachable AS (
+            SELECT b_id FROM GRAPH_TABLE(
+                edges MATCH (a)-[:DEPENDS_ON]->(b)
+                WHERE a.id = $root_id
+                COLUMNS (b.id AS b_id)
+            )
+        )
+        SELECT e.name FROM entities e INNER JOIN reachable r ON e.id = r.b_id",
+            &params(vec![("root_id", Value::Uuid(eid1))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
+    assert_eq!(result.rows[0][name_idx], Value::Text("child".into()));
+}
+
+#[test]
+fn jn_06_cte_filtered_vector_ordering_executes() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, embedding VECTOR(3), is_deprecated BOOLEAN)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let root = Uuid::new_v4();
+    let near = Uuid::new_v4();
+    let far = Uuid::new_v4();
+
+    for (id, name, embedding) in [
+        (root, "root", vec![0.0, 0.0, 1.0]),
+        (near, "near", vec![1.0, 0.0, 0.0]),
+        (far, "far", vec![0.0, 1.0, 0.0]),
+    ] {
+        db.execute(
+            "INSERT INTO entities (id, name, embedding, is_deprecated) VALUES ($id, $name, $embedding, $deprecated)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text(name.into())),
+                ("embedding", Value::Vector(embedding)),
+                ("deprecated", Value::Bool(false)),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let tx = db.begin_or_panic();
+    for target in [near, far] {
+        db.insert_edge(tx, root, target, "RELATES_TO".into(), HashMap::new())
+            .unwrap();
+        db.insert_row(tx, "edges", {
+            let mut m = HashMap::new();
+            m.insert("id".to_string(), Value::Uuid(Uuid::new_v4()));
+            m.insert("source_id".to_string(), Value::Uuid(root));
+            m.insert("target_id".to_string(), Value::Uuid(target));
+            m.insert("edge_type".to_string(), Value::Text("RELATES_TO".into()));
+            m
+        })
+        .unwrap();
+    }
+    db.commit(tx).unwrap();
+
+    let result = db
+        .execute(
+            "WITH neighborhood AS (
+                SELECT b_id FROM GRAPH_TABLE(
+                    edges MATCH (a)-[:RELATES_TO]->(b)
+                    WHERE a.id = $root_id
+                    COLUMNS (b.id AS b_id)
+                )
+            ),
+            filtered AS (
+                SELECT id, name, embedding
+                FROM entities e
+                INNER JOIN neighborhood n ON e.id = n.b_id
+                WHERE e.is_deprecated = FALSE
+            )
+            SELECT id, name FROM filtered ORDER BY embedding <=> $query LIMIT 2",
+            &params(vec![
+                ("root_id", Value::Uuid(root)),
+                ("query", Value::Vector(vec![1.0, 0.0, 0.0])),
+            ]),
+        )
+        .expect("CTE-backed vector ordering should execute");
+
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][0], Value::Uuid(near));
+    assert_eq!(result.rows[0][1], Value::Text("near".into()));
+    assert_eq!(result.rows[1][0], Value::Uuid(far));
+    assert_eq!(result.rows[1][1], Value::Text("far".into()));
+}
+
+fn sarg_uuid(n: u128) -> Uuid {
+    Uuid::from_u128(n)
+}
+
+fn sarg_contexts(contexts: &[Uuid]) -> BTreeSet<ContextId> {
+    contexts.iter().copied().map(ContextId::new).collect()
+}
+
+fn sarg_labels(labels: &[&str]) -> BTreeSet<ScopeLabel> {
+    labels.iter().copied().map(ScopeLabel::new).collect()
+}
+
+fn sarg_insert_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str) {
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(source)),
+            ("target_id", Value::Uuid(target)),
+            ("edge_type", Value::Text(edge_type.to_string())),
+        ]),
+    )
+    .unwrap();
+}
+
+fn sarg_insert_context_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str, ctx: Uuid) {
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id) VALUES ($id, $source_id, $target_id, $edge_type, $ctx)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(source)),
+            ("target_id", Value::Uuid(target)),
+            ("edge_type", Value::Text(edge_type.to_string())),
+            ("ctx", Value::Uuid(ctx)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn sarg_insert_node(db: &Database, id: Uuid, ctx: Option<Uuid>, kind: Option<&str>) {
+    match (ctx, kind) {
+        (Some(ctx), Some(kind)) => db
+            .execute(
+                "INSERT INTO nodes (id, context_id, kind) VALUES ($id, $ctx, $kind)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("ctx", Value::Uuid(ctx)),
+                    ("kind", Value::Text(kind.to_string())),
+                ]),
+            )
+            .unwrap(),
+        (Some(ctx), None) => db
+            .execute(
+                "INSERT INTO nodes (id, context_id) VALUES ($id, $ctx)",
+                &params(vec![("id", Value::Uuid(id)), ("ctx", Value::Uuid(ctx))]),
+            )
+            .unwrap(),
+        (None, Some(kind)) => db
+            .execute(
+                "INSERT INTO nodes (id, kind) VALUES ($id, $kind)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("kind", Value::Text(kind.to_string())),
+                ]),
+            )
+            .unwrap(),
+        (None, None) => db
+            .execute(
+                "INSERT INTO nodes (id) VALUES ($id)",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .unwrap(),
+    };
+}
+
+fn sarg_uuid_column_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<Uuid> {
+    let idx = result
+        .columns
+        .iter()
+        .position(|c| c == column || c.rsplit('.').next() == Some(column))
+        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns));
+    result
+        .rows
+        .iter()
+        .map(|row| match &row[idx] {
+            Value::Uuid(id) => *id,
+            other => panic!("expected UUID in column {column}, got {other:?}"),
+        })
+        .collect()
+}
+
+fn sarg_row_id_for_uuid(db: &Database, table: &str, id: Uuid) -> RowId {
+    db.scan(table, db.snapshot())
+        .unwrap()
+        .into_iter()
+        .find(|row| row.values.get("id") == Some(&Value::Uuid(id)))
+        .map(|row| row.row_id)
+        .unwrap_or_else(|| panic!("row {id} not found in {table}"))
+}
+
+fn sarg_expect_context_violation(err: Error, requested: Uuid, allowed: &[Uuid]) {
+    match err {
+        Error::ContextScopeViolation {
+            requested: got_requested,
+            allowed: got_allowed,
+        } => {
+            assert_eq!(got_requested, ContextId::new(requested));
+            assert_eq!(got_allowed, sarg_contexts(allowed));
+        }
+        other => panic!("expected ContextScopeViolation, got {other:?}"),
+    }
+}
+
+fn sarg_expect_scope_violation(err: Error, requested: &str, allowed: &[&str]) {
+    match err {
+        Error::ScopeLabelViolation {
+            requested: got_requested,
+            allowed: got_allowed,
+        } => {
+            assert_eq!(got_requested, ScopeLabel::new(requested));
+            assert_eq!(got_allowed, sarg_labels(allowed));
+        }
+        other => panic!("expected ScopeLabelViolation, got {other:?}"),
+    }
+}
+
+fn sarg_expect_acl_denied(err: Error, table: &str, row_id: RowId, principal: &str) {
+    match err {
+        Error::AclDenied {
+            table: got_table,
+            row_id: got_row_id,
+            principal: got_principal,
+        } => {
+            assert_eq!(got_table, table);
+            assert_eq!(got_row_id, row_id);
+            assert_eq!(got_principal, Principal::Agent(principal.to_string()));
+        }
+        other => panic!("expected AclDenied, got {other:?}"),
+    }
+}
+
+fn ga_uuid(n: u128) -> Uuid {
+    Uuid::from_u128(0xA000_0000_0000_0000_0000_0000_0000_0000 + n)
+}
+
+fn ga_create_graph_tables(db: &Database, node_columns: &str, edge_suffix: &str) {
+    db.execute(
+        &format!("CREATE TABLE nodes (id UUID PRIMARY KEY{node_columns})"),
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        &format!(
+            "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT{edge_suffix})"
+        ),
+        &empty(),
+    )
+    .unwrap();
+}
+
+fn ga_insert_node(db: &Database, id: Uuid, extras: &[(&str, Value)]) {
+    let mut columns = vec!["id".to_string()];
+    let mut placeholders = vec!["$id".to_string()];
+    let mut values = HashMap::from([("id".to_string(), Value::Uuid(id))]);
+    for (column, value) in extras {
+        columns.push((*column).to_string());
+        placeholders.push(format!("${column}"));
+        values.insert((*column).to_string(), value.clone());
+    }
+    db.execute(
+        &format!(
+            "INSERT INTO nodes ({}) VALUES ({})",
+            columns.join(", "),
+            placeholders.join(", ")
+        ),
+        &values,
+    )
+    .unwrap();
+}
+
+fn ga_insert_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str) {
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source", Value::Uuid(source)),
+            ("target", Value::Uuid(target)),
+            ("edge_type", Value::Text(edge_type.to_string())),
+        ]),
+    )
+    .unwrap();
+}
+
+fn ga_insert_edge_with_context(
+    db: &Database,
+    source: Uuid,
+    target: Uuid,
+    edge_type: &str,
+    context: Uuid,
+) {
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id) VALUES ($id, $source, $target, $edge_type, $context)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source", Value::Uuid(source)),
+            ("target", Value::Uuid(target)),
+            ("edge_type", Value::Text(edge_type.to_string())),
+            ("context", Value::Uuid(context)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn ga_seed_unrelated_edges(db: &Database, base: u128, count: usize, edge_type: &str) {
+    for i in 0..count {
+        ga_insert_edge(
+            db,
+            ga_uuid(base + (i as u128 * 2)),
+            ga_uuid(base + (i as u128 * 2) + 1),
+            edge_type,
+        );
+    }
+}
+
+fn ga_uuid_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<Uuid> {
+    sarg_uuid_column_set(result, column)
+}
+
+fn ga_assert_trace(
+    result: &contextdb_engine::QueryResult,
+    physical_plan: &str,
+    index_used: Option<&str>,
+    predicates: &[&str],
+    indexes_considered_len: usize,
+) {
+    assert_eq!(result.trace.physical_plan, physical_plan);
+    assert_eq!(result.trace.index_used.as_deref(), index_used);
+    let pushed: Vec<&str> = result
+        .trace
+        .predicates_pushed
+        .iter()
+        .map(|predicate| predicate.as_ref())
+        .collect();
+    assert_eq!(pushed, predicates);
+    assert_eq!(
+        result.trace.indexes_considered.len(),
+        indexes_considered_len,
+        "unexpected indexes_considered: {:?}",
+        result.trace.indexes_considered
+    );
+}
+
+#[test]
+fn ga01_forward_pinned_single_hop_reports_forward_adjacency_probe() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    let x = ga_uuid(1);
+    let targets: BTreeSet<_> = (0..5).map(|i| ga_uuid(10 + i)).collect();
+    ga_insert_node(&db, x, &[("name", Value::Text("x".into()))]);
+    for target in &targets {
+        ga_insert_node(
+            &db,
+            *target,
+            &[("name", Value::Text(format!("target-{target}")))],
+        );
+        ga_insert_edge(&db, x, *target, "LINKS");
+    }
+    for i in 0..7 {
+        let off_type = ga_uuid(9_000 + i);
+        ga_insert_node(
+            &db,
+            off_type,
+            &[("name", Value::Text(format!("off-type-{i}")))],
+        );
+        ga_insert_edge(&db, x, off_type, "MENTIONS");
+    }
+    ga_seed_unrelated_edges(&db, 10_000, 2_001, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), targets);
+    assert_eq!(result.rows.len(), targets.len());
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert!(
+        result
+            .trace
+            .predicates_pushed
+            .iter()
+            .any(|predicate| predicate.as_ref() == "a.id"),
+        "expected a.id in predicates_pushed, got {:?}",
+        result.trace.predicates_pushed
+    );
+    assert_eq!(db.__rows_examined(), 5);
+}
+
+#[test]
+fn ga02_reverse_pinned_single_hop_reports_reverse_adjacency_probe() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    let intention = ga_uuid(100);
+    let decisions: BTreeSet<_> = (0..4).map(|i| ga_uuid(110 + i)).collect();
+    ga_insert_node(&db, intention, &[("name", Value::Text("intention".into()))]);
+    for decision in &decisions {
+        ga_insert_node(
+            &db,
+            *decision,
+            &[("name", Value::Text(format!("decision-{decision}")))],
+        );
+        ga_insert_edge(&db, *decision, intention, "SERVES");
+    }
+    for i in 0..6 {
+        let off_type = ga_uuid(19_000 + i);
+        ga_insert_node(
+            &db,
+            off_type,
+            &[("name", Value::Text(format!("off-type-{i}")))],
+        );
+        ga_insert_edge(&db, off_type, intention, "BLOCKS");
+    }
+    ga_seed_unrelated_edges(&db, 20_000, 2_003, "SERVES");
+
+    let result = db
+        .execute(
+            "SELECT d FROM GRAPH_TABLE(edges MATCH (a)<-[:SERVES]-(b) WHERE a.id = $i COLUMNS (b.id AS d))",
+            &params(vec![("i", Value::Uuid(intention))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "d"), decisions);
+    assert_eq!(result.rows.len(), decisions.len());
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("reverse_adj"));
+    assert_eq!(db.__rows_examined(), 4);
+}
+
+#[test]
+fn ga03_both_pinned_positive_applies_target_residual_after_degree_walk() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(200);
+    let y = ga_uuid(211);
+    for id in [x, y, ga_uuid(210), ga_uuid(212)] {
+        ga_insert_node(&db, id, &[]);
+    }
+    for target in [ga_uuid(210), y, ga_uuid(212)] {
+        ga_insert_edge(&db, x, target, "LINKS");
+    }
+    ga_seed_unrelated_edges(&db, 30_000, 2_000, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x AND b.id = $y COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x)), ("y", Value::Uuid(y))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(
+        result
+            .trace
+            .predicates_pushed
+            .iter()
+            .any(|p| p.as_ref() == "a.id")
+            && result
+                .trace
+                .predicates_pushed
+                .iter()
+                .any(|p| p.as_ref() == "b.id"),
+        "expected a.id and b.id predicates, got {:?}",
+        result.trace.predicates_pushed
+    );
+    assert_eq!(db.__rows_examined(), 3);
+}
+
+#[test]
+fn ga04_unpinned_single_hop_reports_honest_edges_scan_rejection() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let pairs = [
+        (ga_uuid(300), ga_uuid(301)),
+        (ga_uuid(302), ga_uuid(303)),
+        (ga_uuid(304), ga_uuid(305)),
+    ];
+    for (source, target) in pairs {
+        ga_insert_node(&db, source, &[]);
+        ga_insert_node(&db, target, &[]);
+        ga_insert_edge(&db, source, target, "LINKS");
+    }
+
+    let result = db
+        .execute(
+            "SELECT s, t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) COLUMNS (a.id AS s, b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+
+    let rows: BTreeSet<_> = result
+        .rows
+        .iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Uuid(source), Value::Uuid(target)) => (*source, *target),
+            other => panic!("expected UUID pair, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(rows, BTreeSet::from(pairs));
+    assert_eq!(result.trace.physical_plan, "EdgesScan");
+    assert_eq!(result.trace.index_used, None);
+    let considered: Vec<(&str, &str)> = result
+        .trace
+        .indexes_considered
+        .iter()
+        .map(|candidate| (candidate.name.as_str(), candidate.rejected_reason.as_ref()))
+        .collect();
+    assert_eq!(considered, vec![("forward_adj", "no pinned vertex")]);
+    assert_eq!(db.__rows_examined(), 3);
+}
+
+#[test]
+fn ga05_non_id_pinned_start_resolves_through_index_then_probes() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    db.execute("CREATE INDEX idx_nodes_name ON nodes (name)", &empty())
+        .unwrap();
+    let x = ga_uuid(400);
+    let x2 = ga_uuid(401);
+    let first_targets: BTreeSet<_> = (0..6).map(|i| ga_uuid(410 + i)).collect();
+    let second_targets: BTreeSet<_> = (0..3).map(|i| ga_uuid(430 + i)).collect();
+    let targets: BTreeSet<_> = first_targets.union(&second_targets).copied().collect();
+    ga_insert_node(&db, x, &[("name", Value::Text("seed".into()))]);
+    ga_insert_node(&db, x2, &[("name", Value::Text("seed".into()))]);
+    for target in &first_targets {
+        ga_insert_node(
+            &db,
+            *target,
+            &[("name", Value::Text(format!("target-{target}")))],
+        );
+        ga_insert_edge(&db, x, *target, "LINKS");
+    }
+    for target in &second_targets {
+        ga_insert_node(
+            &db,
+            *target,
+            &[("name", Value::Text(format!("target-{target}")))],
+        );
+        ga_insert_edge(&db, x2, *target, "LINKS");
+    }
+    for i in 0..2_001 {
+        ga_insert_node(
+            &db,
+            ga_uuid(40_000 + i),
+            &[("name", Value::Text(format!("other-{i}")))],
+        );
+    }
+    ga_seed_unrelated_edges(&db, 50_000, 2_001, "LINKS");
+    let sanity = db
+        .execute("SELECT id FROM nodes WHERE name = 'seed'", &empty())
+        .unwrap();
+    assert_eq!(ga_uuid_set(&sanity, "id"), BTreeSet::from([x, x2]));
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.name = 'seed' COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), targets);
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(db.__rows_examined(), 2 + 9);
+}
+
+#[test]
+fn ga06_variable_length_traversal_reports_graph_bfs_without_changing_results() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(500);
+    let n1 = ga_uuid(501);
+    let n2 = ga_uuid(502);
+    let n3 = ga_uuid(503);
+    let side = ga_uuid(504);
+    for id in [x, n1, n2, n3, side] {
+        ga_insert_node(&db, id, &[]);
+    }
+    for (source, target) in [(x, n1), (n1, n2), (n2, n3), (x, side)] {
+        ga_insert_edge(&db, source, target, "LINKS");
+    }
+    ga_seed_unrelated_edges(&db, 60_000, 2_000, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,3}(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        ga_uuid_set(&result, "t"),
+        BTreeSet::from([n1, n2, n3, side])
+    );
+    assert_eq!(result.trace.physical_plan, "GraphBfs");
+    assert_eq!(db.__rows_examined(), 4);
+}
+
+#[test]
+fn ga07_pre_insert_snapshot_does_not_see_later_edge() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(600);
+    let y = ga_uuid(601);
+    ga_insert_node(&db, x, &[]);
+    ga_insert_node(&db, y, &[]);
+    let snap = db.snapshot();
+    ga_insert_edge(&db, x, y, "LINKS");
+
+    let result = db
+        .execute_at_snapshot(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+            snap,
+        )
+        .unwrap();
+
+    assert!(result.rows.is_empty());
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(db.__rows_examined(), 0);
+}
+
+#[test]
+fn ga08_delete_visibility_respects_pre_and_post_delete_snapshots() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(700);
+    let y = ga_uuid(701);
+    ga_insert_node(&db, x, &[]);
+    ga_insert_node(&db, y, &[]);
+    ga_insert_edge(&db, x, y, "LINKS");
+    let snap_before = db.snapshot();
+    let tx = db.begin_or_panic();
+    db.delete_edge(tx, x, y, "LINKS").unwrap();
+    db.commit(tx).unwrap();
+    let snap_after = db.snapshot();
+
+    let before = db
+        .execute_at_snapshot(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+            snap_before,
+        )
+        .unwrap();
+    let before_examined = db.__rows_examined();
+    let after = db
+        .execute_at_snapshot(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+            snap_after,
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&before, "t"), BTreeSet::from([y]));
+    assert_eq!(before.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(before.trace.index_used.as_deref(), Some("forward_adj"));
+    assert!(after.rows.is_empty());
+    assert_eq!(after.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(after.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(before_examined, 1);
+    assert_eq!(db.__rows_examined(), 0);
+}
+
+#[test]
+fn ga09_same_transaction_staged_edge_is_visible_only_inside_transaction() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(800);
+    let committed = ga_uuid(801);
+    let staged = ga_uuid(802);
+    let off_type = ga_uuid(803);
+    for id in [x, committed, staged, off_type] {
+        ga_insert_node(&db, id, &[]);
+    }
+    ga_insert_edge(&db, x, committed, "LINKS");
+    let tx = db.begin_or_panic();
+    db.insert_edge(tx, x, staged, "LINKS".into(), HashMap::new())
+        .unwrap();
+    db.insert_edge(tx, x, off_type, "BLOCKS".into(), HashMap::new())
+        .unwrap();
+
+    let in_tx = db
+        .execute_in_tx(
+            tx,
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+    let in_tx_examined = db.__rows_examined();
+    let outside_tx = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+    let outside_tx_examined = db.__rows_examined();
+    db.rollback(tx).unwrap();
+
+    assert_eq!(
+        ga_uuid_set(&in_tx, "t"),
+        BTreeSet::from([committed, staged])
+    );
+    assert_eq!(in_tx.rows.len(), 2);
+    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(in_tx.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(in_tx_examined, 2);
+    assert_eq!(ga_uuid_set(&outside_tx, "t"), BTreeSet::from([committed]));
+    assert_eq!(outside_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(outside_tx.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(outside_tx_examined, 1);
+
+    let x2 = ga_uuid(810);
+    let y2 = ga_uuid(811);
+    ga_insert_node(&db, x2, &[]);
+    ga_insert_node(&db, y2, &[]);
+    ga_insert_edge(&db, x2, y2, "LINKS");
+    let delete_tx = db.begin_or_panic();
+    db.delete_edge(delete_tx, x2, y2, "LINKS").unwrap();
+
+    let deleted_in_tx = db
+        .execute_in_tx(
+            delete_tx,
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x2))]),
+        )
+        .unwrap();
+    let deleted_in_tx_examined = db.__rows_examined();
+    let delete_outside_tx = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x2))]),
+        )
+        .unwrap();
+    let delete_outside_examined = db.__rows_examined();
+    db.rollback(delete_tx).unwrap();
+
+    assert!(deleted_in_tx.rows.is_empty());
+    assert_eq!(deleted_in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(
+        deleted_in_tx.trace.index_used.as_deref(),
+        Some("forward_adj")
+    );
+    assert_eq!(deleted_in_tx_examined, 0);
+    assert_eq!(ga_uuid_set(&delete_outside_tx, "t"), BTreeSet::from([y2]));
+    assert_eq!(delete_outside_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(
+        delete_outside_tx.trace.index_used.as_deref(),
+        Some("forward_adj")
+    );
+    assert_eq!(delete_outside_examined, 1);
+}
+
+#[test]
+fn ga10_rolled_back_staged_edge_never_leaks_to_later_read() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(900);
+    let y = ga_uuid(901);
+    ga_insert_node(&db, x, &[]);
+    ga_insert_node(&db, y, &[]);
+    let tx = db.begin_or_panic();
+    db.insert_edge(tx, x, y, "LINKS".into(), HashMap::new())
+        .unwrap();
+    db.rollback(tx).unwrap();
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+
+    assert!(result.rows.is_empty());
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(db.__rows_examined(), 0);
+}
+
+#[test]
+fn ga11_dag_edge_type_forward_probe_matches_plain_edge_type() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('LINKS')",
+        &empty(),
+    )
+    .unwrap();
+    let x = ga_uuid(1_000);
+    let y = ga_uuid(1_001);
+    ga_insert_node(&db, x, &[]);
+    ga_insert_node(&db, y, &[]);
+    ga_insert_edge(&db, x, y, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(db.__rows_examined(), 1);
+}
+
+#[test]
+fn ga12_forward_probe_trace_tuple_is_exact() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(1_100);
+    let y = ga_uuid(1_101);
+    ga_insert_node(&db, x, &[]);
+    ga_insert_node(&db, y, &[]);
+    ga_insert_edge(&db, x, y, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
+    ga_assert_trace(&result, "AdjacencyProbe", Some("forward_adj"), &["a.id"], 0);
+    assert_eq!(db.__rows_examined(), 1);
+}
+
+#[test]
+fn ga13_indexed_subquery_start_feeds_probe_with_combined_accounting() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", kind TEXT", "");
+    db.execute("CREATE INDEX idx_nodes_kind ON nodes (kind)", &empty())
+        .unwrap();
+    let mut expected = BTreeSet::new();
+    for root_idx in 0..3 {
+        let root = ga_uuid(1_200 + root_idx);
+        ga_insert_node(&db, root, &[("kind", Value::Text("root".into()))]);
+        for target_idx in 0..10 {
+            let target = ga_uuid(1_300 + root_idx * 100 + target_idx);
+            ga_insert_node(&db, target, &[("kind", Value::Text("target".into()))]);
+            ga_insert_edge(&db, root, target, "LINKS");
+            expected.insert(target);
+        }
+    }
+    for i in 0..2_000 {
+        ga_insert_node(
+            &db,
+            ga_uuid(70_000 + i),
+            &[("kind", Value::Text(format!("noise-{i}")))],
+        );
+    }
+    ga_seed_unrelated_edges(&db, 80_000, 2_000, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id IN (SELECT id FROM nodes WHERE kind = 'root') COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), expected);
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(db.__rows_examined(), 3 + 30);
+}
+
+#[test]
+fn ga14_both_pinned_negative_residual_returns_empty_after_degree_walk() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(1_400);
+    let z = ga_uuid(1_499);
+    ga_insert_node(&db, x, &[]);
+    ga_insert_node(&db, z, &[]);
+    for i in 0..4 {
+        let target = ga_uuid(1_410 + i);
+        ga_insert_node(&db, target, &[]);
+        ga_insert_edge(&db, x, target, "LINKS");
+    }
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x AND b.id = $z COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x)), ("z", Value::Uuid(z))]),
+        )
+        .unwrap();
+
+    assert!(result.rows.is_empty());
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(db.__rows_examined(), 4);
+}
+
+#[test]
+fn ga16_empty_start_vertex_still_reports_adjacency_probe() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(1_600);
+    ga_insert_node(&db, x, &[]);
+    ga_seed_unrelated_edges(&db, 90_000, 20, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+
+    assert!(result.rows.is_empty());
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(db.__rows_examined(), 0);
+}
+
+#[test]
+fn ga17_non_id_start_with_target_residual_pushes_start_predicate_only() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    db.execute("CREATE INDEX idx_nodes_name ON nodes (name)", &empty())
+        .unwrap();
+    let x = ga_uuid(1_700);
+    let y = ga_uuid(1_702);
+    ga_insert_node(&db, x, &[("name", Value::Text("seed".into()))]);
+    for i in 0..5 {
+        let target = ga_uuid(1_701 + i);
+        ga_insert_node(&db, target, &[("name", Value::Text(format!("target-{i}")))]);
+        ga_insert_edge(&db, x, target, "LINKS");
+    }
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.name = 'seed' AND b.id = $y COLUMNS (b.id AS t))",
+            &params(vec![("y", Value::Uuid(y))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(
+        result
+            .trace
+            .predicates_pushed
+            .iter()
+            .any(|p| p.as_ref() == "a.name"),
+        "expected a.name in predicates_pushed, got {:?}",
+        result.trace.predicates_pushed
+    );
+    assert!(
+        !result
+            .trace
+            .predicates_pushed
+            .iter()
+            .any(|p| p.as_ref() == "b.id"),
+        "b.id is a target residual and must not be reported as routed start predicate: {:?}",
+        result.trace.predicates_pushed
+    );
+    assert_eq!(db.__rows_examined(), 1 + 5);
+}
+
+#[test]
+fn ga18_undirected_pinned_single_hop_probes_forward_and_reverse_maps() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let x = ga_uuid(1_800);
+    ga_insert_node(&db, x, &[]);
+    let forward: BTreeSet<_> = (0..3).map(|i| ga_uuid(1_810 + i)).collect();
+    let reverse: BTreeSet<_> = (0..2).map(|i| ga_uuid(1_820 + i)).collect();
+    let shared = ga_uuid(1_830);
+    for target in &forward {
+        ga_insert_node(&db, *target, &[]);
+        ga_insert_edge(&db, x, *target, "LINK");
+    }
+    for source in &reverse {
+        ga_insert_node(&db, *source, &[]);
+        ga_insert_edge(&db, *source, x, "LINK");
+    }
+    ga_insert_node(&db, shared, &[]);
+    ga_insert_edge(&db, x, shared, "LINK");
+    ga_insert_edge(&db, shared, x, "LINK");
+    ga_seed_unrelated_edges(&db, 100_000, 100, "LINK");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINK]-(b) WHERE a.id = $x COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+
+    let expected: BTreeSet<_> = forward.union(&reverse).copied().collect();
+    let expected: BTreeSet<_> = expected.into_iter().chain([shared]).collect();
+    assert_eq!(ga_uuid_set(&result, "t"), expected);
+    assert_eq!(result.rows.len(), expected.len());
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(db.__rows_examined(), 3 + 2 + 2);
+}
+
+#[test]
+fn ga19_non_indexed_non_id_start_reports_honest_resolution_scan_plus_probe() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", kind TEXT", "");
+    let x = ga_uuid(1_900);
+    let x2 = ga_uuid(1_901);
+    let first_targets: BTreeSet<_> = (0..4).map(|i| ga_uuid(1_910 + i)).collect();
+    let second_targets: BTreeSet<_> = (0..2).map(|i| ga_uuid(1_930 + i)).collect();
+    let targets: BTreeSet<_> = first_targets.union(&second_targets).copied().collect();
+    ga_insert_node(&db, x, &[("kind", Value::Text("root".into()))]);
+    ga_insert_node(&db, x2, &[("kind", Value::Text("root".into()))]);
+    for target in &first_targets {
+        ga_insert_node(&db, *target, &[("kind", Value::Text("target".into()))]);
+        ga_insert_edge(&db, x, *target, "LINKS");
+    }
+    for target in &second_targets {
+        ga_insert_node(&db, *target, &[("kind", Value::Text("target".into()))]);
+        ga_insert_edge(&db, x2, *target, "LINKS");
+    }
+    for i in 0..2_000 {
+        ga_insert_node(
+            &db,
+            ga_uuid(110_000 + i),
+            &[("kind", Value::Text(format!("other-{i}")))],
+        );
+    }
+    let nodes_count = 2 + targets.len() + 2_000;
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.kind = 'root' COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), targets);
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(db.__rows_examined(), nodes_count as u64 + 6);
+}
+
+#[test]
+fn ga21_start_id_residual_is_resolved_before_probe() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    let x = ga_uuid(2_000);
+    let target = ga_uuid(2_001);
+    ga_insert_node(&db, x, &[("name", Value::Text("seed".into()))]);
+    ga_insert_node(&db, target, &[("name", Value::Text("target".into()))]);
+    ga_insert_edge(&db, x, target, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x AND a.name = 'other' COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+
+    assert!(result.rows.is_empty());
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+}
+
+#[test]
+fn ga22_start_only_or_filter_resolves_all_matching_starts_before_probe() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    let x = ga_uuid(2_100);
+    let y = ga_uuid(2_101);
+    let x_target = ga_uuid(2_110);
+    let y_target = ga_uuid(2_111);
+    for (id, name) in [
+        (x, "primary"),
+        (y, "seed"),
+        (x_target, "x-target"),
+        (y_target, "y-target"),
+    ] {
+        ga_insert_node(&db, id, &[("name", Value::Text(name.into()))]);
+    }
+    ga_insert_edge(&db, x, x_target, "LINKS");
+    ga_insert_edge(&db, y, y_target, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $x OR a.name = 'seed' COLUMNS (b.id AS t))",
+            &params(vec![("x", Value::Uuid(x))]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        ga_uuid_set(&result, "t"),
+        BTreeSet::from([x_target, y_target])
+    );
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+}
+
+#[test]
+fn ga23_context_gated_edge_table_has_auto_lookup_index_for_scoped_probe() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(
+        &db,
+        ", context_id UUID CONTEXT_ID",
+        ", context_id UUID CONTEXT_ID",
+    );
+    let ctx_a = ga_uuid(2_200);
+    let ctx_b = ga_uuid(2_201);
+    let source = ga_uuid(2_210);
+    let target = ga_uuid(2_211);
+    let hidden_target = ga_uuid(2_212);
+    for (id, context) in [(source, ctx_a), (target, ctx_a), (hidden_target, ctx_b)] {
+        ga_insert_node(&db, id, &[("context_id", Value::Uuid(context))]);
+    }
+    ga_insert_edge_with_context(&db, source, target, "LINKS", ctx_a);
+    ga_insert_edge_with_context(&db, source, hidden_target, "LINKS", ctx_b);
+    for i in 0..1_000 {
+        let noise_source = ga_uuid(2_300 + i);
+        let noise_target = ga_uuid(3_300 + i);
+        ga_insert_node(&db, noise_source, &[("context_id", Value::Uuid(ctx_b))]);
+        ga_insert_node(&db, noise_target, &[("context_id", Value::Uuid(ctx_b))]);
+        ga_insert_edge_with_context(&db, noise_source, noise_target, "LINKS", ctx_b);
+    }
+
+    let edge_meta = db.table_meta("edges").expect("edges table meta");
+    assert!(
+        edge_meta.indexes.iter().any(|index| {
+            index.name == "__graph_edge_source_target_type"
+                && index.columns.iter().map(|(column, _)| column.as_str()).eq([
+                    "source_id",
+                    "target_id",
+                    "edge_type",
+                ])
+        }),
+        "context-gated edge table must have graph edge lookup auto-index, got {:?}",
+        edge_meta.indexes
+    );
+
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let result = scoped
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(scoped.__rows_examined(), 1);
+}
+
+#[test]
+fn ga24_start_only_or_filter_resolves_across_node_metadata_tables() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    db.execute(
+        "CREATE TABLE alt_nodes (id UUID PRIMARY KEY, kind TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let named_start = ga_uuid(2_600);
+    let kind_start = ga_uuid(2_601);
+    let named_target = ga_uuid(2_610);
+    let kind_target = ga_uuid(2_611);
+    ga_insert_node(&db, named_start, &[("name", Value::Text("seed".into()))]);
+    ga_insert_node(
+        &db,
+        named_target,
+        &[("name", Value::Text("named-target".into()))],
+    );
+    ga_insert_node(
+        &db,
+        kind_target,
+        &[("name", Value::Text("kind-target".into()))],
+    );
+    db.execute(
+        "INSERT INTO alt_nodes (id, kind) VALUES ($id, 'root')",
+        &params(vec![("id", Value::Uuid(kind_start))]),
+    )
+    .unwrap();
+    ga_insert_edge(&db, named_start, named_target, "LINKS");
+    ga_insert_edge(&db, kind_start, kind_target, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.name = 'seed' OR a.kind = 'root' COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        ga_uuid_set(&result, "t"),
+        BTreeSet::from([named_target, kind_target])
+    );
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+}
+
+#[test]
+fn ga25_graph_edge_auto_index_cannot_be_dropped_by_user_or_sync_ddl() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", ", context_id UUID CONTEXT_ID");
+
+    let local_err = db
+        .execute(
+            "DROP INDEX __graph_edge_source_target_type ON edges",
+            &empty(),
+        )
+        .expect_err("local DROP INDEX must not remove internal graph edge index");
+    assert!(
+        matches!(local_err, Error::ReservedIndexName { .. }),
+        "expected ReservedIndexName for local graph edge index drop, got {local_err:?}"
+    );
+
+    let sync_err = db
+        .apply_changes(
+            sync::ChangeSet {
+                ddl: vec![sync::DdlChange::DropIndex {
+                    table: "edges".to_string(),
+                    name: "__graph_edge_source_target_type".to_string(),
+                }],
+                ddl_lsn: vec![Lsn(1)],
+                ..Default::default()
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::LatestWins),
+        )
+        .expect_err("sync DROP INDEX must not remove internal graph edge index");
+    assert!(
+        matches!(sync_err, Error::ReservedIndexName { .. }),
+        "expected ReservedIndexName for sync graph edge index drop, got {sync_err:?}"
+    );
+
+    let edge_meta = db.table_meta("edges").expect("edges table meta");
+    assert!(
+        edge_meta
+            .indexes
+            .iter()
+            .any(|index| index.name == "__graph_edge_source_target_type"),
+        "internal graph edge index must remain after rejected drops"
+    );
+}
+
+#[test]
+fn ga26_alter_table_to_edge_shape_installs_graph_edge_auto_index() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE edges ADD COLUMN edge_type TEXT", &empty())
+        .unwrap();
+
+    let edge_meta = db.table_meta("edges").expect("edges table meta");
+    assert!(
+        edge_meta
+            .indexes
+            .iter()
+            .any(|index| index.name == "__graph_edge_source_target_type"),
+        "ALTER TABLE-created edge metadata shape must receive graph edge auto index"
+    );
+
+    let ctx_a = ga_uuid(2_700);
+    let source = ga_uuid(2_701);
+    let target = ga_uuid(2_702);
+    ga_insert_node(&db, source, &[("context_id", Value::Uuid(ctx_a))]);
+    ga_insert_node(&db, target, &[("context_id", Value::Uuid(ctx_a))]);
+    ga_insert_edge_with_context(&db, source, target, "LINKS", ctx_a);
+
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let result = scoped
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(scoped.__rows_examined(), 1);
+}
+
+#[test]
+fn ga27_unpinned_edge_scan_respects_same_tx_graph_overlay() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let source = ga_uuid(2_800);
+    let committed = ga_uuid(2_801);
+    let staged = ga_uuid(2_802);
+    let deleted_source = ga_uuid(2_803);
+    let deleted_target = ga_uuid(2_804);
+    for id in [source, committed, staged, deleted_source, deleted_target] {
+        ga_insert_node(&db, id, &[]);
+    }
+    ga_insert_edge(&db, source, committed, "LINKS");
+
+    let tx = db.begin_or_panic();
+    db.insert_edge(tx, source, staged, "LINKS".into(), HashMap::new())
+        .unwrap();
+    let in_tx = db
+        .execute_in_tx(
+            tx,
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+    let in_tx_examined = db.__rows_examined();
+    let outside_tx = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+    let outside_tx_examined = db.__rows_examined();
+    db.rollback(tx).unwrap();
+
+    assert_eq!(
+        ga_uuid_set(&in_tx, "t"),
+        BTreeSet::from([committed, staged])
+    );
+    assert_eq!(in_tx.trace.physical_plan, "EdgesScan");
+    assert_eq!(in_tx_examined, 2);
+    assert_eq!(ga_uuid_set(&outside_tx, "t"), BTreeSet::from([committed]));
+    assert_eq!(outside_tx.trace.physical_plan, "EdgesScan");
+    assert_eq!(outside_tx_examined, 1);
+
+    ga_insert_edge(&db, deleted_source, deleted_target, "LINKS");
+    let delete_tx = db.begin_or_panic();
+    db.delete_edge(delete_tx, deleted_source, deleted_target, "LINKS")
+        .unwrap();
+    let deleted_in_tx = db
+        .execute_in_tx(
+            delete_tx,
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+    let deleted_outside_tx = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+    db.rollback(delete_tx).unwrap();
+
+    assert_eq!(
+        ga_uuid_set(&deleted_in_tx, "t"),
+        BTreeSet::from([committed])
+    );
+    assert_eq!(
+        ga_uuid_set(&deleted_outside_tx, "t"),
+        BTreeSet::from([committed, deleted_target])
+    );
+}
+
+#[test]
+fn ga28_multihop_bfs_respects_same_tx_graph_overlay() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let start = ga_uuid(2_900);
+    let middle = ga_uuid(2_901);
+    let committed_leaf = ga_uuid(2_902);
+    let staged_leaf = ga_uuid(2_903);
+    for id in [start, middle, committed_leaf, staged_leaf] {
+        ga_insert_node(&db, id, &[]);
+    }
+    ga_insert_edge(&db, start, middle, "LINKS");
+    ga_insert_edge(&db, middle, committed_leaf, "LINKS");
+
+    let tx = db.begin_or_panic();
+    db.delete_edge(tx, middle, committed_leaf, "LINKS").unwrap();
+    db.insert_edge(tx, middle, staged_leaf, "LINKS".into(), HashMap::new())
+        .unwrap();
+
+    let in_tx = db
+        .execute_in_tx(
+            tx,
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,2}(b) WHERE a.id = $start COLUMNS (b.id AS t))",
+            &params(vec![("start", Value::Uuid(start))]),
+        )
+        .unwrap();
+    let in_tx_examined = db.__rows_examined();
+    let outside_tx = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,2}(b) WHERE a.id = $start COLUMNS (b.id AS t))",
+            &params(vec![("start", Value::Uuid(start))]),
+        )
+        .unwrap();
+    let outside_tx_examined = db.__rows_examined();
+    db.rollback(tx).unwrap();
+
+    assert_eq!(
+        ga_uuid_set(&in_tx, "t"),
+        BTreeSet::from([middle, staged_leaf])
+    );
+    assert_eq!(in_tx.trace.physical_plan, "GraphBfs");
+    assert_eq!(in_tx_examined, 2);
+    assert_eq!(
+        ga_uuid_set(&outside_tx, "t"),
+        BTreeSet::from([middle, committed_leaf])
+    );
+    assert_eq!(outside_tx.trace.physical_plan, "GraphBfs");
+    assert_eq!(outside_tx_examined, 2);
+}
+
+#[test]
+fn ga29_start_and_filter_resolves_across_node_metadata_tables() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    db.execute(
+        "CREATE TABLE alt_nodes (id UUID PRIMARY KEY, kind TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_nodes_name ON nodes (name)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE INDEX idx_alt_nodes_kind ON alt_nodes (kind)",
+        &empty(),
+    )
+    .unwrap();
+
+    let both = ga_uuid(3_000);
+    let name_only = ga_uuid(3_001);
+    let kind_only = ga_uuid(3_002);
+    let target = ga_uuid(3_010);
+    let name_target = ga_uuid(3_011);
+    let kind_target = ga_uuid(3_012);
+    for (id, name) in [
+        (both, "seed"),
+        (name_only, "seed"),
+        (kind_only, "other"),
+        (target, "target"),
+        (name_target, "name-target"),
+        (kind_target, "kind-target"),
+    ] {
+        ga_insert_node(&db, id, &[("name", Value::Text(name.into()))]);
+    }
+    for (id, kind) in [(both, "root"), (kind_only, "root"), (name_only, "leaf")] {
+        db.execute(
+            "INSERT INTO alt_nodes (id, kind) VALUES ($id, $kind)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("kind", Value::Text(kind.into())),
+            ]),
+        )
+        .unwrap();
+    }
+    ga_insert_edge(&db, both, target, "LINKS");
+    ga_insert_edge(&db, name_only, name_target, "LINKS");
+    ga_insert_edge(&db, kind_only, kind_target, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.name = 'seed' AND a.kind = 'root' COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+}
+
+#[test]
+fn ga30_target_metadata_residual_filters_after_degree_walk() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    let source = ga_uuid(3_100);
+    let wanted = ga_uuid(3_101);
+    let rejected = ga_uuid(3_102);
+    ga_insert_node(&db, source, &[("name", Value::Text("source".into()))]);
+    ga_insert_node(&db, wanted, &[("name", Value::Text("wanted".into()))]);
+    ga_insert_node(&db, rejected, &[("name", Value::Text("other".into()))]);
+    ga_insert_edge(&db, source, wanted, "LINKS");
+    ga_insert_edge(&db, source, rejected, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = $source AND b.name = 'wanted' COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([wanted]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(db.__rows_examined(), 2);
+}
+
+#[test]
+fn ga31_unqualified_id_start_filter_still_routes_as_start_pin() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let source = ga_uuid(3_200);
+    let target = ga_uuid(3_201);
+    let other = ga_uuid(3_202);
+    let other_target = ga_uuid(3_203);
+    for id in [source, target, other, other_target] {
+        ga_insert_node(&db, id, &[]);
+    }
+    ga_insert_edge(&db, source, target, "LINKS");
+    ga_insert_edge(&db, other, other_target, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE id = $source COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(db.__rows_examined(), 1);
+}
+
+#[test]
+fn ga32_graph_where_sees_same_tx_node_metadata_overlay() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    let source = ga_uuid(3_300);
+    let updated_target = ga_uuid(3_301);
+    let staged_target = ga_uuid(3_302);
+    ga_insert_node(&db, source, &[("name", Value::Text("source".into()))]);
+    ga_insert_node(&db, updated_target, &[("name", Value::Text("old".into()))]);
+    ga_insert_edge(&db, source, updated_target, "LINKS");
+
+    let tx = db.begin_or_panic();
+    db.execute_in_tx(
+        tx,
+        "UPDATE nodes SET name = 'wanted' WHERE id = $target",
+        &params(vec![("target", Value::Uuid(updated_target))]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO nodes (id, name) VALUES ($id, 'wanted')",
+        &params(vec![("id", Value::Uuid(staged_target))]),
+    )
+    .unwrap();
+    db.insert_edge(tx, source, staged_target, "LINKS".into(), HashMap::new())
+        .unwrap();
+
+    let in_tx = db
+        .execute_in_tx(
+            tx,
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = $source AND b.name = 'wanted' COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+    let in_tx_examined = db.__rows_examined();
+    let outside_tx = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = $source AND b.name = 'wanted' COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+    let outside_tx_examined = db.__rows_examined();
+    db.rollback(tx).unwrap();
+
+    assert_eq!(
+        ga_uuid_set(&in_tx, "t"),
+        BTreeSet::from([updated_target, staged_target])
+    );
+    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(in_tx_examined, 2);
+    assert!(outside_tx.rows.is_empty());
+    assert_eq!(outside_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(outside_tx_examined, 1);
+}
+
+#[test]
+fn ga33_graph_start_subquery_allows_inner_table_aliases() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    db.execute("CREATE INDEX idx_nodes_name ON nodes (name)", &empty())
+        .unwrap();
+    let source = ga_uuid(3_400);
+    let target = ga_uuid(3_401);
+    let other = ga_uuid(3_402);
+    ga_insert_node(&db, source, &[("name", Value::Text("seed".into()))]);
+    ga_insert_node(&db, target, &[("name", Value::Text("target".into()))]);
+    ga_insert_node(&db, other, &[("name", Value::Text("other".into()))]);
+    ga_insert_edge(&db, source, target, "LINKS");
+    ga_insert_edge(&db, other, ga_uuid(3_403), "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id IN (SELECT n.id FROM nodes n WHERE n.name = 'seed') COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(db.__rows_examined(), 1 + 1);
+}
+
+fn sarg_insert_acl_grant(db: &Database, id: Uuid, principal: &str, acl: Uuid) {
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, 'Agent', $principal, $acl)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("principal", Value::Text(principal.to_string())),
+            ("acl", Value::Uuid(acl)),
+        ]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn ga34_graph_where_errors_for_referenced_node_metadata_without_id_index() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    db.execute("CREATE TABLE alt_nodes (id UUID, kind TEXT)", &empty())
+        .unwrap();
+    let source = ga_uuid(3_500);
+    let target = ga_uuid(3_501);
+    ga_insert_node(&db, source, &[]);
+    ga_insert_node(&db, target, &[]);
+    db.execute(
+        "INSERT INTO alt_nodes (id, kind) VALUES ($id, 'root')",
+        &params(vec![("id", Value::Uuid(source))]),
+    )
+    .unwrap();
+    ga_insert_edge(&db, source, target, "LINKS");
+
+    let err = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.kind = 'root' COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .expect_err("referenced graph node metadata must require an id lookup index");
+
+    assert!(
+        err.to_string()
+            .contains("graph node metadata table `alt_nodes` requires an index on id"),
+        "expected explicit graph node id index error, got {err:?}"
+    );
+}
+
+#[test]
+fn ga35_public_edge_metadata_survives_unrelated_gated_edge_table() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, ", context_id UUID CONTEXT_ID", "");
+    db.execute(
+        "CREATE TABLE tenant_edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = ga_uuid(3_600);
+    let source = ga_uuid(3_601);
+    let target = ga_uuid(3_602);
+    for id in [source, target] {
+        ga_insert_node(&db, id, &[("context_id", Value::Uuid(ctx_a))]);
+    }
+    ga_insert_edge(&db, source, target, "LINKS");
+
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let result = scoped
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = $source COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(scoped.__rows_examined(), 1);
+}
+
+#[test]
+fn ga36_graph_gates_see_same_tx_acl_grants() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    let principal = "agent-graph";
+    let acl = ga_uuid(3_700);
+    let source = ga_uuid(3_701);
+    let target = ga_uuid(3_702);
+    let tx = db.begin_or_panic();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, 'Agent', $principal, $acl)",
+        &params(vec![
+            ("id", Value::Uuid(ga_uuid(3_703))),
+            ("principal", Value::Text(principal.to_string())),
+            ("acl", Value::Uuid(acl)),
+        ]),
+    )
+    .unwrap();
+    for id in [source, target] {
+        db.execute_in_tx(
+            tx,
+            "INSERT INTO nodes (id, acl_id) VALUES ($id, $acl)",
+            &params(vec![("id", Value::Uuid(id)), ("acl", Value::Uuid(acl))]),
+        )
+        .unwrap();
+    }
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO edges (id, source_id, target_id, edge_type, acl_id) VALUES ($id, $source, $target, 'LINKS', $acl)",
+        &params(vec![
+            ("id", Value::Uuid(ga_uuid(3_704))),
+            ("source", Value::Uuid(source)),
+            ("target", Value::Uuid(target)),
+            ("acl", Value::Uuid(acl)),
+        ]),
+    )
+    .unwrap();
+
+    let scoped =
+        db.scoped_with_constraints(None, None, Some(Principal::Agent(principal.to_string())));
+    let in_tx = scoped
+        .execute_in_tx(
+            tx,
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = $source COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+    let in_tx_examined = scoped.__rows_examined();
+    let outside_tx = scoped
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = $source COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+    db.rollback(tx).unwrap();
+
+    assert_eq!(ga_uuid_set(&in_tx, "t"), BTreeSet::from([target]));
+    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(in_tx_examined, 1);
+    assert!(outside_tx.rows.is_empty());
+}
+
+#[test]
+fn ga37_column_id_residual_does_not_parse_column_as_uuid() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let source = ga_uuid(3_800);
+    let target = ga_uuid(3_801);
+    for id in [source, target] {
+        ga_insert_node(&db, id, &[]);
+    }
+    ga_insert_edge(&db, source, target, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = $source AND b.id = a.id COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+
+    assert!(result.rows.is_empty());
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+}
+
+#[test]
+fn ga38_start_is_null_filter_falls_back_to_graph_residual_semantics() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let source = ga_uuid(3_900);
+    let target = ga_uuid(3_901);
+    for id in [source, target] {
+        ga_insert_node(&db, id, &[]);
+    }
+    ga_insert_edge(&db, source, target, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.kind IS NULL COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
+    assert_eq!(result.trace.physical_plan, "EdgesScan");
+}
+
+#[test]
+fn ga39_target_only_single_hop_uses_reverse_adjacency_probe() {
+    let db = Database::open_memory();
+    ga_create_graph_tables(&db, "", "");
+    let source = ga_uuid(4_000);
+    let target = ga_uuid(4_001);
+    for id in [source, target] {
+        ga_insert_node(&db, id, &[]);
+    }
+    ga_insert_edge(&db, source, target, "LINKS");
+    ga_seed_unrelated_edges(&db, 4_100, 1_000, "LINKS");
+
+    let result = db
+        .execute(
+            "SELECT s FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE b.id = $target COLUMNS (a.id AS s))",
+            &params(vec![("target", Value::Uuid(target))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "s"), BTreeSet::from([source]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("reverse_adj"));
+    assert_eq!(db.__rows_examined(), 1);
+}
+
+#[test]
+fn ga40_metadata_start_filter_sees_same_tx_acl_grant() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_nodes_name ON nodes (name)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    let principal = "agent-start";
+    let acl = ga_uuid(4_200);
+    let source = ga_uuid(4_201);
+    let target = ga_uuid(4_202);
+    let tx = db.begin_or_panic();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, 'Agent', $principal, $acl)",
+        &params(vec![
+            ("id", Value::Uuid(ga_uuid(4_203))),
+            ("principal", Value::Text(principal.to_string())),
+            ("acl", Value::Uuid(acl)),
+        ]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO nodes (id, name, acl_id) VALUES ($id, 'seed', $acl)",
+        &params(vec![("id", Value::Uuid(source)), ("acl", Value::Uuid(acl))]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO nodes (id, name, acl_id) VALUES ($id, 'target', $acl)",
+        &params(vec![("id", Value::Uuid(target)), ("acl", Value::Uuid(acl))]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO edges (id, source_id, target_id, edge_type, acl_id) VALUES ($id, $source, $target, 'LINKS', $acl)",
+        &params(vec![
+            ("id", Value::Uuid(ga_uuid(4_204))),
+            ("source", Value::Uuid(source)),
+            ("target", Value::Uuid(target)),
+            ("acl", Value::Uuid(acl)),
+        ]),
+    )
+    .unwrap();
+
+    let scoped =
+        db.scoped_with_constraints(None, None, Some(Principal::Agent(principal.to_string())));
+    let in_tx = scoped
+        .execute_in_tx(
+            tx,
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.name = 'seed' COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+    let outside_tx = scoped
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.name = 'seed' COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+    db.rollback(tx).unwrap();
+
+    assert_eq!(ga_uuid_set(&in_tx, "t"), BTreeSet::from([target]));
+    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert!(outside_tx.rows.is_empty());
+}
+
+#[test]
+fn ga41_graph_node_metadata_ignores_non_uuid_id_tables() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE cg_schema_version (id INTEGER PRIMARY KEY, name TEXT, version INTEGER NOT NULL)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE INDEX idx_cg_schema_version_name ON cg_schema_version (name)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO cg_schema_version (id, name, version) VALUES (1, 'seed', 1)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE duplicate_node_noise (id UUID, id INTEGER, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE INDEX idx_duplicate_node_noise_name ON duplicate_node_noise (name)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO duplicate_node_noise (id, name) VALUES ($id, 'seed')",
+        &params(vec![("id", Value::Uuid(ga_uuid(4_399)))]),
+    )
+    .unwrap();
+    ga_create_graph_tables(&db, ", name TEXT", "");
+    db.execute("CREATE INDEX idx_nodes_name ON nodes (name)", &empty())
+        .unwrap();
+    let source = ga_uuid(4_300);
+    let target = ga_uuid(4_301);
+    ga_insert_node(&db, source, &[("name", Value::Text("seed".into()))]);
+    ga_insert_node(&db, target, &[("name", Value::Text("target".into()))]);
+
+    ga_insert_edge(&db, source, target, "LINKS");
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = $source COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(db.__rows_examined(), 1);
+
+    let by_metadata = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.name = 'seed' COLUMNS (b.id AS t))",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(ga_uuid_set(&by_metadata, "t"), BTreeSet::from([target]));
+    assert_eq!(by_metadata.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(by_metadata.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(
+        db.__rows_examined(),
+        2,
+        "metadata start resolution must skip non-UUID id tables instead of counting their indexed rows"
+    );
+}
+
+#[test]
+fn ga42_graph_edge_insert_routing_requires_uuid_edge_shape() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id TEXT, target_id TEXT, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let source = ga_uuid(4_400);
+    let target = ga_uuid(4_401);
+
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) \
+         VALUES (1, $source, $target, 'LINKS')",
+        &params(vec![
+            ("source", Value::Text(source.to_string())),
+            ("target", Value::Text(target.to_string())),
+        ]),
+    )
+    .unwrap();
+
+    assert_eq!(db.edge_count(source, "LINKS", db.snapshot()).unwrap(), 0);
+
+    let result = db
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = $source COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(source))]),
+        )
+        .unwrap();
+
+    assert!(
+        result.rows.is_empty(),
+        "UUID-looking text edge columns must not populate the internal graph"
+    );
+    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(db.__rows_examined(), 0);
+
+    let tx = db.begin_or_panic();
+    let used_before_graph_edge = accountant.usage().used;
+    db.insert_edge(tx, source, target, "LINKS".into(), HashMap::new())
+        .unwrap();
+    db.commit(tx).unwrap();
+    let graph_edge_bytes = accountant
+        .usage()
+        .used
+        .saturating_sub(used_before_graph_edge);
+    assert!(graph_edge_bytes > 0);
+    assert_eq!(db.edge_count(source, "LINKS", db.snapshot()).unwrap(), 1);
+
+    db.execute("DROP TABLE edges", &empty()).unwrap();
+
+    assert_eq!(
+        db.edge_count(source, "LINKS", db.snapshot()).unwrap(),
+        1,
+        "dropping a malformed edge-shaped table must not delete a real graph edge"
+    );
+    assert!(
+        accountant.usage().used + 64 >= graph_edge_bytes,
+        "dropping a malformed edge-shaped table must not release graph-edge bytes it did not allocate"
+    );
+
+    db.execute(
+        "CREATE TABLE mixed_edges (id INTEGER PRIMARY KEY, source_id UUID, source_id TEXT, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let mixed_meta = db.table_meta("mixed_edges").unwrap();
+    assert!(
+        !mixed_meta
+            .indexes
+            .iter()
+            .any(|index| index.name == "__graph_edge_source_target_type"),
+        "conflicting duplicate edge columns must not receive a graph-edge auto index"
+    );
+    let mixed_source = ga_uuid(4_402);
+    let mixed_target = ga_uuid(4_403);
+
+    db.execute(
+        "INSERT INTO mixed_edges (id, source_id, target_id, edge_type) \
+         VALUES (1, $source, $target, 'LINKS')",
+        &params(vec![
+            ("source", Value::Uuid(mixed_source)),
+            ("target", Value::Uuid(mixed_target)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.edge_count(mixed_source, "LINKS", db.snapshot()).unwrap(),
+        0,
+        "conflicting duplicate edge columns must not populate the internal graph"
+    );
+
+    let tx = db.begin_or_panic();
+    let used_before_mixed_graph_edge = accountant.usage().used;
+    db.insert_edge(
+        tx,
+        mixed_source,
+        mixed_target,
+        "LINKS".into(),
+        HashMap::new(),
+    )
+    .unwrap();
+    db.commit(tx).unwrap();
+    let mixed_graph_edge_bytes = accountant
+        .usage()
+        .used
+        .saturating_sub(used_before_mixed_graph_edge);
+    assert!(mixed_graph_edge_bytes > 0);
+
+    db.execute("DROP TABLE mixed_edges", &empty()).unwrap();
+
+    assert_eq!(
+        db.edge_count(mixed_source, "LINKS", db.snapshot()).unwrap(),
+        1,
+        "dropping a conflicting duplicate edge table must not delete a real graph edge"
+    );
+    assert!(
+        accountant.usage().used + 64 >= graph_edge_bytes + mixed_graph_edge_bytes,
+        "dropping a conflicting duplicate edge table must not release graph-edge bytes it did not allocate"
+    );
+}
+
+#[test]
+fn scoped_anchor_read_reports_context_scope_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    for (id, ctx, data) in [
+        (sarg_uuid(1), ctx_a, "a1"),
+        (sarg_uuid(2), ctx_a, "a2"),
+        (sarg_uuid(3), ctx_b, "b"),
+        (sarg_uuid(4), ctx_c, "c"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("ctx", Value::Uuid(ctx)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let err_b = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(3)))]),
+        )
+        .expect_err("hidden ctx-b anchor must be refused");
+    sarg_expect_context_violation(err_b, ctx_b, &[ctx_a]);
+    let err_c = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(4)))]),
+        )
+        .expect_err("hidden ctx-c anchor must be refused");
+    sarg_expect_context_violation(err_c, ctx_c, &[ctx_a]);
+}
+
+#[test]
+fn scoped_anchor_read_reports_scope_label_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, scope TEXT SCOPE_LABEL_READ ('a','b','c') WRITE ('a','b','c'), data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    for (id, scope) in [(1, "a"), (2, "b"), (3, "c")] {
+        db.execute(
+            "INSERT INTO t (id, scope, data) VALUES ($id, $scope, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("scope", Value::Text(scope.to_string())),
+                ("data", Value::Text(scope.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_constraints(None, Some(sarg_labels(&["a"])), None);
+    for (id, label) in [(2, "b"), (3, "c")] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(sarg_uuid(id)))]),
+            )
+            .expect_err("hidden scope-label anchor must be refused");
+        sarg_expect_scope_violation(err, label, &["a"]);
+    }
+}
+
+#[test]
+fn scoped_anchor_read_reports_acl_denied() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let principal = "agent-a";
+    let acl_visible = sarg_uuid(0xA1);
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, 'Agent', $principal, $acl)",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(0xAA))),
+            ("principal", Value::Text(principal.to_string())),
+            ("acl", Value::Uuid(acl_visible)),
+        ]),
+    )
+    .unwrap();
+    for (id, acl, data) in [
+        (sarg_uuid(1), acl_visible, "visible"),
+        (sarg_uuid(2), sarg_uuid(0xB1), "hidden-b"),
+        (sarg_uuid(3), sarg_uuid(0xC1), "hidden-c"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, acl_id, data) VALUES ($id, $acl, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("acl", Value::Uuid(acl)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let row_2 = sarg_row_id_for_uuid(&db, "t", sarg_uuid(2));
+    let row_3 = sarg_row_id_for_uuid(&db, "t", sarg_uuid(3));
+    let scoped =
+        db.scoped_with_constraints(None, None, Some(Principal::Agent(principal.to_string())));
+    for (id, row_id) in [(sarg_uuid(2), row_2), (sarg_uuid(3), row_3)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .expect_err("ungranted ACL anchor must be refused");
+        sarg_expect_acl_denied(err, "t", row_id, principal);
+    }
+}
+
+#[test]
+fn unique_column_anchor_read_under_constraint_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, uniq_col TEXT UNIQUE, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    for (id, ctx, key) in [(1, ctx_a, "a"), (2, ctx_b, "b"), (3, ctx_c, "c")] {
+        db.execute(
+            "INSERT INTO t (id, context_id, uniq_col, data) VALUES ($id, $ctx, $key, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("key", Value::Text(key.to_string())),
+                ("data", Value::Text(key.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    for (key, ctx) in [("b", ctx_b), ("c", ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE uniq_col = $key",
+                &params(vec![("key", Value::Text(key.to_string()))]),
+            )
+            .expect_err("hidden unique anchor must be refused");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
+}
+
+#[test]
+fn scope_label_unique_anchor_read_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, scope TEXT SCOPE_LABEL_READ ('a','b','c') WRITE ('a','b','c'), uniq_col TEXT UNIQUE, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    for (id, scope, key) in [(1, "a", "a"), (2, "b", "b"), (3, "c", "c")] {
+        db.execute(
+            "INSERT INTO t (id, scope, uniq_col, data) VALUES ($id, $scope, $key, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("scope", Value::Text(scope.to_string())),
+                ("key", Value::Text(key.to_string())),
+                ("data", Value::Text(key.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_constraints(None, Some(sarg_labels(&["a"])), None);
+    for (key, label) in [("b", "b"), ("c", "c")] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE uniq_col = $key",
+                &params(vec![("key", Value::Text(key.to_string()))]),
+            )
+            .expect_err("hidden scope-label unique anchor must be refused");
+        sarg_expect_scope_violation(err, label, &["a"]);
+    }
+}
+
+#[test]
+fn acl_unique_anchor_read_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), uniq_col TEXT UNIQUE, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let principal = "agent-a";
+    let acl_visible = sarg_uuid(0xA1);
+    sarg_insert_acl_grant(&db, sarg_uuid(0xAA), principal, acl_visible);
+    for (id, acl, key) in [
+        (sarg_uuid(1), acl_visible, "a"),
+        (sarg_uuid(2), sarg_uuid(0xB1), "b"),
+        (sarg_uuid(3), sarg_uuid(0xC1), "c"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, acl_id, uniq_col, data) VALUES ($id, $acl, $key, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("acl", Value::Uuid(acl)),
+                ("key", Value::Text(key.to_string())),
+                ("data", Value::Text(key.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let row_b = sarg_row_id_for_uuid(&db, "t", sarg_uuid(2));
+    let row_c = sarg_row_id_for_uuid(&db, "t", sarg_uuid(3));
+    let scoped =
+        db.scoped_with_constraints(None, None, Some(Principal::Agent(principal.to_string())));
+    for (key, row_id) in [("b", row_b), ("c", row_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE uniq_col = $key",
+                &params(vec![("key", Value::Text(key.to_string()))]),
+            )
+            .expect_err("hidden ACL unique anchor must be refused");
+        sarg_expect_acl_denied(err, "t", row_id, principal);
+    }
+}
+
+#[test]
+fn composite_unique_anchor_read_under_constraint_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, u_a INTEGER, u_b INTEGER, data TEXT, UNIQUE (u_a, u_b))",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    for (id, ctx, u_a, u_b, data) in [
+        (1, ctx_b, 1, 1, "b"),
+        (2, ctx_c, 1, 2, "c"),
+        (3, ctx_a, 2, 1, "a"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, context_id, u_a, u_b, data) VALUES ($id, $ctx, $u_a, $u_b, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("u_a", Value::Int64(u_a)),
+                ("u_b", Value::Int64(u_b)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    for (u_b, ctx) in [(1, ctx_b), (2, ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE u_a = $u_a AND u_b = $u_b",
+                &params(vec![("u_a", Value::Int64(1)), ("u_b", Value::Int64(u_b))]),
+            )
+            .expect_err("hidden composite unique anchor must be refused");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
+}
+
+#[test]
+fn scope_label_composite_unique_anchor_read_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, scope TEXT SCOPE_LABEL_READ ('a','b','c') WRITE ('a','b','c'), u_a INTEGER, u_b INTEGER, data TEXT, UNIQUE (u_a, u_b))",
+        &empty(),
+    )
+    .unwrap();
+    for (id, scope, u_a, u_b, data) in [
+        (1, "b", 1, 1, "b"),
+        (2, "c", 1, 2, "c"),
+        (3, "a", 2, 1, "a"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, scope, u_a, u_b, data) VALUES ($id, $scope, $u_a, $u_b, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("scope", Value::Text(scope.to_string())),
+                ("u_a", Value::Int64(u_a)),
+                ("u_b", Value::Int64(u_b)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_constraints(None, Some(sarg_labels(&["a"])), None);
+    for (u_b, label) in [(1, "b"), (2, "c")] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE u_a = $u_a AND u_b = $u_b",
+                &params(vec![("u_a", Value::Int64(1)), ("u_b", Value::Int64(u_b))]),
+            )
+            .expect_err("hidden scope-label composite unique anchor must be refused");
+        sarg_expect_scope_violation(err, label, &["a"]);
+    }
+}
+
+#[test]
+fn acl_composite_unique_anchor_read_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), u_a INTEGER, u_b INTEGER, data TEXT, UNIQUE (u_a, u_b))",
+        &empty(),
+    )
+    .unwrap();
+    let principal = "agent-a";
+    let acl_visible = sarg_uuid(0xA1);
+    sarg_insert_acl_grant(&db, sarg_uuid(0xAA), principal, acl_visible);
+    for (id, acl, u_a, u_b, data) in [
+        (sarg_uuid(1), sarg_uuid(0xB1), 1, 1, "b"),
+        (sarg_uuid(2), sarg_uuid(0xC1), 1, 2, "c"),
+        (sarg_uuid(3), acl_visible, 2, 1, "a"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, acl_id, u_a, u_b, data) VALUES ($id, $acl, $u_a, $u_b, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("acl", Value::Uuid(acl)),
+                ("u_a", Value::Int64(u_a)),
+                ("u_b", Value::Int64(u_b)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let row_b = sarg_row_id_for_uuid(&db, "t", sarg_uuid(1));
+    let row_c = sarg_row_id_for_uuid(&db, "t", sarg_uuid(2));
+    let scoped =
+        db.scoped_with_constraints(None, None, Some(Principal::Agent(principal.to_string())));
+    for (u_b, row_id) in [(1, row_b), (2, row_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE u_a = $u_a AND u_b = $u_b",
+                &params(vec![("u_a", Value::Int64(1)), ("u_b", Value::Int64(u_b))]),
+            )
+            .expect_err("hidden ACL composite unique anchor must be refused");
+        sarg_expect_acl_denied(err, "t", row_id, principal);
+    }
+}
+
+#[test]
+fn null_context_id_row_anchor_read_under_scoped_handle_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    db.execute(
+        "INSERT INTO t (id, data) VALUES ($id, 'null-context')",
+        &params(vec![("id", Value::Uuid(sarg_uuid(1)))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'ctx-b')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(2))),
+            ("ctx", Value::Uuid(ctx_b)),
+        ]),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let err_null = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(1)))]),
+        )
+        .expect_err("NULL context anchor must be refused");
+    sarg_expect_context_violation(err_null, Uuid::from_u128(u128::MAX), &[ctx_a]);
+    let err_b = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+        )
+        .expect_err("foreign context anchor must be refused");
+    sarg_expect_context_violation(err_b, ctx_b, &[ctx_a]);
+}
+
+#[test]
+fn stacked_constraints_anchor_read_reports_first_violating_gate_context_first() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, scope TEXT SCOPE_LABEL_READ ('a','c','d') WRITE ('a','c','d'), acl_id UUID ACL REFERENCES acl_grants(acl_id), data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    for (id, ctx, scope, acl) in [
+        (1, ctx_b, "c", sarg_uuid(0xB1)),
+        (2, ctx_c, "d", sarg_uuid(0xC1)),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, context_id, scope, acl_id, data) VALUES ($id, $ctx, $scope, $acl, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("scope", Value::Text(scope.to_string())),
+                ("acl", Value::Uuid(acl)),
+                ("data", Value::Text(scope.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_constraints(
+        Some(sarg_contexts(&[ctx_a])),
+        Some(sarg_labels(&["a"])),
+        Some(Principal::Agent("agent-a".to_string())),
+    );
+    for (id, ctx) in [(1, ctx_b), (2, ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(sarg_uuid(id)))]),
+            )
+            .expect_err("first violating gate must be context");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
+}
+
+#[test]
+fn scoped_list_query_continues_to_filter_hidden_rows_silently_across_shapes() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, category TEXT, score INTEGER)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    for (id, ctx, category, score) in [
+        (1, ctx_a, "x", 10),
+        (2, ctx_a, "x", 90),
+        (3, ctx_b, "x", 80),
+        (4, ctx_b, "x", 81),
+        (5, ctx_b, "y", 82),
+        (6, ctx_b, "y", 83),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, context_id, category, score) VALUES ($id, $ctx, $category, $score)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("category", Value::Text(category.to_string())),
+                ("score", Value::Int64(score)),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let all = scoped.execute("SELECT id FROM t", &empty()).unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&all, "id"),
+        BTreeSet::from([sarg_uuid(1), sarg_uuid(2)])
+    );
+    let x = scoped
+        .execute("SELECT id FROM t WHERE category = 'x'", &empty())
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&x, "id"),
+        BTreeSet::from([sarg_uuid(1), sarg_uuid(2)])
+    );
+    let range = scoped
+        .execute("SELECT id FROM t WHERE score > 50", &empty())
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&range, "id"),
+        BTreeSet::from([sarg_uuid(2)])
+    );
+    let y = scoped
+        .execute("SELECT id FROM t WHERE category = 'y'", &empty())
+        .unwrap();
+    assert!(y.rows.is_empty());
+    let limit = scoped
+        .execute("SELECT id FROM t LIMIT 1", &empty())
+        .unwrap();
+    assert_eq!(limit.rows.len(), 1);
+    assert!(
+        sarg_uuid_column_set(&limit, "id").is_subset(&BTreeSet::from([sarg_uuid(1), sarg_uuid(2)]))
+    );
+    let ordered = scoped
+        .execute("SELECT id FROM t ORDER BY id LIMIT 1", &empty())
+        .unwrap();
+    assert_eq!(ordered.rows, vec![vec![Value::Uuid(sarg_uuid(1))]]);
+}
+
+#[test]
+fn scoped_anchor_read_returns_empty_when_row_does_not_exist() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'a')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(1))),
+            ("ctx", Value::Uuid(ctx_a)),
+        ]),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let result = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(999)))]),
+        )
+        .unwrap();
+    assert!(result.rows.is_empty());
+}
+
+#[test]
+fn in_list_against_primary_key_under_constraint_returns_visible_subset_no_typed_err() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    for (id, ctx) in [(1, ctx_a), (2, ctx_b), (3, ctx_b)] {
+        db.execute(
+            "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("data", Value::Text(id.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let result = scoped
+        .execute(
+            "SELECT id FROM t WHERE id IN ($a, $b, $c)",
+            &params(vec![
+                ("a", Value::Uuid(sarg_uuid(1))),
+                ("b", Value::Uuid(sarg_uuid(2))),
+                ("c", Value::Uuid(sarg_uuid(3))),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "id"),
+        BTreeSet::from([sarg_uuid(1)])
+    );
+}
+
+#[test]
+fn update_delete_predicate_against_hidden_only_rows_preserves_rows_affected_zero() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'b')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(2))),
+            ("ctx", Value::Uuid(ctx_b)),
+        ]),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let update = scoped
+        .execute(
+            "UPDATE t SET data = $data WHERE id = $id",
+            &params(vec![
+                ("data", Value::Text("new".to_string())),
+                ("id", Value::Uuid(sarg_uuid(2))),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(update.rows_affected, 0);
+    let delete = scoped
+        .execute(
+            "DELETE FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+        )
+        .unwrap();
+    assert_eq!(delete.rows_affected, 0);
+}
+
+#[test]
+fn admin_handle_anchor_read_under_no_constraints_returns_ok_rows() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'b')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(2))),
+            ("ctx", Value::Uuid(sarg_uuid(0xB))),
+        ]),
+    )
+    .unwrap();
+    let result = db
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Text("b".to_string())]]);
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_uses_pinned_snapshot_for_traversal() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    for id in [n1, n2, n3] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    sarg_insert_edge(&db, n1, n2, "T");
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n1, n3, "T");
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.id = $start COLUMNS (b.id AS target))",
+            &params(vec![("start", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_uses_pinned_snapshot_for_filter_derived_start_nodes() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, kind TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n4 = sarg_uuid(4);
+    let n5 = sarg_uuid(5);
+    sarg_insert_node(&db, n1, None, Some("seed"));
+    sarg_insert_node(&db, n2, None, None);
+    sarg_insert_node(&db, n4, None, Some("other"));
+    sarg_insert_node(&db, n5, None, None);
+    sarg_insert_edge(&db, n1, n2, "T");
+    sarg_insert_edge(&db, n4, n5, "T");
+    let snapshot = db.snapshot();
+    db.execute(
+        "UPDATE nodes SET kind = 'seed' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(n4))]),
+    )
+    .unwrap();
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.kind = 'seed' COLUMNS (b.id AS target))",
+            &empty(),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_uses_pinned_snapshot_for_subquery_derived_start_nodes() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE seeds (id UUID PRIMARY KEY, node_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    let n4 = sarg_uuid(4);
+    let n5 = sarg_uuid(5);
+    for id in [n1, n2, n3, n4, n5] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    sarg_insert_edge(&db, n1, n2, "T");
+    sarg_insert_edge(&db, n4, n5, "T");
+    db.execute(
+        "INSERT INTO seeds (id, node_id) VALUES ($id, $node)",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(10))),
+            ("node", Value::Uuid(n1)),
+        ]),
+    )
+    .unwrap();
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n1, n3, "T");
+    db.execute(
+        "INSERT INTO seeds (id, node_id) VALUES ($id, $node)",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(11))),
+            ("node", Value::Uuid(n4)),
+        ]),
+    )
+    .unwrap();
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.id IN (SELECT node_id FROM seeds) COLUMNS (b.id AS target))",
+            &empty(),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_pins_multi_hop_bfs_depth() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    let n4 = sarg_uuid(4);
+    for id in [n1, n2, n3, n4] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    sarg_insert_edge(&db, n1, n2, "T");
+    sarg_insert_edge(&db, n2, n3, "T");
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n2, n4, "T");
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->{1,2}(b) WHERE a.id = $start COLUMNS (b.id AS target))",
+            &params(vec![("start", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2, n3])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_uses_pinned_snapshot_for_unbound_start_fallback() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    let n4 = sarg_uuid(4);
+    for id in [n1, n2, n3, n4] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    sarg_insert_edge(&db, n1, n2, "T");
+    let snapshot = db.snapshot();
+    let tx = db.begin_or_panic();
+    db.delete_edge(tx, n1, n2, "T").unwrap();
+    db.commit(tx).unwrap();
+    sarg_insert_edge(&db, n3, n4, "T");
+    let result = db
+        .execute_at_snapshot(
+            "SELECT source, target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) COLUMNS (a.id AS source, b.id AS target))",
+            &empty(),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "source"),
+        BTreeSet::from([n1])
+    );
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_under_scoped_handle_uses_pinned_snapshot() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let src = sarg_uuid(1);
+    let pre_a = sarg_uuid(2);
+    let post_a = sarg_uuid(3);
+    let pre_b = sarg_uuid(4);
+    let post_b = sarg_uuid(5);
+    let gate_flip = sarg_uuid(6);
+    for (id, ctx) in [
+        (src, ctx_a),
+        (pre_a, ctx_a),
+        (post_a, ctx_a),
+        (pre_b, ctx_b),
+        (post_b, ctx_b),
+        (gate_flip, ctx_a),
+    ] {
+        sarg_insert_node(&db, id, Some(ctx), None);
+    }
+    sarg_insert_context_edge(&db, src, pre_a, "T", ctx_a);
+    sarg_insert_context_edge(&db, src, pre_b, "T", ctx_b);
+    sarg_insert_context_edge(&db, src, gate_flip, "T", ctx_b);
+    let snapshot = db.snapshot();
+    db.execute(
+        "UPDATE edges SET context_id = $ctx WHERE source_id = $src AND target_id = $target AND edge_type = 'T'",
+        &params(vec![
+            ("ctx", Value::Uuid(ctx_a)),
+            ("src", Value::Uuid(src)),
+            ("target", Value::Uuid(gate_flip)),
+        ]),
+    )
+    .unwrap();
+    sarg_insert_context_edge(&db, src, post_a, "T", ctx_a);
+    sarg_insert_context_edge(&db, src, post_b, "T", ctx_b);
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let result = scoped
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.id = $start COLUMNS (b.id AS target))",
+            &params(vec![("start", Value::Uuid(src))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([pre_a])
+    );
+}
+
+#[test]
+fn multi_cte_graph_table_composition_at_pinned_snapshot_via_in_select() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    let n4 = sarg_uuid(4);
+    let n5 = sarg_uuid(5);
+    for id in [n1, n2, n3, n4, n5] {
+        db.execute(
+            "INSERT INTO nodes (id, data) VALUES ($id, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("data", Value::Text(id.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    sarg_insert_edge(&db, n2, n1, "BASED_ON");
+    sarg_insert_edge(&db, n3, n1, "ABOUT");
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n4, n1, "BASED_ON");
+    sarg_insert_edge(&db, n5, n1, "ABOUT");
+    let sql = "WITH based AS (
+            SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:BASED_ON]-(a) WHERE b.id = $anchor COLUMNS (a.id AS target))
+        ), about AS (
+            SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:ABOUT]-(a) WHERE b.id = $anchor COLUMNS (a.id AS target))
+        )
+        SELECT id, data FROM nodes
+        WHERE id IN (SELECT src FROM based) OR id IN (SELECT src FROM about)";
+    let result = db
+        .execute_at_snapshot(sql, &params(vec![("anchor", Value::Uuid(n1))]), snapshot)
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "id"),
+        BTreeSet::from([n2, n3])
+    );
+    let based = db
+        .execute_at_snapshot(
+            "WITH based AS (SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:BASED_ON]-(a) WHERE b.id = $anchor COLUMNS (a.id AS target))) SELECT src FROM based",
+            &params(vec![("anchor", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(sarg_uuid_column_set(&based, "src"), BTreeSet::from([n2]));
+    let about = db
+        .execute_at_snapshot(
+            "WITH about AS (SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:ABOUT]-(a) WHERE b.id = $anchor COLUMNS (a.id AS target))) SELECT src FROM about",
+            &params(vec![("anchor", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(sarg_uuid_column_set(&about, "src"), BTreeSet::from([n3]));
+}
+
+#[test]
+fn graph_table_at_pinned_snapshot_with_no_pre_pin_edges_returns_ok_empty() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    for id in [n1, n2, n3] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n1, n2, "T");
+    sarg_insert_edge(&db, n1, n3, "T");
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.id = $start COLUMNS (b.id AS target))",
+            &params(vec![("start", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert!(result.rows.is_empty());
+}
+
+#[test]
+fn scoped_anchor_read_at_pinned_snapshot_reports_context_scope_violation_at_pin_state() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'b')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(2))),
+            ("ctx", Value::Uuid(ctx_b)),
+        ]),
+    )
+    .unwrap();
+    let snapshot = db.snapshot();
+    db.execute(
+        "DELETE FROM t WHERE id = $id",
+        &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let err = scoped
+        .execute_at_snapshot(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+            snapshot,
+        )
+        .expect_err("hidden row at pinned snapshot must be refused");
+    sarg_expect_context_violation(err, ctx_b, &[ctx_a]);
+}
+
+#[test]
+fn scoped_multi_cte_graph_table_with_cross_scope_anchor_parameter_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let visible_anchor = sarg_uuid(1);
+    let visible_source = sarg_uuid(2);
+    let hidden_anchor = sarg_uuid(3);
+    let hidden_source = sarg_uuid(4);
+    for (id, ctx, data) in [
+        (visible_anchor, ctx_a, "visible-anchor"),
+        (visible_source, ctx_a, "visible-source"),
+        (hidden_anchor, ctx_b, "hidden-anchor"),
+        (hidden_source, ctx_b, "hidden-source"),
+    ] {
+        db.execute(
+            "INSERT INTO nodes (id, context_id, data) VALUES ($id, $ctx, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("ctx", Value::Uuid(ctx)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    sarg_insert_context_edge(&db, visible_source, visible_anchor, "VISIBLE", ctx_a);
+    sarg_insert_context_edge(&db, hidden_source, hidden_anchor, "HIDDEN", ctx_b);
+    let snapshot = db.snapshot();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let sql = "WITH visible AS (
+            SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:VISIBLE]-(a) WHERE b.id = $visible_anchor COLUMNS (a.id AS target))
+        ), hidden AS (
+            SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:HIDDEN]-(a) WHERE b.id = $hidden_anchor COLUMNS (a.id AS target))
+        )
+        SELECT id FROM nodes
+        WHERE id IN (SELECT src FROM visible) OR id IN (SELECT src FROM hidden)";
+    let err = scoped
+        .execute_at_snapshot(
+            sql,
+            &params(vec![
+                ("visible_anchor", Value::Uuid(visible_anchor)),
+                ("hidden_anchor", Value::Uuid(hidden_anchor)),
+            ]),
+            snapshot,
+        )
+        .expect_err("cross-scope graph anchor in any CTE must be refused");
+    sarg_expect_context_violation(err, ctx_b, &[ctx_a]);
+}
+
+#[test]
+fn anchor_read_of_sync_replicated_row_under_scoped_handle_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    db.apply_changes(
+        sync::ChangeSet {
+            rows: vec![
+                sync::RowChange {
+                    table: "t".to_string(),
+                    natural_key: sync::NaturalKey::single(
+                        "id".to_string(),
+                        Value::Uuid(sarg_uuid(2)),
+                    ),
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(sarg_uuid(2))),
+                        ("context_id".to_string(), Value::Uuid(ctx_b)),
+                        ("data".to_string(), Value::Text("b".to_string())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(1),
+                    created_at: None,
+                },
+                sync::RowChange {
+                    table: "t".to_string(),
+                    natural_key: sync::NaturalKey::single(
+                        "id".to_string(),
+                        Value::Uuid(sarg_uuid(3)),
+                    ),
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(sarg_uuid(3))),
+                        ("context_id".to_string(), Value::Uuid(ctx_c)),
+                        ("data".to_string(), Value::Text("c".to_string())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(2),
+                    created_at: None,
+                },
+            ],
+            ..sync::ChangeSet::default()
+        },
+        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    for (id, ctx) in [(sarg_uuid(2), ctx_b), (sarg_uuid(3), ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .expect_err("sync-replicated hidden anchor must be refused");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
+}
+
+// The published three-bucket contract (`docs/architecture.md:352-359`,
+// `docs/cli.md:239`) says `conflicts` records ONLY genuine divergence
+// between two peers, and `skipped_rows` records a policy or context
+// refusal. This test's original assertion required the OPPOSITE for an
+// access-scope refusal — that it produce BOTH a skip AND a `Conflict`
+// record naming the hidden row's natural key. That premise contradicted the
+// documented contract and is corrected in place below (assertions only; the
+// scenario, table shape, and every other value are unchanged).
+// Access/context refusals are skipped-ONLY, no conflict record — the
+// receiver genuinely refused the row (nothing to leak, nothing to disagree
+// about), and a `Conflict` naming a natural key the receiver cannot see
+// would leak that the hidden row exists at all, which the access boundary
+// exists to prevent. The security ordering — the access gate runs before
+// the identical-row no-op check — is UNCHANGED and correct: a receiver must
+// never compare an incoming row's content against local state it is not
+// entitled to see, so an access-hidden row is always a refusal, even when
+// its content happens to be byte-identical to what the receiver cannot look
+// at.
+#[test]
+fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let visible_id = sarg_uuid(0xA1);
+    let hidden_id = sarg_uuid(0xB1);
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+
+    let result = scoped
+        .apply_changes(
+            sync::ChangeSet {
+                rows: vec![
+                    sync::RowChange {
+                        table: "t".to_string(),
+                        natural_key: sync::NaturalKey::single(
+                            "id".to_string(),
+                            Value::Uuid(hidden_id),
+                        ),
+                        values: HashMap::from([
+                            ("id".to_string(), Value::Uuid(hidden_id)),
+                            ("context_id".to_string(), Value::Uuid(ctx_b)),
+                            ("data".to_string(), Value::Text("hidden".to_string())),
+                        ]),
+                        deleted: false,
+                        lsn: Lsn(1),
+                        created_at: None,
+                    },
+                    sync::RowChange {
+                        table: "t".to_string(),
+                        natural_key: sync::NaturalKey::single(
+                            "id".to_string(),
+                            Value::Uuid(visible_id),
+                        ),
+                        values: HashMap::from([
+                            ("id".to_string(), Value::Uuid(visible_id)),
+                            ("context_id".to_string(), Value::Uuid(ctx_a)),
+                            ("data".to_string(), Value::Text("visible".to_string())),
+                        ]),
+                        deleted: false,
+                        lsn: Lsn(2),
+                        created_at: None,
+                    },
+                ],
+                ..sync::ChangeSet::default()
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::LatestWins),
+        )
+        .expect("scoped sync apply must skip hidden incoming rows, not abort");
+
+    assert_eq!(result.applied_rows, 1);
+    assert_eq!(
+        result.skipped_rows, 1,
+        "the hidden row is still refused — an access-scope refusal is genuine \
+         refused work, so it counts as skipped"
+    );
+    assert!(
+        result.conflicts.is_empty(),
+        "an access-scope refusal must NOT produce a Conflict record — conflicts \
+         are reserved for genuine divergence between two peers that both saw \
+         and disagree on the same row. A receiver refusing to look at a row it \
+         cannot see has nothing to disagree about, and a conflict record naming \
+         the row's natural key would leak that the hidden row exists at all — \
+         exactly what the access boundary exists to prevent. Got {:?}",
+        result.conflicts
+    );
+    let visible = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(visible_id))]),
+        )
+        .unwrap();
+    assert_eq!(visible.rows, vec![vec![Value::Text("visible".to_string())]]);
+    let hidden = db
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(hidden_id))]),
+        )
+        .unwrap();
+    assert!(
+        hidden.rows.is_empty(),
+        "hidden incoming sync row must not be stored by the scoped receiver"
+    );
+}
+
+/// GUARD, alongside the corrected test above: the access-refusal fix must not
+/// bleed into rows the scoped receiver CAN see. Two rows at the SAME natural
+/// key, both tagged with the receiver's OWN visible context (no access
+/// hiding involved anywhere in this scenario) but carrying GENUINELY
+/// DIFFERENT content, is real divergence a conflict policy must actually
+/// decide on — it must still produce exactly one `Conflict` record, with a
+/// reason that names the POLICY that resolved it (`"server_wins"`), never the
+/// access-scope reason, proving the two refusal classes stay genuinely
+/// distinct.
+#[test]
+fn scoped_sync_apply_genuine_divergence_within_visible_scope_still_conflicts() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let row_id = sarg_uuid(0xC1);
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+
+    // The receiver already holds its OWN value for this key, within its own
+    // visible context — never hidden, never synced from anywhere.
+    scoped
+        .execute(
+            "INSERT INTO t (id, context_id, data) VALUES ($id, $context_id, $data)",
+            &params(vec![
+                ("id", Value::Uuid(row_id)),
+                ("context_id", Value::Uuid(ctx_a)),
+                ("data", Value::Text("local-version".to_string())),
+            ]),
+        )
+        .unwrap();
+
+    // An incoming row at the SAME key, the SAME (fully visible) context, but
+    // GENUINELY DIFFERENT content — a real competing write the receiver can
+    // see in full, not a re-delivery and not access-hidden.
+    let result = scoped
+        .apply_changes(
+            sync::ChangeSet {
+                rows: vec![sync::RowChange {
+                    table: "t".to_string(),
+                    natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(row_id)),
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(row_id)),
+                        ("context_id".to_string(), Value::Uuid(ctx_a)),
+                        (
+                            "data".to_string(),
+                            Value::Text("incoming-version".to_string()),
+                        ),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(1),
+                    created_at: None,
+                }],
+                ..sync::ChangeSet::default()
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .expect("scoped sync apply of a genuinely diverging visible row must not abort");
+
+    assert_eq!(
+        result.skipped_rows, 1,
+        "ServerWins declines the incoming row, so it counts as skipped: {result:?}"
+    );
+    assert_eq!(
+        result.conflicts.len(),
+        1,
+        "a genuine divergence within fully visible scope must still be reported \
+         as exactly one conflict: {:?}",
+        result.conflicts
+    );
+    let conflict = &result.conflicts[0];
+    assert_eq!(
+        conflict.natural_key,
+        sync::NaturalKey::single("id".to_string(), Value::Uuid(row_id)),
+        "the conflict must name the genuinely diverging row: {conflict:?}"
+    );
+    assert_eq!(
+        conflict.reason.as_deref(),
+        Some("server_wins"),
+        "the reason must name the POLICY that resolved it, never the \
+         access-scope reason — this scenario has no hidden row anywhere: \
+         {conflict:?}"
+    );
+
+    let local = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(row_id))]),
+        )
+        .unwrap();
+    assert_eq!(
+        local.rows,
+        vec![vec![Value::Text("local-version".to_string())]],
+        "ServerWins keeps the receiver's own value through the genuine conflict"
+    );
+}
+
+#[test]
+fn scoped_sync_apply_skips_hidden_graph_edges_and_applies_allowed_edges() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let visible_source = sarg_uuid(0xA10);
+    let visible_target = sarg_uuid(0xA11);
+    let visible_edge = sarg_uuid(0xA12);
+    let hidden_source = sarg_uuid(0xB10);
+    let hidden_target = sarg_uuid(0xB11);
+    let hidden_edge = sarg_uuid(0xB12);
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+
+    let node_row = |id, context, data: &str, lsn| sync::RowChange {
+        table: "nodes".to_string(),
+        natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(id)),
+        values: HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            ("context_id".to_string(), Value::Uuid(context)),
+            ("data".to_string(), Value::Text(data.to_string())),
+        ]),
+        deleted: false,
+        lsn,
+        created_at: None,
+    };
+    let edge_row = |id, source, target, context, lsn| sync::RowChange {
+        table: "edges".to_string(),
+        natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(id)),
+        values: HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            ("source_id".to_string(), Value::Uuid(source)),
+            ("target_id".to_string(), Value::Uuid(target)),
+            ("edge_type".to_string(), Value::Text("LINKS".to_string())),
+            ("context_id".to_string(), Value::Uuid(context)),
+        ]),
+        deleted: false,
+        lsn,
+        created_at: None,
+    };
+
+    let result = scoped
+        .apply_changes(
+            sync::ChangeSet {
+                rows: vec![
+                    node_row(hidden_source, ctx_b, "hidden source", Lsn(1)),
+                    node_row(hidden_target, ctx_b, "hidden target", Lsn(1)),
+                    edge_row(hidden_edge, hidden_source, hidden_target, ctx_b, Lsn(1)),
+                    node_row(visible_source, ctx_a, "visible source", Lsn(2)),
+                    node_row(visible_target, ctx_a, "visible target", Lsn(2)),
+                    edge_row(visible_edge, visible_source, visible_target, ctx_a, Lsn(2)),
+                ],
+                edges: vec![
+                    sync::EdgeChange {
+                        source: hidden_source,
+                        target: hidden_target,
+                        edge_type: "LINKS".to_string(),
+                        properties: HashMap::new(),
+                        lsn: Lsn(1),
+                    },
+                    sync::EdgeChange {
+                        source: visible_source,
+                        target: visible_target,
+                        edge_type: "LINKS".to_string(),
+                        properties: HashMap::new(),
+                        lsn: Lsn(2),
+                    },
+                ],
+                ..sync::ChangeSet::default()
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::LatestWins),
+        )
+        .expect("scoped sync apply must skip hidden graph edges, not abort");
+
+    assert_eq!(result.applied_rows, 3);
+    assert!(result.skipped_rows >= 4, "got {result:?}");
+    let visible = scoped
+        .execute(
+            "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))",
+            &params(vec![("source", Value::Uuid(visible_source))]),
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&visible, "t"),
+        BTreeSet::from([visible_target])
+    );
+    let hidden = db
+        .execute(
+            "SELECT data FROM nodes WHERE id = $id",
+            &params(vec![("id", Value::Uuid(hidden_source))]),
+        )
+        .unwrap();
+    assert!(
+        hidden.rows.is_empty(),
+        "hidden incoming graph endpoint must not be stored by the scoped receiver"
+    );
+}
+
+#[test]
+fn sync_apply_replays_same_lsn_non_vector_delete_before_replacement_insert() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID UNIQUE, success BOOLEAN)",
+        &empty(),
+    )
+    .unwrap();
+    let decision_id = sarg_uuid(0xD);
+    let old_id = sarg_uuid(0xD1);
+    let new_id = sarg_uuid(0xD2);
+    db.execute(
+        "INSERT INTO outcomes (id, decision_id, success) VALUES ($id, $decision_id, $success)",
+        &params(vec![
+            ("id", Value::Uuid(old_id)),
+            ("decision_id", Value::Uuid(decision_id)),
+            ("success", Value::Bool(false)),
+        ]),
+    )
+    .unwrap();
+
+    db.apply_changes(
+        sync::ChangeSet {
+            rows: vec![
+                sync::RowChange {
+                    table: "outcomes".to_string(),
+                    natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(new_id)),
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(new_id)),
+                        ("decision_id".to_string(), Value::Uuid(decision_id)),
+                        ("success".to_string(), Value::Bool(true)),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(2),
+                    created_at: None,
+                },
+                sync::RowChange {
+                    table: "outcomes".to_string(),
+                    natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(old_id)),
+                    values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
+                    deleted: true,
+                    lsn: Lsn(2),
+                    created_at: None,
+                },
+            ],
+            ..sync::ChangeSet::default()
+        },
+        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::EdgeWins),
+    )
+    .unwrap();
+
+    let rows = db
+        .execute("SELECT id, success FROM outcomes", &empty())
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::Uuid(new_id), Value::Bool(true)]]
+    );
+}
+
+#[test]
+fn sync_edge_wins_replaces_committed_unique_conflict_with_incoming_row() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID UNIQUE, success BOOLEAN)",
+        &empty(),
+    )
+    .unwrap();
+    let decision_id = sarg_uuid(0xE);
+    let local_id = sarg_uuid(0xE1);
+    let incoming_id = sarg_uuid(0xE2);
+    db.execute(
+        "INSERT INTO outcomes (id, decision_id, success) VALUES ($id, $decision_id, $success)",
+        &params(vec![
+            ("id", Value::Uuid(local_id)),
+            ("decision_id", Value::Uuid(decision_id)),
+            ("success", Value::Bool(false)),
+        ]),
+    )
+    .unwrap();
+
+    db.apply_changes(
+        sync::ChangeSet {
+            rows: vec![sync::RowChange {
+                table: "outcomes".to_string(),
+                natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(incoming_id)),
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(incoming_id)),
+                    ("decision_id".to_string(), Value::Uuid(decision_id)),
+                    ("success".to_string(), Value::Bool(true)),
+                ]),
+                deleted: false,
+                lsn: Lsn(2),
+                created_at: None,
+            }],
+            ..sync::ChangeSet::default()
+        },
+        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::EdgeWins),
+    )
+    .unwrap();
+
+    let rows = db
+        .execute("SELECT id, success FROM outcomes", &empty())
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::Uuid(incoming_id), Value::Bool(true)]]
+    );
+}
+
+#[test]
+fn typed_error_display_messages_describe_hidden_by_scope_with_actionable_phrasing() {
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let context = Error::ContextScopeViolation {
+        requested: ContextId::new(ctx_b),
+        allowed: sarg_contexts(&[ctx_a]),
+    };
+    let msg = context.to_string();
+    assert!(msg.to_lowercase().contains("hidden") && msg.to_lowercase().contains("scope"));
+    assert!(msg.contains(&ctx_b.to_string()));
+    assert!(msg.contains('{') && msg.contains(&ctx_a.to_string()) && msg.contains('}'));
+    assert!(!msg.contains("ContextId(") && !msg.contains("Uuid(") && !msg.contains("BTreeSet"));
+
+    let missing = Error::ContextScopeViolation {
+        requested: ContextId::new(Uuid::from_u128(u128::MAX)),
+        allowed: sarg_contexts(&[ctx_a]),
+    }
+    .to_string();
+    assert!(missing.to_lowercase().contains("no context"));
+
+    let scope = Error::ScopeLabelViolation {
+        requested: ScopeLabel::new("b"),
+        allowed: sarg_labels(&["a"]),
+    };
+    let msg = scope.to_string();
+    assert!(msg.to_lowercase().contains("hidden") && msg.to_lowercase().contains("scope label"));
+    assert!(msg.contains("{a}"));
+    assert!(!msg.contains("ScopeLabel(") && !msg.contains("BTreeSet"));
+
+    let acl = Error::AclDenied {
+        table: "t".to_string(),
+        row_id: RowId(7),
+        principal: Principal::Agent("agent-a".to_string()),
+    };
+    let msg = acl.to_string();
+    assert!(msg.to_lowercase().contains("hidden") && msg.to_lowercase().contains("acl"));
+    assert!(msg.contains("t"));
+}
+
+#[test]
+fn scoped_anchor_read_with_degenerate_input_returns_error_or_empty_no_panic() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[sarg_uuid(0xA)]));
+    let missing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scoped.execute(
+            "SELECT data FROM nonexistent_table WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(1)))]),
+        )
+    }))
+    .expect("nonexistent table query must not panic");
+    assert!(matches!(missing, Err(Error::TableNotFound(_))));
+
+    let wrong_type = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scoped.execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Text("not-a-uuid".to_string()))]),
+        )
+    }))
+    .expect("wrong typed parameter query must not panic")
+    .unwrap();
+    assert!(wrong_type.rows.is_empty());
+}
+
+#[test]
+fn trigger_written_cross_context_row_anchor_read_under_scoped_handle_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE obs (id UUID PRIMARY KEY, kind TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE TRIGGER tr ON obs WHEN INSERT", &empty())
+        .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    db.register_trigger_callback("tr", move |db_handle, ctx| {
+        let id = ctx
+            .row_values
+            .get("id")
+            .and_then(Value::as_uuid)
+            .copied()
+            .ok_or_else(|| Error::Other("obs id missing".to_string()))?;
+        let target_ctx = if id == sarg_uuid(21) { ctx_b } else { ctx_c };
+        db_handle.insert_row(
+            ctx.tx,
+            "t",
+            HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("context_id".to_string(), Value::Uuid(target_ctx)),
+                ("data".to_string(), Value::Text("triggered".to_string())),
+            ]),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+    for id in [sarg_uuid(21), sarg_uuid(22)] {
+        db.execute(
+            "INSERT INTO obs (id, kind, context_id) VALUES ($id, 'k', $ctx)",
+            &params(vec![("id", Value::Uuid(id)), ("ctx", Value::Uuid(ctx_a))]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    for (id, ctx) in [(sarg_uuid(21), ctx_b), (sarg_uuid(22), ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .expect_err("trigger-written hidden anchor must be refused");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
+}
+
+#[test]
+fn trigger_callback_cannot_insert_or_update_a_null_primary_key() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE callback_source (id UUID PRIMARY KEY, action TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE callback_target (tenant_id UUID, item_id UUID, body TEXT, PRIMARY KEY (tenant_id, item_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER callback_pk_guard ON callback_source WHEN INSERT",
+        &empty(),
+    )
+    .unwrap();
+    let tenant_id = Uuid::new_v4();
+    let item_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO callback_target (tenant_id, item_id, body) VALUES ($tenant_id, $item_id, 'kept')",
+        &params(vec![
+            ("tenant_id", Value::Uuid(tenant_id)),
+            ("item_id", Value::Uuid(item_id)),
+        ]),
+    )
+    .unwrap();
+    db.register_trigger_callback("callback_pk_guard", move |db_handle, ctx| {
+        match ctx.row_values.get("action").and_then(Value::as_text) {
+            Some("insert") => {
+                db_handle.insert_row(
+                    ctx.tx,
+                    "callback_target",
+                    HashMap::from([
+                        ("tenant_id".to_string(), Value::Null),
+                        ("item_id".to_string(), Value::Uuid(Uuid::new_v4())),
+                        ("body".to_string(), Value::Text("bad insert".to_string())),
+                    ]),
+                )?;
+            }
+            Some("update") => {
+                db_handle.execute_in_tx(
+                    ctx.tx,
+                    "UPDATE callback_target SET tenant_id = NULL WHERE item_id = $item_id",
+                    &params(vec![("item_id", Value::Uuid(item_id))]),
+                )?;
+            }
+            _ => return Err(Error::Other("unknown callback action".to_string())),
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+
+    for action in ["insert", "update"] {
+        assert!(
+            db.execute(
+                "INSERT INTO callback_source (id, action) VALUES ($id, $action)",
+                &params(vec![
+                    ("id", Value::Uuid(Uuid::new_v4())),
+                    ("action", Value::Text(action.to_string())),
+                ]),
+            )
+            .is_err(),
+            "callback {action} must refuse a NULL primary-key member"
+        );
+    }
+    let rows = db
+        .execute("SELECT * FROM callback_target", &empty())
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Uuid(tenant_id));
+    assert_eq!(rows[0][2], Value::Text("kept".to_string()));
+}
+
+#[test]
+fn dual_01_select_without_from() {
+    let db = Database::open_memory();
+    let result = db.execute("SELECT NOW()", &empty()).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert!(
+        matches!(result.rows[0][0], Value::Timestamp(_)),
+        "SELECT NOW() without FROM should return timestamp"
+    );
+}
+
+#[test]
+fn err_01_triple_not_evaluates_correctly() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE errtest (id UUID PRIMARY KEY, val TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO errtest (id, val) VALUES ($id, $val)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("val", Value::Text("hello".into())),
+        ]),
+    )
+    .unwrap();
+
+    // NOT NOT NOT (val = 'hello') = NOT NOT false = NOT true = false => 0 rows
+    let result = db
+        .execute(
+            "SELECT * FROM errtest WHERE NOT NOT NOT val = 'hello'",
+            &empty(),
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "triple NOT of true = false, so 0 rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cmt_01 — Line comment stripped
+// ---------------------------------------------------------------------------
+#[test]
+fn cmt_01_line_comment() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (id UUID PRIMARY KEY, val TEXT)", &empty())
+        .unwrap();
+    db.execute(
+        "INSERT INTO t (id, val) VALUES ($id, $val)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("val", Value::Text("hello".into())),
+        ]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT * FROM t -- this is a comment\nWHERE val = 'hello'",
+            &empty(),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let val_idx = result.columns.iter().position(|c| c == "val").unwrap();
+    assert_eq!(result.rows[0][val_idx], Value::Text("hello".into()));
+}
+
+// ---------------------------------------------------------------------------
+// cmt_02 — Block comment stripped
+// ---------------------------------------------------------------------------
+#[test]
+fn cmt_02_block_comment() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (id UUID PRIMARY KEY, val TEXT)", &empty())
+        .unwrap();
+    db.execute(
+        "INSERT INTO t (id, val) VALUES ($id, $val)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("val", Value::Text("hello".into())),
+        ]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT /* all columns */ * FROM t WHERE val = 'hello'",
+            &empty(),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let val_idx = result.columns.iter().position(|c| c == "val").unwrap();
+    assert_eq!(result.rows[0][val_idx], Value::Text("hello".into()));
+}
+
+// ---------------------------------------------------------------------------
+// upd_01 — UPDATE SET count = count + 1
+// ---------------------------------------------------------------------------
+#[test]
+fn upd_01_update_with_arithmetic() {
+    let db = Database::open_memory();
+    let id1 = Uuid::new_v4();
+    db.execute(
+        "CREATE TABLE counters (id UUID PRIMARY KEY, count INTEGER)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO counters (id, count) VALUES ($id, $count)",
+        &params(vec![("id", Value::Uuid(id1)), ("count", Value::Int64(10))]),
+    )
+    .unwrap();
+
+    db.execute(
+        "UPDATE counters SET count = count + 1 WHERE id = $id",
+        &params(vec![("id", Value::Uuid(id1))]),
+    )
+    .unwrap();
+
+    let row = db
+        .point_lookup("counters", "id", &Value::Uuid(id1), db.snapshot())
+        .unwrap()
+        .expect("row must exist");
+    assert_eq!(
+        row.values.get("count"),
+        Some(&Value::Int64(11)),
+        "count must be 11 after +1"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// upd_02 — UPDATE SET ts = NOW()
+// ---------------------------------------------------------------------------
+#[test]
+fn upd_02_update_with_now() {
+    let db = Database::open_memory();
+    let id1 = Uuid::new_v4();
+    db.execute(
+        "CREATE TABLE events (id UUID PRIMARY KEY, ts TIMESTAMP)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO events (id, ts) VALUES ($id, $ts)",
+        &params(vec![("id", Value::Uuid(id1)), ("ts", Value::Timestamp(0))]),
+    )
+    .unwrap();
+
+    db.execute(
+        "UPDATE events SET ts = NOW() WHERE id = $id",
+        &params(vec![("id", Value::Uuid(id1))]),
+    )
+    .unwrap();
+
+    let row = db
+        .point_lookup("events", "id", &Value::Uuid(id1), db.snapshot())
+        .unwrap()
+        .expect("row must exist");
+    match row.values.get("ts") {
+        Some(Value::Timestamp(t)) => assert!(*t > 0, "NOW() must produce a timestamp > 0"),
+        other => panic!("expected Timestamp, got {:?}", other),
+    }
+}
+
+#[test]
+fn upd_03_update_embedding_changes_vector_recall_immediately() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id_a = Uuid::new_v4();
+    let id_b = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO observations (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id_a)),
+            ("embedding", Value::Vector(vec![0.95, 0.05, 0.0])),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO observations (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id_b)),
+            ("embedding", Value::Vector(vec![0.9, 0.1, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    let before = db
+        .execute(
+            "SELECT id FROM observations ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
+        )
+        .unwrap();
+    assert_eq!(before.rows.len(), 1);
+    assert_eq!(before.rows[0][0], Value::Uuid(id_a));
+
+    db.execute(
+        "UPDATE observations SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(id_a)),
+            ("embedding", Value::Vector(vec![-1.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    let after = db
+        .execute(
+            "SELECT id FROM observations ORDER BY embedding <=> $query LIMIT 2",
+            &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
+        )
+        .unwrap();
+    assert_eq!(after.rows.len(), 2);
+    assert_eq!(after.rows[0][0], Value::Uuid(id_b));
+    assert_eq!(after.rows[1][0], Value::Uuid(id_a));
+}
+
+#[test]
+fn upd_04_stale_conditional_update_in_explicit_tx_commits_as_noop_atomically() {
+    let db = Database::open_memory();
+    let id = Uuid::new_v4();
+    db.execute(
+        "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tasks (id, status) VALUES ($id, 'pending')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let tx_a = db.begin_or_panic();
+    let tx_b = db.begin_or_panic();
+    let stale_predicate = params(vec![
+        ("id", Value::Uuid(id)),
+        ("pending", Value::Text("pending".to_string())),
+        ("done", Value::Text("done".to_string())),
+    ]);
+
+    let a = db
+        .execute_in_tx(
+            tx_a,
+            "UPDATE tasks SET status = $done WHERE id = $id AND status = $pending",
+            &stale_predicate,
+        )
+        .unwrap();
+    let b = db
+        .execute_in_tx(
+            tx_b,
+            "UPDATE tasks SET status = $done WHERE id = $id AND status = $pending",
+            &stale_predicate,
+        )
+        .unwrap();
+    assert_eq!(a.rows_affected, 1);
+    assert_eq!(b.rows_affected, 1);
+
+    db.commit(tx_a).expect("first conditional update commits");
+    db.commit(tx_b)
+        .expect("ordinary stale conditional update commits as commit-time no-op");
+
+    let row = db
+        .point_lookup("tasks", "id", &Value::Uuid(id), db.snapshot())
+        .unwrap()
+        .expect("task must still exist");
+    assert_eq!(
+        row.values.get("status"),
+        Some(&Value::Text("done".to_string()))
+    );
+}
+
+#[test]
+fn upd_05_row_condition_guard_in_explicit_tx_fails_commit_atomically() {
+    let db = Database::open_memory();
+    let id = Uuid::new_v4();
+    db.execute(
+        "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE task_audit (id UUID PRIMARY KEY, task_id UUID, note TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tasks (id, status) VALUES ($id, 'active')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let tx_guarded = db.begin_or_panic();
+    assert!(
+        db.guard_row_conditions_in_tx(
+            tx_guarded,
+            "tasks",
+            "id",
+            &Value::Uuid(id),
+            &[("status".to_string(), Value::Text("active".to_string()))],
+        )
+        .expect("register guard")
+    );
+    db.execute_in_tx(
+        tx_guarded,
+        "INSERT INTO task_audit (id, task_id, note) VALUES ($id, $task_id, 'guarded side effect')",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("task_id", Value::Uuid(id)),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "UPDATE tasks SET status = 'archived' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let err = db
+        .commit(tx_guarded)
+        .expect_err("stale guarded transaction must fail");
+    assert!(
+        matches!(err, Error::ConditionalUpdateConflict { count: 1 }),
+        "expected ConditionalUpdateConflict, got {err:?}"
+    );
+    let audit_rows = db
+        .execute(
+            "SELECT id FROM task_audit WHERE task_id = $task_id",
+            &params(vec![("task_id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(
+        audit_rows.rows.len(),
+        0,
+        "guarded side effects must roll back with the stale transaction"
+    );
+}
+
+fn setup_cte_sensor_db() -> Database {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, status TEXT, reading REAL)",
+        &empty(),
+    )
+    .unwrap();
+
+    for (id, name, status, reading) in [
+        (
+            Uuid::from_u128(1),
+            "sensor-north",
+            "active",
+            Value::Float64(42.0),
+        ),
+        (
+            Uuid::from_u128(2),
+            "sensor-south",
+            "inactive",
+            Value::Float64(10.0),
+        ),
+        (
+            Uuid::from_u128(3),
+            "widget-east",
+            "active",
+            Value::Float64(99.0),
+        ),
+    ] {
+        db.execute(
+            "INSERT INTO sensors (id, name, status, reading) VALUES ($id, $name, $status, $reading)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text(name.to_string())),
+                ("status", Value::Text(status.to_string())),
+                ("reading", reading),
+            ]),
+        )
+        .unwrap();
+    }
+
+    db
+}
+
+#[test]
+fn cte_01_outer_where_filters_cte_rows() {
+    let db = setup_cte_sensor_db();
+
+    let result = db
+        .execute(
+            "WITH active AS (SELECT id, name, reading FROM sensors WHERE status = 'active') \
+             SELECT id, name FROM active WHERE name LIKE 'sensor%'",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "outer WHERE on CTE should keep only sensor-prefixed active rows"
+    );
+    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
+    let names: Vec<_> = result
+        .rows
+        .iter()
+        .map(|row| row[name_idx].clone())
+        .collect();
+    assert_eq!(names, vec![Value::Text("sensor-north".to_string())]);
+    assert!(
+        !names.contains(&Value::Text("widget-east".to_string())),
+        "widget-east is active but should be filtered out by outer LIKE predicate"
+    );
+}
+
+#[test]
+fn cte_02_outer_where_comparison_filters_cte_rows() {
+    let db = setup_cte_sensor_db();
+
+    let result = db
+        .execute(
+            "WITH high AS (SELECT id, name, reading FROM sensors WHERE status = 'active') \
+             SELECT id, name, reading FROM high WHERE reading > 50.0",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "outer WHERE on CTE should keep only rows above the reading threshold"
+    );
+    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
+    let reading_idx = result.columns.iter().position(|c| c == "reading").unwrap();
+    assert_eq!(
+        result.rows[0][name_idx],
+        Value::Text("widget-east".to_string())
+    );
+    assert_eq!(result.rows[0][reading_idx], Value::Float64(99.0));
+}
+
+#[test]
+fn dag_01_cycle_rejected_via_insert_sql() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE dependencies (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS_ON')",
+        &empty(),
+    )
+    .unwrap();
+
+    let a = Uuid::from_u128(101);
+    let b = Uuid::from_u128(102);
+
+    db.execute(
+        "INSERT INTO dependencies (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(201))),
+            ("source", Value::Uuid(a)),
+            ("target", Value::Uuid(b)),
+            ("edge_type", Value::Text("DEPENDS_ON".to_string())),
+        ]),
+    )
+    .unwrap();
+
+    let err = db
+        .execute(
+            "INSERT INTO dependencies (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $edge_type)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(202))),
+                ("source", Value::Uuid(b)),
+                ("target", Value::Uuid(a)),
+                ("edge_type", Value::Text("DEPENDS_ON".to_string())),
+            ]),
+        )
+        .unwrap_err();
+
+    assert!(
+        err.to_string().to_lowercase().contains("cycle"),
+        "expected cycle rejection on reverse insert, got {err}"
+    );
+}
+
+#[test]
+fn dag_02_self_loop_rejected_via_insert_sql() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE dependencies (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS_ON')",
+        &empty(),
+    )
+    .unwrap();
+
+    let node = Uuid::from_u128(103);
+    let err = db
+        .execute(
+            "INSERT INTO dependencies (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $edge_type)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(203))),
+                ("source", Value::Uuid(node)),
+                ("target", Value::Uuid(node)),
+                ("edge_type", Value::Text("DEPENDS_ON".to_string())),
+            ]),
+        )
+        .unwrap_err();
+
+    assert!(
+        err.to_string().to_lowercase().contains("cycle"),
+        "expected self-loop insert to be rejected as a cycle, got {err}"
+    );
+}
+
+#[test]
+fn prop_01_fk_propagate_fires_on_update() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: active -> [archived, completed])",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated, status TEXT) STATE MACHINE (status: active -> [invalidated, superseded])",
+        &empty(),
+    )
+    .unwrap();
+
+    let intention_id = Uuid::from_u128(301);
+    let decision_id = Uuid::from_u128(302);
+
+    db.execute(
+        "INSERT INTO intentions (id, status) VALUES ($id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(intention_id)),
+            ("status", Value::Text("active".to_string())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO decisions (id, intention_id, status) VALUES ($id, $intention_id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(decision_id)),
+            ("intention_id", Value::Uuid(intention_id)),
+            ("status", Value::Text("active".to_string())),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "UPDATE intentions SET status = 'archived' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(intention_id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT status FROM decisions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(decision_id))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        result.rows[0][0],
+        Value::Text("invalidated".to_string()),
+        "child decision should be invalidated after parent UPDATE archives intention"
+    );
+}
+
+#[test]
+fn prop_02_fk_propagate_cascades_multiple_children() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: active -> [archived, completed])",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated, status TEXT) STATE MACHINE (status: active -> [invalidated, superseded])",
+        &empty(),
+    )
+    .unwrap();
+
+    let intention_id = Uuid::from_u128(401);
+    let decision_a = Uuid::from_u128(402);
+    let decision_b = Uuid::from_u128(403);
+
+    db.execute(
+        "INSERT INTO intentions (id, status) VALUES ($id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(intention_id)),
+            ("status", Value::Text("active".to_string())),
+        ]),
+    )
+    .unwrap();
+
+    for decision_id in [decision_a, decision_b] {
+        db.execute(
+            "INSERT INTO decisions (id, intention_id, status) VALUES ($id, $intention_id, $status)",
+            &params(vec![
+                ("id", Value::Uuid(decision_id)),
+                ("intention_id", Value::Uuid(intention_id)),
+                ("status", Value::Text("active".to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+
+    db.execute(
+        "UPDATE intentions SET status = 'archived' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(intention_id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute("SELECT id, status FROM decisions ORDER BY id", &empty())
+        .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    let id_idx = result.columns.iter().position(|c| c == "id").unwrap();
+    let status_idx = result.columns.iter().position(|c| c == "status").unwrap();
+
+    assert_eq!(result.rows[0][id_idx], Value::Uuid(decision_a));
+    assert_eq!(
+        result.rows[0][status_idx],
+        Value::Text("invalidated".to_string())
+    );
+    assert_eq!(result.rows[1][id_idx], Value::Uuid(decision_b));
+    assert_eq!(
+        result.rows[1][status_idx],
+        Value::Text("invalidated".to_string())
+    );
+}
+
+fn ddl_name(change: &contextdb_engine::sync_types::DdlChange) -> String {
+    match change {
+        contextdb_engine::sync_types::DdlChange::CreateTable { name, .. }
+        | contextdb_engine::sync_types::DdlChange::DropTable { name }
+        | contextdb_engine::sync_types::DdlChange::AlterTable { name, .. } => name.clone(),
+        contextdb_engine::sync_types::DdlChange::CreateIndex { table, .. }
+        | contextdb_engine::sync_types::DdlChange::DropIndex { table, .. } => table.clone(),
+        contextdb_engine::sync_types::DdlChange::CreateTrigger { table, .. }
+        | contextdb_engine::sync_types::DdlChange::CreateTriggerIncludingSync { table, .. } => {
+            table.clone()
+        }
+        contextdb_engine::sync_types::DdlChange::DropTrigger { name } => name.clone(),
+        contextdb_engine::sync_types::DdlChange::CreateEventType { table, .. } => table.clone(),
+        contextdb_engine::sync_types::DdlChange::CreateSink { name, .. }
+        | contextdb_engine::sync_types::DdlChange::CreateRoute { name, .. }
+        | contextdb_engine::sync_types::DdlChange::DropRoute { name, .. } => name.clone(),
+    }
+}
+
+#[test]
+fn sql_15_ddl_dml_lsn_causal_ordering() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let workers = 4;
+    let iterations = 40;
+    let barrier = Arc::new(Barrier::new(workers + 1));
+    let done = Arc::new(AtomicBool::new(false));
+    let expected_tables: Vec<String> = (0..workers)
+        .flat_map(|worker| (0..iterations).map(move |i| format!("lsn_race_{worker}_{i}")))
+        .collect();
+    let poller_expected = Arc::new(expected_tables.clone());
+    let poller_db = db.clone();
+    let poller_done = done.clone();
+    let poller_barrier = barrier.clone();
+
+    let poller = thread::spawn(move || {
+        let mut watermark = Lsn(0);
+        let mut seen_creates = std::collections::HashSet::new();
+        let mut row_before_create = Vec::new();
+        let mut idle_after_done_since = None;
+        poller_barrier.wait();
+
+        loop {
+            let expected_len = poller_expected.len();
+            let changes = poller_db.changes_since(watermark);
+            let before_seen = seen_creates.len();
+            if !changes.ddl.is_empty() || !changes.rows.is_empty() {
+                for ddl in &changes.ddl {
+                    if matches!(
+                        ddl,
+                        contextdb_engine::sync_types::DdlChange::CreateTable { .. }
+                    ) {
+                        seen_creates.insert(ddl_name(ddl));
+                    }
+                }
+                for row in &changes.rows {
+                    if row.table.starts_with("lsn_race_") && !seen_creates.contains(&row.table) {
+                        row_before_create.push(row.table.clone());
+                    }
+                }
+                if let Some(lsn) = changes.max_lsn() {
+                    watermark = lsn;
+                }
+            } else {
+                thread::yield_now();
+            }
+
+            if poller_done.load(Ordering::SeqCst) && seen_creates.len() >= expected_len {
+                break;
+            }
+            if poller_done.load(Ordering::SeqCst) {
+                if seen_creates.len() == before_seen {
+                    idle_after_done_since.get_or_insert_with(Instant::now);
+                } else {
+                    idle_after_done_since = None;
+                }
+                if idle_after_done_since
+                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
+                {
+                    break;
+                }
+            }
+        }
+
+        let expected = poller_expected.as_ref().clone();
+        (row_before_create, seen_creates, expected)
+    });
+
+    let mut handles = Vec::new();
+    for worker in 0..workers {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for i in 0..iterations {
+                let table = format!("lsn_race_{worker}_{i}");
+                db.execute(
+                    &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, val TEXT)"),
+                    &empty(),
+                )
+                .unwrap();
+                db.execute(
+                    &format!("INSERT INTO {table} (id, val) VALUES ($id, 'data')"),
+                    &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO shared (id, val) VALUES ($id, 'shared')",
+                    &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                )
+                .unwrap();
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    done.store(true, Ordering::SeqCst);
+    let (row_before_create, seen_creates, expected) = poller.join().unwrap();
+
+    assert!(
+        row_before_create.is_empty(),
+        "sync consumer observed row changes before CREATE TABLE DDL for tables: {:?}",
+        row_before_create
+    );
+    for table in expected {
+        assert!(
+            seen_creates.contains(&table),
+            "sync consumer missed CREATE TABLE DDL for {table}"
+        );
+    }
+}
+
+#[test]
+fn sql_16_ddl_lsn_no_duplicates_under_contention() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let workers = 4;
+    let iterations = 25;
+    let barrier = Arc::new(Barrier::new(workers + 1));
+    let done = Arc::new(AtomicBool::new(false));
+    let expected_columns: Vec<String> = (0..workers)
+        .flat_map(|worker| (0..iterations).map(move |i| format!("c_{worker}_{i}")))
+        .collect();
+    let poller_expected = Arc::new(expected_columns.clone());
+    let poller_db = db.clone();
+    let poller_done = done.clone();
+    let poller_barrier = barrier.clone();
+
+    let poller = thread::spawn(move || {
+        let mut watermark = Lsn(0);
+        let mut seen_columns = std::collections::HashSet::new();
+        let mut idle_after_done_since = None;
+        poller_barrier.wait();
+
+        loop {
+            let expected_len = poller_expected.len();
+            let changes = poller_db.changes_since(watermark);
+            let before_seen = seen_columns.len();
+            if !changes.ddl.is_empty() || !changes.rows.is_empty() {
+                for ddl in &changes.ddl {
+                    if let contextdb_engine::sync_types::DdlChange::AlterTable {
+                        name, columns, ..
+                    } = ddl
+                        && name == "shared"
+                    {
+                        for (column, _) in columns {
+                            if column.starts_with("c_") {
+                                seen_columns.insert(column.clone());
+                            }
+                        }
+                    }
+                }
+                if let Some(lsn) = changes.max_lsn() {
+                    watermark = lsn;
+                }
+            } else {
+                thread::yield_now();
+            }
+
+            if poller_done.load(Ordering::SeqCst) && seen_columns.len() >= expected_len {
+                break;
+            }
+            if poller_done.load(Ordering::SeqCst) {
+                if seen_columns.len() == before_seen {
+                    idle_after_done_since.get_or_insert_with(Instant::now);
+                } else {
+                    idle_after_done_since = None;
+                }
+                if idle_after_done_since
+                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
+                {
+                    break;
+                }
+            }
+        }
+
+        let expected = poller_expected.len();
+        (seen_columns, poller_expected.as_ref().clone(), expected)
+    });
+
+    let mut handles = Vec::new();
+    for worker in 0..workers {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for i in 0..iterations {
+                let col = format!("c_{worker}_{i}");
+                db.execute(
+                    "INSERT INTO shared (id, val) VALUES ($id, 'data')",
+                    &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                )
+                .unwrap();
+                db.execute(
+                    &format!("ALTER TABLE shared ADD COLUMN {col} TEXT"),
+                    &empty(),
+                )
+                .unwrap();
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    done.store(true, Ordering::SeqCst);
+    let (seen_columns, expected_columns, expected) = poller.join().unwrap();
+
+    assert_eq!(expected_columns.len(), expected);
+    for column in expected_columns {
+        assert!(
+            seen_columns.contains(&column),
+            "sync consumer missed ALTER TABLE DDL for added column {column}"
+        );
+    }
+}
+
+#[test]
+fn sql_17_sync_watermark_does_not_skip_ddl() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let done = Arc::new(AtomicBool::new(false));
+    let expected_tables: Vec<String> = (0..120).map(|i| format!("watermark_race_{i}")).collect();
+
+    let poller_db = db.clone();
+    let poller_done = done.clone();
+    let poller_expected = Arc::new(expected_tables.clone());
+    let poller_barrier = barrier.clone();
+    let poller = thread::spawn(move || {
+        let mut watermark = Lsn(0);
+        let mut seen_tables = std::collections::HashSet::new();
+        let mut idle_after_done_since = None;
+        poller_barrier.wait();
+
+        loop {
+            let expected_len = poller_expected.len();
+            let changes = poller_db.changes_since(watermark);
+            let before_seen = seen_tables.len();
+            if !changes.ddl.is_empty() || !changes.rows.is_empty() {
+                for ddl in &changes.ddl {
+                    if matches!(
+                        ddl,
+                        contextdb_engine::sync_types::DdlChange::CreateTable { .. }
+                    ) {
+                        seen_tables.insert(ddl_name(ddl));
+                    }
+                }
+                if let Some(lsn) = changes.max_lsn() {
+                    watermark = lsn;
+                }
+            } else {
+                thread::yield_now();
+            }
+
+            if poller_done.load(Ordering::SeqCst) && seen_tables.len() >= expected_len {
+                break;
+            }
+            if poller_done.load(Ordering::SeqCst) {
+                if seen_tables.len() == before_seen {
+                    idle_after_done_since.get_or_insert_with(Instant::now);
+                } else {
+                    idle_after_done_since = None;
+                }
+                if idle_after_done_since
+                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
+                {
+                    break;
+                }
+            }
+        }
+
+        let expected = poller_expected.as_ref().clone();
+        (seen_tables, expected)
+    });
+
+    let ddl_db = db.clone();
+    let ddl_barrier = barrier.clone();
+    let ddl_thread = thread::spawn(move || {
+        ddl_barrier.wait();
+        for i in 0..120 {
+            let table = format!("watermark_race_{i}");
+            ddl_db
+                .execute(
+                    &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, val TEXT)"),
+                    &empty(),
+                )
+                .unwrap();
+        }
+    });
+
+    let dml_db = db.clone();
+    let dml_barrier = barrier.clone();
+    let dml_thread = thread::spawn(move || {
+        dml_barrier.wait();
+        for _ in 0..400 {
+            dml_db
+                .execute(
+                    "INSERT INTO shared (id, val) VALUES ($id, 'shared')",
+                    &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                )
+                .unwrap();
+        }
+    });
+
+    ddl_thread.join().unwrap();
+    dml_thread.join().unwrap();
+    done.store(true, Ordering::SeqCst);
+    let (seen_tables, expected) = poller.join().unwrap();
+
+    for table in expected {
+        assert!(
+            seen_tables.contains(&table),
+            "watermark advance skipped CREATE TABLE DDL for {table}"
+        );
+    }
+}
+
+#[test]
+fn disk_01_set_disk_limit_parses() {
+    let db = Database::open_memory();
+    let result = db.execute("SET DISK_LIMIT '1G'", &empty());
+    assert!(result.is_ok(), "SET DISK_LIMIT must parse: {result:?}");
+}
+
+#[test]
+fn disk_02_show_disk_limit_parses() {
+    let db = Database::open_memory();
+    let result = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
+    assert_eq!(
+        result.columns,
+        vec!["limit", "used", "available", "startup_ceiling"]
+    );
+    assert_eq!(result.rows.len(), 1);
+}
+
+#[test]
+fn disk_03_disk_limit_noop_for_memory() {
+    let db = Database::open_memory();
+    db.execute("SET DISK_LIMIT '1M'", &empty()).unwrap();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let payload = "x".repeat(128 * 1024);
+    let insert = db.execute(
+        "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("payload", Value::Text(payload)),
+        ]),
+    );
+    assert!(
+        insert.is_ok(),
+        "in-memory databases must ignore disk limits: {insert:?}"
+    );
+
+    let result = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
+    assert_eq!(
+        result.columns,
+        vec!["limit", "used", "available", "startup_ceiling"]
+    );
+    assert!(
+        match &result.rows[0][0] {
+            Value::Null => true,
+            Value::Text(s) if s == "none" => true,
+            _ => false,
+        },
+        "in-memory SHOW DISK_LIMIT must report no active limit: {:?}",
+        result.rows[0]
+    );
+}
+
+#[test]
+fn disk_04_insert_rejected_when_over_disk_budget() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("disk_04.db");
+    let db = Database::open(&db_path).unwrap();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let limit_kib = disk_limit_kib_for_path(&db_path, 64);
+    db.execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
+        .unwrap();
+
+    let payload = "x".repeat(16 * 1024);
+    let mut inserted = 0usize;
+    let mut failure = None;
+    for _ in 0..64 {
+        match db.execute(
+            "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("payload", Value::Text(payload.clone())),
+            ]),
+        ) {
+            Ok(_) => inserted += 1,
+            Err(err) => {
+                failure = Some(err.to_string());
+                break;
+            }
+        }
+    }
+
+    assert!(
+        inserted > 0,
+        "disk budget should allow at least one insert before rejecting writes"
+    );
+    let err = failure.expect("eventually expected disk budget rejection");
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "error must mention disk budget, got: {err}"
+    );
+}
+
+#[test]
+fn disk_05_disk_limit_persists_across_reopen() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("disk_05.db");
+    let configured_limit_bytes = {
+        let db = Database::open(&db_path).unwrap();
+        db.execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        let limit_kib = disk_limit_kib_for_path(&db_path, 64);
+        let configured_limit_bytes = (limit_kib * 1024) as i64;
+        db.execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
+            .unwrap();
+        let before = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
+        assert!(
+            before.rows[0].contains(&Value::Int64(configured_limit_bytes)),
+            "SHOW DISK_LIMIT must reflect configured limit before reopen: {:?}",
+            before.rows
+        );
+        db.close().unwrap();
+        configured_limit_bytes
+    };
+
+    let reopened = Database::open(&db_path).unwrap();
+    let after = reopened.execute("SHOW DISK_LIMIT", &empty()).unwrap();
+    assert!(
+        after.rows[0].contains(&Value::Int64(configured_limit_bytes)),
+        "SHOW DISK_LIMIT must reflect persisted limit after reopen: {:?}",
+        after.rows
+    );
+
+    let payload = "x".repeat(16 * 1024);
+    let mut failure = None;
+    for _ in 0..64 {
+        match reopened.execute(
+            "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("payload", Value::Text(payload.clone())),
+            ]),
+        ) {
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    let err = failure.expect("persisted disk limit must still reject writes after reopen");
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "reopened file-backed database must still enforce persisted disk limit: {err}"
+    );
+}
+
+#[test]
+fn disk_06_sync_pull_rejected_when_over_disk_budget() {
+    let edge_tmp = TempDir::new().expect("edge tempdir");
+    let server_tmp = TempDir::new().expect("server tempdir");
+    let edge_path = edge_tmp.path().join("edge.db");
+    let server_path = server_tmp.path().join("server.db");
+
+    let edge = Database::open(&edge_path).unwrap();
+    edge.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    for _ in 0..24 {
+        edge.execute(
+            "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("payload", Value::Text("x".repeat(8 * 1024))),
+            ]),
+        )
+        .unwrap();
+    }
+    let changes = edge.changes_since(Lsn(0));
+
+    let server = Database::open(&server_path).unwrap();
+    server
+        .execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+            &empty(),
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("payload", Value::Text("prime".repeat(1024))),
+            ]),
+        )
+        .unwrap();
+    server
+        // A fixed cap below the primed database survives redb's close-time
+        // page reclamation.  Deriving the cap from a pre-close file length
+        // made this rejection depend on allocator layout rather than the
+        // sync-pull contract under test.
+        .execute("SET DISK_LIMIT '1K'", &empty())
+        .unwrap();
+    server.close().unwrap();
+
+    let server = Database::open(&server_path).unwrap();
+
+    let result = server.apply_changes(
+        changes,
+        &contextdb_engine::sync_types::ConflictPolicies::uniform(
+            contextdb_engine::sync_types::ConflictPolicy::LatestWins,
+        ),
+    );
+    assert!(
+        result.is_err(),
+        "sync pull must fail when disk budget blocks persistence"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "sync pull failure must mention disk budget, got: {err}"
+    );
+
+    let count = server
+        .execute("SELECT COUNT(*) FROM items", &empty())
+        .unwrap()
+        .rows[0][0]
+        .clone();
+    assert_eq!(
+        count,
+        Value::Int64(1),
+        "failed sync pull must not make remote rows visible on the server"
+    );
+}
+
+#[test]
+fn sql_09_vector_text_coercion() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id_a = Uuid::from_u128(9001);
+    let id_b = Uuid::from_u128(9002);
+
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id_a)),
+            ("embedding", Value::Vector(vec![0.1, 0.2, 0.3])),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, '[0.4, 0.5, 0.6]')",
+        &params(vec![("id", Value::Uuid(id_b))]),
+    )
+    .unwrap();
+
+    let rows = db
+        .execute("SELECT id, embedding FROM docs ORDER BY id", &empty())
+        .unwrap();
+    let id_idx = rows.columns.iter().position(|c| c == "id").unwrap();
+    let embedding_idx = rows.columns.iter().position(|c| c == "embedding").unwrap();
+
+    assert_eq!(rows.rows.len(), 2);
+    assert_eq!(rows.rows[0][id_idx], Value::Uuid(id_a));
+    assert!(matches!(rows.rows[0][embedding_idx], Value::Vector(_)));
+    assert_eq!(rows.rows[1][id_idx], Value::Uuid(id_b));
+    assert!(
+        matches!(rows.rows[1][embedding_idx], Value::Vector(_)),
+        "quoted vector literal should be coerced to Value::Vector, got {:?}",
+        rows.rows[1][embedding_idx]
+    );
+
+    let search = db
+        .execute(
+            "SELECT id FROM docs ORDER BY embedding <=> $query LIMIT 2",
+            &params(vec![("query", Value::Vector(vec![0.4, 0.5, 0.6]))]),
+        )
+        .unwrap();
+    let search_id_idx = search.columns.iter().position(|c| c == "id").unwrap();
+    let ids: Vec<Value> = search
+        .rows
+        .iter()
+        .map(|r| r[search_id_idx].clone())
+        .collect();
+    assert!(ids.contains(&Value::Uuid(id_a)));
+    assert!(ids.contains(&Value::Uuid(id_b)));
+}
+
+#[test]
+fn sql_10_edge_dedup_no_relational_leak() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let source = Uuid::from_u128(9101);
+    let target = Uuid::from_u128(9102);
+
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, 'CITES')",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(9103))),
+            ("source", Value::Uuid(source)),
+            ("target", Value::Uuid(target)),
+        ]),
+    )
+    .unwrap();
+
+    let second = db
+        .execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, 'CITES')",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(9104))),
+                ("source", Value::Uuid(source)),
+                ("target", Value::Uuid(target)),
+            ]),
+        )
+        .unwrap();
+
+    let count = db
+        .execute(
+            "SELECT COUNT(*) FROM edges WHERE source_id = $source AND target_id = $target AND edge_type = 'CITES'",
+            &params(vec![
+                ("source", Value::Uuid(source)),
+                ("target", Value::Uuid(target)),
+            ]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        count.rows[0][0],
+        Value::Int64(1),
+        "duplicate logical edge should not leave a second relational row"
+    );
+    assert_eq!(
+        second.rows_affected, 0,
+        "deduped second edge insert should report zero affected rows"
+    );
+}
+
+#[test]
+fn sql_11_upsert_set_clause_values() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE kv (id UUID PRIMARY KEY, val TEXT)", &empty())
+        .unwrap();
+
+    let id = Uuid::from_u128(9201);
+    db.execute(
+        "INSERT INTO kv (id, val) VALUES ($id, 'original')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO kv (id, val) VALUES ($id, 'from-insert') ON CONFLICT (id) DO UPDATE SET val = 'from-update'",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let out = db
+        .execute(
+            "SELECT val FROM kv WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(
+        out.rows[0][0],
+        Value::Text("from-update".to_string()),
+        "upsert should apply SET clause values, not the INSERT value map"
+    );
+}
+
+#[test]
+fn sql_13_null_in_nullable_uuid() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE refs (id UUID PRIMARY KEY, parent_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::from_u128(9401);
+    db.execute(
+        "INSERT INTO refs (id, parent_id) VALUES ($id, NULL)",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let out = db
+        .execute(
+            "SELECT parent_id FROM refs WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0][0], Value::Null);
+}
+
+#[test]
+fn integrity_01_text_memory_estimate_not_pathologically_high() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(32 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, body TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let body = "x".repeat(1024);
+    let result = db.execute(
+        "INSERT INTO docs (id, body) VALUES ($id, $body)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("body", Value::Text(body)),
+        ]),
+    );
+    assert!(
+        result.is_ok(),
+        "1KiB TEXT insert should fit within a 32KiB budget: {result:?}"
+    );
+    assert!(
+        accountant.usage().used < 16 * 1024,
+        "1KiB TEXT row should not consume pathological memory, got {} bytes",
+        accountant.usage().used
+    );
+}
+
+#[test]
+fn integrity_02_upsert_noop_does_not_leak_memory() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(12 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute("CREATE TABLE kv (id UUID PRIMARY KEY, val TEXT)", &empty())
+        .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO kv (id, val) VALUES ($id, 'same')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+    let baseline = accountant.usage().used;
+
+    for _ in 0..20 {
+        db.execute(
+            "INSERT INTO kv (id, val) VALUES ($id, 'same') ON CONFLICT (id) DO UPDATE SET val = 'same'",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    }
+
+    let used = accountant.usage().used;
+    assert!(
+        used <= baseline + 256,
+        "noop upserts must not leak memory: baseline={baseline}, used={used}"
+    );
+}
+
+#[test]
+fn integrity_03_retain_pruning_releases_memory() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE obs (id UUID PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
+        &empty(),
+    )
+    .unwrap();
+
+    let baseline = accountant.usage().used;
+    db.execute(
+        "INSERT INTO obs (id, data) VALUES ($id, $data)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("data", Value::Text("x".repeat(4096))),
+        ]),
+    )
+    .unwrap();
+    let used_after_insert = accountant.usage().used;
+    assert!(used_after_insert > baseline);
+
+    std::thread::sleep(Duration::from_millis(1100));
+    let pruned = db.run_pruning_cycle();
+    assert_eq!(pruned, 1, "expired row must be pruned");
+
+    let used_after_prune = accountant.usage().used;
+    assert!(
+        used_after_prune + 512 < used_after_insert,
+        "pruning must release row memory: before={used_after_insert}, after={used_after_prune}"
+    );
+    assert_eq!(
+        db.execute("SELECT COUNT(*) FROM obs", &empty())
+            .unwrap()
+            .rows[0][0],
+        Value::Int64(0)
+    );
+}
+
+#[test]
+fn integrity_04_edge_delete_releases_memory() {
+    // Deleting an edge tombstones it: the entry stays whole in both adjacency
+    // maps, so the store is still holding it and is still charged for it. The
+    // bytes come back where the entry actually goes away -- the pass that
+    // drops it. Both halves are pinned, because a release at the delete would
+    // be the accountant handing back memory the process never freed, and a
+    // limit that no longer covers what is held.
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+    let _clock = {
+        let now = Arc::clone(&now);
+        contextdb_core::Wallclock::test_clock_guard(move || now.load(Ordering::SeqCst))
+    };
+
+    let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY) RETAIN 1 SECONDS",
+        &empty(),
+    )
+    .unwrap();
+
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    for id in [source, target] {
+        db.execute(
+            "INSERT INTO nodes (id) VALUES ($id)",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    }
+    let baseline = accountant.usage().used;
+
+    let tx = db.begin_or_panic();
+    assert!(
+        db.insert_edge(tx, source, target, "REL".to_string(), HashMap::new())
+            .unwrap()
+    );
+    db.commit(tx).unwrap();
+
+    let used_after_insert = accountant.usage().used;
+    assert!(used_after_insert > baseline);
+
+    let tx = db.begin_or_panic();
+    db.delete_edge(tx, source, target, "REL").unwrap();
+    db.commit(tx).unwrap();
+
+    let used_after_delete = accountant.usage().used;
+    assert_eq!(
+        used_after_delete, used_after_insert,
+        "a deleted edge is tombstoned rather than removed, so the accountant still covers what \
+         the store is still holding: before={used_after_insert}, after={used_after_delete}"
+    );
+
+    // Past the declared window. The pass runs on this thread, under the clock
+    // the guard above installs.
+    now.fetch_add(5_000, Ordering::SeqCst);
+    let report = db.run_pruning_cycle_checked().unwrap();
+    assert_eq!(
+        report.pruned_rows, 2,
+        "both rows the edge connects are past their window: {report:?}"
+    );
+
+    let used_after_pass = accountant.usage().used;
+    assert!(
+        used_after_pass + 128 < used_after_insert,
+        "the pass that drops the tombstoned entry is where the bytes come back: \
+         before={used_after_insert}, after={used_after_pass}"
+    );
+}
+
+#[test]
+fn integrity_05_drop_table_releases_edge_memory() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, 'REL')",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source", Value::Uuid(source)),
+            ("target", Value::Uuid(target)),
+        ]),
+    )
+    .unwrap();
+    let used_after_insert = accountant.usage().used;
+
+    db.execute("DROP TABLE edges", &empty()).unwrap();
+
+    assert!(
+        accountant.usage().used + 128 < used_after_insert,
+        "DROP TABLE must release edge allocations: before={used_after_insert}, after={}",
+        accountant.usage().used
+    );
+    let bfs = db
+        .query_bfs(
+            source,
+            Some(&["REL".to_string()]),
+            contextdb_core::Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .unwrap();
+    assert_eq!(
+        bfs.nodes.len(),
+        0,
+        "dropped edge table must not leave graph edges behind"
+    );
+}
+
+#[test]
+fn integrity_06_create_table_honors_disk_budget() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("integrity-create-table.db");
+    let db = Database::open(&path).unwrap();
+
+    db.execute("SET DISK_LIMIT '1K'", &empty()).unwrap();
+
+    let result = db.execute("CREATE TABLE blocked (id UUID PRIMARY KEY)", &empty());
+    assert!(
+        result.is_err(),
+        "CREATE TABLE must fail when disk budget is already exhausted"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "disk-budget rejection must mention disk budget, got: {err}"
+    );
+    assert!(
+        db.table_meta("blocked").is_none(),
+        "failed CREATE TABLE must not leave table metadata behind"
+    );
+}
+
+#[test]
+fn integrity_07_alter_table_honors_disk_budget() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("integrity-alter-table.db");
+    let db = Database::open(&path).unwrap();
+    db.execute("CREATE TABLE items (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+
+    db.execute("SET DISK_LIMIT '1K'", &empty()).unwrap();
+
+    let result = db.execute("ALTER TABLE items ADD COLUMN note TEXT", &empty());
+    assert!(
+        result.is_err(),
+        "ALTER TABLE must fail when disk budget is already exhausted"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "disk-budget rejection must mention disk budget, got: {err}"
+    );
+    let meta = db.table_meta("items").unwrap();
+    assert!(
+        meta.columns.iter().all(|c| c.name != "note"),
+        "failed ALTER TABLE must not mutate schema"
+    );
+}
+
+#[test]
+fn integrity_08_upsert_insert_indexes_vector() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, '[1.0, 0.0, 0.0]')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, '[0.0, 1.0, 0.0]') ON CONFLICT (id) DO UPDATE SET embedding = '[0.0, 1.0, 0.0]'",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT id FROM docs ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![0.0, 1.0, 0.0]))]),
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(
+        result.len(),
+        1,
+        "vector search must still find the upserted row"
+    );
+    assert_eq!(
+        result[0][0],
+        Value::Uuid(id),
+        "vector search must resolve to the row updated by ON CONFLICT DO UPDATE"
+    );
+}
+
+#[test]
+fn integrity_09_drop_table_removes_vectors() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, '[0.1, 0.2, 0.3]')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+    let row_id = db
+        .point_lookup("docs", "id", &Value::Uuid(id), db.snapshot())
+        .unwrap()
+        .expect("row must exist")
+        .row_id;
+    assert!(
+        db.live_vector_entry(row_id, db.snapshot()).is_some(),
+        "vector must exist before DROP TABLE"
+    );
+
+    db.execute("DROP TABLE docs", &empty()).unwrap();
+
+    assert!(
+        db.live_vector_entry(row_id, db.snapshot()).is_none(),
+        "DROP TABLE must remove vector entries for dropped rows"
+    );
+}
+
+#[test]
+fn integrity_10_failed_insert_does_not_leak_memory() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(12 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT UNIQUE)",
+        &empty(),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO items (id, name) VALUES ($id, 'dup')",
+        &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+    )
+    .unwrap();
+    let baseline = accountant.usage().used;
+
+    for _ in 0..20 {
+        db.execute(
+            "INSERT INTO items (id, name) VALUES ($id, 'dup')",
+            &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+        )
+        .unwrap();
+    }
+
+    let used = accountant.usage().used;
+    assert!(
+        used <= baseline + 256,
+        "duplicate no-op inserts must not leak memory: baseline={baseline}, used={used}"
+    );
+}
+
+#[test]
+fn test_coerce_uuid_name_based_still_works_post_catchall_removal() {
+    use contextdb_core::Value;
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id INTEGER, user_id INTEGER, other_id INTEGER, plain INTEGER)",
+        &empty,
+    )
+    .expect("CREATE TABLE with four INTEGER columns must succeed");
+
+    let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+    let expected_uuid = Uuid::parse_str(uuid_str).expect("fixture uuid must parse");
+
+    let mut row: HashMap<String, Value> = HashMap::new();
+    row.insert("id".to_string(), Value::Text(uuid_str.into()));
+    row.insert("user_id".to_string(), Value::Text(uuid_str.into()));
+    row.insert("other_id".to_string(), Value::Text(uuid_str.into()));
+    row.insert("plain".to_string(), Value::Text(uuid_str.into()));
+
+    db.execute(
+        "INSERT INTO t (id, user_id, other_id, plain) VALUES ($id, $user_id, $other_id, $plain)",
+        &row,
+    )
+    .expect("INSERT must succeed under UUID name-based coercion");
+
+    let result = db
+        .execute("SELECT * FROM t", &empty)
+        .expect("SELECT * FROM t must succeed");
+    assert_eq!(result.rows.len(), 1, "exactly one row expected");
+    let row_vals = &result.rows[0];
+    let col_idx = |name: &str| {
+        result
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .unwrap_or_else(|| panic!("column {name:?} must exist in result"))
+    };
+
+    assert_eq!(
+        row_vals[col_idx("id")],
+        Value::Uuid(expected_uuid),
+        "id column must coerce Text → Uuid",
+    );
+    assert_eq!(
+        row_vals[col_idx("user_id")],
+        Value::Uuid(expected_uuid),
+        "user_id column must coerce Text → Uuid (name ends in _id)",
+    );
+    assert_eq!(
+        row_vals[col_idx("other_id")],
+        Value::Uuid(expected_uuid),
+        "other_id column must coerce Text → Uuid (name ends in _id)",
+    );
+    assert_eq!(
+        row_vals[col_idx("plain")],
+        Value::Text(uuid_str.into()),
+        "plain column (no _id suffix) must retain Value::Text without coercion",
+    );
+}
+
+#[test]
+fn where_txid_bound_int64_returns_rows() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    // Drive watermark past 200 so inserts are allowed.
+    db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+        .unwrap();
+    for n in 0..250i64 {
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+        r.insert("n".to_string(), Value::Int64(n));
+        db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &r)
+            .unwrap();
+    }
+
+    // Insert the three TxId rows via library API.
+    for tx_val in &[TxId(10), TxId(50), TxId(200)] {
+        let tx = db.begin_or_panic();
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("x".to_string(), Value::TxId(*tx_val));
+        db.insert_row(tx, "t", r)
+            .unwrap_or_else(|e| panic!("insert Value::TxId({tx_val:?}) must succeed: {e:?}"));
+        db.commit(tx).expect("commit must succeed");
+    }
+
+    let mut bind: HashMap<String, Value> = HashMap::new();
+    bind.insert("bound".to_string(), Value::Int64(100));
+    let result = db
+        .execute("SELECT * FROM t WHERE x > $bound", &bind)
+        .expect("SELECT with bound Int64 must succeed on TXID column");
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "exactly one row must match x > 100 (only TxId(200))",
+    );
+    let x_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "x")
+        .expect("result must have column \"x\"");
+    assert_eq!(
+        result.rows[0][x_idx],
+        Value::TxId(TxId(200)),
+        "the one matching row must be Value::TxId(TxId(200))",
+    );
+}
+
+#[test]
+fn where_txid_negative_literal_below_all() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    // Bump watermark past 200.
+    db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+        .unwrap();
+    for n in 0..250i64 {
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+        r.insert("n".to_string(), Value::Int64(n));
+        db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &r)
+            .unwrap();
+    }
+
+    for tx_val in &[TxId(10), TxId(50), TxId(200)] {
+        let tx = db.begin_or_panic();
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("x".to_string(), Value::TxId(*tx_val));
+        db.insert_row(tx, "t", r)
+            .unwrap_or_else(|e| panic!("insert Value::TxId({tx_val:?}) must succeed: {e:?}"));
+        db.commit(tx).expect("commit must succeed");
+    }
+
+    let mut bind: HashMap<String, Value> = HashMap::new();
+    bind.insert("bound".to_string(), Value::Int64(-1));
+    let result = db
+        .execute("SELECT COUNT(*) AS c FROM t WHERE x > $bound", &bind)
+        .expect("COUNT(*) with negative bound must succeed on TXID column");
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "COUNT(*) result must have exactly one row",
+    );
+    let c_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "c")
+        .expect("result must have the aliased count column \"c\"");
+    assert_eq!(
+        result.rows[0][c_idx],
+        Value::Int64(3),
+        "COUNT(*) of TxIds > -1 must equal 3 (all three rows match)",
+    );
+}
+
+#[test]
+fn where_txid_text_literal_returns_no_rows() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    // Bump watermark past 42.
+    db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+        .unwrap();
+    for n in 0..50i64 {
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+        r.insert("n".to_string(), Value::Int64(n));
+        db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &r)
+            .unwrap();
+    }
+
+    let tx = db.begin_or_panic();
+    let mut r: HashMap<String, Value> = HashMap::new();
+    r.insert("x".to_string(), Value::TxId(TxId(42)));
+    db.insert_row(tx, "t", r)
+        .expect("insert Value::TxId(TxId(42)) must succeed");
+    db.commit(tx).expect("commit must succeed");
+
+    // Positive control: prove the row is actually present with x = Value::TxId(TxId(42))
+    // before we test the text-bind negative case. This prevents a stub or regression
+    // that silently drops inserts from trivially satisfying the "0 rows" assertion below.
+    let unfiltered = db
+        .execute("SELECT x FROM t", &empty)
+        .expect("SELECT x FROM t (no filter) must succeed");
+    assert_eq!(
+        unfiltered.rows.len(),
+        1,
+        "positive control: exactly one row must be present after insert",
+    );
+    assert_eq!(
+        unfiltered.rows[0][0],
+        Value::TxId(TxId(42)),
+        "positive control: the stored x column must be Value::TxId(TxId(42))",
+    );
+
+    let mut bind: HashMap<String, Value> = HashMap::new();
+    bind.insert("bound".to_string(), Value::Text("42".into()));
+    let result = db
+        .execute("SELECT * FROM t WHERE x = $bound", &bind)
+        .expect("SELECT with Text bound on TXID column must not error — just return empty");
+
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "no rows must be returned — Text must never coerce to TxId; got rows: {:?}",
+        result.rows,
+    );
+}
+
+#[test]
+fn insert_sql_literal_int_into_txid_rejected() {
+    use contextdb_core::{Error, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    let err = db
+        .execute("INSERT INTO t (x) VALUES (42)", &empty)
+        .expect_err("INSERT INTO t (x) VALUES (42) must be rejected — literal Int64 into TXID");
+
+    match err {
+        Error::ColumnTypeMismatch {
+            table,
+            column,
+            expected,
+            actual,
+        } => {
+            assert_eq!(table, "t", "error.table must be \"t\"");
+            assert_eq!(column, "x", "error.column must be \"x\"");
+            assert_eq!(expected, "TXID", "error.expected must be \"TXID\"");
+            assert_eq!(
+                actual, "Int64",
+                "error.actual must be \"Int64\" (SQL literal 42 parses to Value::Int64)",
+            );
+        }
+        other => panic!("expected Error::ColumnTypeMismatch, got {other:?}",),
+    }
+}
+
+#[test]
+fn orderby_txid_asc_desc() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    // Bump watermark past 42.
+    db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+        .unwrap();
+    for n in 0..50i64 {
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+        r.insert("n".to_string(), Value::Int64(n));
+        db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &r)
+            .unwrap();
+    }
+
+    // Insert out of order: 7, 1, 42, 3.
+    for tx_val in &[TxId(7), TxId(1), TxId(42), TxId(3)] {
+        let tx = db.begin_or_panic();
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("x".to_string(), Value::TxId(*tx_val));
+        db.insert_row(tx, "t", r)
+            .unwrap_or_else(|e| panic!("insert Value::TxId({tx_val:?}) must succeed: {e:?}"));
+        db.commit(tx).expect("commit must succeed");
+    }
+
+    // ASC
+    let asc = db
+        .execute("SELECT x FROM t ORDER BY x ASC", &empty)
+        .expect("SELECT ... ORDER BY x ASC must succeed");
+    let x_idx = asc
+        .columns
+        .iter()
+        .position(|c| c == "x")
+        .expect("asc result must have column \"x\"");
+    let asc_vals: Vec<Value> = asc.rows.iter().map(|r| r[x_idx].clone()).collect();
+    assert_eq!(
+        asc_vals,
+        vec![
+            Value::TxId(TxId(1)),
+            Value::TxId(TxId(3)),
+            Value::TxId(TxId(7)),
+            Value::TxId(TxId(42)),
+        ],
+        "ORDER BY x ASC must sort TxIds by native u64::cmp",
+    );
+
+    // DESC
+    let desc = db
+        .execute("SELECT x FROM t ORDER BY x DESC", &empty)
+        .expect("SELECT ... ORDER BY x DESC must succeed");
+    let x_idx_d = desc
+        .columns
+        .iter()
+        .position(|c| c == "x")
+        .expect("desc result must have column \"x\"");
+    let desc_vals: Vec<Value> = desc.rows.iter().map(|r| r[x_idx_d].clone()).collect();
+    assert_eq!(
+        desc_vals,
+        vec![
+            Value::TxId(TxId(42)),
+            Value::TxId(TxId(7)),
+            Value::TxId(TxId(3)),
+            Value::TxId(TxId(1)),
+        ],
+        "ORDER BY x DESC must reverse the ASC sequence",
+    );
+}
+
+#[cfg(feature = "test-seams")]
+const PER_INDEX_SQL_ROWS: usize = 1024;
+const PER_INDEX_SQL_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "test-seams")]
+fn per_index_ranked3(rank: usize) -> Vec<f32> {
+    let score = (1.0 - rank as f32 * 0.0005).clamp(0.05, 1.0);
+    vec![score, (1.0 - score * score).max(0.0).sqrt(), 0.0]
+}
+
+fn per_index_axis3(axis: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; 3];
+    vector[axis.min(2)] = 1.0;
+    vector
+}
+
+fn per_index_top_id(db: &Database, table: &str, column: &str, query: Vec<f32>) -> Uuid {
+    let sql = format!("SELECT id FROM {table} ORDER BY {column} <=> $query LIMIT 1");
+    let result = db
+        .execute(&sql, &params(vec![("query", Value::Vector(query))]))
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    match result.rows[0][0] {
+        Value::Uuid(id) => id,
+        ref other => panic!("expected UUID id, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "test-seams")]
+fn seed_two_vector_evidence(db: &Database) -> Vec<Uuid> {
+    db.execute(
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(3), vector_vision VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let ids = (0..PER_INDEX_SQL_ROWS)
+        .map(|i| Uuid::from_u128(10_000 + i as u128))
+        .collect::<Vec<_>>();
+    for (i, id) in ids.iter().copied().enumerate() {
+        db.execute(
+            "INSERT INTO evidence (id, vector_text, vector_vision) VALUES ($id, $text, $vision)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("text", Value::Vector(per_index_ranked3(i))),
+                (
+                    "vision",
+                    Value::Vector(vec![0.0, 1.0 - i as f32 * 0.0001, 0.0]),
+                ),
+            ]),
+        )
+        .unwrap();
+    }
+    ids
+}
+
+#[test]
+fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE table_text (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE table_face (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let id_text = Uuid::from_u128(1);
+    let id_face = Uuid::from_u128(2);
+    let pause = db.pause_after_relational_apply_for_test();
+    let writer_db = db.clone();
+    let writer = thread::spawn(move || {
+        let tx = writer_db.begin().unwrap();
+        writer_db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO table_text (id, embedding) VALUES ($id, $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id_text)),
+                    ("embedding", Value::Vector(per_index_axis3(0))),
+                ]),
+            )
+            .unwrap();
+        writer_db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO table_face (id, embedding) VALUES ($id, $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id_face)),
+                    ("embedding", Value::Vector(per_index_axis3(1))),
+                ]),
+            )
+            .unwrap();
+        writer_db.commit(tx).unwrap();
+    });
+
+    assert!(pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    assert_eq!(
+        db.execute("SELECT id FROM table_text", &empty())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.execute("SELECT id FROM table_face", &empty())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id FROM table_text ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))])
+        )
+        .unwrap()
+        .rows
+        .len(),
+        0
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id FROM table_face ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(1)))])
+        )
+        .unwrap()
+        .rows
+        .len(),
+        0
+    );
+
+    pause.release();
+    writer.join().unwrap();
+    assert_eq!(
+        per_index_top_id(&db, "table_text", "embedding", per_index_axis3(0)),
+        id_text
+    );
+    assert_eq!(
+        per_index_top_id(&db, "table_face", "embedding", per_index_axis3(1)),
+        id_face
+    );
+}
+
+#[test]
+fn multi_ref_tx_abort_leaves_no_vectors_visible() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE table_text (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE table_face (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO table_text (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(11))),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO table_face (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(12))),
+            ("embedding", Value::Vector(per_index_axis3(1))),
+        ]),
+    )
+    .unwrap();
+    db.rollback(tx).unwrap();
+
+    assert_eq!(
+        db.execute("SELECT id FROM table_text", &empty())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.execute("SELECT id FROM table_face", &empty())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id FROM table_text ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))])
+        )
+        .unwrap()
+        .rows
+        .len(),
+        0
+    );
+}
+
+#[test]
+fn concurrent_distinct_table_sql_updates_yield_correct_vector_recall() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE table_text (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE table_face (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let text_id = Uuid::from_u128(21);
+    let face_id = Uuid::from_u128(22);
+    db.execute(
+        "INSERT INTO table_text (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(text_id)),
+            ("embedding", Value::Vector(per_index_axis3(1))),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO table_face (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(face_id)),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    let db_text = db.clone();
+    let text_worker = thread::spawn(move || {
+        db_text
+            .execute(
+                "UPDATE table_text SET embedding = $embedding WHERE id = $id",
+                &params(vec![
+                    ("id", Value::Uuid(text_id)),
+                    ("embedding", Value::Vector(per_index_axis3(0))),
+                ]),
+            )
+            .unwrap();
+    });
+    let db_face = db.clone();
+    let face_worker = thread::spawn(move || {
+        db_face
+            .execute(
+                "UPDATE table_face SET embedding = $embedding WHERE id = $id",
+                &params(vec![
+                    ("id", Value::Uuid(face_id)),
+                    ("embedding", Value::Vector(per_index_axis3(1))),
+                ]),
+            )
+            .unwrap();
+    });
+    text_worker.join().unwrap();
+    face_worker.join().unwrap();
+
+    assert_eq!(
+        per_index_top_id(&db, "table_text", "embedding", per_index_axis3(0)),
+        text_id
+    );
+    assert_eq!(
+        per_index_top_id(&db, "table_face", "embedding", per_index_axis3(1)),
+        face_id
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
+    let db = Arc::new(Database::open_memory());
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    let ids = seed_two_vector_evidence(&db);
+    let text_ref = VectorIndexRef::new("evidence", "vector_text");
+    let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
+    let vector_store = db.vector_store_for_test();
+    let text_partition = contextdb_vector::VectorPartitionRef::new(
+        text_ref.clone(),
+        contextdb_core::VectorPartitionKey::unpartitioned(),
+    );
+    let text_pause =
+        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
+    let (done_text_tx, done_text_rx) = mpsc::channel();
+    let db_text = db.clone();
+    thread::spawn(move || {
+        done_text_tx.send(db_text.run_maintenance_cycle()).unwrap();
+    });
+    assert!(text_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+
+    let target_id = ids[3];
+    let (done_vision_tx, done_vision_rx) = mpsc::channel();
+    let db_vision = db.clone();
+    thread::spawn(move || {
+        db_vision
+            .execute(
+                "UPDATE evidence SET vector_vision = $vision WHERE id = $id",
+                &params(vec![
+                    ("id", Value::Uuid(target_id)),
+                    ("vision", Value::Vector(per_index_axis3(2))),
+                ]),
+            )
+            .unwrap();
+        done_vision_tx
+            .send(per_index_top_id(
+                &db_vision,
+                "evidence",
+                "vector_vision",
+                per_index_axis3(2),
+            ))
+            .unwrap();
+    });
+    let vision_first = done_vision_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    let vision_hnsw_before_release = vector_store.has_hnsw_index_for(&vision_ref);
+    let text_still_paused = done_text_rx.try_recv();
+    text_pause.release();
+    done_text_rx
+        .recv_timeout(PER_INDEX_SQL_TIMEOUT)
+        .unwrap()
+        .unwrap();
+    let vision_id = match vision_first {
+        Ok(id) => id,
+        Err(_) => done_vision_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).unwrap(),
+    };
+
+    assert_eq!(vision_id, target_id);
+    assert!(
+        !vision_hnsw_before_release,
+        "the concurrent query must not build the sibling graph"
+    );
+    assert!(matches!(text_still_paused, Err(TryRecvError::Empty)));
+    assert!(vector_store.has_hnsw_index_for(&text_ref));
+    assert!(
+        vector_store.has_hnsw_index_for(&vision_ref),
+        "after the paused text build resumes, the same wake services the needy sibling graph"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() {
+    use contextdb_vector::test_seam::PauseWindow;
+
+    let db = Arc::new(Database::open_memory());
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    seed_two_vector_evidence(&db);
+    let text_ref = VectorIndexRef::new("evidence", "vector_text");
+    let vector_store = db.vector_store_for_test();
+    let text_partition = contextdb_vector::VectorPartitionRef::new(
+        text_ref.clone(),
+        contextdb_core::VectorPartitionKey::unpartitioned(),
+    );
+    let build_pause =
+        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
+    let (done_build_tx, done_build_rx) = mpsc::channel();
+    let db_build = db.clone();
+    thread::spawn(move || {
+        done_build_tx
+            .send(db_build.run_maintenance_cycle())
+            .unwrap();
+    });
+    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+
+    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Ddl);
+    let (started_drop_tx, started_drop_rx) = mpsc::channel();
+    let (done_drop_tx, done_drop_rx) = mpsc::channel();
+    let db_drop = db.clone();
+    thread::spawn(move || {
+        started_drop_tx.send(()).unwrap();
+        let result = db_drop.execute("ALTER TABLE evidence DROP COLUMN vector_text", &empty());
+        done_drop_tx.send(result).unwrap();
+    });
+    assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
+    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
+    build_pause.release();
+    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    // Table-changing SQL cannot retire a vector state while maintenance owns
+    // that same state. It reaches the DDL pause only after maintenance exits.
+    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let ref_present_during_pause = vector_store
+        .index_infos()
+        .iter()
+        .any(|info| info.index == text_ref);
+    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
+    ddl_pause.release();
+    let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+
+    assert!(ref_present_during_pause);
+    assert!(
+        db.execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
+            .is_err()
+    );
+    build_result.unwrap().unwrap();
+    drop_result.unwrap().unwrap();
+    assert_eq!(
+        per_index_top_id(&db, "evidence", "vector_vision", per_index_axis3(1)),
+        Uuid::from_u128(10_000)
+    );
+    assert!(!vector_store.has_hnsw_index_for(&text_ref));
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() {
+    use contextdb_vector::test_seam::PauseWindow;
+
+    let db = Arc::new(Database::open_memory());
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    seed_two_vector_evidence(&db);
+    let old_ref = VectorIndexRef::new("evidence", "vector_text");
+    let new_ref = VectorIndexRef::new("evidence", "vector_text_v2");
+    let vector_store = db.vector_store_for_test();
+    let old_partition = contextdb_vector::VectorPartitionRef::new(
+        old_ref.clone(),
+        contextdb_core::VectorPartitionKey::unpartitioned(),
+    );
+    let build_pause =
+        vector_store.arm_maintenance_progress_pause_for_test(&old_partition, PER_INDEX_SQL_ROWS);
+    let (done_build_tx, done_build_rx) = mpsc::channel();
+    let db_build = db.clone();
+    thread::spawn(move || {
+        done_build_tx
+            .send(db_build.run_maintenance_cycle())
+            .unwrap();
+    });
+    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+
+    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&old_ref, PauseWindow::Ddl);
+    let (started_rename_tx, started_rename_rx) = mpsc::channel();
+    let (done_rename_tx, done_rename_rx) = mpsc::channel();
+    let db_rename = db.clone();
+    thread::spawn(move || {
+        started_rename_tx.send(()).unwrap();
+        let result = db_rename.execute(
+            "ALTER TABLE evidence RENAME COLUMN vector_text TO vector_text_v2",
+            &empty(),
+        );
+        done_rename_tx.send(result).unwrap();
+    });
+    assert!(
+        started_rename_rx
+            .recv_timeout(PER_INDEX_SQL_TIMEOUT)
+            .is_ok()
+    );
+    assert!(matches!(
+        done_rename_rx.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    build_pause.release();
+    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    // The rename cannot enter this DDL pause until the maintenance-owned
+    // traversal releases the old vector state.
+    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let old_ref_present_during_pause = vector_store
+        .index_infos()
+        .iter()
+        .any(|info| info.index == old_ref);
+    assert!(matches!(
+        done_rename_rx.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    ddl_pause.release();
+    let rename_result = done_rename_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+
+    assert!(old_ref_present_during_pause);
+    assert!(
+        db.execute(
+            "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))])
+        )
+        .is_err()
+    );
+    build_result.unwrap().unwrap();
+    rename_result.unwrap().unwrap();
+    assert_eq!(
+        per_index_top_id(&db, "evidence", "vector_text_v2", per_index_axis3(0)),
+        Uuid::from_u128(10_000)
+    );
+    assert!(!vector_store.has_hnsw_index_for(&old_ref));
+    assert!(vector_store.has_hnsw_index_for(&new_ref));
+}
+
+#[test]
+fn sync_alter_table_drop_vector_column_removes_receiver_index() {
+    let origin = Database::open_memory();
+    let receiver = Database::open_memory();
+    let schema = "CREATE TABLE evidence (
+        id UUID PRIMARY KEY,
+        vector_text VECTOR(3),
+        vector_vision VECTOR(8)
+    )";
+    origin.execute(schema, &empty()).unwrap();
+    receiver.execute(schema, &empty()).unwrap();
+
+    let id = Uuid::from_u128(42);
+    for db in [&origin, &receiver] {
+        db.execute(
+            "INSERT INTO evidence (id, vector_text, vector_vision) VALUES ($id, $text, $vision)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("text", Value::Vector(per_index_axis3(0))),
+                (
+                    "vision",
+                    Value::Vector(vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                ),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let watermark = origin.current_lsn();
+    origin
+        .execute("ALTER TABLE evidence DROP COLUMN vector_vision", &empty())
+        .unwrap();
+    receiver
+        .apply_changes(
+            origin.changes_since(watermark),
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("vector_text".to_string())));
+    assert!(!columns.contains(&Value::Text("vector_vision".to_string())));
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "vector_text", per_index_axis3(0)),
+        id
+    );
+    assert!(matches!(
+        receiver.execute(
+            "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![0.0_f32; 8]))]),
+        ),
+        Err(Error::UnknownVectorIndex { index })
+            if index == VectorIndexRef::new("evidence", "vector_vision")
+    ));
+}
+
+#[test]
+fn sync_alter_table_rename_vector_column_moves_receiver_index() {
+    let origin = Database::open_memory();
+    let receiver = Database::open_memory();
+    let schema = "CREATE TABLE evidence (
+        id UUID PRIMARY KEY,
+        vector_text VECTOR(3),
+        vector_vision VECTOR(8)
+    )";
+    origin.execute(schema, &empty()).unwrap();
+    receiver.execute(schema, &empty()).unwrap();
+
+    let id = Uuid::from_u128(43);
+    let vision = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    for db in [&origin, &receiver] {
+        db.execute(
+            "INSERT INTO evidence (id, vector_text, vector_vision) VALUES ($id, $text, $vision)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("text", Value::Vector(per_index_axis3(0))),
+                ("vision", Value::Vector(vision.clone())),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let watermark = origin.current_lsn();
+    origin
+        .execute(
+            "ALTER TABLE evidence RENAME COLUMN vector_vision TO vector_image",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .apply_changes(
+            origin.changes_since(watermark),
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("vector_image".to_string())));
+    assert!(!columns.contains(&Value::Text("vector_vision".to_string())));
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "vector_image", vision),
+        id
+    );
+    assert!(matches!(
+        receiver.execute(
+            "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![0.0_f32; 8]))]),
+        ),
+        Err(Error::UnknownVectorIndex { index })
+            if index == VectorIndexRef::new("evidence", "vector_vision")
+    ));
+}
+
+#[test]
+fn commit_rejects_staged_vector_insert_after_same_ref_sync_shape_change() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO evidence (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(44))),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    db.apply_changes(
+        sync::ChangeSet {
+            rows: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![sync::DdlChange::AlterTable {
+                name: "evidence".to_string(),
+                columns: vec![
+                    ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                    ("embedding".to_string(), "VECTOR(4)".to_string()),
+                ],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
+            }],
+            ddl_lsn: vec![Lsn(db.current_lsn().0 + 1)],
+        },
+        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    let err = db
+        .commit(tx)
+        .expect_err("commit must reject stale 3D vector staged for reshaped 4D index");
+    assert!(matches!(
+        err,
+        Error::SchemaInvalid { reason }
+            if reason.contains("evidence.embedding")
+                && reason.contains("changed while transaction was open")
+    ));
+    let _ = db.rollback(tx);
+    assert!(matches!(
+        db.execute(
+            "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0, 0.0]))]),
+        ),
+        Ok(result) if result.rows.is_empty()
+    ));
+}
+
+#[test]
+fn commit_rejects_staged_vector_insert_after_same_ref_drop_readd_same_shape() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'stale', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(444))),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    db.execute("ALTER TABLE evidence DROP COLUMN embedding", &empty())
+        .unwrap();
+    db.execute(
+        "ALTER TABLE evidence ADD COLUMN embedding VECTOR(3)",
+        &empty(),
+    )
+    .unwrap();
+
+    let err = db
+        .commit(tx)
+        .expect_err("commit must reject a vector staged for an older same-ref generation");
+    assert!(matches!(
+        err,
+        Error::SchemaInvalid { reason }
+            if reason.contains("evidence.embedding")
+                && reason.contains("changed while transaction was open")
+    ));
+    let _ = db.rollback(tx);
+    assert!(matches!(
+        db.execute(
+            "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+        ),
+        Ok(result) if result.rows.is_empty()
+    ));
+}
+
+#[test]
+fn commit_rejects_commit_time_vector_exclusion_after_same_ref_drop_readd_same_shape() {
+    let db = Database::open_memory();
+    let id = Uuid::from_u128(445);
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT, embedding VECTOR(3)) STATE MACHINE (status: active -> [invalidated]) PROPAGATE ON STATE invalidated EXCLUDE VECTOR",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO decisions (id, status, embedding) VALUES ($id, 'active', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO decisions (id, status) VALUES ($id, 'invalidated') ON CONFLICT (id) DO UPDATE SET status = 'invalidated'",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    db.execute("ALTER TABLE decisions DROP COLUMN embedding", &empty())
+        .unwrap();
+    db.execute(
+        "ALTER TABLE decisions ADD COLUMN embedding VECTOR(3)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE decisions SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("embedding", Value::Vector(per_index_axis3(1))),
+        ]),
+    )
+    .unwrap();
+
+    let err = db.commit(tx).expect_err(
+        "commit-time vector exclusion must not delete a newer same-ref vector generation",
+    );
+    assert!(matches!(
+        err,
+        Error::SchemaInvalid { reason }
+            if reason.contains("decisions.embedding")
+                && reason.contains("changed while transaction was open")
+    ));
+    let _ = db.rollback(tx);
+
+    let result = db
+        .execute(
+            "SELECT id FROM decisions ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(1)))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Uuid(id)]]);
+}
+
+#[test]
+fn commit_rejects_staged_vector_update_after_same_ref_sync_shape_change() {
+    let db = Database::open_memory();
+    let id = Uuid::from_u128(45);
+    db.execute(
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'old', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE evidence SET note = 'new' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    db.apply_changes(
+        sync::ChangeSet {
+            rows: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![sync::DdlChange::AlterTable {
+                name: "evidence".to_string(),
+                columns: vec![
+                    ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                    ("note".to_string(), "TEXT".to_string()),
+                    ("embedding".to_string(), "VECTOR(4)".to_string()),
+                ],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
+            }],
+            ddl_lsn: vec![Lsn(db.current_lsn().0 + 1)],
+        },
+        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    let err = db
+        .commit(tx)
+        .expect_err("commit must reject stale 3D vector carried by UPDATE row image");
+    assert!(matches!(
+        err,
+        Error::VectorIndexDimensionMismatch {
+            index,
+            expected: 4,
+            actual: 3,
+        } if index == VectorIndexRef::new("evidence", "embedding")
+    ));
+    let _ = db.rollback(tx);
+}
+
+#[test]
+fn sync_alter_table_shape_change_accepts_following_vector_payload() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(46);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    let reshaped = vec![0.0_f32, 1.0, 0.0, 0.0];
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: vec![sync::VectorChange {
+                    index: VectorIndexRef::new("evidence", "embedding"),
+                    row_id: RowId(1),
+                    vector: reshaped.clone(),
+                    lsn: Lsn(11),
+                }],
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("note".to_string(), "TEXT".to_string()),
+                        ("embedding".to_string(), "VECTOR(4)".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "embedding", reshaped),
+        id
+    );
+    let row = receiver
+        .execute(
+            "SELECT note FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+}
+
+#[test]
+fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
+    let sender = Database::open_memory();
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(4701);
+
+    for db in [&sender, &receiver] {
+        db.execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    }
+
+    let tx = sender.begin().unwrap();
+    let row_id = sender
+        .insert_row(
+            tx,
+            "evidence",
+            params(vec![
+                ("id", Value::Uuid(id)),
+                ("note", Value::Text("vector owner".to_string())),
+            ]),
+        )
+        .unwrap();
+    sender.commit(tx).unwrap();
+    let row_lsn = sender.current_lsn();
+
+    let tx = sender.begin().unwrap();
+    sender
+        .insert_vector(
+            tx,
+            VectorIndexRef::new("evidence", "embedding"),
+            row_id,
+            per_index_axis3(1),
+        )
+        .unwrap();
+    sender.commit(tx).unwrap();
+    let vector_lsn = sender.current_lsn();
+
+    let changes = sender.changes_since(row_lsn);
+    assert_eq!(changes.rows.len(), 1);
+    assert_eq!(changes.vectors.len(), 1);
+    assert_eq!(
+        changes.rows[0].lsn, vector_lsn,
+        "the restored owner row must travel in the same LSN group as the vector"
+    );
+
+    receiver
+        .apply_changes(
+            changes,
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::InsertIfNotExists),
+        )
+        .unwrap();
+
+    let row = receiver
+        .execute(
+            "SELECT note FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][0], Value::Text("vector owner".to_string()));
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "embedding", per_index_axis3(1)),
+        id
+    );
+}
+
+#[test]
+fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(47);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: Vec::new(),
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("embedding".to_string(), "VECTOR(4)".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let row = receiver
+        .execute(
+            "SELECT note FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+    assert!(matches!(
+        receiver.execute(
+            "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0, 0.0]))]),
+        ),
+        Err(Error::VectorIndexDimensionMismatch {
+            expected: 3,
+            actual: 4,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn sync_additive_vector_alter_with_existing_non_vector_columns_keeps_old_vector_index() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(48);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, vector_text VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, vector_text) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: Vec::new(),
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("note".to_string(), "TEXT".to_string()),
+                        ("vector_vision".to_string(), "VECTOR(8)".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "vector_text", per_index_axis3(0)),
+        id
+    );
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("vector_text".to_string())));
+    assert!(columns.contains(&Value::Text("vector_vision".to_string())));
+}
+
+#[test]
+fn sync_additive_non_vector_alter_does_not_drop_omitted_vector_index() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(4801);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, vector_text VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, vector_text) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: Vec::new(),
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("note".to_string(), "TEXT".to_string()),
+                        ("tag".to_string(), "TEXT".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "vector_text", per_index_axis3(0)),
+        id
+    );
+    let row = receiver
+        .execute(
+            "SELECT tag FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][0], Value::Null);
+}
+
+#[test]
+fn sync_vector_rename_persists_row_image_across_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("receiver.db");
+    let origin = Database::open_memory();
+    let id = Uuid::from_u128(49);
+    let vision = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let schema = "CREATE TABLE evidence (
+        id UUID PRIMARY KEY,
+        note TEXT,
+        vector_text VECTOR(3),
+        vector_vision VECTOR(8)
+    )";
+
+    {
+        let receiver = Database::open(&db_path).unwrap();
+        origin.execute(schema, &empty()).unwrap();
+        receiver.execute(schema, &empty()).unwrap();
+        for db in [&origin, &receiver] {
+            db.execute(
+                "INSERT INTO evidence (id, note, vector_text, vector_vision) VALUES ($id, 'kept', $text, $vision)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("text", Value::Vector(per_index_axis3(0))),
+                    ("vision", Value::Vector(vision.clone())),
+                ]),
+            )
+            .unwrap();
+        }
+        let watermark = origin.current_lsn();
+        origin
+            .execute(
+                "ALTER TABLE evidence RENAME COLUMN vector_vision TO vector_image",
+                &empty(),
+            )
+            .unwrap();
+        receiver
+            .apply_changes(
+                origin.changes_since(watermark),
+                &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+            )
+            .unwrap();
+        receiver.close().unwrap();
+    }
+
+    let reopened = Database::open(&db_path).unwrap();
+    let row = reopened
+        .execute(
+            "SELECT note, vector_image FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+    assert_eq!(row.rows[0][1], Value::Vector(vision));
+    assert!(matches!(
+        reopened.execute(
+            "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![0.0_f32; 8]))]),
+        ),
+        Err(Error::UnknownVectorIndex { index })
+            if index == VectorIndexRef::new("evidence", "vector_vision")
+    ));
+}
+
+#[test]
+fn sync_single_vector_column_rename_moves_receiver_index() {
+    let origin = Database::open_memory();
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(50);
+    let schema = "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))";
+    origin.execute(schema, &empty()).unwrap();
+    receiver.execute(schema, &empty()).unwrap();
+    for db in [&origin, &receiver] {
+        db.execute(
+            "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let watermark = origin.current_lsn();
+    origin
+        .execute(
+            "ALTER TABLE evidence RENAME COLUMN embedding TO embedding_v2",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .apply_changes(
+            origin.changes_since(watermark),
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "embedding_v2", per_index_axis3(0)),
+        id
+    );
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("embedding_v2".to_string())));
+    assert!(!columns.contains(&Value::Text("embedding".to_string())));
+    assert!(matches!(
+        receiver.execute(
+            "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+        ),
+        Err(Error::UnknownVectorIndex { index })
+            if index == VectorIndexRef::new("evidence", "embedding")
+    ));
+}
+
+#[test]
+fn sync_additive_same_shape_vector_alter_does_not_rename_omitted_vector_index() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(51);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: Vec::new(),
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("note".to_string(), "TEXT".to_string()),
+                        ("thumbnail".to_string(), "VECTOR(3)".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "embedding", per_index_axis3(0)),
+        id
+    );
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("embedding".to_string())));
+    assert!(columns.contains(&Value::Text("thumbnail".to_string())));
+    let added_search = receiver
+        .execute(
+            "SELECT id FROM evidence ORDER BY thumbnail <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+        )
+        .unwrap();
+    assert!(added_search.rows.is_empty());
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
+    use contextdb_vector::test_seam::PauseWindow;
+
+    let db = Arc::new(Database::open_memory());
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    seed_two_vector_evidence(&db);
+    let text_ref = VectorIndexRef::new("evidence", "vector_text");
+    let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
+    let table_ref = VectorIndexRef::new("evidence", "*");
+    let vector_store = db.vector_store_for_test();
+    let text_partition = contextdb_vector::VectorPartitionRef::new(
+        text_ref.clone(),
+        contextdb_core::VectorPartitionKey::unpartitioned(),
+    );
+    let build_pause =
+        vector_store.arm_maintenance_progress_pause_for_test(&text_partition, PER_INDEX_SQL_ROWS);
+    let (done_build_tx, done_build_rx) = mpsc::channel();
+    let db_build = db.clone();
+    thread::spawn(move || {
+        done_build_tx
+            .send(db_build.run_maintenance_cycle())
+            .unwrap();
+    });
+    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+
+    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&table_ref, PauseWindow::Ddl);
+    let (started_drop_tx, started_drop_rx) = mpsc::channel();
+    let (done_drop_tx, done_drop_rx) = mpsc::channel();
+    let db_drop = db.clone();
+    thread::spawn(move || {
+        started_drop_tx.send(()).unwrap();
+        let result = db_drop.execute("DROP TABLE evidence", &empty());
+        done_drop_tx.send(result).unwrap();
+    });
+    assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
+    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
+    build_pause.release();
+    let _ = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    // DROP TABLE cannot retire a vector state while maintenance owns that
+    // same state. The table-level DDL pause is reachable only after the
+    // maintenance batch releases it; no query is allowed to start the build.
+    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
+    ddl_pause.release();
+    let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+
+    drop_result.unwrap().unwrap();
+    assert!(
+        db.execute("SELECT id FROM evidence LIMIT 1", &empty())
+            .is_err()
+    );
+    assert!(!vector_store.has_hnsw_index_for(&text_ref));
+    assert!(!vector_store.has_hnsw_index_for(&vision_ref));
+}
+
+// ============================================================
+// Persisted row vector query operand
+// ============================================================
+
+#[derive(Clone)]
+struct PrvFixture {
+    source: Uuid,
+    near: Uuid,
+    mid: Uuid,
+    far: Uuid,
+    source_vec: Vec<f32>,
+    near_vec: Vec<f32>,
+    mid_vec: Vec<f32>,
+    far_vec: Vec<f32>,
+}
+
+fn prv_fixture() -> PrvFixture {
+    PrvFixture {
+        source: Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0001),
+        near: Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0002),
+        mid: Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0003),
+        far: Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0004),
+        source_vec: vec![0.731_234, 0.212_345, 0.648_901],
+        near_vec: vec![0.730_001, 0.214_001, 0.647_222],
+        mid_vec: vec![0.120_222, 0.970_111, 0.110_333],
+        far_vec: vec![0.030_111, 0.040_222, 0.998_333],
+    }
+}
+
+fn prv_create_docs_table(db: &Database) {
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, label TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+}
+
+fn prv_insert_doc(db: &Database, id: Uuid, label: &str, embedding: Vec<f32>) {
+    db.execute(
+        "INSERT INTO docs (id, label, embedding) VALUES ($id, $label, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("label", Value::Text(label.to_string())),
+            ("embedding", Value::Vector(embedding)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn prv_update_doc_embedding(db: &Database, id: Uuid, embedding: Vec<f32>) {
+    db.execute(
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("embedding", Value::Vector(embedding)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn prv_seed_docs(db: &Database) -> PrvFixture {
+    let f = prv_fixture();
+    prv_create_docs_table(db);
+    prv_insert_doc(db, f.source, "source", f.source_vec.clone());
+    prv_insert_doc(db, f.near, "near", f.near_vec.clone());
+    prv_insert_doc(db, f.mid, "mid", f.mid_vec.clone());
+    prv_insert_doc(db, f.far, "far", f.far_vec.clone());
+    f
+}
+
+fn prv_seed_hnsw_docs(db: &Database, rows: usize) -> PrvFixture {
+    let f = prv_seed_docs(db);
+    for idx in 4..rows {
+        let id = Uuid::from_u128(0x7200_0000_0000_0000_0000_0000_0000_0000 + idx as u128);
+        let angle = idx as f32 * 0.013;
+        prv_insert_doc(
+            db,
+            id,
+            &format!("hnsw-{idx}"),
+            vec![
+                angle.sin().abs(),
+                angle.cos().abs(),
+                (angle * 0.5).sin().abs(),
+            ],
+        );
+    }
+    f
+}
+
+fn prv_expect_query_ok(
+    result: contextdb_core::Result<contextdb_engine::QueryResult>,
+    context: &str,
+) -> contextdb_engine::QueryResult {
+    if let Err(err) = &result {
+        assert!(
+            result.is_ok(),
+            "{context}: expected ROW_VECTOR query to succeed, got {err:?}"
+        );
+    }
+    match result {
+        Ok(result) => result,
+        Err(_) => unreachable!(),
+    }
+}
+
+fn prv_expect_query_err(
+    result: contextdb_core::Result<contextdb_engine::QueryResult>,
+    context: &str,
+) -> Error {
+    if let Ok(ok_result) = &result {
+        assert!(
+            result.is_err(),
+            "{context}: expected ROW_VECTOR query to fail, got {ok_result:?}"
+        );
+    }
+    match result {
+        Ok(_) => unreachable!(),
+        Err(err) => err,
+    }
+}
+
+fn prv_column(result: &contextdb_engine::QueryResult, name: &str) -> usize {
+    result
+        .columns
+        .iter()
+        .position(|column| column == name || column.rsplit('.').next() == Some(name))
+        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns))
+}
+
+fn prv_uuid_at(result: &contextdb_engine::QueryResult, row: usize, column: &str) -> Uuid {
+    let idx = prv_column(result, column);
+    match result.rows.get(row).and_then(|values| values.get(idx)) {
+        Some(Value::Uuid(id)) => *id,
+        other => panic!("expected UUID in row {row} column {column}, got {other:?}"),
+    }
+}
+
+fn prv_score_at(result: &contextdb_engine::QueryResult, row: usize) -> f64 {
+    let idx = prv_column(result, "score");
+    match result.rows.get(row).and_then(|values| values.get(idx)) {
+        Some(Value::Float64(score)) => *score,
+        other => panic!("expected score in row {row}, got {other:?}"),
+    }
+}
+
+fn prv_assert_same_signature(
+    literal: &contextdb_engine::QueryResult,
+    persisted: &contextdb_engine::QueryResult,
+) {
+    assert_eq!(
+        persisted.trace.physical_plan, literal.trace.physical_plan,
+        "persisted ROW_VECTOR query must match literal-vector plan label"
+    );
+    assert_eq!(
+        persisted.trace.index_used, literal.trace.index_used,
+        "persisted ROW_VECTOR query must match literal-vector index trace"
+    );
+    assert_eq!(persisted.rows.len(), literal.rows.len());
+    for idx in 0..literal.rows.len() {
+        assert_eq!(
+            prv_uuid_at(persisted, idx, "id"),
+            prv_uuid_at(literal, idx, "id"),
+            "persisted ROW_VECTOR row order must match literal-vector row order at row {idx}"
+        );
+        let literal_score = prv_score_at(literal, idx);
+        let persisted_score = prv_score_at(persisted, idx);
+        let ulps = literal_score.to_bits().abs_diff(persisted_score.to_bits());
+        assert!(
+            ulps <= 1,
+            "persisted ROW_VECTOR score must match literal-vector score within 1 ULP at row {idx}: literal={literal_score:?}, persisted={persisted_score:?}, ulps={ulps}"
+        );
+    }
+}
+
+fn prv_row_vector_query(where_clause: &str) -> String {
+    format!(
+        "SELECT id, label, score FROM docs {where_clause} ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 3"
+    )
+}
+
+fn prv_literal_query(where_clause: &str) -> String {
+    format!(
+        "SELECT id, label, score FROM docs {where_clause} ORDER BY embedding <=> $query LIMIT 3"
+    )
+}
+
+fn prv_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let b0 = bytes[pos];
+        let b1 = bytes.get(pos + 1).copied().unwrap_or(0);
+        let b2 = bytes.get(pos + 2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if pos + 1 < bytes.len() {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if pos + 2 < bytes.len() {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        pos += 3;
+    }
+    out
+}
+
+fn prv_assert_no_encoded_vector_bytes(surface: &str, label: &str, bytes: &[u8]) {
+    if bytes.iter().all(|byte| *byte == 0) {
+        return;
+    }
+    let lower = surface.to_ascii_lowercase();
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert!(
+        !lower.contains(&hex),
+        "surface leaked {label} vector bytes as hex {hex}: {surface}"
+    );
+    let decimal = bytes
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(
+        !surface.contains(&decimal),
+        "surface leaked {label} vector bytes as decimal list {decimal}: {surface}"
+    );
+    let b64 = prv_base64(bytes);
+    assert!(
+        !surface.contains(&b64),
+        "surface leaked {label} vector bytes as base64 {b64}: {surface}"
+    );
+}
+
+fn prv_assert_no_source_vector_leak_in_debug(debug: &str, source_vec: &[f32]) {
+    assert!(
+        !debug.contains("query: ["),
+        "debug surface must not expose an internal query vector: {debug}"
+    );
+    assert!(
+        !debug.contains("Value::Vector") && !debug.contains("Vector(["),
+        "debug surface must not expose a vector-valued payload: {debug}"
+    );
+    for component in source_vec {
+        let token = format!("{component:?}");
+        assert!(
+            !debug.contains(&token),
+            "debug surface leaked source vector component {token}: {debug}"
+        );
+        let little = component.to_le_bytes();
+        let big = component.to_be_bytes();
+        prv_assert_no_encoded_vector_bytes(debug, "little-endian component", &little);
+        prv_assert_no_encoded_vector_bytes(debug, "big-endian component", &big);
+    }
+    let little_vec = source_vec
+        .iter()
+        .flat_map(|component| component.to_le_bytes())
+        .collect::<Vec<_>>();
+    let big_vec = source_vec
+        .iter()
+        .flat_map(|component| component.to_be_bytes())
+        .collect::<Vec<_>>();
+    prv_assert_no_encoded_vector_bytes(debug, "little-endian full", &little_vec);
+    prv_assert_no_encoded_vector_bytes(debug, "big-endian full", &big_vec);
+}
+
+fn prv_assert_result_has_no_vector_payload(
+    result: &contextdb_engine::QueryResult,
+    source_vec: &[f32],
+) {
+    for row in &result.rows {
+        for value in row {
+            assert!(
+                !matches!(value, Value::Vector(_)),
+                "ROW_VECTOR query result must not expose vector-valued cells: {result:?}"
+            );
+        }
+    }
+    prv_assert_no_source_vector_leak_in_debug(&format!("{result:?}"), source_vec);
+}
+
+fn prv_memory_usage_tuple(db: &Database) -> (Option<usize>, usize, Option<usize>, Option<usize>) {
+    let usage = db.accountant().usage();
+    (
+        usage.limit,
+        usage.used,
+        usage.available,
+        usage.startup_ceiling,
+    )
+}
+
+fn prv_seed_rank_policy_docs(db: &Database, rows: usize) -> PrvFixture {
+    db.execute(
+        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID, success_rate REAL)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE docs (
+            id UUID PRIMARY KEY,
+            label TEXT,
+            embedding VECTOR(3) RANK_POLICY (
+                JOIN outcomes ON decision_id,
+                FORMULA '{vector_score} * coalesce({success_rate}, 1.0)',
+                SORT_KEY weighted
+            )
+        )",
+        &empty(),
+    )
+    .unwrap();
+
+    let f = prv_fixture();
+    let fixed = [
+        (f.source, "source", f.source_vec.clone(), 1.0),
+        (f.near, "near", f.near_vec.clone(), 0.75),
+        (f.mid, "mid", f.mid_vec.clone(), 2.0),
+        (f.far, "far", f.far_vec.clone(), 0.25),
+    ];
+    let fixed_len = fixed.len();
+    for (id, label, vector, success_rate) in fixed {
+        db.execute(
+            "INSERT INTO docs (id, label, embedding) VALUES ($id, $label, $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("label", Value::Text(label.to_string())),
+                ("embedding", Value::Vector(vector)),
+            ]),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO outcomes (id, decision_id, success_rate) VALUES ($id, $decision_id, $success_rate)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("decision_id", Value::Uuid(id)),
+                ("success_rate", Value::Float64(success_rate)),
+            ]),
+        )
+        .unwrap();
+    }
+    for idx in fixed_len..rows {
+        let id = Uuid::from_u128(0x7100_0000_0000_0000_0000_0000_0000_0000 + idx as u128);
+        let angle = idx as f32 * 0.017;
+        let vector = vec![angle.sin().abs(), angle.cos().abs(), 0.125];
+        prv_insert_doc(db, id, &format!("bulk-{idx}"), vector);
+        db.execute(
+            "INSERT INTO outcomes (id, decision_id, success_rate) VALUES ($id, $decision_id, $success_rate)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("decision_id", Value::Uuid(id)),
+                ("success_rate", Value::Float64(1.0)),
+            ]),
+        )
+        .unwrap();
+    }
+    f
+}
+
+fn prv_06_child_process() {
+    let db_path = std::env::var("CONTEXTDB_PRV06_DB").unwrap();
+    let barrier_dir = std::path::PathBuf::from(std::env::var("CONTEXTDB_PRV06_BARRIER").unwrap());
+    let query_id = Uuid::parse_str(&std::env::var("CONTEXTDB_PRV06_QUERY_ID").unwrap()).unwrap();
+    let f = prv_fixture();
+    let db = Database::open(&db_path).unwrap();
+    for phase in 0..3 {
+        let go = barrier_dir.join(format!("phase-{phase}.go"));
+        let done = barrier_dir.join(format!("phase-{phase}.done"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !go.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "child timed out waiting for barrier {go:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        match phase {
+            1 => {
+                prv_update_doc_embedding(&db, f.source, f.mid_vec.clone());
+                prv_update_doc_embedding(&db, f.near, f.mid_vec.clone());
+                prv_update_doc_embedding(&db, f.mid, f.far_vec.clone());
+                prv_update_doc_embedding(&db, f.far, f.source_vec.clone());
+            }
+            2 => {
+                prv_update_doc_embedding(&db, f.source, f.near_vec.clone());
+                prv_update_doc_embedding(&db, f.mid, f.near_vec.clone());
+                prv_update_doc_embedding(&db, f.near, f.far_vec.clone());
+                prv_update_doc_embedding(&db, f.far, f.far_vec.clone());
+            }
+            _ => {}
+        }
+        let result = prv_expect_query_ok(
+            db.execute(
+                "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+                &params(vec![("query_id", Value::Uuid(query_id))]),
+            ),
+            "child process ROW_VECTOR query",
+        );
+        let top = prv_uuid_at(&result, 0, "id");
+        let tmp_done = done.with_extension("tmp");
+        std::fs::write(&tmp_done, top.to_string()).unwrap();
+        std::fs::rename(tmp_done, done).unwrap();
+    }
+}
+
+fn prv_wait_for_file(path: &std::path::Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for barrier file {path:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn prv_01_parser_accepts_row_vector_as_cosine_distance_rhs() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let result = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 2",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "well-formed persisted row vector RHS",
+    );
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(prv_uuid_at(&result, 0, "id"), f.source);
+    assert_eq!(
+        result.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+}
+
+#[test]
+fn prv_02_parser_rejects_malformed_or_misplaced_row_vector_forms() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let positive = db.execute(
+        "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+        &params(vec![("query_id", Value::Uuid(f.source))]),
+    );
+    assert!(
+        positive.is_ok(),
+        "well-formed ROW_VECTOR RHS must execute before malformed cases are meaningful: {positive:?}"
+    );
+
+    let uncorrelated_in = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs WHERE id IN (SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1)",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "uncorrelated IN subquery with ROW_VECTOR order",
+    );
+    assert_eq!(prv_uuid_at(&uncorrelated_in, 0, "id"), f.source);
+
+    let malformed = [
+        (
+            "select-list placement",
+            "SELECT ROW_VECTOR('docs','embedding',$query_id) FROM docs",
+        ),
+        (
+            "where-predicate placement",
+            "SELECT id FROM docs WHERE ROW_VECTOR('docs','embedding',$query_id) = 1",
+        ),
+        (
+            "standalone order item",
+            "SELECT id FROM docs ORDER BY ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+        ),
+        (
+            "row-vector as cosine lhs",
+            "SELECT id FROM docs ORDER BY ROW_VECTOR('docs','embedding',$query_id) <=> [1,0,0] LIMIT 1",
+        ),
+        (
+            "row-vector arithmetic",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) + 1 LIMIT 1",
+        ),
+        (
+            "join-on placement",
+            "SELECT d.id FROM docs d JOIN docs q ON ROW_VECTOR('docs','embedding',$query_id) = 1 ORDER BY d.id LIMIT 1",
+        ),
+        (
+            "aliased row-vector expression",
+            "SELECT ROW_VECTOR('docs','embedding',$query_id) AS query_vec FROM docs",
+        ),
+        (
+            "cte self-join column key leakage",
+            "WITH s AS (SELECT id FROM docs) SELECT d.id FROM docs d JOIN s ON d.id = s.id ORDER BY d.embedding <=> ROW_VECTOR('docs','embedding',s.id) LIMIT 1",
+        ),
+        (
+            "nested cosine distance",
+            "SELECT id FROM docs ORDER BY embedding <=> (ROW_VECTOR('docs','embedding',$query_id) <=> [1,0,0]) LIMIT 1",
+        ),
+        (
+            "correlated in-subquery leakage",
+            "SELECT id FROM docs WHERE id IN (SELECT q.id FROM docs q WHERE q.id = docs.id ORDER BY q.embedding <=> ROW_VECTOR('docs','embedding',docs.id) LIMIT 1) ORDER BY embedding <=> $query LIMIT 1",
+        ),
+        (
+            "subselect key argument",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',(SELECT id FROM docs LIMIT 1)) LIMIT 1",
+        ),
+        (
+            "parameterized table name",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR($table,'embedding',$query_id) LIMIT 1",
+        ),
+        (
+            "parameterized column name",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs',$column,$query_id) LIMIT 1",
+        ),
+        (
+            "computed key",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id + 1) LIMIT 1",
+        ),
+        (
+            "null key",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',NULL) LIMIT 1",
+        ),
+        (
+            "one-argument arity",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs') LIMIT 1",
+        ),
+        (
+            "two-argument arity",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding') LIMIT 1",
+        ),
+        (
+            "four-argument arity",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id,'extra') LIMIT 1",
+        ),
+        (
+            "multiple row-vector operands",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) + ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+        ),
+    ];
+    for (case, sql) in malformed {
+        let err = prv_expect_query_err(
+            db.execute(
+                sql,
+                &params(vec![
+                    ("query_id", Value::Uuid(f.source)),
+                    ("table", Value::Text("docs".to_string())),
+                    ("column", Value::Text("embedding".to_string())),
+                    ("query", Value::Vector(f.source_vec.clone())),
+                ]),
+            ),
+            case,
+        );
+        assert!(
+            matches!(err, Error::ParseError(_) | Error::PlanError(_)),
+            "{case} must fail with a typed parse/plan error, got {err:?}"
+        );
+    }
+
+    let non_vector_source = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','label',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "non-vector source column in ROW_VECTOR",
+    );
+    assert!(matches!(
+        non_vector_source,
+        Error::UnknownVectorIndex { .. }
+    ));
+
+    let table_missing = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('missing','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "missing source table",
+    );
+    assert!(matches!(table_missing, Error::TableNotFound(_)));
+}
+
+#[test]
+fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let literal = db
+        .execute(
+            &prv_literal_query(""),
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    let persisted = prv_expect_query_ok(
+        db.execute(
+            &prv_row_vector_query(""),
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "persisted row vector parity query",
+    );
+    prv_assert_same_signature(&literal, &persisted);
+    assert_eq!(literal.trace.query_vector_source, None);
+    assert_eq!(
+        persisted.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+
+    let hnsw_db = Database::open_memory();
+    let hnsw_f = prv_seed_hnsw_docs(&hnsw_db, 1024);
+    let hnsw_literal = hnsw_db
+        .execute(
+            &prv_literal_query(""),
+            &params(vec![("query", Value::Vector(hnsw_f.source_vec.clone()))]),
+        )
+        .unwrap();
+    assert!(
+        hnsw_literal.trace.physical_plan.contains("HNSWSearch"),
+        "literal-vector HNSW oracle must use the HNSW path, got {:?}",
+        hnsw_literal.trace
+    );
+    let hnsw_persisted = prv_expect_query_ok(
+        hnsw_db.execute(
+            &prv_row_vector_query(""),
+            &params(vec![("query_id", Value::Uuid(hnsw_f.source))]),
+        ),
+        "persisted row vector HNSW parity query",
+    );
+    prv_assert_same_signature(&hnsw_literal, &hnsw_persisted);
+    assert_eq!(
+        hnsw_persisted.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+}
+
+#[test]
+fn prv_04_row_vector_query_returns_rows_score_trace_without_vector_bytes() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let persisted = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, label, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 2",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "persisted row vector byte non-exposure query",
+    );
+    assert!(persisted.columns.iter().any(|column| column == "score"));
+    assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.near);
+    prv_assert_result_has_no_vector_payload(&persisted, &f.source_vec);
+}
+
+#[test]
+fn prv_05_row_vector_query_respects_candidate_filter() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let result = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, label FROM docs WHERE id = $candidate_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 3",
+            &params(vec![
+                ("candidate_id", Value::Uuid(f.mid)),
+                ("query_id", Value::Uuid(f.source)),
+            ]),
+        ),
+        "candidate-filtered persisted row vector query",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(prv_uuid_at(&result, 0, "id"), f.mid);
+    assert!(
+        result.trace.physical_plan.contains("VectorSearch")
+            || result.trace.physical_plan.contains("HNSWSearch"),
+        "trace must show candidate plan feeding vector search, got {:?}",
+        result.trace
+    );
+}
+
+#[test]
+fn prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process() {
+    if std::env::var_os("CONTEXTDB_PRV06_CHILD").is_some() {
+        prv_06_child_process();
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("prv06.db");
+    let f = {
+        let db = Database::open(&db_path).unwrap();
+        let f = prv_seed_docs(&db);
+        drop(db);
+        f
+    };
+
+    let db = Database::open(&db_path).unwrap();
+    let initial = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "reopened persisted row vector query",
+    );
+    assert_eq!(prv_uuid_at(&initial, 0, "id"), f.near);
+
+    let pinned_before_writer = db.snapshot();
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(f.source)),
+            ("embedding", Value::Vector(f.far_vec.clone())),
+        ]),
+    )
+    .unwrap();
+    let concurrent_read = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "read outside uncommitted writer",
+    );
+    assert_eq!(prv_uuid_at(&concurrent_read, 0, "id"), f.near);
+    db.commit(tx).unwrap();
+    let late_candidate = Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_00aa);
+    prv_insert_doc(&db, late_candidate, "late-candidate", f.source_vec.clone());
+    db.execute(
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(f.mid)),
+            ("embedding", Value::Vector(f.source_vec.clone())),
+        ]),
+    )
+    .unwrap();
+    let pinned_after_commit = prv_expect_query_ok(
+        db.execute_at_snapshot(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+            pinned_before_writer,
+        ),
+        "pinned snapshot after committed writer",
+    );
+    assert_eq!(
+        prv_uuid_at(&pinned_after_commit, 0, "id"),
+        f.near,
+        "execute_at_snapshot must resolve source ROW_VECTOR, candidate visibility, and existing candidate vector payloads from the same pinned snapshot; live candidate state would rank first otherwise"
+    );
+    let post_commit = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "read after committed writer",
+    );
+    assert_eq!(prv_uuid_at(&post_commit, 0, "id"), f.far);
+    drop(db);
+
+    let barrier = tmp.path().join("prv06-barrier");
+    std::fs::create_dir(&barrier).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(crate::child_test_filter(
+            module_path!(),
+            "prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process",
+        ))
+        .env("CONTEXTDB_PRV06_CHILD", "1")
+        .env("CONTEXTDB_PRV06_DB", &db_path)
+        .env("CONTEXTDB_PRV06_BARRIER", &barrier)
+        .env("CONTEXTDB_PRV06_QUERY_ID", f.source.to_string())
+        .spawn()
+        .unwrap();
+
+    std::fs::write(barrier.join("phase-0.go"), b"go").unwrap();
+    let phase0 = prv_wait_for_file(&barrier.join("phase-0.done"));
+    assert_eq!(phase0.trim(), f.far.to_string());
+
+    std::fs::write(barrier.join("phase-1.go"), b"go").unwrap();
+    let phase1 = prv_wait_for_file(&barrier.join("phase-1.done"));
+    assert_eq!(phase1.trim(), f.near.to_string());
+
+    std::fs::write(barrier.join("phase-2.go"), b"go").unwrap();
+    let phase2 = prv_wait_for_file(&barrier.join("phase-2.done"));
+    assert_eq!(phase2.trim(), f.mid.to_string());
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_variants() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    db.execute(
+        "INSERT INTO docs (id, label) VALUES ($id, 'null-cell')",
+        &params(vec![(
+            "id",
+            Value::Uuid(Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_00ff)),
+        )]),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE source4 (id UUID PRIMARY KEY, embedding VECTOR(4))",
+        &empty(),
+    )
+    .unwrap();
+    let source4 = Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0f04);
+    db.execute(
+        "INSERT INTO source4 (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(source4)),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    let missing = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$missing_id) LIMIT 1",
+            &params(vec![(
+                "missing_id",
+                Value::Uuid(Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0bad)),
+            )]),
+        ),
+        "missing source row",
+    );
+    assert!(matches!(
+        missing,
+        Error::PersistedRowVectorRowMissing { .. }
+    ));
+
+    let null_cell = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$null_id) LIMIT 1",
+            &params(vec![(
+                "null_id",
+                Value::Uuid(Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_00ff)),
+            )]),
+        ),
+        "NULL source vector cell",
+    );
+    assert!(matches!(
+        null_cell,
+        Error::PersistedRowVectorCellNull { .. }
+    ));
+
+    let wrong_column = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','label',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "non-vector source column",
+    );
+    assert!(matches!(wrong_column, Error::UnknownVectorIndex { .. }));
+    assert_ne!(
+        std::mem::discriminant(&missing),
+        std::mem::discriminant(&null_cell)
+    );
+    assert_ne!(
+        std::mem::discriminant(&missing),
+        std::mem::discriminant(&wrong_column)
+    );
+    assert_ne!(
+        std::mem::discriminant(&null_cell),
+        std::mem::discriminant(&wrong_column)
+    );
+
+    let missing_table = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('missing','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "missing source table",
+    );
+    assert!(matches!(missing_table, Error::TableNotFound(_)));
+
+    let dim = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('source4','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(source4))]),
+        ),
+        "dimension mismatch source vector",
+    );
+    assert!(matches!(dim, Error::VectorIndexDimensionMismatch { .. }));
+
+    for err in [missing, null_cell, wrong_column, missing_table] {
+        let rendered = format!("{err:?} {err}");
+        prv_assert_no_source_vector_leak_in_debug(&rendered, &f.source_vec);
+    }
+    let rendered_dim = format!("{dim:?} {dim}");
+    prv_assert_no_source_vector_leak_in_debug(&rendered_dim, &[1.0, 0.0, 0.0, 0.0]);
+}
+
+struct PrvPluginCounters {
+    pre_commit: std::sync::atomic::AtomicUsize,
+    post_commit: std::sync::atomic::AtomicUsize,
+    commit_failed: std::sync::atomic::AtomicUsize,
+}
+
+impl contextdb_engine::plugin::DatabasePlugin for PrvPluginCounters {
+    fn pre_commit(
+        &self,
+        _ws: &contextdb_tx::WriteSet,
+        _source: contextdb_engine::plugin::CommitSource,
+    ) -> contextdb_core::Result<()> {
+        self.pre_commit.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn post_commit(
+        &self,
+        _ws: &contextdb_tx::WriteSet,
+        _source: contextdb_engine::plugin::CommitSource,
+    ) {
+        self.post_commit.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn commit_failed(
+        &self,
+        _ws: &contextdb_tx::WriteSet,
+        _source: contextdb_engine::plugin::CommitSource,
+        _error: &Error,
+    ) {
+        self.commit_failed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync() {
+    let counters = Arc::new(PrvPluginCounters {
+        pre_commit: std::sync::atomic::AtomicUsize::new(0),
+        post_commit: std::sync::atomic::AtomicUsize::new(0),
+        commit_failed: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let db = Database::open_memory_with_plugin(counters.clone()).unwrap();
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    let f = prv_seed_hnsw_docs(&db, 1024);
+    db.execute("CREATE TRIGGER prv08_tr ON docs WHEN UPDATE", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE prv08_doc_update WHEN UPDATE ON docs",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK prv08_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE ROUTE prv08_route EVENT prv08_doc_update TO prv08_sink",
+        &empty(),
+    )
+    .unwrap();
+    let trigger_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let trigger_count_for_callback = trigger_count.clone();
+    db.register_trigger_callback("prv08_tr", move |_db_handle, _ctx| {
+        trigger_count_for_callback.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+    let index = VectorIndexRef::new("docs", "embedding");
+    db.run_maintenance_cycle()
+        .expect("caller-driven maintenance builds the graph before the read-only probe");
+    let before_hnsw_len = db.__debug_vector_hnsw_len(index.clone());
+    let before_hnsw_stats = db.__debug_vector_hnsw_stats(index.clone());
+    assert!(
+        before_hnsw_len.is_some() && before_hnsw_stats.is_some(),
+        "read-only probe must exercise an already-built HNSW graph"
+    );
+    let sink_deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink_deliveries_for_callback = sink_deliveries.clone();
+    db.register_sink("prv08_sink", None, move |_event| {
+        sink_deliveries_for_callback.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+
+    let before_trigger = trigger_count.load(Ordering::SeqCst);
+    let before_sink_deliveries = sink_deliveries.load(Ordering::SeqCst);
+    let before_pre = counters.pre_commit.load(Ordering::SeqCst);
+    let before_post = counters.post_commit.load(Ordering::SeqCst);
+    let before_failed = counters.commit_failed.load(Ordering::SeqCst);
+    let before_watermark = db.committed_watermark();
+    let before_lsn = db.current_lsn();
+    let before_sink = db.sink_metrics_for_test("prv08_sink");
+
+    let result = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "read-only persisted row vector query",
+    );
+    assert_eq!(prv_uuid_at(&result, 0, "id"), f.source);
+
+    assert_eq!(trigger_count.load(Ordering::SeqCst), before_trigger);
+    assert_eq!(
+        sink_deliveries.load(Ordering::SeqCst),
+        before_sink_deliveries
+    );
+    assert_eq!(counters.pre_commit.load(Ordering::SeqCst), before_pre);
+    assert_eq!(counters.post_commit.load(Ordering::SeqCst), before_post);
+    assert_eq!(counters.commit_failed.load(Ordering::SeqCst), before_failed);
+    assert_eq!(db.committed_watermark(), before_watermark);
+    assert_eq!(db.current_lsn(), before_lsn);
+    assert_eq!(db.sink_metrics_for_test("prv08_sink"), before_sink);
+    assert_eq!(db.__debug_vector_hnsw_len(index.clone()), before_hnsw_len);
+    assert_eq!(db.__debug_vector_hnsw_stats(index), before_hnsw_stats);
+    assert!(db.changes_since(before_lsn).rows.is_empty());
+    assert!(db.changes_since(before_lsn).vectors.is_empty());
+    assert!(db.changes_since(before_lsn).ddl.is_empty());
+}
+
+#[test]
+fn prv_09_existing_literal_and_parameter_cosine_distance_unchanged() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let parameter = db
+        .execute(
+            "SELECT id FROM docs ORDER BY embedding <=> $query LIMIT 3",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    assert_eq!(parameter.trace.physical_plan, "Scan -> VectorSearch");
+    assert_eq!(parameter.trace.query_vector_source, None);
+    assert_eq!(prv_uuid_at(&parameter, 0, "id"), f.source);
+    assert_eq!(prv_uuid_at(&parameter, 1, "id"), f.near);
+
+    let literal = db
+        .execute(
+            "SELECT id FROM docs ORDER BY embedding <=> [0.731234,0.212345,0.648901] LIMIT 3",
+            &empty(),
+        )
+        .unwrap();
+    assert_eq!(literal.trace.physical_plan, "Scan -> VectorSearch");
+    assert_eq!(literal.trace.query_vector_source, None);
+    assert_eq!(prv_uuid_at(&literal, 0, "id"), f.source);
+    assert_eq!(prv_uuid_at(&literal, 1, "id"), f.near);
+}
+
+#[test]
+fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
+    let small_db = Database::open_memory();
+    let small_f = prv_seed_rank_policy_docs(&small_db, 4);
+    let small_literal = small_db
+        .execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 3",
+            &params(vec![("query", Value::Vector(small_f.source_vec.clone()))]),
+        )
+        .unwrap();
+    assert!(
+        small_literal.trace.physical_plan.contains("VectorSearch")
+            && !small_literal.trace.physical_plan.contains("HNSWSearch"),
+        "small literal USE RANK query must exercise the non-HNSW path, got {:?}",
+        small_literal.trace
+    );
+    let small_persisted = prv_expect_query_ok(
+        small_db.execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 3",
+            &params(vec![("query_id", Value::Uuid(small_f.source))]),
+        ),
+        "small USE RANK persisted row vector query",
+    );
+    prv_assert_same_signature(&small_literal, &small_persisted);
+    assert_eq!(
+        small_persisted.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+
+    let db = Database::open_memory();
+    let f = prv_seed_rank_policy_docs(&db, 1024);
+    let literal = db
+        .execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 3",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    assert!(
+        literal.trace.physical_plan.contains("HNSWSearch"),
+        "literal USE RANK query must report actual HNSW path before ROW_VECTOR parity is accepted, got {:?}",
+        literal.trace
+    );
+    let persisted = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 3",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "USE RANK persisted row vector query",
+    );
+    prv_assert_same_signature(&literal, &persisted);
+    assert!(
+        persisted.trace.physical_plan.contains("HNSWSearch"),
+        "persisted USE RANK query must report actual HNSW path, got {:?}",
+        persisted.trace
+    );
+    assert_eq!(
+        persisted.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+}
+
+#[test]
+fn prv_11_row_vector_query_accepts_parameter_bound_key() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let param = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 3",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "parameter-bound ROW_VECTOR key",
+    );
+    let literal = prv_expect_query_ok(
+        db.execute(
+            &format!(
+                "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding','{}') LIMIT 3",
+                f.source
+            ),
+            &empty(),
+        ),
+        "literal ROW_VECTOR key",
+    );
+    prv_assert_same_signature(&literal, &param);
+
+    let missing = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![(
+                "query_id",
+                Value::Uuid(Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_dead)),
+            )]),
+        ),
+        "missing parameter-bound ROW_VECTOR key",
+    );
+    assert!(matches!(
+        missing,
+        Error::PersistedRowVectorRowMissing { .. }
+    ));
+}
+
+#[test]
+fn prv_12_row_vector_query_in_active_tx_sees_active_tx_view() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(f.source)),
+            ("embedding", Value::Vector(f.far_vec.clone())),
+        ]),
+    )
+    .unwrap();
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction own-write ROW_VECTOR query",
+    );
+    assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.far);
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![
+                ("query_id", Value::Uuid(f.source)),
+                ("query", Value::Vector(f.far_vec.clone())),
+            ]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_17_row_vector_query_scores_active_tx_target_vector_updates() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(f.far)),
+            ("embedding", Value::Vector(f.source_vec.clone())),
+        ]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction target own-write ROW_VECTOR query",
+    );
+    assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.far);
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![
+                ("query_id", Value::Uuid(f.source)),
+                ("query", Value::Vector(f.source_vec.clone())),
+            ]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_18_row_vector_query_keeps_target_vector_on_non_vector_tx_update() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET label = 'near-updated' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(f.near))]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction non-vector target update ROW_VECTOR query",
+    );
+    assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.near);
+    let label_idx = prv_column(&persisted, "label");
+    assert_eq!(
+        persisted.rows[0].get(label_idx),
+        Some(&Value::Text("near-updated".to_string())),
+        "vector search must preserve the committed vector while materializing the staged row"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE id != $query_id ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![
+                ("query_id", Value::Uuid(f.source)),
+                ("query", Value::Vector(f.source_vec.clone())),
+            ]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_19_row_vector_query_candidate_filter_uses_active_tx_row_overlay() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET label = 'eligible' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(f.near))]),
+    )
+    .unwrap();
+
+    let newly_matching = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE label = 'eligible' ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction ROW_VECTOR query with staged candidate newly matching filter",
+    );
+    assert_eq!(prv_uuid_at(&newly_matching, 0, "id"), f.near);
+    let label_idx = prv_column(&newly_matching, "label");
+    assert_eq!(
+        newly_matching.rows[0].get(label_idx),
+        Some(&Value::Text("eligible".to_string()))
+    );
+
+    let literal_newly_matching = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE label = 'eligible' ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal_newly_matching, &newly_matching);
+
+    let stopped_matching = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE label = 'near' ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction ROW_VECTOR query with staged candidate no longer matching filter",
+    );
+    assert!(
+        stopped_matching.rows.is_empty(),
+        "candidate bitmap must exclude the pre-update row image once the active tx changed the non-indexed filter column: {stopped_matching:?}"
+    );
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_20_row_vector_source_missing_key_still_checks_table_read_gate() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO docs (id, acl_id, embedding) VALUES ($id, $acl, [1,0,0])",
+        &params(vec![
+            (
+                "id",
+                Value::Uuid(Uuid::from_u128(0x7700_0000_0000_0000_0000_0000_0000_0001)),
+            ),
+            (
+                "acl",
+                Value::Uuid(Uuid::from_u128(0x7700_0000_0000_0000_0000_0000_0000_00aa)),
+            ),
+        ]),
+    )
+    .unwrap();
+
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[sarg_uuid(0xA)]));
+    let missing_key = Uuid::from_u128(0x7700_0000_0000_0000_0000_0000_0000_dead);
+    let err = prv_expect_query_err(
+        scoped.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(missing_key))]),
+        ),
+        "ROW_VECTOR source missing key under ACL-gated table without principal",
+    );
+    assert!(
+        matches!(err, Error::PrincipalRequired { .. }),
+        "source table read gate must run before returning missing-key ROW_VECTOR errors, got {err:?}"
+    );
+}
+
+#[test]
+fn prv_21_row_vector_query_treats_vector_null_update_as_null_cell() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = NULL WHERE id = $id",
+        &params(vec![("id", Value::Uuid(f.source))]),
+    )
+    .unwrap();
+
+    let active_err = prv_expect_query_err(
+        db.execute_in_tx(
+            tx,
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "active transaction ROW_VECTOR source with vector cell updated to NULL",
+    );
+    assert!(
+        matches!(active_err, Error::PersistedRowVectorCellNull { .. }),
+        "active tx source vector NULL must not read the stale committed vector entry: {active_err:?}"
+    );
+
+    db.commit(tx).unwrap();
+    let committed_err = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "committed ROW_VECTOR source with vector cell updated to NULL",
+    );
+    assert!(
+        matches!(committed_err, Error::PersistedRowVectorCellNull { .. }),
+        "committed source vector NULL must not read the old vector entry: {committed_err:?}"
+    );
+}
+
+#[test]
+fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(4 * 1024 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = NULL WHERE id = $id",
+        &params(vec![("id", Value::Uuid(f.near))]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "active transaction target vector updated to NULL",
+    );
+    assert_eq!(
+        prv_uuid_at(&persisted, 0, "id"),
+        f.far,
+        "target vector NULL update must remove the stale near-vector candidate from scoring"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![
+                ("query_id", Value::Uuid(f.source)),
+                ("query", Value::Vector(f.source_vec.clone())),
+            ]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+
+    let before_budget_probe = accountant.usage().used;
+    let vector_search_bytes = 3usize
+        .saturating_mul(f.source_vec.len())
+        .saturating_mul(std::mem::size_of::<f32>());
+    // Candidate-route preflight now reserves the score slots needed to prove
+    // this unindexed filter can still use exact work. Leave enough room for
+    // that transient check while keeping less than one overlay entry, so the
+    // active-transaction overlay remains the reservation the budget refuses.
+    const SLACK_BEFORE_OVERLAY: usize = 192;
+    let one_overlay_entry_bytes = std::mem::size_of::<contextdb_core::VectorEntry>()
+        .saturating_add(std::mem::size_of::<(RowId, Vec<f32>)>())
+        .saturating_add(f.source_vec.len() * std::mem::size_of::<f32>())
+        .saturating_add(64);
+    assert!(
+        SLACK_BEFORE_OVERLAY < one_overlay_entry_bytes,
+        "the fixture must still make the overlay reservation exceed its remaining headroom"
+    );
+    accountant
+        .set_budget(Some(
+            before_budget_probe
+                .saturating_add(vector_search_bytes)
+                .saturating_add(SLACK_BEFORE_OVERLAY),
+        ))
+        .unwrap();
+    let budget_err = prv_expect_query_err(
+        db.execute_in_tx(
+            tx,
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "active transaction vector overlay should respect MEMORY_LIMIT",
+    );
+    assert!(
+        matches!(
+            budget_err,
+            Error::MemoryBudgetExceeded { ref operation, .. }
+                if operation.starts_with("active_tx_vector_overlay@docs.embedding")
+        ),
+        "active tx exact overlay must be memory-accounted before cloning vectors: {budget_err:?}"
+    );
+    assert_eq!(
+        accountant.usage().used,
+        before_budget_probe,
+        "failed overlay reservation must release the vector-search working set"
+    );
+}
+
+#[test]
+fn prv_23_row_vector_query_cte_projected_id_candidates_use_active_tx_overlay() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let staged = Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0c7e);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO docs (id, label, embedding) VALUES ($id, 'eligible', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(staged)),
+            ("embedding", Value::Vector(f.source_vec.clone())),
+        ]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "WITH filtered AS (SELECT id, embedding FROM docs WHERE label = 'eligible')
+             SELECT id, score FROM filtered ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "projected CTE candidate ids must map staged rows to row ids",
+    );
+    assert_eq!(
+        prv_uuid_at(&persisted, 0, "id"),
+        staged,
+        "candidate bitmap fallback from projected UUID id must include active-tx inserts"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "WITH filtered AS (SELECT id, embedding FROM docs WHERE label = 'eligible')
+             SELECT id, score FROM filtered ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_24_row_vector_order_by_rejects_unsupported_sort_shapes() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let unsupported = [
+        (
+            "SELECT id FROM docs ORDER BY label ASC, embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            "ROW_VECTOR as a non-leading ORDER BY item",
+        ),
+        (
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id), label ASC LIMIT 1",
+            "ROW_VECTOR with a secondary ORDER BY item",
+        ),
+    ];
+
+    for (sql, context) in unsupported {
+        let err = prv_expect_query_err(
+            db.execute(sql, &params(vec![("query_id", Value::Uuid(f.source))])),
+            context,
+        );
+        assert!(
+            matches!(err, Error::PlanError(ref message)
+                if message.contains("ROW_VECTOR") && message.contains("only ORDER BY item")),
+            "{context} must be rejected instead of silently ignoring the ROW_VECTOR source: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn prv_25_row_vector_use_rank_joined_row_uses_active_tx_overlay() {
+    let db = Database::open_memory();
+    let f = prv_seed_rank_policy_docs(&db, 4);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE outcomes SET success_rate = 10.0 WHERE decision_id = $decision_id",
+        &params(vec![("decision_id", Value::Uuid(f.far))]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "ROW_VECTOR USE RANK query must see active transaction joined-row updates",
+    );
+    assert_eq!(
+        prv_uuid_at(&persisted, 0, "id"),
+        f.far,
+        "rank policy must score against the active transaction image of the joined row"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 1",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_26_row_vector_use_rank_overfetch_includes_active_tx_vector_inserts() {
+    let db = Database::open_memory();
+    let f = prv_seed_rank_policy_docs(&db, 4);
+    let staged = Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0027);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO docs (id, label, embedding) VALUES ($id, 'staged-rank', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(staged)),
+            ("embedding", Value::Vector(vec![-1.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO outcomes (id, decision_id, success_rate) VALUES ($id, $decision_id, -10.0)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("decision_id", Value::Uuid(staged)),
+        ]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "ROW_VECTOR USE RANK query must include active transaction vector inserts in rank overfetch",
+    );
+    assert_eq!(
+        prv_uuid_at(&persisted, 0, "id"),
+        staged,
+        "active-tx staged vector inserts must be ranked before truncating the final top-k"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 1",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+
+    let committed = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "committed ROW_VECTOR USE RANK query after staged insert commit",
+    );
+    assert_eq!(
+        prv_uuid_at(&committed, 0, "id"),
+        staged,
+        "active transaction and committed ranked search must agree on the winning row"
+    );
+}
+
+#[test]
+fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
+    let db = Database::open_memory();
+    let f = prv_seed_hnsw_docs(&db, 1000);
+    let index = VectorIndexRef::new("docs", "embedding");
+    assert_eq!(db.__debug_vector_hnsw_len(index.clone()), None);
+
+    let explain = db
+        .explain(&format!(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding','{}') LIMIT 5",
+            f.source
+        ))
+        .unwrap();
+    assert!(
+        explain.contains("VectorSearch") || explain.contains("HNSWSearch"),
+        "EXPLAIN must still describe the vector operator without building HNSW: {explain}"
+    );
+    assert_eq!(
+        db.__debug_vector_hnsw_len(index),
+        None,
+        "EXPLAIN must be read-only and must not lazily materialize HNSW state"
+    );
+}
+
+#[test]
+fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building() {
+    let covering_db = Database::open_memory();
+    covering_db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    let f = prv_seed_hnsw_docs(&covering_db, 1000);
+    let index = VectorIndexRef::new("docs", "embedding");
+    assert_eq!(covering_db.__debug_vector_hnsw_len(index.clone()), None);
+
+    let covering_explain = covering_db
+        .explain(
+            "SELECT id FROM docs WHERE id != $query_id \
+             ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 5",
+        )
+        .unwrap();
+    assert!(
+        covering_explain.contains("VectorSearch")
+            && covering_explain.contains("strategy=BruteForce")
+            && covering_explain.contains("route=exact")
+            && covering_explain.contains("fallback=filtered_route_exact"),
+        "filtered EXPLAIN must describe the read-only exact fallback without inventing a graph: {covering_explain}"
+    );
+    assert_eq!(
+        covering_db.__debug_vector_hnsw_len(index.clone()),
+        None,
+        "covering EXPLAIN must derive strategy without building HNSW"
+    );
+
+    let covering_result = covering_db
+        .execute(
+            "SELECT id FROM docs WHERE id != $query_id \
+             ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 5",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        )
+        .unwrap();
+    assert!(
+        covering_result.trace.physical_plan.contains("VectorSearch")
+            && !covering_result.trace.physical_plan.contains("HNSWSearch"),
+        "a query cannot build HNSW and must use the same exact fallback EXPLAIN predicted: {:?}",
+        covering_result.trace.physical_plan
+    );
+    assert!(
+        covering_result
+            .rows
+            .iter()
+            .all(|row| row.first() != Some(&Value::Uuid(f.source))),
+        "the exact fallback must preserve the candidate filter"
+    );
+
+    let fallback_db = Database::open_memory();
+    fallback_db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    let fallback = prv_seed_hnsw_docs(&fallback_db, 5001);
+    let fallback_index = VectorIndexRef::new("docs", "embedding");
+    assert_eq!(
+        fallback_db.__debug_vector_hnsw_len(fallback_index.clone()),
+        None
+    );
+
+    let fallback_explain = fallback_db
+        .explain(
+            "SELECT id FROM docs WHERE id != $query_id \
+             ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 5",
+        )
+        .unwrap();
+    assert!(
+        fallback_explain.contains("VectorSearch")
+            && fallback_explain.contains("strategy=BruteForce"),
+        "filtered EXPLAIN must match runtime fallback when the effective search width cannot cover the graph: {fallback_explain}"
+    );
+    assert_eq!(
+        fallback_db.__debug_vector_hnsw_len(fallback_index.clone()),
+        None,
+        "fallback EXPLAIN must not build HNSW"
+    );
+
+    let fallback_result = fallback_db
+        .execute(
+            "SELECT id FROM docs WHERE id != $query_id \
+             ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 5",
+            &params(vec![("query_id", Value::Uuid(fallback.source))]),
+        )
+        .unwrap();
+    assert!(
+        fallback_result.trace.physical_plan.contains("VectorSearch")
+            && !fallback_result.trace.physical_plan.contains("HNSWSearch"),
+        "a caller-driven query cannot build HNSW and must use the exact fallback: {:?}",
+        fallback_result.trace.physical_plan
+    );
+    assert!(
+        fallback_result
+            .rows
+            .iter()
+            .all(|row| row.first() != Some(&Value::Uuid(fallback.source))),
+        "fallback path must preserve the candidate filter"
+    );
+}
+
+#[test]
+fn prv_28b_filtered_indexed_explain_names_specific_or_generic_recovery() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+
+    let simple = db
+        .explain(
+            "SELECT id FROM docs WHERE label = 'near' \
+             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+        )
+        .unwrap();
+    assert!(
+        simple.contains("recovery=CREATE INDEX docs_label_idx ON docs (label)"),
+        "a simple filtered scan must retain its directly executable CREATE INDEX recovery: {simple}"
+    );
+
+    let compound = db
+        .explain(&format!(
+            "SELECT d.id FROM docs d INNER JOIN docs q ON d.id = q.id WHERE q.label = 'near' \
+             ORDER BY d.embedding <=> ROW_VECTOR('docs','embedding','{}') \
+             USE VECTOR INDEXED LIMIT 1",
+            f.source
+        ))
+        .unwrap();
+    assert!(
+        compound.contains("refusal=filtered_route_unavailable")
+            && compound.contains(
+                "recovery=use EXACT or rewrite the filter with a supporting relational index"
+            ),
+        "a compound filtered plan with no derivable index must name the exact-or-rewrite recovery: {compound}"
+    );
+    assert!(
+        !compound.contains("recovery=none"),
+        "the compound refusal must not strand the operator without a recovery: {compound}"
+    );
+}
+
+#[test]
+fn prv_13_row_vector_query_honors_scoped_handle_context_isolation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, label TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let allowed = Uuid::from_u128(0x7300_0000_0000_0000_0000_0000_0000_0001);
+    let hidden = Uuid::from_u128(0x7300_0000_0000_0000_0000_0000_0000_0002);
+    for (id, ctx, vector) in [
+        (allowed, ctx_a, vec![1.0, 0.0, 0.0]),
+        (hidden, ctx_b, vec![0.0, 1.0, 0.0]),
+    ] {
+        db.execute(
+            "INSERT INTO docs (id, context_id, label, embedding) VALUES ($id, $ctx, 'd', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("ctx", Value::Uuid(ctx)),
+                ("embedding", Value::Vector(vector)),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let err = prv_expect_query_err(
+        scoped.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(hidden))]),
+        ),
+        "scoped handle hidden source row",
+    );
+    sarg_expect_context_violation(err, ctx_b, &[ctx_a]);
+
+    let ok = prv_expect_query_ok(
+        scoped.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(allowed))]),
+        ),
+        "scoped handle visible source row",
+    );
+    assert_eq!(prv_uuid_at(&ok, 0, "id"), allowed);
+}
+
+#[test]
+fn prv_14_row_vector_query_renders_in_explain_without_vector_bytes() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let sql = format!(
+        "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding','{}') LIMIT 1",
+        f.source
+    );
+    let explain_result = db.explain(&sql);
+    if let Err(err) = &explain_result {
+        assert!(
+            explain_result.is_ok(),
+            "EXPLAIN ROW_VECTOR query must succeed, got {err:?}"
+        );
+    }
+    let explain = explain_result.unwrap();
+    assert!(
+        explain.contains("VectorSearch") || explain.contains("HNSWSearch"),
+        "EXPLAIN must render the selected vector path, got {explain}"
+    );
+    assert!(explain.contains("docs"));
+    assert!(explain.contains("embedding"));
+    assert!(
+        explain.contains("RowVectorSource(table=docs, column=embedding"),
+        "EXPLAIN must render ROW_VECTOR as a resolved source reference, got {explain}"
+    );
+    assert!(
+        explain.contains("key=<redacted>"),
+        "EXPLAIN must redact the ROW_VECTOR key identity, got {explain}"
+    );
+    assert!(
+        !explain.contains(&f.source.to_string()),
+        "EXPLAIN must not render the ROW_VECTOR key identity, got {explain}"
+    );
+    prv_assert_no_source_vector_leak_in_debug(&explain, &f.source_vec);
+}
+
+#[test]
+fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
+    // Seam-interleaved rounds, not a wall-clock race: each round parks one
+    // UPDATE writer INSIDE its commit (after the relational apply, before
+    // vector publication) with `pause_after_relational_apply_for_test`, then
+    // proves the row-vector reader completes DURING that window on the main
+    // thread. The verdict is state, counters, and events -- `current_lsn()`
+    // and the query's own rows -- never elapsed time; the only `Duration` in
+    // this test is `PER_INDEX_SQL_TIMEOUT`, a liveness bound on the seam
+    // being reached at all (the same idiom `multi_ref_tx_mid_apply_state_
+    // invisible_post_commit_state_visible` above already uses), not a bound
+    // on how long the reads take.
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE sources (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let source = Uuid::from_u128(0x7500_0000_0000_0000_0000_0000_0000_0001);
+    let doc = Uuid::from_u128(0x7500_0000_0000_0000_0000_0000_0000_0002);
+    db.execute(
+        "INSERT INTO sources (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(source)),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(doc)),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    const ROUNDS: usize = 8;
+    let base_lsn = db.current_lsn();
+    let mut reads_completed_mid_apply = 0u64;
+
+    for round in 0..ROUNDS {
+        let (table, id) = if round.is_multiple_of(2) {
+            ("sources", source)
+        } else {
+            ("docs", doc)
+        };
+        let new_vector = if round.is_multiple_of(2) {
+            vec![1.0, 0.0, 0.0]
+        } else {
+            vec![0.0, 1.0, 0.0]
+        };
+
+        let lsn_before_round = db.current_lsn();
+        assert_eq!(
+            lsn_before_round,
+            Lsn(base_lsn.0 + round as u64),
+            "round {round}: LSN must equal base plus the writer commits of every prior round"
+        );
+
+        let pause = db.pause_after_relational_apply_for_test();
+        let db_writer = db.clone();
+        let table_owned = table.to_string();
+        let update_vector = new_vector.clone();
+        let writer = thread::spawn(move || {
+            db_writer
+                .execute(
+                    &format!("UPDATE {table_owned} SET embedding = $embedding WHERE id = $id"),
+                    &params(vec![
+                        ("id", Value::Uuid(id)),
+                        ("embedding", Value::Vector(update_vector)),
+                    ]),
+                )
+                .unwrap();
+        });
+
+        assert!(
+            pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT),
+            "round {round}: writer must reach the apply-phase pause seam \
+             (mid-commit, relational applied, vector not yet published)"
+        );
+
+        // The reader runs on the main thread WHILE the writer holds the
+        // commit mutex, parked between relational apply and vector
+        // publication -- the most adversarial reachable moment for a
+        // row-vector read.
+        let read = db
+            .execute(
+                "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('sources','embedding',$source_id) LIMIT 1",
+                &params(vec![("source_id", Value::Uuid(source))]),
+            )
+            .unwrap();
+        assert_eq!(
+            read.rows.len(),
+            1,
+            "round {round}: row-vector read must complete with exactly one row while a writer is parked mid-commit"
+        );
+        assert_eq!(
+            read.rows[0][0],
+            Value::Uuid(doc),
+            "round {round}: row-vector read must resolve the one doc row while a writer is parked mid-commit"
+        );
+        reads_completed_mid_apply += 1;
+        assert_eq!(
+            db.current_lsn(),
+            lsn_before_round,
+            "round {round}: the row-vector read must not itself advance the LSN, \
+             and the parked writer's commit has not published yet"
+        );
+
+        pause.release();
+        writer.join().unwrap();
+
+        assert_eq!(
+            db.current_lsn(),
+            Lsn(lsn_before_round.0 + 1),
+            "round {round}: releasing the parked writer must advance the LSN by exactly one commit"
+        );
+
+        // The new vector is now visible: read the updated column back
+        // directly (state, not inference from ordering, since each table
+        // holds only one row).
+        let readback = db
+            .execute(
+                &format!("SELECT embedding FROM {table} WHERE id = $id"),
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .unwrap();
+        assert_eq!(
+            readback.rows[0][0],
+            Value::Vector(new_vector),
+            "round {round}: the committed vector must be visible immediately after the writer is released"
+        );
+    }
+
+    assert_eq!(
+        reads_completed_mid_apply, ROUNDS as u64,
+        "every round's row-vector read must have completed while a writer was parked mid-commit"
+    );
+    assert_eq!(
+        db.current_lsn(),
+        Lsn(base_lsn.0 + ROUNDS as u64),
+        "exactly one LSN advance per writer round: per-writer progress, as a counter"
+    );
+}
+
+#[test]
+fn prv_16_row_vector_query_releases_accountant_on_every_error_path() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    db.execute(
+        "INSERT INTO docs (id, label) VALUES ($id, 'null-cell')",
+        &params(vec![(
+            "id",
+            Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_0001)),
+        )]),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE source4 (id UUID PRIMARY KEY, embedding VECTOR(4))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO source4 (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            (
+                "id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_0002)),
+            ),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    fn is_missing(err: &Error) -> bool {
+        matches!(err, Error::PersistedRowVectorRowMissing { .. })
+    }
+    fn is_null_cell(err: &Error) -> bool {
+        matches!(err, Error::PersistedRowVectorCellNull { .. })
+    }
+    fn is_unknown_index(err: &Error) -> bool {
+        matches!(err, Error::UnknownVectorIndex { .. })
+    }
+    fn is_table_missing(err: &Error) -> bool {
+        matches!(err, Error::TableNotFound(_))
+    }
+    fn is_dimension_mismatch(err: &Error) -> bool {
+        matches!(err, Error::VectorIndexDimensionMismatch { .. })
+    }
+    struct PrvErrorCase {
+        label: &'static str,
+        sql: &'static str,
+        params: HashMap<String, Value>,
+        matches: fn(&Error) -> bool,
+    }
+
+    let baseline = prv_memory_usage_tuple(&db);
+    let missing_probe = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$missing_id) LIMIT 1",
+            &params(vec![(
+                "missing_id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_dead)),
+            )]),
+        ),
+        "accountant missing-row typed probe",
+    );
+    assert!(matches!(
+        missing_probe,
+        Error::PersistedRowVectorRowMissing { .. }
+    ));
+    assert_eq!(
+        prv_memory_usage_tuple(&db),
+        baseline,
+        "typed missing-row probe must not change accountant usage"
+    );
+    let cases = [
+        PrvErrorCase {
+            label: "missing source row",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$missing_id) LIMIT 1",
+            params: params(vec![(
+                "missing_id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_dead)),
+            )]),
+            matches: is_missing,
+        },
+        PrvErrorCase {
+            label: "NULL source cell",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$null_id) LIMIT 1",
+            params: params(vec![(
+                "null_id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_0001)),
+            )]),
+            matches: is_null_cell,
+        },
+        PrvErrorCase {
+            label: "non-vector source column",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','label',$query_id) LIMIT 1",
+            params: params(vec![("query_id", Value::Uuid(f.source))]),
+            matches: is_unknown_index,
+        },
+        PrvErrorCase {
+            label: "missing source table",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('missing','embedding',$query_id) LIMIT 1",
+            params: params(vec![("query_id", Value::Uuid(f.source))]),
+            matches: is_table_missing,
+        },
+        PrvErrorCase {
+            label: "dimension mismatch after vector resolution",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('source4','embedding',$source4_id) LIMIT 1",
+            params: params(vec![(
+                "source4_id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_0002)),
+            )]),
+            matches: is_dimension_mismatch,
+        },
+    ];
+    for _ in 0..100 {
+        for case in &cases {
+            let err = prv_expect_query_err(db.execute(case.sql, &case.params), case.label);
+            assert!(
+                (case.matches)(&err),
+                "accountant error-path probe {} returned wrong error: {err:?}",
+                case.label
+            );
+            assert_eq!(
+                prv_memory_usage_tuple(&db),
+                baseline,
+                "ROW_VECTOR error path {} must release every transient accountant allocation",
+                case.label
+            );
+        }
+    }
+    assert_eq!(
+        prv_memory_usage_tuple(&db),
+        baseline,
+        "ROW_VECTOR error paths must release every transient accountant allocation"
+    );
+}
+
+// ============================================================
+// A table-level composite PRIMARY KEY column cannot be dropped or
+// renamed, and the refusal names the reason. Single-column PK columns
+// are already un-droppable and un-renamable with a clear "cannot
+// drop/rename primary key column" error; a composite key column must
+// match that behavior. The ALTER guards check only the column-level
+// primary_key flag, which a table-level PRIMARY KEY (...) does not set,
+// so before this guard the refusal came from a DOWNSTREAM constraint
+// check and surfaced as a misleading `column not found`. The guard must
+// refuse the operation up front and name the key, mirroring the
+// single-column case.
+// ============================================================
+
+const COMPOSITE_PK_DDL: &str = "CREATE TABLE metric_windows (\
+     machine_id TEXT NOT NULL, \
+     sensor_id TEXT NOT NULL, \
+     metric TEXT NOT NULL, \
+     window_start INTEGER NOT NULL, \
+     value INTEGER NOT NULL, \
+     PRIMARY KEY (machine_id, sensor_id, metric, window_start))";
+
+#[test]
+fn dropping_a_composite_primary_key_column_is_refused() {
+    let db = Database::open_memory();
+    db.execute(COMPOSITE_PK_DDL, &empty())
+        .expect("composite-key table creates");
+
+    let result = db.execute("ALTER TABLE metric_windows DROP COLUMN sensor_id", &empty());
+    let err = result.expect_err("dropping a composite primary key column must be refused");
+    assert!(
+        err.to_string().contains("primary key"),
+        "the refusal must name that it is a primary key column, got {err:?}",
+    );
+
+    let meta = db.table_meta("metric_windows").expect("table still exists");
+    assert_eq!(
+        meta.primary_key_columns,
+        vec![
+            "machine_id".to_string(),
+            "sensor_id".to_string(),
+            "metric".to_string(),
+            "window_start".to_string(),
+        ],
+        "the composite key declaration is left intact after the refusal",
+    );
+    assert!(
+        meta.columns.iter().any(|c| c.name == "sensor_id"),
+        "the key column is still present after the refused drop",
+    );
+}
+
+#[test]
+fn renaming_a_composite_primary_key_column_is_refused() {
+    let db = Database::open_memory();
+    db.execute(COMPOSITE_PK_DDL, &empty())
+        .expect("composite-key table creates");
+
+    let result = db.execute(
+        "ALTER TABLE metric_windows RENAME COLUMN window_start TO ws",
+        &empty(),
+    );
+    let err = result.expect_err("renaming a composite primary key column must be refused");
+    assert!(
+        err.to_string().contains("primary key"),
+        "the refusal must name that it is a primary key column, got {err:?}",
+    );
+
+    let meta = db.table_meta("metric_windows").expect("table still exists");
+    assert_eq!(
+        meta.primary_key_columns,
+        vec![
+            "machine_id".to_string(),
+            "sensor_id".to_string(),
+            "metric".to_string(),
+            "window_start".to_string(),
+        ],
+        "the composite key declaration is left intact after the refusal",
+    );
+    assert!(
+        meta.columns.iter().any(|c| c.name == "window_start"),
+        "the original key column name is unchanged after the refused rename",
+    );
+    assert!(
+        !meta.columns.iter().any(|c| c.name == "ws"),
+        "the rename did not take effect",
+    );
+}
+
+// ============================================================
+// A vector column takes embeddings. A scalar bound where an
+// embedding belongs is refused at the door, by name, and nothing
+// of the refused statement survives -- no row, no searchable
+// embedding, and no change to an embedding already stored.
+// ============================================================
+
+const VECTOR_WRITE_DOOR_DDL: &str =
+    "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))";
+
+/// The values a caller binds by mistake where an embedding belongs, paired
+/// with the name the refusal has to report for each.
+fn non_embedding_bindings() -> Vec<(&'static str, Value, &'static str)> {
+    vec![
+        ("an integer", Value::Int64(7), "Int64"),
+        ("a boolean", Value::Bool(true), "Bool"),
+        (
+            "a json object",
+            Value::Json(serde_json::json!({"embedding": "later"})),
+            "Json",
+        ),
+    ]
+}
+
+fn assert_embedding_column_refusal(err: Error, label: &str, bound_value_name: &str) {
+    match err {
+        Error::ColumnTypeMismatch {
+            table,
+            column,
+            expected,
+            actual,
+        } => {
+            assert_eq!(table, "evidence", "the refusal names the table for {label}");
+            assert_eq!(
+                column, "embedding",
+                "the refusal names the column for {label}"
+            );
+            assert_eq!(
+                expected, "VECTOR(3)",
+                "the refusal names the declared column type for {label}"
+            );
+            assert_eq!(
+                actual, bound_value_name,
+                "the refusal names the value that was bound for {label}"
+            );
+        }
+        other => panic!(
+            "{label} bound where an embedding belongs must be refused as a column type \
+             mismatch, got {other:?}"
+        ),
+    }
+}
+
+/// An INSERT that binds a scalar where an embedding belongs is refused before
+/// anything is staged: the caller gets the typed refusal naming the column, the
+/// table is still empty, and a neighbour search finds nothing -- rather than the
+/// store quietly accepting a value the column cannot hold and only surfacing it
+/// when someone later reads the file.
+#[test]
+fn inserting_a_scalar_where_an_embedding_belongs_stores_nothing() {
+    for (label, bound, bound_value_name) in non_embedding_bindings() {
+        let db = Database::open_memory();
+        db.execute(VECTOR_WRITE_DOOR_DDL, &empty())
+            .expect("the evidence table creates");
+        let id = Uuid::from_u128(0x9100_0000_0000_0000_0000_0000_0000_0001);
+
+        let err = db
+            .execute(
+                "INSERT INTO evidence (id, note, embedding) VALUES ($id, $note, $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("note", Value::Text(format!("bound-{label}"))),
+                    ("embedding", bound.clone()),
+                ]),
+            )
+            .expect_err(&format!(
+                "an INSERT binding {label} where an embedding belongs must be refused",
+            ));
+        assert_embedding_column_refusal(err, label, bound_value_name);
+
+        let rows = db
+            .execute("SELECT id FROM evidence", &empty())
+            .expect("the table still reads");
+        assert!(
+            rows.rows.is_empty(),
+            "the refused INSERT of {label} left a row behind: {:?}",
+            rows.rows,
+        );
+
+        let search = db
+            .execute(
+                "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+                &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0]))]),
+            )
+            .expect("the neighbour search still answers");
+        assert!(
+            search.rows.is_empty(),
+            "the refused INSERT of {label} left a searchable embedding behind: {:?}",
+            search.rows,
+        );
+    }
+}
+
+/// Refusing scalars must not refuse the two forms a vector column has always
+/// taken: an exact-dimension embedding, and the text form that parses to one.
+#[test]
+fn a_vector_column_still_takes_an_embedding_and_its_text_form() {
+    let db = Database::open_memory();
+    db.execute(VECTOR_WRITE_DOOR_DDL, &empty())
+        .expect("the evidence table creates");
+    let bound = Uuid::from_u128(0x9100_0000_0000_0000_0000_0000_0000_0011);
+    let written = Uuid::from_u128(0x9100_0000_0000_0000_0000_0000_0000_0012);
+
+    db.execute(
+        "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'bound', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(bound)),
+            ("embedding", Value::Vector(vec![0.95_f32, 0.05, 0.0])),
+        ]),
+    )
+    .expect("an exact-dimension embedding is accepted");
+    db.execute(
+        "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'written', '[0.0, 0.9, 0.1]')",
+        &params(vec![("id", Value::Uuid(written))]),
+    )
+    .expect("the text form of an embedding is accepted");
+
+    let rows = db
+        .execute("SELECT id, embedding FROM evidence ORDER BY note", &empty())
+        .expect("both rows read back");
+    let embedding_idx = rows
+        .columns
+        .iter()
+        .position(|column| column == "embedding")
+        .expect("the embedding column is projected");
+    assert_eq!(rows.rows.len(), 2, "both accepted rows are stored");
+    for row in &rows.rows {
+        assert!(
+            matches!(row[embedding_idx], Value::Vector(_)),
+            "an accepted embedding is stored as an embedding, got {:?}",
+            row[embedding_idx],
+        );
+    }
+}
+
+/// An UPDATE that binds a scalar where an embedding belongs is refused the same
+/// way, and the embedding already stored is exactly what it was: the refused
+/// statement neither rewrites the row nor moves the row in a neighbour search.
+#[test]
+fn updating_an_embedding_with_a_scalar_leaves_the_stored_embedding_alone() {
+    for (label, bound, bound_value_name) in non_embedding_bindings() {
+        let db = Database::open_memory();
+        db.execute(VECTOR_WRITE_DOOR_DDL, &empty())
+            .expect("the evidence table creates");
+        let near = Uuid::from_u128(0x9200_0000_0000_0000_0000_0000_0000_0001);
+        let far = Uuid::from_u128(0x9200_0000_0000_0000_0000_0000_0000_0002);
+        let stored = vec![0.95_f32, 0.05, 0.0];
+        for (id, note, embedding) in [
+            (near, "near", stored.clone()),
+            (far, "far", vec![0.0_f32, 0.1, 0.9]),
+        ] {
+            db.execute(
+                "INSERT INTO evidence (id, note, embedding) VALUES ($id, $note, $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("note", Value::Text(note.to_owned())),
+                    ("embedding", Value::Vector(embedding)),
+                ]),
+            )
+            .expect("the seed row is accepted");
+        }
+
+        let err = db
+            .execute(
+                "UPDATE evidence SET embedding = $embedding WHERE id = $id",
+                &params(vec![
+                    ("id", Value::Uuid(near)),
+                    ("embedding", bound.clone()),
+                ]),
+            )
+            .expect_err(&format!(
+                "an UPDATE binding {label} where an embedding belongs must be refused",
+            ));
+        assert_embedding_column_refusal(err, label, bound_value_name);
+
+        let rows = db
+            .execute(
+                "SELECT embedding FROM evidence WHERE id = $id",
+                &params(vec![("id", Value::Uuid(near))]),
+            )
+            .expect("the row still reads");
+        assert_eq!(rows.rows.len(), 1, "the refused UPDATE kept the row");
+        assert_eq!(
+            rows.rows[0][0],
+            Value::Vector(stored.clone()),
+            "the refused UPDATE of {label} rewrote the stored embedding",
+        );
+
+        let search = db
+            .execute(
+                "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+                &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0]))]),
+            )
+            .expect("the neighbour search still answers");
+        assert_eq!(
+            search.rows.len(),
+            1,
+            "the neighbour search still answers after refusing {label}",
+        );
+        assert_eq!(
+            search.rows[0][0],
+            Value::Uuid(near),
+            "the refused UPDATE of {label} moved the row in the neighbour search",
+        );
+    }
+}

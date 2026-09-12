@@ -1,5 +1,3 @@
-#![cfg(feature = "test-seams")]
-
 use contextdb_core::Value;
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_engine::direct_file_reader::{

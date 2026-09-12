@@ -2,7 +2,6 @@ use super::common::*;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// A-MA1 — RED: --memory-limit flag sets startup ceiling
 // ---------------------------------------------------------------------------
 #[test]
 fn a_ma1_memory_limit_flag_sets_ceiling() {
@@ -26,7 +25,6 @@ fn a_ma1_memory_limit_flag_sets_ceiling() {
 }
 
 // ---------------------------------------------------------------------------
-// A-MA2 — RED: CONTEXTDB_MEMORY_LIMIT env var sets ceiling
 // ---------------------------------------------------------------------------
 /// Run the CLI over a fresh store with the given extra arguments and
 /// environment, ask it what its memory ceiling is, and hand back what it said.
@@ -89,7 +87,6 @@ fn a_ma2_the_command_line_sets_the_startup_memory_ceiling_and_the_environment_do
 }
 
 // ---------------------------------------------------------------------------
-// A-MA3 — RED: SET MEMORY_LIMIT lower than ceiling takes effect
 // ---------------------------------------------------------------------------
 #[test]
 fn a_ma3_set_lower_than_ceiling() {
@@ -115,7 +112,6 @@ fn a_ma3_set_lower_than_ceiling() {
 }
 
 // ---------------------------------------------------------------------------
-// A-MA4 — RED: SET MEMORY_LIMIT higher than ceiling errors
 // ---------------------------------------------------------------------------
 #[test]
 fn a_ma4_set_higher_than_ceiling_errors() {
@@ -142,7 +138,6 @@ fn a_ma4_set_higher_than_ceiling_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// A-MA5 — RED: SET MEMORY_LIMIT 'none' with ceiling errors
 // ---------------------------------------------------------------------------
 #[test]
 fn a_ma5_set_none_with_ceiling_errors() {
@@ -166,7 +161,6 @@ fn a_ma5_set_none_with_ceiling_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// A-MA6 — RED: MemoryBudgetExceeded error has all diagnostic fields
 // ---------------------------------------------------------------------------
 #[test]
 fn a_ma6_error_message_has_diagnostic_fields() {
@@ -195,7 +189,6 @@ fn a_ma6_error_message_has_diagnostic_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// A-MA7 — RED: INSERT, exhaust, delete, INSERT again
 // ---------------------------------------------------------------------------
 #[test]
 fn a_ma7_insert_exhaust_delete_insert() {
@@ -260,7 +253,6 @@ fn a_ma8_no_memory_limit_flag_works() {
 }
 
 // ---------------------------------------------------------------------------
-// A-MA9 — RED: file-backed MEMORY_LIMIT survives restart
 // ---------------------------------------------------------------------------
 #[test]
 fn a_ma9_memory_limit_survives_restart() {

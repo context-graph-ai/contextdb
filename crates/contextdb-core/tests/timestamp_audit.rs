@@ -16,15 +16,15 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
     // These are not transaction identifiers — they are user-visible timestamps.
     let whitelist: BTreeSet<(String, u32)> = [
         (
-            "crates/contextdb-engine/tests/sql_surface_tests.rs".to_string(),
-            889u32,
+            "crates/contextdb-engine/tests/sql_surface/sql_surface_tests.rs".to_string(),
+            1265u32,
         ),
-        ("tests/acceptance/query_surface.rs".to_string(), 675u32),
+        ("tests/acceptance/query_surface.rs".to_string(), 588u32),
         (
             "benches/indexed_scan_filter_entity_list.rs".to_string(),
             15u32,
         ),
-        ("tests/acceptance/query_surface.rs".to_string(), 1105u32),
+        ("tests/acceptance/query_surface.rs".to_string(), 1018u32),
         (
             "tests/integration/indexed_scan_filter_tests.rs".to_string(),
             1994u32,
@@ -37,8 +37,8 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
             "tests/integration/indexed_scan_filter_tests.rs".to_string(),
             2920u32,
         ),
-        ("tests/integration/retention_tests.rs".to_string(), 2207u32),
-        ("tests/integration/retention_tests.rs".to_string(), 2253u32),
+        ("tests/integration/retention_tests.rs".to_string(), 2172u32),
+        ("tests/integration/retention_tests.rs".to_string(), 2218u32),
     ]
     .into_iter()
     .collect();

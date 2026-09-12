@@ -32,7 +32,7 @@ aliases; a behavior reaches the binary as a flag.
 | Invariant | Guard (file → test) |
 |---|---|
 | Sync logic stays behind the engine's transport and protocol seams | `tests/transport_boundary_tests.rs` → `sync_logic_stays_behind_the_transport_and_protocol_seams` |
-| `src/transport/iroh.rs` and `large_request_staging.rs` are byte-identical to the engine's | `crates/contextdb-engine/tests/sync_source_mirror_tests.rs` → `server_sync_sources_are_exact_engine_audit_mirrors` |
+| `src/transport/iroh.rs` and `large_request_staging.rs` are byte-identical to the engine's | `crates/contextdb-engine/tests/sync/sync_source_mirror_tests.rs` → `server_sync_sources_are_exact_engine_audit_mirrors` |
 | Protocol 7 wire bytes do not drift | `tests/protocol_wire_format_freeze_tests.rs` → `protocol_seven_push_and_pull_wire_bytes_are_frozen` |
 | A peer on another protocol is refused, moving no rows and advancing no watermark | `tests/protocol_version_bump_tests.rs` → `a_version_mismatched_peer_is_refused_on_push_moving_no_rows_and_advancing_no_watermark` |
 | The ALPN stays `contextdb.sync.v6` | `tests/iroh_transport_tests.rs` → `sync_alpn_is_frozen_at_v6` |
@@ -43,7 +43,7 @@ aliases; a behavior reaches the binary as a flag.
 | Aliases cannot supply behavior configuration | `tests/server_behavior_alias_contract_tests.rs` → `tenant_and_sync_aliases_cannot_supply_behavior_configuration` |
 | No binary exits with a bare integer | `tests/binary_exit_code_contract.rs` → `no_binary_exits_with_a_bare_integer_literal` |
 | A vector update syncs with its owner row before delete arbitration | `tests/established_owner_vector_update_sync_tests.rs` → `established_owner_vector_update_syncs_before_delete_arbitration` |
-| A pushed vector schema capability the receiving peer lacks is held back per table, never silently applied and never a wholesale refusal of ordinary tables | `crates/contextdb-engine/tests/vector_schema_mixed_version_push_compatibility_contract.rs` → `newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_after_hub_upgrade`, `a_newer_edge_holds_authored_history_until_the_hub_can_replay_it` (siblings: `vector_schema_mixed_version_recovery_cursor_contract.rs`, `vector_schema_mixed_version_compatibility_contract.rs`, `vector_schema_mixed_version_erasure_frontier_contract.rs`, `vector_schema_mixed_version_restart_contract.rs`) — capability holdback logic (`SchemaSyncCapability`, `SchemaSyncHoldback`) lives in the engine's `sync_server.rs`; these tests drive it through `contextdb-server`'s `SyncClient`/`SyncServer`/`protocol`, so a new server-side refusal test for a schema-capability change belongs beside them, not beside `protocol_version_bump_tests.rs` (that guards protocol *version* mismatch, a different refusal). |
+| A pushed vector schema capability the receiving peer lacks is held back per table, never silently applied and never a wholesale refusal of ordinary tables | `crates/contextdb-engine/tests/vector/vector_schema_mixed_version_push_compatibility_contract.rs` → `newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_after_hub_upgrade`, `a_newer_edge_holds_authored_history_until_the_hub_can_replay_it` (siblings: `vector_schema_mixed_version_recovery_cursor_contract.rs`, `vector_schema_mixed_version_compatibility_contract.rs`, `vector_schema_mixed_version_erasure_frontier_contract.rs`, `vector_schema_mixed_version_restart_contract.rs`) — capability holdback logic (`SchemaSyncCapability`, `SchemaSyncHoldback`) lives in the engine's `sync_server.rs`; these tests drive it through `contextdb-server`'s `SyncClient`/`SyncServer`/`protocol`, so a new server-side refusal test for a schema-capability change belongs beside them, not beside `protocol_version_bump_tests.rs` (that guards protocol *version* mismatch, a different refusal). |
 | Exactly one of two racing workers wins a claim | `tests/work_ledger_tests.rs` → `two_workers_race_exactly_one_wins_and_one_result_exists` |
 
 ## Where a change lives
@@ -60,5 +60,5 @@ aliases; a behavior reaches the binary as a flag.
 
 ```bash
 cargo test -p contextdb-server --test transport_boundary_tests --test protocol_version_bump_tests
-cargo test -p contextdb-engine --test sync_source_mirror_tests
+cargo test -p contextdb-engine --test sync
 ```

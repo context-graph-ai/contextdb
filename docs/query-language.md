@@ -656,13 +656,13 @@ let bounded = reader.read_session(ReadLimits::default())?
 ```
 
 Rows whose `acl_id` the principal was not granted are absent from both answers.
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_granting_principal_sees_the_same_rows_on_both_live_routes -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::a_granting_principal_sees_the_same_rows_on_both_live_routes -->
 
 A handle that narrowed itself by context or scope but named no principal that can hold grants is **refused** the table with `Error::PrincipalRequired`. Authorization is a property the table declared, not an axis the reader opts into, so narrowing by some other axis never turns the grant filter off.
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_context_only_handle_is_refused_an_access_controlled_table_on_both_live_routes -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::a_context_only_handle_is_refused_an_access_controlled_table_on_both_live_routes -->
 
 `Principal::System` cannot hold grants and is refused the same way.
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_system_principal_is_refused_an_access_controlled_table_on_both_live_routes -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::a_system_principal_is_refused_an_access_controlled_table_on_both_live_routes -->
 
 Constraints compose. A handle that names both a context and a principal hides the rows outside its context *and* the rows it holds no grant for:
 
@@ -674,13 +674,13 @@ let reader = database.scoped_with_constraints(
 );
 ```
 
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_context_and_principal_handle_hides_the_foreign_context_and_ungranted_rows_on_both_live_routes -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::a_context_and_principal_handle_hides_the_foreign_context_and_ungranted_rows_on_both_live_routes -->
 
 An administrative handle — one that declared no context, no scope, and no principal — reads every row, and a table that declares no `ACL REFERENCES` column is unaffected: it keeps narrowing by exactly the axes it does declare.
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_table_without_an_acl_declaration_narrows_by_context_alone_on_every_route -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::a_table_without_an_acl_declaration_narrows_by_context_alone_on_every_route -->
 
 A direct read of a CLOSED store is not a handle that declared anything. `ReadSession::open` on a path with no live owner, and the CLI pointed at a path, read the committed store as its owner does: no principal is declared, so every row is returned, ACL column or not. Row-level authorization therefore governs handles that declare a principal — an embedded `scoped_with_constraints` reader and a read served by a live owner — while who may read a closed store at all is governed by the file's permissions.
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::the_direct_route_reads_a_closed_store_as_its_owner_with_no_declared_narrowing -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::the_direct_route_reads_a_closed_store_as_its_owner_with_no_declared_narrowing -->
 
 ACL is authorization, not relevance ranking. A withheld row is withheld because the reader is not entitled to it; it is never scored, ordered, or surfaced as a lower-ranked result.
 
@@ -1231,7 +1231,7 @@ read-scope error as an explicit anchor read. Missing source tables return
 `TableNotFound`, non-vector source columns return `UnknownVectorIndex`,
 dimension mismatches return `VectorIndexDimensionMismatch`, missing source rows
 return `PersistedRowVectorRowMissing`, and rows with NULL vector cells return
-`PersistedRowVectorCellNull`. <!-- enforced by: sql_surface_tests::prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results, sql_surface_tests::prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process, sql_surface_tests::prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_variants -->
+`PersistedRowVectorCellNull`. <!-- enforced by: sql_surface_other::prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results, sql_surface_other::prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process, sql_surface_other::prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_variants -->
 
 ### Pre-Filtered Search
 
@@ -1719,9 +1719,9 @@ node-local table, and on every edge that applies the hub's purges, including an 
 several purges of one key in a single pull. Every purged life of the key stays permanently refused,
 with its own frontier, after reopen and after a later life of the key is deleted, discarded, or
 purged.
-<!-- enforced by: crates/contextdb-engine/tests/custody_purge_and_discard_contract.rs::a_purge_erases_a_row_written_again_at_a_purged_key_and_every_purged_life_stays_refused -->
-<!-- enforced by: crates/contextdb-engine/tests/custody_purge_and_discard_contract.rs::a_purged_key_accepts_a_new_write_after_reopen_and_every_purged_life_stays_refused -->
-<!-- enforced by: crates/contextdb-engine/tests/custody_purge_and_discard_contract.rs::an_ordinary_delete_of_a_later_life_keeps_the_purged_life_refused -->
+<!-- enforced by: crates/contextdb-engine/tests/custody/custody_purge_and_discard_contract.rs::a_purge_erases_a_row_written_again_at_a_purged_key_and_every_purged_life_stays_refused -->
+<!-- enforced by: crates/contextdb-engine/tests/custody/custody_purge_and_discard_contract.rs::a_purged_key_accepts_a_new_write_after_reopen_and_every_purged_life_stays_refused -->
+<!-- enforced by: crates/contextdb-engine/tests/custody/custody_purge_and_discard_contract.rs::an_ordinary_delete_of_a_later_life_keeps_the_purged_life_refused -->
 <!-- enforced by: crates/contextdb-server/tests/authoritative_purge_fresh_same_key_lineage_tests.rs::fresh_same_key_insert_after_authoritative_purge_starts_new_lineage_and_syncs -->
 <!-- enforced by: crates/contextdb-server/tests/authoritative_purge_fresh_same_key_lineage_tests.rs::deleting_a_new_same_key_life_keeps_the_purged_life_refused_on_hub_and_edge -->
 <!-- enforced by: crates/contextdb-server/tests/authoritative_purge_sync_off_delivery_tests.rs::authoritative_purge_reaches_sync_off_edge_while_ordinary_rows_stay_local -->

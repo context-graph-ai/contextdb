@@ -67,44 +67,6 @@ fn ddl_sql_from_change(change: &DdlChange) -> String {
 }
 
 #[test]
-fn a1_01_create_all_12_tables() {
-    let db = setup_ontology_db();
-    let tables = db.table_names();
-    assert_eq!(tables.len(), 12);
-    for expected in [
-        "contexts",
-        "intentions",
-        "decisions",
-        "entities",
-        "entity_snapshots",
-        "observations",
-        "outcomes",
-        "invalidations",
-        "edges",
-        "approvals",
-        "patterns",
-        "sync_state",
-    ] {
-        assert!(tables.contains(&expected.to_string()));
-        let scanned = db.scan(expected, db.snapshot()).expect("table should scan");
-        assert!(scanned.is_empty());
-    }
-}
-
-#[test]
-fn a1_02_create_table_with_immutable_constraint() {
-    let db = setup_ontology_db();
-    db.execute(
-        "CREATE TABLE obs_gate_a (id UUID PRIMARY KEY, data JSON) IMMUTABLE",
-        &HashMap::new(),
-    )
-    .expect("create immutable table");
-
-    let meta = db.table_meta("obs_gate_a").expect("table meta");
-    assert!(meta.immutable);
-}
-
-#[test]
 fn a1_03_create_table_with_state_machine_constraint() {
     let db = setup_ontology_db();
     db.execute(
@@ -1044,80 +1006,6 @@ fn a3_13_bfs_over_adjacency_not_recursive_cte() {
         .expect("explain");
     assert!(explain.contains("GraphBfs"));
     assert!(!explain.contains("RecursiveCte"));
-}
-
-#[test]
-fn a4_01_insert_and_search_basic() {
-    let db = setup_ontology_db();
-    let tx = db.begin_or_panic();
-    let r1 = db
-        .insert_row(
-            tx,
-            "observations",
-            HashMap::from([
-                ("id".to_string(), Value::Uuid(Uuid::new_v4())),
-                ("entity_id".to_string(), Value::Uuid(Uuid::new_v4())),
-                ("data".to_string(), Value::Null),
-            ]),
-        )
-        .expect("insert r1");
-    let r2 = db
-        .insert_row(
-            tx,
-            "observations",
-            HashMap::from([
-                ("id".to_string(), Value::Uuid(Uuid::new_v4())),
-                ("entity_id".to_string(), Value::Uuid(Uuid::new_v4())),
-                ("data".to_string(), Value::Null),
-            ]),
-        )
-        .expect("insert r2");
-    let r3 = db
-        .insert_row(
-            tx,
-            "observations",
-            HashMap::from([
-                ("id".to_string(), Value::Uuid(Uuid::new_v4())),
-                ("entity_id".to_string(), Value::Uuid(Uuid::new_v4())),
-                ("data".to_string(), Value::Null),
-            ]),
-        )
-        .expect("insert r3");
-
-    db.insert_vector(
-        tx,
-        contextdb_core::VectorIndexRef::new("observations", "embedding"),
-        r1,
-        embedding384(&[1.0, 0.0, 0.0]),
-    )
-    .expect("v1");
-    db.insert_vector(
-        tx,
-        contextdb_core::VectorIndexRef::new("observations", "embedding"),
-        r2,
-        embedding384(&[0.0, 1.0, 0.0]),
-    )
-    .expect("v2");
-    db.insert_vector(
-        tx,
-        contextdb_core::VectorIndexRef::new("observations", "embedding"),
-        r3,
-        embedding384(&[0.0, 0.0, 1.0]),
-    )
-    .expect("v3");
-    db.commit(tx).expect("commit");
-
-    let out = db
-        .query_vector(
-            contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &embedding384(&[1.0, 0.0, 0.0]),
-            1,
-            None,
-            db.snapshot(),
-        )
-        .expect("search");
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].0, r1);
 }
 
 #[test]

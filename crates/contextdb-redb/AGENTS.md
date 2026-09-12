@@ -36,12 +36,12 @@ to `src/` updates the patch and that table in the same commit.
 
 | Invariant | Guard (file → test) |
 |---|---|
-| Relocation batches preserve every value across interleaved writes and a restart | `crates/contextdb-engine/tests/storage_compaction_online.rs` → `relocation_batches_preserve_values_with_interleaved_writes_and_restart` |
-| A refused page allocation aborts the batch without advancing the cursor | `crates/contextdb-engine/tests/storage_compaction_online.rs` → `allocation_refusal_aborts_relocation_without_advancing_its_position` |
+| Relocation batches preserve every value across interleaved writes and a restart | `crates/contextdb-engine/tests/engine_seams/storage_compaction_online.rs` → `relocation_batches_preserve_values_with_interleaved_writes_and_restart` |
+| A refused page allocation aborts the batch without advancing the cursor | `crates/contextdb-engine/tests/engine_seams/storage_compaction_online.rs` → `allocation_refusal_aborts_relocation_without_advancing_its_position` |
 | A live read snapshot survives relocated and reused pages | `src/transactions.rs` → `live_snapshot_survives_relocated_and_reused_pages` |
 | Relocation progresses while reads are live and yields to a waiting writer | `crates/contextdb-engine/src/database/storage_compaction_overlap_tests.rs` → `automatic_relocation_progresses_with_live_storage_reads_and_waiting_recordings` |
-| A paused statistics snapshot does not block a foreground commit | `crates/contextdb-engine/tests/storage_compaction_online.rs` → `paused_storage_statistics_allow_a_foreground_commit` |
-| Backend-read observation counts the bytes actually read and ends with the operation | `crates/contextdb-engine/tests/storage_compaction_online.rs` → `backend_read_observation_counts_actual_bytes_and_ends_with_the_operation` |
+| A paused statistics snapshot does not block a foreground commit | `crates/contextdb-engine/tests/engine_seams/storage_compaction_online.rs` → `paused_storage_statistics_allow_a_foreground_commit` |
+| Backend-read observation counts the bytes actually read and ends with the operation | `crates/contextdb-engine/tests/engine_seams/storage_compaction_online.rs` → `backend_read_observation_counts_actual_bytes_and_ends_with_the_operation` |
 | Files written by older redb releases still open | `tests/backward_compatibility.rs` (upstream suite) |
 | The fork's `Cargo.lock` is unchanged by packaging | no Rust test — checked by `scripts/verify-packaged-engine.sh` |
 | `src/` differs from upstream 4.1.0 by exactly `upstream-4.1.0.patch`; the five upstream test targets are unmodified | unguarded — regenerate the patch with the MAINTENANCE.md command and compare |
@@ -58,5 +58,5 @@ to `src/` updates the patch and that table in the same commit.
 
 ```bash
 cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
-cargo test -p contextdb-engine --features test-seams --test storage_compaction_online
+cargo test -p contextdb-engine --features test-seams --test engine_seams
 ```

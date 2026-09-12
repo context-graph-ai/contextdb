@@ -31,7 +31,7 @@ fn checked_path(root: &std::path::Path, raw: &[u8]) -> Option<PathBuf> {
 
 /// `git ls-files -z` scoped to the whole workspace root (no pathspec), walked
 /// directly off the filesystem. Duplicated from the sibling fallback in
-/// `crates/contextdb-engine/tests/timeless_source_vocabulary_tests.rs`
+/// `crates/contextdb-engine/tests/engine/timeless_source_vocabulary_tests.rs`
 /// (cross-crate test-support sharing isn't available); used only when the
 /// source tree is not a git repository (e.g. a `git archive` export) --
 /// git stays the primary source because it honors `.gitignore`, so this

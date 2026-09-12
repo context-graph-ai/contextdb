@@ -2899,20 +2899,20 @@ fn iroh_word_confined_to_adapter_and_config_surface() {
         "contextdb-engine/src/lib.rs",
         // These read-surface containment proofs name the remote adapter only
         // to reject it as a dependency of direct and same-machine reading.
-        "contextdb-engine/tests/direct_file_reader_contract_tests.rs",
-        "contextdb-engine/tests/local_transport_containment.rs",
-        "contextdb-engine/tests/durable_public_api_surface_tests.rs",
+        "contextdb-engine/tests/read/direct_file_reader_contract_tests.rs",
+        "contextdb-engine/tests/local_transport/local_transport_containment.rs",
+        "contextdb-engine/tests/durable_public_api/durable_public_api_surface_tests.rs",
         // Fixed custody proofs bind the actual authenticated adapter.
-        "contextdb-engine/tests/delivery_manifest_contract.rs",
-        "contextdb-engine/tests/delivery_outcome_contract.rs",
-        "contextdb-engine/tests/custody_protocol_contract.rs",
-        "contextdb-engine/tests/custody_purge_and_discard_contract.rs",
-        "contextdb-engine/tests/tenant_table_policy_contract.rs",
-        "contextdb-engine/tests/custody_inspection_contract.rs",
+        "contextdb-engine/tests/custody/delivery_manifest_contract.rs",
+        "contextdb-engine/tests/custody/delivery_outcome_contract.rs",
+        "contextdb-engine/tests/custody/custody_protocol_contract.rs",
+        "contextdb-engine/tests/custody/custody_purge_and_discard_contract.rs",
+        "contextdb-engine/tests/custody/tenant_table_policy_contract.rs",
+        "contextdb-engine/tests/custody/custody_inspection_contract.rs",
         // Actual ordinary-push scale measurement.
         "contextdb-engine/examples/custody_scale.rs",
-        "contextdb-engine/tests/server_resource_policy_contract_tests.rs",
-        "contextdb-engine/tests/sync_source_mirror_tests.rs",
+        "contextdb-engine/tests/custody/server_resource_policy_contract_tests.rs",
+        "contextdb-engine/tests/sync/sync_source_mirror_tests.rs",
         // The test-estate ratchet audit names test FILES (including this one)
         // in its per-file sleep counts — filenames, not transport use.
         "contextdb-core/tests/test_estate_audit.rs",

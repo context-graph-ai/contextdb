@@ -1,21 +1,9 @@
+use super::common::*;
 use contextdb_core::{Error, Value};
 use contextdb_engine::cli_render::render_explain;
 use contextdb_engine::{Database, QueryResult};
-use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use uuid::Uuid;
-
-const FEWER: &str = "fewer predicate columns matched than chosen index";
-const FIRST: &str = "first column not in WHERE";
-const TIED: &str = "tied with chosen index; lost by creation order";
-
-fn empty() -> HashMap<String, Value> {
-    HashMap::new()
-}
-
-fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
-    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
-}
 
 fn ce_uuid(n: u128) -> Uuid {
     Uuid::from_u128(0xCE00_0000_0000_0000_0000_0000_0000_0000 + n)
@@ -28,6 +16,10 @@ fn pushed(r: &QueryResult) -> Vec<&str> {
         .map(|c| c.as_ref())
         .collect()
 }
+
+const FEWER: &str = "fewer predicate columns matched than chosen index";
+const FIRST: &str = "first column not in WHERE";
+const TIED: &str = "tied with chosen index; lost by creation order";
 
 fn reason<'a>(r: &'a QueryResult, name: &str) -> Option<&'a str> {
     r.trace
@@ -58,8 +50,13 @@ fn seed_edge(
     .unwrap();
 }
 
+/// EXPLAIN tells a consumer why each competing index lost. On a DAG edges table with a composite
+/// UNIQUE constraint, the hop composite beats both automatic indexes and a hand-made index
+/// (fewer predicate columns) and the primary key (first column not in WHERE), and pushes every
+/// predicate so only the matching rows are read. When two composites tie, the one created later
+/// says it lost by creation order.
 #[test]
-fn acceptance_consumer_edges_composite_chosen_full_pushdown() {
+fn acceptance_explain_says_why_each_competing_composite_index_lost() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE edges (
@@ -70,17 +67,17 @@ fn acceptance_consumer_edges_composite_chosen_full_pushdown() {
             target_id UUID,
             UNIQUE (source_id, target_id, edge_type)
         ) DAG('HOP')",
-        &empty(),
+        &empty_params(),
     )
     .unwrap();
     db.execute(
         "CREATE INDEX idx_hop ON edges (source_id, context_id, edge_type)",
-        &empty(),
+        &empty_params(),
     )
     .unwrap();
     db.execute(
         "CREATE INDEX idx_alt ON edges (source_id, target_id)",
-        &empty(),
+        &empty_params(),
     )
     .unwrap();
 
@@ -144,30 +141,27 @@ fn acceptance_consumer_edges_composite_chosen_full_pushdown() {
     assert!(explain.contains("source_id"));
     assert!(explain.contains("context_id"));
     assert!(explain.contains("edge_type"));
-}
 
-#[test]
-fn acceptance_diagnosability_losing_composite_explained() {
-    let db = Database::open_memory();
-    db.execute(
+    let tie = Database::open_memory();
+    tie.execute(
         "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, context_id UUID, weight INTEGER)",
-        &empty(),
+        &empty_params(),
     )
     .unwrap();
-    db.execute(
+    tie.execute(
         "CREATE INDEX idx_long ON edges (source_id, context_id, weight)",
-        &empty(),
+        &empty_params(),
     )
     .unwrap();
-    db.execute(
+    tie.execute(
         "CREATE INDEX idx_short ON edges (source_id, context_id)",
-        &empty(),
+        &empty_params(),
     )
     .unwrap();
     let source = ce_uuid(0x21);
     let cutoff = ce_uuid(0x30);
     for i in 0..20 {
-        db.execute(
+        tie.execute(
             "INSERT INTO edges (id, source_id, context_id, weight) VALUES ($id, $source, $ctx, $weight)",
             &params(vec![
                 ("id", Value::Uuid(ce_uuid(0x1000 + i))),
@@ -178,14 +172,15 @@ fn acceptance_diagnosability_losing_composite_explained() {
         )
         .unwrap();
     }
-    let sql = "SELECT id FROM edges WHERE source_id IN ($s) AND context_id > $c ORDER BY id ASC";
-    let query_params = params(vec![("s", Value::Uuid(source)), ("c", Value::Uuid(cutoff))]);
-    let r = db.execute(sql, &query_params).unwrap();
+    let tie_sql =
+        "SELECT id FROM edges WHERE source_id IN ($s) AND context_id > $c ORDER BY id ASC";
+    let tie_params = params(vec![("s", Value::Uuid(source)), ("c", Value::Uuid(cutoff))]);
+    let r = tie.execute(tie_sql, &tie_params).unwrap();
     assert_eq!(r.trace.index_used.as_deref(), Some("idx_long"));
     assert_eq!(pushed(&r), vec!["source_id"]);
     assert_eq!(reason(&r, "idx_short"), Some(TIED));
 
-    let explain = render_explain(&db, sql, &query_params).unwrap();
+    let explain = render_explain(&tie, tie_sql, &tie_params).unwrap();
     assert!(explain.contains("idx_short: tied with chosen index; lost by creation order"));
     assert!(explain.contains("idx_long"));
 }
@@ -195,12 +190,15 @@ fn acceptance_first_composite_index_explain_walkthrough() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE notes (id UUID PRIMARY KEY, tag TEXT, score INTEGER)",
-        &empty(),
+        &empty_params(),
     )
     .unwrap();
-    db.execute("CREATE INDEX idx_tag_score ON notes (tag, score)", &empty())
-        .unwrap();
-    db.execute("ALTER TABLE notes ADD COLUMN tag2 TEXT", &empty())
+    db.execute(
+        "CREATE INDEX idx_tag_score ON notes (tag, score)",
+        &empty_params(),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE notes ADD COLUMN tag2 TEXT", &empty_params())
         .unwrap();
     for (n, tag, score) in [(1, "work", 5), (2, "work", 9), (3, "home", 5)] {
         db.execute(
@@ -217,15 +215,19 @@ fn acceptance_first_composite_index_explain_walkthrough() {
     let explain = render_explain(
         &db,
         "SELECT id FROM notes WHERE tag = 'work' AND score = 5",
-        &empty(),
+        &empty_params(),
     )
     .unwrap();
     assert!(explain.contains("IndexScan"));
     assert!(explain.contains("idx_tag_score"));
     assert!(explain.contains("predicates_pushed: [tag, score]"));
 
-    let scan_explain =
-        render_explain(&db, "SELECT id FROM notes WHERE tag2 = 'x'", &empty()).unwrap();
+    let scan_explain = render_explain(
+        &db,
+        "SELECT id FROM notes WHERE tag2 = 'x'",
+        &empty_params(),
+    )
+    .unwrap();
     assert!(scan_explain.contains("Scan"));
 }
 
@@ -234,11 +236,14 @@ fn acceptance_degenerate_in_queries_graceful() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE notes (id UUID PRIMARY KEY, tag TEXT, score INTEGER)",
-        &empty(),
+        &empty_params(),
     )
     .unwrap();
-    db.execute("CREATE INDEX idx_tag_score ON notes (tag, score)", &empty())
-        .unwrap();
+    db.execute(
+        "CREATE INDEX idx_tag_score ON notes (tag, score)",
+        &empty_params(),
+    )
+    .unwrap();
     db.execute(
         "INSERT INTO notes (id, tag, score) VALUES ($id, 'work', 5)",
         &params(vec![("id", Value::Uuid(ce_uuid(1)))]),
@@ -247,7 +252,7 @@ fn acceptance_degenerate_in_queries_graceful() {
 
     let empty_in = db.execute(
         "SELECT id FROM notes WHERE tag IN () AND score = 5",
-        &empty(),
+        &empty_params(),
     );
     assert!(matches!(empty_in, Err(Error::ParseError(_))));
 
@@ -255,7 +260,7 @@ fn acceptance_degenerate_in_queries_graceful() {
     plain
         .execute(
             "CREATE TABLE plain_notes (id UUID PRIMARY KEY, tag TEXT)",
-            &empty(),
+            &empty_params(),
         )
         .unwrap();
     plain
@@ -267,7 +272,7 @@ fn acceptance_degenerate_in_queries_graceful() {
     let unindexed = plain
         .execute(
             "SELECT id FROM plain_notes WHERE tag IN (1, 'work')",
-            &empty(),
+            &empty_params(),
         )
         .unwrap();
     assert_eq!(unindexed.trace.physical_plan, "Scan");
@@ -277,7 +282,7 @@ fn acceptance_degenerate_in_queries_graceful() {
     let indexed = catch_unwind(AssertUnwindSafe(|| {
         db.execute(
             "SELECT id FROM notes WHERE tag IN (1, 'work') AND score = 5",
-            &empty(),
+            &empty_params(),
         )
     }));
     assert!(

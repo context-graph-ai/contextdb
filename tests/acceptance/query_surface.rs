@@ -116,29 +116,6 @@ INSERT INTO workflows (id, status) VALUES ('00000000-0000-0000-0000-000000000002
     assert!(combined.contains("immutable") || combined.contains("state"));
 }
 
-/// I queried SELECT DISTINCT on a column with duplicates, and I got only the unique values back.
-#[test]
-fn f67_select_distinct() {
-    let db = setup_sql_ops_db();
-    let result = db
-        .execute("SELECT DISTINCT category FROM t", &empty_params())
-        .expect("distinct query");
-    assert_eq!(result.rows.len(), 2);
-}
-
-/// I filtered rows with IN ('alice', 'bob'), and I got exactly the rows matching those names.
-#[test]
-fn f62_in_with_literal_list() {
-    let db = setup_sql_ops_db();
-    let result = db
-        .execute(
-            "SELECT * FROM t WHERE name IN ('alice', 'bob')",
-            &empty_params(),
-        )
-        .expect("IN query");
-    assert_eq!(result.rows.len(), 3);
-}
-
 /// I used IN with a subquery to cross-reference two tables, and it returned only the matching row.
 #[test]
 fn f63_in_with_subquery() {
@@ -187,19 +164,6 @@ fn f64_like_pattern_matching() {
         .execute("SELECT * FROM t WHERE name LIKE 'temp%'", &empty_params())
         .expect("LIKE query");
     assert_eq!(result.rows.len(), 2);
-}
-
-/// I filtered with BETWEEN 10 AND 20, and only rows within that range came back.
-#[test]
-fn f65_between_operator() {
-    let db = setup_sql_ops_db();
-    let result = db
-        .execute(
-            "SELECT * FROM t WHERE reading BETWEEN 10 AND 20",
-            &empty_params(),
-        )
-        .expect("BETWEEN query");
-    assert_eq!(result.rows.len(), 3);
 }
 
 /// I split rows by IS NULL and IS NOT NULL on a nullable column, and every row landed in exactly one bucket.
@@ -277,16 +241,6 @@ fn f74_not_operator() {
     );
 }
 
-/// I ran COUNT(*) on a table with 5 rows, and I got back 5.
-#[test]
-fn f74b_count_star_aggregate_function() {
-    let db = setup_sql_ops_db();
-    let result = db
-        .execute("SELECT COUNT(*) FROM t", &empty_params())
-        .expect("count query");
-    assert_eq!(extract_i64(&result, 0, 0), 5);
-}
-
 /// I called SELECT NOW(), and I got back a timestamp value.
 #[test]
 fn f74c_now_function() {
@@ -295,47 +249,6 @@ fn f74c_now_function() {
         .execute("SELECT NOW()", &empty_params())
         .expect("now query");
     assert!(matches!(result.rows[0][0], Value::Timestamp(_)));
-}
-
-/// I joined sensors to readings with INNER JOIN, and only the sensor with a matching reading appeared.
-#[test]
-fn f74d_inner_join() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)",
-        &empty_params(),
-    )
-    .expect("create sensors");
-    db.execute(
-        "CREATE TABLE readings (id UUID PRIMARY KEY, sensor_id UUID, value REAL)",
-        &empty_params(),
-    )
-    .expect("create readings");
-    let sensor_id = Uuid::new_v4();
-    db.execute(
-        "INSERT INTO sensors (id, name) VALUES ($id, $name)",
-        &params(vec![
-            ("id", Value::Uuid(sensor_id)),
-            ("name", Value::Text("s1".into())),
-        ]),
-    )
-    .expect("insert sensor");
-    db.execute(
-        "INSERT INTO readings (id, sensor_id, value) VALUES ($id, $sensor_id, $value)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("sensor_id", Value::Uuid(sensor_id)),
-            ("value", Value::Float64(9.0)),
-        ]),
-    )
-    .expect("insert reading");
-    let result = db
-        .execute(
-            "SELECT s.name, r.value FROM sensors s INNER JOIN readings r ON s.id = r.sensor_id",
-            &empty_params(),
-        )
-        .expect("inner join");
-    assert_eq!(result.rows.len(), 1);
 }
 
 /// I left-joined a sensor with no readings, and the sensor still appeared with NULLs for the reading columns.

@@ -938,7 +938,6 @@ fn t15_09_concurrent_delete_and_insert_same_unique_key_serialize() {
 
 #[test]
 fn t15_10_concurrent_insert_with_fk_and_unique_constraints_serialize() {
-    // RED: a child table with both a UNIQUE constraint and a FK to a parent.
     // Two concurrent INSERTs target the same UNIQUE key with a live parent.
     // The fix must serialize: one commits, one fails. The parent is live for
     // both writers, so the loser must be the duplicate reason_hash writer.

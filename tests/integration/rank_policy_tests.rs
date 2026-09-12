@@ -647,7 +647,6 @@ fn unquoted_field(value: Option<&String>) -> Option<&str> {
     value.map(|value| value.trim_matches('"'))
 }
 
-/// RED: happy-path DDL must populate the protected join index, not just parse text.
 #[test]
 fn dp01_happy_path_populates_rank_policy() {
     let db = Database::open_memory();
@@ -677,7 +676,6 @@ fn dp02_no_clause_yields_none() {
     assert!(embedding.rank_policy.is_none());
 }
 
-/// RED: RANK_POLICY must behave identically in every column-constraint position.
 #[test]
 fn dp03_any_constraint_position() {
     for ddl in [
@@ -704,7 +702,6 @@ fn dp03_any_constraint_position() {
     }
 }
 
-/// RED: duplicate RANK_POLICY clauses must be rejected with a column-specific parse error.
 #[test]
 fn dp04_duplicate_clauses_rejected() {
     let result = contextdb_parser::parse(
@@ -716,7 +713,6 @@ fn dp04_duplicate_clauses_rejected() {
     );
 }
 
-/// RED: a policy attached to a non-vector anchor column is rejected at DDL time.
 #[test]
 fn dp05_non_vector_anchor_rejected() {
     let db = Database::open_memory();
@@ -731,131 +727,141 @@ fn dp05_non_vector_anchor_rejected() {
     );
 }
 
-/// RED: unknown anchor formula references are rejected at DDL time.
 #[test]
-fn de01_unknown_anchor_column() {
-    let db = Database::open_memory();
-    let result = create_bad_policy_table(&db, "embedding VECTOR(2)", "coalesce({bogus}, 1.0)");
-    assert!(
-        matches!(result, Err(Error::RankPolicyColumnUnknown { ref index, ref column })
-            if index == "decisions.embedding" && column == "bogus"),
-        "expected unknown formula column `bogus`, got {result:?}"
-    );
-}
-
-/// RED: ambiguous anchor/joined column references are rejected instead of resolved silently.
-#[test]
-fn de02_ambiguous_column() {
-    let db = Database::open_memory();
-    let result = create_bad_policy_table(&db, "embedding VECTOR(2)", "{id}");
-    assert!(
-        matches!(result, Err(Error::RankPolicyColumnAmbiguous { ref index, ref column })
-            if index == "decisions.embedding" && column == "id"),
-        "expected ambiguous formula column `id`, got {result:?}"
-    );
-}
-
-/// RED: TEXT and JSON formula operands are rejected with actionable type errors.
-#[test]
-fn de03_unsupported_column_type() {
-    for (formula, column, actual) in [
-        ("{description}", "description", "TEXT"),
-        ("{payload}", "payload", "JSON"),
-    ] {
+fn rank_policy_ddl_rejects_unknown_ambiguous_type_join_and_formula_defects() {
+    #[derive(Clone, Copy)]
+    enum Defect {
+        UnknownColumn,
+        Ambiguous,
+        ColumnType(&'static str, &'static str, &'static str),
+        UnknownJoinTable,
+        UnknownJoinColumn,
+        UnindexedJoin,
+        MalformedFormula,
+    }
+    let rows = [
+        ("de01_unknown_anchor_column", Defect::UnknownColumn),
+        ("de02_ambiguous_column", Defect::Ambiguous),
+        (
+            "de03_unsupported_column_type_description",
+            Defect::ColumnType("{description}", "description", "TEXT"),
+        ),
+        (
+            "de03_unsupported_column_type_payload",
+            Defect::ColumnType("{payload}", "payload", "JSON"),
+        ),
+        ("de04_unknown_join_table", Defect::UnknownJoinTable),
+        ("de05_unknown_join_column", Defect::UnknownJoinColumn),
+        ("de06_unindexed_join_column", Defect::UnindexedJoin),
+        ("de07_malformed_formula_at_ddl", Defect::MalformedFormula),
+    ];
+    for (name, defect) in rows {
         let db = Database::open_memory();
-        let result = create_bad_policy_table(&db, "embedding VECTOR(2)", formula);
-        assert!(
-            matches!(
-                result,
-                Err(Error::RankPolicyColumnType {
-                    ref index,
-                    column: ref got_column,
-                    ref expected,
-                    actual: ref got_actual,
-                }) if index == "decisions.embedding"
-                    && got_column == column
-                    && expected == "number-or-bool"
-                    && got_actual == actual
-            ),
-            "expected RankPolicyColumnType for {column} actual {actual}, got {result:?}"
-        );
+        match defect {
+            Defect::UnknownColumn => {
+                let result =
+                    create_bad_policy_table(&db, "embedding VECTOR(2)", "coalesce({bogus}, 1.0)");
+                assert!(
+                    matches!(result, Err(Error::RankPolicyColumnUnknown { ref index, ref column })
+                        if index == "decisions.embedding" && column == "bogus"),
+                    "{name}: expected unknown formula column `bogus`, got {result:?}"
+                );
+            }
+            Defect::Ambiguous => {
+                let result = create_bad_policy_table(&db, "embedding VECTOR(2)", "{id}");
+                assert!(
+                    matches!(result, Err(Error::RankPolicyColumnAmbiguous { ref index, ref column })
+                        if index == "decisions.embedding" && column == "id"),
+                    "{name}: expected ambiguous formula column `id`, got {result:?}"
+                );
+            }
+            Defect::ColumnType(formula, column, actual) => {
+                let result = create_bad_policy_table(&db, "embedding VECTOR(2)", formula);
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::RankPolicyColumnType {
+                            ref index,
+                            column: ref got_column,
+                            ref expected,
+                            actual: ref got_actual,
+                        }) if index == "decisions.embedding"
+                            && got_column == column
+                            && expected == "number-or-bool"
+                            && got_actual == actual
+                    ),
+                    "{name}: expected RankPolicyColumnType for {column} actual {actual}, got {result:?}"
+                );
+            }
+            Defect::UnknownJoinTable => {
+                let result = db.execute(
+                    "CREATE TABLE decisions (id UUID PRIMARY KEY, confidence REAL, embedding VECTOR(2) RANK_POLICY (JOIN bogus_table ON decision_id, FORMULA '1.0', SORT_KEY effective_confidence))",
+                    &empty_params(),
+                );
+                assert!(
+                    matches!(result, Err(Error::RankPolicyJoinTableUnknown { ref index, ref table })
+                        if index == "decisions.embedding" && table == "bogus_table"),
+                    "{name}: expected unknown join table `bogus_table`, got {result:?}"
+                );
+            }
+            Defect::UnknownJoinColumn => {
+                db.execute(
+                    "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID)",
+                    &empty_params(),
+                )
+                .unwrap();
+                let result = db.execute(
+                    "CREATE TABLE decisions (id UUID PRIMARY KEY, confidence REAL, embedding VECTOR(2) RANK_POLICY (JOIN outcomes ON bogus_column, FORMULA '1.0', SORT_KEY effective_confidence))",
+                    &empty_params(),
+                );
+                assert!(
+                    matches!(result, Err(Error::RankPolicyJoinColumnUnknown { ref index, ref table, ref column })
+                        if index == "decisions.embedding" && table == "outcomes" && column == "bogus_column"),
+                    "{name}: expected unknown join column `outcomes.bogus_column`, got {result:?}"
+                );
+            }
+            Defect::UnindexedJoin => {
+                db.execute(
+                    "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID)",
+                    &empty_params(),
+                )
+                .unwrap();
+                let result = db.execute(
+                    "CREATE TABLE decisions (id UUID PRIMARY KEY, confidence REAL, embedding VECTOR(2) RANK_POLICY (JOIN outcomes ON decision_id, FORMULA '1.0', SORT_KEY effective_confidence))",
+                    &empty_params(),
+                );
+                assert!(
+                    matches!(result, Err(Error::RankPolicyJoinColumnUnindexed { ref joined_table, ref column, .. }) if joined_table == "outcomes" && column == "decision_id"),
+                    "{name}: expected unindexed join column, got {result:?}"
+                );
+                if let Err(err) = result {
+                    assert!(
+                        err.to_string().contains(
+                            "CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id);"
+                        ),
+                        "{name}: message must include actionable index DDL, got {err}"
+                    );
+                }
+            }
+            Defect::MalformedFormula => {
+                let result = create_bad_policy_table(&db, "embedding VECTOR(2)", "coalesce(");
+                match result {
+                    Err(Error::RankPolicyFormulaParse {
+                        ref index,
+                        position,
+                        ref reason,
+                    }) if index == "decisions.embedding"
+                        && position == 11
+                        && reason.contains("coalesce") => {}
+                    other => {
+                        panic!("{name}: expected RankPolicyFormulaParse at coalesce, got {other:?}")
+                    }
+                }
+            }
+        }
     }
 }
 
-/// RED: unknown join tables fail CREATE TABLE before search.
-#[test]
-fn de04_unknown_join_table() {
-    let db = Database::open_memory();
-    let result = db.execute(
-        "CREATE TABLE decisions (id UUID PRIMARY KEY, confidence REAL, embedding VECTOR(2) RANK_POLICY (JOIN bogus_table ON decision_id, FORMULA '1.0', SORT_KEY effective_confidence))",
-        &empty_params(),
-    );
-    assert!(
-        matches!(result, Err(Error::RankPolicyJoinTableUnknown { ref index, ref table })
-            if index == "decisions.embedding" && table == "bogus_table"),
-        "expected unknown join table `bogus_table`, got {result:?}"
-    );
-}
-
-/// RED: unknown join columns fail CREATE TABLE before search.
-#[test]
-fn de05_unknown_join_column() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID)",
-        &empty_params(),
-    )
-    .unwrap();
-    let result = db.execute(
-        "CREATE TABLE decisions (id UUID PRIMARY KEY, confidence REAL, embedding VECTOR(2) RANK_POLICY (JOIN outcomes ON bogus_column, FORMULA '1.0', SORT_KEY effective_confidence))",
-        &empty_params(),
-    );
-    assert!(
-        matches!(result, Err(Error::RankPolicyJoinColumnUnknown { ref index, ref table, ref column })
-            if index == "decisions.embedding" && table == "outcomes" && column == "bogus_column"),
-        "expected unknown join column `outcomes.bogus_column`, got {result:?}"
-    );
-}
-
-/// RED: join columns must be indexed and the error must include the suggested index DDL.
-#[test]
-fn de06_unindexed_join_column() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID)",
-        &empty_params(),
-    )
-    .unwrap();
-    let result = db.execute(
-        "CREATE TABLE decisions (id UUID PRIMARY KEY, confidence REAL, embedding VECTOR(2) RANK_POLICY (JOIN outcomes ON decision_id, FORMULA '1.0', SORT_KEY effective_confidence))",
-        &empty_params(),
-    );
-    assert!(
-        matches!(result, Err(Error::RankPolicyJoinColumnUnindexed { ref joined_table, ref column, .. }) if joined_table == "outcomes" && column == "decision_id"),
-        "expected unindexed join column, got {result:?}"
-    );
-    if let Err(err) = result {
-        assert!(
-            err.to_string()
-                .contains("CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id);"),
-            "message must include actionable index DDL, got {err}"
-        );
-    }
-}
-
-/// RED: malformed formulas are parsed eagerly at DDL time.
-#[test]
-fn de07_malformed_formula_at_ddl() {
-    let db = Database::open_memory();
-    expect_formula_parse_error(
-        create_bad_policy_table(&db, "embedding VECTOR(2)", "coalesce("),
-        "decisions.embedding",
-        11,
-        "coalesce",
-    );
-}
-
-/// RED: DDL validation reports the deterministic first error as each prior defect is fixed.
 #[test]
 fn de08_error_precedence_walkthrough() {
     fn run_case(
@@ -993,7 +999,6 @@ fn de09_clean_create_table_succeeds() {
     );
 }
 
-/// RED: literal-only formulas produce a constant rank independent of cosine.
 #[test]
 fn fg01_literal_only() {
     let db = Database::open_memory();
@@ -1004,7 +1009,6 @@ fn fg01_literal_only() {
     assert!(results.iter().all(|result| result.rank == 1.0));
 }
 
-/// RED: BOOL formula operands coerce locally to 1.0 and 0.0.
 #[test]
 fn fg02_bool_coercion() {
     let db = Database::open_memory();
@@ -1016,7 +1020,6 @@ fn fg02_bool_coercion() {
     assert_eq!(results[1].rank, 0.0);
 }
 
-/// RED: coalesce(expr, literal) substitutes only NULL operands.
 #[test]
 fn fg03_coalesce() {
     let db = Database::open_memory();
@@ -1049,7 +1052,6 @@ fn fg03_coalesce() {
     );
 }
 
-/// RED: multiplication binds tighter than addition in formula evaluation.
 #[test]
 fn fg04_mul_binds_tighter_than_add() {
     let db = Database::open_memory();
@@ -1059,7 +1061,6 @@ fn fg04_mul_binds_tighter_than_add() {
     assert_eq!(results[0].rank, 7.0);
 }
 
-/// RED: parentheses override default precedence in formula evaluation.
 #[test]
 fn fg05_parens_override_precedence() {
     let db = Database::open_memory();
@@ -1069,7 +1070,6 @@ fn fg05_parens_override_precedence() {
     assert_eq!(results[0].rank, 9.0);
 }
 
-/// RED: {vector_score} participates in formulas and cannot be dropped by the compiler.
 #[test]
 fn fg07_cosine_times_confidence() {
     let db = Database::open_memory();
@@ -1089,7 +1089,6 @@ fn fg07_cosine_times_confidence() {
     expect_policy_order(&db, &[b, a]);
 }
 
-/// RED: a real column named vector_score is rejected because the name is reserved.
 #[test]
 fn fg08_vector_score_reserved() {
     let db = Database::open_memory();
@@ -1114,7 +1113,6 @@ fn fg08_vector_score_reserved() {
     );
 }
 
-/// RED: CASE expressions remain outside the formula grammar.
 #[test]
 fn fg09_case_rejected() {
     let db = Database::open_memory();
@@ -1130,7 +1128,6 @@ fn fg09_case_rejected() {
     );
 }
 
-/// RED: subqueries remain outside the formula grammar.
 #[test]
 fn fg10_subquery_rejected() {
     let db = Database::open_memory();
@@ -1142,7 +1139,6 @@ fn fg10_subquery_rejected() {
     );
 }
 
-/// RED: dotted refs are rejected because table-qualified formula refs are unsupported.
 #[test]
 fn fg11_dotted_column_rejected() {
     let db = Database::open_memory();
@@ -1154,7 +1150,6 @@ fn fg11_dotted_column_rejected() {
     );
 }
 
-/// RED: division stays banned from the rank formula grammar.
 #[test]
 fn fg12_division_rejected() {
     let db = Database::open_memory();
@@ -1166,7 +1161,6 @@ fn fg12_division_rejected() {
     );
 }
 
-/// RED: arbitrary function calls stay banned from the rank formula grammar.
 #[test]
 fn fg13_function_call_rejected() {
     let db = Database::open_memory();
@@ -1178,7 +1172,6 @@ fn fg13_function_call_rejected() {
     );
 }
 
-/// RED: subtraction stays banned from the rank formula grammar.
 #[test]
 fn fg14_subtraction_rejected() {
     let db = Database::open_memory();
@@ -1190,7 +1183,6 @@ fn fg14_subtraction_rejected() {
     );
 }
 
-/// RED: every banned formula construct is rejected by the same compile-time gate.
 #[test]
 fn bf01_banned_features_table() {
     for (formula, position, reason) in [
@@ -1220,7 +1212,6 @@ fn fe01_base_arithmetic() {
     expect_policy_order(&db, &[d1, d3, d4, d2]);
 }
 
-/// RED: NULL confidence defaults to the joined success value.
 #[test]
 fn fe02_null_confidence() {
     let db = Database::open_memory();
@@ -1241,7 +1232,6 @@ fn fe02_null_confidence() {
     assert_eq!(results[0].rank, 1.0);
 }
 
-/// RED: missing outcome uses LEFT OUTER null semantics with the coalesce fallback.
 #[test]
 fn fe03_no_outcome() {
     let db = Database::open_memory();
@@ -1260,7 +1250,6 @@ fn fe03_no_outcome() {
     assert_eq!(results[0].rank, 0.7);
 }
 
-/// RED: failed outcomes force rank to zero.
 #[test]
 fn fe04_failed_outcome() {
     let db = Database::open_memory();
@@ -1280,7 +1269,6 @@ fn fe04_failed_outcome() {
     assert_eq!(results[0].rank, 0.0);
 }
 
-/// RED: simultaneous null-confidence and no-outcome fallbacks multiply to one.
 #[test]
 fn fe05_both_fallbacks() {
     let db = Database::open_memory();
@@ -1291,7 +1279,6 @@ fn fe05_both_fallbacks() {
     assert_eq!(results[0].rank, 1.0);
 }
 
-/// RED: NULL confidence with failed outcome still ranks zero.
 #[test]
 fn fe06_null_conf_failed_outcome() {
     let db = Database::open_memory();
@@ -1311,7 +1298,6 @@ fn fe06_null_conf_failed_outcome() {
     assert_eq!(results[0].rank, 0.0);
 }
 
-/// RED: policy top-k must differ from raw cosine when the formula says so.
 #[test]
 fn top01_policy_topk_ne_cosine_topk() {
     let db = Database::open_memory();
@@ -1325,7 +1311,6 @@ fn top01_policy_topk_ne_cosine_topk() {
     assert_eq!(result_ids(&raw), vec![ids[0], ids[1], ids[2]]);
 }
 
-/// RED: implementations may not cosine-top-k first and rerank only those rows.
 #[test]
 fn top03_no_posthoc_rerank() {
     let db = Database::open_memory();
@@ -1337,7 +1322,6 @@ fn top03_no_posthoc_rerank() {
     assert_eq!(db.__rank_policy_eval_count(), 10);
 }
 
-/// RED: equal computed rank ties are broken by raw cosine descending.
 #[test]
 fn tie01_cosine_on_equal_rank() {
     let db = Database::open_memory();
@@ -1401,7 +1385,6 @@ fn tie02_rowid_on_equal_rank_and_cosine() {
     );
 }
 
-/// RED: NaN ranks sort last under deterministic total-order semantics.
 #[test]
 fn tie03_totalorder_on_nan() {
     let db = Database::open_memory();
@@ -1432,7 +1415,6 @@ fn tie03_totalorder_on_nan() {
     );
 }
 
-/// RED: formula-generated NaN also sorts last and does not break deterministic ties.
 #[test]
 fn tie04_nan_from_formula() {
     let db = Database::open_memory();
@@ -1477,7 +1459,6 @@ fn tie04_nan_from_formula() {
     assert!(results[2].rank.is_nan());
 }
 
-/// RED: an orphan anchor remains visible under LEFT OUTER semantics.
 #[test]
 fn jn01_left_outer_orphan_present() {
     let db = Database::open_memory();
@@ -1497,7 +1478,6 @@ fn jn01_left_outer_orphan_present() {
     assert_eq!(results[0].rank, 0.7);
 }
 
-/// RED: a single joined row can match multiple anchors without cross-product duplication.
 #[test]
 fn jn02_multi_anchor_single_joined_row() {
     let db = Database::open_memory();
@@ -1558,7 +1538,6 @@ fn jn02_multi_anchor_single_joined_row() {
     assert_eq!(db.__rank_policy_eval_count(), 3);
 }
 
-/// RED: NULL join keys evaluate joined columns as NULL and keep the anchor candidate.
 #[test]
 fn jn03_null_join_key() {
     let db = Database::open_memory();
@@ -1613,7 +1592,6 @@ fn jn03_null_join_key() {
     assert_eq!(results[0].rank, 0.6);
 }
 
-/// RED: min_similarity filters are applied before policy evaluation.
 #[test]
 fn fil01_min_similarity_pre_eval() {
     let db = Database::open_memory();
@@ -1631,7 +1609,6 @@ fn fil01_min_similarity_pre_eval() {
     assert_eq!(db.__rank_policy_eval_count(), 6);
 }
 
-/// RED: time-range WHERE filters are applied before policy evaluation.
 #[test]
 fn fil02_where_time_range() {
     let db = Database::open_memory();
@@ -1649,7 +1626,6 @@ fn fil02_where_time_range() {
     assert_eq!(db.__rank_policy_eval_count(), 7);
 }
 
-/// RED: equality WHERE filters are applied before policy evaluation.
 #[test]
 fn fil03_where_column_equality() {
     let db = Database::open_memory();
@@ -1667,7 +1643,6 @@ fn fil03_where_column_equality() {
     assert_eq!(db.__rank_policy_eval_count(), 6);
 }
 
-/// RED: min_similarity and WHERE filters compose before policy evaluation.
 #[test]
 fn fil04_filter_composition() {
     let db = Database::open_memory();
@@ -1741,7 +1716,6 @@ fn seed_many_hnsw_frontier_policy(db: &Database, count: usize) -> Vec<Uuid> {
     (0..10).rev().map(|n| uuid(10_000 + n)).collect()
 }
 
-/// RED: brute-force boundary evaluates policy over every survivor.
 #[test]
 fn hnsw_threshold_999_brute_force_boundary() {
     let db = Database::open_memory();
@@ -1825,7 +1799,6 @@ fn hnsw03_sort_key_none_unchanged() {
     );
 }
 
-/// RED: formulas are parsed once at DDL time and never in the search hot path.
 #[test]
 fn formula_cache_hit() {
     let db = Database::open_memory();
@@ -1838,7 +1811,6 @@ fn formula_cache_hit() {
     assert_eq!(db.__rank_policy_formula_parse_count(), 1);
 }
 
-/// RED: dropping a policy-bearing table clears the formula cache atomically.
 #[test]
 fn drop_clears_cache() {
     let db = Database::open_memory();
@@ -1890,7 +1862,6 @@ fn drop_clears_cache() {
     assert_eq!(new_results[0].rank, 0.25);
 }
 
-/// RED: an empty corpus returns no rows but still proves eager policy registration.
 #[test]
 fn empty_corpus_with_policy() {
     let db = Database::open_memory();
@@ -1903,7 +1874,6 @@ fn empty_corpus_with_policy() {
     assert_eq!(db.__rank_policy_eval_count(), 0);
 }
 
-/// RED: reopen preserves rank-policy ordering, not just raw vector storage.
 #[test]
 fn ps01_reopen_preserves_ordering() {
     let dir = tempfile::tempdir().unwrap();
@@ -1919,7 +1889,6 @@ fn ps01_reopen_preserves_ordering() {
     expect_policy_order(&reopened, &[ids[0], ids[2], ids[3], ids[1]]);
 }
 
-/// RED: reopen preserves the full RankPolicy struct, including protected_index.
 #[test]
 fn ps02_reopen_preserves_rank_policy_struct() {
     let dir = tempfile::tempdir().unwrap();
@@ -1940,7 +1909,6 @@ fn ps02_reopen_preserves_rank_policy_struct() {
     assert_eq!(policy.protected_index, "outcomes_decision_id_idx");
 }
 
-/// RED: DdlChange round-trips policy metadata through sync apply.
 #[test]
 fn sy01_ddl_change_round_trip() {
     let origin = Database::open_memory();
@@ -1958,7 +1926,6 @@ fn sy01_ddl_change_round_trip() {
     );
 }
 
-/// RED: peer-side searches are byte-identical to origin rank-policy searches.
 #[test]
 fn sy02_peer_search_byte_identical() {
     let origin = Database::open_memory();
@@ -1974,7 +1941,6 @@ fn sy02_peer_search_byte_identical() {
     expect_policy_order(&peer, &[ids[0], ids[2], ids[3], ids[1]]);
 }
 
-/// RED: persisted full snapshots emit joined-table dependencies before rank-policy anchor tables.
 #[test]
 fn sy03_persisted_full_snapshot_orders_rank_policy_dependencies() {
     let dir = tempfile::tempdir().unwrap();
@@ -2022,7 +1988,6 @@ fn sy03_persisted_full_snapshot_orders_rank_policy_dependencies() {
     );
 }
 
-/// RED: sync-applied DropTable respects rank-policy dependent-DDL RESTRICT.
 #[test]
 fn sy04_sync_drop_table_respects_rank_policy_restrict() {
     let db = Database::open_memory();
@@ -2054,7 +2019,6 @@ fn sy04_sync_drop_table_respects_rank_policy_restrict() {
     }
 }
 
-/// RED: sync-applied DropIndex respects rank-policy dependent-DDL RESTRICT.
 #[test]
 fn sy05_sync_drop_index_respects_rank_policy_restrict() {
     let db = Database::open_memory();
@@ -2089,7 +2053,6 @@ fn sy05_sync_drop_index_respects_rank_policy_restrict() {
     }
 }
 
-/// RED: full snapshots can apply a same-table rank policy after its protected index exists.
 #[test]
 fn sy06_persisted_full_snapshot_orders_same_table_rank_policy_dependencies() {
     let dir = tempfile::tempdir().unwrap();
@@ -2158,7 +2121,6 @@ fn sy06_persisted_full_snapshot_orders_same_table_rank_policy_dependencies() {
     );
 }
 
-/// RED: sort_key Some populates formula rank and raw vector_score distinctly.
 #[test]
 fn an01_sort_key_some_populates_fields() {
     let db = Database::open_memory();
@@ -2179,7 +2141,6 @@ fn an02_sort_key_none_rank_equals_vector_score() {
     assert!(results.iter().all(|r| r.rank == r.vector_score));
 }
 
-/// RED: SQL USE RANK orders identically to the library semantic-search API.
 #[test]
 fn api01_use_rank_parses_and_orders() {
     let db = Database::open_memory();
@@ -2201,7 +2162,6 @@ fn api01_use_rank_parses_and_orders() {
     assert_eq!(ids, vec![d1, d3, d4]);
 }
 
-/// RED: USE RANK without LIMIT is rejected loudly.
 #[test]
 fn api02_use_rank_without_limit() {
     let db = Database::open_memory();
@@ -2212,7 +2172,6 @@ fn api02_use_rank_without_limit() {
     ));
 }
 
-/// RED: USE RANK without vector ORDER BY is rejected loudly.
 #[test]
 fn api03_use_rank_without_vector_order() {
     let db = Database::open_memory();
@@ -2223,7 +2182,6 @@ fn api03_use_rank_without_vector_order() {
     ));
 }
 
-/// RED: SQL USE RANK with an unknown sort key returns RankPolicyNotFound.
 #[test]
 fn api04_use_rank_unknown_sort_key_sql() {
     let db = Database::open_memory();
@@ -2238,7 +2196,6 @@ fn api04_use_rank_unknown_sort_key_sql() {
     );
 }
 
-/// RED: library semantic_search with an unknown sort key returns RankPolicyNotFound.
 #[test]
 fn api05_unknown_sort_key_library() {
     let db = Database::open_memory();
@@ -2277,7 +2234,6 @@ fn api06_select_without_use_rank() {
     assert_eq!(ids, vec![d1, d2, d3]);
 }
 
-/// RED: dropping a joined table used by a rank policy is refused.
 #[test]
 fn ddl_rj01_drop_table_joined() {
     let db = Database::open_memory();
@@ -2293,7 +2249,6 @@ fn ddl_rj01_drop_table_joined() {
     );
 }
 
-/// RED: dropping the joined key column used by a rank policy is refused.
 #[test]
 fn ddl_rj02_drop_column_join_key() {
     let db = Database::open_memory();
@@ -2312,7 +2267,6 @@ fn ddl_rj02_drop_column_join_key() {
     );
 }
 
-/// RED: renaming the joined key column used by a rank policy is refused.
 #[test]
 fn ddl_rj03_rename_column_join_key() {
     let db = Database::open_memory();
@@ -2331,7 +2285,6 @@ fn ddl_rj03_rename_column_join_key() {
     );
 }
 
-/// RED: dropping the protected join index used by a rank policy is refused.
 #[test]
 fn ddl_rj04_drop_index_protected() {
     let db = Database::open_memory();
@@ -2372,7 +2325,6 @@ fn ddl_rj05_unrelated_ddl_succeeds() {
     db.execute("DROP TABLE scratch", &empty_params()).unwrap();
 }
 
-/// RED: dropping the anchor vector column is refused with the policy identity in the error.
 #[test]
 fn ddl_rj06_drop_column_anchor() {
     let db = Database::open_memory();
@@ -2391,7 +2343,6 @@ fn ddl_rj06_drop_column_anchor() {
     );
 }
 
-/// RED: corrupt joined-row values warn once, skip the corrupt candidate, and return remaining rows.
 #[test]
 fn wn01_corrupt_joined_row_warns_and_skips() {
     let db = Database::open_memory();
@@ -2566,7 +2517,6 @@ fn rd02_bool_outside_rank_formula_unchanged() {
     assert_eq!(joined.rows[0][1], Value::Bool(true));
 }
 
-/// RED: every new Error variant exposes the pinned user-facing Display text.
 #[test]
 fn err_disp_every_new_variant() {
     let cases = vec![
@@ -2678,7 +2628,6 @@ fn err_disp_every_new_variant() {
     }
 }
 
-/// RED: independent databases with identical data produce byte-identical policy ordering.
 #[test]
 fn prod01_byte_identical_across_independent_dbs() {
     let a = Database::open_memory();
@@ -2694,7 +2643,6 @@ fn prod01_byte_identical_across_independent_dbs() {
     );
 }
 
-/// RED: concurrent policy reads on the same DB produce identical orderings.
 #[test]
 fn conc01_concurrent_reads_deterministic() {
     let db = Arc::new(Database::open_memory());
@@ -2712,7 +2660,6 @@ fn conc01_concurrent_reads_deterministic() {
     assert_eq!(b.join().unwrap(), vec![ids[0], ids[2], ids[3], ids[1]]);
 }
 
-/// RED: reader-at-snapshot rank search ignores a concurrent joined-table insert.
 #[test]
 fn write01_reader_at_snapshot_unaffected() {
     let db = Database::open_memory();
@@ -2750,7 +2697,6 @@ fn write01_reader_at_snapshot_unaffected() {
     expect_policy_order(&db, &[d1, d2]);
 }
 
-/// RED: new joined outcomes surface in a fresh policy search.
 #[test]
 fn write02_new_outcome_surfaces_new_rank() {
     let db = Database::open_memory();
@@ -2783,7 +2729,6 @@ fn walk01_first_run_walkthrough() {
     expect_policy_order(&db, &[d1, d3, d4, d2]);
 }
 
-/// RED: agent-memory persona ranks useful precedent over a failed high-cosine decision.
 #[test]
 fn persona01_agent_memory_end_to_end() {
     let db = Database::open_memory();
@@ -2792,7 +2737,6 @@ fn persona01_agent_memory_end_to_end() {
     expect_policy_order(&db, &[ids[0], ids[2], ids[3], ids[1]]);
 }
 
-/// RED: hook-injection bridge returns framework context with finite formula rank.
 #[test]
 fn cgs01_hook_injection_bridge() {
     let db = Database::open_memory();
@@ -2808,7 +2752,6 @@ fn cgs01_hook_injection_bridge() {
     assert!(results[0].vector_score.is_finite());
 }
 
-/// RED: dedup bridge is deterministic and prefers the successful near-duplicate.
 #[test]
 fn cgs02_dedup_bridge() {
     fn seed(db: &Database) -> (Uuid, Uuid) {
@@ -2916,7 +2859,6 @@ fn evidence_search(db: &Database, column: &str, sort_key: Option<&str>) -> Vec<U
     sql_vector_search_ids_with_query(db, "evidence", column, sort_key, query_vec(), 3)
 }
 
-/// RED: one policy vector and one raw vector column coexist independently.
 #[test]
 fn mv01_two_columns_one_with_policy() {
     let db = Database::open_memory();
@@ -2933,7 +2875,6 @@ fn mv01_two_columns_one_with_policy() {
     assert_eq!(db.__rank_policy_eval_count(), 3);
 }
 
-/// RED: two vector columns may carry distinct policies and distinct sort keys.
 #[test]
 fn mv02_two_columns_distinct_policies() {
     let db = Database::open_memory();
@@ -2949,7 +2890,6 @@ fn mv02_two_columns_distinct_policies() {
     );
 }
 
-/// RED: USE RANK binds to the vector column named in the same ORDER BY.
 #[test]
 fn mv03_use_rank_binds_to_order_by_column() {
     let db = Database::open_memory();
@@ -2965,7 +2905,6 @@ fn mv03_use_rank_binds_to_order_by_column() {
     );
 }
 
-/// RED: the same sort-key name may exist independently on two vector columns.
 #[test]
 fn mv04_same_sort_key_different_columns() {
     let db = Database::open_memory();
@@ -2981,7 +2920,6 @@ fn mv04_same_sort_key_different_columns() {
     );
 }
 
-/// RED: writes to one vector index do not perturb another vector index's policy order.
 #[test]
 fn mv05_independent_index_writes() {
     let db = Database::open_memory();
@@ -3017,7 +2955,6 @@ fn mv05_independent_index_writes() {
     );
 }
 
-/// RED: dropping one vector column leaves the other policy usable.
 #[test]
 fn mv06_drop_column_one_policy_isolated() {
     let db = Database::open_memory();
@@ -3043,7 +2980,6 @@ fn mv06_drop_column_one_policy_isolated() {
     );
 }
 
-/// RED: reopen preserves both policies on a two-vector table.
 #[test]
 fn mv07_reopen_preserves_both_policies() {
     let dir = tempfile::tempdir().unwrap();
@@ -3061,7 +2997,6 @@ fn mv07_reopen_preserves_both_policies() {
     assert_eq!(vision_policy.protected_index, "observations_id_idx");
 }
 
-/// RED: sync round-trips both policies on a two-vector table.
 #[test]
 fn mv08_sync_round_trip_both_policies() {
     let origin = Database::open_memory();
@@ -3094,7 +3029,6 @@ fn mv09_single_vector_regression_guard() {
     );
 }
 
-/// RED: same vector column names across tables route by full (table, column).
 #[test]
 fn mv10_cross_table_same_column_routing() {
     let db = Database::open_memory();
@@ -3160,7 +3094,6 @@ fn mv10_cross_table_same_column_routing() {
     );
 }
 
-/// RED: quantization and RANK_POLICY compose through parse, persistence, and sync.
 #[test]
 fn mv11_quantization_composes_with_rank_policy() {
     const MV11_DIMS: usize = 768;
@@ -3288,7 +3221,6 @@ fn mv11_quantization_composes_with_rank_policy() {
     assert_eq!(result_ids(&sq8_search(&peer)), expected);
 }
 
-/// RED: ALTER TABLE ADD COLUMN can register a new rank-policy vector column.
 #[test]
 fn mv12_alter_table_add_column_with_rank_policy() {
     let db = Database::open_memory();

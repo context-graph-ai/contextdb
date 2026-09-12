@@ -46,7 +46,6 @@ fn measure_schema_and_row(
 }
 
 // ---------------------------------------------------------------------------
-// M01 — RED: INSERT succeeds when under budget
 // ---------------------------------------------------------------------------
 #[test]
 fn m01_insert_succeeds_under_budget() {
@@ -88,7 +87,6 @@ fn m01_insert_succeeds_under_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// M02 — RED: INSERT rejected when budget exceeded
 // ---------------------------------------------------------------------------
 #[test]
 fn m02_insert_rejected_when_budget_exceeded() {
@@ -138,7 +136,6 @@ fn m02_insert_rejected_when_budget_exceeded() {
 }
 
 // ---------------------------------------------------------------------------
-// M03 — RED: DELETE reclaims memory, allowing previously-rejected INSERT
 // ---------------------------------------------------------------------------
 #[test]
 fn m03_delete_reclaims_memory_for_insert() {
@@ -234,7 +231,6 @@ fn m03_delete_reclaims_memory_for_insert() {
 }
 
 // ---------------------------------------------------------------------------
-// M04 — RED: Vector search succeeds under budget
 // ---------------------------------------------------------------------------
 #[test]
 fn m04_vector_search_succeeds_under_budget() {
@@ -278,7 +274,6 @@ fn m04_vector_search_succeeds_under_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// M05 — RED: Vector search rejected when budget exceeded
 // ---------------------------------------------------------------------------
 #[test]
 fn m05_vector_search_rejected_over_budget() {
@@ -320,7 +315,6 @@ fn m05_vector_search_rejected_over_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// M06 — RED: HNSW build falls back to brute-force under tight budget
 // ---------------------------------------------------------------------------
 #[test]
 fn m06_hnsw_fallback_to_brute_force_under_budget() {
@@ -363,7 +357,6 @@ fn m06_hnsw_fallback_to_brute_force_under_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// M07 — RED: BFS traversal succeeds under budget
 // ---------------------------------------------------------------------------
 #[test]
 fn m07_bfs_succeeds_under_budget() {
@@ -424,7 +417,6 @@ fn m07_bfs_succeeds_under_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// M08 — RED: BFS traversal rejected when budget exceeded
 // ---------------------------------------------------------------------------
 #[test]
 fn m08_bfs_rejected_over_budget() {
@@ -474,7 +466,6 @@ fn m08_bfs_rejected_over_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// M09 — RED: SET MEMORY_LIMIT and SHOW MEMORY_LIMIT
 // ---------------------------------------------------------------------------
 #[test]
 fn m09_set_and_show_memory_limit() {
@@ -504,7 +495,6 @@ fn m09_set_and_show_memory_limit() {
 }
 
 // ---------------------------------------------------------------------------
-// M10 — RED: SET MEMORY_LIMIT 'none' removes limit
 // ---------------------------------------------------------------------------
 #[test]
 fn m10_set_memory_limit_none_removes_limit() {
@@ -539,7 +529,6 @@ fn m10_set_memory_limit_none_removes_limit() {
 }
 
 // ---------------------------------------------------------------------------
-// M11 — RED: SET MEMORY_LIMIT above startup ceiling is rejected
 // ---------------------------------------------------------------------------
 #[test]
 fn m11_set_above_startup_ceiling_rejected() {
@@ -569,7 +558,6 @@ fn m11_set_above_startup_ceiling_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// M12 — RED: open_with_config wires accountant to INSERT
 // ---------------------------------------------------------------------------
 #[test]
 fn m12_open_with_config_wires_accountant() {
@@ -683,7 +671,6 @@ fn m13_default_no_limit_allows_everything() {
 }
 
 // ---------------------------------------------------------------------------
-// M14 — RED: thread-safe concurrent allocations
 // ---------------------------------------------------------------------------
 #[test]
 fn m14_concurrent_allocation_accounting() {
@@ -724,7 +711,6 @@ fn m14_concurrent_allocation_accounting() {
 }
 
 // ---------------------------------------------------------------------------
-// M15 — RED: UPDATE to larger row tracks memory growth
 // ---------------------------------------------------------------------------
 #[test]
 fn m15_update_tracks_memory_growth() {
@@ -767,7 +753,6 @@ fn m15_update_tracks_memory_growth() {
 }
 
 // ---------------------------------------------------------------------------
-// M16 — RED: Graph edge insertion is memory-accounted
 // ---------------------------------------------------------------------------
 #[test]
 fn m16_graph_edge_insertion_accounted() {
@@ -812,7 +797,6 @@ fn m16_graph_edge_insertion_accounted() {
 }
 
 // ---------------------------------------------------------------------------
-// M17 — RED: Reopen pre-populated database reflects loaded data
 // ---------------------------------------------------------------------------
 #[test]
 fn m17_reopen_reflects_loaded_data() {
@@ -857,7 +841,6 @@ fn m17_reopen_reflects_loaded_data() {
 }
 
 // ---------------------------------------------------------------------------
-// M18 — RED: DDL operations (CREATE TABLE, CREATE INDEX) are memory-accounted
 // ---------------------------------------------------------------------------
 #[test]
 fn m18_ddl_memory_accounted() {
@@ -880,7 +863,6 @@ fn m18_ddl_memory_accounted() {
 }
 
 // ---------------------------------------------------------------------------
-// MT1 — RED: DROP TABLE releases accounting for rows + metadata
 // ---------------------------------------------------------------------------
 #[test]
 fn mt1_drop_table_releases_accounting() {
@@ -940,7 +922,6 @@ fn mt1_drop_table_releases_accounting() {
 }
 
 // ---------------------------------------------------------------------------
-// MT2 — RED: UPDATE rejection leaves accounting unchanged
 // ---------------------------------------------------------------------------
 #[test]
 fn mt2_update_rejection_leaves_accounting_unchanged() {
@@ -998,7 +979,6 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
 }
 
 // ---------------------------------------------------------------------------
-// MT3 — RED: Vector bytes released on DELETE
 // ---------------------------------------------------------------------------
 #[test]
 fn mt3_vector_bytes_released_on_delete() {
@@ -1045,7 +1025,6 @@ fn mt3_vector_bytes_released_on_delete() {
 }
 
 // ---------------------------------------------------------------------------
-// MT4 — RED: Failed vector allocation releases pre-allocated row bytes
 // ---------------------------------------------------------------------------
 #[test]
 fn mt4_failed_vector_alloc_releases_row_bytes() {
@@ -1083,7 +1062,6 @@ fn mt4_failed_vector_alloc_releases_row_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// MT5 — RED: HNSW build failure does not leak accounting bytes
 // ---------------------------------------------------------------------------
 #[test]
 fn mt5_hnsw_build_failure_no_leaked_bytes() {

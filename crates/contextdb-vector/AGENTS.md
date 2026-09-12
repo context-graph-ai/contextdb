@@ -48,8 +48,8 @@ vector search needs from a graph is written here, in `hnsw.rs`, on top of that f
 | A generation with no live vectors loads as an empty graph | `tests/vector_tests.rs` → `a_durable_generation_with_no_live_vectors_loads_as_an_empty_graph` |
 | Corrupt or incompatible generation bytes are refused, never searched | `src/hnsw.rs` → `durable_generation_refuses_corruption_and_incompatible_column_definition` |
 | Filtered search charges no work for excluded history | `src/hnsw.rs` → `ordinary_allowed_search_excluded_history_adds_no_visit_or_distance_work` |
-| Recall-at-10 of the indexed route is at least 95% of exact | `crates/contextdb-engine/tests/vector_held_out_native_reference.rs` → `held_out_unfiltered_native_reference_recovers_the_required_neighbors` |
-| Every search, index and consolidation threshold comes from the declared column policy resolved in one place (`VectorIndexLayout::resolve_policy` / `effective_auto_index_at` in `store.rs`); an undeclared value falls back to a documented default there, but a declared value is never silently overridden by a constant elsewhere | `crates/contextdb-engine/tests/vector_policy_resolver_contract.rs` → `declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries` |
+| Recall-at-10 of the indexed route is at least 95% of exact | `crates/contextdb-engine/tests/vector/vector_held_out_native_reference.rs` → `held_out_unfiltered_native_reference_recovers_the_required_neighbors` |
+| Every search, index and consolidation threshold comes from the declared column policy resolved in one place (`VectorIndexLayout::resolve_policy` / `effective_auto_index_at` in `store.rs`); an undeclared value falls back to a documented default there, but a declared value is never silently overridden by a constant elsewhere | `crates/contextdb-engine/tests/vector/vector_policy_resolver_contract.rs` → `declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries` |
 
 Publication, restart, repair and partition behaviour end to end are guarded by the engine's
 `crates/contextdb-engine/tests/vector_*_contract.rs` files; the claims they bind are tagged in
@@ -70,7 +70,7 @@ Publication, restart, repair and partition behaviour end to end are guarded by t
 
 ```bash
 cargo test -p contextdb-vector --features test-seams
-cargo test -p contextdb-engine --features test-seams --test vector_partition_restart_contract
+cargo test -p contextdb-engine --features test-seams --test vector
 ```
 
 Most vector test files compile only with `test-seams` (`#![cfg(feature = "test-seams")]` or

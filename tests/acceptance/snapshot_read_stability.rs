@@ -740,7 +740,6 @@ fn run_replace_race_with_readers_rounds(
 
 #[test]
 fn sr_01_core_replace_race_file_backed() {
-    // RED: current code can surface NotFound during a concurrent replace race.
     let (_dir, _path, db, group, bystander) = setup_standard_file("sr_01.db");
     run_replace_race(Arc::clone(&db), group);
     assert_final_replace_state(&db, group, "sr_01 final state");
@@ -754,14 +753,12 @@ fn sr_01_core_replace_race_file_backed() {
 
 #[test]
 fn sr_02_concurrent_readers_during_race() {
-    // RED: readers must never observe NotFound, empty, partial, or mixed snapshots.
     let (_dir, _path, db, group, _bystander) = setup_standard_file("sr_02.db");
     run_replace_race_with_readers(db, group, None);
 }
 
 #[test]
 fn sr_03_core_replace_race_in_memory() {
-    // RED: the in-memory store has the same replacement contract.
     let db = Arc::new(Database::open_memory());
     create_replace_targets(&db);
     let group = Uuid::from_u128(0x6700);
@@ -772,7 +769,6 @@ fn sr_03_core_replace_race_in_memory() {
 
 #[test]
 fn sr_04_update_replacement_race() {
-    // RED: UPDATE/UPSERT races may downgrade to zero rows or typed conflicts, never NotFound.
     let (_dir, _path, db, group, _bystander) = setup_standard_file("sr_04.db");
     let barrier = Arc::new(Barrier::new(WRITERS + 1));
     let update_successes = Arc::new(AtomicUsize::new(0));
@@ -916,7 +912,6 @@ fn sr_04_update_replacement_race() {
 
 #[test]
 fn sr_05_same_tx_readback_under_committed_replacement() {
-    // RED: current code returns a mixed committed+staged set instead of A's staged overlay.
     let (_dir, _path, db) = open_file_db("sr_05.db");
     create_replace_targets(&db);
     let group = Uuid::from_u128(0x6705);
@@ -985,7 +980,6 @@ fn sr_05_same_tx_readback_under_committed_replacement() {
 
 #[test]
 fn sr_06_stale_staged_delete_is_commit_noop() {
-    // RED: current file-backed persist path errors on stale staged deletes.
     let (_dir, _path, db) = open_file_db("sr_06.db");
     create_replace_targets(&db);
     let group_x = Uuid::from_u128(0x6706);
@@ -1048,7 +1042,6 @@ fn sr_06_stale_staged_delete_is_commit_noop() {
 
 #[test]
 fn sr_07_scoped_handle_replace_race() {
-    // RED: scoped handles must not mask a replace-race NotFound as scope behavior.
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("sr_07.db");
     let group = Uuid::from_u128(0x6707);
@@ -1203,7 +1196,6 @@ fn sr_08_sequential_replacement_convergence() {
 
 #[test]
 fn sr_09_reopen_after_race_winner_survives() {
-    // RED: same root race as sr_01, plus durability of the converged winner.
     let (dir, path, db, group, _bystander) = setup_standard_file("sr_09.db");
     run_replace_race_rounds(Arc::clone(&db), group, 10);
     let captured = select_group(&db, group);

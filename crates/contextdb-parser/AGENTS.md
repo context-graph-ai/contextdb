@@ -54,7 +54,7 @@ to register `:memory:` session callbacks).
 | `PURGE` is its own statement, not a `DELETE` | `tests/purge_parser_contract_tests.rs::purge_from_where_parses_as_distinct_statement` |
 | The removed conflict-policy statements stay parse errors | `tests/legacy_conflict_policy_ddl_tests.rs::legacy_global_set_sync_conflict_policy_is_a_parse_error` |
 | A `WRITE` substring in a comment or quoted label does not split a scope-label list | `tests/scope_label_write_keyword_word_boundary_tests.rs::comment_containing_write_substring_inside_read_list_does_not_corrupt_labels` |
-| `SET/SHOW MAINTENANCE_POLL_INTERVAL` declare and read back through the engine | `crates/contextdb-engine/tests/vector_partition_declaration_contract.rs::consolidation_and_maintenance_poll_declarations_round_trip_and_reset` |
+| `SET/SHOW MAINTENANCE_POLL_INTERVAL` declare and read back through the engine | `crates/contextdb-engine/tests/vector/vector_partition_declaration_contract.rs::consolidation_and_maintenance_poll_declarations_round_trip_and_reset` |
 
 **Char-boundary rule.** Never slice `&input[a..b]` on a window whose end you computed
 (`idx + token.len()` need not be a char boundary). Use `input.get(a..b)`, which returns `None`

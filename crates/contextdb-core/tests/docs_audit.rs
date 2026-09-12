@@ -102,8 +102,9 @@ fn docs_query_language_lists_txid_column_type() {
 //     <!-- enforced by: file_stem::test_fn, file_stem::test_fn -->
 //
 // Three entry forms are accepted:
-// - `file_stem::test_fn` — `crates/*/tests/<file_stem>.rs` or
-//   `crates/*/tests/<file_stem>/main.rs` defines a test `fn test_fn`;
+// - `file_stem::test_fn` — `crates/*/tests/<file_stem>.rs`,
+//   `crates/*/tests/<file_stem>/main.rs`, or `crates/*/tests/*/<file_stem>.rs`
+//   defines a test `fn test_fn`;
 // - `<path>.rs::test_fn` — a repository-relative test file (for example
 //   `tests/integration/hnsw_tests.rs::h04_hnsw_recall_is_at_least_ninety_five_percent`)
 //   defines a test `fn test_fn`;
@@ -278,13 +279,27 @@ fn binding_entries(text: &str) -> Vec<(usize, String)> {
 
 fn test_target_files(crate_dir: &Path, file_stem: &str) -> Vec<PathBuf> {
     let tests = crate_dir.join("tests");
-    [
-        tests.join(format!("{file_stem}.rs")),
-        tests.join(file_stem).join("main.rs"),
-    ]
-    .into_iter()
-    .filter(|path| path.is_file())
-    .collect()
+    let mut files = Vec::new();
+    let direct = tests.join(format!("{file_stem}.rs"));
+    if direct.is_file() {
+        files.push(direct);
+    }
+    let nested_main = tests.join(file_stem).join("main.rs");
+    if nested_main.is_file() {
+        files.push(nested_main);
+    }
+    if let Ok(entries) = std::fs::read_dir(&tests) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let nested = path.join(format!("{file_stem}.rs"));
+                if nested.is_file() {
+                    files.push(nested);
+                }
+            }
+        }
+    }
+    files
 }
 
 fn is_test_attribute(attr: &str) -> bool {
@@ -388,7 +403,7 @@ fn resolve_binding(root: &Path, entry: &str) -> Result<(), String> {
     if candidates.is_empty() {
         return Err(format!(
             "names test file `{target}`, but neither `crates/*/tests/{target}.rs` nor \
-             `crates/*/tests/{target}/main.rs` exists"
+             `crates/*/tests/{target}/main.rs` nor `crates/*/tests/*/{target}.rs` exists"
         ));
     }
     if candidates.iter().any(|file| defines_fn(file, name)) {

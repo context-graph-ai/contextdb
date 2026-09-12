@@ -35,7 +35,7 @@ the upgrade procedure and the upstream proposals that would let the fork shrink.
 
 | Invariant | Guard (file → test) |
 |---|---|
-| The same points and seed rebuild the same topology | `crates/contextdb-engine/tests/hnsw_rebuild_determinism_tests.rs` → `consecutive_hnsw_builds_within_one_open_database_are_stable`, `hnsw_build_invariant_under_parallel_pressure_does_not_drift` |
+| The same points and seed rebuild the same topology | `crates/contextdb-engine/tests/engine/hnsw_rebuild_determinism_tests.rs` → `consecutive_hnsw_builds_within_one_open_database_are_stable`, `hnsw_build_invariant_under_parallel_pressure_does_not_drift` |
 | A graph with no points iterates to nothing instead of panicking | `src/hnsw.rs` → `iterating_a_graph_with_no_points_yields_nothing`; `crates/contextdb-vector/tests/vector_tests.rs` → `a_durable_generation_with_no_live_vectors_loads_as_an_empty_graph` |
 | Owned graph bytes round-trip, and malformed bytes are an error, not a graph | `src/hnswio.rs` → `streamed_owned_graph_preserves_payload_bytes_and_roundtrip`; `crates/contextdb-vector/src/hnsw.rs` → `durable_generation_refuses_corruption_and_incompatible_column_definition` |
 | Allowed-set search finishes its greedy descent before level zero and charges only admitted nodes | `src/hnsw.rs` → `allowed_search_finishes_greedy_descent_before_entering_level_zero`; `crates/contextdb-vector/src/hnsw.rs` → `ordinary_allowed_search_excluded_history_adds_no_visit_or_distance_work` |
@@ -54,5 +54,5 @@ the upgrade procedure and the upstream proposals that would let the fork shrink.
 
 ```bash
 cargo test -p contextdb-hnsw
-cargo test -p contextdb-engine --test hnsw_rebuild_determinism_tests
+cargo test -p contextdb-engine --test engine
 ```

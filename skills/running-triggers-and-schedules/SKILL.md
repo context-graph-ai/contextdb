@@ -221,7 +221,7 @@ A **fresh process**, same file — `queued:1` survived. This is the durability t
 ### Worked example 2 — registering the callback (Rust, the embedding pattern)
 
 This is the pattern that makes a file-backed store actually deliver, adapted from the shipped test
-suite's own round-trip proof (`crates/contextdb-engine/tests/checkpoint_export_tests.rs`,
+suite's own round-trip proof (`crates/contextdb-engine/tests/engine/checkpoint_export_tests.rs`,
 `register_sink`/`register_cron_callback` call sites) — not hand-invented, since the CLI has no verb
 for this and there's no way to execute it from a shell recipe.
 

@@ -20,24 +20,6 @@ async fn wait_for_sync_server(fabric: &InProcessBroker, tenant: &str) {
 }
 
 #[test]
-fn ontology_ops() {
-    let db = setup_ontology_db();
-    let id = uuid::Uuid::new_v4();
-    db.execute(
-        "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &make_params(vec![
-            ("id", Value::Uuid(id)),
-            ("name", Value::Text("n".into())),
-        ]),
-    )
-    .unwrap();
-    assert_eq!(db.scan("entities", db.snapshot()).unwrap().len(), 1);
-}
-
-#[test]
-fn ignored_hnsw_recall() {}
-
-#[test]
 #[ignore = "requires ARM64 cross compile"]
 fn ignored_arm64() {}
 

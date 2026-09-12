@@ -56,8 +56,6 @@ mod concurrent_unique_revalidation;
 mod conditional_update_serializable;
 #[path = "acceptance/contributing.rs"]
 mod contributing;
-#[path = "acceptance/cross_platform.rs"]
-mod cross_platform;
 #[path = "acceptance/data_integrity.rs"]
 mod data_integrity;
 #[path = "acceptance/db_lock_visibility.rs"]

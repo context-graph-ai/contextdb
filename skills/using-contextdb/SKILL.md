@@ -379,19 +379,19 @@ let reader = db.scoped_with_constraints(None, None,
 let rows = reader.execute("SELECT payload FROM notes ORDER BY id", &HashMap::new())?;
 ```
 
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_granting_principal_sees_the_same_rows_on_both_live_routes -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::a_granting_principal_sees_the_same_rows_on_both_live_routes -->
 
 A handle that narrowed itself by context or scope but named no principal that can hold grants is
 refused the table with `Error::PrincipalRequired` — narrowing by another axis never turns the
 grant filter off.
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_context_only_handle_is_refused_an_access_controlled_table_on_both_live_routes -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::a_context_only_handle_is_refused_an_access_controlled_table_on_both_live_routes -->
 
 An administrative handle — no context, no scope, no principal — reads every row, and a table that
 declares no `ACL REFERENCES` column is unaffected.
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::a_table_without_an_acl_declaration_narrows_by_context_alone_on_every_route -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::a_table_without_an_acl_declaration_narrows_by_context_alone_on_every_route -->
 
 A direct read of a CLOSED store declares nothing: `ReadSession::open` on a path with no live owner, or the CLI pointed at a path, reads it as its owner does and sees every row. Row-level authorization governs handles that name a principal; file permissions govern who may read a closed store at all.
-<!-- enforced by: crates/contextdb-engine/tests/read_visibility_route_parity.rs::the_direct_route_reads_a_closed_store_as_its_owner_with_no_declared_narrowing -->
+<!-- enforced by: crates/contextdb-engine/tests/read/read_visibility_route_parity.rs::the_direct_route_reads_a_closed_store_as_its_owner_with_no_declared_narrowing -->
 
 ACL is authorization, not relevance ranking: a withheld row is withheld because the reader is not
 entitled to it, never scored or surfaced lower. Full recipe:

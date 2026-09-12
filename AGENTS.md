@@ -176,7 +176,7 @@ CONTEXTDB_SERVER="$install_root/bin/contextdb-server" \
 `CONTRIBUTING.md` lists the same nine steps for outside contributors; the two documents agree.
 Read the disk and single-build rules in [Safety boundaries](#one-cargo-build-at-a-time-and-check-the-disk-first)
 before you start `cargo test --workspace`. Narrower suites while iterating:
-`cargo test -p contextdb-engine --test acceptance`, `--test integration`, `--test sql_surface_tests`.
+`cargo test -p contextdb-engine --test acceptance`, `--test integration`, `--test sql_surface`.
 
 ### Where a change lives
 

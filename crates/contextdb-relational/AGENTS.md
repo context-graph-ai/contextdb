@@ -48,9 +48,9 @@ it with their own scope and principal decision), SQL, or graph/vector structures
 | Membership images stay balanced and release their memory charge when the last reader drops | `src/membership.rs::tests::persistent_membership_paths_balance_and_release_when_the_last_reader_drops` |
 | Bounded seeks keep duplicate keys, direction, and exclusive bounds | `src/membership.rs::tests::bounded_seeks_preserve_duplicate_keys_direction_and_exclusive_edges` |
 | A refused (over-budget) membership change leaves identity, visibility and charge unchanged | `src/membership.rs::tests::refused_path_copy_leaves_identity_visibility_and_charge_unchanged` |
-| A captured cursor keeps its membership image across later same-id changes | `crates/contextdb-engine/tests/snapshot_visible_posting_membership_contract.rs::captured_current_cursor_keeps_its_image_across_same_id_changes_and_cancellation` |
-| Current membership does not walk retired postings after replacements and reopen | `crates/contextdb-engine/tests/snapshot_visible_posting_membership_contract.rs::current_index_membership_does_not_walk_retained_true_postings_after_replacements_and_reopen` |
-| A deleted row's posting is tombstoned (its key, including any partition key, is kept and `deleted_tx` stamped — never dropped), so an older snapshot still finds it | `crates/contextdb-engine/tests/snapshot_visible_posting_membership_contract.rs::retired_partitions_keep_old_exact_membership_after_moves_delete_and_reopen` |
+| A captured cursor keeps its membership image across later same-id changes | `crates/contextdb-engine/tests/engine_seams/snapshot_visible_posting_membership_contract.rs::captured_current_cursor_keeps_its_image_across_same_id_changes_and_cancellation` |
+| Current membership does not walk retired postings after replacements and reopen | `crates/contextdb-engine/tests/engine_seams/snapshot_visible_posting_membership_contract.rs::current_index_membership_does_not_walk_retained_true_postings_after_replacements_and_reopen` |
+| A deleted row's posting is tombstoned (its key, including any partition key, is kept and `deleted_tx` stamped — never dropped), so an older snapshot still finds it | `crates/contextdb-engine/tests/engine_seams/snapshot_visible_posting_membership_contract.rs::retired_partitions_keep_old_exact_membership_after_moves_delete_and_reopen` |
 
 ## Where a change lives
 

@@ -27,7 +27,6 @@ fn col_idx(result: &QueryResult, name: &str) -> usize {
 
 // ---------------------------------------------------------------------------
 // R01 — Basic age-based pruning (with young-row survival guard)
-// RED: run_pruning_cycle is a no-op stub returning 0, rows stay
 // ---------------------------------------------------------------------------
 #[test]
 fn r01_basic_age_pruning() {
@@ -77,7 +76,6 @@ fn r01_basic_age_pruning() {
 
 // ---------------------------------------------------------------------------
 // R02 — Short TTL with sleep verification
-// RED: run_pruning_cycle is a no-op, rows survive
 // ---------------------------------------------------------------------------
 #[test]
 fn r02_short_ttl_prunes_old_not_new() {
@@ -117,7 +115,6 @@ fn r02_short_ttl_prunes_old_not_new() {
 
 // ---------------------------------------------------------------------------
 // R03 — SYNC SAFE prevents pruning of unsynced rows
-// RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r03_sync_safe_unsynced_rows_survive() {
@@ -157,7 +154,6 @@ fn r03_sync_safe_unsynced_rows_survive() {
 
 // ---------------------------------------------------------------------------
 // R04 — SYNC SAFE allows pruning after sync
-// RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r04_sync_safe_synced_rows_pruned() {
@@ -195,7 +191,6 @@ fn r04_sync_safe_synced_rows_pruned() {
 
 // ---------------------------------------------------------------------------
 // R05 — Per-row EXPIRES override
-// RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r05_expires_column_per_row_override() {
@@ -261,7 +256,6 @@ fn r05b_pruning_expired_history_keeps_newer_live_version() {
 
 // ---------------------------------------------------------------------------
 // R06 — Infinity means never prune
-// RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r06_expires_infinity_never_pruned() {
@@ -302,7 +296,6 @@ fn r06_expires_infinity_never_pruned() {
 
 // ---------------------------------------------------------------------------
 // R07 — NULL EXPIRES falls back to table-level RETAIN
-// RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r07_null_expires_uses_default_ttl() {
@@ -341,7 +334,6 @@ fn r07_null_expires_uses_default_ttl() {
 
 // ---------------------------------------------------------------------------
 // R08 — ALTER TABLE SET RETAIN adds retention (with young-row survival guard)
-// RED: ALTER TABLE SET RETAIN is not wired (stub AST builder ignores it)
 // ---------------------------------------------------------------------------
 #[test]
 fn r08_alter_table_set_retain() {
@@ -392,7 +384,6 @@ fn r08_alter_table_set_retain() {
 
 // ---------------------------------------------------------------------------
 // R09 — ALTER TABLE DROP RETAIN stops pruning
-// RED: ALTER TABLE DROP RETAIN is not wired
 // ---------------------------------------------------------------------------
 #[test]
 fn r09_alter_table_drop_retain() {
@@ -433,7 +424,6 @@ fn r09_alter_table_drop_retain() {
 
 // ---------------------------------------------------------------------------
 // R10 — ALTER TABLE SET RETAIN SYNC SAFE
-// RED: ALTER TABLE SET RETAIN is not wired
 // ---------------------------------------------------------------------------
 #[test]
 fn r10_alter_table_set_retain_sync_safe() {
@@ -481,7 +471,6 @@ fn r10_alter_table_set_retain_sync_safe() {
 
 // ---------------------------------------------------------------------------
 // R11 — IMMUTABLE + RETAIN mutual exclusion at CREATE
-// RED: grammar stub accepts both; engine stub does not reject
 // ---------------------------------------------------------------------------
 #[test]
 fn r11_immutable_retain_mutual_exclusion_create() {
@@ -507,7 +496,6 @@ fn r11_immutable_retain_mutual_exclusion_create() {
 
 // ---------------------------------------------------------------------------
 // R12 — IMMUTABLE + RETAIN mutual exclusion at ALTER
-// RED: ALTER TABLE SET RETAIN is not wired; IMMUTABLE check not performed
 // ---------------------------------------------------------------------------
 #[test]
 fn r12_immutable_retain_mutual_exclusion_alter() {
@@ -525,7 +513,6 @@ fn r12_immutable_retain_mutual_exclusion_alter() {
 
 // ---------------------------------------------------------------------------
 // R13 — EXPIRES on non-TIMESTAMP column is an error
-// RED: grammar stub accepts EXPIRES on any column; engine stub does not check type
 // ---------------------------------------------------------------------------
 #[test]
 fn r13_expires_on_non_timestamp_errors() {
@@ -543,7 +530,6 @@ fn r13_expires_on_non_timestamp_errors() {
 
 // ---------------------------------------------------------------------------
 // R14 — TIMESTAMP column type: ISO 8601 round-trip
-// RED: ColumnType::Timestamp stub exists but engine does not parse ISO strings
 //      into Value::Timestamp on INSERT
 // ---------------------------------------------------------------------------
 #[test]
@@ -583,7 +569,6 @@ fn r14_timestamp_iso8601_round_trip() {
 
 // ---------------------------------------------------------------------------
 // R15 — 'infinity' stored as i64::MAX
-// RED: engine does not parse 'infinity' into Value::Timestamp(i64::MAX)
 // ---------------------------------------------------------------------------
 #[test]
 fn r15_infinity_sentinel_value() {
@@ -612,7 +597,6 @@ fn r15_infinity_sentinel_value() {
 
 // ---------------------------------------------------------------------------
 // R16 — \d tablename shows RETAIN and SYNC SAFE
-// RED: stub TableMeta has default_ttl_seconds=None, sync_safe=false;
 //      \d output won't contain RETAIN
 // ---------------------------------------------------------------------------
 #[test]
@@ -645,7 +629,6 @@ fn r16_describe_shows_retain() {
 
 // ---------------------------------------------------------------------------
 // R17 — \d tablename shows EXPIRES on column
-// RED: stub ColumnDef has expires=false; metadata won't show EXPIRES
 // ---------------------------------------------------------------------------
 #[test]
 fn r17_describe_shows_expires_column() {
@@ -683,7 +666,6 @@ fn r17_describe_shows_expires_column() {
 
 // ---------------------------------------------------------------------------
 // R18 — Pruning removes graph edges
-// RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r18_pruning_removes_graph_edges() {
@@ -750,7 +732,6 @@ fn r18_pruning_removes_graph_edges() {
 
 // ---------------------------------------------------------------------------
 // R19 — Pruning removes vector index entries
-// RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r19_pruning_removes_vector_entries() {
@@ -821,7 +802,6 @@ fn r19_pruning_removes_vector_entries() {
 
 // ---------------------------------------------------------------------------
 // R20 — Legacy rows without created_at are never age-pruned (unit test)
-// RED: run_pruning_cycle is a no-op (stub returns 0).
 //
 // The engine stamps `created_at` on ALL inserts, so there is no SQL-level
 // way to produce a row with `created_at: None`. This test verifies the
@@ -921,7 +901,6 @@ fn r20_legacy_rows_without_created_at_survive() {
 
 // ---------------------------------------------------------------------------
 // R21 — In-memory databases support retention pruning (with young-row guard)
-// RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r21_in_memory_retention_works() {
@@ -964,7 +943,6 @@ fn r21_in_memory_retention_works() {
 
 // ---------------------------------------------------------------------------
 // R22 — Pruning does NOT fire CommitEvent
-// RED: run_pruning_cycle is a no-op (no pruning = no event either way).
 //      After implementation, if pruning fires CommitEvent, the hook counter
 //      will be > 0, failing the assertion.
 // ---------------------------------------------------------------------------
@@ -1033,7 +1011,6 @@ fn r22_pruning_does_not_fire_commit_event() {
 
 // ---------------------------------------------------------------------------
 // R23 — All four RETAIN units parse correctly
-// RED: grammar stub may accept units but AST builder discards duration;
 //      metadata shows None
 // ---------------------------------------------------------------------------
 #[test]
@@ -1065,7 +1042,6 @@ fn r23_retain_all_units() {
 
 // ---------------------------------------------------------------------------
 // R24 — ALTER TABLE SET RETAIN overwrites existing retention
-// RED: ALTER TABLE SET RETAIN is not wired
 // ---------------------------------------------------------------------------
 #[test]
 fn r24_alter_set_retain_overwrites() {
@@ -1092,7 +1068,6 @@ fn r24_alter_set_retain_overwrites() {
 
 // ---------------------------------------------------------------------------
 // R25 — Background pruning loop runs automatically
-// RED: no background loop exists; Database::set_pruning_interval is not
 //      implemented. The row survives because no one calls run_pruning_cycle.
 // ---------------------------------------------------------------------------
 #[test]
@@ -1139,7 +1114,6 @@ fn r25_background_pruning_loop() {
 
 // ---------------------------------------------------------------------------
 // R26 — Retention metadata survives persistence round-trip
-// RED: TableMeta fields (default_ttl_seconds, sync_safe, expires_column)
 //      are never populated, and persistence does not serialize them.
 // ---------------------------------------------------------------------------
 #[test]
@@ -1178,7 +1152,6 @@ fn r26_retention_metadata_persists() {
 
 // ---------------------------------------------------------------------------
 // R27 — Pruning thread stops on database drop
-// RED: no background pruning thread exists to stop.
 //      After implementation, if the thread leaks, the test process hangs
 //      or panics on dropped channel receivers.
 // ---------------------------------------------------------------------------
@@ -1205,7 +1178,6 @@ fn r27_pruning_thread_stops_on_drop() {
 
 // ---------------------------------------------------------------------------
 // R28 — Concurrent access: pruning while inserting/selecting
-// RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r28_concurrent_prune_and_insert() {
@@ -1284,9 +1256,7 @@ fn r28_concurrent_prune_and_insert() {
 }
 
 // ---------------------------------------------------------------------------
-// MR1 — RED: ANN search accuracy after vector pruning
 // Pruned vectors must not appear in ANN results; remaining vectors rank correctly.
-// RED: run_pruning_cycle is a no-op, so pruned vectors remain in search results.
 // ---------------------------------------------------------------------------
 #[test]
 fn mr1_ann_accuracy_after_vector_pruning() {
@@ -1385,9 +1355,8 @@ fn mr1_ann_accuracy_after_vector_pruning() {
 }
 
 // ---------------------------------------------------------------------------
-// MR2 — RED: Graph edge cleanup after prune + reopen (file-backed)
 // Pruned row's edges must be removed from in-memory graph AND from redb
-// on reopen. RED: run_pruning_cycle is a no-op.
+// on reopen. run_pruning_cycle is a no-op.
 // ---------------------------------------------------------------------------
 #[test]
 fn mr2_graph_edge_cleanup_after_prune_reopen() {
@@ -1472,10 +1441,8 @@ fn mr2_graph_edge_cleanup_after_prune_reopen() {
 }
 
 // ---------------------------------------------------------------------------
-// MR3 — RED: LSN stamped and sync-safe pruning semantics
 // Verifies that rows get LSN stamped at commit, and that sync_safe pruning
 // respects the watermark correctly (lsn >= watermark → skip).
-// RED: run_pruning_cycle is a no-op.
 // ---------------------------------------------------------------------------
 #[test]
 fn mr3_lsn_stamped_and_sync_safe_pruning() {
@@ -2129,9 +2096,7 @@ fn retention_keeps_rows_an_explicit_snapshot_pin_is_entitled_to() {
 }
 
 // ---------------------------------------------------------------------------
-// MR5 — RED: Persistence round-trip with pruning (file-backed)
 // After pruning, reopened DB must not contain pruned rows.
-// RED: run_pruning_cycle is a no-op.
 // ---------------------------------------------------------------------------
 #[test]
 fn mr5_persistence_round_trip_with_pruning() {

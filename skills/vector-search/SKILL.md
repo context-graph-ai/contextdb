@@ -106,7 +106,7 @@ handles honor source-row visibility: a hidden source row returns the same typed 
 an explicit anchor read. Missing table → `TableNotFound`; non-vector column → `UnknownVectorIndex`;
 dimension mismatch → `VectorIndexDimensionMismatch`; missing row → `PersistedRowVectorRowMissing`;
 NULL cell → `PersistedRowVectorCellNull`.
-<!-- enforced by: sql_surface_tests::prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process, sql_surface_tests::prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_variants, sql_surface_tests::prv_13_row_vector_query_honors_scoped_handle_context_isolation -->
+<!-- enforced by: sql_surface_other::prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process, sql_surface_other::prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_variants, sql_surface_other::prv_13_row_vector_query_honors_scoped_handle_context_isolation -->
 
 ## Maintained indexing and search modes
 
