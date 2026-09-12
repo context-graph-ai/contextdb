@@ -1,4 +1,4 @@
-//! Service-side RED assembly for authenticated owner reads.
+//! Service-side listener for authenticated owner reads.
 
 use super::admission::{OwnerAdmission, RequestLease};
 use super::{OwnerReadScaffoldError, OwnerReadScaffoldResult, response_expectation};
@@ -712,8 +712,8 @@ pub struct OwnerReadService {
 }
 
 impl OwnerReadService {
-    /// Start remains RED after every shared validator and carrier seam is
-    /// reached. No database lifecycle method wires this scaffold yet.
+    /// Bind the owner listener and begin answering authenticated reads.
+    /// Database open starts this service once the store is claimed.
     pub fn start(spec: OwnerServiceSpec) -> OwnerReadScaffoldResult<Arc<Self>> {
         #[cfg(feature = "test-seams")]
         crate::read_probe::note_owner_service_start();
@@ -2919,6 +2919,12 @@ impl OwnerReadService {
     pub fn translate_bounded_refusal_for_test(failure: ReadFailure) -> OwnerReadScaffoldError {
         map_bounded_error(BoundedExecutionError::Refused(failure))
     }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn translate_bounded_cancelled_for_test() -> OwnerReadScaffoldError {
+        map_bounded_error(BoundedExecutionError::Cancelled)
+    }
 }
 
 /// Run one served request with this owner's channel counter in force, so the
@@ -3317,9 +3323,9 @@ fn map_bounded_error(error: BoundedExecutionError) -> OwnerReadScaffoldError {
                 OwnerReadScaffoldError::Refused(failure)
             }
         }
-        BoundedExecutionError::Cancelled => OwnerReadScaffoldError::unimplemented(
-            "timeout/disconnect cancellation-to-failure mapping",
-        ),
+        BoundedExecutionError::Cancelled => {
+            OwnerReadScaffoldError::Database(contextdb_core::Error::ReadCancelled)
+        }
         BoundedExecutionError::Engine(error) => OwnerReadScaffoldError::Database(error),
     }
 }

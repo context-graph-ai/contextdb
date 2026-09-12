@@ -963,11 +963,6 @@ impl std::fmt::Debug for CommittedImage {
     }
 }
 
-#[allow(dead_code)]
-fn unused_error_shape(error: Error) -> Error {
-    error
-}
-
 fn write_vector_search_disclosure(
     bytes: &mut crate::read_contract::CanonicalWriter,
     disclosure: Option<&crate::database::VectorSearchDisclosure>,

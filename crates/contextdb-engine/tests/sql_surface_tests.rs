@@ -11931,3 +11931,62 @@ fn updating_an_embedding_with_a_scalar_leaves_the_stored_embedding_alone() {
         );
     }
 }
+
+/// A bare boolean column is a legal predicate on a scan, on a CTE filter,
+/// and on JOIN ON. All three keep the rows where the column is TRUE and
+/// exclude FALSE and NULL.
+#[test]
+fn a_boolean_column_predicate_selects_the_same_rows_on_a_scan_and_on_a_join() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE flags (id UUID PRIMARY KEY, flag BOOLEAN)",
+        &empty(),
+    )
+    .unwrap();
+    let yes = Uuid::new_v4();
+    let no = Uuid::new_v4();
+    let unset = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO flags (id, flag) VALUES ($id, $flag)",
+        &params(vec![("id", Value::Uuid(yes)), ("flag", Value::Bool(true))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO flags (id, flag) VALUES ($id, $flag)",
+        &params(vec![("id", Value::Uuid(no)), ("flag", Value::Bool(false))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO flags (id, flag) VALUES ($id, NULL)",
+        &params(vec![("id", Value::Uuid(unset))]),
+    )
+    .unwrap();
+
+    let scan = db
+        .execute("SELECT id FROM flags WHERE flag", &empty())
+        .expect("a scan WHERE on a boolean column is a legal predicate");
+    assert_eq!(scan.rows.len(), 1, "WHERE flag keeps only flag = TRUE");
+    assert_eq!(scan.rows[0][0], Value::Uuid(yes));
+
+    let cte = db
+        .execute(
+            "WITH nested AS (SELECT id, flag FROM flags) SELECT id FROM nested WHERE flag",
+            &empty(),
+        )
+        .expect("a CTE WHERE on a boolean column uses the same predicate rules as a scan");
+    assert_eq!(
+        cte.rows, scan.rows,
+        "the CTE filter path must keep the same row the scan path kept"
+    );
+
+    let joined = db
+        .execute(
+            "SELECT a.id FROM flags a INNER JOIN flags b ON a.flag AND a.id = b.id",
+            &empty(),
+        )
+        .expect("JOIN ON a boolean column uses the same predicate rules as a scan WHERE");
+    assert_eq!(
+        joined.rows, scan.rows,
+        "the JOIN ON path must keep the same row the scan path kept"
+    );
+}

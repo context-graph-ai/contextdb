@@ -531,7 +531,7 @@ impl Database {
     /// post-DDL table view, and encode all durable values before publication.
     /// Source-order coordination belongs to `ReceivedSchemaStage`; this helper
     /// deliberately does not append category-local DDL to the log.
-    #[allow(dead_code)] // consumed when Phase B joins the staged Redb transaction
+    #[allow(dead_code)] // consumed when received-schema publication joins the staged Redb transaction
     pub(super) fn prepare_received_event_bus_publication(
         &self,
         ddl: &[DdlChange],

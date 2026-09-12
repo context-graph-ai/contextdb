@@ -4,6 +4,14 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
+- **Fixed.** A bounded owner read that the kernel cancels while the reader
+  interrupts it or closes its cursor is reported as a cancelled read, not as an
+  unimplemented feature. A timeout or disconnect still reports the owner-timeout
+  or owner-disconnected refusal it always did.
+- **Fixed.** A boolean predicate — including a bare boolean column, a boolean
+  function result, and a `NULL` predicate — is evaluated by the same rules on a
+  scan `WHERE`, a `JOIN ON`, and a CTE `WHERE`.
+
 - **Added.** `DECLARE TENANT TABLE POLICY` persists versioned hub policy and freezes it at
   binding. Transactional delivery manifests cover the complete root/member rows with BLAKE3;
   ordinary push returns durable `accepted`, `equivalent`, or `refused` outcomes, and authenticated

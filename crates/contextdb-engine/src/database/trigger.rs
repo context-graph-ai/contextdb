@@ -470,7 +470,7 @@ impl Database {
     /// Validate and encode a received trigger projection using the projected
     /// table state supplied by the source-order schema planner.  This performs
     /// every fallible parse/definition check before durable publication.
-    #[allow(dead_code)] // consumed when Phase B joins the staged Redb transaction
+    #[allow(dead_code)] // consumed when received-schema publication joins the staged Redb transaction
     pub(super) fn prepare_received_trigger_publication(
         &self,
         ddl: &[DdlChange],

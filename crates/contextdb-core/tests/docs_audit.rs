@@ -103,10 +103,10 @@ fn docs_query_language_lists_txid_column_type() {
 //
 // Three entry forms are accepted:
 // - `file_stem::test_fn` — `crates/*/tests/<file_stem>.rs` or
-//   `crates/*/tests/<file_stem>/main.rs` defines `fn test_fn`;
+//   `crates/*/tests/<file_stem>/main.rs` defines a test `fn test_fn`;
 // - `<path>.rs::test_fn` — a repository-relative test file (for example
 //   `tests/integration/hnsw_tests.rs::h04_hnsw_recall_is_at_least_ninety_five_percent`)
-//   defines `fn test_fn`;
+//   defines a test `fn test_fn`;
 // - `<crate>::<file_stem>` — the whole test target
 //   `crates/<crate>/tests/<file_stem>.rs` enforces the claim.
 //
@@ -287,9 +287,54 @@ fn test_target_files(crate_dir: &Path, file_stem: &str) -> Vec<PathBuf> {
     .collect()
 }
 
+fn is_test_attribute(attr: &str) -> bool {
+    let inner = attr
+        .trim()
+        .trim_start_matches("#[")
+        .trim_end_matches(']')
+        .trim();
+    let path = inner.split('(').next().unwrap_or(inner).trim();
+    path == "test" || path.ends_with("::test") || path == "serial" || path.ends_with("::serial")
+}
+
+/// A binding names a test function: `fn NAME` immediately preceded by
+/// `#[test]`, `#[tokio::test]`, `#[serial]`, or the same attributes with
+/// arguments (`#[tokio::test(flavor = "multi_thread")]`,
+/// `#[serial_test::serial(safe_fs_pause)]`). A plain helper of the same
+/// name does not count.
 fn defines_fn(file: &Path, name: &str) -> bool {
-    let pattern = regex::Regex::new(&format!(r"\bfn\s+{}\s*[<(]", regex::escape(name))).unwrap();
-    pattern.is_match(&read_document(file))
+    let fn_pattern = regex::Regex::new(&format!(r"\bfn\s+{}\s*[<(]", regex::escape(name))).unwrap();
+    let source = read_document(file);
+    let mut pending_attrs: Vec<String> = Vec::new();
+    let mut attr_accum: Option<String> = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(acc) = attr_accum.as_mut() {
+            acc.push(' ');
+            acc.push_str(trimmed);
+            if trimmed.contains(']') {
+                pending_attrs.push(std::mem::take(acc));
+                attr_accum = None;
+            }
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with("#[") {
+            if trimmed.contains(']') {
+                pending_attrs.push(trimmed.to_string());
+            } else {
+                attr_accum = Some(trimmed.to_string());
+            }
+            continue;
+        }
+        if fn_pattern.is_match(trimmed) {
+            return pending_attrs.iter().any(|attr| is_test_attribute(attr));
+        }
+        pending_attrs.clear();
+    }
+    false
 }
 
 /// Resolves one binding entry to the test that enforces it, or says why it

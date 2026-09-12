@@ -10457,7 +10457,7 @@ pub(crate) fn row_matches(
     expr: &Expr,
     params: &HashMap<String, Value>,
 ) -> Result<bool> {
-    Ok(eval_bool_expr(row, expr, params)?.unwrap_or(false))
+    Ok(eval_bool_expr(expr, &|inner| eval_expr_value(row, inner, params))?.unwrap_or(false))
 }
 
 /// Filter `rows` by an optional predicate, propagating a genuine evaluation
@@ -10727,15 +10727,14 @@ fn unique_component(candidate: Value, value: &Value, neighbours: &[Value]) -> Pa
 }
 
 fn eval_bool_expr(
-    row: &VersionedRow,
     expr: &Expr,
-    params: &HashMap<String, Value>,
+    eval_value: &impl Fn(&Expr) -> Result<Value>,
 ) -> Result<Option<bool>> {
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
-                let left = eval_expr_value(row, left, params)?;
-                let right = eval_expr_value(row, right, params)?;
+                let left = eval_value(left)?;
+                let right = eval_value(right)?;
                 if left == Value::Null || right == Value::Null {
                     return Ok(None);
                 }
@@ -10762,11 +10761,11 @@ fn eval_bool_expr(
                 Ok(Some(result))
             }
             BinOp::And => {
-                let left = eval_bool_expr(row, left, params)?;
+                let left = eval_bool_expr(left, eval_value)?;
                 if left == Some(false) {
                     return Ok(Some(false));
                 }
-                let right = eval_bool_expr(row, right, params)?;
+                let right = eval_bool_expr(right, eval_value)?;
                 Ok(match (left, right) {
                     (Some(true), Some(true)) => Some(true),
                     (Some(true), other) => other,
@@ -10776,11 +10775,11 @@ fn eval_bool_expr(
                 })
             }
             BinOp::Or => {
-                let left = eval_bool_expr(row, left, params)?;
+                let left = eval_bool_expr(left, eval_value)?;
                 if left == Some(true) {
                     return Ok(Some(true));
                 }
-                let right = eval_bool_expr(row, right, params)?;
+                let right = eval_bool_expr(right, eval_value)?;
                 Ok(match (left, right) {
                     (Some(false), Some(false)) => Some(false),
                     (Some(false), other) => other,
@@ -10793,13 +10792,13 @@ fn eval_bool_expr(
         Expr::UnaryOp {
             op: UnaryOp::Not,
             operand,
-        } => Ok(eval_bool_expr(row, operand, params)?.map(|value| !value)),
+        } => Ok(eval_bool_expr(operand, eval_value)?.map(|value| !value)),
         Expr::InList {
             expr,
             list,
             negated,
         } => {
-            let needle = eval_expr_value(row, expr, params)?;
+            let needle = eval_value(expr)?;
             if needle == Value::Null {
                 return Ok(None);
             }
@@ -10808,7 +10807,7 @@ fn eval_bool_expr(
                 if found {
                     Ok(true)
                 } else {
-                    let candidate = eval_expr_value(row, item, params)?;
+                    let candidate = eval_value(item)?;
                     Ok(
                         matches!(compare_values(&needle, &candidate), Some(Ordering::Equal))
                             || (candidate != Value::Null && needle == candidate),
@@ -10825,8 +10824,8 @@ fn eval_bool_expr(
             pattern,
             negated,
         } => {
-            let left = eval_expr_value(row, expr, params)?;
-            let right = eval_expr_value(row, pattern, params)?;
+            let left = eval_value(expr)?;
+            let right = eval_value(pattern)?;
             let matched = match (left, right) {
                 (Value::Text(value), Value::Text(pattern)) => like_matches(&value, &pattern),
                 _ => false,
@@ -10834,7 +10833,7 @@ fn eval_bool_expr(
             Ok(Some(if *negated { !matched } else { matched }))
         }
         Expr::IsNull { expr, negated } => {
-            let is_null = eval_expr_value(row, expr, params)? == Value::Null;
+            let is_null = eval_value(expr)? == Value::Null;
             Ok(Some(if *negated { !is_null } else { is_null }))
         }
         // A boolean literal is a legal predicate anywhere a predicate is
@@ -10850,7 +10849,7 @@ fn eval_bool_expr(
         Expr::Column(_)
         | Expr::Parameter(_)
         | Expr::Literal(Literal::Null)
-        | Expr::FunctionCall { .. } => match eval_expr_value(row, expr, params)? {
+        | Expr::FunctionCall { .. } => match eval_value(expr)? {
             Value::Bool(value) => Ok(Some(value)),
             Value::Null => Ok(None),
             other => Err(Error::PlanError(format!(
@@ -11444,137 +11443,10 @@ fn query_result_row_matches(
     expr: &Expr,
     params: &HashMap<String, Value>,
 ) -> Result<bool> {
-    Ok(eval_query_result_bool_expr(row, columns, expr, params)?.unwrap_or(false))
-}
-
-fn eval_query_result_bool_expr(
-    row: &[Value],
-    columns: &[String],
-    expr: &Expr,
-    params: &HashMap<String, Value>,
-) -> Result<Option<bool>> {
-    match expr {
-        Expr::BinaryOp { left, op, right } => match op {
-            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
-                let left = eval_query_result_expr(left, row, columns, params)?;
-                let right = eval_query_result_expr(right, row, columns, params)?;
-                if left == Value::Null || right == Value::Null {
-                    return Ok(None);
-                }
-
-                let result = match op {
-                    BinOp::Eq => {
-                        compare_values(&left, &right) == Some(Ordering::Equal) || left == right
-                    }
-                    BinOp::Neq => {
-                        !(compare_values(&left, &right) == Some(Ordering::Equal) || left == right)
-                    }
-                    BinOp::Lt => compare_values(&left, &right) == Some(Ordering::Less),
-                    BinOp::Lte => matches!(
-                        compare_values(&left, &right),
-                        Some(Ordering::Less | Ordering::Equal)
-                    ),
-                    BinOp::Gt => compare_values(&left, &right) == Some(Ordering::Greater),
-                    BinOp::Gte => matches!(
-                        compare_values(&left, &right),
-                        Some(Ordering::Greater | Ordering::Equal)
-                    ),
-                    BinOp::And | BinOp::Or => unreachable!(),
-                };
-                Ok(Some(result))
-            }
-            BinOp::And => {
-                let left = eval_query_result_bool_expr(row, columns, left, params)?;
-                if left == Some(false) {
-                    return Ok(Some(false));
-                }
-                let right = eval_query_result_bool_expr(row, columns, right, params)?;
-                Ok(match (left, right) {
-                    (Some(true), Some(true)) => Some(true),
-                    (Some(true), other) => other,
-                    (None, Some(false)) => Some(false),
-                    (None, Some(true)) | (None, None) => None,
-                    (Some(false), _) => Some(false),
-                })
-            }
-            BinOp::Or => {
-                let left = eval_query_result_bool_expr(row, columns, left, params)?;
-                if left == Some(true) {
-                    return Ok(Some(true));
-                }
-                let right = eval_query_result_bool_expr(row, columns, right, params)?;
-                Ok(match (left, right) {
-                    (Some(false), Some(false)) => Some(false),
-                    (Some(false), other) => other,
-                    (None, Some(true)) => Some(true),
-                    (None, Some(false)) | (None, None) => None,
-                    (Some(true), _) => Some(true),
-                })
-            }
-        },
-        Expr::UnaryOp {
-            op: UnaryOp::Not,
-            operand,
-        } => Ok(eval_query_result_bool_expr(row, columns, operand, params)?.map(|value| !value)),
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let needle = eval_query_result_expr(expr, row, columns, params)?;
-            if needle == Value::Null {
-                return Ok(None);
-            }
-
-            let matched = list.iter().try_fold(false, |found, item| -> Result<bool> {
-                if found {
-                    Ok(true)
-                } else {
-                    let candidate = eval_query_result_expr(item, row, columns, params)?;
-                    Ok(
-                        matches!(compare_values(&needle, &candidate), Some(Ordering::Equal))
-                            || (candidate != Value::Null && needle == candidate),
-                    )
-                }
-            })?;
-            Ok(Some(if *negated { !matched } else { matched }))
-        }
-        Expr::InSubquery { .. } => Err(Error::PlanError(
-            "IN (subquery) must be resolved before execution".to_string(),
-        )),
-        Expr::Like {
-            expr,
-            pattern,
-            negated,
-        } => {
-            let left = eval_query_result_expr(expr, row, columns, params)?;
-            let right = eval_query_result_expr(pattern, row, columns, params)?;
-            let matched = match (left, right) {
-                (Value::Text(value), Value::Text(pattern)) => like_matches(&value, &pattern),
-                _ => false,
-            };
-            Ok(Some(if *negated { !matched } else { matched }))
-        }
-        Expr::IsNull { expr, negated } => {
-            let is_null = eval_query_result_expr(expr, row, columns, params)? == Value::Null;
-            Ok(Some(if *negated { !is_null } else { is_null }))
-        }
-        // A boolean literal is a legal predicate anywhere a predicate is
-        // legal (`ON TRUE`, `WHERE FALSE`), per standard SQL.
-        Expr::Literal(Literal::Bool(value)) => Ok(Some(*value)),
-        Expr::FunctionCall { .. } => match eval_query_result_expr(expr, row, columns, params)? {
-            Value::Bool(value) => Ok(Some(value)),
-            Value::Null => Ok(None),
-            _ => Err(Error::PlanError(format!(
-                "unsupported WHERE expression: {:?}",
-                expr
-            ))),
-        },
-        _ => Err(Error::PlanError(format!(
-            "unsupported WHERE expression: {:?}",
-            expr
-        ))),
-    }
+    Ok(eval_bool_expr(expr, &|inner| {
+        eval_query_result_expr(inner, row, columns, params)
+    })?
+    .unwrap_or(false))
 }
 
 /// How a column reference resolves against a query result's column list.

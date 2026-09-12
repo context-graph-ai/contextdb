@@ -46,7 +46,7 @@ use crate::local_transport::{LocalRequest, LocalResponseExpectation, PayloadViol
 use contextdb_core::Error;
 use contextdb_core::read_contract::{ReadContractViolation, ReadFailure};
 
-/// Internal error for this RED assembly. Stable product failures remain the
+/// Internal error for the owner-read plane. Stable product failures remain the
 /// existing `ReadFailure`; this enum only makes missing prerequisites honest.
 #[derive(Debug, thiserror::Error)]
 pub enum OwnerReadScaffoldError {

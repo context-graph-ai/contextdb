@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::path::Path::new(&args[1]);
     std::fs::create_dir_all(root)?;
     let total: usize = args[2].parse()?;
-    let tenant = TenantId::from("correction01-scale");
+    let tenant = TenantId::from("custody-scale");
     let hub = Arc::new(Database::open(root.join("hub.db"))?);
     let endpoint = IrohServer::bind(&format!(
         "iroh:?identity={}",

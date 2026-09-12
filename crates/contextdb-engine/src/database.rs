@@ -3733,23 +3733,6 @@ struct ReceivedSchemaMemoryMirrors {
     receipt_and_applied_watermarks: HashMap<String, Lsn>,
 }
 
-#[allow(dead_code)] // Phase B constructs production mirror replacements
-impl ReceivedSchemaMemoryMirrors {
-    fn empty() -> Self {
-        Self {
-            table_generations: HashMap::new(),
-            ddl_generations: HashMap::new(),
-            received_ddl_arrivals: HashMap::new(),
-            superseded_ddl_occurrences: HashMap::new(),
-            source_state: HashMap::new(),
-            accepted_authors: HashMap::new(),
-            terminal_markers: HashMap::new(),
-            terminal_scans: HashMap::new(),
-            receipt_and_applied_watermarks: HashMap::new(),
-        }
-    }
-}
-
 /// Private, commit-LSN keyed state for one authenticated received schema
 /// unit.  It never crosses the public `ChangeSet` boundary.  Everything in
 /// it is prepared before durability; `publish_received_schema_stage` contains
@@ -3990,7 +3973,7 @@ impl Drop for PreparedMemorySwap {
     }
 }
 
-#[allow(dead_code)] // its table view is consumed by the Phase B projection builder
+#[allow(dead_code)] // its table view is consumed by received-schema source-order projection
 struct ReceivedSchemaSemanticProjection {
     tables: HashMap<String, TableMeta>,
     event_bus: event_bus::EventBusDefinitions,
@@ -37354,23 +37337,6 @@ impl Database {
         }
     }
 
-    /// Start the ONE engine-owned maintenance loop iff this database has
-    /// anything to maintain — a retained table, a currency table, a durable
-    /// trigger audit, or a declared vector index. Called at open (next to the
-    /// cron tickler) and again whenever DDL lands, so a fresh install, a
-    /// REOPEN, and a table that ARRIVED over synced DDL all self-maintain with
-    /// no consumer call. A database with nothing to maintain spawns no thread
-    /// at all.
-    ///
-    /// Registry-table invariant maintenance is engine-owned as of this commit:
-    /// the earlier "host-driven maintenance" model was unrealized — `run_pruning_cycle`
-    /// had zero production callers, so even `work_inputs` TTL never fired on a real
-    /// fabric node, and the currency tables grew without bound (a 365MB debris
-    /// ledger held 248,996 `work_capabilities` versions for ~10 live rows). An
-    /// engine whose bounded-registry invariant depends on every host remembering a
-    /// maintenance call is the silent-degradation class the substrate exists to
-    /// kill, and the hub accumulates versions via sync-apply that no write-helper
-    /// hook would catch — so the substrate self-maintains.
     /// Read the established retention hub back out of database metadata at
     /// open, so the multi-hub refusal survives a reboot.
     pub(crate) fn load_retention_sync_peer(&self) {
@@ -37385,6 +37351,23 @@ impl Database {
         }
     }
 
+    /// Start the ONE engine-owned maintenance loop iff this database has
+    /// anything to maintain — a retained table, a currency table, a durable
+    /// trigger audit, or a declared vector index. Called at open (next to the
+    /// cron tickler) and again whenever DDL lands, so a fresh install, a
+    /// REOPEN, and a table that ARRIVED over synced DDL all self-maintain with
+    /// no consumer call. A database with nothing to maintain spawns no thread
+    /// at all.
+    ///
+    /// Registry-table invariant maintenance is engine-owned:
+    /// the earlier "host-driven maintenance" model was unrealized — `run_pruning_cycle`
+    /// had zero production callers, so even `work_inputs` TTL never fired on a real
+    /// fabric node, and the currency tables grew without bound (a 365MB debris
+    /// ledger held 248,996 `work_capabilities` versions for ~10 live rows). An
+    /// engine whose bounded-registry invariant depends on every host remembering a
+    /// maintenance call is the silent-degradation class the substrate exists to
+    /// kill, and the hub accumulates versions via sync-apply that no write-helper
+    /// hook would catch — so the substrate self-maintains.
     pub(crate) fn reconcile_maintenance_thread(&self) {
         if self.maintenance_caller_driven.load(Ordering::SeqCst) {
             // CallerDriven: never spawn, however much is declared -- the
@@ -50711,24 +50694,6 @@ struct VectorPolicyExplainFacts {
     /// been resolved to count over.
     aggregate_allowed_vectors: Option<usize>,
     policy: contextdb_vector::store::ResolvedVectorPolicy,
-}
-
-/// The traversal steps a plan walks, if it walks any.
-#[allow(dead_code)]
-fn graph_bfs_steps_from_plan(plan: &PhysicalPlan) -> Option<&[contextdb_planner::GraphStepPlan]> {
-    match plan {
-        PhysicalPlan::GraphBfs { steps, .. } => Some(steps.as_slice()),
-        PhysicalPlan::Project { input, .. }
-        | PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Distinct { input }
-        | PhysicalPlan::Limit { input, .. }
-        | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::MaterializeCte { input, .. } => graph_bfs_steps_from_plan(input),
-        PhysicalPlan::Join { left, right, .. } => {
-            graph_bfs_steps_from_plan(left).or_else(|| graph_bfs_steps_from_plan(right))
-        }
-        _ => None,
-    }
 }
 
 fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<VectorExplainShape<'_>> {

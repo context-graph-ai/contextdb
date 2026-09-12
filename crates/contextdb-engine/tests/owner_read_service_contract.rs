@@ -3767,3 +3767,23 @@ fn remote_explain_of_a_bound_partition_key_reports_the_bound_scopes_count_and_ro
          local={local_vector_search_line:?} remote={remote_rendered:?}"
     );
 }
+
+/// A kernel cancel on the owner plane is a cancelled read. Mapping it through
+/// the shared bounded-error translator must not report a missing feature.
+#[cfg(feature = "test-seams")]
+#[test]
+fn a_cancelled_owner_read_is_reported_as_cancelled() {
+    let error = OwnerReadService::translate_bounded_cancelled_for_test();
+    assert!(
+        matches!(
+            error,
+            OwnerReadScaffoldError::Database(Error::ReadCancelled)
+        ),
+        "a cancelled owner read is Error::ReadCancelled, got {error:?}"
+    );
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("unimplemented"),
+        "a cancelled owner read must not be reported as unimplemented: {rendered}"
+    );
+}

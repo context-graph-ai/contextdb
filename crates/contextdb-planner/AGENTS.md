@@ -17,7 +17,7 @@ cap (`BfsDepthExceeded`, cap 10, default 5), and a `MATCH` with no edge.
 Must not own: grammar or AST shape (parser); any decision that needs a table's declared schema —
 immutability, state machines, which index serves a predicate, vector search mode resolution,
 partition scope, `validate_sort_key` — those run in the engine executor against `TableMeta`.
-`try_plan_index_scan` is a deliberate stub returning `None`; index selection happens in the engine.
+Index selection happens in the engine.
 Never add a catalog handle here to make a plan "smarter".
 
 ## Seams

@@ -9,15 +9,13 @@
 //! `OutputOptions` and the `EXIT_*` codes; the document shapes are a CLI
 //! contract documented in `docs/cli.md`, not a Rust API.
 
-use contextdb_core::Direction;
 use contextdb_core::read_contract::{
     CursorExpiryKind, CursorPage, OwnerReadStatus, OwnerServingReason, OwnerServingState,
     ReadFailure, ReadFailureClass, ReadFailureDetail, ReadFailureKind, ReadFailureLimit, ReadRoute,
 };
-use contextdb_core::table_meta::{ConflictPolicy, SyncDirection};
 use contextdb_engine::QueryResult;
 use contextdb_engine::database::QueryTrace;
-use contextdb_engine::{CompactionReport, MaintenancePolicy, MaintenanceReport};
+use contextdb_engine::{CompactionReport, MaintenanceReport};
 use contextdb_engine::{
     DirectEventsStatus, DirectIndexDirection, DirectMaintenanceStatus, DirectPropagationRule,
     DirectSchema, DirectVectorQuantization, OwnerConfigurationSource, OwnerConfiguredValue,
@@ -237,75 +235,6 @@ pub(crate) fn read_failure_detail_document(failure: &ReadFailure) -> Value {
         }
     }
     Value::Object(detail)
-}
-
-/// The wire word for a table's sync direction.
-///
-/// Declared here rather than derived from the Rust enum: `format!("{:?}")` would
-/// make the identifier spelling of `SyncDirection` the contract, so renaming a
-/// variant — or a change in how `Debug` renders — would silently rewrite what
-/// every consumer parses, with no product intent behind it. Each word is the
-/// DDL clause an operator writes (`SyncDirection::sql`) in lowercase
-/// snake_case, so the CLI, the declaration and the persisted meta all say the
-/// same thing.
-///
-/// The match is exhaustive on purpose. A new direction must be given a word
-/// here deliberately; it must not fall through to a default.
-#[allow(dead_code)]
-pub(crate) fn sync_direction_wire_word(direction: SyncDirection) -> &'static str {
-    match direction {
-        SyncDirection::None => "sync_off",
-        SyncDirection::Push => "push_only",
-        SyncDirection::Pull => "pull_only",
-        SyncDirection::Both => "two_way",
-    }
-}
-
-/// The wire word for a propagation rule's edge direction — the DDL keyword an
-/// operator writes in `PROPAGATE ON EDGE <type> INCOMING|OUTGOING|BOTH`.
-///
-/// Spelled out for the same reason as the two above: the previous
-/// `format!("{:?}").to_uppercase()` happened to produce the DDL keyword, which
-/// made a Rust identifier the wire contract by coincidence. The words are
-/// unchanged; only the coupling is.
-#[allow(dead_code)]
-pub(crate) fn propagation_direction_wire_word(direction: &Direction) -> &'static str {
-    match direction {
-        Direction::Incoming => "INCOMING",
-        Direction::Outgoing => "OUTGOING",
-        Direction::Both => "BOTH",
-    }
-}
-
-/// The machine word for a DDL-declared conflict policy. Engine-private
-/// mechanics have no declared clause and therefore no public representation.
-#[allow(dead_code)]
-pub(crate) fn conflict_policy_wire_word(policy: ConflictPolicy) -> Option<&'static str> {
-    if policy == ConflictPolicy::KEEP_FIRST {
-        Some("keep_first")
-    } else if policy == ConflictPolicy::KEEP_LATEST {
-        Some("keep_latest")
-    } else {
-        None
-    }
-}
-
-/// The wire word for a table's version-history policy, on the same terms.
-#[allow(dead_code)]
-pub(crate) fn history_policy_wire_word(policy: contextdb_core::HistoryPolicy) -> &'static str {
-    match policy {
-        contextdb_core::HistoryPolicy::All => "ALL",
-        contextdb_core::HistoryPolicy::CurrentOnly => "CURRENT_ONLY",
-    }
-}
-
-/// The wire word for who owns a database's maintenance schedule.
-#[allow(dead_code)]
-pub(crate) fn maintenance_policy_wire_word(policy: MaintenancePolicy) -> &'static str {
-    match policy {
-        MaintenancePolicy::EngineOwned => "engine_owned",
-        MaintenancePolicy::CallerDriven => "caller_driven",
-    }
 }
 
 /// `.maintenance run` under `--json`: what the one driven cycle reclaimed.
@@ -1341,37 +1270,6 @@ mod tests {
             },
         ] {
             assert_eq!(ErrorClass::of(&error), ErrorClass::Sql, "{error}");
-        }
-    }
-
-    /// Every direction has a word, including through the arms no DDL-driven
-    /// test can reach. The match is exhaustive with no wildcard, so a new
-    /// variant fails to compile until someone chooses its word.
-    #[test]
-    fn sync_direction_wire_word_covers_every_variant() {
-        assert_eq!(sync_direction_wire_word(SyncDirection::None), "sync_off");
-        assert_eq!(sync_direction_wire_word(SyncDirection::Push), "push_only");
-        assert_eq!(sync_direction_wire_word(SyncDirection::Pull), "pull_only");
-        assert_eq!(sync_direction_wire_word(SyncDirection::Both), "two_way");
-    }
-
-    /// No wire word may coincide with its variant's `Debug` spelling. The
-    /// point of declaring these words is that renaming a Rust type cannot
-    /// reach a consumer, and an accidental match would hide a regression back
-    /// to formatting the identifier.
-    #[test]
-    fn no_wire_word_repeats_a_rust_identifier() {
-        for direction in [
-            SyncDirection::None,
-            SyncDirection::Push,
-            SyncDirection::Pull,
-            SyncDirection::Both,
-        ] {
-            assert_ne!(
-                sync_direction_wire_word(direction),
-                format!("{direction:?}"),
-                "the wire word must not be the Rust identifier"
-            );
         }
     }
 

@@ -4,9 +4,7 @@ use std::collections::BTreeSet;
 /// Distinguishes which callback context produced a callback-active error.
 ///
 /// Contract: final `Display` for callback-active errors must be alloc-free
-/// (inline `&'static str` templates, never `kind.to_string()`). The RED stub
-/// commit intentionally allocates in this `Display` impl so the allocator probe
-/// fails until the implementation commit replaces it.
+/// (inline `&'static str` templates, never `kind.to_string()`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CallbackKind {
     Trigger,

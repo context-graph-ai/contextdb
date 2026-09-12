@@ -713,15 +713,3 @@ fn map_parser_to_core_sort_direction(
         )),
     }
 }
-
-/// Stub: returns None so the planner always uses Scan. Impl must inspect the
-/// WHERE clause, match eligible predicate shapes, consult TableMeta.indexes,
-/// and return Some(IndexScan { ... }) when applicable.
-#[allow(dead_code)]
-fn try_plan_index_scan(
-    _table: &str,
-    _where_clause: Option<&Expr>,
-    _indexes: &[contextdb_core::table_meta::IndexDecl],
-) -> Option<crate::plan::PhysicalPlan> {
-    None
-}

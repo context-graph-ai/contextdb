@@ -5907,7 +5907,9 @@ impl VectorState {
                 filter: Some(filter),
                 ..
             }) = plan
-                && super::eval_bool_expr(row, filter, &self.params)? != Some(true)
+                && super::eval_bool_expr(filter, &|inner| {
+                    super::eval_expr_value(row, inner, &self.params)
+                })? != Some(true)
             {
                 return Ok(false);
             }
@@ -8662,7 +8664,9 @@ fn build_vector_kernel<'plan>(
                     return Ok(());
                 };
                 if let Some(filter) = sql_filter
-                    && super::eval_bool_expr(row, filter, &params)? != Some(true)
+                    && super::eval_bool_expr(filter, &|inner| {
+                        super::eval_expr_value(row, inner, &params)
+                    })? != Some(true)
                 {
                     return Ok(());
                 }
