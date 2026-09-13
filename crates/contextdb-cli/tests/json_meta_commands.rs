@@ -439,6 +439,48 @@ fn json_sync_status_without_configuration() {
     );
 }
 
+#[test]
+fn sync_status_refuses_a_trailing_json_flag() {
+    let (events_code, events_stdout, events_stderr) = run_cli(&[], ".events status --json\n");
+    assert_eq!(
+        events_code,
+        Some(1),
+        "`.events status --json` must refuse. stdout:\n{events_stdout}\nstderr:\n{events_stderr}"
+    );
+    assert!(
+        events_stderr.contains("Usage: .events status"),
+        "`.events status --json` must be a usage refusal. stdout:\n{events_stdout}\nstderr:\n{events_stderr}"
+    );
+
+    let (sync_code, sync_stdout, sync_stderr) = run_cli(&[], ".sync status --json\n");
+    assert_eq!(
+        sync_code, events_code,
+        "`.sync status --json` must exit the same way `.events status --json` does. \
+         stdout:\n{sync_stdout}\nstderr:\n{sync_stderr}"
+    );
+    assert!(
+        sync_stderr.contains("Usage: .sync status"),
+        "`.sync status --json` must refuse with the command's usage text. \
+         stdout:\n{sync_stdout}\nstderr:\n{sync_stderr}"
+    );
+    assert!(
+        !sync_stdout.contains("Sync not configured"),
+        "a refused `.sync status --json` must not print the successful status answer. \
+         stdout:\n{sync_stdout}"
+    );
+
+    let (plain_code, plain_stdout, plain_stderr) = run_cli(&[], ".sync status\n");
+    assert_eq!(
+        plain_code,
+        Some(0),
+        "plain `.sync status` must still succeed. stdout:\n{plain_stdout}\nstderr:\n{plain_stderr}"
+    );
+    assert!(
+        plain_stdout.contains("Sync not configured"),
+        "plain `.sync status` must still answer. stdout:\n{plain_stdout}\nstderr:\n{plain_stderr}"
+    );
+}
+
 // 11. `.sync auto` under --json holds the same contract as test 10.
 #[test]
 fn json_sync_auto_without_configuration() {

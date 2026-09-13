@@ -1,5 +1,6 @@
 use crate::command_registry::{
     MetaCommandAuthorization, authorize_meta_command_before_dispatch, canonical_help_signatures,
+    unknown_trailing_arguments_usage,
 };
 use crate::formatter::format_query_result_with_empty_headers;
 use crate::json_output::{self, ErrorClass};
@@ -533,25 +534,6 @@ fn write_requires_flag() -> ReadFailure {
         .expect("a write refusal carries no specialized detail")
 }
 
-/// Whether this statement would change the store, decided by the parser's own
-/// classification rather than by a keyword list kept here — the same
-/// classification a live owner applies when it answers a read, so the two
-/// surfaces can never disagree about what a write is.
-///
-/// Input that parses as nothing is NOT a write. It is a parse error, reported
-/// identically in read and write sessions, so a typo never arrives dressed as
-/// a permission problem.
-#[allow(dead_code)]
-fn statement_writes(sql: &str) -> bool {
-    match contextdb_parser::parse(sql) {
-        Ok(statement) => {
-            contextdb_parser::statement_effect(&statement)
-                != contextdb_parser::StatementEffect::Read
-        }
-        Err(_) => false,
-    }
-}
-
 /// What an interactive session announces about itself at startup, and the
 /// prompt it then wears. Neither exists when nobody is watching a terminal.
 const READ_SESSION_BANNER: &str = "read-only session — pass --write to mutate";
@@ -1053,6 +1035,11 @@ fn process_meta_line(
         }
         return true;
     }
+    if let Some(usage) = unknown_trailing_arguments_usage(line) {
+        report_failure(ErrorClass::Usage, &usage, input);
+        session.had_error = true;
+        return true;
+    }
     // A session that cannot write has no sync of its own to report, and the
     // store's sync state is not this session's to speak for. Saying both is
     // what keeps the answer from being read as the store's health.
@@ -1129,6 +1116,26 @@ fn report_failure(class: ErrorClass, message: &str, input: InputContext) {
     } else {
         eprintln!("{message}");
     }
+}
+
+fn render_optional_value<T: std::fmt::Display>(value: Option<T>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "none".to_string(),
+    }
+}
+
+fn render_replayed_key(key: &[(String, contextdb_core::Value)]) -> String {
+    key.iter()
+        .map(|(column, value)| format!("{column}={}", crate::formatter::render_value(value)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn with_sentence_break(error: &impl std::fmt::Display, next_sentence: &str) -> String {
+    let text = error.to_string();
+    let text = text.trim_end_matches('.');
+    format!("{text}. {next_sentence}")
 }
 
 struct SyncCommandOutcome {
@@ -1308,8 +1315,8 @@ pub(crate) fn handle_meta_command(
                                  vector_first_failure={} vector_failure_operation={} \
                                  vector_failure_requested_bytes={} vector_failure_available_bytes={} \
                                  vector_failure_current_bytes={} vector_failure_budget_limit_bytes={} \
-                                 vector_failure_message={:?} vector_failure_recovery_action={} \
-                                 vector_failure_recovery_instruction={:?}",
+                                 vector_failure_message={} vector_failure_recovery_action={} \
+                                 vector_failure_recovery_instruction={}",
                                 report.pruning.pruned_rows,
                                 report.pruning.rows_deferred_for_readers,
                                 report.currency.pruned_versions,
@@ -1350,12 +1357,12 @@ pub(crate) fn handle_meta_command(
                             ));
                         } else {
                             println!(
-                                "ran={} duration_micros={} bytes_before={:?} bytes_after={:?} \
+                                "ran={} duration_micros={} bytes_before={} bytes_after={} \
                                  file_shrank={} fragmentation_before={}",
                                 report.ran,
                                 report.duration_micros,
-                                report.bytes_before,
-                                report.bytes_after,
+                                render_optional_value(report.bytes_before),
+                                render_optional_value(report.bytes_after),
                                 report.file_shrank,
                                 report.fragmentation_before,
                             );
@@ -2547,8 +2554,9 @@ fn run_sync_command(
                 // Same contract as the CLI's own unconditional exit-push.
                 SyncCommandOutcome::succeeded(
                     format!(
-                        "Push re-offered {table} {key:?}, which the hub already converged on \
-                         as deleted; nothing to do."
+                        "Push re-offered {table} {}, which the hub already converged on \
+                         as deleted; nothing to do.",
+                        render_replayed_key(&key)
                     ),
                     serde_json::json!({ "sync_push": { "outcome": "converged" } }),
                 )
@@ -2556,9 +2564,13 @@ fn run_sync_command(
             Err(e) => SyncCommandOutcome::failed(
                 ErrorClass::of(&e),
                 format!(
-                    "Push to sync endpoint {} (tenant {}) failed: {e}. Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync push`.",
+                    "Push to sync endpoint {} (tenant {}) failed: {}",
                     client.endpoint(),
-                    client.tenant_id()
+                    client.tenant_id(),
+                    with_sentence_break(
+                        &e,
+                        "Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync push`.",
+                    )
                 ),
             ),
         },
@@ -2598,9 +2610,13 @@ fn run_sync_command(
             Err(e) => SyncCommandOutcome::failed(
                 ErrorClass::of(&e),
                 format!(
-                    "Pull from sync endpoint {} (tenant {}) failed: {e}. Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync pull`.",
+                    "Pull from sync endpoint {} (tenant {}) failed: {}",
                     client.endpoint(),
-                    client.tenant_id()
+                    client.tenant_id(),
+                    with_sentence_break(
+                        &e,
+                        "Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync pull`.",
+                    )
                 ),
             ),
         },
@@ -2770,14 +2786,14 @@ fn print_direct_events_status(status: &contextdb_engine::DirectEventsStatus) {
     for schedule in &status.schedules {
         println!(
             "  {} EVERY {} TX ({}) registered={} fired={} next_fire_at_ms={} \
-             last_fire_at_ms={:?}",
+             last_fire_at_ms={}",
             schedule.name,
             schedule.every,
             schedule.callback,
             schedule.callback_registered,
             schedule.fire_count,
             schedule.next_fire_at_ms,
-            schedule.last_fire_at_ms,
+            render_optional_value(schedule.last_fire_at_ms),
         );
     }
 }

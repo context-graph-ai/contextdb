@@ -255,14 +255,6 @@ pub(crate) static OPERATIONAL_COMMANDS: &[OperationalCommand] = &[
     },
 ];
 
-/// Classify a command without reconstructing an alias effect.
-#[allow(dead_code)]
-pub(crate) fn classify_meta_command(line: &str) -> CommandEffect {
-    resolve_meta_command(line)
-        .map(|declaration| declaration.effect)
-        .unwrap_or(CommandEffect::Invalid)
-}
-
 /// Resolve a spelling to the declaration that owns its effect.
 ///
 /// This is deliberately an internal seam: alias dispatch borrows the exact
@@ -309,26 +301,6 @@ pub(crate) fn authorize_meta_command_before_dispatch(
         }
         _ => Some(MetaCommandAuthorization::Dispatch(declaration)),
     }
-}
-
-/// The generated read-command discovery list from the canonical table.
-#[allow(dead_code)]
-pub(crate) fn read_command_discovery() -> Vec<&'static str> {
-    META_COMMANDS
-        .iter()
-        .filter(|declaration| declaration.effect == CommandEffect::StoreRead)
-        .map(|declaration| declaration.spelling)
-        .collect()
-}
-
-/// The generated requires-write discovery list from the canonical table.
-#[allow(dead_code)]
-pub(crate) fn requires_write_command_discovery() -> Vec<&'static str> {
-    META_COMMANDS
-        .iter()
-        .filter(|declaration| declaration.effect == CommandEffect::StoreWrite)
-        .map(|declaration| declaration.spelling)
-        .collect()
 }
 
 /// Return the trimmed argument tail only when `spelling` ends at a command
@@ -405,6 +377,61 @@ fn continuation_arguments_are_valid(arguments: &str) -> bool {
     invocation_arguments(arguments, "--continue").is_some_and(|token| !token.is_empty())
 }
 
+/// Longest registry spelling that is a prefix of `line`, ignoring whether the
+/// argument tail is legal. Used to refuse unknown trailing arguments through
+/// the same table that classifies the command, rather than per-handler checks.
+fn matching_declaration_and_arguments(line: &str) -> Option<(&'static CommandDeclaration, &str)> {
+    let line = line.trim();
+    let direct = META_COMMANDS
+        .iter()
+        .filter_map(|declaration| {
+            invocation_arguments(line, declaration.spelling)
+                .map(|arguments| (declaration, arguments))
+        })
+        .max_by_key(|(declaration, _)| declaration.spelling.len());
+    let aliased = CONVENTIONAL_ALIASES.iter().find_map(|alias| {
+        let arguments = invocation_arguments(line, alias.spelling)?;
+        let declaration = META_COMMANDS
+            .iter()
+            .find(|candidate| candidate.spelling == alias.canonical_spelling)?;
+        Some((declaration, arguments, alias.spelling.len()))
+    });
+    match (direct, aliased) {
+        (Some((declaration, arguments)), Some((alias_declaration, alias_arguments, alias_len))) => {
+            if alias_len > declaration.spelling.len() {
+                Some((alias_declaration, alias_arguments))
+            } else {
+                Some((declaration, arguments))
+            }
+        }
+        (Some(pair), None) => Some(pair),
+        (None, Some((declaration, arguments, _))) => Some((declaration, arguments)),
+        (None, None) => None,
+    }
+}
+
+/// Usage text when a recognized command is followed by arguments it does not
+/// take. Parent spellings such as `.sync` stay with their handlers so an
+/// unknown subcommand keeps the message that lists the operations that exist.
+pub(crate) fn unknown_trailing_arguments_usage(line: &str) -> Option<String> {
+    let (declaration, arguments) = matching_declaration_and_arguments(line)?;
+    if declaration.effect == CommandEffect::Invalid {
+        return None;
+    }
+    if arguments.is_empty() || invocation_is_valid(declaration, arguments) {
+        return None;
+    }
+    // A word tail that is not a flag stays with the command handler, so a
+    // spelling that is not a legal argument remains independently unknown.
+    if !arguments
+        .split_whitespace()
+        .any(|word| word.starts_with('-'))
+    {
+        return None;
+    }
+    Some(format!("Usage: {}", help_signature(declaration.spelling)))
+}
+
 /// The top-level operation spellings for ordinary `--help` discovery.
 pub fn operational_command_discovery() -> Vec<&'static str> {
     OPERATIONAL_COMMANDS
@@ -417,6 +444,12 @@ pub fn operational_command_discovery() -> Vec<&'static str> {
 mod contract_tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn effect_of(line: &str) -> CommandEffect {
+        resolve_meta_command(line)
+            .map(|declaration| declaration.effect)
+            .unwrap_or(CommandEffect::Invalid)
+    }
 
     const EXPECTED_META_COMMANDS: &[CommandDeclaration] = &[
         CommandDeclaration {
@@ -662,7 +695,7 @@ mod contract_tests {
             ("\\?vector", CommandEffect::Invalid),
         ] {
             assert_eq!(
-                classify_meta_command(line),
+                effect_of(line),
                 effect,
                 "{line} must retain its declared effect"
             );
@@ -685,12 +718,12 @@ mod contract_tests {
                 "{alias} must borrow {canonical}'s canonical declaration, not reconstruct an equal effect"
             );
             assert_eq!(
-                classify_meta_command(alias),
+                effect_of(alias),
                 alias_row.effect,
                 "{alias} classification must come from its resolved canonical declaration"
             );
             assert_eq!(
-                classify_meta_command(canonical),
+                effect_of(canonical),
                 canonical_row.effect,
                 "{canonical} classification must come from its resolved canonical declaration"
             );
@@ -724,7 +757,7 @@ mod contract_tests {
         ] {
             let resolved = resolve_meta_command(line).expect("declared command must resolve");
             assert_eq!(
-                classify_meta_command(line),
+                effect_of(line),
                 resolved.effect,
                 "{line} classification must match its canonical registry row"
             );
@@ -737,22 +770,10 @@ mod contract_tests {
             META_COMMANDS, EXPECTED_META_COMMANDS,
             "a missing registry must not make discovery vacuous"
         );
-        let reads: Vec<_> = META_COMMANDS
-            .iter()
-            .filter(|row| row.effect == CommandEffect::StoreRead)
-            .map(|row| row.spelling)
-            .collect();
-        let writes: Vec<_> = META_COMMANDS
-            .iter()
-            .filter(|row| row.effect == CommandEffect::StoreWrite)
-            .map(|row| row.spelling)
-            .collect();
         let operational: Vec<_> = OPERATIONAL_COMMANDS
             .iter()
             .map(|row| row.spelling)
             .collect();
-        assert_eq!(read_command_discovery(), reads);
-        assert_eq!(requires_write_command_discovery(), writes);
         assert_eq!(operational_command_discovery(), operational);
         assert!(!operational_command_discovery().contains(&"repair"));
     }
@@ -819,5 +840,24 @@ mod contract_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unknown_trailing_arguments_use_the_registry_usage_text() {
+        assert_eq!(
+            unknown_trailing_arguments_usage(".sync status --json").as_deref(),
+            Some("Usage: .sync status")
+        );
+        assert_eq!(
+            unknown_trailing_arguments_usage(".events status --json").as_deref(),
+            Some("Usage: .events status")
+        );
+        assert_eq!(unknown_trailing_arguments_usage(".sync status"), None);
+        assert_eq!(unknown_trailing_arguments_usage(".events status"), None);
+        assert_eq!(unknown_trailing_arguments_usage(".sync bogus"), None);
+        assert_eq!(
+            unknown_trailing_arguments_usage(".sync policy notes LatestWins"),
+            None
+        );
     }
 }

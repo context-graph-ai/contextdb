@@ -10,8 +10,8 @@
 //! contract documented in `docs/cli.md`, not a Rust API.
 
 use contextdb_core::read_contract::{
-    CursorExpiryKind, CursorPage, OwnerReadStatus, OwnerServingReason, OwnerServingState,
-    ReadFailure, ReadFailureClass, ReadFailureDetail, ReadFailureKind, ReadFailureLimit, ReadRoute,
+    CursorExpiryKind, CursorPage, OwnerServingReason, OwnerServingState, ReadFailure,
+    ReadFailureClass, ReadFailureDetail, ReadFailureKind, ReadFailureLimit, ReadRoute,
 };
 use contextdb_engine::QueryResult;
 use contextdb_engine::database::QueryTrace;
@@ -538,27 +538,6 @@ pub(crate) fn owner_report_document(report: &OwnerReport) -> Value {
     json!({ "owner": Value::Object(owner) })
 }
 
-/// `.owner status` — the file-backed process owner, never sync health. A
-/// reason is absent rather than null when the state has none to give.
-#[allow(dead_code)]
-pub(crate) fn owner_status_document(status: &OwnerReadStatus) -> Value {
-    let mut owner = Map::new();
-    owner.insert(
-        "state".to_string(),
-        json!(owner_serving_state_wire_word(status.state)),
-    );
-    if let Some(reason) = &status.reason {
-        owner.insert(
-            "reason".to_string(),
-            json!(owner_serving_reason_wire_word(reason)),
-        );
-        if let OwnerServingReason::StartupFailure(detail) = reason {
-            owner.insert("detail".to_string(), json!(detail));
-        }
-    }
-    json!({ "owner": Value::Object(owner) })
-}
-
 /// `.schema <table>` — the table's declared contract as data, rendered from the
 /// body the metadata door publishes.
 ///
@@ -841,22 +820,6 @@ pub(crate) fn events_status_body_document(
                 Some(token) => json!(token),
                 None => Value::Null,
             },
-        }
-    })
-}
-
-/// `.explain <sql>` from the door's body. The door PLANS and never applies, so
-/// no runtime trace was collected and it says so rather than implying one.
-#[allow(dead_code)]
-pub(crate) fn explain_body_document(physical_plan: &str, index: Option<&str>) -> Value {
-    json!({
-        "explain": {
-            "physical_plan": physical_plan.trim_end(),
-            "index_used": match index {
-                Some(index) => json!(index),
-                None => Value::Null,
-            },
-            "runtime_trace": false,
         }
     })
 }

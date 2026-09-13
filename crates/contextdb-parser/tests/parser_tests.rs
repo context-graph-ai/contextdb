@@ -1,6 +1,7 @@
 use contextdb_core::Error;
 use contextdb_parser::ast::{
-    AstPropagationRule, BinOp, Cte, EdgeDirection, Expr, ForeignKey, FromItem, Literal, Statement,
+    AlterAction, AstPropagationRule, BinOp, Cte, EdgeDirection, Expr, ForeignKey, FromItem,
+    Literal, Statement,
 };
 use contextdb_parser::parse;
 
@@ -50,6 +51,42 @@ fn parse_valid_sql_subset() {
     // CRITICAL-2: return_cols mirrors columns
     assert_eq!(mc.return_cols.len(), cols.len());
     assert_eq!(mc.return_cols[0].alias.as_deref(), Some(&cols[0].alias[..]));
+}
+
+#[test]
+fn alter_table_drop_accepts_optional_column_keyword() {
+    for sql in ["ALTER TABLE t DROP a", "ALTER TABLE t DROP COLUMN a"] {
+        match parse(sql) {
+            Ok(Statement::AlterTable(table)) => match table.action {
+                AlterAction::DropColumn { column, cascade } => {
+                    assert_eq!(column, "a", "{sql}");
+                    assert!(!cascade, "{sql}");
+                }
+                other => panic!("{sql} should drop column a, got {other:?}"),
+            },
+            other => panic!("{sql} should parse, got {other:?}"),
+        }
+    }
+    match parse("ALTER TABLE t ADD note TEXT") {
+        Ok(Statement::AlterTable(table)) => {
+            assert!(
+                matches!(table.action, AlterAction::AddColumn(_)),
+                "ADD without COLUMN must still parse, got {:?}",
+                table.action
+            );
+        }
+        other => panic!("ADD without COLUMN should parse, got {other:?}"),
+    }
+    match parse("ALTER TABLE t DROP RETAIN") {
+        Ok(Statement::AlterTable(table)) => {
+            assert!(
+                matches!(table.action, AlterAction::DropRetain),
+                "DROP RETAIN must stay drop-retain, got {:?}",
+                table.action
+            );
+        }
+        other => panic!("DROP RETAIN should parse as drop-retain, got {other:?}"),
+    }
 }
 
 #[test]

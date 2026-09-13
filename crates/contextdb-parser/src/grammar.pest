@@ -213,7 +213,10 @@ set_history_action = { ^"SET" ~ history_option }
 set_sync_conflict_action = { ^"SET" ~ sync_conflict_option }
 set_sync_direction_action = { ^"SET" ~ sync_direction_option }
 add_column_action = { ^"ADD" ~ (^"COLUMN")? ~ column_def }
-drop_column_action = { ^"DROP" ~ ^"COLUMN" ~ identifier ~ drop_column_modifier? }
+drop_column_action = {
+    (^"DROP" ~ ^"COLUMN" ~ identifier ~ drop_column_modifier?)
+    | (^"DROP" ~ !^"RETAIN" ~ !^"SYNC_CONFLICT_POLICY" ~ identifier ~ drop_column_modifier?)
+}
 drop_column_modifier = { ^"RESTRICT" | ^"CASCADE" }
 rename_column_action = { ^"RENAME" ~ ^"COLUMN" ~ identifier ~ ^"TO" ~ identifier }
 

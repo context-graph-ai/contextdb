@@ -646,7 +646,7 @@ fn maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli()
         "vector_remaining_partitions=0",
         "vector_failure_operation=none",
         "vector_failure_requested_bytes=none",
-        "vector_failure_recovery_instruction=\"none\"",
+        "vector_failure_recovery_instruction=none",
     ] {
         assert!(
             outcome.stdout.contains(field),

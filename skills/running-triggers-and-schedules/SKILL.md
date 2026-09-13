@@ -139,7 +139,7 @@ Sinks:
 Routes:
   (none)
 Schedules:
-  heartbeat EVERY 200 MILLISECONDS TX (heartbeat_cb) registered=true fired=4 next_fire_at_ms=1788021562626 last_fire_at_ms=Some(1788021562426)
+  heartbeat EVERY 200 MILLISECONDS TX (heartbeat_cb) registered=true fired=4 next_fire_at_ms=1788021562626 last_fire_at_ms=1788021562426
 has_more: false
 ```
 

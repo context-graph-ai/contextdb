@@ -478,7 +478,13 @@ fn repeated_cancelled_waits_against_a_stuck_holder_do_not_pile_up() {
     // Twenty abandoned acquisitions would all be queued for the exclusive hold
     // the release just freed, and the first of them would be holding it now.
     // One fresh wait answered at once is twenty proofs that none of them are.
-    let after = released_store_answer(&path, "after {REPEATED_WAITS} cancelled waits");
+    let after_label = format!("after {REPEATED_WAITS} cancelled waits");
+    assert_eq!(after_label, "after 20 cancelled waits");
+    assert!(
+        after_label.contains(&REPEATED_WAITS.to_string()),
+        "the wait-failure label must carry the number of waits, got {after_label}"
+    );
+    let after = released_store_answer(&path, &after_label);
     assert!(
         matches!(after, ReaderReleaseWait::Released),
         "after {REPEATED_WAITS} cancelled waits the released store is free to the next caller, \

@@ -141,7 +141,14 @@ pub fn render_value(v: &Value) -> String {
         Value::Uuid(u) => u.to_string(),
         Value::Timestamp(ts) => ts.to_string(),
         Value::Json(j) => j.to_string(),
-        Value::Vector(vec) => format!("{:?}", vec),
+        Value::Vector(vec) => {
+            let inner = vec
+                .iter()
+                .map(|component| format!("{component:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{inner}]")
+        }
         Value::TxId(tx) => tx.0.to_string(),
     }
 }

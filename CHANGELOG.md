@@ -4,6 +4,16 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
+- **Fixed.** A dotted command with an unknown trailing argument, including
+  `.sync status --json`, is refused with that command's usage text and a
+  non-zero exit. Plain `.sync status` is unchanged.
+- **Fixed.** Human CLI output prints optional values as the value itself (or
+  `none`) rather than Rust `Some(...)` / quoted Debug forms, and no longer
+  doubles the period after an error that already ended with one.
+- **Fixed.** `ALTER TABLE t DROP a` parses the same way as
+  `ALTER TABLE t DROP COLUMN a`.
+- **Fixed.** A coordination-wait failure names how many cancelled waits ran,
+  instead of printing the placeholder `{REPEATED_WAITS}`.
 - **Fixed.** A bounded owner read that the kernel cancels while the reader
   interrupts it or closes its cursor is reported as a cancelled read, not as an
   unimplemented feature. A timeout or disconnect still reports the owner-timeout

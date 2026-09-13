@@ -69,7 +69,7 @@ CREATE TABLE items (
 
 ```sql
 ALTER TABLE t ADD [COLUMN] col TYPE
-ALTER TABLE t DROP COLUMN col
+ALTER TABLE t DROP [COLUMN] col
 ALTER TABLE t RENAME COLUMN old TO new
 ALTER TABLE t SET RETAIN 7 DAYS [SYNC SAFE]
 ALTER TABLE t DROP RETAIN
@@ -82,8 +82,8 @@ ALTER TABLE t ALTER COLUMN vector_col SET AUTO_INDEX_AT positive_integer | DEFAU
 ALTER TABLE t ALTER COLUMN vector_col SET HNSW DEFAULT | (M = positive_integer | DEFAULT, EF_CONSTRUCTION = positive_integer | DEFAULT, EF_SEARCH = positive_integer | DEFAULT)
 ```
 
-`COLUMN` is optional on `ADD` but required on `DROP` — `ALTER TABLE t DROP a` does not parse;
-write `ALTER TABLE t DROP COLUMN a`.
+`COLUMN` is optional on `ADD` and on `DROP` — `ALTER TABLE t DROP a` and `ALTER TABLE t DROP COLUMN a` both parse.
+<!-- enforced by: parser_tests::alter_table_drop_accepts_optional_column_keyword -->
 
 A table's conflict policy is declared on the table itself with the
 `SYNC CONFLICT KEEP FIRST | KEEP LATEST` clause (see CREATE TABLE), and can
@@ -1505,6 +1505,7 @@ DROP INDEX IF EXISTS idx_bucket ON documents;
 ### ALTER TABLE DROP COLUMN
 
 ```sql
+ALTER TABLE t DROP a;                     -- COLUMN is optional
 ALTER TABLE t DROP COLUMN a;              -- defaults to RESTRICT
 ALTER TABLE t DROP COLUMN a RESTRICT;     -- explicit
 ALTER TABLE t DROP COLUMN a CASCADE;      -- drops dependent indexes
