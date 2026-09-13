@@ -158,10 +158,10 @@ Describe the capability, then go to the crate that owns it — do not go looking
 - **Time-dependent behavior uses the clock seam.** Two audits enforce it on every gate; the
   mechanics (`Wallclock::test_clock_guard`, the thread-local limitation, the ratchet you may
   lower but never raise) are in [`crates/contextdb-engine/AGENTS.md`](crates/contextdb-engine/AGENTS.md).
-- **When `timestamp_audit` fails on a change that touched no timestamps:** its whitelist is
-  pinned by line number, so any line-count shift in a whitelisted file trips it. Do not disable
-  or re-scope the audit — update the pinned line numbers to their new positions in the same
-  commit and say so in the message.
+- **When `timestamp_audit` fails on a change that touched no timestamp columns:** its whitelist
+  is pinned by declaration text, so a line-count shift in a whitelisted file does not trip it.
+  A new `created_at`/`valid_from`/`valid_to TIMESTAMP` declaration, or a removed whitelisted
+  declaration, does. Do not disable or re-scope the audit. It scans git-tracked files only.
 - **Testability touches in `src/` are production-dead** — `#[doc(hidden)] ..._for_test`
   accessors or unused-in-production seams. Anything else is a behavior change and needs its own
   proof (benchmark + full gate), stated in the commit.
