@@ -17,11 +17,15 @@ cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
 
 ## Before Submitting a PR
 
-All nine checks must pass. The final check installs the release binaries into an
-isolated root and drives the production ticketed-Iroh durability smoke; its
+All nine must pass before any commit, release, or "done" claim. The last installs isolated
+release binaries and drives the production ticketed-Iroh durability smoke; its
 feature-gated verifier is not part of the ordinary product CLI.
 The smoke uses Bash 3.2-compatible syntax and requires GNU `timeout`; macOS
 contributors can install it as `gtimeout` with `brew install coreutils`.
+
+**Run `cargo fmt --all` before you consider yourself done — formatting is the gate's first
+command, and an otherwise-correct change fails immediately on an unformatted line.** Run it first
+when you start and again as the last thing you do.
 
 ```bash
 cargo fmt --all --check

@@ -30,8 +30,8 @@ Earlier versions: see git tags.
 - **Distribution and maintenance.** The engine's registry dependency is the maintained
   `contextdb-redb` 4.1.0 package, retaining library name `redb`, published before the engine.
   The fork carries the complete upstream integration suite and locked dev dependencies. Release
-  requires its standalone format, lint and test gates plus an actual unpacked-engine build against
-  the unpacked fork; the tag publication job must depend on those checks for the same commit.
+  requires its standalone format, lint and test checks plus an actual unpacked-engine build against
+  the unpacked fork.
   `crates/contextdb-redb/MAINTENANCE.md` records upstream identity, the reproducible source delta,
   upgrades, and the upstream-proposal path. The HNSW engine is the maintained `contextdb-hnsw`
   package (library name `hnsw_rs`), published before `contextdb-vector`;
@@ -132,8 +132,7 @@ Earlier versions: see git tags.
   `--read-result-rows` / `--read-result-bytes` ceilings, and the refusal carries the
   `.cursor open` command that pages it. Diagnosis and format upgrades go through the sanctioned
   `contextdb diagnose <path>` and one-door `contextdb migrate <path>` surface; the old repair
-  guidance is gone. Every recipe in `AGENTS.md`, `skills/*/SKILL.md`, `README.md`, and `docs/`
-  has been brought onto this contract.
+  guidance is gone.
 - **Removed.** The `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` environment override for the same-DB
   trigger deadlock guard is gone; no environment variable adjusts it anymore, matching the
   environment-is-not-a-behavior-surface convention. The guard keeps its fixed 60-second default.
@@ -304,8 +303,6 @@ Earlier versions: see git tags.
 - Boolean literals (`TRUE`/`FALSE`) are valid predicates everywhere a predicate is legal, including `JOIN ... ON TRUE`.
 - **Fixed.** The parser could abort the process on multi-byte UTF-8 near a keyword lookahead; it now parses or rejects, never panics.
 - The CLI accepts standard multi-line, semicolon-terminated SQL in both interactive and piped modes (statements end at `;` outside quotes and comments, or at end of piped input), so multi-line schema files and documentation examples run as pasted.
-- The manual `workflow_dispatch` trigger was added to CI so the full gate can be run on demand against any branch.
-- Test-harness: acceptance and integration suites resolve the spawned CLI/server binary through one shared resolver that picks the most recently built profile (override with `CONTEXTDB_TEST_BIN_PROFILE`), so a stale binary can no longer produce false results.
 - CLI exit codes are now one documented four-value table honored by every binary (`docs/cli.md`, "Exit Codes"): `0` success, `1` error, `2` usage, `3` an interrupted push whose outcome the hub never confirmed.
 - **Behavior change.** Every error now goes to stderr and fails the run. Runtime errors (constraint violations, immutable-column writes, and the rest of the former "non-fatal" class) previously printed to stdout and left the exit code at `0`; a script branching on `$?` could not see them.
 - **Behavior change.** `.sync push`, `pull`, `reconnect`, `destination`, `direction` and `policy` now fail when the CLI was started without `--tenant-id`, instead of printing "Sync not configured" to stdout and exiting `0`. `.sync status` and `.sync auto` still answer and exit `0`.
@@ -325,8 +322,8 @@ Earlier versions: see git tags.
 
 ## v1.1.0
 
-- TriggerActiveSameDBProgress: same-DB cross-thread trigger contention now waits-and-proceeds inside the engine instead of surfacing retry churn to callers.
+- Same-DB cross-thread trigger contention now waits-and-proceeds inside the engine instead of surfacing retry churn to callers.
 - `CallbackActiveCrossThread { Trigger }` keeps its exact Display string, but its normal trigger scope narrows to captured callback tx-bound handles used from the wrong thread and deadlock-guard timeout paths; unrelated cross-DB writers proceed independently.
 - Added a bounded same-DB trigger wait guard. Default: 60 seconds.
 - Deadlock-guard timeouts emit one structured `tracing::warn!` with `trigger_name`, `waited_ms`, and `surface`.
-- Class A callback-thread misuse returns `CallbackReentry`; cron same-DB callback contention remains an immediate typed callback-active error.
+- Callback-thread reentry returns `CallbackReentry`; cron same-DB callback contention remains an immediate typed callback-active error.

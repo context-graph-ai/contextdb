@@ -64,18 +64,11 @@ correct answer, rejects a wrong one) and one way on `.explain` (rejects a wrong 
 The honest result: the strongest model tested did not clear the bar within the fixed 25-turn
 budget. On the `LENGTH` exercise it repeatedly produced a semantically correct implementation
 with its own tests, but ran out of turns before running `cargo fmt`, and the unformatted diff
-failed the gate's first step. On the `.explain` exercise, which touches more files across the
+failed the verification's first step. On the `.explain` exercise, which touches more files across the
 parser, planner, and CLI, it spent its full turn budget exploring the codebase and never reached
 an edit.
 
-## What the measurement changed here
-
-Running this measurement was not just an audit — it found and fixed real problems in the
-repository it was measuring. A near-miss caused purely by unformatted code led to a direct
-reminder in `AGENTS.md` telling contributors to run `cargo fmt --all` before considering a
-change done. Flaky sync tests that raced real wall-clock sleeps were rewritten to run on
-injected virtual time instead. The verification gate itself was fixed to build and check
-correctly from a plain source export rather than assuming a git checkout was present. And the
-sync guide's cross-network guidance (NAT traversal, hub-log expectations) was corrected against
-what actually happens on a real two-machine run. The measurement exists to improve this surface,
-and it did.
+Formatting is the first verification command: an otherwise-correct change fails immediately on
+an unformatted line. Time-dependent tests use the injected clock seam rather than wall-clock
+sleeps. The packaged-engine check builds from a plain source export. The sync skill's
+cross-network guidance matches a real two-machine run (NAT traversal and hub-log expectations).

@@ -11,23 +11,9 @@ Two different jobs bring an agent here. Pick one; you do not need the other half
 
 ### Reading is safe by default
 
-Plain `contextdb <path>` opens an existing store for a bounded **read session** — it never
-creates the store, never opens it through a writable handle, and leaves every byte in the store
-folder unchanged. A no-op meta-command like `.help` does not rewrite anything either. The session
-resolves one of two read routes and never switches mid-session:
-
-- **Owner route** — a live process already owns the store, so the session is served that
-  owner's committed state over its authenticated local channel.
-- **File route** — nobody owns the store, so the session reads the committed snapshot directly
-  from the file. Several direct readers coexist on one store.
-
-There is nothing to copy first — reading never requires a peek copy. Two contracts to know
-before you script against this:
-
-- **A missing store is refused, not created.** `contextdb <path>` against a path that does not
-  exist returns `store_not_found`; only `contextdb <path> --write` creates it.
-- **Mutation needs the flag.** SQL or a meta-command that would change state is refused with
-  `write_requires_flag` on a read session — add `--write` to run it.
+Plain `contextdb <path>` is a bounded read session; the `--write` flag, missing-store
+refusal, owner-vs-file routing, and that `.help` rewrites nothing are in
+[`docs/cli.md`](docs/cli.md#cli-client-contextdb).
 
 ```bash
 contextdb ./their.db                              # bounded read session, never modifies
@@ -97,16 +83,8 @@ printf "%s\n" \
 only reading the store back.
 
 Prefer `--json` and read named fields; never scrape the human table output, which reflows freely.
-A successful ordinary `SELECT` is one namespaced document — `{"result":{"columns":[…],"rows":[…]}}`
-— so a consumer reads `.result.rows`, and metadata commands answer under their own keys
-(`.tables` → `{"tables":{"items":[…],"has_more":…,"continuation":…}}`). Nothing truncates a
-result and there is no row cap to disable: a result either publishes complete or refuses with
-`owner_limit_exceeded` under the declared `--read-result-rows` / `--read-result-bytes` ceilings,
-and the refusal prints the `.cursor open` command that pages it instead. Under `--json`, stdout is
-JSON Lines (results only) and everything else — errors `{"error":{"class":...}}`, notices, traces
-— goes to stderr. Branch on the exit code:
-`0` success, `1` the run failed, `2` the command line was wrong so nothing ran, `3` a `.sync push`
-was interrupted and is unconfirmed, so re-push (never treat `3` as failure).
+JSON document shapes and the four exit codes are in
+[`docs/cli.md`](docs/cli.md#--json).
 
 Task-shaped recipes, copy-paste runnable. Read the one matching what you are doing.
 
@@ -128,54 +106,24 @@ Reference docs, when a skill is not enough:
 | [`docs/cli.md`](docs/cli.md) | Every flag and meta-command, the `--json` document shapes, the exit-code table |
 | [`docs/query-language.md`](docs/query-language.md) | SQL surface, `GRAPH_TABLE` traversal, vector search, constraints, what is unsupported |
 | [`docs/architecture.md`](docs/architecture.md) | Crate map, MVCC, sync protocol, work ledger and blob plane, upgrades and recovery |
-| [`docs/usage-scenarios.md`](docs/usage-scenarios.md) | 16 problem-first walkthroughs with SQL |
+| [`docs/usage-scenarios.md`](docs/usage-scenarios.md) | Walkthroughs with SQL |
 | [`docs/why-contextdb.md`](docs/why-contextdb.md) | Problem statement and comparison with alternatives |
 | [`docs/capability-index.md`](docs/capability-index.md) | One page: what contextdb is, is not, and the numbers it stops at |
 | [`docs/agent-readiness.md`](docs/agent-readiness.md) | How this repo measures whether AI assistants can use and contribute to it |
 
-contextdb ships **no built-in schema**. `decisions`, `observations`, `entities`, `edges` and
-friends are example tables the docs define; you define your own and attach policy to them.
-
-Two policy declarations decide by themselves whether your data survives — pick deliberately:
-
-| Situation | Declare | Consequence you are accepting |
-|---|---|---|
-| A row's first value is the fleet's value (facts, immutable observations) | `SYNC CONFLICT KEEP FIRST` (the default) | Later writes to that key lose — **including deletes**, which are arbitrated exactly like writes and will not propagate off the originating edge. |
-| A row is a replaceable current-state cell (status, config, cursors) | `SYNC CONFLICT KEEP LATEST` | The last hub-accepted write wins; deletes propagate. |
+contextdb ships no built-in schema; the `decisions` example and that framing live in the
+[README](README.md). Conflict policy (`KEEP FIRST` vs `KEEP LATEST`) is in
+[`docs/query-language.md`](docs/query-language.md#table-options), with one recipe in
+[`skills/sync`](skills/sync/SKILL.md#7-a-delete-that-stays-deleted--across-sync-and-restart).
 
 ## Contribute (change this repo)
 
 ### Verification gate
 
-All nine must pass before any commit, release, or "done" claim. The last installs isolated
-release binaries and drives the production ticketed-Iroh durability smoke.
-
-**Run `cargo fmt --all` before you consider yourself done — formatting is the gate's first
-command, and an otherwise-correct change fails immediately on an unformatted line.** Run it first
-when you start and again as the last thing you do.
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check
-cargo clippy --manifest-path crates/contextdb-redb/Cargo.toml --all-targets -- -D warnings
-cargo test --workspace
-cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked
-cargo build --release
-bash scripts/verify-packaged-engine.sh
-install_root="$(mktemp -d)"
-cargo install --locked --path crates/contextdb-cli --root "$install_root"
-cargo install --locked --path crates/contextdb-server --root "$install_root" \
-  --features production-smoke-driver --bins
-CONTEXTDB_CLI="$install_root/bin/contextdb" \
-CONTEXTDB_SMOKE_DRIVER="$install_root/bin/contextdb-smoke-driver" \
-CONTEXTDB_SERVER="$install_root/bin/contextdb-server" \
-  scripts/installed-release-durable-sync-smoke.sh
-```
-
-`CONTRIBUTING.md` lists the same nine steps for outside contributors; the two documents agree.
-Read the disk and single-build rules in [Safety boundaries](#one-cargo-build-at-a-time-and-check-the-disk-first)
-before you start `cargo test --workspace`. Narrower suites while iterating:
+The nine-command verification gate is in [`CONTRIBUTING.md`](CONTRIBUTING.md). All nine must
+pass before any commit, release, or "done" claim. Read the disk and single-build rules in
+[Safety boundaries](#one-cargo-build-at-a-time-and-check-the-disk-first) before you start
+`cargo test --workspace`. Narrower suites while iterating:
 `cargo test -p contextdb-engine --test acceptance`, `--test integration`, `--test sql_surface`.
 
 ### Where a change lives
@@ -225,25 +173,26 @@ Describe the capability, then go to the crate that owns it — do not go looking
 
 ### Crate guides
 
-Ten crates carry a guide: what the crate owns and must not own, its seams, each invariant with
+Every crate carries a guide: what the crate owns and must not own, its seams, each invariant with
 the test that guards it, where a change lands, and the fast test command. A guide adds to this file
 rather than overriding it. Read the matching one before you edit that crate.
+[`docs/architecture.md`](docs/architecture.md#crate-map) maps every crate and the dependency
+direction.
 
 | Crate | Guide | Rule to know before editing |
 |---|---|---|
 | `contextdb-cli` | [`crates/contextdb-cli/AGENTS.md`](crates/contextdb-cli/AGENTS.md) | The CLI and REPL surface; behavior belongs to the engine. |
 | `contextdb-core` | [`crates/contextdb-core/AGENTS.md`](crates/contextdb-core/AGENTS.md) | Shared types, errors and the read-contract vocabulary; the workspace audits live in its `tests/`. |
 | `contextdb-engine` | [`crates/contextdb-engine/AGENTS.md`](crates/contextdb-engine/AGENTS.md) | Clock-seam discipline: every persisted timestamp goes through `Wallclock::now()`; the test-estate ratchet audit enforces it. |
+| `contextdb-graph` | [`crates/contextdb-graph/AGENTS.md`](crates/contextdb-graph/AGENTS.md) | Adjacency index and bounded BFS; DAG cycle refusal on insert. |
 | `contextdb-hnsw` | [`crates/contextdb-hnsw/AGENTS.md`](crates/contextdb-hnsw/AGENTS.md) | Maintained fork of `hnsw_rs` 0.3.4: the delta stays minimal and additive code lives in `contextdb-vector`; see its `MAINTENANCE.md`. |
 | `contextdb-parser` | [`crates/contextdb-parser/AGENTS.md`](crates/contextdb-parser/AGENTS.md) | Char-boundary discipline: every fixed-width lookahead over input must be boundary-safe, or multi-byte UTF-8 panics the parser. |
 | `contextdb-planner` | [`crates/contextdb-planner/AGENTS.md`](crates/contextdb-planner/AGENTS.md) | Turns the parsed statement into a physical plan. |
 | `contextdb-redb` | [`crates/contextdb-redb/AGENTS.md`](crates/contextdb-redb/AGENTS.md) | Maintained fork of redb 4.1.0, outside the workspace: the delta stays minimal and additive code lives in the engine; see its `MAINTENANCE.md`. |
 | `contextdb-relational` | [`crates/contextdb-relational/AGENTS.md`](crates/contextdb-relational/AGENTS.md) | Row storage, scan, insert, upsert and delete. |
 | `contextdb-server` | [`crates/contextdb-server/AGENTS.md`](crates/contextdb-server/AGENTS.md) | The sync mover: sync semantics are the engine's and re-exported; never a mirror module. |
+| `contextdb-tx` | [`crates/contextdb-tx/AGENTS.md`](crates/contextdb-tx/AGENTS.md) | MVCC transaction manager and deferred-apply write sets. |
 | `contextdb-vector` | [`crates/contextdb-vector/AGENTS.md`](crates/contextdb-vector/AGENTS.md) | Partitioned maintained vector search; most of its tests need `--features test-seams`. |
-
-`contextdb-graph` and `contextdb-tx` have no guide; [`docs/architecture.md`](docs/architecture.md#crate-map)
-maps every crate and the dependency direction.
 
 ### Releases
 

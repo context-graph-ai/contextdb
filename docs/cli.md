@@ -17,7 +17,9 @@ contextdb <PATH> [OPTIONS]
 
 **Reading is the default.** `contextdb <PATH>` opens an existing store for bounded, read-only
 inspection: it never creates the store, never mutates it, and leaves every byte in the store
-folder unchanged. <!-- enforced by: read_cli_journeys_invocation::reading_an_idle_store_leaves_every_byte_and_the_folder_listing_unchanged, read_cli_journeys_invocation::bare_path_on_a_missing_store_refuses_and_creates_nothing --> Anything that would write — creating a
+folder unchanged. A no-op meta-command like `.help` does not rewrite anything either. There is
+nothing to copy first — reading never requires a peek copy.
+<!-- enforced by: read_cli_journeys_invocation::reading_an_idle_store_leaves_every_byte_and_the_folder_listing_unchanged, read_cli_journeys_invocation::bare_path_on_a_missing_store_refuses_and_creates_nothing --> Anything that would write — creating a
 store, DML, DDL, transactions, maintenance, sync operations — takes the explicit `--write`
 flag; a read session refuses it before execution with `write_requires_flag`.
 <!-- enforced by: read_cli_journeys_invocation::a_reading_session_refuses_every_mutating_statement_before_it_executes, read_cli_journeys_invocation::writer_only_meta_commands_are_refused_in_a_reading_session -->
@@ -465,7 +467,7 @@ Paste a meta-command's whole invocation, including any SQL argument, on one line
 | `.trace on` / `.trace off` | | session | Toggle one-line execution traces. |
 | `.events status [--continue <c>]` | | read | Bounded, resumable event/sink/route/schedule health. |
 | `.maintenance status` | | read | One complete bounded maintenance-state response. |
-| `.maintenance run` / `.maintenance compact` | | **write** | Advance one maintenance cycle / explicitly drain file compaction. |
+| `.maintenance run` / `.maintenance compact` | | **write** | Run one synchronous maintenance cycle / explicitly drain file compaction. |
 | `.cursor open/fetch/close` | | read | Bounded traversal beyond an ordinary-result ceiling. |
 | `.owner status` | | status | Owner policy and state; works at capacity. |
 | `.sync status` | | session | Current CLI session's sync state only. |
@@ -482,6 +484,25 @@ classification exactly:
 | `\?` | `.help` |
 
 `\trace` and `\sync` do not exist. <!-- enforced by: read_cli_journeys_session_shape::removed_aliases_are_not_accepted_spellings, read_cli_journeys_session_shape::conventional_aliases_keep_the_classification_of_the_commands_they_spell -->
+
+`.maintenance run` drives one synchronous maintenance cycle on this process: it
+expires rows whose table declared `RETAIN`, reclaims superseded versions on
+`HISTORY CURRENT ONLY` tables, advances vector index work, and may attempt
+automatic file compaction. Use it when the next statement must see that cycle
+finish — in particular a `--write` session opened with `--maintenance
+caller-driven`, which starts no background worker and leaves scheduling to this
+command. An idle file-backed store prints one line of counters:
+
+```text
+pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true vector_built_indexes=0 vector_remaining_indexes=0 vector_nonempty_partitions=0 vector_ready_partitions=0 vector_built_partitions=0 vector_remaining_partitions=0 vector_first_failure=none vector_failure_operation=none vector_failure_requested_bytes=none vector_failure_available_bytes=none vector_failure_current_bytes=none vector_failure_budget_limit_bytes=none vector_failure_message="none" vector_failure_recovery_action=none vector_failure_recovery_instruction="none"
+```
+
+`--json` emits one `maintenance_cycle` document with those same facts as named
+fields (`pruned_rows`, `rows_deferred_for_readers`, `reclaimed_bytes`,
+`file_shrank`, `currency_pruned_versions`, `currency_versions_deferred_for_readers`,
+`currency_redb_compacted`, `pruned_trigger_audit_rows`, `vector`, `compaction`).
+Compaction byte counts and duration depend on the file.
+<!-- enforced by: read_cli_journeys_ordinary_results::maintenance_run_and_status_publish_their_text_receipts_through_the_real_cli -->
 
 ### Trace vs Explain
 
@@ -768,6 +789,13 @@ contextdb-server --tenant-id <TENANT_ID> [OPTIONS]
 The four resource-policy controls are top-level flags; the endpoint string carries only
 transport identity and routing (identity, port, relay, publish, lookup).
 <!-- enforced by: contextdb-server::server_resource_policy_contract_tests -->
+
+In the default build a hub is reached by the direct addresses carried in its
+enrollment ticket. A DHCP reassignment of the hub's IP breaks dialing until the
+ticket is re-issued and re-pasted. The sticky port recorded beside the identity
+key only survives restarts on the same address; LAN self-healing across IP
+changes needs a build with the `mdns` cargo feature (`lookup=mdns`).
+<!-- enforced by: iroh_transport_tests::hub_restart_without_port_keeps_the_same_ticket, iroh_transport_tests::ticket_round_trips_as_opaque_config_string -->
 
 Everything else about the server — the enrollment ticket contract and its sensitivity, relay and
 address-lookup configuration, restart semantics and port stickiness, files on disk

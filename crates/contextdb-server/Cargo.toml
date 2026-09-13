@@ -185,6 +185,10 @@ harness = false
 path = "../../benches/sync_pr.rs"
 required-features = ["iroh"]
 
+[[example]]
+name = "work_fabric_two_nodes"
+required-features = ["test-seams"]
+
 [[bench]]
 name = "blob_transfer"
 harness = false

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sync policy-declaration linter (R13 script for the `sync` skill). Given a store,
+# Sync policy-declaration linter for the `sync` skill. Given a store,
 # lists every table lacking an explicit SYNC CONFLICT declaration, and flags any
 # table where a DELETE would strand on its originating edge: a table that both
 # DELIVERS rows (SYNC TWO WAY, the default, or SYNC PUSH ONLY) and arbitrates

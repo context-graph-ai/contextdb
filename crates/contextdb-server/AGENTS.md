@@ -60,5 +60,5 @@ aliases; a behavior reaches the binary as a flag.
 
 ```bash
 cargo test -p contextdb-server --test transport_boundary_tests --test protocol_version_bump_tests
-cargo test -p contextdb-engine --test sync
+cargo test -p contextdb-engine --features test-seams --test sync
 ```

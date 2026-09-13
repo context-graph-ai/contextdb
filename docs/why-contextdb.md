@@ -28,10 +28,10 @@ contextdb replaces all three with one embedded database. One transaction atomica
 | Capability | SQLite + extensions | contextdb |
 |---|---|---|
 | Vector search | sqlite-vec (separate extension, no unified transactions with relational data) | Built-in maintained search with per-column policy, pre-filtered search, same MVCC transaction as rows <!-- enforced by: vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/hnsw_tests.rs::h08_prefiltered_search_respects_candidate_bitmap, tests/integration/hnsw_tests.rs::h19_relational_graph_and_vector_atomicity_hold_under_hnsw --> |
-| Graph traversal | Recursive CTEs (unbounded, no cycle detection) | SQL/PGQ-style MATCH with bounded BFS, typed edges |
+| Graph traversal | Recursive CTEs (unbounded, no cycle detection) | SQL/PGQ-style MATCH with bounded BFS, DAG enforcement, typed edges |
 | State machines | CHECK constraints + validation triggers (bypassable) | `STATE MACHINE` in DDL, enforced by the database engine |
 | Atomic cross-model updates | Application-level coordination | Single MVCC transaction across relational + graph + vector |
-| Sync | Build your own | Bidirectional dial-by-key sync — each database exchanges changesets with per-table conflict resolution, no broker to install |
+| Sync | Build your own | Bidirectional dial-by-key sync — each database exchanges changesets with per-table conflict resolution, not WAL pages, no broker to install |
 | Immutable tables | Not enforceable with bypassable validation triggers | `IMMUTABLE` keyword, enforced by the database engine |
 | Cascading invalidation | Application code | `PROPAGATE` in DDL — state changes cascade along edges and FKs |
 
@@ -140,7 +140,8 @@ contextdb is designed for agentic memory, not data warehousing:
 - Sparse graphs with bounded traversal (depth <= 10)
 - Append-heavy writes, small transactions
 - Configurable memory budget via `SET MEMORY_LIMIT` (no hard-coded ceiling)
-- Configurable disk budget for file-backed databases via `SET DISK_LIMIT`
+- Configurable disk budget for file-backed databases via `SET DISK_LIMIT` / `SHOW DISK_LIMIT` or `--disk-limit`
+- See [Architecture](architecture.md#memory-limit-on-edge-devices) for memory-limit behavior on edge devices.
 - Laptops, ARM64 devices (browser and mobile via Rust's WASM target are future directions)
 
 ---
@@ -148,5 +149,5 @@ contextdb is designed for agentic memory, not data warehousing:
 ## Next Steps
 
 - [Getting Started](getting-started.md) — build and run in 2 minutes
-- [Usage Scenarios](usage-scenarios.md) — 16 problem-first walkthroughs
+- [Usage Scenarios](usage-scenarios.md)
 - [Architecture](architecture.md) — how it works under the hood

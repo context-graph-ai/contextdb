@@ -11,7 +11,7 @@ install`): [`docs/getting-started.md`](../../docs/getting-started.md).
 
 contextdb is an embedded database — one file, one process, relational + graph + vector under one
 transaction. `contextdb` is how you drive it from a shell. There is no server to start and no
-schema to migrate to: **contextdb ships no built-in schema**, you create your own tables.
+schema to migrate to: you create your own tables (see the [README](../../README.md)).
 
 ## Open a database
 
@@ -21,10 +21,9 @@ contextdb ./demo.db --write      # create it if missing, and permit mutation
 contextdb :memory:               # ephemeral writable scratch, discarded on exit
 ```
 
-**Plain `contextdb <path>` (no `--write`) is a bounded read session by default** — it never
-creates the store, never opens a writable handle, and leaves every byte in the store folder
-unchanged; even `.help` doesn't rewrite anything. There is nothing to copy first. Two refusals
-follow from that, and both are what you will hit first if you copy a recipe without the flag:
+A file-backed open without `--write` is a bounded read session; the refusals, owner-vs-file
+routing, and JSON/exit-code contract are in [`docs/cli.md`](../../docs/cli.md#cli-client-contextdb).
+`scripts/store-health-check.sh` (below) reads a store directly as a working example.
 
 ```bash
 # A store that does not exist. A read session never creates one.
@@ -34,7 +33,7 @@ contextdb ./missing.db </dev/null
 # exit:   1
 
 # A store that DOES exist — create ./demo.db first with the paste below, or this second
-# example answers `store_not_found` too, not the write refusal it is here to show.
+# example answers the missing-store refusal too, not the write refusal it is here to show.
 echo "INSERT INTO decisions VALUES ('550e8400-e29b-41d4-a716-446655440000', 'draft');" \
   | contextdb ./demo.db
 # stderr: Error: this statement writes, so it needs a write session; rerun with --write
@@ -42,15 +41,6 @@ echo "INSERT INTO decisions VALUES ('550e8400-e29b-41d4-a716-446655440000', 'dra
 ```
 
 `:memory:` is always writable and needs no flag; an explicit `--write` on it is an accepted no-op.
-
-Reading is not exclusive. Several direct readers coexist on one store, and while a live process
-owns the store a read session is served by that owner over its authenticated local channel — same
-commands, same output shapes. `DatabaseLocked` is the *writable*-open refusal only: `--write`
-against a store a live writer already owns is refused (`held_by_writer`), and the refusal tells
-you that dropping `--write` reaches that owner's channel. See
-[`AGENTS.md`'s "Reading is safe by default"](../../AGENTS.md#reading-is-safe-by-default) for the
-owner-route/file-route contract. `scripts/store-health-check.sh` (below) reads a store directly,
-with no peek copy, as a working example.
 
 When stdin is not a terminal the CLI runs in **pipe mode**: no banner, no prompt, results on
 stdout, every error and diagnostic on stderr, and the process exit code tells you what happened.

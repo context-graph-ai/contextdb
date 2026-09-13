@@ -59,34 +59,50 @@ printf '.maintenance run\nSELECT COUNT(*) AS n FROM pings;\n' | contextdb ./life
 ```
 
 ```json
-{"maintenance_cycle":{"compaction":{"bytes_after":61440,"bytes_before":61440,"duration_micros":3095,"file_shrank":false,"fragmentation_before":0.8407264122596154,"ran":true},"currency_pruned_versions":0,"currency_redb_compacted":false,"currency_versions_deferred_for_readers":0,"file_shrank":true,"pruned_rows":1,"pruned_trigger_audit_rows":0,"reclaimed_bytes":360,"rows_deferred_for_readers":0}}
+{"maintenance_cycle":{"compaction":{"bytes_after":40960,"bytes_before":40960,"duration_micros":3233,"file_shrank":false,"fragmentation_before":0.9239153180803571,"ran":true},"currency_pruned_versions":0,"currency_redb_compacted":false,"currency_versions_deferred_for_readers":0,"file_shrank":true,"pruned_rows":1,"pruned_trigger_audit_rows":0,"reclaimed_bytes":558,"rows_deferred_for_readers":0,"vector":{"built_indexes":0,"built_partitions":0,"first_failure":null,"first_failure_details":null,"nonempty_partitions":0,"ready_partitions":0,"remaining_indexes":0,"remaining_partitions":0}}}
 {"result":{"columns":["n"],"rows":[{"n":0}]}}
 ```
 
 `pruned_rows:1` confirms the expiry actually fired; `n:0` confirms the row is gone.
 
-### Worked example 2 — human output, and checking maintenance is actually running
+### Worked example 2 — human output, and checking which maintenance mode is in force
+
+The CLI starts engine-owned maintenance by default. A writable file-backed session
+spawns the worker when the store has something to maintain (a `RETAIN` table, a
+currency table, a durable trigger audit, or a declared vector index). Use
+`--maintenance caller-driven` for a predictable, synchronous-only session that
+never spawns the worker and leaves scheduling to `.maintenance run`.
 
 ```bash
-printf '.maintenance status\n' | contextdb ./life.db --json
+printf '.maintenance status\n' | contextdb ./life.db --write --json
 ```
 
 ```json
 {"maintenance":{"active_maintenance_loops":0,"currency_compaction_enabled":false,"policy":"engine_owned","retention_enabled":true,"running":false}}
 ```
 
-`retention_enabled:true` is the fact to read here: some table in this store declares `RETAIN`, so
-there is something for a cycle to reclaim. `running:false` with `active_maintenance_loops:0` is
-expected from a one-shot CLI session — it runs no background maintenance loop of its own, which is
-exactly why `.maintenance run` exists as the synchronous door. A long-lived embedding process that
-owns the store reports its own loop here.
+```bash
+printf '.maintenance status\n' | contextdb ./life.db --write --maintenance caller-driven --json
+```
+
+```json
+{"maintenance":{"active_maintenance_loops":0,"currency_compaction_enabled":false,"policy":"caller_driven","retention_enabled":true,"running":false}}
+```
+
+`policy` is the mode: `engine_owned` (the default) or `caller_driven`.
+`retention_enabled:true` means some table in this store declares `RETAIN`, so
+there is something for a cycle to reclaim. `running` is whether a cycle is in
+flight at the moment of the status read — a short-lived CLI process often
+reads `running:false` because it asked before a tick, which is why
+`.maintenance run` exists as the synchronous door. Do not read `running:false`
+as "this process started no worker."
 
 ```bash
 printf '.maintenance run\nSELECT COUNT(*) AS n FROM pings;\n' | contextdb ./life.db --write
 ```
 
 ```text
-pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true
+pruned_rows=0 rows_deferred_for_readers=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true vector_built_indexes=0 vector_remaining_indexes=0 vector_nonempty_partitions=0 vector_ready_partitions=0 vector_built_partitions=0 vector_remaining_partitions=0 vector_first_failure=none vector_failure_operation=none vector_failure_requested_bytes=none vector_failure_available_bytes=none vector_failure_current_bytes=none vector_failure_budget_limit_bytes=none vector_failure_message="none" vector_failure_recovery_action=none vector_failure_recovery_instruction="none"
 +---+
 | n |
 +---+
@@ -207,7 +223,7 @@ contextdb snapshot export ./snap.db ./snap-backup
 ```
 
 ```text
-snapshot exported to './snap-backup' at LSN 2 (1 rows, 0 edges, 0 vectors, 77824 bytes)
+snapshot exported to './snap-backup' at LSN 2 (1 rows, 0 edges, 0 vectors, 110592 bytes)
 ```
 
 `1 rows` matches the one row inserted — that's the validation. **If the row count in the export

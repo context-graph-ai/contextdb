@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Deterministic store health/verify probe (R13 script for the `using-contextdb` and
-# `sync` skills). Checks that a store diagnoses clean, that `.tables` lists its
+# Deterministic store health/verify probe for the `using-contextdb` and
+# `sync` skills. Checks that a store diagnoses clean, that `.tables` lists its
 # tables, and that every table's row count is readable — the three things "is this
 # store OK" actually means. Plain `contextdb <path>` (no `--write`) is a bounded
 # read session by default, so every check here reads the store directly; nothing

@@ -255,6 +255,23 @@ refreshes instead of polling.
 
 ## Wiring the two together
 
+A runnable two-node recipe is
+[`crates/contextdb-server/examples/work_fabric_two_nodes.rs`](../../crates/contextdb-server/examples/work_fabric_two_nodes.rs):
+it boots two in-process nodes, publishes a job on node A, claims it from node B,
+and records the result so A can pull it. Run:
+
+```bash
+cargo run --example work_fabric_two_nodes
+```
+
+```text
+claim: Won { synced: true }
+transfer: node-b recorded result for job-1 (executor=node-b)
+```
+
+The fragment below is the API reference those two nodes call (blob ingest and
+claim), not a second runnable recipe.
+
 ```rust
 // Node A (holder): ingest a blob, serve it, and submit a job that references it.
 use contextdb_engine::work_ledger::{InputRef, JobSpec, submit_job};

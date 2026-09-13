@@ -47,7 +47,7 @@ The ticket is pinned to each edge's identity key on first connect, so later reco
 
 ## Converge in both directions
 
-Sync is push/pull, driven from the REPL with `.sync` meta-commands. On edge 1, create a small example table (`decisions` is a table you define — contextdb ships no built-in schema), insert a row, and push:
+Sync is push/pull, driven from the REPL with `.sync` meta-commands. On edge 1, create a small example table (`decisions` is a table you define — see the [README](../README.md)), insert a row, and push:
 
 ```sql
 -- on machine B (edge 1)

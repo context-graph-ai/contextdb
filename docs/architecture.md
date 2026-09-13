@@ -44,8 +44,7 @@ from its own locked manifest in CI. Its provenance, fork delta, upgrade procedur
 contribution path are maintained in `crates/contextdb-redb/MAINTENANCE.md`. Distribution requires
 publishing this package before the engine, formatting/linting/testing its standalone manifest, and
 building the unpacked engine against the unpacked fork with `scripts/verify-packaged-engine.sh`.
-The tag publication job must depend on those checks for the same commit. An upstream proposal
-remains part of maintenance; no upstream acceptance is claimed.
+An upstream proposal remains part of maintenance; no upstream acceptance is claimed.
 
 ---
 
@@ -208,15 +207,15 @@ so relational rows, graph edges, and vectors commit atomically.
 
 The callback-active contract is deliberately split by concurrency domain:
 
-- same-DB trigger Class B waits-and-proceeds inside the engine, including
+- same-DB trigger contention waits-and-proceeds inside the engine, including
   public tx-control, SQL write paths, direct write helpers, and internal
   handles that share the same trigger state
 - unrelated cross-DB writers proceed independently; a parked callback on DB-X
   does not poison ordinary worker-thread writes on DB-Y
-- Class A callback-thread reentry returns `CallbackReentry`; retrying inside
+- callback-thread reentry returns `CallbackReentry`; retrying inside
   the callback body is misuse
 - callback tx-bound handles remain isolated to their runner thread
-- cron same-DB Class B keeps the immediate typed cron callback-active error
+- cron same-DB contention keeps the immediate typed cron callback-active error
 - a same-DB trigger wait that exceeds the deadlock guard's timeout returns the
   typed trigger callback-active error and emits one warning
 
@@ -540,7 +539,8 @@ pull responses, the purge instruction lane, schema provenance, and the structure
 authoritative-hub purge refusal.
 <!-- enforced by: protocol_version_bump_tests::current_wire_arrival_and_source_fields_round_trip, protocol_version_bump_tests::current_wire_purge_instruction_and_typed_authority_error_round_trip, schema_provenance_wire_contract::nonempty_schema_provenance_round_trips_and_validates -->
 
-Future work bumps the protocol version whenever it changes sync bytes or sync semantics. SQL, storage, CLI, or maintenance work that leaves sync unchanged does not bump the protocol.
+The wire version bumps when a change alters sync bytes or sync semantics. SQL, storage, CLI, or maintenance work that leaves sync unchanged does not bump the protocol. A downstream consumer that must adapt to a new wire does that in its own release; the bump is not a contextdb defect.
+<!-- enforced by: protocol_future_bump_rule_tests::architecture_requires_a_protocol_version_bump_for_every_envelope_shape_change -->
 
 Partitioned vector search leaves the sync message shape unchanged. Partition-key declarations travel
 with ordinary schema DDL; on receipt, ContextDB derives the local layout membership from the row it
@@ -656,6 +656,12 @@ to sync must declare an identity, the same way a table meant to be looked up
 efficiently declares an index. There is no silent partial-sync mode — either
 the table can be synced (it has an identity) or it explicitly opts out
 (`SYNC OFF`); nothing in between quietly drops rows.
+
+The keyless fallback — a column named `id` with no declared key — is usable
+only when `id` has a covering index. Sync apply otherwise refuses with
+`exact sync key probe on keyless(id) has no covering index` (the table name
+fills the first slot: a table `events` would read `events(id)`).
+<!-- enforced by: tests/integration/composite_primary_key_tests.rs::c5b_guard_a_keyless_id_table_replicates_unchanged, keyless_sync_eligibility_tests::keyless_table_with_id_column_but_no_covering_index_still_refuses_push -->
 
 ### Conflict Resolution
 

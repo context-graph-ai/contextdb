@@ -37351,23 +37351,14 @@ impl Database {
         }
     }
 
-    /// Start the ONE engine-owned maintenance loop iff this database has
-    /// anything to maintain — a retained table, a currency table, a durable
-    /// trigger audit, or a declared vector index. Called at open (next to the
-    /// cron tickler) and again whenever DDL lands, so a fresh install, a
-    /// REOPEN, and a table that ARRIVED over synced DDL all self-maintain with
-    /// no consumer call. A database with nothing to maintain spawns no thread
-    /// at all.
-    ///
-    /// Registry-table invariant maintenance is engine-owned:
-    /// the earlier "host-driven maintenance" model was unrealized — `run_pruning_cycle`
-    /// had zero production callers, so even `work_inputs` TTL never fired on a real
-    /// fabric node, and the currency tables grew without bound (a 365MB debris
-    /// ledger held 248,996 `work_capabilities` versions for ~10 live rows). An
-    /// engine whose bounded-registry invariant depends on every host remembering a
-    /// maintenance call is the silent-degradation class the substrate exists to
-    /// kill, and the hub accumulates versions via sync-apply that no write-helper
-    /// hook would catch — so the substrate self-maintains.
+    /// Start or stop the engine-owned maintenance thread so it runs exactly
+    /// when this database has something to maintain — a retained table, a
+    /// currency table, a durable trigger audit, or a declared vector index.
+    /// Called at open (next to the cron tickler) and again whenever DDL lands,
+    /// so a fresh install, a reopen, and a table that arrived over synced DDL
+    /// all self-maintain with no consumer call. A database with nothing to
+    /// maintain spawns no thread at all. Caller-driven mode never spawns; the
+    /// host drives `run_maintenance_cycle` itself.
     pub(crate) fn reconcile_maintenance_thread(&self) {
         if self.maintenance_caller_driven.load(Ordering::SeqCst) {
             // CallerDriven: never spawn, however much is declared -- the
@@ -37390,8 +37381,7 @@ impl Database {
             // The last declaration left (an ALTER dropped the only RETAIN
             // window, the only HISTORY CURRENT ONLY table was dropped, ...):
             // stop the loop rather than leaving it ticking forever over
-            // nothing to maintain. `start_maintenance_if_eligible`'s old
-            // start-only shape never did this.
+            // nothing to maintain.
             self.stop_pruning_thread();
         }
     }

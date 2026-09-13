@@ -183,7 +183,7 @@ const CAPABILITY_WORDS: &[&str] = &["vector", "partition", "maintenance", "purge
 /// count only by an explicit edit to this table once the page's claims
 /// genuinely shrink.
 const PAGE_BINDING_FLOORS: &[(&str, usize)] = &[
-    ("README.md", 15),
+    ("README.md", 11),
     ("skills/vector-search/SKILL.md", 40),
     ("docs/capability-index.md", 17),
     ("docs/query-language.md", 65),

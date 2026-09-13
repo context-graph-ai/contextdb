@@ -54,5 +54,5 @@ the upgrade procedure and the upstream proposals that would let the fork shrink.
 
 ```bash
 cargo test -p contextdb-hnsw
-cargo test -p contextdb-engine --test engine
+cargo test -p contextdb-engine --features test-seams --test engine
 ```

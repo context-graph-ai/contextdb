@@ -18,7 +18,7 @@ All examples work in the Rust API via `db.execute(sql, &params)` where parameter
 
 ### CREATE TABLE
 
-`documents` here is an example table you might define — there is no built-in schema; name your own tables and columns:
+`documents` here is an example table you might define — name your own tables and columns (see the [README](../README.md)):
 
 ```sql
 CREATE TABLE documents (
@@ -763,6 +763,9 @@ CREATE TABLE documents (
 ) IMMUTABLE
 ```
 
+Table-level `IMMUTABLE` and `RETAIN` are refused together at parse time.
+<!-- enforced by: tests/integration/retention_tests.rs::r11_immutable_retain_mutual_exclusion_create, tests/integration/acceptance_retention.rs::a_rt6_immutable_retain_mutual_exclusion -->
+
 ### STATE MACHINE
 
 Restrict a column's value transitions to declared edges:
@@ -884,7 +887,10 @@ ALTER TABLE items SET SYNC PULL ONLY;
 
 `SYNC SAFE` with a direction that never delivers the table (`SYNC OFF` or `SYNC PULL ONLY`) is refused when it is written — at `CREATE`, at `ALTER`, and when the definition arrives from another machine. The promise could never be kept, so the rows would simply never expire. Plain `RETAIN` with no delivery promise may declare any direction, including `SYNC OFF` for a colocated installation that keeps one copy.
 
-**A table that syncs needs a sync identity — the covering-index requirement.** Any direction but `SYNC OFF` tells apart rows arriving from another machine by that table's declared identity: a `PRIMARY KEY` (single-column or a table-level `PRIMARY KEY (a, b, ...)`), or, failing that, an indexed `id` column as a fallback. A table with neither — a **keyless** table — has no way to do that. If a keyless table declares `SYNC OFF` this never matters, since its rows were never eligible to leave the machine either way. But a keyless table that would otherwise sync makes a push refuse loudly (`Error::SyncError`, naming all three fixes) instead of silently reporting success while that table's rows never actually cross the wire:
+**A table that syncs needs a sync identity — the covering-index requirement.** Any direction but `SYNC OFF` tells apart rows arriving from another machine by that table's declared identity: a `PRIMARY KEY` (single-column or a table-level `PRIMARY KEY (a, b, ...)`), or, failing that, an indexed `id` column as a fallback. A table with neither — a **keyless** table — has no way to do that. If a keyless table declares `SYNC OFF` this never matters, since its rows were never eligible to leave the machine either way. But a keyless table that would otherwise sync makes a push refuse loudly (`Error::SyncError`, naming all three fixes) instead of silently reporting success while that table's rows never actually cross the wire.
+
+The keyless fallback — a column named `id` with no declared key — requires a covering index on `id`. Without that index, sync apply refuses with `exact sync key probe on keyless(id) has no covering index` (the table name fills the first slot).
+<!-- enforced by: tests/integration/composite_primary_key_tests.rs::c5b_guard_a_keyless_id_table_replicates_unchanged, keyless_sync_eligibility_tests::keyless_table_with_id_column_but_no_covering_index_still_refuses_push -->
 
 ```sql
 -- Keyless and would sync (the default SYNC TWO WAY) — push refuses:
@@ -912,10 +918,11 @@ CREATE TABLE observations (
 
 | Clause | Meaning |
 |---|---|
-| `SYNC CONFLICT KEEP FIRST` | write-once — the first value written for a key stays; a re-send of that key does not overwrite it |
-| `SYNC CONFLICT KEEP LATEST` | last-writer-wins — a re-send of a key replaces the value already there |
+| `SYNC CONFLICT KEEP FIRST` | write-once — the first value written for a key stays; a re-send of that key does not overwrite it. Later writes to that key lose — **including deletes**, which are arbitrated exactly like any other contending write. A pulling edge reports the delete as skipped and the row survives. |
+| `SYNC CONFLICT KEEP LATEST` | last-writer-wins — a re-send of a key replaces the value already there. The last hub-accepted write wins; deletes propagate. |
 
 A table that declares no policy is `SYNC CONFLICT KEEP FIRST` — the non-overwriting default, so a re-send of an existing key never silently rewrites it.
+<!-- enforced by: hub_ordered_sync_mutation_arbitration_tests::declared_keep_first_later_synced_delete_keeps_the_first_value_everywhere, conflict_policy_honored_tests::refused_keep_first_delete_reconciles_forward_without_rewinding_pull_cursor -->
 
 On a hub the policy is resolved in one order: a system table's baked policy wins first, then the table's own declaration, then the default. So an application table always gets exactly the policy it declared, while the engine's own distributed tables keep the policy their contract requires.
 

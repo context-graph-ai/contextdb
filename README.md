@@ -24,25 +24,13 @@ No PostgreSQL-style validation triggers. No duplicated application-side
 constraint checks. The database enforces policy invariants, while host
 callbacks are reserved for explicit observation/cascade workflows.
 
-**Familiar conventions, nothing new to learn:** PostgreSQL-compatible SQL, [pgvector](https://github.com/pgvector/pgvector) syntax for vector search (`<=>`), and [SQL/PGQ](https://www.iso.org/standard/76120.html)-style `GRAPH_TABLE ... MATCH` for graph queries — the subset that matters for bounded traversal, not the full standard.
+SQL, `<=>`, and `GRAPH_TABLE ... MATCH` follow existing conventions — the comparison with SQLite, the hybrid query, and the design envelope are in [Why contextdb?](docs/why-contextdb.md).
 
 **Language support:** contextdb is a Rust library and CLI today. Python and TypeScript bindings are on the roadmap — contributions welcome.
 
 **Website:** [contextdb.tech](https://contextdb.tech) · **Docs:** [contextdb.tech/docs](https://contextdb.tech/docs/)
 
 See [Why contextdb?](docs/why-contextdb.md) for the full problem statement, or jump to [Getting Started](docs/getting-started.md) to try it in 2 minutes.
-
-## Why Not SQLite + Extensions?
-
-| Capability | SQLite + extensions | contextdb |
-|---|---|---|
-| Vector search | sqlite-vec (separate extension, no unified transactions with relational data) | Built-in, automatically maintained index with per-column policy, pre-filtered search, same MVCC transaction as rows <!-- enforced by: vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/hnsw_tests.rs::h08_prefiltered_search_respects_candidate_bitmap, tests/integration/hnsw_tests.rs::h19_relational_graph_and_vector_atomicity_hold_under_hnsw --> |
-| Graph traversal | Recursive CTEs (unbounded, no cycle detection) | SQL/PGQ with bounded BFS, DAG enforcement, typed edges |
-| State machines | CHECK constraints + validation triggers (bypassable) | `STATE MACHINE` in DDL, enforced by the database engine |
-| Atomic cross-model updates | Application-level coordination | Single MVCC transaction across relational + graph + vector |
-| Sync | Build your own | Bidirectional collaborative sync — each database syncs changesets with conflict resolution, not WAL pages |
-| Immutable tables | Not enforceable with bypassable validation triggers | `IMMUTABLE` keyword, enforced by the database engine |
-| Cascading invalidation | Application code | `PROPAGATE` in DDL — state changes cascade along edges and FKs |
 
 ## Use It As a Library
 
@@ -105,14 +93,10 @@ let rx = db.subscribe();
 // rx is a std::sync::mpsc::Receiver<CommitEvent>
 ```
 
-**Ownership:** a database file has exactly one *writer* at a time — a second
-writable open of the same path (this process or another) returns
-`Error::DatabaseLocked`. Reading is a separate door that does not take the write
-lock: while a process owns the store, a read session is served by that owner over
-its authenticated local channel, and when nobody owns it several direct readers
-read the committed snapshot side by side. Either way there is no copy of the data
-outside the store. See
-[Store Ownership & Concurrency](docs/architecture.md#store-ownership--concurrency).
+**Ownership:** a database file has exactly one writer at a time; reading is a
+separate door that does not take the write lock. See
+[Store Ownership & Concurrency](docs/architecture.md#store-ownership--concurrency)
+and the CLI contract in [`docs/cli.md`](docs/cli.md#cli-client-contextdb).
 
 ### Triggers
 
@@ -162,30 +146,7 @@ databases proceed independently, same-thread callback reentry receives
 thread, cron same-DB contention remains immediate, and an unhealthy wait trips
 the bounded deadlock guard with a structured `tracing::warn!`.
 
-### One Query, Three Subsystems
-
-Find semantically similar observations within a graph neighborhood, filtered by relational predicates — a query that would take ~40 lines of Python across SQLite, ChromaDB, and a hand-rolled BFS:
-
-```sql
-WITH neighborhood AS (
-  SELECT b_id FROM GRAPH_TABLE(
-    edges MATCH (start)-[:RELATES_TO]->{1,3}(related)
-    WHERE start.id = $entity_id
-    COLUMNS (related.id AS b_id)
-  )
-),
-candidates AS (
-  SELECT o.id, o.data, o.embedding
-  FROM observations o
-  INNER JOIN neighborhood n ON o.entity_id = n.b_id
-  WHERE o.observation_type = 'config_change'
-)
-SELECT id, data FROM candidates
-ORDER BY embedding <=> $query_embedding
-LIMIT 5
-```
-
-One query. One transaction. One process.
+The hybrid `GRAPH_TABLE` + `<=>` query is in [Why contextdb?](docs/why-contextdb.md#one-query-three-subsystems).
 
 Add to your `Cargo.toml`:
 
@@ -265,9 +226,10 @@ ORDER BY vector_text <=> ROW_VECTOR('evidence', 'vector_text', '11111111-1111-11
 LIMIT 1;
 ```
 
-Every `VECTOR(N)` column is searchable with no separate index to create:
-ContextDB keeps each column's index current as rows commit. Declare
-`PARTITION_KEY (...)` on a vector column to keep one smaller index per key
+Every `VECTOR(N)` column is searchable with no separate index to create.
+Index construction and repair run only through maintenance — see
+[Vector Similarity Search](docs/query-language.md#vector-similarity-search).
+Declare `PARTITION_KEY (...)` on a vector column to keep one smaller index per key
 value, so a search whose `WHERE` names a key looks only inside that partition.
 `SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW
 VECTOR_PARTITIONS FOR table.column` shows each partition's state. Use `VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` to choose the
@@ -289,13 +251,13 @@ format, or recreate the schema and reimport the data.
 
 **Graph (SQL/PGQ-style)** — `GRAPH_TABLE(... MATCH ...)` following SQL/PGQ conventions for bounded BFS, typed edges, variable-length paths (`{1,3}`), and direction control. DAG constraint enforcement prevents cycles. State propagation cascades changes along graph edges.
 
-**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Query with a bound vector, vector literal, or `ROW_VECTOR('table', 'column', key)` to reuse a persisted row vector as the query vector. Every `VECTOR(N)` column is indexed automatically and kept current as rows commit, and can be partitioned by key so a search looks only inside the partitions it names: `SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW VECTOR_PARTITIONS FOR table.column` shows each partition's state. `AUTO_INDEX_AT` and HNSW settings are declared per column; leaving them unset keeps the defaults. Pre-filtered search narrows candidates before scoring. <!-- enforced by: sql_surface_other::prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/hnsw_tests.rs::h08_prefiltered_search_respects_candidate_bitmap -->
+**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Query with a bound vector, vector literal, or `ROW_VECTOR('table', 'column', key)` to reuse a persisted row vector as the query vector. Construction and repair of each column's index run only through maintenance ([query-language reference](docs/query-language.md#vector-similarity-search)), and a column can be partitioned by key so a search looks only inside the partitions it names: `SHOW VECTOR_INDEXES` returns one summary row per vector column, and `SHOW VECTOR_PARTITIONS FOR table.column` shows each partition's state. `AUTO_INDEX_AT` and HNSW settings are declared per column; leaving them unset keeps the defaults. Pre-filtered search narrows candidates before scoring. <!-- enforced by: sql_surface_other::prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms, vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, tests/integration/hnsw_tests.rs::h08_prefiltered_search_respects_candidate_bitmap -->
 
 **Unified transactions** — One transaction atomically updates relational rows, graph adjacency structures, and vector indexes. One read snapshot sees consistent state across all three. MVCC with consistent snapshots — readers never block writers.
 
 **Enforceable policy constraints** — `IMMUTABLE` tables, `STATE MACHINE` column transitions, `DAG` cycle prevention, single-column and composite foreign keys, `RETAIN` with TTL expiry, `PROPAGATE` for cascading state changes along edges and foreign keys. Enforced by the database — no application code can bypass them.
 
-**Collaborative sync** — Every contextdb instance is a full read-write database. Each runs a SyncClient that syncs bidirectionally with a central SyncServer by dial-by-key: the server is reached through its own cryptographic identity (its enrollment ticket), not a broker address — nothing to install or expose. Machines on one LAN sync with zero external infrastructure and no internet, over direct connections; the default configuration contacts no third-party service. Crossing networks, the operator either self-hosts a small stateless relay or opts into the free public relays — connectivity is never a paid feature. Offline-first: each database works independently, syncing changesets when connected. Tables declare conflict handling as `SYNC CONFLICT KEEP FIRST` or `KEEP LATEST`, and declare travel as `SYNC PUSH ONLY`, `PULL ONLY`, `TWO WAY`, or `OFF`; the database persists, displays, transports, and honors those same words. The server runs the same contextdb engine — self-host it, or point your databases at a hosted server.
+**Collaborative sync** — Every contextdb instance is a full read-write database. Each runs a SyncClient that syncs bidirectionally with a central SyncServer by dial-by-key: the server is reached through its own cryptographic identity (its enrollment ticket), not a broker address — nothing to install or expose. Machines on one LAN sync with zero external infrastructure and no internet, over direct connections; the default configuration contacts no third-party service. Crossing networks, the operator either self-hosts a small stateless relay or opts into the free public relays — connectivity is never a paid feature. Offline-first: each database works independently, syncing changesets when connected. Conflict policy and travel direction are declared on the table; see [`docs/query-language.md`](docs/query-language.md#table-options) and the recipe in [`skills/sync`](skills/sync/SKILL.md#7-a-delete-that-stays-deleted--across-sync-and-restart). The server runs the same contextdb engine — self-host it, or point your databases at a hosted server.
 
 **Persistence** — Single-file storage via redb. Crash-safe. Compute/storage separated via the `WriteSetApplicator` trait (local redb for open source, object store for enterprise).
 
@@ -303,17 +265,7 @@ format, or recreate the schema and reimport the data.
 
 **Subscriptions** — `db.subscribe()` returns a `std::sync::mpsc::Receiver<CommitEvent>`, one per subscriber, and every commit is fanned out to all of them. `db.subscribe_with_capacity(n)` sets the per-subscriber queue depth.
 
-## Scale Envelope
-
-contextdb is designed for agentic memory, not data warehousing:
-
-- 10K-1M rows
-- Sparse graphs with bounded traversal (depth <= 10)
-- Append-heavy writes, small transactions
-- Configurable memory budget via `SET MEMORY_LIMIT` (no hard-coded ceiling)
-- Configurable file-growth budget via `SET DISK_LIMIT` / `SHOW DISK_LIMIT` or `--disk-limit` for file-backed databases
-- See [Architecture](docs/architecture.md#memory-limit-on-edge-devices) for memory-limit behavior on edge devices.
-- Laptops, ARM64 devices (browser and mobile via Rust's WASM target are future directions)
+The 10K-1M / depth-10 design envelope is in [Why contextdb?](docs/why-contextdb.md#design-envelope).
 
 ## Documentation
 
@@ -324,7 +276,7 @@ Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/
 | **[Capability Index](docs/capability-index.md)** | One page: what contextdb is, what it is not, and the numbers it stops at |
 | **[Getting Started](docs/getting-started.md)** | Build, first REPL session, library embedding — 2 minutes |
 | **[Why contextdb?](docs/why-contextdb.md)** | Problem statement, design philosophy, comparison with alternatives |
-| **[Usage Scenarios](docs/usage-scenarios.md)** | 16 problem-first walkthroughs: constraints, graph queries, vector search, sync, propagation |
+| **[Usage Scenarios](docs/usage-scenarios.md)** | Walkthroughs: constraints, graph queries, vector search, sync, propagation |
 | **[Query Language](docs/query-language.md)** | SQL, graph MATCH, vector search, constraints, built-in functions |
 | **[Sync Across Two Machines](docs/sync-two-machines.md)** | Stand up a hub, enroll two edges, converge in both directions |
 | **[CLI Reference](docs/cli.md)** | REPL commands, sync commands, non-interactive scripting |
@@ -350,10 +302,10 @@ Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/
 | `contextdb-server` | Sync server and client (dial-by-key transport, conflict resolution) |
 | `contextdb-cli` | Interactive CLI REPL |
 
-Tenant-governed event tables bind hub policy, register root/member delivery manifests in their
-write transaction, and inspect durable per-unit outcomes. See
-[the custody SQL and API guide](docs/query-language.md#tenant-policy-and-event-custody) for whole-row
-hashing, discard modes, and atomic fleet erasure.
+A hub can declare which tables an enrolled edge may push. Every delivered unit
+reports accepted or refused. Authoritative erasure is all-or-nothing across the
+fleet. See [the custody SQL and API guide](docs/query-language.md#tenant-policy-and-event-custody).
+<!-- enforced by: crates/contextdb-engine/tests/custody/tenant_table_policy_contract.rs::a_matching_expectation_binds_a_differing_clause_and_an_undeclared_table_are_typed_refusals_and_none_writes_on_either_side, crates/contextdb-engine/tests/custody/delivery_outcome_contract.rs::a_refused_unit_is_terminal_the_resend_obligation_ends_status_is_clean_and_the_rows_stay_locatable, crates/contextdb-engine/tests/custody/custody_purge_and_discard_contract.rs::a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_is_refused_before_selection_when_illegal -->
 
 ## Building
 

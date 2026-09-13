@@ -40,16 +40,17 @@ cargo build --release -p contextdb-cli
 ## First REPL Session
 
 ```bash
-contextdb :memory:
+contextdb ./my.db --write
 ```
 
-`:memory:` is always writable: it creates no file, so there is nothing for a flag to authorize.
-A file-backed store is different — see [Persist to Disk](#persist-to-disk).
+`--write` creates the store if it is missing and authorizes mutation. `:memory:` is always
+writable with no flag; a file-backed store is different — see
+[`docs/cli.md`](cli.md#cli-client-contextdb). Example tables such as `decisions` are yours to
+define; see the [README](../README.md).
 
 Try the state machine — the feature that makes contextdb different from plain SQL:
 
 ```sql
--- `decisions` is an example table you define - contextdb ships no built-in schema.
 CREATE TABLE decisions (
   id UUID PRIMARY KEY,
   status TEXT NOT NULL,
@@ -98,34 +99,11 @@ The row stays at its original `decision_type`; the session continues. To record 
 
 ## Persist to Disk
 
-Replace `:memory:` with a file path, and add `--write` — creating and changing a store is what
-that flag authorizes:
-
-```bash
-contextdb ./my.db --write
-```
-
-The `:memory:` work above is gone with that session, so recreate the `decisions` table here —
-this is the store the rest of this page reads:
-
-```sql
-CREATE TABLE decisions (
-  id UUID PRIMARY KEY,
-  status TEXT NOT NULL,
-  reasoning TEXT
-) STATE MACHINE (status: draft -> [active, rejected], active -> [superseded]);
-
-INSERT INTO decisions (id, status, reasoning)
-VALUES ('550e8400-e29b-41d4-a716-446655440000', 'draft', 'initial assessment');
-
-UPDATE decisions SET status = 'active'
-WHERE id = '550e8400-e29b-41d4-a716-446655440000';
-```
-
-One database file plus its `.lock` companion (`my.db` and `my.db.lock`), and a third file —
-`my.db.fabric-identity.key` — once the store has synced. Crash-safe via redb. Reopen and your data
-is there. Without `--write` the same path opens a read-only session instead, which is the subject
-of the next chapter.
+The first session already wrote `./my.db`. One database file plus its `.lock` companion
+(`my.db` and `my.db.lock`), and a third file — `my.db.fabric-identity.key` — once the store has
+synced. Crash-safe via redb. Reopen and your data is there. Without `--write` the same path opens
+a read-only session instead, which is the subject of the next chapter. See
+[`docs/cli.md`](cli.md#cli-client-contextdb).
 
 ## Inspecting a store safely
 
@@ -136,9 +114,9 @@ want to look inside without any risk of changing it. That is the default command
 contextdb ./my.db
 ```
 
-This opens a **read-only session**. It never creates a store, never mutates one, and leaves
-every byte of the store folder unchanged; anything that would write is refused with
-`write_requires_flag` telling you to add `--write`. <!-- enforced by: read_cli_journeys_invocation::reading_an_idle_store_leaves_every_byte_and_the_folder_listing_unchanged, read_cli_journeys_invocation::a_reading_session_refuses_every_mutating_statement_before_it_executes, read_cli_journeys_invocation::bare_path_on_a_missing_store_refuses_and_creates_nothing -->
+This opens a **read-only session**. Mutation needs `--write`; the refusals and routing are in
+[`docs/cli.md`](cli.md#cli-client-contextdb).
+<!-- enforced by: read_cli_journeys_invocation::reading_an_idle_store_leaves_every_byte_and_the_folder_listing_unchanged, read_cli_journeys_invocation::a_reading_session_refuses_every_mutating_statement_before_it_executes, read_cli_journeys_invocation::bare_path_on_a_missing_store_refuses_and_creates_nothing -->
 
 ### 1. Look around
 
@@ -148,12 +126,12 @@ decisions
 has_more: false
 
 contextdb(ro)> .schema decisions
-CREATE TABLE decisions (
-  id UUID PRIMARY KEY,
-  status TEXT NOT NULL,
-  reasoning TEXT
-) STATE MACHINE (status: active -> [superseded], draft -> [active, rejected]);
+```
 
+`.schema` reprints the declaration from the first session, with from-states sorted rather than
+in the order you declared them.
+
+```text
 contextdb(ro)> SELECT id, status FROM decisions;
 +--------------------------------------+--------+
 | id                                   | status |
@@ -164,8 +142,8 @@ contextdb(ro)> SELECT id, status FROM decisions;
 ```
 
 Three shapes to expect. `.tables` is a bounded page, so it always closes with a `has_more:` line.
-`.schema` prints the from-states sorted, not in the order you declared them. And an ordinary
-`SELECT` renders as a bordered table with exactly one `(N rows)` footer.
+`.schema` prints the from-states sorted. And an ordinary `SELECT` renders as a bordered table with
+exactly one `(N rows)` footer.
 
 The first reading command prints one route notice on stderr telling you **how** you are reading.
 In human mode that is one sentence — `reading the committed snapshot taken at
@@ -195,9 +173,8 @@ and let the two copies drift, three sentences and where each one is spelled out 
   [Reading routes](cli.md#reading-routes) and [Declared limits](cli.md#declared-limits).
   <!-- enforced by: read_cli_journeys_live_owner::the_owner_route_refusal_names_the_writer_side_change_and_the_cursor, read_cli_journeys_live_owner::a_reading_session_routes_through_the_live_owner_and_says_so_once, read_cli_journeys_live_owner::a_second_writer_is_refused_and_told_how_to_read_instead, read_cli_journeys_live_owner::owner_status_reports_the_serving_owner_as_control_data -->
 - **Scripts pass `--json`**: stdout is one JSON document per statement, every notice and error is
-  a JSON document on stderr, and the process exit code is one of four — `0` success, `1` a valid
-  run with a refused statement, `2` an invalid invocation, `3` a `.sync push` whose outcome is
-  unconfirmed: [Exit Codes](cli.md#exit-codes).
+  a JSON document on stderr, and the process exit code is one of the four in
+  [Exit Codes](cli.md#exit-codes).
   <!-- enforced by: read_cli_journeys_session_shape::a_piped_session_is_a_full_session_including_the_cursor -->
 
 ### 3. Scratch space
@@ -213,7 +190,7 @@ sub-100ms filtered retrieval. Indexes accelerate filtered scans so a
 milliseconds.
 
 ```sql
--- `observations` is an example table you define - no built-in schema ships with contextdb.
+-- `observations` is an example table you define - see the README.
 CREATE TABLE observations (
   id UUID PRIMARY KEY,
   tag TEXT,
@@ -329,7 +306,7 @@ machine-readable `detail()`:
 ## What's Next
 
 - [Why contextdb?](why-contextdb.md) — the problems it solves and how it compares to alternatives
-- [Usage Scenarios](usage-scenarios.md) — 16 problem-first walkthroughs with SQL
+- [Usage Scenarios](usage-scenarios.md)
 - [Query Language](query-language.md) — full SQL, graph, and vector reference
 - [Sync Across Two Machines](sync-two-machines.md) — stand up a hub, enroll two edges, converge both ways
 - [CLI Reference](cli.md) — REPL commands, sync, scripting

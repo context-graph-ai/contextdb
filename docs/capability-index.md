@@ -45,7 +45,7 @@ of truth.
 
 - **Not a schema.** The agentic-memory tables used as running examples throughout these docs
   (`decisions`, `observations`, `intentions`, `digests`) are one example schema you can delete
-  or replace. contextdb ships no built-in schema and requires none — see the README and
+  or replace. See the [README](../README.md) and
   [Why contextdb?](why-contextdb.md).
 - **Not a general-purpose database.** The SQL/PGQ graph subset covers bounded traversal for
   agentic workloads, not the full standard; contextdb is a focused tool for agent memory, not a
