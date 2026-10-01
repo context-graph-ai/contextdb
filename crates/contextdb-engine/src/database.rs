@@ -34393,7 +34393,9 @@ impl Database {
         // thread-local override. A PK/UNIQUE violation on a committed row must
         // be detected even if the caller pinned a pre-violation snapshot for
         // read visibility.
-        let snapshot = self.snapshot();
+        let published = self.tx_mgr.capture_published_read();
+        let snapshot = published.snapshot;
+        let _writer_read = self.enter_writer_read(writer_read::durable_root(published.handle)?);
         self.check_row_constraints_at_snapshot(
             tx,
             table,
