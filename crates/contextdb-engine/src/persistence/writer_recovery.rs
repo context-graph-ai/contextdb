@@ -4,8 +4,8 @@ use super::*;
 const WRITER_RECOVERY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("writer_recovery");
 const BOUNDS_KEY: &str = "bounds";
 
-/// Floors which cannot be reconstructed from relation end keys and the
-/// canonical commit directory. Derivable row/commit maxima are not copied.
+/// Identity floors survive directory cleanup as well as noncanonical imports.
+/// Logical publication frontiers must not rewind when the final entry retires.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct WriterRecoveryBounds {
     pub(crate) identity_tx_floor: u64,
@@ -54,9 +54,12 @@ impl RedbPersistence {
             .transpose()?
             .unwrap_or_default();
         bounds.commit_count = commit_count;
+        if let Some((lsn, tx)) = last {
+            bounds.identity_tx_floor = bounds.identity_tx_floor.max(tx);
+            bounds.source_lsn_floor = bounds.source_lsn_floor.max(lsn);
+        }
         if let Some(ws) = ws {
-            // Canonical committed ids derive from the last commit key. Only
-            // identities beyond that frontier require an independent floor.
+            // Imports can name identities beyond the local commit frontier.
             let tx = Self::write_set_visibility_tx(ws)
                 .into_iter()
                 .chain(ws.visibility_floor)

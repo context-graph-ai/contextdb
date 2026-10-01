@@ -28,12 +28,8 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// A single published descriptor. Readers only clone this handle; no disk
-/// read, registry operation or commit mutex is involved in capture.
-pub(crate) struct WriterReadSource {
-    published: parking_lot::RwLock<Arc<WriterSnapshot>>,
-}
-
+/// An admitted durable descriptor prepared before the transaction manager's
+/// publication swap. Only capture_published_read captures statement roots.
 pub(crate) struct WriterSnapshot {
     read: redb::ReadTransaction,
     pub(crate) snapshot: SnapshotId,
@@ -42,43 +38,16 @@ pub(crate) struct WriterSnapshot {
     _control: OwnedMemoryReservation,
 }
 
-impl WriterReadSource {
-    fn new(snapshot: Arc<WriterSnapshot>) -> Self {
-        Self {
-            published: parking_lot::RwLock::new(snapshot),
-        }
-    }
-
-    pub(crate) fn capture(&self) -> Arc<WriterSnapshot> {
-        Arc::clone(&self.published.read())
-    }
-
-    /// Integration calls this at logical publication, after preparing the
-    /// complete durable root. Drop the displaced root outside the swap lock.
-    pub(crate) fn publish(&self, snapshot: Arc<WriterSnapshot>) {
-        let prior = std::mem::replace(&mut *self.published.write(), snapshot);
-        drop(prior);
-    }
-}
-
 impl RedbPersistence {
-    /// Call once during writer construction, before serving statements.
-    /// The logical frontier is supplied by the transaction manager.
-    pub(crate) fn initialize_writer_read_source(
+    /// Prepare the initial admitted root before constructing the manager.
+    /// Pass it to new_with_directory; persistence keeps no publication slot.
+    pub(crate) fn initialize_writer_snapshot(
         &self,
         snapshot: SnapshotId,
         lsn: Lsn,
-    ) -> Result<Arc<WriterReadSource>> {
-        if let Some(source) = self.writer_read_source.get() {
-            return Ok(Arc::clone(source));
-        }
+    ) -> Result<Arc<WriterSnapshot>> {
         let control = self.reserve_writer_snapshot()?;
-        let root = self.prepare_writer_snapshot(control, snapshot, lsn)?;
-        let source = Arc::new(WriterReadSource::new(root));
-        let _ = self.writer_read_source.set(source);
-        Ok(Arc::clone(
-            self.writer_read_source.get().expect("source initialized"),
-        ))
+        self.prepare_writer_snapshot(control, snapshot, lsn)
     }
 
     /// Reserve this before durable commit. Failed reservation leaves the
@@ -89,7 +58,7 @@ impl RedbPersistence {
         })?;
         OwnedMemoryReservation::try_new_for(
             accountant,
-            std::mem::size_of::<WriterSnapshot>() + std::mem::size_of::<WriterReadSource>() + 128,
+            std::mem::size_of::<WriterSnapshot>() + 128,
             "writer_source",
             "published_root",
             HINT,
@@ -921,6 +890,37 @@ mod tests {
         (store, accountant)
     }
 
+    // Exercise the manager's real publication door with the durable source.
+    struct RootApplicator {
+        store: Arc<RedbPersistence>,
+        prepared: parking_lot::Mutex<Option<Arc<WriterSnapshot>>>,
+    }
+    impl contextdb_tx::WriteSetApplicator for RootApplicator {
+        fn apply(&self, ws: &WriteSet) -> Result<()> {
+            let reservation = self.store.reserve_writer_snapshot()?;
+            self.store.flush_data(ws)?;
+            let root = self
+                .store
+                .prepare_writer_snapshot(
+                    reservation,
+                    SnapshotId(ws.relational_inserts[0].1.created_tx.0),
+                    ws.commit_lsn.unwrap(),
+                )
+                .expect("post-durability root preparation must terminate on failure");
+            *self.prepared.lock() = Some(root);
+            Ok(())
+        }
+        fn new_row_id(&self) -> RowId {
+            RowId(0)
+        }
+        fn publication_handle(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            self.prepared
+                .lock()
+                .as_ref()
+                .map(|root| Arc::clone(root) as Arc<dyn std::any::Any + Send + Sync>)
+        }
+    }
+
     #[test]
     fn published_writer_root_stays_old_until_explicit_swap_and_windows_release() {
         let directory = tempfile::tempdir().unwrap();
@@ -928,12 +928,31 @@ mod tests {
         store
             .flush_table_meta("items", &TableMeta::default())
             .unwrap();
-        let source = store
-            .initialize_writer_read_source(SnapshotId(0), Lsn(0))
+        let initial = store
+            .initialize_writer_snapshot(SnapshotId(0), Lsn(0))
             .unwrap();
-        let old = source.capture();
+        let store = Arc::new(store);
+        let source = contextdb_tx::TransactionManager::new_with_directory(
+            RootApplicator {
+                store: Arc::clone(&store),
+                prepared: parking_lot::Mutex::new(None),
+            },
+            TxId(1),
+            Lsn(1),
+            TxId(0),
+            store.clone(),
+            Some(initial),
+        );
+        let capture = || {
+            source
+                .capture_published_read()
+                .handle
+                .unwrap()
+                .downcast::<WriterSnapshot>()
+                .unwrap()
+        };
+        let old = capture();
         let old_identity = old.storage_identity();
-        let reservation = store.reserve_writer_snapshot().unwrap();
         let row = VersionedRow {
             row_id: RowId(7),
             values: HashMap::from([("body".into(), Value::Text("durable body".repeat(1000)))]),
@@ -942,41 +961,49 @@ mod tests {
             lsn: Lsn(1),
             created_at: None,
         };
-        let mut ws = WriteSet::new();
-        ws.commit_lsn = Some(Lsn(1));
-        ws.relational_inserts.push(("items".into(), row.clone()));
-        store.flush_data(&ws).unwrap();
-        // Durability has completed; publication has deliberately not occurred.
-        assert_eq!(source.capture().storage_identity(), old_identity);
-        assert!(
-            old.row_cursor("items", RowId(7))
-                .unwrap()
-                .next_row()
-                .unwrap()
-                .is_none()
-        );
-        // A live redb writer cannot delay capture or reads at the published root.
-        store
-            .with_db(|db| {
-                let pending = db.begin_write().map_err(RedbPersistence::storage_error)?;
-                let captured = source.capture();
-                assert_eq!(captured.storage_identity(), old_identity);
-                assert!(
-                    captured
-                        .row_cursor("items", RowId(7))?
-                        .next_row()?
-                        .is_none()
-                );
-                drop(pending);
-                Ok(())
+        let tx = source.begin();
+        source
+            .with_write_set(tx, |ws| {
+                ws.relational_inserts.push(("items".into(), row.clone()))
             })
             .unwrap();
-        let next = store
-            .prepare_writer_snapshot(reservation, SnapshotId(1), Lsn(1))
+        source
+            .commit_with_lsn_prepared_and_applied(
+                tx,
+                |_| Ok(()),
+                |_, _| {
+                    // Durability and preparation completed; logical publication has not.
+                    assert_eq!(capture().storage_identity(), old_identity);
+                    assert!(
+                        old.row_cursor("items", RowId(7))
+                            .unwrap()
+                            .next_row()
+                            .unwrap()
+                            .is_none()
+                    );
+                    // A live redb write cannot delay capture at the published root.
+                    store
+                        .with_db(|db| {
+                            let pending =
+                                db.begin_write().map_err(RedbPersistence::storage_error)?;
+                            let captured = capture();
+                            assert_eq!(captured.storage_identity(), old_identity);
+                            assert!(
+                                captured
+                                    .row_cursor("items", RowId(7))?
+                                    .next_row()?
+                                    .is_none()
+                            );
+                            drop(pending);
+                            Ok(())
+                        })
+                        .unwrap();
+                },
+            )
             .unwrap();
-        assert_ne!(next.storage_identity(), old_identity);
-        source.publish(next);
-        let current = source.capture();
+        let current = capture();
+        assert_ne!(current.storage_identity(), old_identity);
+        assert_eq!((current.snapshot, current.lsn), (SnapshotId(1), Lsn(1)));
         let baseline = accountant.usage().used;
         let mut cursor = current.row_cursor("items", RowId(7)).unwrap();
         let cursor_only = accountant.usage().used;
@@ -994,6 +1021,61 @@ mod tests {
                 .next_row()
                 .unwrap()
                 .is_none()
+        );
+        // The manager uses the durable directory, not a mirrored tree.
+        use contextdb_tx::CommitDirectory;
+        assert_eq!(store.census().unwrap(), (1, Lsn(1)));
+        assert!(store.contains(Lsn(1)).unwrap());
+        assert_eq!(
+            store.floor(Bound::Included(Lsn(1))).unwrap(),
+            Some((Lsn(1), TxId(1)))
+        );
+        assert_eq!(store.floor(Bound::Excluded(Lsn(1))).unwrap(), None);
+        let mut pinned = source
+            .commit_directory_cursor(Bound::Unbounded, Bound::Unbounded)
+            .unwrap();
+        assert_eq!(store.remove(&[Lsn(1), Lsn(1), Lsn(99)]).unwrap(), 1);
+        assert_eq!(store.census().unwrap(), (0, Lsn(0)));
+        assert!(!store.contains(Lsn(1)).unwrap());
+        assert_eq!(pinned.next_entry().unwrap(), Some((Lsn(1), TxId(1))));
+        assert_eq!(pinned.next_entry().unwrap(), None);
+        let bounds = store.writer_open_bounds(["items"]).unwrap();
+        assert_eq!(
+            (bounds.max_tx, bounds.max_lsn, bounds.commit_count),
+            (TxId(1), Lsn(1), 0)
+        );
+        let retained = BTreeMap::from([(Lsn(2), TxId(2)), (Lsn(3), TxId(3))]);
+        assert_eq!(store.replace(retained.clone()).unwrap(), 0);
+        assert_eq!(store.load_commit_index().unwrap(), retained);
+        assert_eq!(
+            store.replace(BTreeMap::from([(Lsn(3), TxId(4))])).unwrap(),
+            1
+        );
+        assert_eq!(
+            store.load_commit_index().unwrap(),
+            BTreeMap::from([(Lsn(3), TxId(4))])
+        );
+        let mut exclusive = store
+            .cursor(Bound::Excluded(Lsn(2)), Bound::Included(Lsn(3)))
+            .unwrap();
+        assert_eq!(exclusive.next_entry().unwrap(), Some((Lsn(3), TxId(4))));
+        assert_eq!(exclusive.next_entry().unwrap(), None);
+        for (lower, upper) in [
+            (Bound::Excluded(Lsn(u64::MAX)), Bound::Unbounded),
+            (Bound::Unbounded, Bound::Excluded(Lsn(0))),
+            (Bound::Included(Lsn(3)), Bound::Excluded(Lsn(3))),
+            (Bound::Included(Lsn(9)), Bound::Included(Lsn(1))),
+        ] {
+            assert_eq!(
+                store.cursor(lower, upper).unwrap().next_entry().unwrap(),
+                None
+            );
+        }
+        assert_eq!(store.replace(BTreeMap::new()).unwrap(), 1);
+        let bounds = store.writer_open_bounds(["items"]).unwrap();
+        assert_eq!(
+            (bounds.max_tx, bounds.max_lsn, bounds.commit_count),
+            (TxId(4), Lsn(3), 0)
         );
     }
 
@@ -1022,10 +1104,9 @@ mod tests {
         let store = RedbPersistence::open(&path).unwrap();
         store.attach_memory_accountant(Arc::new(MemoryAccountant::no_limit()));
         let bounds = store.writer_open_bounds(["items"]).unwrap();
-        let source = store
-            .initialize_writer_read_source(SnapshotId(bounds.max_tx.0), bounds.max_lsn)
+        let root = store
+            .initialize_writer_snapshot(SnapshotId(bounds.max_tx.0), bounds.max_lsn)
             .unwrap();
-        let root = source.capture();
         let mut current = root
             .index_cursor(
                 "items",
@@ -1090,10 +1171,9 @@ mod tests {
         let mut edges = (2..102).map(|id| edge(id, 200, 1)).collect::<Vec<_>>();
         edges.extend([edge(1, 200, 1), edge(1, 200, 2), edge(1, 201, 1)]);
         store.append_graph_edges_batch(&edges).unwrap();
-        let source = store
-            .initialize_writer_read_source(SnapshotId(2), Lsn(2))
+        let before = store
+            .initialize_writer_snapshot(SnapshotId(2), Lsn(2))
             .unwrap();
-        let before = source.capture();
         let mut ws = WriteSet::new();
         ws.commit_lsn = Some(Lsn(3));
         ws.adj_deletes
@@ -1153,10 +1233,9 @@ mod tests {
             },
         ];
         store.append_change_log(Lsn(9), &entries).unwrap();
-        let source = store
-            .initialize_writer_read_source(SnapshotId(0), Lsn(9))
+        let old = store
+            .initialize_writer_snapshot(SnapshotId(0), Lsn(9))
             .unwrap();
-        let old = source.capture();
         assert_eq!(old.change_log_occurrences(Lsn(9)).unwrap(), 2);
         let mut selected = old.table_change_cursor("a", Lsn(9), Lsn(9)).unwrap();
         for entry in &entries {

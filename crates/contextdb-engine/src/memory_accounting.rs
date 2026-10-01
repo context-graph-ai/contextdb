@@ -341,6 +341,9 @@ impl Drop for ScopedMemoryReservation<'_> {
     }
 }
 
+// Ordered staged postings retain the same engine admission owner.
+impl contextdb_tx::StagedPostingCharge for OwnedMemoryReservation {}
+
 impl OwnedMemoryReservation {
     pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {
         Self {

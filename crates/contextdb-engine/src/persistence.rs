@@ -11,6 +11,7 @@ mod reader_presence;
 mod transaction_repair;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
+mod writer_commit_directory;
 mod writer_file;
 mod writer_history;
 mod writer_recovery;
@@ -19,7 +20,7 @@ use writer_file::{LockedWriterFile, OpenedWriterDatabase};
 #[allow(unused_imports)] // Recovery types are consumed by writer integration.
 pub(crate) use writer_recovery::{WriterOpenBounds, WriterRecoveryBounds};
 #[allow(unused_imports)] // Internal source surface for the store adapters.
-pub(crate) use writer_source::{WriterReadSource, WriterSnapshot};
+pub(crate) use writer_source::WriterSnapshot;
 
 use crate::blob_repository::{
     BlobAuthoritativePurgeProjection, apply_authoritative_purge_in_write,
@@ -16696,7 +16697,6 @@ pub struct RedbPersistence {
     db: std::sync::RwLock<Option<redb::Database>>,
     writer_file: std::sync::RwLock<Option<Arc<LockedWriterFile>>>,
     lock_file: std::sync::RwLock<Option<CompanionGuard>>,
-    writer_read_source: std::sync::OnceLock<Arc<WriterReadSource>>,
     storage_compaction: Mutex<(redb::CompactionCursor, redb::CompactionProgress, f64)>,
     #[cfg(feature = "test-seams")]
     handoff_prepare_io_fault: AtomicBool,
@@ -19025,7 +19025,6 @@ impl RedbPersistence {
             lock_file: std::sync::RwLock::new(Some(lock_file)),
             db: std::sync::RwLock::new(Some(replacement_db)),
             writer_file: std::sync::RwLock::new(Some(replacement_owner)),
-            writer_read_source: std::sync::OnceLock::new(),
             storage_compaction: Mutex::new(Default::default()),
             #[cfg(feature = "test-seams")]
             handoff_prepare_io_fault: AtomicBool::new(false),
@@ -19089,7 +19088,6 @@ impl RedbPersistence {
                         lock_file: std::sync::RwLock::new(Some(lock_file)),
                         db: std::sync::RwLock::new(Some(db)),
                         writer_file: std::sync::RwLock::new(Some(owner)),
-                        writer_read_source: std::sync::OnceLock::new(),
                         storage_compaction: Mutex::new(Default::default()),
                         #[cfg(feature = "test-seams")]
                         handoff_prepare_io_fault: AtomicBool::new(false),
@@ -19265,7 +19263,6 @@ impl RedbPersistence {
                     lock_file: std::sync::RwLock::new(Some(lock_file)),
                     db: std::sync::RwLock::new(Some(db.database)),
                     writer_file: std::sync::RwLock::new(Some(db.owner)),
-                    writer_read_source: std::sync::OnceLock::new(),
                     storage_compaction: Mutex::new(Default::default()),
                     #[cfg(feature = "test-seams")]
                     handoff_prepare_io_fault: AtomicBool::new(false),
