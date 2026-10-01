@@ -133,6 +133,263 @@ fn allocator_open_decodes_a_fixed_number_of_regions() {
     assert_row(&large_db, 79, 0x35);
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BackendWork {
+    scratch_reads: usize,
+    scratch_writes: usize,
+    scratch_lengths: usize,
+    scratch_resizes: usize,
+    backend_reads: usize,
+    backend_read_bytes: usize,
+}
+
+impl BackendWork {
+    fn sample(fault: &ScratchFault) -> Self {
+        Self {
+            scratch_reads: fault.reads.load(Ordering::SeqCst),
+            scratch_writes: fault.writes.load(Ordering::SeqCst),
+            scratch_lengths: fault.lengths.load(Ordering::SeqCst),
+            scratch_resizes: fault.resizes.load(Ordering::SeqCst),
+            backend_reads: fault.backend_reads.load(Ordering::SeqCst),
+            backend_read_bytes: fault.backend_read_bytes.load(Ordering::SeqCst),
+        }
+    }
+
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            scratch_reads: self.scratch_reads - earlier.scratch_reads,
+            scratch_writes: self.scratch_writes - earlier.scratch_writes,
+            scratch_lengths: self.scratch_lengths - earlier.scratch_lengths,
+            scratch_resizes: self.scratch_resizes - earlier.scratch_resizes,
+            backend_reads: self.backend_reads - earlier.backend_reads,
+            backend_read_bytes: self.backend_read_bytes - earlier.backend_read_bytes,
+        }
+    }
+
+    fn scratch_calls(self) -> usize {
+        self.scratch_reads + self.scratch_writes + self.scratch_lengths + self.scratch_resizes
+    }
+}
+
+fn rejected_first_compaction_batch(path: &Path) -> BackendWork {
+    let fault = Arc::new(ScratchFault::default());
+    let db = builder()
+        .open_with_backend(FaultBackend {
+            inner: file_backend(path),
+            fault: Arc::clone(&fault),
+        })
+        .expect("open saved allocator source");
+    let before = BackendWork::sample(&fault);
+    let mut at_admission = None;
+    let mut admissions = 0;
+    let mut cursor = redb::CompactionCursor::default();
+    let error = db
+        .compact_step(&mut cursor, 1, |_| {
+            admissions += 1;
+            at_admission = Some(BackendWork::sample(&fault).since(before));
+            Err(io::Error::other("refused first relocation admission"))
+        })
+        .expect_err("admission must reject the first relocation");
+    assert!(format!("{error:?}").contains("refused first relocation admission"));
+    assert_eq!(
+        admissions, 1,
+        "the first batch attempted more than one page"
+    );
+    assert!(!cursor.is_active(), "a refused batch advanced its cursor");
+    let work = at_admission.expect("fixture reached page admission");
+    assert_eq!(
+        BackendWork::sample(&fault).since(before).scratch_calls(),
+        work.scratch_calls(),
+        "reject cleanup did extra allocator scratch work"
+    );
+    work
+}
+
+/// A one-page relocation must reach admission before any whole-source
+/// allocator traversal. Rejection leaves the cursor and durable rows intact.
+#[test]
+fn allocator_compaction_rejection_has_fixed_pre_admission_work() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let small = dir.path().join("rejected-small.redb");
+    let large = dir.path().join("rejected-large.redb");
+    let small_regions = create_regions(&small, 40);
+    let large_regions = create_regions(&large, 80);
+    assert!(large_regions > small_regions);
+
+    let n = rejected_first_compaction_batch(&small);
+    let twice_n = rejected_first_compaction_batch(&large);
+    eprintln!("first compaction admission: N={n:?}, 2N={twice_n:?}");
+    assert!(
+        n.scratch_calls() <= 32 && twice_n.scratch_calls() <= 32,
+        "one-page admission copied allocator state: N={n:?}, 2N={twice_n:?}"
+    );
+    assert!(
+        twice_n.scratch_calls() <= n.scratch_calls() + 8,
+        "pre-admission allocator calls scaled with regions: N={n:?}, 2N={twice_n:?}"
+    );
+    assert!(
+        n.backend_reads <= 64 && twice_n.backend_reads <= 64,
+        "one-page admission traversed too many storage pages: N={n:?}, 2N={twice_n:?}"
+    );
+    assert!(
+        twice_n.backend_read_bytes <= n.backend_read_bytes + 128 * 1024,
+        "pre-admission storage reads scaled with regions: N={n:?}, 2N={twice_n:?}"
+    );
+    let reopened = builder().open(&large).expect("reopen after rejected batch");
+    assert_row(&reopened, 0, 0x35);
+    assert_row(&reopened, 79, 0x35);
+}
+
+/// Finite one-page batches eventually finish while a reader holds an older
+/// root; a later growth and abort preserve the published rows across reopen.
+#[test]
+fn allocator_one_page_compaction_batches_finish_and_preserve_roots() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("finite-batches.redb");
+    create_regions(&path, 32);
+    let db = builder().open(&path).expect("open saved allocator source");
+    let retained = db.begin_read().expect("retain committed root");
+    let mut cursor = redb::CompactionCursor::default();
+    let mut examined = 0;
+    let mut complete = false;
+    for _ in 0..4096 {
+        let progress = db
+            .compact_step(&mut cursor, 1, |_| Ok(()))
+            .expect("advance one-page relocation");
+        assert!(
+            progress.pages_examined <= 16,
+            "one-page batch exceeded the fixture's bounded ancestor path: {progress:?}"
+        );
+        examined += progress.pages_examined;
+        if progress.complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete, "finite compaction did not complete its sweep");
+    assert!(examined > 0, "fixture had no pages to inspect");
+    assert_eq!(
+        retained
+            .open_table(TABLE)
+            .unwrap()
+            .get(31)
+            .unwrap()
+            .unwrap()
+            .value()[0],
+        0x35
+    );
+
+    let grow = db.begin_write().expect("begin growth after compaction");
+    {
+        let mut table = grow.open_table(TABLE).unwrap();
+        let payload = value(0x78);
+        for key in 32..48 {
+            table.insert(key, payload.as_slice()).expect("grow rows");
+        }
+    }
+    grow.commit().expect("commit growth after finite sweep");
+    let abort = db.begin_write().expect("begin abort after compaction");
+    abort
+        .open_table(TABLE)
+        .unwrap()
+        .insert(48, value(0x99).as_slice())
+        .unwrap();
+    abort.abort().expect("abort unpublished row");
+    assert!(
+        retained
+            .open_table(TABLE)
+            .unwrap()
+            .get(32)
+            .unwrap()
+            .is_none()
+    );
+    drop(retained);
+    drop(db);
+
+    let mut reopened = builder().open(&path).expect("reopen after finite sweep");
+    assert!(reopened.check_integrity().expect("check compacted store"));
+    for key in 0..32 {
+        assert_row(&reopened, key, 0x35);
+    }
+    for key in 32..48 {
+        assert_row(&reopened, key, 0x78);
+    }
+    assert!(
+        reopened
+            .begin_read()
+            .unwrap()
+            .open_table(TABLE)
+            .unwrap()
+            .get(48)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Quick repair serializes the v3 region values and tracker directly into
+/// reserved pages at a larger region geometry, then reopens the exact state.
+#[test]
+fn allocator_large_geometry_serialization_survives_reopen_and_growth() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let path = dir.path().join("large-geometry.redb");
+    let mut wide = builder();
+    wide.set_region_size(4 << 20);
+    let db = wide.create(&path).expect("create wide region fixture");
+    let mut seed = db.begin_write().expect("begin wide-region seed");
+    seed.set_quick_repair(true);
+    {
+        let mut table = seed.open_table(TABLE).expect("open seed table");
+        let payload = value(0x42);
+        for key in 0..112 {
+            table
+                .insert(key, payload.as_slice())
+                .expect("seed wide regions");
+        }
+    }
+    seed.commit().expect("serialize wide allocator state");
+    let regions = db.allocator_regions_for_test();
+    assert!(
+        regions >= 16,
+        "fixture did not span enough regions: {regions}"
+    );
+    assert!(db.allocator_metadata_bytes_for_test() <= RESIDENT_LIMIT);
+    drop(db);
+
+    let reopened = wide.open(&path).expect("decode wide allocator state");
+    assert_eq!(reopened.allocator_regions_for_test(), regions);
+    for key in 0..112 {
+        assert_row(&reopened, key, 0x42);
+    }
+    let mut grow = reopened.begin_write().expect("begin growth after decode");
+    grow.set_quick_repair(true);
+    {
+        let mut table = grow.open_table(TABLE).expect("open growth table");
+        let payload = value(0x87);
+        for key in 112..160 {
+            table
+                .insert(key, payload.as_slice())
+                .expect("grow wide regions");
+        }
+    }
+    grow.commit().expect("serialize grown allocator tracker");
+    assert!(reopened.allocator_regions_for_test() > regions);
+    drop(reopened);
+
+    let mut final_view = wide.open(&path).expect("reopen grown tracker");
+    assert!(
+        final_view
+            .check_integrity()
+            .expect("check v3 allocator roots")
+    );
+    for key in 0..112 {
+        assert_row(&final_view, key, 0x42);
+    }
+    for key in 112..160 {
+        assert_row(&final_view, key, 0x87);
+    }
+    assert!(final_view.allocator_metadata_bytes_for_test() <= RESIDENT_LIMIT);
+}
+
 /// Dirtying more regions than the fixed window set and then committing must
 /// preserve every row without growing the allocator owner with file size.
 #[test]
@@ -346,7 +603,11 @@ fn allocator_spill_preserves_registered_external_snapshot() {
 #[derive(Debug, Default)]
 struct ScratchFault {
     fail_writes: AtomicBool,
+    reads: AtomicUsize,
     writes: AtomicUsize,
+    lengths: AtomicUsize,
+    resizes: AtomicUsize,
+    backend_reads: AtomicUsize,
     backend_read_bytes: AtomicUsize,
     armed: Mutex<Option<(ScratchOperation, usize)>>,
     injected: AtomicBool,
@@ -394,7 +655,7 @@ impl ScratchFault {
         // Scratch record = 8-byte identity + 4096-byte bitmap window;
         // 32 windows per array and four arrays (root first) per order.
         let array = (offset / (4096 + 8)) / 32;
-        if self.child_reads_only.load(Ordering::SeqCst) && array % 4 == 0 {
+        if self.child_reads_only.load(Ordering::SeqCst) && array.is_multiple_of(4) {
             if self.armed.lock().unwrap().is_some() {
                 self.root_reads_while_armed.fetch_add(1, Ordering::SeqCst);
             }
@@ -412,11 +673,13 @@ struct FaultScratch {
 
 impl ScratchBackend for FaultScratch {
     fn len(&self) -> io::Result<u64> {
+        self.fault.lengths.fetch_add(1, Ordering::SeqCst);
         self.fault.maybe_fail(ScratchOperation::Len)?;
         self.inner.len()
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.fault.reads.fetch_add(1, Ordering::SeqCst);
         self.fault.maybe_fail_read(offset)?;
         self.inner.read(offset, out)
     }
@@ -431,6 +694,7 @@ impl ScratchBackend for FaultScratch {
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
+        self.fault.resizes.fetch_add(1, Ordering::SeqCst);
         self.fault.maybe_fail(ScratchOperation::Resize)?;
         self.inner.set_len(len)
     }
@@ -449,6 +713,7 @@ impl StorageBackend for FaultBackend {
 
     fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
         self.inner.read(offset, out)?;
+        self.fault.backend_reads.fetch_add(1, Ordering::SeqCst);
         self.fault
             .backend_read_bytes
             .fetch_add(out.len(), Ordering::SeqCst);
@@ -1049,15 +1314,16 @@ fn allocator_scratch_resize_failure_during_active_shrink_preserves_rows() {
     }
 }
 
-/// Materializing a saved allocator source before compaction must propagate
-/// scratch I/O failure and leave the last durable root readable.
+/// Finite compaction keeps the saved source lazy. Explicit whole-file
+/// compaction must still propagate a materialization fault and keep the last
+/// durable root readable.
 #[test]
 fn allocator_scratch_failure_during_source_materialization_preserves_rows() {
     let dir = tempfile::tempdir().expect("fixture directory");
     let path = dir.path().join("materialize-fault.redb");
     create_regions(&path, 48);
     let fault = Arc::new(ScratchFault::default());
-    let db = builder()
+    let mut db = builder()
         .open_with_backend(FaultBackend {
             inner: file_backend(&path),
             fault: Arc::clone(&fault),
@@ -1065,9 +1331,21 @@ fn allocator_scratch_failure_during_source_materialization_preserves_rows() {
         .expect("open saved allocator source");
     fault.arm(ScratchOperation::Write, 1);
     let mut cursor = redb::CompactionCursor::default();
+    let writes_before = fault.writes.load(Ordering::SeqCst);
+    db.compact_step(&mut cursor, 8, |_| Ok(()))
+        .expect("finite compaction leaves the saved source lazy");
+    assert!(
+        !fault.hit(),
+        "finite compaction materialized its saved source"
+    );
+    assert_eq!(
+        fault.writes.load(Ordering::SeqCst),
+        writes_before,
+        "finite compaction spilled the whole saved source"
+    );
     let error = format!(
         "{:?}",
-        db.compact_step(&mut cursor, 8, |_| Ok(()))
+        db.compact()
             .expect_err("materialization scratch write must refuse compaction")
     );
     assert!(fault.hit(), "fixture did not spill materialized source");
