@@ -91,6 +91,8 @@ mod writer_file_ownership_survives_recycle;
 
 #[path = "engine_seams/buffer_pool_share_evicts_and_recharges_under_the_writer_budget.rs"]
 mod buffer_pool_share_evicts_and_recharges_under_the_writer_budget;
+#[path = "engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs"]
+mod history_sync_and_commit_cursors_reload_without_full_directories;
 #[cfg(target_os = "linux")]
 #[path = "engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs"]
 mod writer_reopen_and_doubling_keep_a_fixed_resident_envelope;
