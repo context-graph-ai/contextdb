@@ -55,7 +55,7 @@ use crate::executor::{
     analyze_passive_relational_route, apply_on_conflict_updates, execute_plan,
     validate_plan_columns,
 };
-use crate::memory_accounting::MemoryAccountant;
+use crate::memory_accounting::{MemoryAccountant, OwnedMemoryReservation};
 use crate::persistence::{
     AuthoritativePurgePersistenceProjection, LoadedVectorPartitionGenerationCatalog,
     LocalSchemaPersistenceProjection, ReadOnlyVectorGenerationSource,
@@ -25268,9 +25268,21 @@ impl Database {
                     Some(self.enter_sql_write_control_bypass(tx))
                 };
                 let snapshot = self.snapshot_for_read();
-                self.with_snapshot_override(snapshot, || {
+                let checkpoint = matches!(
+                    plan,
+                    PhysicalPlan::Insert(_) | PhysicalPlan::Update(_) | PhysicalPlan::Delete(_)
+                )
+                .then(|| self.write_set_checkpoint(tx))
+                .transpose()?;
+                let result = self.with_snapshot_override(snapshot, || {
                     self.run_read_plan(plan, params, Some(tx), snapshot)
-                })
+                });
+                if let Some(checkpoint) = checkpoint
+                    && result.is_err()
+                {
+                    let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+                }
+                result
             }
             None => self.execute_autocommit(plan, params, preopened_autocommit_tx),
         };
@@ -25678,6 +25690,39 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<RowId> {
+        let mut values =
+            self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
+        self.complete_insert_access_values(table, &mut values)?;
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let admission = self.admit_retained_row_owned(
+            table,
+            &values,
+            &meta,
+            "relational",
+            "staged_index_posting",
+            "Reduce row size or raise MEMORY_LIMIT.",
+        )?;
+        self.insert_row_with_admission(tx, table, values, Some(admission))
+    }
+
+    pub(crate) fn insert_row_prepaid(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+    ) -> Result<RowId> {
+        self.insert_row_with_admission(tx, table, values, None)
+    }
+
+    fn insert_row_with_admission(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+        mut admission: Option<OwnedMemoryReservation>,
+    ) -> Result<RowId> {
         self.ensure_no_mixed_local_schema_dml(tx)?;
         let trigger_callback_bound = self.trigger_callback_tx_bound_matches(tx);
         let _operation = if trigger_callback_bound {
@@ -25689,7 +25734,13 @@ impl Database {
             self.ensure_trigger_table_ready(table, "insert_row")?;
         }
         let checkpoint = self.write_set_checkpoint(tx)?;
-        let result = self.insert_row_within_operation(tx, table, values, trigger_callback_bound);
+        let result = self.insert_row_within_operation(
+            tx,
+            table,
+            values,
+            trigger_callback_bound,
+            &mut admission,
+        );
         if result.is_err() {
             let _ = self.restore_write_set_checkpoint(tx, checkpoint);
         }
@@ -25702,6 +25753,7 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
         trigger_callback_bound: bool,
+        admission: &mut Option<OwnedMemoryReservation>,
     ) -> Result<RowId> {
         // Statement-scoped bound: `Value::TxId(n)` must satisfy
         // `n <= max(committed_watermark, tx)` so writes inside an active
@@ -25737,6 +25789,9 @@ impl Database {
                         values,
                         self.trigger_callback_wallclock(),
                     )?;
+                if let Some(admission) = admission.take() {
+                    self.record_owned_row_admission(tx, table, inserted, admission);
+                }
                 self.write_row_vectors_or_unstage(
                     tx,
                     table,
@@ -25757,6 +25812,9 @@ impl Database {
                 self.snapshot_for_read(),
                 None,
             )?;
+            if let Some(admission) = admission.take() {
+                self.record_owned_row_admission(tx, table, inserted, admission);
+            }
             self.write_row_vectors_or_unstage(
                 tx,
                 table,
@@ -25779,6 +25837,9 @@ impl Database {
             self.snapshot_for_read(),
             None,
         )?;
+        if let Some(admission) = admission.take() {
+            self.record_owned_row_admission(tx, table, inserted, admission);
+        }
         self.write_row_vectors_or_unstage(tx, table, inserted, &row_vectors_source, staged_before)?;
         if let Some(key) = creation_key {
             self.stage_local_creation_lineage(tx, table, key, inserted)?;
@@ -25841,6 +25902,9 @@ impl Database {
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        if !self.trigger_callback_tx_bound_matches(tx) {
+            self.validate_row_constraints(tx, table, &values, Some(row_id))?;
+        }
         let committed_row_exists = self.committed_row_at(table, row_id, snapshot)?.is_some();
         self.replace_row_after_update_validation_counted(
             tx,
@@ -25885,26 +25949,33 @@ impl Database {
                 meta.as_ref(),
             );
         }
-        let charge = self
-            .relational
-            .delete_retiring_staged_charge_with_presence(
-                tx,
-                table,
-                row_id,
-                self.committed_row_at(table, row_id, self.snapshot_for_read())?
-                    .is_some(),
-                |row, admitted| {
-                    #[cfg(any(test, feature = "test-seams"))]
-                    STAGED_DELETE_RACE_HOOK_FOR_TEST.with(|slot| {
-                        if let Some(hook) = slot.borrow().as_ref() {
-                            (hook.observe)(StagedDeleteRacePointForTest::AdmissionReadObserved);
-                        }
-                    });
-                    admitted.unwrap_or_else(|| {
-                        retained_row_bytes_with_optional_meta(table, row, meta.as_ref())
-                    })
-                },
-            )?;
+        let charge = self.relational.delete_retiring_staged_charge_with_undo(
+            tx,
+            table,
+            row_id,
+            self.committed_row_at(table, row_id, self.snapshot_for_read())?
+                .is_some(),
+            |row, admitted| {
+                #[cfg(any(test, feature = "test-seams"))]
+                STAGED_DELETE_RACE_HOOK_FOR_TEST.with(|slot| {
+                    if let Some(hook) = slot.borrow().as_ref() {
+                        (hook.observe)(StagedDeleteRacePointForTest::AdmissionReadObserved);
+                    }
+                });
+                admitted.unwrap_or_else(|| {
+                    retained_row_bytes_with_optional_meta(table, row, meta.as_ref())
+                })
+            },
+            |bytes| {
+                Some(Arc::new(
+                    crate::memory_accounting::TransferredRowReservation::from_admitted(
+                        self.accountant.clone(),
+                        bytes,
+                    ),
+                )
+                    as Arc<dyn contextdb_tx::StagedPostingCharge>)
+            },
+        )?;
         #[cfg(any(test, feature = "test-seams"))]
         STAGED_DELETE_RACE_HOOK_FOR_TEST.with(|slot| {
             if let Some(hook) = slot.borrow().as_ref() {
@@ -34325,9 +34396,20 @@ impl Database {
         self.ensure_trigger_table_ready(table, "upsert_row")?;
         self.complete_insert_access_values(table, &mut values)?;
         let checkpoint = self.write_set_checkpoint(tx)?;
-        let result = self.upsert_row_within_operation(tx, table, conflict_col, values);
+        let mut admission = None;
+        let mut staged_row = None;
+        let result = self.upsert_row_within_operation(
+            tx,
+            table,
+            conflict_col,
+            values,
+            &mut admission,
+            &mut staged_row,
+        );
         if result.is_err() {
             let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        } else if let (Some(admission), Some(row)) = (admission.take(), staged_row) {
+            self.record_owned_row_admission(tx, table, row, admission);
         }
         result
     }
@@ -34338,6 +34420,8 @@ impl Database {
         table: &str,
         conflict_col: &str,
         values: HashMap<ColName, Value>,
+        admission: &mut Option<OwnedMemoryReservation>,
+        staged_row: &mut Option<RowId>,
     ) -> Result<UpsertResult> {
         let snapshot = self.snapshot_for_read();
         let existing_row = values
@@ -34393,8 +34477,23 @@ impl Database {
             let staged_before = self.staged_row_count(tx);
             let mut values = values;
             self.blank_quantized_vector_values(table, &mut values);
+            let row_meta = meta
+                .as_ref()
+                .ok_or_else(|| Error::TableNotFound(table.into()))?;
+            *admission = Some(self.admit_retained_row_owned(
+                table,
+                &row_vectors_source,
+                row_meta,
+                "relational",
+                "staged_index_posting",
+                "Reduce row size or raise MEMORY_LIMIT.",
+            )?);
             let inserted =
                 self.insert_relational_row_from_read(tx, table, row_id, values, snapshot, None)?;
+            *staged_row = Some(inserted);
+            if let Some(admission) = admission.take() {
+                self.record_owned_row_admission(tx, table, inserted, admission);
+            }
             self.write_row_vectors_or_unstage(
                 tx,
                 table,
@@ -34442,11 +34541,26 @@ impl Database {
         // Placing the new vector is what retires the old one: the store
         // deletes the entry this row already had before it takes the new one,
         // so an updating upsert leaves one vector behind, not two.
+        let row_meta = meta
+            .as_ref()
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        *admission = Some(self.admit_retained_row_owned(
+            table,
+            &values,
+            row_meta,
+            "relational",
+            "staged_index_posting",
+            "Reduce row size or raise MEMORY_LIMIT.",
+        )?);
         let row_vectors = self.row_vector_values(table, &values);
         let mut values = values;
         self.blank_quantized_vector_values(table, &mut values);
         let replaced =
             self.replace_row_after_update_validation(tx, table, existing.row_id, values, snapshot)?;
+        *staged_row = Some(replaced);
+        if let Some(admission) = admission.take() {
+            self.record_owned_row_admission(tx, table, replaced, admission);
+        }
         self.write_row_vectors(tx, replaced, row_vectors)?;
 
         if let (Some(uuid), Some(state), Some(_meta)) =
@@ -37676,9 +37790,33 @@ impl Database {
             )?;
             self.assert_row_write_allowed(&entry.table, existing.row_id, &next_values, snapshot)?;
 
-            let upsert_outcome =
-                self.relational
-                    .upsert(tx, &entry.table, "id", next_values, snapshot);
+            let upsert_outcome = (|| {
+                if existing.values == next_values {
+                    return Ok(UpsertResult::NoOp);
+                }
+                self.validate_commit_time_upsert_state_transition(
+                    &entry.table,
+                    &existing,
+                    &next_values,
+                )?;
+                let admission = self.admit_retained_row_owned(
+                    &entry.table,
+                    &next_values,
+                    meta,
+                    "relational",
+                    "staged_index_posting",
+                    "Reduce propagation growth or raise MEMORY_LIMIT.",
+                )?;
+                let row = self.replace_row_after_update_validation(
+                    tx,
+                    &entry.table,
+                    existing.row_id,
+                    next_values,
+                    snapshot,
+                )?;
+                self.record_owned_row_admission(tx, &entry.table, row, admission);
+                Ok(UpsertResult::Updated)
+            })();
 
             let reached_state = match upsert_outcome {
                 Ok(UpsertResult::Updated) => entry.target_state.as_str(),
@@ -38576,31 +38714,38 @@ impl Database {
         } else {
             Some(self.open_operation_after_write_control_wait(tx, "delete_row")?)
         };
-        self.ensure_trigger_table_ready(table, "delete_row")?;
-        self.assert_row_id_write_allowed(Some(tx), table, row_id, self.snapshot_for_read())?;
-        if let Some(row) = self.committed_row_at(table, row_id, self.snapshot_for_read())?
-            && let Some(meta) = self.table_meta(table)
-            && let Some(natural_key) = natural_key_from_row_values(&meta, &row.values)
-        {
-            // A local delete replaces any older pulled tombstone for this key.
-            // Sync apply records its own marker again only after its delete
-            // commits, so a failed inbound delete never becomes suppressible.
-            self.clear_sync_tombstone(table, &natural_key);
-        }
-        if release_vectors {
-            // Before the relational body goes, so a failure leaves the row and
-            // its vectors together rather than a row with no embeddings.
-            for index in self.vector_indexes_of_table(table) {
-                if self.vector_store.has_live_entry_for_row(
-                    &index,
-                    row_id,
-                    self.snapshot_for_read(),
-                ) {
-                    self.delete_vector(tx, index, row_id)?;
+        let checkpoint = self.write_set_checkpoint(tx)?;
+        let result = (|| {
+            self.ensure_trigger_table_ready(table, "delete_row")?;
+            self.assert_row_id_write_allowed(Some(tx), table, row_id, self.snapshot_for_read())?;
+            if let Some(row) = self.committed_row_at(table, row_id, self.snapshot_for_read())?
+                && let Some(meta) = self.table_meta(table)
+                && let Some(natural_key) = natural_key_from_row_values(&meta, &row.values)
+            {
+                // A local delete replaces any older pulled tombstone for this key.
+                // Sync apply records its own marker again only after its delete
+                // commits, so a failed inbound delete never becomes suppressible.
+                self.clear_sync_tombstone(table, &natural_key);
+            }
+            if release_vectors {
+                // Before the relational body goes, so a failure leaves the row and
+                // its vectors together rather than a row with no embeddings.
+                for index in self.vector_indexes_of_table(table) {
+                    if self.vector_store.has_live_entry_for_row(
+                        &index,
+                        row_id,
+                        self.snapshot_for_read(),
+                    ) {
+                        self.delete_vector(tx, index, row_id)?;
+                    }
                 }
             }
+            self.delete_relational_row_releasing_staged(tx, table, row_id)
+        })();
+        if result.is_err() {
+            let _ = self.restore_write_set_checkpoint(tx, checkpoint);
         }
-        self.delete_relational_row_releasing_staged(tx, table, row_id)
+        result
     }
 
     /// One index reference per vector column the table declares.
@@ -50437,6 +50582,33 @@ impl Database {
         Ok(admitted)
     }
 
+    pub(crate) fn admit_retained_row_owned(
+        &self,
+        table: &str,
+        values: &HashMap<ColName, Value>,
+        meta: &TableMeta,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<OwnedMemoryReservation> {
+        let bytes =
+            self.admit_retained_row_bytes(table, values, meta, subsystem, operation, hint)?;
+        Ok(OwnedMemoryReservation::from_admitted(
+            self.accountant.clone(),
+            bytes,
+        ))
+    }
+    pub(crate) fn record_owned_row_admission(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        admission: OwnedMemoryReservation,
+    ) {
+        self.record_staged_row_admission(tx, table, row_id, admission.bytes());
+        admission.transfer_to_staged();
+    }
+
     /// Record what admission charged for a row version that is now staged.
     ///
     /// A staged version is released by exactly this figure. Without the
@@ -50453,6 +50625,8 @@ impl Database {
     ) {
         let _ = self.tx_mgr.with_write_set(tx, |ws| {
             ws.set_relational_insert_admitted_bytes(table, row_id, bytes);
+            ws.ordered_staged_rows
+                .record_installed_admission(table, row_id, bytes);
         });
     }
 
@@ -50795,6 +50969,7 @@ impl Database {
                 checkpoint.marker,
                 &mut ws.relational_inserts,
                 &mut ws.relational_insert_admitted_bytes,
+                |bytes| self.accountant.release(bytes),
             );
             ws.ordered_staged_rows.restore_vector_checkpoint(
                 checkpoint.marker,
@@ -50806,7 +50981,11 @@ impl Database {
             ws.ordered_staged_rows.settle_checkpoint();
             ws.relational_inserts.truncate(checkpoint.counts[0]);
             ws.relational_deletes.truncate(checkpoint.counts[1]);
-            ws.adj_inserts.truncate(checkpoint.counts[2]);
+            for edge in ws.adj_inserts.drain(checkpoint.counts[2]..) {
+                let bytes = edge.estimated_bytes();
+                drop(edge);
+                self.accountant.release(bytes);
+            }
             ws.vector_inserts.truncate(checkpoint.counts[3]);
             ws.vector_deletes.truncate(checkpoint.counts[4]);
             ws.vector_moves.truncate(checkpoint.counts[5]);

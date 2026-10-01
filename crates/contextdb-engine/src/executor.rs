@@ -6663,14 +6663,14 @@ fn exec_insert(
             validate_vector_columns(db, &p.table, &values)?;
         }
         let checkpoint = db.write_set_checkpoint(txid)?;
-        let row_bytes = db.admit_retained_row_bytes(
+        let mut row_admission = Some(db.admit_retained_row_owned(
             &p.table,
             &values,
             &insert_meta,
             "insert",
             "row_insert",
             "Reduce row size or raise MEMORY_LIMIT before inserting more data.",
-        )?;
+        )?);
         let graph_edge = if route_inserts_to_graph {
             match (
                 values.get("source_id"),
@@ -6690,7 +6690,6 @@ fn exec_insert(
 
         let _row_id = if let Some(on_conflict) = &p.on_conflict {
             if on_conflict.columns.is_empty() {
-                db.accountant().release(row_bytes);
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(Error::Other(
                     "ON CONFLICT target must include at least one column".to_string(),
@@ -6708,7 +6707,6 @@ fn exec_insert(
             {
                 Ok(values) => values,
                 Err(err) => {
-                    db.accountant().release(row_bytes);
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
@@ -6722,7 +6720,6 @@ fn exec_insert(
             ) {
                 Ok(existing) => existing,
                 Err(err) => {
-                    db.accountant().release(row_bytes);
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
@@ -6739,7 +6736,6 @@ fn exec_insert(
                 ) {
                     Ok(v) => v,
                     Err(err) => {
-                        db.accountant().release(row_bytes);
                         let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                         return Err(err);
                     }
@@ -6750,7 +6746,7 @@ fn exec_insert(
             match existing {
                 None => {
                     let intent_insert_values = upsert_values.clone();
-                    match db.insert_row(txid, &p.table, upsert_values) {
+                    match db.insert_row_prepaid(txid, &p.table, upsert_values) {
                         Ok(row_id) => {
                             if let Err(err) = db.record_upsert_intent(
                                 txid,
@@ -6763,14 +6759,12 @@ fn exec_insert(
                                     params: params.clone(),
                                 },
                             ) {
-                                db.accountant().release(row_bytes);
                                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                                 return Err(err);
                             }
                             row_id
                         }
                         Err(err) => {
-                            db.accountant().release(row_bytes);
                             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                             return Err(err);
                         }
@@ -6781,7 +6775,6 @@ fn exec_insert(
                         .iter()
                         .any(|(k, v)| existing_row.values.get(k) != Some(v));
                     if !changed {
-                        db.accountant().release(row_bytes);
                         RowId(0)
                     } else {
                         if let Err(err) = validate_update_state_transition(
@@ -6790,7 +6783,6 @@ fn exec_insert(
                             &existing_row,
                             &upsert_values,
                         ) {
-                            db.accountant().release(row_bytes);
                             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                             return Err(err);
                         }
@@ -6803,7 +6795,6 @@ fn exec_insert(
                                 ) && let Err(err) =
                                     db.delete_vector(txid, index, existing_row.row_id)
                                 {
-                                    db.accountant().release(row_bytes);
                                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                                     return Err(err);
                                 }
@@ -6825,11 +6816,16 @@ fn exec_insert(
                         ) {
                             Ok(row_id) => row_id,
                             Err(err) => {
-                                db.accountant().release(row_bytes);
                                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                                 return Err(err);
                             }
                         };
+                        db.record_owned_row_admission(
+                            txid,
+                            &p.table,
+                            row_id,
+                            row_admission.take().expect("row payload admission"),
+                        );
                         if let (Some(uuid), Some(state)) = (row_uuid, new_state.as_deref())
                             && let Err(err) = db.propagate_state_change_if_needed(
                                 txid,
@@ -6838,7 +6834,6 @@ fn exec_insert(
                                 Some(state),
                             )
                         {
-                            db.accountant().release(row_bytes);
                             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                             return Err(err);
                         }
@@ -6850,11 +6845,10 @@ fn exec_insert(
             match db.insert_row_with_unique_noop(txid, &p.table, values) {
                 Ok(InsertRowResult::Inserted(row_id)) => row_id,
                 Ok(InsertRowResult::NoOp) => {
-                    db.accountant().release(row_bytes);
                     continue;
                 }
                 Err(err) => {
-                    db.accountant().release(row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
             }
@@ -6862,8 +6856,10 @@ fn exec_insert(
         // The admitted figure rides with the version it paid for, so the
         // release is that same number however the table's index set changes
         // while the transaction stays open.
-        if _row_id != RowId(0) {
-            db.record_staged_row_admission(txid, &p.table, _row_id, row_bytes);
+        if _row_id != RowId(0)
+            && let Some(admission) = row_admission.take()
+        {
+            db.record_owned_row_admission(txid, &p.table, _row_id, admission);
         }
 
         if let Some((source, target, edge_type)) = graph_edge {
@@ -6871,12 +6867,10 @@ fn exec_insert(
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-                    db.accountant().release(row_bytes);
                     continue;
                 }
                 Err(err) => {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-                    db.accountant().release(row_bytes);
                     return Err(err);
                 }
             }
@@ -7345,7 +7339,7 @@ fn exec_update(
             if !skip_trigger_access_checks {
                 db.assert_row_write_allowed(&p.table, row.row_id, &values, snapshot)?;
             }
-            let new_row_bytes = admit_table_row_bytes(
+            let row_admission = admit_table_row_bytes(
                 db,
                 &p.table,
                 &values,
@@ -7379,11 +7373,10 @@ fn exec_update(
                     ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
-                        db.accountant().release(new_row_bytes);
                         return Err(err);
                     }
                 };
-                db.record_staged_row_admission(txid, &p.table, new_row_id, new_row_bytes);
+                db.record_owned_row_admission(txid, &p.table, new_row_id, row_admission);
                 if let Some(predicates) = conditional_predicates.clone() {
                     db.record_conditional_update_guard(
                         txid,
@@ -7401,7 +7394,6 @@ fn exec_update(
             let checkpoint = match db.write_set_checkpoint(txid) {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => {
-                    db.accountant().release(new_row_bytes);
                     return Err(error);
                 }
             };
@@ -7411,19 +7403,17 @@ fn exec_update(
             {
                 Ok(row_id) => row_id,
                 Err(err) => {
-                    db.accountant().release(new_row_bytes);
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
             };
+            db.record_owned_row_admission(txid, &p.table, new_row_id, row_admission);
             if let Err(err) =
                 db.propagate_state_change_if_needed(txid, &p.table, row_uuid, new_state.as_deref())
             {
-                db.accountant().release(new_row_bytes);
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(err);
             }
-            db.record_staged_row_admission(txid, &p.table, new_row_id, new_row_bytes);
             if let Some(predicates) = conditional_predicates.clone() {
                 let after_counts = db.write_set_counts(txid)?;
                 db.record_conditional_update_guard(
@@ -7529,7 +7519,7 @@ fn exec_update(
         let assigned_vector_columns = plan.assigned_vector_columns;
         let conditional_predicates = plan.conditional_predicates;
         let checkpoint = db.write_set_checkpoint(txid)?;
-        let new_row_bytes = admit_table_row_bytes(
+        let row_admission = admit_table_row_bytes(
             db,
             &p.table,
             &values,
@@ -7548,7 +7538,6 @@ fn exec_update(
             {
                 Ok(row_id) => row_id,
                 Err(err) => {
-                    db.accountant().release(new_row_bytes);
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
@@ -7560,7 +7549,6 @@ fn exec_update(
                     contextdb_core::VectorIndexRef::new(&p.table, column.clone()),
                     row.row_id,
                 ) {
-                    db.accountant().release(new_row_bytes);
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
@@ -7570,7 +7558,6 @@ fn exec_update(
             {
                 Ok(row_id) => row_id,
                 Err(err) => {
-                    db.accountant().release(new_row_bytes);
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
@@ -7580,18 +7567,16 @@ fn exec_update(
                     continue;
                 }
                 if let Err(err) = db.move_vector(txid, index.clone(), row.row_id, new_row_id) {
-                    db.accountant().release(new_row_bytes);
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     return Err(err);
                 }
             }
             new_row_id
         };
-        db.record_staged_row_admission(txid, &p.table, new_row_id, new_row_bytes);
+        db.record_owned_row_admission(txid, &p.table, new_row_id, row_admission);
         for (column, vector) in assigned_vector_values {
             let index = contextdb_core::VectorIndexRef::new(&p.table, column);
             if let Err(err) = db.insert_vector_strict(txid, index, new_row_id, vector) {
-                db.accountant().release(new_row_bytes);
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(err);
             }
@@ -7599,7 +7584,6 @@ fn exec_update(
         if let Err(err) =
             db.propagate_state_change_if_needed(txid, &p.table, row_uuid, new_state.as_deref())
         {
-            db.accountant().release(new_row_bytes);
             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
             return Err(err);
         }
@@ -8556,11 +8540,11 @@ fn admit_table_row_bytes(
     subsystem: &str,
     operation: &str,
     hint: &str,
-) -> Result<usize> {
+) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
     let meta = db
         .table_meta(table)
         .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
-    db.admit_retained_row_bytes(table, values, &meta, subsystem, operation, hint)
+    db.admit_retained_row_owned(table, values, &meta, subsystem, operation, hint)
 }
 
 // ========================= Index scan planning + execution =========================

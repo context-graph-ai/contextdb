@@ -7,11 +7,11 @@ use std::ops::Bound;
 use std::sync::{Arc, Weak};
 
 #[derive(Debug)]
-struct RowOwner {
-    row: VersionedRow,
+pub(crate) struct RowOwner {
+    pub(crate) row: VersionedRow,
     sequence: usize,
-    keys: Vec<(String, IndexKey)>,
-    schema: Arc<crate::ordered_staged::StagedSchema>,
+    pub(crate) keys: Vec<(String, IndexKey)>,
+    pub(crate) schema: Arc<crate::ordered_staged::StagedSchema>,
     _charge: Arc<dyn StagedPostingCharge>,
 }
 
@@ -159,6 +159,10 @@ impl StatementRows {
                     .as_ref()
                     .map_or(0, |charge| charge.retained_bytes()),
             )
+    }
+
+    pub(crate) fn owner(&self, row: RowId) -> Option<Arc<RowOwner>> {
+        self.rows.get(&row).cloned()
     }
 
     pub fn is_empty(&self) -> bool {

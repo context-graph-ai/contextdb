@@ -392,6 +392,9 @@ impl contextdb_tx::StagedPostingCharge for OwnedMemoryReservation {
 }
 
 impl OwnedMemoryReservation {
+    pub(crate) fn from_admitted(accountant: Arc<MemoryAccountant>, bytes: usize) -> Self {
+        Self { accountant, bytes }
+    }
     pub(crate) fn transfer_to_staged(mut self) {
         self.bytes = 0;
     }

@@ -197,6 +197,7 @@ struct StagedMutationUndo {
     table_existed: bool,
     displaced: Vec<(usize, String, contextdb_core::VersionedRow)>,
     prior_admitted: Option<usize>,
+    installed_admitted: usize,
     admission: Option<Arc<dyn StagedPostingCharge>>,
     _charge: Arc<dyn StagedPostingCharge>,
 }
@@ -715,16 +716,31 @@ impl OrderedStagedRows {
         undo.admission = admission;
         true
     }
+    /// Associate the actual payload admission with its prepared mutation undo.
+    #[doc(hidden)]
+    pub fn record_installed_admission(&mut self, table: &str, row: RowId, bytes: usize) {
+        if let Some(undo) = self
+            .undo
+            .iter_mut()
+            .rev()
+            .find(|undo| undo.table == table && undo.row_id == row)
+        {
+            debug_assert_eq!(undo.installed_admitted, 0);
+            undo.installed_admitted = bytes;
+        }
+    }
     #[doc(hidden)]
     pub fn restore_checkpoint(
         &mut self,
         marker: [usize; 2],
         inserts: &mut Vec<(String, contextdb_core::VersionedRow)>,
         admitted: &mut HashMap<String, HashMap<RowId, usize>>,
+        mut release: impl FnMut(usize),
     ) {
         while self.undo.len() > marker[0] {
             let undo = self.undo.pop().expect("mutation undo");
             inserts.retain(|(table, row)| table != &undo.table || row.row_id != undo.row_id);
+            release(undo.installed_admitted);
             if let Some(rows) = admitted.get_mut(&undo.table) {
                 rows.remove(&undo.row_id);
             }
@@ -778,6 +794,56 @@ impl OrderedStagedRows {
             }
         }
         self.discard_empty_maps();
+    }
+    /// Prepare the same admitted inverse as replacement, retaining the old row owner.
+    #[doc(hidden)]
+    pub fn prepare_row_removal(
+        &mut self,
+        table: &str,
+        row: RowId,
+        retired_count: usize,
+        mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    ) -> Result<()> {
+        if self.checkpoint_depth == 0 {
+            return Ok(());
+        }
+        let Some(snapshot) = self.statement_rows.get(table) else {
+            return Ok(());
+        };
+        let Some(owner) = snapshot.owner(row) else {
+            return Ok(());
+        };
+        let prepared = crate::StatementRows::prepare(
+            snapshot,
+            &owner.row,
+            &owner.keys,
+            owner.schema.clone(),
+            &mut reserve,
+            true,
+        )?;
+        self.stage_retiring_row(
+            table,
+            StagedPosition {
+                row_id: row,
+                position: 0,
+                created_tx: owner.row.created_tx,
+            },
+            &owner.keys,
+            &owner.schema,
+            retired_count,
+            &mut reserve,
+        )?;
+        let undo = crate::StatementRows::publish(
+            self.statement_rows
+                .get_mut(table)
+                .expect("prepared removal table"),
+            prepared,
+        );
+        self.undo
+            .last_mut()
+            .expect("prepared removal undo")
+            .statement = undo;
+        Ok(())
     }
     pub fn remove_statement_row(&mut self, table: &str, row: RowId) -> Result<()> {
         if let Some(snapshot) = self.statement_rows.get_mut(table) {
@@ -996,6 +1062,7 @@ impl OrderedStagedRows {
                 table_existed: self.statement_rows.contains_key(table),
                 displaced: Vec::with_capacity(retired_count),
                 prior_admitted: None,
+                installed_admitted: 0,
                 admission: None,
                 _charge: undo_charge,
             });

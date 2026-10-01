@@ -1213,26 +1213,62 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         table: &str,
         row_id: RowId,
         committed_row_exists: bool,
+        staged_charge: impl FnMut(&VersionedRow, Option<usize>) -> usize,
+    ) -> Result<usize> {
+        self.delete_retiring_staged_charge_with_undo(
+            tx,
+            table,
+            row_id,
+            committed_row_exists,
+            staged_charge,
+            |_| None,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn delete_retiring_staged_charge_with_undo(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        committed_row_exists: bool,
         mut staged_charge: impl FnMut(&VersionedRow, Option<usize>) -> usize,
+        mut transfer: impl FnMut(usize) -> Option<Arc<dyn contextdb_tx::StagedPostingCharge>>,
     ) -> Result<usize> {
         self.ensure_table_exists(table)?;
         if self.store.is_immutable(table) {
             return Err(Error::ImmutableTable(table.to_string()));
         }
         self.tx_mgr.with_write_set(tx, |ws| {
-            ws.ordered_staged_rows.remove_statement_row(table, row_id)?;
             let admitted = ws.admitted_bytes_for_staged_row(table, row_id);
             let mut retired = 0usize;
-            let mut removed = false;
-            ws.relational_inserts.retain(|(staged_table, row)| {
+            let mut count = 0usize;
+            for (staged_table, row) in &ws.relational_inserts {
                 if staged_table == table && row.row_id == row_id {
-                    removed = true;
+                    count += 1;
                     retired = retired.saturating_add(staged_charge(row, admitted));
-                    false
-                } else {
-                    true
                 }
-            });
+            }
+            if let Some(admission) = &self.staged_posting_admission {
+                ws.ordered_staged_rows
+                    .prepare_row_removal(table, row_id, count, |bytes| admission.reserve(bytes))?;
+            }
+            ws.ordered_staged_rows.remove_statement_row(table, row_id)?;
+            let removed = count != 0;
+            let deferred = removed
+                && ws.ordered_staged_rows.checkpoint_active()
+                && ws.ordered_staged_rows.retain_displaced(
+                    &mut ws.relational_inserts,
+                    table,
+                    row_id,
+                    admitted,
+                    transfer(retired),
+                );
+            if !deferred {
+                ws.relational_inserts
+                    .retain(|(name, row)| name != table || row.row_id != row_id);
+            }
+
             if removed {
                 ws.ordered_staged_rows.remove(table, row_id);
                 ws.rebind_ordered_staged_rows();
@@ -1246,7 +1282,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             {
                 ws.relational_deletes.push((table.to_string(), row_id, tx));
             }
-            Ok(retired)
+            Ok(if deferred { 0 } else { retired })
         })?
     }
 
