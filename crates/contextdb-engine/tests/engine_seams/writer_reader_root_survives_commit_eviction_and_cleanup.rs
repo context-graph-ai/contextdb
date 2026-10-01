@@ -7,7 +7,9 @@ use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey, Wallclock};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::local_transport::ManualDeadlineClock;
 use contextdb_engine::writer_commit_test_seams::{CommitBoundary, observe as observe_commit};
-use contextdb_engine::writer_query_test_seams::observe as observe_query;
+use contextdb_engine::writer_query_test_seams::{
+    PhysicalFamily, observe as observe_query, observe_target,
+};
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::{
     collections::HashMap,
@@ -36,6 +38,15 @@ impl bounded::ExecutionProbe for StatementPause {
 
 #[test]
 fn writer_reader_root_survives_commit_eviction_and_cleanup() {
+    for boundary in [
+        CommitBoundary::BeforeRedb,
+        CommitBoundary::BeforeMemoryPublication,
+    ] {
+        reader_at_boundary(boundary);
+    }
+}
+
+fn reader_at_boundary(boundary: CommitBoundary) {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("reader-roots.redb");
@@ -47,7 +58,7 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
         },
     )
     .unwrap();
-    database.execute("CREATE TABLE reader_items (id INTEGER PRIMARY KEY, unique_key TEXT UNIQUE, embedding VECTOR(3) SEARCH_MODE EXACT) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST", &HashMap::new()).unwrap();
+    database.execute("CREATE TABLE reader_items (id INTEGER PRIMARY KEY, unique_key TEXT UNIQUE, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 8, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST", &HashMap::new()).unwrap();
     let old_vectors = [
         vec![1.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0],
@@ -65,6 +76,42 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
             )
             .unwrap();
     }
+    // Unrelated, wide scalar rows force real leaves below the relation root.
+    // NULL embeddings preserve the three-point maintained-vector fixture.
+    for id in 1000..1128 {
+        database
+            .execute(
+                "INSERT INTO reader_items VALUES ($id, $key, NULL)",
+                &HashMap::from([
+                    ("id".to_owned(), Value::Int64(id)),
+                    (
+                        "key".to_owned(),
+                        Value::Text(format!("filler-{id}-{}", "x".repeat(1024))),
+                    ),
+                ]),
+            )
+            .unwrap();
+    }
+    for _ in 0..8 {
+        database.run_maintenance_cycle().unwrap();
+    }
+    database
+        .execute(
+            "CREATE TABLE displacement (id INT PRIMARY KEY, body TEXT) SYNC OFF",
+            &HashMap::new(),
+        )
+        .unwrap();
+    for id in 0..96 {
+        database
+            .execute(
+                "INSERT INTO displacement VALUES ($id,$body)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("body".into(), Value::Text("p".repeat(128 * 1024))),
+                ]),
+            )
+            .unwrap();
+    }
     database.close().unwrap();
     drop(database);
     let database = Arc::new(
@@ -77,10 +124,38 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
         )
         .unwrap(),
     );
+    let relation_height = database
+        .__durable_relation_tree_height_for_test("reader_items")
+        .unwrap();
+    assert!(
+        relation_height > 1,
+        "cold-row fixture requires actual child leaves below the eagerly opened relation root: height={relation_height}"
+    );
+    eprintln!(
+        "reader_items fixture: 3 vector rows + 128 scalar filler rows; actual tree height={relation_height}"
+    );
     let old_snapshot = database.snapshot();
+
     let pinned = database.pin_snapshot(old_snapshot);
     let transaction = database.begin_or_panic();
-    let sql = "SELECT id, unique_key, embedding FROM reader_items ORDER BY id";
+    let sql = "SELECT id, unique_key, embedding FROM reader_items WHERE unique_key >= 'old-' ORDER BY unique_key";
+    let successor_sql =
+        "SELECT id, unique_key, embedding FROM reader_items WHERE id <= 3 ORDER BY id";
+    let displace = || {
+        let before = database.__writer_cache_stats_for_test().unwrap();
+        for id in 0..96 {
+            drop(
+                database
+                    .__hold_row_page_for_test("displacement", id)
+                    .unwrap(),
+            );
+        }
+        let after = database.__writer_cache_stats_for_test().unwrap();
+        assert!(
+            after.2 > before.2 && after.1 > before.1,
+            "reader displacement must cause actual cache misses and evictions: before={before:?}; after={after:?}"
+        );
+    };
     let expected_old = old_vectors
         .iter()
         .enumerate()
@@ -92,13 +167,10 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
             ]
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        database
-            .execute_in_tx(transaction, sql, &HashMap::new())
-            .unwrap()
-            .rows,
-        expected_old
-    );
+    let (initial_transaction, initial_transaction_work) = observe_target("reader_items", || {
+        database.execute_in_tx(transaction, sql, &HashMap::new())
+    });
+    assert_eq!(initial_transaction.unwrap().rows, expected_old);
     let clock = Arc::new(ManualDeadlineClock::at(0));
     let limits = ReadLimits {
         cursor_page_rows: 1,
@@ -109,7 +181,34 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
         ..Default::default()
     };
     let request = bounded::BoundedReadRequest::new(sql, HashMap::new(), limits, clock.clone());
-    let mut opened = bounded::open_cursor(database.clone(), &request).unwrap();
+    let (opened, admission_sources) = observe_target("reader_items", || {
+        bounded::open_cursor(database.clone(), &request)
+    });
+    let mut opened = opened.unwrap();
+    let original_physical = admission_sources
+        .physical_sources
+        .iter()
+        .flatten()
+        .find_map(|(family, identity)| {
+            (*family == PhysicalFamily::Row || *family == PhysicalFamily::Posting)
+                .then_some(*identity)
+        });
+    assert!(
+        original_physical.is_some(),
+        "reader admission must expose its actual row/posting storage transaction, without opening an independent root"
+    );
+    let original_physical = original_physical.unwrap();
+    assert!(
+        database
+            .__native_read_transaction_count_for_test(original_physical.transaction_id)
+            .unwrap()
+            > 0,
+        "cursor admission retains an actual native read transaction at its captured root"
+    );
+    assert!(
+        opened.cursor.continuation_bytes().unwrap().total > 0,
+        "open cursor owns real continuation scratch"
+    );
     assert_eq!(opened.first_page.rows, expected_old[..1]);
     let (statement_reached, statement_started) = mpsc::channel();
     let statement_release = Arc::new(Barrier::new(2));
@@ -142,7 +241,7 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
                 ])).unwrap();
             }
             observe_commit(Arc::new(move |point| {
-                if point == CommitBoundary::BeforeMemoryPublication {
+                if point == boundary {
                     commit_reached.send(()).unwrap();
                     commit_resume.lock().unwrap().recv().unwrap();
                 }
@@ -175,6 +274,7 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
         // strand the scoped writer/statement threads during assertion unwinding.
         commit_release.send(()).unwrap();
         writer.join().unwrap();
+        displace();
         let evicted = database
             .vector_store_for_test()
             .evict_raw_partition_for_test(
@@ -211,42 +311,172 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        database.execute(sql, &HashMap::new()).unwrap().rows,
+        database
+            .execute(successor_sql, &HashMap::new())
+            .unwrap()
+            .rows,
         expected_new,
         "a newer reader sees the complete successor"
     );
-    assert_eq!(
-        database
-            .execute_at_snapshot(sql, &HashMap::new(), old_snapshot)
-            .unwrap()
-            .rows,
-        expected_old
+    displace();
+    let (historical_result, historical_work) = observe_target("reader_items", || {
+        database.execute_at_snapshot(sql, &HashMap::new(), old_snapshot)
+    });
+    assert_eq!(historical_result.unwrap().rows, expected_old);
+    displace();
+    let (transaction_result, transaction_work) = observe_target("reader_items", || {
+        database.execute_in_tx(transaction, sql, &HashMap::new())
+    });
+    assert_eq!(transaction_result.unwrap().rows, expected_old);
+    displace();
+    let (successor_result, successor_work) = observe_target("reader_items", || {
+        bounded::execute(
+            &database,
+            &bounded::BoundedReadRequest::new(successor_sql, HashMap::new(), limits, clock.clone()),
+        )
+    });
+    assert_eq!(successor_result.unwrap().result.rows, expected_new);
+    let successor_physical = successor_work
+        .physical_sources
+        .iter()
+        .flatten()
+        .find_map(|(family, identity)| {
+            (*family == PhysicalFamily::Row || *family == PhysicalFamily::Posting)
+                .then_some(*identity)
+        })
+        .expect("successor statement must observe its own actual physical page root");
+    let (_, indexed_work) = observe_target("reader_items", || {
+        for (offset, vector) in old_vectors.iter().enumerate() {
+            assert_eq!(database.execute_at_snapshot("SELECT id FROM reader_items WHERE embedding IS NOT NULL ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+                &HashMap::from([("q".into(),Value::Vector(vector.clone()))]),old_snapshot).unwrap().rows,
+                vec![vec![Value::Int64(offset as i64 + 1)]], "old reader traverses its maintained vector generation");
+        }
+    });
+    let (_, indexed_transaction_work) = observe_target("reader_items", || {
+        for (offset, vector) in old_vectors.iter().enumerate() {
+            assert_eq!(database.execute_in_tx(transaction,
+                "SELECT id FROM reader_items WHERE embedding IS NOT NULL ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+                &HashMap::from([("q".into(), Value::Vector(vector.clone()))])).unwrap().rows,
+                vec![vec![Value::Int64(offset as i64 + 1)]]);
+        }
+    });
+    assert_ne!(
+        original_physical, successor_physical,
+        "the successor has a different real storage transaction/root"
     );
-    assert_eq!(
+    // Leave the cursor as the final holder of the retired original root.
+    database.rollback(transaction).unwrap();
+    drop(pinned);
+    assert!(
         database
-            .execute_in_tx(transaction, sql, &HashMap::new())
+            .__native_read_transaction_count_for_test(original_physical.transaction_id)
             .unwrap()
-            .rows,
-        expected_old
+            > 0,
+        "the continuation itself keeps its retired native root alive"
     );
+    let mut has_more = opened.first_page.has_more;
     let mut continued = opened.first_page.rows;
-    for _ in 1..expected_old.len() {
-        continued.extend(
-            opened
-                .cursor
-                .fetch(None, Default::default())
-                .unwrap()
-                .page
-                .rows,
-        );
+    let mut continuation_sources = Vec::new();
+    for _ in 0..expected_old.len() {
+        if !has_more {
+            break;
+        }
+        displace();
+        let (page, sources) = observe_target("reader_items", || {
+            opened.cursor.fetch(None, Default::default())
+        });
+        let page = page.unwrap().page;
+        has_more = page.has_more;
+        continued.extend(page.rows);
+        if sources.physical_source_calls > 0 {
+            continuation_sources.push(sources);
+        }
     }
+    assert!(
+        !has_more,
+        "the finite fixture must reach actual cursor completion"
+    );
     assert_eq!(
         continued, expected_old,
         "the bounded continuation reloads its original row/key/vector view"
     );
-    opened.cursor.close().unwrap();
-    database.rollback(transaction).unwrap();
-    drop(pinned);
+    assert!(
+        continuation_sources
+            .iter()
+            .any(|work| work.target_backend_bytes[PhysicalFamily::Row as usize] > 0)
+            && continuation_sources
+                .iter()
+                .any(|work| work.target_backend_bytes[PhysicalFamily::Posting as usize] > 0),
+        "the retained cursor must reload displaced target row and posting data pages: {continuation_sources:?}"
+    );
+    // Observe completion before explicit close; the cursor object remains alive.
+    // The current writer retains its successor root throughout these checks.
+    assert_eq!(
+        database
+            .__native_read_transaction_count_for_test(original_physical.transaction_id)
+            .unwrap(),
+        0,
+        "completion releases the actual captured native transaction after its last old-root holder"
+    );
+    assert_eq!(
+        opened.cursor.continuation_bytes().unwrap().total,
+        0,
+        "completion releases continuation scratch while the cursor object survives"
+    );
+    let cancellation_request =
+        bounded::BoundedReadRequest::new(successor_sql, HashMap::new(), limits, clock.clone());
+    let (cancelled_cursor, cancelled_work) = observe_target("reader_items", || {
+        bounded::open_cursor(database.clone(), &cancellation_request)
+    });
+    let mut cancelled_cursor = cancelled_cursor.unwrap();
+    assert!(
+        cancelled_work
+            .physical_sources
+            .iter()
+            .flatten()
+            .all(|(_, root)| *root == successor_physical)
+    );
+    assert!(
+        cancelled_cursor.cursor.continuation_bytes().unwrap().total > 0,
+        "cancellable cursor owns real continuation scratch"
+    );
+    // Publish a third root so cancellation can release the successor's last
+    // native owner without asserting database-wide absence of live readers.
+    database
+        .execute(
+            "UPDATE displacement SET body = 'successor root' WHERE id = 0",
+            &HashMap::new(),
+        )
+        .unwrap();
+    assert!(
+        database
+            .__native_read_transaction_count_for_test(successor_physical.transaction_id)
+            .unwrap()
+            > 0,
+        "cancellable cursor retains the retired successor's actual native transaction"
+    );
+    let cancellation = contextdb_engine::OwnerReadCancellation::new();
+    cancellation.cancel();
+    assert!(cancelled_cursor.cursor.fetch(None, cancellation).is_err());
+    assert_eq!(
+        database
+            .__native_read_transaction_count_for_test(successor_physical.transaction_id)
+            .unwrap(),
+        0,
+        "cancellation releases the actual retired native transaction without dropping the cursor object"
+    );
+    assert_eq!(
+        cancelled_cursor.cursor.continuation_bytes().unwrap().total,
+        0,
+        "cancellation releases continuation scratch while the cursor object survives"
+    );
+    assert_eq!(
+        database
+            .vector_memory_ownership_receipt_for_test()
+            .temporary_workspace,
+        0,
+        "terminal reads release vector scratch owners"
+    );
     let released_cleanup = database.compact_currency_versions().unwrap();
     assert!(
         released_cleanup.pruned_versions > 0,
@@ -263,5 +493,83 @@ fn writer_reader_root_survives_commit_eviction_and_cleanup() {
     );
     assert_eq!(during_work.captured_read_snapshot, Some(old_snapshot.0));
     assert_eq!(during.unwrap().result.rows, expected_old);
+    let mut observed_families = [false; 4];
+    for (label, work) in [
+        ("admission", admission_sources),
+        ("active statement", statement.1),
+        ("read during durability window", during_work),
+        ("captured transaction", transaction_work),
+        ("initial transaction", initial_transaction_work),
+        (
+            "captured transaction maintained generation",
+            indexed_transaction_work,
+        ),
+    ]
+    .into_iter()
+    .chain(
+        continuation_sources
+            .into_iter()
+            .map(|work| ("continuation", work)),
+    ) {
+        assert!(
+            work.physical_source_calls > 0,
+            "{label} must observe actual row/posting/vector page-source transactions after eviction: {work:?}"
+        );
+        assert!(
+            work.physical_source_calls <= work.physical_sources.len(),
+            "source provenance observation must not overflow"
+        );
+        for (family, identity) in work.physical_sources.into_iter().flatten() {
+            observed_families[family as usize] = true;
+            assert_eq!(
+                identity, original_physical,
+                "{label} page access must use the captured original physical root; fresh-root/old-logical-filter substitution is forbidden"
+            );
+        }
+    }
+    assert_eq!(
+        observed_families, [true; 4],
+        "reader must use row, posting, raw-vector and maintained-graph sources, not one arbitrary family"
+    );
+    for (label, work) in [
+        ("later historical rows", historical_work),
+        ("later historical maintained generation", indexed_work),
+    ] {
+        assert!(
+            work.physical_source_calls > 0
+                && work.physical_source_calls <= work.physical_sources.len(),
+            "{label} must expose its current physical source: {work:?}"
+        );
+        assert!(
+            work.physical_sources
+                .iter()
+                .flatten()
+                .all(|(_, identity)| *identity == successor_physical),
+            "{label} pins the current root and filters old MVCC intervals"
+        );
+    }
+    assert!(
+        continuation_sources_cold(&successor_work, &transaction_work, &historical_work),
+        "displaced target rows and postings must really reload data pages from their attributed roots"
+    );
+    assert!(
+        successor_work
+            .physical_sources
+            .iter()
+            .flatten()
+            .all(|(_, identity)| *identity == successor_physical),
+        "every actual successor page access uses the successor root"
+    );
     database.close().unwrap();
+}
+
+fn continuation_sources_cold(
+    successor: &contextdb_engine::writer_query_test_seams::WriterQueryWork,
+    transaction: &contextdb_engine::writer_query_test_seams::WriterQueryWork,
+    historical: &contextdb_engine::writer_query_test_seams::WriterQueryWork,
+) -> bool {
+    [successor, transaction, historical].iter().all(|work| {
+        work.target_backend_bytes[PhysicalFamily::Row as usize] > 0
+            && work.target_backend_bytes[PhysicalFamily::Posting as usize] > 0
+    })
 }
