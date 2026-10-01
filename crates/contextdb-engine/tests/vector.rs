@@ -48,6 +48,9 @@ mod auto_chooses_the_cheaper_route_for_each_partition;
 mod auto_decides_the_route_once_for_the_whole_scope;
 #[path = "vector/auto_pays_what_indexed_pays.rs"]
 mod auto_pays_what_indexed_pays;
+#[cfg(feature = "nightly-tests")]
+#[path = "vector/continuous_writers_hold_throughput_and_reader_latency.rs"]
+mod continuous_writers_hold_throughput_and_reader_latency;
 #[cfg(unix)]
 #[path = "vector/each_layer_a_wide_find_loads_keeps_its_share.rs"]
 mod each_layer_a_wide_find_loads_keeps_its_share;
