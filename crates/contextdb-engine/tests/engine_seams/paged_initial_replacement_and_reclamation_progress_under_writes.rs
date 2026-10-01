@@ -57,6 +57,9 @@ fn bounded_cycle(
 
 #[test]
 fn paged_initial_replacement_and_reclamation_progress_under_writes() {
+    if maintenance_crash_child() {
+        return;
+    }
     if isolated_test(
         module_path!(),
         "paged_initial_replacement_and_reclamation_progress_under_writes",
@@ -65,6 +68,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         return;
     }
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    current_only_maintenance_crash_cuts();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("maintenance.db");
     let db = Arc::new(open(&path, Some(64 * 1024 * 1024)));
@@ -408,4 +412,201 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     );
     all_searches(&db, 128..ROWS + 8, "INDEXED");
     db.close().unwrap();
+}
+
+const MAINTENANCE_CHILD_PATH: &str = "CONTEXTDB_CURRENT_MAINTENANCE_CRASH_PATH";
+const MAINTENANCE_CHILD_CUT: &str = "CONTEXTDB_CURRENT_MAINTENANCE_CRASH_CUT";
+fn maintenance_crash_child() -> bool {
+    use std::io::{Read, Write};
+    let Some(path) = std::env::var_os(MAINTENANCE_CHILD_PATH) else {
+        return false;
+    };
+    let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let db = Arc::new(open(std::path::Path::new(&path), Some(64 * 1024 * 1024)));
+    let cut = std::env::var(MAINTENANCE_CHILD_CUT).unwrap();
+    let pause = |label: &str| {
+        println!("MAINTENANCE_REAL_CUT {label}");
+        std::io::stdout().flush().unwrap();
+        let mut byte = [0];
+        std::io::stdin()
+            .read_exact(&mut byte)
+            .expect("parent kills paused process");
+    };
+    if cut == "Insertion" {
+        let route = VectorPartitionRef::new(index("current_build"), partition(0));
+        let boundary = db.__arm_vector_maintenance_progress_pause_for_test(&route, 3);
+        let worker_db = db.clone();
+        let worker = std::thread::spawn(move || {
+            let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+            worker_db.run_maintenance_cycle()
+        });
+        if boundary.wait_until_reached_blocking() {
+            pause("Insertion");
+        }
+        boundary.release();
+        worker.join().unwrap().unwrap();
+    } else {
+        contextdb_engine::writer_commit_test_seams::observe(
+            Arc::new(move |point| {
+                if format!("{point:?}") == cut {
+                    use std::io::{Read, Write};
+                    println!("MAINTENANCE_REAL_CUT {point:?}");
+                    std::io::stdout().flush().unwrap();
+                    std::io::stdin()
+                        .read_exact(&mut [0])
+                        .expect("parent kills paused process");
+                }
+            }),
+            || db.run_maintenance_cycle(),
+        )
+        .unwrap();
+    }
+    true
+}
+
+fn current_only_maintenance_crash_cuts() {
+    use std::{
+        io::BufRead,
+        process::{Command, Stdio},
+    };
+    const ROWS: usize = 128;
+    for cut in ["GenerationBeforeRedb", "GenerationAfterRedb", "Insertion"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("current-build.db");
+        let db = open(&path, Some(64 * 1024 * 1024));
+        exec(
+            &db,
+            "CREATE TABLE current_build (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(128) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED HNSW (M = 16, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC OFF",
+        );
+        for id in 0..ROWS {
+            insert_vector(&db, "current_build", id, Some(0), 128);
+        }
+        let frontier = db.snapshot();
+        db.close().unwrap();
+        drop(db);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &crate::child_test_filter(
+                    module_path!(),
+                    "paged_initial_replacement_and_reclamation_progress_under_writes",
+                ),
+                "--nocapture",
+            ])
+            .env(MAINTENANCE_CHILD_PATH, &path)
+            .env(MAINTENANCE_CHILD_CUT, cut)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut reached = false;
+        let mut transcript = String::new();
+        loop {
+            let mut line = String::new();
+            if output.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            transcript.push_str(&line);
+            if line.contains("MAINTENANCE_REAL_CUT") {
+                reached = true;
+                break;
+            }
+        }
+        if reached {
+            child.kill().unwrap();
+        }
+        let status = child.wait().unwrap();
+        assert!(
+            reached && !status.success(),
+            "must kill at a real production maintenance boundary: cut={cut}; {transcript}"
+        );
+        let db = open(&path, Some(64 * 1024 * 1024));
+        let route = VectorPartitionRef::new(index("current_build"), partition(0));
+        let restored = db
+            .vector_store_for_test()
+            .partition_info(&route.index, &route.partition_key)
+            .unwrap();
+        assert_eq!(
+            restored.graph_available,
+            cut == "GenerationAfterRedb",
+            "complete graph/catalog publication is atomic across process death: {cut}; {restored:?}"
+        );
+        // No caller pin is created. Superseding current-only source must leave the
+        // durable maintenance floor protecting the captured unfinished frontier.
+        if cut == "Insertion" {
+            for id in 0..ROWS {
+                if id % 3 == 0 {
+                    exec(&db, &format!("DELETE FROM current_build WHERE id = {id}"));
+                } else {
+                    db.execute(
+                        "UPDATE current_build SET scope = $scope, v = $v WHERE id = $id",
+                        &std::collections::HashMap::from([
+                            ("scope".into(), Value::Int64((id % 3 == 1) as i64)),
+                            ("v".into(), Value::Vector(vector(id + ROWS, 128))),
+                            ("id".into(), Value::Int64(id as i64)),
+                        ]),
+                    )
+                    .unwrap();
+                }
+            }
+            db.compact_currency_versions().unwrap();
+            assert_eq!(
+                vector_rows(&db, "current_build", frontier, Some(0)),
+                vector_oracle(0..ROWS, 128),
+                "restart restores the maintenance floor before cleanup, without a caller-created pin"
+            );
+            // The first batch may correctly roll back to zero progress. This cut
+            // establishes no preceding committed scratch batch; exact durable
+            // node/source/adjacency/progress correspondence awaits that protocol.
+        }
+        for _ in 0..64 {
+            db.run_maintenance_cycle().unwrap();
+        }
+        assert!(
+            db.vector_store_for_test()
+                .partition_info(&route.index, &route.partition_key)
+                .unwrap()
+                .graph_available
+        );
+        let changed = cut == "Insertion";
+        for scope in 0..=1 {
+            let expected = (0..ROWS)
+                .filter(|id| {
+                    if changed {
+                        id % 3 != 0 && (*id % 3 == 1) as usize == scope
+                    } else {
+                        scope == 0
+                    }
+                })
+                .map(|id| {
+                    vec![
+                        Value::Int64(id as i64),
+                        Value::Vector(vector(if changed { id + ROWS } else { id }, 128)),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                vector_rows(&db, "current_build", db.snapshot(), Some(scope as i64)),
+                expected,
+                "resumed current graph/source preserves changed vectors, partition moves and deletes: {cut}; scope={scope}"
+            );
+        }
+        for id in 0..ROWS {
+            if changed && id % 3 == 0 {
+                continue;
+            }
+            let scope = if changed { (id % 3 == 1) as i64 } else { 0 };
+            let query = vector(if changed { id + ROWS } else { id }, 128);
+            let answer = db.execute("SELECT id FROM current_build WHERE scope = $scope ORDER BY v <=> $v USE VECTOR INDEXED LIMIT 1", &std::collections::HashMap::from([
+                ("scope".into(),Value::Int64(scope)), ("v".into(),Value::Vector(query))])).unwrap();
+            assert_eq!(
+                answer.rows,
+                vec![vec![Value::Int64(id as i64)]],
+                "resumed maintained search returns the verified committed suffix: {cut}; {id}"
+            );
+        }
+        db.close().unwrap();
+    }
 }
