@@ -93,5 +93,8 @@ mod writer_file_ownership_survives_recycle;
 #[path = "engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs"]
 mod writer_reopen_and_doubling_keep_a_fixed_resident_envelope;
 
+#[path = "engine_seams/aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope.rs"]
+mod aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope;
+
 #[path = "engine_seams/resident_history_support.rs"]
 mod resident_history_support;
