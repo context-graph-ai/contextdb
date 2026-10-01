@@ -113,6 +113,8 @@ mod first_search_after_writer_reopen_uses_saved_pages_without_build;
 mod graph_delete_seeks_only_its_edge_identity;
 #[path = "engine_seams/paged_constraints_preserve_staging_and_competing_commit_conflicts.rs"]
 mod paged_constraints_preserve_staging_and_competing_commit_conflicts;
+#[path = "engine_seams/writable_open_never_touches_history_families.rs"]
+mod writable_open_never_touches_history_families;
 
 #[path = "engine_seams/resident_history_support.rs"]
 mod resident_history_support;
