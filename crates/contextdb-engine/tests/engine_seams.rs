@@ -115,6 +115,8 @@ mod graph_delete_seeks_only_its_edge_identity;
 mod paged_constraints_preserve_staging_and_competing_commit_conflicts;
 #[path = "engine_seams/writable_open_never_touches_history_families.rs"]
 mod writable_open_never_touches_history_families;
+#[path = "engine_seams/writer_reader_root_survives_commit_eviction_and_cleanup.rs"]
+mod writer_reader_root_survives_commit_eviction_and_cleanup;
 
 #[path = "engine_seams/resident_history_support.rs"]
 mod resident_history_support;
