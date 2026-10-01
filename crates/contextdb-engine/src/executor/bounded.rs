@@ -3173,6 +3173,29 @@ fn index_pick_capacity_bytes(
             "index suffix shape",
         )?;
     }
+    if let Some((lower, upper)) = &pick.trailing_range {
+        for bound in [lower, upper] {
+            if let Bound::Included(key) | Bound::Excluded(key) = bound {
+                bytes = checked_size_add(
+                    bytes,
+                    checked_size_mul(
+                        key.capacity(),
+                        std::mem::size_of::<DirectedValue>(),
+                        "index trailing range",
+                    )?,
+                    "index trailing range",
+                )?;
+                for value in key {
+                    let value = match value {
+                        DirectedValue::Asc(TotalOrdAsc(value))
+                        | DirectedValue::Desc(TotalOrdDesc(value)) => value,
+                    };
+                    bytes =
+                        checked_size_add(bytes, value.estimated_bytes(), "index trailing range")?;
+                }
+            }
+        }
+    }
     if let Some(tuples) = pick.tuple_prefix() {
         for tuple in tuples {
             bytes = checked_size_add(
@@ -11213,6 +11236,7 @@ fn build_direct_index_scan(
             pushed_column: leading_column.clone(),
             pushed_columns: vec![leading_column.clone()],
             suffix_shapes: Vec::new(),
+            trailing_range: None,
             tuple_prefix: None,
             prefix_empty: false,
             probe_values_normalized: false,
@@ -11422,7 +11446,16 @@ fn declared_index_run(
         IndexPredicateShape::Equality(_) | IndexPredicateShape::IsNull => {
             let mut runs = crate::executor::expanded_index_runs(pick).unwrap_or_default();
             if let Some((start, end)) = runs.pop() {
-                (start, end, 1 + pick.suffix_shapes.len())
+                let prefix_len = if pick.trailing_range.is_some() {
+                    let len = |bound: &Bound<IndexKey>| match bound {
+                        Bound::Included(key) | Bound::Excluded(key) => key.len(),
+                        Bound::Unbounded => 0,
+                    };
+                    len(&start).min(len(&end))
+                } else {
+                    1 + pick.suffix_shapes.len()
+                };
+                (start, end, prefix_len)
             } else {
                 (Bound::Unbounded, Bound::Unbounded, 0)
             }

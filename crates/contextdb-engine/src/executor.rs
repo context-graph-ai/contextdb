@@ -8538,6 +8538,8 @@ pub(crate) struct IndexPick {
     /// `pushed_columns[1..]`. Keeping the shape, rather than one representative
     /// value, lets every pushed column contribute to the tuple-run product.
     suffix_shapes: Vec<IndexPredicateShape>,
+    /// Physical bounds on the first range after the finite prefix.
+    trailing_range: Option<(std::ops::Bound<IndexKey>, std::ops::Bound<IndexKey>)>,
     /// The prefix is provably empty before touching the index tree
     /// (contradictory suffix constants, NULL/NaN suffix binds, or an
     /// incoercible leading equality/range value).
@@ -8660,6 +8662,7 @@ mod candidate_placement_rank_tests {
                 pushed_column: "col".to_string(),
                 pushed_columns: Vec::new(),
                 suffix_shapes: Vec::new(),
+                trailing_range: None,
                 prefix_empty: false,
                 probe_values_normalized: true,
                 tuple_prefix: None,
@@ -9065,6 +9068,7 @@ fn coerce_pick_shape_to_column_type(
         pushed_column: pick.pushed_column.clone(),
         pushed_columns: pick.pushed_columns.clone(),
         suffix_shapes,
+        trailing_range: pick.trailing_range.clone(),
         prefix_empty,
         probe_values_normalized: true,
         tuple_prefix: pick.tuple_prefix.clone(),
@@ -9320,9 +9324,42 @@ fn analyze_filter_for_index_with_sort(
                 }
             }
         }
-        let match_count = pushed_columns.len();
-        let automatic_supported = automatic_index_supports_pick(decl, &shape, match_count);
-        let single_row_probe = shape_is_single_value_equality(&shape)
+        let trailing_range = if probe_values_normalized {
+            let position = 1 + suffix_shapes.len();
+            decl.columns.get(position).and_then(|(column, _)| {
+                let ranges = conjunct_shapes
+                    .iter()
+                    .filter_map(|(_, candidate, shape)| {
+                        (candidate == column && matches!(shape, IndexPredicateShape::Range { .. }))
+                            .then_some(shape.clone())
+                    })
+                    .collect::<Vec<_>>();
+                if ranges.is_empty() {
+                    return None;
+                }
+                let ranges = ranges
+                    .iter()
+                    .map(|shape| normalize_index_range(table, meta, column, shape))
+                    .collect::<Option<Vec<_>>>();
+                let Some(ranges) = ranges else {
+                    prefix_empty = true;
+                    return None;
+                };
+                let range = combine_shapes(ranges);
+                let bounds = trailing_range_edges(meta, &decl.columns, position, &range);
+                if bounds.is_none() {
+                    prefix_empty = true;
+                }
+                bounds
+            })
+        } else {
+            None
+        };
+        let match_count = pushed_columns.len() + usize::from(trailing_range.is_some());
+        let automatic_supported =
+            automatic_index_supports_pick(decl, &shape, 1 + suffix_shapes.len());
+        let single_row_probe = trailing_range.is_none()
+            && shape_is_single_value_equality(&shape)
             && suffix_shapes.iter().all(shape_is_single_value_equality);
         let plan = IndexCandidatePlan {
             pick: IndexPick {
@@ -9332,6 +9369,7 @@ fn analyze_filter_for_index_with_sort(
                 pushed_column: first_col.clone(),
                 pushed_columns,
                 suffix_shapes,
+                trailing_range,
                 prefix_empty,
                 probe_values_normalized,
                 tuple_prefix: None,
@@ -9570,6 +9608,134 @@ fn attach_row_value_tuples(mut pick: IndexPick, lists: &[RowValueList]) -> Index
     pick.prefix_empty = tuples.is_empty();
     pick.tuple_prefix = Some(Arc::new(tuples));
     pick
+}
+
+/// A finite physical minimum exists for every declared scalar index type.
+/// NULL is the maximum ascending value and the minimum descending value.
+fn index_column_minimum(meta: &TableMeta, column: &str) -> Option<Value> {
+    Some(
+        match &meta
+            .columns
+            .iter()
+            .find(|def| def.name == column)?
+            .column_type
+        {
+            ColumnType::Integer => Value::Int64(i64::MIN),
+            ColumnType::Real => Value::Float64(f64::from_bits(0xffff_ffff_ffff_ffff)),
+            ColumnType::Text => Value::Text(String::new()),
+            ColumnType::Boolean => Value::Bool(false),
+            ColumnType::Uuid => Value::Uuid(uuid::Uuid::nil()),
+            ColumnType::Timestamp => Value::Timestamp(i64::MIN),
+            ColumnType::TxId => Value::TxId(TxId(0)),
+            _ => return None,
+        },
+    )
+}
+
+fn normalize_index_range(
+    table: &str,
+    meta: &TableMeta,
+    column: &str,
+    shape: &IndexPredicateShape,
+) -> Option<IndexPredicateShape> {
+    use std::ops::Bound;
+    let IndexPredicateShape::Range { lower, upper } = shape else {
+        return None;
+    };
+    let normalize = |bound: &Bound<Value>| {
+        let value = |value: &Value| {
+            coerce_index_probe_value_with_meta(table, meta, column, value.clone())
+                .filter(usable_index_probe_value)
+        };
+        Some(match bound {
+            Bound::Included(v) => Bound::Included(value(v)?),
+            Bound::Excluded(v) => Bound::Excluded(value(v)?),
+            Bound::Unbounded => Bound::Unbounded,
+        })
+    };
+    Some(IndexPredicateShape::Range {
+        lower: normalize(lower)?,
+        upper: normalize(upper)?,
+    })
+}
+
+fn trailing_range_edges(
+    meta: &TableMeta,
+    columns: &[(String, contextdb_core::SortDirection)],
+    position: usize,
+    shape: &IndexPredicateShape,
+) -> Option<(std::ops::Bound<IndexKey>, std::ops::Bound<IndexKey>)> {
+    use std::ops::Bound;
+    let IndexPredicateShape::Range { lower, upper } = shape else {
+        return None;
+    };
+    let (column, direction) = &columns[position];
+    let directed = |value, direction| match direction {
+        contextdb_core::SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value)),
+        contextdb_core::SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value)),
+    };
+    let high_suffix = columns
+        .iter()
+        .skip(position + 1)
+        .map(|(column, direction)| {
+            let value = match direction {
+                contextdb_core::SortDirection::Asc => Value::Null,
+                contextdb_core::SortDirection::Desc => index_column_minimum(meta, column)?,
+            };
+            Some(directed(value, *direction))
+        })
+        .collect::<Option<IndexKey>>()?;
+    let edge = |bound: &Bound<Value>, high: bool| -> Option<Bound<IndexKey>> {
+        let (value, included) = match bound {
+            Bound::Included(value) => (value.clone(), true),
+            Bound::Excluded(value) => (value.clone(), false),
+            Bound::Unbounded => {
+                let value = if high == (*direction == contextdb_core::SortDirection::Asc) {
+                    Value::Null
+                } else {
+                    index_column_minimum(meta, column)?
+                };
+                let included = !value.is_null();
+                (value, included)
+            }
+        };
+        if !matches!(bound, Bound::Unbounded) && !usable_index_probe_value(&value) {
+            return None;
+        }
+        let mut key = vec![directed(value, *direction)];
+        // An exclusive lower edge skips the entire equal-component group;
+        // an inclusive upper edge includes it. Other edges stay short.
+        if high == included {
+            key.extend(high_suffix.iter().cloned());
+        }
+        Some(if included {
+            Bound::Included(key)
+        } else {
+            Bound::Excluded(key)
+        })
+    };
+    let (low, high) = match direction {
+        contextdb_core::SortDirection::Asc => (lower, upper),
+        contextdb_core::SortDirection::Desc => (upper, lower),
+    };
+    let bounds = (edge(low, false)?, edge(high, true)?);
+    if let (
+        Bound::Included(low) | Bound::Excluded(low),
+        Bound::Included(high) | Bound::Excluded(high),
+    ) = (&bounds.0, &bounds.1)
+    {
+        match low.cmp(high) {
+            Ordering::Greater => return None,
+            Ordering::Equal
+                if matches!(bounds.0, Bound::Excluded(_))
+                    || matches!(bounds.1, Bound::Excluded(_)) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(bounds)
 }
 
 fn choose_driving_shape(
@@ -10522,6 +10688,34 @@ fn planned_index_run_bytes(pick: &IndexPick, skip_first: bool) -> Result<usize> 
         return Ok(0);
     }
     let retained_runs = run_count - usize::from(skip_first);
+    let trailing_bytes = if let Some((lower, upper)) = &pick.trailing_range {
+        let edge_bytes = |bound: &Bound<IndexKey>| -> Result<usize> {
+            let (Bound::Included(key) | Bound::Excluded(key)) = bound else {
+                return Ok(0);
+            };
+            key.iter().try_fold(
+                checked_index_run_mul(
+                    key.len(),
+                    std::mem::size_of::<DirectedValue>(),
+                    "index range edges",
+                )?,
+                |bytes, value| {
+                    let value = match value {
+                        DirectedValue::Asc(TotalOrdAsc(value))
+                        | DirectedValue::Desc(TotalOrdDesc(value)) => value,
+                    };
+                    checked_index_run_add(bytes, value.estimated_bytes(), "index range edges")
+                },
+            )
+        };
+        checked_index_run_mul(
+            retained_runs,
+            checked_index_run_add(edge_bytes(lower)?, edge_bytes(upper)?, "index range edges")?,
+            "index range edges",
+        )?
+    } else {
+        0
+    };
     let prefix_len = 1 + pick.suffix_shapes.len();
     let pad_len = if pick
         .columns
@@ -10619,6 +10813,7 @@ fn planned_index_run_bytes(pick: &IndexPick, skip_first: bool) -> Result<usize> 
         directed_slots,
         padding_values,
         both_edges,
+        trailing_bytes,
     ]
     .into_iter()
     .try_fold(0usize, |bytes, part| {
@@ -10718,6 +10913,19 @@ pub(crate) fn expanded_index_runs(
     runs.try_reserve_exact(run_count)
         .map_err(|_| Error::Other("index tuple-run allocation failed".to_string()))?;
     visit_index_prefixes(pick, |prefix| {
+        if let Some((lower, upper)) = &pick.trailing_range {
+            let append = |bound: &Bound<IndexKey>| match bound {
+                Bound::Included(edge) => {
+                    Bound::Included(prefix.iter().chain(edge).cloned().collect())
+                }
+                Bound::Excluded(edge) => {
+                    Bound::Excluded(prefix.iter().chain(edge).cloned().collect())
+                }
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            runs.push((append(lower), append(upper)));
+            return Ok(());
+        }
         let mut reverse_seek_end = prefix.clone();
         if pick
             .columns
@@ -10739,8 +10947,11 @@ pub(crate) fn expanded_index_runs(
         Ok(())
     })?;
     runs.sort_unstable_by(|(left, _), (right, _)| match (left, right) {
-        (Bound::Included(left), Bound::Included(right)) => left.cmp(right),
-        _ => unreachable!("finite tuple runs always have included starts"),
+        (
+            Bound::Included(left) | Bound::Excluded(left),
+            Bound::Included(right) | Bound::Excluded(right),
+        ) => left.cmp(right),
+        _ => unreachable!("finite tuple runs always have bounded starts"),
     });
     contextdb_core::find_attribution::count("index_runs_expanded", runs.len() as u64);
     Ok(runs)
@@ -10943,7 +11154,11 @@ fn execute_index_scan(
                     "expand_index_tuple_runs",
                     "Reduce the equality/IN tuple product or raise MEMORY_LIMIT.",
                 )?;
-                for (start, _) in expanded_index_runs(pick)? {
+                for (start, end) in expanded_index_runs(pick)? {
+                    if pick.trailing_range.is_some() {
+                        collect_range(&mut postings, &mut rows_examined, start, end);
+                        continue;
+                    }
                     let Bound::Included(prefix) = start else {
                         unreachable!("finite tuple run always has an included prefix")
                     };
@@ -11315,6 +11530,7 @@ fn run_index_scan_with_order(
         pushed_column: decl.columns[0].0.clone(),
         pushed_columns: vec![decl.columns[0].0.clone()],
         suffix_shapes: Vec::new(),
+        trailing_range: None,
         tuple_prefix: None,
         prefix_empty: false,
         probe_values_normalized: false,
@@ -19664,5 +19880,93 @@ mod tests {
         let real_value = evaluate_stored_default_expr("Literal(Real(0.5))")
             .expect("wrapped real shape must still be readable");
         assert_eq!(real_value, Value::Float64(0.5));
+    }
+}
+
+#[cfg(test)]
+mod composite_resume_range_tests {
+    use super::*;
+
+    #[test]
+    fn composite_resume_ranges_preserve_directions_and_exclusive_duplicates() {
+        let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+        for ordinal_direction in ["ASC", "DESC"] {
+            for id_direction in ["ASC", "DESC"] {
+                let db = Database::open_memory();
+                db.execute("CREATE TABLE resume_items (id INTEGER PRIMARY KEY, context INTEGER, stream INTEGER, ordinal INTEGER)", &HashMap::new()).unwrap();
+                db.execute(&format!("CREATE INDEX resume_position ON resume_items (context, stream, ordinal {ordinal_direction}, id {id_direction})"), &HashMap::new()).unwrap();
+                let tx = db.begin_or_panic();
+                for (id, stream, ordinal) in [
+                    (1, 6, 1),
+                    (2, 7, 1),
+                    (3, 7, 2),
+                    (4, 7, 2),
+                    (5, 7, 3),
+                    (6, 7, 4),
+                    (7, 8, 3),
+                ] {
+                    db.execute_in_tx(
+                        tx,
+                        &format!("INSERT INTO resume_items VALUES ({id}, 9, {stream}, {ordinal})"),
+                        &HashMap::new(),
+                    )
+                    .unwrap();
+                }
+                db.execute_in_tx(
+                    tx,
+                    "INSERT INTO resume_items VALUES (8, 9, 7, NULL)",
+                    &HashMap::new(),
+                )
+                .unwrap();
+                db.execute_in_tx(
+                    tx,
+                    "INSERT INTO resume_items VALUES (9, 8, 7, 3)",
+                    &HashMap::new(),
+                )
+                .unwrap();
+                db.execute_in_tx(
+                    tx,
+                    "INSERT INTO resume_items VALUES (10, 10, 7, 3)",
+                    &HashMap::new(),
+                )
+                .unwrap();
+                db.commit(tx).unwrap();
+                for (predicate, ascending) in [
+                    ("ordinal > 2", vec![5, 6]),
+                    ("ordinal < 3", vec![2, 3]),
+                    ("ordinal > 2 AND ordinal < 4", vec![5]),
+                    ("ordinal >= 2 AND ordinal <= 3", vec![3, 4]),
+                    ("ordinal > 3 AND ordinal < 3", vec![]),
+                ] {
+                    for direction in ["ASC", "DESC"] {
+                        let answer = db.execute(&format!("SELECT id FROM resume_items WHERE context = 9 AND stream = 7 AND {predicate} ORDER BY ordinal {direction}, id {direction} LIMIT 2"), &HashMap::new()).unwrap();
+                        let expected = match (predicate, direction) {
+                            ("ordinal > 2", "DESC") => vec![6, 5],
+                            ("ordinal < 3", "DESC") => vec![4, 3],
+                            ("ordinal >= 2 AND ordinal <= 3", "DESC") => vec![5, 4],
+                            _ => ascending.clone(),
+                        };
+                        assert_eq!(
+                            answer.rows,
+                            expected
+                                .into_iter()
+                                .map(|id| vec![Value::Int64(id)])
+                                .collect::<Vec<_>>(),
+                            "{ordinal_direction}/{id_direction}/{predicate}/{direction}"
+                        );
+                        // Only matching entries contribute, including when the
+                        // seek skips duplicate ordinals at an exclusive edge.
+                        if ordinal_direction == id_direction {
+                            assert_eq!(answer.trace.rows_examined, answer.rows.len() as u64);
+                        }
+                        // Mixed physical directions may need the ordinary SQL
+                        // sort; agreeing directions must walk the index directly.
+                        if ordinal_direction == id_direction {
+                            assert!(answer.trace.sort_elided);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
