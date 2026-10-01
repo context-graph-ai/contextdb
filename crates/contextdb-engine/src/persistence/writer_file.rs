@@ -435,6 +435,15 @@ impl Drop for WriterFileView {
 }
 
 impl redb::StorageBackend for WriterFileView {
+    fn scratch_backend(&self) -> io::Result<Option<Box<dyn redb::ScratchBackend>>> {
+        let owner = self.owner()?;
+        let path = owner.file_path();
+        let directory = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "writer file has no directory")
+        })?;
+        redb::scratch_backend_in_directory(directory).map(Some)
+    }
+
     fn len(&self) -> io::Result<u64> {
         self.owner()?.file.metadata().map(|metadata| metadata.len())
     }
