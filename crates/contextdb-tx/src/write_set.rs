@@ -20,6 +20,8 @@ pub struct WriteSet {
     pub vector_deletes: Vec<(VectorIndexRef, RowId, TxId)>,
     pub vector_moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
     pub commit_lsn: Option<Lsn>,
+    /// Canonical local visibility identity finalized by the commit manager.
+    pub finalized_tx: Option<TxId>,
     pub relational_insert_source_lsns: HashMap<TableName, HashMap<RowId, Lsn>>,
     pub relational_insert_source_kinds: HashMap<TableName, HashMap<RowId, u8>>,
     /// What each staged row version's admission actually charged, keyed the
@@ -128,6 +130,7 @@ impl WriteSet {
     }
 
     pub fn reassign_tx(&mut self, from: TxId, to: TxId) {
+        if self.finalized_tx == Some(from) { self.finalized_tx = Some(to); }
         if from == to {
             return;
         }

@@ -20527,16 +20527,7 @@ impl Database {
         )?;
 
         let loaded_change_log = persistence.load_change_log()?;
-        let mut commit_index = persistence.load_commit_index()?;
-        let reconstructed_commit_index =
-            commit_index_across_all(&relational, &graph, &vector, &loaded_change_log);
-        let mut missing_commit_index = BTreeMap::new();
-        for (lsn, tx) in reconstructed_commit_index {
-            if let std::collections::btree_map::Entry::Vacant(slot) = commit_index.entry(lsn) {
-                slot.insert(tx);
-                missing_commit_index.insert(lsn, tx);
-            }
-        }
+        let commit_index = persistence.load_commit_index()?;
         if commit_index
             .values()
             .try_fold(TxId(0), |previous, tx| (*tx >= previous).then_some(*tx))
@@ -20578,9 +20569,6 @@ impl Database {
                 startup_disk_limit,
             );
         }
-        if !missing_commit_index.is_empty() {
-            persistence.flush_commit_index_entries(&missing_commit_index)?;
-        }
         for table in sanitized_row_tables {
             let meta = all_meta
                 .get(&table)
@@ -20592,13 +20580,14 @@ impl Database {
             persistence.rewrite_table_rows(&table, &rows)?;
         }
 
-        let max_row_id = relational.max_row_id();
-        // The commit index names every committed transaction, including those
-        // whose rows, links and vectors a later drop removed; the next
-        // transaction starts after all of them.
-        let max_tx = max_tx_across_all(&relational, &graph, &vector)
-            .max(commit_index.values().copied().max().unwrap_or(TxId(0)));
-        let commit_index_max_lsn = commit_index.keys().next_back().copied().unwrap_or(Lsn(0));
+        // Recovery uses durable end keys and maintained identity floors. It
+        // must not depend on the resident projections or enumerate retained
+        // versions to decide which identities a new writer may allocate.
+        let open_bounds = persistence.writer_open_bounds(all_meta.keys().map(String::as_str))?;
+        let max_tx = open_bounds.max_tx;
+        // Some schema-only persistence doors still store their frontier in
+        // the DDL log. Preserve that floor until those doors atomically
+        // maintain the recovery record too.
         let ddl_max_lsn = loaded_ddl_log
             .iter()
             .map(|(lsn, _)| *lsn)
@@ -20615,9 +20604,9 @@ impl Database {
         {
             lineage_bounds.admit(&key, &bytes)?;
         }
-        let max_row_id = max_row_id.max(lineage_bounds.max_row_id);
-        let max_lsn = max_lsn_across_all(&relational, &graph, &vector)
-            .max(commit_index_max_lsn)
+        let max_row_id = open_bounds.max_row_id.max(lineage_bounds.max_row_id);
+        let max_lsn = open_bounds
+            .max_lsn
             .max(ddl_max_lsn)
             .max(lineage_bounds.purge_frontier_max_lsn);
         relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
@@ -30249,6 +30238,7 @@ impl Database {
                         relational_inserts: write_set.relational_inserts.clone(),
                         relational_deletes: write_set.relational_deletes.clone(),
                         commit_lsn: write_set.commit_lsn,
+                        finalized_tx: write_set.finalized_tx,
                         visibility_floor: write_set.visibility_floor,
                         ..WriteSet::default()
                     })?;
@@ -30302,7 +30292,9 @@ impl Database {
                                 "received-schema stage disappeared before prepare".to_string(),
                             )
                         })?;
+                    let finalized_tx = write_set.finalized_tx;
                     *write_set = replacement;
+                    write_set.finalized_tx = finalized_tx;
                     self.plugin.pre_commit(write_set, CommitSource::SyncPull)?;
                     #[cfg(any(test, feature = "test-seams"))]
                     self.received_schema_pre_commit_pause.maybe_pause();
@@ -33823,7 +33815,11 @@ impl Database {
 
     pub(crate) fn commit_index_for_read_image(&self) -> Result<Vec<(Lsn, TxId)>> {
         self.ensure_image_history()?;
-        Ok(self.tx_mgr.commit_index_entries())
+        Ok(self
+            .tx_mgr
+            .try_commit_index_prefix(self.tx_mgr.current_lsn())?
+            .into_iter()
+            .collect())
     }
 
     /// How many entries [`Self::commit_index_for_read_image`] copies.
@@ -33879,13 +33875,15 @@ impl Database {
         let indexes = crate::read_image_memory::ImageMemory::charging(Arc::clone(&self.accountant));
         let (table_index, lsn_refcounts) =
             build_admitted_change_log_aux_indexes(&read.change_log, &indexes)?;
-        self.with_commit_lock(|| {
+        self.with_commit_lock(|| -> Result<()> {
+            self.tx_mgr.try_replace_commit_index(read.commit_index)?;
             *self.change_log.write() = read.change_log;
             *self.change_log_table_index.write() = table_index;
             *self.change_log_lsn_refcounts.write() = lsn_refcounts;
             *self.ddl_log.write() = read.ddl_log;
-            self.tx_mgr.replace_commit_index(read.commit_index);
-        });
+            Ok(())
+        })
+        .map_err(ImageHistoryError::from)?;
         *loaded = Some(LoadedImageHistoryCharge {
             _history: read.charge,
             _indexes: indexes,
@@ -35067,8 +35065,7 @@ impl Database {
         crate::composite_store::change_log_retained_bytes(&self.change_log.read())
             .saturating_add(
                 self.tx_mgr
-                    .commit_index_prefix(Lsn(u64::MAX))
-                    .len()
+                    .commit_index_len()
                     .saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES),
             )
             .saturating_add(
@@ -42222,7 +42219,9 @@ impl Database {
                 )
             })
             .collect::<Vec<_>>();
-        let commit_index = self.tx_mgr.commit_index_snapshot();
+        let commit_index = self
+            .tx_mgr
+            .try_commit_index_prefix(self.tx_mgr.current_lsn())?;
         let mut edge_delete_witnesses = canonical_graph_entries
             .iter()
             .filter_map(|entry| {
@@ -48382,7 +48381,7 @@ impl Database {
             .with_commit_lock(|| -> Result<_> {
                 let watermark = self.tx_mgr.current_tx_max();
                 let snapshot_lsn = self.tx_mgr.current_lsn();
-                let commit_index = self.tx_mgr.commit_index_prefix(snapshot_lsn);
+                let commit_index = self.tx_mgr.try_commit_index_prefix(snapshot_lsn)?;
                 let blob_snapshot = self.blob_repository.begin_export_snapshot()?;
                 let checkpoint_source = self
                     .persistence
@@ -67719,7 +67718,7 @@ fn prune_expired_rows(
         .extend(relational_store.reclaimed_retention_expiry_lsns(&pruned_versions_by_table_sets));
     let commit_index_candidates = {
         let lsn_refcounts = change_log_lsn_refcounts.read();
-        scoped_commit_index_candidates(tx_mgr, &lsn_refcounts, &removed_lsn_counts, &affected_lsns)
+        scoped_commit_index_candidates(tx_mgr, &lsn_refcounts, &removed_lsn_counts, &affected_lsns)?
     };
 
     let generation_cleanup = prepare_retention_cleanup_generations(
@@ -67979,9 +67978,9 @@ fn scoped_commit_index_candidates(
     lsn_refcounts: &ChangeLogLsnRefcounts,
     removed_lsn_counts: &HashMap<Lsn, u64>,
     affected_lsns: &HashSet<Lsn>,
-) -> Vec<Lsn> {
+) -> Result<Vec<Lsn>> {
     if affected_lsns.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let still_covered = |lsn: Lsn| -> bool {
         lsn_refcounts.get(&lsn).copied().unwrap_or(0)
@@ -67996,14 +67995,18 @@ fn scoped_commit_index_candidates(
         None => None,
     };
     let anchor_lsn = match floor_after {
-        Some(floor) => tx_mgr.commit_index_floor_below(floor).map(|(lsn, _)| lsn),
-        None => tx_mgr.commit_index_last().map(|(lsn, _)| lsn),
+        Some(floor) => tx_mgr
+            .try_commit_index_floor(std::ops::Bound::Excluded(floor))?
+            .map(|(lsn, _)| lsn),
+        None => tx_mgr
+            .try_commit_index_floor(std::ops::Bound::Unbounded)?
+            .map(|(lsn, _)| lsn),
     };
-    affected_lsns
+    Ok(affected_lsns
         .iter()
         .filter(|lsn| !still_covered(**lsn) && Some(**lsn) != anchor_lsn)
         .copied()
-        .collect()
+        .collect())
 }
 
 /// Whether a change-log entry names one of the pruned `(table, row_id, lsn)`
@@ -68525,7 +68528,7 @@ fn compact_currency_versions_inner(
     let affected_lsns: HashSet<Lsn> = removed_lsn_counts.keys().copied().collect();
     let commit_index_candidates = {
         let lsn_refcounts = change_log_lsn_refcounts.read();
-        scoped_commit_index_candidates(tx_mgr, &lsn_refcounts, &removed_lsn_counts, &affected_lsns)
+        scoped_commit_index_candidates(tx_mgr, &lsn_refcounts, &removed_lsn_counts, &affected_lsns)?
     };
 
     let generation_cleanup = prepare_cleanup_generations(
@@ -69091,6 +69094,7 @@ type VectorTombstoneIndex = HashMap<(VectorIndexRef, RowId), Vec<(Lsn, TxId)>>;
 /// the original was O(deletes × rows). The produced index is byte-identical to
 /// the original algorithm for any input (proven by
 /// `commit_index_reconstruction_tests::commit_index_matches_naive_across_shapes`).
+#[cfg(test)]
 fn commit_index_across_all(
     relational: &RelationalStore,
     graph: &GraphStore,

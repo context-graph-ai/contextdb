@@ -275,6 +275,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         }
         let visibility_tx = self.visibility_tx_for_commit(tx, ws.visibility_floor);
         ws.reassign_tx(tx, visibility_tx);
+        ws.finalized_tx = Some(visibility_tx);
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         debug_assert_eq!(lsn, reserved_lsn);
         ws.stamp_lsn(lsn);
@@ -346,6 +347,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         }
         let visibility_tx = self.visibility_tx_for_commit(tx, ws.visibility_floor);
         ws.reassign_tx(tx, visibility_tx);
+        ws.finalized_tx = Some(visibility_tx);
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         ws.stamp_lsn(lsn);
         if let Err(error) = prepare(&mut ws) {
@@ -398,6 +400,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             }
             let visibility_tx = self.visibility_tx_for_commit(tx, ws.visibility_floor);
             ws.reassign_tx(tx, visibility_tx);
+        ws.finalized_tx = Some(visibility_tx);
             visibility_tx
         };
 
@@ -426,6 +429,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         };
         ws.canonicalize_final_state();
         ws.reassign_tx(tx, visibility_tx);
+        ws.finalized_tx = Some(visibility_tx);
         ws.stamp_lsn(lsn);
 
         if let Err(error) = prepare(&mut ws) {
