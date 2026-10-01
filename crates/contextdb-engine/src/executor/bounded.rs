@@ -13423,8 +13423,11 @@ fn start_cursor_expiry_watch(
             let mut context = std::task::Context::from_waker(&waker);
             loop {
                 let mut wait = clock.wait_until(deadline);
+                let mut completed = false;
                 loop {
-                    let ready = wait.as_mut().poll(&mut context).is_ready();
+                    if !completed {
+                        completed = wait.as_mut().poll(&mut context).is_ready();
+                    }
                     {
                         let Some(execution) = weak.upgrade() else {
                             return;
@@ -13449,7 +13452,7 @@ fn start_cursor_expiry_watch(
                             break;
                         }
                     }
-                    if ready {
+                    if completed {
                         // A failed timer arm returns ready before its deadline.
                         std::thread::park_timeout(std::time::Duration::from_millis(
                             deadline.saturating_sub(clock.now_ms()).max(1),
