@@ -16,6 +16,9 @@ const LARGE_STREAM_ROWS: i64 = 20_010;
 const NEIGHBOUR_ROWS: i64 = 20_000;
 const CONNECTOR_ID: &str = "test.connector";
 
+#[path = "newest_event_merges_staged_order_without_sort.rs"]
+mod newest_event_merges_staged_order_without_sort;
+
 fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<String, Value> {
     pairs
         .into_iter()
