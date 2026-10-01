@@ -207,9 +207,39 @@
 +pub fn take_commit_spans_for_test() -> CommitSpansForTest {
 +    COMMIT_SPANS.with(|spans| spans.replace(CommitSpansForTest::ZERO))
 +}
+--- /dev/null
++++ b/src/db/allocator_metadata_test_seams.rs
+@@ -0,0 +1,27 @@
++//! Retained allocator capacity for `writer_reopen_and_doubling_keep_a_fixed_resident_envelope`.
++
++use super::Database;
++
++impl Database {
++    /// Return retained allocator metadata heap payload bytes from actual vector capacities.
++    ///
++    /// Counts `Allocators::region_allocators`, each `BuddyAllocator::free`, each
++    /// `BtreeBitmap::heights`, every `U64GroupedBitmap::data`, and the same bitmap
++    /// owners reached through `RegionTracker::order_trackers`. Outer vector capacities
++    /// include inline element bookkeeping and spare slots; nested allocations are
++    /// counted only for initialized elements, so no owner is counted twice.
++    ///
++    /// This is a lower bound on heap residency: allocator rounding/headers are unknown.
++    /// It excludes fixed inline `TransactionalMemory` state, page caches, commit page
++    /// sets, debug-only page tracking, temporary serialization/open buffers, and any
++    /// old/new allocation overlap inside a vector reallocation. Those owners require
++    /// separate observations; this settled snapshot is not complete reconciliation.
++    ///
++    /// Takes only the allocator state mutex, allocates nothing, and reads no storage
++    /// pages. It can observe retained state after open or file growth without starting
++    /// a transaction or hydrating history. The seam is absent from normal builds.
++    #[doc(hidden)]
++    pub fn allocator_metadata_bytes_for_test(&self) -> usize {
++        self.mem.allocator_metadata_bytes_for_test()
++    }
++}
 --- a/src/db.rs
 +++ b/src/db.rs
-@@ -20,8 +20,8 @@
+@@ -20,12 +20,15 @@
  use crate::sealed::Sealed;
  use crate::transactions::{
      ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTree, DATA_ALLOCATED_TABLE,
@@ -220,7 +250,14 @@
  };
  use crate::tree_store::file_backend::FileBackend;
  #[cfg(feature = "logging")]
-@@ -305,6 +305,14 @@
+ use log::{debug, info, warn};
++
++#[cfg(feature = "test-seams")]
++mod allocator_metadata_test_seams;
+ 
+ #[allow(clippy::len_without_is_empty)]
+ /// Implements persistent storage for a database.
+@@ -305,6 +308,14 @@
          Self {
              transaction_tracker: None,
              transaction_id: None,
@@ -235,7 +272,7 @@
              write_transaction: false,
          }
      }
-@@ -424,11 +432,53 @@
+@@ -424,11 +435,53 @@
          Builder::new().open_read_only(path)
      }
  
@@ -289,7 +326,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -441,21 +491,24 @@
+@@ -441,21 +494,24 @@
              region_size,
              cache_size,
              true,
@@ -327,7 +364,7 @@
          let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
          let db = Self {
              mem,
-@@ -502,6 +555,9 @@
+@@ -502,6 +558,9 @@
  pub struct Database {
      mem: Arc<TransactionalMemory>,
      transaction_tracker: Arc<TransactionTracker>,
@@ -337,7 +374,7 @@
  }
  
  impl ReadableDatabase for Database {
-@@ -619,6 +675,7 @@
+@@ -619,6 +678,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -345,7 +382,7 @@
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +686,7 @@
+@@ -629,6 +689,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -353,7 +390,7 @@
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +701,7 @@
+@@ -643,6 +704,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -361,7 +398,7 @@
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +711,7 @@
+@@ -652,6 +714,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -369,7 +406,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +720,7 @@
+@@ -660,6 +723,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -377,7 +414,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -676,6 +737,209 @@
+@@ -676,6 +740,209 @@
          }
  
          Ok(compacted)
@@ -587,7 +624,7 @@
      }
  
      #[cfg_attr(not(debug_assertions), expect(dead_code))]
-@@ -891,6 +1155,7 @@
+@@ -891,6 +1158,7 @@
          Ok([data_root, system_root])
      }
  
@@ -595,7 +632,7 @@
      fn new(
          file: Box<dyn StorageBackend>,
          allow_initialize: bool,
-@@ -898,6 +1163,8 @@
+@@ -898,6 +1166,8 @@
          region_size: Option<u64>,
          cache_size: usize,
          repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
@@ -604,7 +641,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -909,6 +1176,7 @@
+@@ -909,6 +1179,7 @@
              page_size,
              region_size,
              cache_size,
@@ -612,7 +649,7 @@
              false,
          )?;
          let mut mem = Arc::new(mem);
-@@ -944,8 +1212,20 @@
+@@ -944,8 +1215,20 @@
  
          let db = Database {
              mem,
@@ -634,7 +671,7 @@
  
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-@@ -1035,12 +1315,21 @@
+@@ -1035,12 +1318,21 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -656,7 +693,7 @@
          WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
              .map_err(|e| e.into())
      }
-@@ -1056,16 +1345,78 @@
+@@ -1056,16 +1348,78 @@
  
          Ok(())
      }
@@ -737,7 +774,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +1457,7 @@
+@@ -1106,6 +1460,7 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -745,7 +782,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +1477,7 @@
+@@ -1125,6 +1480,7 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -753,7 +790,7 @@
          }
      }
  
-@@ -1154,6 +1507,20 @@
+@@ -1154,6 +1510,20 @@
      pub fn set_page_size(&mut self, size: usize) -> &mut Self {
          assert!(size.is_power_of_two());
          self.page_size = std::cmp::max(size, 512);
@@ -774,7 +811,7 @@
          self
      }
  
-@@ -1189,6 +1556,8 @@
+@@ -1189,6 +1559,8 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -783,7 +820,7 @@
          )
      }
  
-@@ -1203,6 +1572,48 @@
+@@ -1203,6 +1575,48 @@
              None,
              self.cache_size,
              &self.repair_callback,
@@ -832,7 +869,7 @@
          )
      }
  
-@@ -1222,6 +1633,36 @@
+@@ -1222,6 +1636,36 @@
              self.page_size,
              None,
              self.cache_size,
@@ -869,7 +906,7 @@
          )
      }
  
-@@ -1236,6 +1677,29 @@
+@@ -1236,6 +1680,29 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -899,7 +936,7 @@
          )
      }
  
-@@ -1251,6 +1715,8 @@
+@@ -1251,6 +1718,8 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -908,7 +945,7 @@
          )
      }
  }
-@@ -1260,18 +1726,215 @@
+@@ -1260,18 +1729,215 @@
          f.debug_struct("Database").finish()
      }
  }
@@ -6608,6 +6645,44 @@
  }
  
  pub(crate) enum PageTrackerPolicy {
+--- a/src/tree_store/page_store/bitmap.rs
++++ b/src/tree_store/page_store/bitmap.rs
+@@ -16,6 +16,16 @@
+ // layer data: u64s
+ // ...consecutive layers. Except for the last level, all sub-trees of the root must be complete
+ impl BtreeBitmap {
++    #[cfg(feature = "test-seams")]
++    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
++        self.heights.capacity() * size_of::<U64GroupedBitmap>()
++            + self
++                .heights
++                .iter()
++                .map(|height| height.data.capacity() * size_of::<u64>())
++                .sum::<usize>()
++    }
++
+     pub(crate) fn count_unset(&self) -> u32 {
+         self.get_level(self.get_height() - 1).count_unset()
+     }
+--- a/src/tree_store/page_store/buddy_allocator.rs
++++ b/src/tree_store/page_store/buddy_allocator.rs
+@@ -34,6 +34,16 @@
+ }
+ 
+ impl BuddyAllocator {
++    #[cfg(feature = "test-seams")]
++    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
++        self.free.capacity() * size_of::<BtreeBitmap>()
++            + self
++                .free
++                .iter()
++                .map(BtreeBitmap::allocator_metadata_bytes_for_test)
++                .sum::<usize>()
++    }
++
+     pub(crate) fn new(num_pages: u32, max_page_capacity: u32) -> Self {
+         let max_order = calculate_usable_order(max_page_capacity);
+ 
 --- a/src/tree_store/page_store/cached_file.rs
 +++ b/src/tree_store/page_store/cached_file.rs
 @@ -15,6 +15,79 @@
@@ -7071,7 +7146,23 @@
      FILE_FORMAT_VERSION3, ShrinkPolicy, TransactionalMemory, xxh3_checksum,
 --- a/src/tree_store/page_store/page_manager.rs
 +++ b/src/tree_store/page_store/page_manager.rs
-@@ -137,9 +137,10 @@
+@@ -129,6 +129,15 @@
+ }
+ 
+ impl TransactionalMemory {
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn allocator_metadata_bytes_for_test(&self) -> usize {
++        self.state
++            .lock()
++            .unwrap()
++            .allocators
++            .allocator_metadata_bytes_for_test()
++    }
++
+     pub(crate) fn new(
+         file: Box<dyn StorageBackend>,
+         // Allow initializing a new database in an empty file
+@@ -137,9 +146,10 @@
          requested_region_size: Option<u64>,
          cache_size: usize,
          read_only: bool,
@@ -7083,7 +7174,7 @@
          let region_size = requested_region_size.unwrap_or(MAX_USABLE_REGION_SPACE);
          let region_size = min(
              region_size,
-@@ -226,12 +227,17 @@
+@@ -226,12 +236,17 @@
          }
          let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
          let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
@@ -7104,7 +7195,7 @@
              if read_only {
                  return Err(DatabaseError::RepairAborted);
              }
-@@ -252,9 +258,14 @@
+@@ -252,9 +267,14 @@
                  .copy_from_slice(&header.to_bytes(true));
              storage.flush()?;
          }
@@ -7121,7 +7212,7 @@
          let region_size = layout.full_region_layout().len();
          let region_header_size = layout.full_region_layout().data_section().start;
          let state = InMemoryState::new(header);
-@@ -774,6 +785,24 @@
+@@ -774,6 +794,24 @@
              #[cfg(debug_assertions)]
              open_pages: self.read_page_ref_counts.clone(),
          })
@@ -7146,7 +7237,7 @@
      }
  
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
-@@ -1107,6 +1136,13 @@
+@@ -1107,6 +1145,13 @@
  
          let result = self.storage.resize(new_layout.len());
          if result.is_err() {
@@ -7160,7 +7251,7 @@
              // TODO: it would be nice to have a more cohesive approach to setting this.
              // we do it in commit() & rollback() on failure, but there are probably other places that need it
              self.needs_recovery.store(true, Ordering::Release);
-@@ -1158,6 +1194,36 @@
+@@ -1158,6 +1203,36 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -7197,6 +7288,43 @@
      pub(crate) fn close(&self) -> Result {
          if !self.needs_recovery.load(Ordering::Acquire) && !thread::panicking() {
              let mut state = self.state.lock()?;
+--- a/src/tree_store/page_store/region.rs
++++ b/src/tree_store/page_store/region.rs
+@@ -13,6 +13,16 @@
+ }
+ 
+ impl RegionTracker {
++    #[cfg(feature = "test-seams")]
++    fn allocator_metadata_bytes_for_test(&self) -> usize {
++        self.order_trackers.capacity() * size_of::<BtreeBitmap>()
++            + self
++                .order_trackers
++                .iter()
++                .map(BtreeBitmap::allocator_metadata_bytes_for_test)
++                .sum::<usize>()
++    }
++
+     pub(crate) fn new(regions: u32, orders: u8) -> Self {
+         let mut data = vec![];
+         for _ in 0..orders {
+@@ -105,6 +115,17 @@
+ }
+ 
+ impl Allocators {
++    #[cfg(feature = "test-seams")]
++    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
++        self.region_allocators.capacity() * size_of::<BuddyAllocator>()
++            + self
++                .region_allocators
++                .iter()
++                .map(BuddyAllocator::allocator_metadata_bytes_for_test)
++                .sum::<usize>()
++            + self.region_tracker.allocator_metadata_bytes_for_test()
++    }
++
+     pub(super) fn new(layout: DatabaseLayout) -> Self {
+         let mut region_allocators = vec![];
+         let initial_regions = max(INITIAL_REGIONS, layout.num_regions());
 --- a/src/tree_store/table_tree.rs
 +++ b/src/tree_store/table_tree.rs
 @@ -34,6 +34,18 @@

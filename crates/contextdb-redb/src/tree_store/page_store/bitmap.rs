@@ -16,6 +16,16 @@ pub(crate) struct BtreeBitmap {
 // layer data: u64s
 // ...consecutive layers. Except for the last level, all sub-trees of the root must be complete
 impl BtreeBitmap {
+    #[cfg(feature = "test-seams")]
+    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
+        self.heights.capacity() * size_of::<U64GroupedBitmap>()
+            + self
+                .heights
+                .iter()
+                .map(|height| height.data.capacity() * size_of::<u64>())
+                .sum::<usize>()
+    }
+
     pub(crate) fn count_unset(&self) -> u32 {
         self.get_level(self.get_height() - 1).count_unset()
     }

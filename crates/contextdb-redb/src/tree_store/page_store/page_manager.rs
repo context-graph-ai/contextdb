@@ -129,6 +129,15 @@ pub(crate) struct TransactionalMemory {
 }
 
 impl TransactionalMemory {
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn allocator_metadata_bytes_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .allocator_metadata_bytes_for_test()
+    }
+
     pub(crate) fn new(
         file: Box<dyn StorageBackend>,
         // Allow initializing a new database in an empty file
