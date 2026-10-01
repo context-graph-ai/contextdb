@@ -813,14 +813,7 @@ impl OrderedStagedRows {
         let Some(owner) = snapshot.owner(row) else {
             return Ok(());
         };
-        let prepared = crate::StatementRows::prepare(
-            snapshot,
-            &owner.row,
-            &owner.keys,
-            owner.schema.clone(),
-            &mut reserve,
-            true,
-        )?;
+        let prepared = crate::StatementRows::prepare_delete(snapshot, row, &mut reserve)?;
         self.stage_retiring_row(
             table,
             StagedPosition {
@@ -833,16 +826,17 @@ impl OrderedStagedRows {
             retired_count,
             &mut reserve,
         )?;
-        let undo = crate::StatementRows::publish(
+        let undo = crate::StatementRows::publish_delete(
             self.statement_rows
                 .get_mut(table)
                 .expect("prepared removal table"),
+            row,
             prepared,
         );
         self.undo
             .last_mut()
             .expect("prepared removal undo")
-            .statement = undo;
+            .statement = Some(undo);
         Ok(())
     }
     pub fn remove_statement_row(&mut self, table: &str, row: RowId) -> Result<()> {

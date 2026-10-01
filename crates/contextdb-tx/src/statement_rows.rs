@@ -24,13 +24,13 @@ pub struct PreparedStatementRow {
 
 #[derive(Debug)]
 pub(crate) struct StatementRowUndo {
-    _charge: Arc<dyn StagedPostingCharge>,
     prior_image: Weak<StatementRows>,
     prior_row: Option<Arc<RowOwner>>,
     prior_sequence: usize,
     prior_copy_charge: Option<Arc<dyn StagedPostingCharge>>,
     domains: Vec<(String, Option<StatementIndex>)>,
     schemas: Vec<(String, Arc<crate::ordered_staged::StagedSchema>)>,
+    _charge: Arc<dyn StagedPostingCharge>,
 }
 
 // Boundary probes sort before or after every full key sharing their logical
@@ -98,6 +98,10 @@ impl PartialOrd for StatementIndexKey {
 
 pub struct PreparedStatementRemoval {
     replacement: Option<Arc<StatementRows>>,
+}
+pub(crate) struct PreparedStatementDelete {
+    copy_charge: Option<Arc<dyn StagedPostingCharge>>,
+    undo: StatementRowUndo,
 }
 #[derive(Debug, Clone)]
 struct StatementIndex {
@@ -525,6 +529,72 @@ impl StatementRows {
             None
         };
         Ok(PreparedStatementRemoval { replacement })
+    }
+    pub(crate) fn prepare_delete(
+        snapshot: &Arc<Self>,
+        row: RowId,
+        mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    ) -> Result<PreparedStatementDelete> {
+        let owner = snapshot.rows.get(&row).expect("selected staged row");
+        let copy_charge = if Arc::strong_count(snapshot) > 1 {
+            Some(owner._charge.reserve_copy(snapshot.control_bytes())?)
+        } else {
+            None
+        };
+        let charge = reserve(snapshot.undo_control_bytes(row, &owner.keys))?;
+        Ok(PreparedStatementDelete {
+            undo: StatementRowUndo {
+                _charge: charge,
+                prior_image: if copy_charge.is_some() {
+                    Arc::downgrade(snapshot)
+                } else {
+                    Weak::new()
+                },
+                prior_row: Some(owner.clone()),
+                prior_sequence: snapshot.next_sequence,
+                prior_copy_charge: snapshot.copy_charge.clone(),
+                domains: Vec::with_capacity(owner.keys.len()),
+                schemas: Vec::with_capacity(snapshot.indexes.len()),
+            },
+            copy_charge,
+        })
+    }
+    pub(crate) fn publish_delete(
+        snapshot: &mut Arc<Self>,
+        row: RowId,
+        mut prepared: PreparedStatementDelete,
+    ) -> StatementRowUndo {
+        if let Some(charge) = prepared.copy_charge {
+            let mut next = (**snapshot).clone();
+            next.copy_charge = Some(charge);
+            *snapshot = Arc::new(next);
+        }
+        let rows = Arc::get_mut(snapshot).expect("staged deletion prepared under write-set mutex");
+        for (name, index) in &rows.indexes {
+            prepared
+                .undo
+                .schemas
+                .push((name.clone(), index.schema.clone()));
+        }
+        let owner = prepared
+            .undo
+            .prior_row
+            .as_ref()
+            .expect("selected staged row");
+        for (name, _) in &owner.keys {
+            if rows.indexes.get(name).is_some_and(|index| {
+                index.postings.len() == 1
+                    && index.postings.values().next() == Some(&row)
+                    && index.schema.matches_index(&owner.schema, name)
+            }) {
+                prepared
+                    .undo
+                    .domains
+                    .push((name.clone(), rows.indexes.remove(name)));
+            }
+        }
+        rows.remove_private(row);
+        prepared.undo
     }
     pub(crate) fn publish_removal(
         snapshot: &mut Arc<Self>,

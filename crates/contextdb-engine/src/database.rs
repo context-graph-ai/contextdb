@@ -9284,6 +9284,7 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub reconciliation_gap: i64,
     pub published_root_charge: usize,
     pub captured_root_charge: usize,
+    pub commit_source_reference_charge: usize,
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -11422,6 +11423,8 @@ pub struct Database {
     /// config write that changes Pending to Accepted; a crash before that
     /// promotion leaves the ordinary delete pending and resumable.
     persistence: Option<Arc<RedbPersistence>>,
+    #[cfg(any(test, feature = "test-seams"))]
+    commit_source_reference_charge: usize,
     /// Present only on a handle built from a committed image: the startup
     /// rows a live store would have been asked for at open.
     committed_image_startup: Option<Arc<CommittedImageStartupState>>,
@@ -19157,6 +19160,8 @@ impl Database {
             received_staging_access: None,
             received_vector_image_pending: Arc::new(AtomicBool::new(false)),
             persistence,
+            #[cfg(any(test, feature = "test-seams"))]
+            commit_source_reference_charge: 0,
             committed_image_startup: None,
             image_history: None,
             retained_relational_source: None,
@@ -20224,6 +20229,8 @@ impl Database {
             received_staging_access: self.received_staging_access.clone(),
             received_vector_image_pending: self.received_vector_image_pending.clone(),
             persistence: self.persistence.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            commit_source_reference_charge: self.commit_source_reference_charge,
             committed_image_startup: self.committed_image_startup.clone(),
             image_history: self.image_history.clone(),
             retained_relational_source: self.retained_relational_source.clone(),
@@ -20757,17 +20764,20 @@ impl Database {
         let received_arriving_table_meta = composite.received_arriving_table_meta.clone();
         let event_bus = Arc::new(EventBusState::new());
         let trigger = Arc::new(TriggerState::new());
+        let initial_root =
+            persistence.initialize_writer_snapshot(SnapshotId::from_tx(max_tx), max_lsn)?;
         let persistent = PersistentCompositeStore::new(
             composite,
             persistence.clone(),
+            initial_root.clone(),
             Some(event_bus.clone()),
             Some(trigger.clone()),
             received_schema_stages.clone(),
             local_schema_stages.clone(),
-        );
+        )?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let commit_source_reference_charge = persistent.source_control_bytes_for_test();
         let store: DynStore = Box::new(persistent);
-        let initial_root =
-            persistence.initialize_writer_snapshot(SnapshotId::from_tx(max_tx), max_lsn)?;
         let tx_mgr = Arc::new(TransactionManager::new_with_directory(
             store,
             TxId(max_tx.0.saturating_add(1)),
@@ -20807,6 +20817,12 @@ impl Database {
             event_bus,
             trigger,
         );
+        #[cfg(any(test, feature = "test-seams"))]
+        let db = {
+            let mut db = db;
+            db.commit_source_reference_charge = commit_source_reference_charge;
+            db
+        };
         db.maintenance_poll_interval_ms
             .store(persisted_maintenance_poll_interval_ms, Ordering::SeqCst);
         db.vector_serving_cache_bytes
@@ -23677,6 +23693,20 @@ impl Database {
         result
     }
 
+    fn run_callback_dml_plan(
+        &self,
+        tx: TxId,
+        plan: &PhysicalPlan,
+        params: &HashMap<String, Value>,
+    ) -> Result<QueryResult> {
+        let checkpoint = self.write_set_checkpoint(tx)?;
+        let result = execute_plan(self, plan, params, Some(tx));
+        if result.is_err() {
+            let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        }
+        result
+    }
+
     fn execute_in_tx_with_rows_examined_scope(
         &self,
         tx: TxId,
@@ -23735,7 +23765,9 @@ impl Database {
                 validate_plan_columns(self, plan)?;
                 let snapshot = self.snapshot_for_read();
                 return self
-                    .with_snapshot_override(snapshot, || execute_plan(self, plan, params, Some(tx)))
+                    .with_snapshot_override(snapshot, || {
+                        self.run_callback_dml_plan(tx, plan, params)
+                    })
                     .map(strip_internal_row_id);
             }
 
@@ -23745,7 +23777,7 @@ impl Database {
             validate_plan_columns(self, &plan)?;
             let snapshot = self.snapshot_for_read();
             return self
-                .with_snapshot_override(snapshot, || execute_plan(self, &plan, params, Some(tx)))
+                .with_snapshot_override(snapshot, || self.run_callback_dml_plan(tx, &plan, params))
                 .map(strip_internal_row_id);
         }
         let requires_callback_tx = Self::statement_requires_cron_bound_handle(stmt);
@@ -25325,6 +25357,9 @@ impl Database {
                 None => self.begin_for_public_autocommit_write()?,
             },
         };
+        let checkpoint = (!auto_commit)
+            .then(|| self.write_set_checkpoint(tx))
+            .transpose()?;
         let result = {
             let _write_gate = self.enter_sql_write_control_bypass(tx);
             (|| {
@@ -25369,6 +25404,9 @@ impl Database {
         let count = match result {
             Ok(count) => count,
             Err(error) => {
+                if let Some(checkpoint) = checkpoint {
+                    let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+                }
                 if auto_commit {
                     let _ = self.rollback_without_callback_tx_control(tx);
                 }
@@ -40221,10 +40259,7 @@ impl Database {
                 return Ok(());
             }
             let snapshot = self.snapshot_for_read();
-            let Some(old_row) = self
-                .relational_store
-                .row_by_id(&index.table, old_row_id, snapshot)
-            else {
+            let Some(old_row) = self.committed_row_at(&index.table, old_row_id, snapshot)? else {
                 return Ok(());
             };
             let new_row =
@@ -45075,83 +45110,105 @@ impl Database {
         &self,
         tx: TxId,
         index: &VectorIndexRef,
-    ) -> Result<crate::executor::TransactionVectorOverlay> {
-        self.tx_mgr.with_write_set(tx, |ws| {
-            let mut removed: std::collections::HashSet<RowId> = ws
-                .vector_deletes
-                .iter()
-                .filter(|(delete_index, _, _)| delete_index == index)
-                .map(|(_, row_id, _)| *row_id)
-                .collect();
-            // A row deleted and then put back at the same identity is still
-            // there to be scored; only a deletion with no replacement takes
-            // the entry out of the search.
-            for (delete_table, row_id, _) in &ws.relational_deletes {
-                if delete_table != &index.table {
-                    continue;
+        before_retain: &mut dyn FnMut(
+            usize,
+        ) -> std::result::Result<
+            (),
+            crate::executor::BoundedExecutionError,
+        >,
+    ) -> std::result::Result<
+        crate::executor::TransactionVectorOverlay,
+        crate::executor::BoundedExecutionError,
+    > {
+        self.tx_mgr.with_write_set(
+            tx,
+            |ws| -> std::result::Result<_, crate::executor::BoundedExecutionError> {
+                let removed_capacity = ws
+                    .vector_deletes
+                    .iter()
+                    .filter(|(have, _, _)| have == index)
+                    .count()
+                    .saturating_add(
+                        ws.relational_deletes
+                            .iter()
+                            .filter(|(table, _, _)| table == &index.table)
+                            .count(),
+                    );
+                let moved_capacity = ws
+                    .vector_moves
+                    .iter()
+                    .filter(|(have, _, _, _)| have == index)
+                    .count();
+                let staged_capacity = ws
+                    .vector_inserts
+                    .iter()
+                    .filter(|entry| entry.index == *index && entry.deleted_tx.is_none())
+                    .count();
+                // Explicit requested capacities bound every hash allocation and the
+                // positions buffer before construction under the write-set lock.
+                let bytes = held::map::<RowId, ()>(removed_capacity)
+                    .saturating_add(held::map::<RowId, RowId>(moved_capacity))
+                    .saturating_add(held::map::<RowId, ()>(staged_capacity))
+                    .saturating_add(staged_capacity.saturating_mul(std::mem::size_of::<usize>()))
+                    .saturating_add(if staged_capacity == 0 {
+                        0
+                    } else {
+                        held::ALLOCATION_BYTES
+                    });
+                before_retain(bytes)?;
+                let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    self.accountant.clone(),
+                    bytes,
+                    "query",
+                    &format!("active_tx_vector_overlay@{}.{}", index.table, index.column),
+                    "Reduce active transaction vector search scope or raise MEMORY_LIMIT.",
+                )?;
+                let mut removed = HashSet::with_capacity(removed_capacity);
+                for (have, row, _) in &ws.vector_deletes {
+                    if have == index {
+                        removed.insert(*row);
+                    }
                 }
-                let replaced = ws.relational_inserts.iter().any(|(insert_table, row)| {
-                    insert_table == &index.table && row.row_id == *row_id
-                });
-                if !replaced {
-                    removed.insert(*row_id);
+                for (table, row_id, _) in &ws.relational_deletes {
+                    if table != &index.table {
+                        continue;
+                    }
+                    let replaced = ws.ordered_staged_rows.contains_row(table, *row_id);
+                    if !replaced {
+                        removed.insert(*row_id);
+                    }
                 }
-            }
-            let moved: HashMap<RowId, RowId> = ws
-                .vector_moves
-                .iter()
-                .filter(|(move_index, _, _, _)| move_index == index)
-                .map(|(_, from_row_id, to_row_id, _)| (*from_row_id, *to_row_id))
-                .collect();
-            // Newest version per row wins and the survivors keep the order the
-            // transaction staged them in -- the same rule the established
-            // merge follows, so both doors publish one answer.
-            let mut staged_identities = std::collections::HashSet::new();
-            let mut staged_positions: Vec<usize> = ws
-                .vector_inserts
-                .iter()
-                .enumerate()
-                .rev()
-                .filter(|(_, entry)| {
-                    entry.index == *index
+                let mut moved = HashMap::with_capacity(moved_capacity);
+                for (have, from, to, _) in &ws.vector_moves {
+                    if have == index {
+                        moved.insert(*from, *to);
+                    }
+                }
+                let mut staged_identities = HashSet::with_capacity(staged_capacity);
+                let mut staged_positions = Vec::with_capacity(staged_capacity);
+                for (position, entry) in ws.vector_inserts.iter().enumerate().rev() {
+                    if entry.index == *index
                         && entry.deleted_tx.is_none()
                         && staged_identities.insert(entry.row_id)
+                    {
+                        staged_positions.push(position);
+                    }
+                }
+                staged_positions.reverse();
+                let searchable_entry_count = removed
+                    .len()
+                    .saturating_add(moved.len())
+                    .saturating_add(staged_positions.len());
+                Ok(crate::executor::TransactionVectorOverlay {
+                    removed,
+                    moved,
+                    staged_identities,
+                    staged_positions,
+                    searchable_entry_count,
+                    _memory: Some(memory),
                 })
-                .map(|(position, _)| position)
-                .collect();
-            staged_positions.reverse();
-            let bytes = removed
-                .len()
-                .saturating_add(staged_identities.len())
-                .saturating_mul(std::mem::size_of::<RowId>())
-                .saturating_add(
-                    moved
-                        .len()
-                        .saturating_mul(std::mem::size_of::<(RowId, RowId)>()),
-                )
-                .saturating_add(
-                    staged_positions
-                        .len()
-                        .saturating_mul(std::mem::size_of::<usize>()),
-                );
-            // The graph owns committed search work. This count sizes only
-            // the transaction delta and the bounded widening needed after
-            // that graph result is filtered; including the whole committed
-            // index here turns `k` into the index cardinality and makes a
-            // healthy INDEXED route look incomplete.
-            let searchable_entry_count = removed
-                .len()
-                .saturating_add(moved.len())
-                .saturating_add(staged_positions.len());
-            crate::executor::TransactionVectorOverlay {
-                removed,
-                moved,
-                staged_identities,
-                staged_positions,
-                searchable_entry_count,
-                bytes,
-            }
-        })
+            },
+        )?
     }
 
     /// One vector the transaction has staged, cloned under the caller's
@@ -46392,28 +46449,6 @@ impl Database {
         // one that resolves many. The read holds that reservation itself and
         // grows it as each start is resolved.
         Ok(held)
-    }
-
-    pub(crate) fn bounded_vector_overlay_reservation(
-        &self,
-        index: &VectorIndexRef,
-        entry_count: usize,
-    ) -> Result<Option<Box<dyn Send + Sync>>> {
-        let dimension = self
-            .vector_store
-            .index_layout(index)
-            .ok()
-            .map(|layout| layout.dimension)
-            .unwrap_or(0);
-        let bytes = estimate_active_tx_vector_overlay_bytes(entry_count, dimension);
-        let reservation = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-            Arc::clone(&self.accountant),
-            bytes,
-            "query",
-            &format!("active_tx_vector_overlay@{}.{}", index.table, index.column),
-            "Reduce active transaction vector search scope or raise MEMORY_LIMIT.",
-        )?;
-        Ok(Some(Box::new(reservation) as Box<dyn Send + Sync>))
     }
 
     /// Build this index's approximate graph if this snapshot is entitled to
@@ -49991,6 +50026,7 @@ impl Database {
             let mut receipt = WriterMemoryOwnershipReceiptForTest {
                 vector: self.vector_memory_ownership_receipt_for_test(),
                 relational_inventory: self.relational_store.retained_structure_bytes(),
+                commit_source_reference_charge: self.commit_source_reference_charge,
                 ..WriterMemoryOwnershipReceiptForTest::default()
             };
             let metadata = self.relational_store.table_meta.read();
@@ -50119,7 +50155,8 @@ impl Database {
                     persistence.writer_snapshot_charge_for_test()
                 })
                 .saturating_sub(receipt.published_root_charge);
-            receipt.named_owner_total = receipt.published_root_charge
+            receipt.named_owner_total = receipt.commit_source_reference_charge
+                + receipt.published_root_charge
                 + receipt.captured_root_charge
                 + receipt.staged_index_postings
                 + receipt.vector.retained_total
@@ -50679,25 +50716,22 @@ impl Database {
         }
     }
 
-    /// Once a file-backed commit is durable, the relational store retains a
-    /// lightweight directory row and Redb owns the full body.  Return exactly
-    /// the difference between the transaction's admission and that directory;
-    /// rollback still returns the complete staged allocation above.
+    /// File-backed commits retain rows and postings only in the durable source.
+    /// The transaction payload admission retires after durable publication;
+    /// source pages, schema and root controls have their separate owners.
     fn release_committed_row_body_allocations(&self, ws: &contextdb_tx::WriteSet) {
         if self.persistence.is_none() || !self.relational_store.uses_disk_backed_committed_bodies()
         {
             return;
         }
         for (table, row) in &ws.relational_inserts {
-            let Some(meta) = self.relational_store.table_meta(table) else {
-                continue;
-            };
-            let admitted = ws
-                .admitted_bytes_for_staged_row(table, row.row_id)
-                .unwrap_or_else(|| retained_row_bytes_for_meta(table, &row.values, &meta, true));
-            let directory_values = self.relational_store.committed_directory_values(table, row);
-            let retained = retained_row_bytes_for_meta(table, &directory_values, &meta, true);
-            self.accountant.release(admitted.saturating_sub(retained));
+            let admitted = self.staged_row_release_bytes(
+                ws,
+                table,
+                row,
+                self.relational_store.table_meta(table),
+            );
+            self.accountant.release(admitted);
         }
     }
 

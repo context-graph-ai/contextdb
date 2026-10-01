@@ -5,9 +5,7 @@ use crate::database::{LocalSchemaStageRegistry, ReceivedSchemaStageRegistry};
 use crate::persistence::{
     FlushDataOptions, FlushDataSnapshots, RedbPersistence, SchemaDdlPersistence,
 };
-#[cfg(any(test, feature = "test-seams"))]
-use contextdb_core::Error;
-use contextdb_core::{Result, RowId, SnapshotId};
+use contextdb_core::{Error, Result, RowId, SnapshotId};
 use contextdb_tx::{WriteSet, WriteSetApplicator};
 use contextdb_vector::VectorPartitionRef;
 use std::collections::HashSet;
@@ -32,19 +30,36 @@ pub struct PersistentCompositeStore {
     local_schema_stages: LocalSchemaStageRegistry,
     prepared_publication:
         parking_lot::Mutex<Option<Arc<crate::persistence::writer_source::WriterSnapshot>>>,
+    precommit_source: parking_lot::Mutex<std::sync::Weak<crate::persistence::WriterSnapshot>>,
+    _precommit_source_memory: crate::memory_accounting::OwnedMemoryReservation,
     publication_interrupted: std::sync::atomic::AtomicBool,
 }
 
 impl PersistentCompositeStore {
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn source_control_bytes_for_test(&self) -> usize {
+        self._precommit_source_memory.bytes()
+    }
+
     pub(crate) fn new(
         inner: CompositeStore,
         persistence: Arc<RedbPersistence>,
+        initial_root: Arc<crate::persistence::WriterSnapshot>,
         event_bus: Option<Arc<EventBusState>>,
         trigger: Option<Arc<TriggerState>>,
         received_schema_stages: ReceivedSchemaStageRegistry,
         local_schema_stages: LocalSchemaStageRegistry,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let source_memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            inner.accountant.clone(),
+            std::mem::size_of::<
+                parking_lot::Mutex<std::sync::Weak<crate::persistence::WriterSnapshot>>,
+            >(),
+            "writer_source",
+            "commit_root_reference",
+            "Raise MEMORY_LIMIT to retain commit source control.",
+        )?;
+        Ok(Self {
             inner,
             persistence,
             event_bus,
@@ -52,8 +67,10 @@ impl PersistentCompositeStore {
             received_schema_stages,
             local_schema_stages,
             prepared_publication: parking_lot::Mutex::new(None),
+            precommit_source: parking_lot::Mutex::new(Arc::downgrade(&initial_root)),
+            _precommit_source_memory: source_memory,
             publication_interrupted: std::sync::atomic::AtomicBool::new(false),
-        }
+        })
     }
 }
 
@@ -135,7 +152,10 @@ impl PersistentCompositeStore {
             crate::persistence::AppendStage::TableMetaClone,
             &mut stage_started,
         );
-        let deleted_rows = self.deleted_rows_snapshot_for_write_set(ws)?;
+        let mut accepted_row_memory =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.inner.accountant.clone());
+        let deleted_rows =
+            self.deleted_rows_snapshot_for_write_set(ws, &mut accepted_row_memory)?;
         let log_entries = self.inner.build_change_log_entries_with_snapshots(
             ws,
             Some(&table_meta),
@@ -195,13 +215,13 @@ impl PersistentCompositeStore {
             .apply_exact_with_log_entries(ws, log_entries, partition_mutations)
     }
 
-    /// Capture complete pre-delete bodies from the durable source.  The
-    /// in-memory relational image of a file-backed writer is intentionally a
-    /// lightweight directory; using it here would overwrite retained history
-    /// with that projection when persistence stamps `deleted_tx`.
+    /// Retain admitted current bodies only for row/vector identities this commit
+    /// touches. The same prepared publication owner supplies the precommit
+    /// physical source; no resident row directory or history walk is needed.
     fn deleted_rows_snapshot_for_write_set(
         &self,
         ws: &WriteSet,
+        memory: &mut crate::memory_accounting::OwnedMemoryReservation,
     ) -> Result<
         Option<
             std::collections::HashMap<
@@ -210,38 +230,86 @@ impl PersistentCompositeStore {
             >,
         >,
     > {
-        if ws.relational_deletes.is_empty() {
+        use crate::sync_types::held;
+        use contextdb_relational::source::{RelationalReadSource, visible_row};
+        if ws.relational_deletes.is_empty()
+            && ws.vector_inserts.is_empty()
+            && ws.vector_deletes.is_empty()
+            && ws.vector_moves.is_empty()
+        {
             return Ok(None);
         }
-        let metadata = self.inner.relational.table_meta.read();
+        let root = self.precommit_source.lock().upgrade().ok_or_else(|| {
+            Error::Other("writer publication no longer owns its commit source".into())
+        })?;
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
         let mut rows = std::collections::HashMap::<
             String,
             std::collections::HashMap<RowId, contextdb_core::VersionedRow>,
         >::new();
-        for (table, row_id, deleted_tx) in &ws.relational_deletes {
+        let mut retain = |table: &str, row_id: RowId| -> Result<()> {
             if rows
                 .get(table)
-                .is_some_and(|by_id| by_id.contains_key(row_id))
+                .is_some_and(|by_id| by_id.contains_key(&row_id))
             {
-                continue;
+                return Ok(());
             }
-            let Some(meta) = metadata.get(table) else {
-                continue;
+            let Some(window) = visible_row(&source, table, row_id, source.snapshot())? else {
+                return Ok(());
             };
-            let snapshot = SnapshotId::from_raw_wire(deleted_tx.0.saturating_sub(1));
-            if let Some(row) = self
-                .persistence
-                .load_relational_row_by_id_at(table, meta, *row_id, snapshot)?
-            {
-                rows.entry(table.clone()).or_default().insert(*row_id, row);
+            if !rows.contains_key(table) {
+                let before = held::map::<
+                    String,
+                    std::collections::HashMap<RowId, contextdb_core::VersionedRow>,
+                >(rows.len());
+                let after = held::map::<
+                    String,
+                    std::collections::HashMap<RowId, contextdb_core::VersionedRow>,
+                >(rows.len().saturating_add(1));
+                memory.try_grow_for(
+                    after
+                        .saturating_sub(before)
+                        .saturating_add(held::text(table)),
+                    "vector",
+                    "accepted_row_source",
+                    "Reduce changed identities or raise MEMORY_LIMIT.",
+                )?;
+                rows.try_reserve(1)
+                    .map_err(|_| Error::Other("accepted row table allocation failed".into()))?;
+                rows.insert(table.to_owned(), std::collections::HashMap::new());
             }
+            let by_id = rows.get_mut(table).expect("admitted table control");
+            let before = held::map::<RowId, contextdb_core::VersionedRow>(by_id.len());
+            let after =
+                held::map::<RowId, contextdb_core::VersionedRow>(by_id.len().saturating_add(1));
+            memory.try_grow_for(
+                after
+                    .saturating_sub(before)
+                    .saturating_add(held::values(&window.value().values)),
+                "vector",
+                "accepted_row_source",
+                "Reduce changed row bodies or raise MEMORY_LIMIT.",
+            )?;
+            by_id
+                .try_reserve(1)
+                .map_err(|_| Error::Other("accepted row identity allocation failed".into()))?;
+            by_id.insert(row_id, window.value().clone());
+            Ok(())
+        };
+        for (table, row, _) in &ws.relational_deletes {
+            retain(table, *row)?;
         }
-        drop(metadata);
-        if rows.is_empty() {
-            Ok(self.inner.deleted_rows_snapshot_for_write_set(ws))
-        } else {
-            Ok(Some(rows))
+        for entry in &ws.vector_inserts {
+            retain(&entry.index.table, entry.row_id)?;
         }
+        for (index, row, _) in &ws.vector_deletes {
+            retain(&index.table, *row)?;
+        }
+        for (index, from, to, _) in &ws.vector_moves {
+            retain(&index.table, *from)?;
+            retain(&index.table, *to)?;
+        }
+        Ok((!rows.is_empty()).then_some(rows))
     }
 }
 
@@ -260,6 +328,7 @@ impl PersistentCompositeStore {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 panic!("durable publication root preparation failed: {error}");
             });
+        *self.precommit_source.lock() = Arc::downgrade(&root);
         *self.prepared_publication.lock() = Some(root);
     }
 }

@@ -1879,11 +1879,6 @@ struct VectorState {
     /// file and every read by a handle that is not mid-write.
     vector_overlay: Option<super::TransactionVectorOverlay>,
     overlay_bytes: usize,
-    /// The store-wide reservation this search holds while it reads the
-    /// transaction's own vectors, released when the search is done with them.
-    /// The request's own ceiling is charged separately and governs this
-    /// request; this one is what the STORE's limit governs.
-    _overlay_reservation: Option<Box<dyn Send + Sync>>,
 }
 
 struct ProjectState {
@@ -7771,8 +7766,6 @@ impl VectorState {
         self.vector_overlay = None;
         context.release(self.overlay_bytes)?;
         self.overlay_bytes = 0;
-        // The store gets its share back at the same moment the request does.
-        self._overlay_reservation = None;
         Ok(())
     }
 
@@ -10291,15 +10284,27 @@ fn build_vector_kernel<'plan>(
     // What this handle's own transaction has done to these vectors, decided
     // once here rather than asked per entry. Charged before it is held, like
     // the row overlay a scan takes.
+    let mut overlay_bytes = 0;
     let vector_overlay = match context.transaction() {
-        Some(tx) => db
-            .transaction_vector_overlay(tx, &index)?
-            .into_option_if_not_empty(),
+        Some(tx) => {
+            let overlay = db.transaction_vector_overlay(tx, &index, &mut |bytes| {
+                context.reserve(BoundedWorkSource::VectorCandidates, bytes)?;
+                overlay_bytes = bytes;
+                Ok(())
+            });
+            match overlay {
+                Ok(overlay) => overlay.into_option_if_not_empty(),
+                Err(error) => {
+                    context.release(overlay_bytes)?;
+                    return Err(error);
+                }
+            }
+        }
         None => None,
     };
-    let overlay_bytes = vector_overlay.as_ref().map_or(0, |overlay| overlay.bytes);
-    if overlay_bytes > 0 {
-        context.reserve(BoundedWorkSource::VectorCandidates, overlay_bytes)?;
+    if vector_overlay.is_none() {
+        context.release(overlay_bytes)?;
+        overlay_bytes = 0;
     }
     let mut candidate_ids = Vec::new();
     let mut candidate_bytes = 0usize;
@@ -10418,22 +10423,8 @@ fn build_vector_kernel<'plan>(
         None if unrestricted => Some(QueryTrace::scan()),
         None => None,
     };
-    // Taken before a single vector is read, and named for the work it belongs
-    // to: a store whose limit stops this tells the operator WHICH work it
-    // stopped, rather than reporting the read's own ceiling for a limit that
-    // is not the read's.
-    let overlay_reservation = match vector_overlay.as_ref() {
-        Some(overlay) => {
-            match db.bounded_vector_overlay_reservation(&index, overlay.searchable_entry_count) {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    context.release(overlay_bytes)?;
-                    return Err(error.into());
-                }
-            }
-        }
-        None => None,
-    };
+    // The overlay owns its real store-wide container admission. Vector
+    // payload clones are admitted when touched by the existing kernel.
     // With an overlay in play the source must hand up enough extra committed
     // candidates for every removed, moved, or staged delta to have its say.
     // Stopping at the statement's LIMIT can lose the replacement for a row
@@ -10509,7 +10500,6 @@ fn build_vector_kernel<'plan>(
             disclosure: None,
             vector_overlay,
             overlay_bytes,
-            _overlay_reservation: overlay_reservation,
         }),
     })
 }

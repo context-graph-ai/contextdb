@@ -262,8 +262,8 @@ pub(crate) struct TransactionVectorOverlay {
     /// truncate before the overlay has had its say, so this many extra
     /// committed candidates are requested and final truncation happens after.
     pub(crate) searchable_entry_count: usize,
-    /// What holding the above costs.
-    pub(crate) bytes: usize,
+    /// Retains the real container admission through the overlay lifetime.
+    pub(crate) _memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
 }
 
 impl TransactionVectorOverlay {
@@ -455,8 +455,9 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         &self,
         tx: TxId,
         index: &VectorIndexRef,
-    ) -> Result<TransactionVectorOverlay> {
-        let _ = (tx, index);
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<TransactionVectorOverlay, BoundedExecutionError> {
+        let _ = (tx, index, before_retain);
         Ok(TransactionVectorOverlay::default())
     }
 
@@ -835,23 +836,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn bounded_legacy_visited_cap(&self, declares_no_ceilings: bool) -> Option<usize> {
         let _ = declares_no_ceilings;
         None
-    }
-
-    /// Reserve, against the STORE's memory limit, the working set a search
-    /// holds while it is reading a transaction's own vectors.
-    ///
-    /// The read's own ceiling governs what this request may hold; the store's
-    /// limit governs what the store may hold for everyone. Both apply, and a
-    /// refusal from the store's limit has to name the work it stopped, so an
-    /// operator can act on it. The guard releases when the search is done with
-    /// it.
-    fn bounded_vector_overlay_reservation(
-        &self,
-        index: &VectorIndexRef,
-        entry_count: usize,
-    ) -> Result<Option<Box<dyn Send + Sync>>> {
-        let _ = (index, entry_count);
-        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1374,8 +1358,9 @@ impl ReadExecutionTarget for Database {
         &self,
         tx: TxId,
         index: &VectorIndexRef,
-    ) -> Result<TransactionVectorOverlay> {
-        Database::transaction_vector_overlay(self, tx, index)
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<TransactionVectorOverlay, BoundedExecutionError> {
+        Database::transaction_vector_overlay(self, tx, index, before_retain)
     }
 
     fn transaction_staged_vector(
@@ -1930,14 +1915,6 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_legacy_visited_cap(&self, declares_no_ceilings: bool) -> Option<usize> {
         Database::bounded_legacy_visited_cap(self, declares_no_ceilings)
-    }
-
-    fn bounded_vector_overlay_reservation(
-        &self,
-        index: &VectorIndexRef,
-        entry_count: usize,
-    ) -> Result<Option<Box<dyn Send + Sync>>> {
-        Database::bounded_vector_overlay_reservation(self, index, entry_count)
     }
 
     fn bounded_rank_candidate(

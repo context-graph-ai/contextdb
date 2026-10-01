@@ -477,7 +477,7 @@ pub struct CompositeStore {
     pub change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     pub ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     vector_partition_snapshot_stages: VectorPartitionSnapshotStageRegistry,
-    accountant: Arc<MemoryAccountant>,
+    pub(crate) accountant: Arc<MemoryAccountant>,
     apply_phase_pause: Arc<ApplyPhasePause>,
 }
 
@@ -964,6 +964,12 @@ impl CompositeStore {
             new_rows
                 .get(&(table.to_owned(), row_id))
                 .cloned()
+                .or_else(|| {
+                    deleted_rows
+                        .and_then(|tables| tables.get(table))
+                        .and_then(|rows| rows.get(&row_id))
+                        .cloned()
+                })
                 .or_else(|| self.relational.live_row_by_id(table, row_id))
         };
 

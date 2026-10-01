@@ -854,6 +854,8 @@ impl Database {
             received_staging_access: self.received_staging_access.clone(),
             received_vector_image_pending: self.received_vector_image_pending.clone(),
             persistence: self.persistence.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            commit_source_reference_charge: self.commit_source_reference_charge,
             committed_image_startup: self.committed_image_startup.clone(),
             image_history: self.image_history.clone(),
             retained_relational_source: self.retained_relational_source.clone(),
