@@ -2642,7 +2642,7 @@ pub(crate) struct BoundedCursorExecutionState {
     active_cancellation: std::sync::Mutex<OwnerReadCancellation>,
     cancellation_listener:
         std::sync::Mutex<Option<contextdb_core::read_contract::CancellationListener>>,
-    expiry_waker: std::sync::Mutex<Option<std::thread::Thread>>,
+    expiry_watch: std::sync::Mutex<Option<Arc<bounded::CursorExpiryWatch>>>,
 }
 
 impl BoundedCursorExecutionState {
@@ -2666,14 +2666,29 @@ impl BoundedCursorExecutionState {
     }
 
     fn wake_expiry(&self) {
-        if let Some(thread) = self
-            .expiry_waker
+        let watch = self
+            .expiry_watch
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            thread.unpark();
+            .clone();
+        if let Some(watch) = watch {
+            watch.drive();
         }
+    }
+
+    fn retire_expiry(&self) {
+        let watch = self
+            .expiry_watch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(watch) = watch {
+            watch.retire();
+        }
+        self.cancellation_listener
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
     }
 
     pub(crate) fn release_for_erasure(&self) {
@@ -2686,13 +2701,14 @@ impl BoundedCursorExecutionState {
         cancellation.cancel();
         let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
         *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Erased);
-        self.wake_expiry();
+        drop(lifecycle);
+        self.retire_expiry();
     }
 }
 
 impl Drop for BoundedCursorExecutionState {
     fn drop(&mut self) {
-        self.wake_expiry();
+        self.retire_expiry();
     }
 }
 
@@ -3893,7 +3909,9 @@ fn execute_create_table_plan(
                     db.bounded_read_accountant(),
                 );
             }
-            if let Some(table_meta) = db.table_meta(&p.name) {
+            // Publication installs vector layouts from the newly prepared
+            // schema, rather than the statement's pre-DDL read descriptor.
+            if let Some(table_meta) = db.relational_store().table_meta(&p.name) {
                 for column in &table_meta.columns {
                     db.register_vector_index_for_column(&p.name, column)?;
                 }
@@ -11525,7 +11543,7 @@ fn execute_writer_index_scan(
         },
         |bytes| {
             admission.try_grow_for(
-                bytes.saturating_add(std::mem::size_of::<VersionedRow>()),
+                bytes.saturating_add(std::mem::size_of::<VersionedRow>() * 4),
                 "query",
                 "eager_index_output",
                 "Reduce query output or raise MEMORY_LIMIT.",
@@ -11549,6 +11567,7 @@ fn execute_writer_index_scan(
     } else {
         out = db.filter_rows_for_read_in_tx(tx, table, out, snapshot)?;
     }
+    db.retain_writer_output(admission);
     Ok((out, examined))
 }
 

@@ -13368,11 +13368,11 @@ pub(super) fn open_cursor(
         erased: std::sync::atomic::AtomicBool::new(false),
         active_cancellation: Mutex::new(publication.budget.cancellation.clone()),
         cancellation_listener: Mutex::new(None),
-        expiry_waker: Mutex::new(None),
+        expiry_watch: Mutex::new(None),
     });
     execution.watch_cancellation(&publication.budget.cancellation);
     db.register_writer_cursor(&execution)?;
-    start_cursor_expiry_watch(&execution)?;
+    start_cursor_expiry_watch(&execution, db.bounded_read_accountant())?;
     Ok(BoundedCursorOpen {
         cursor: BoundedCursorHandle { _state: execution },
         first_page: first.page,
@@ -13382,21 +13382,99 @@ pub(super) fn open_cursor(
     })
 }
 
-/// Keep the existing cursor deadlines authoritative while no fetch is active.
-/// The watcher owns only a weak lifecycle reference and the declared clock.
-fn start_cursor_expiry_watch(
-    execution: &Arc<BoundedCursorExecutionState>,
-) -> std::result::Result<(), BoundedExecutionError> {
-    struct WakeThread(std::thread::Thread);
-    impl std::task::Wake for WakeThread {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
+/// The existing deadline future wakes this admitted control owner directly.
+/// No separate native thread or strong execution cycle is created.
+pub(super) struct CursorExpiryWatch {
+    execution: std::sync::Weak<BoundedCursorExecutionState>,
+    clock: Arc<dyn DeadlineClock>,
+    wait: Mutex<Option<(u64, contextdb_core::read_contract::DeadlineWait<'static>)>>,
+    _memory: crate::memory_accounting::OwnedMemoryReservation,
+}
+
+impl CursorExpiryWatch {
+    pub(super) fn retire(&self) {
+        let wait = self.wait.lock().unwrap_or_else(|p| p.into_inner()).take();
+        drop(wait);
+    }
+
+    pub(super) fn drive(self: &Arc<Self>) {
+        let Some(execution) = self.execution.upgrade() else {
+            self.retire();
+            return;
+        };
+        // A wake may come from inside the active fetch. That fetch drives us
+        // again after releasing its lifecycle borrow and updating its deadline.
+        let Ok(mut lifecycle) = execution.lifecycle.try_lock() else {
+            return;
+        };
+        let BoundedCursorLifecycle::Open(state) = &mut *lifecycle else {
+            drop(lifecycle);
+            execution.retire_expiry();
+            return;
+        };
+        if let Err(error) = state.check_expiry() {
+            state.finish_plugin_error(&error);
+            *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Expired);
+            drop(lifecycle);
+            execution.retire_expiry();
+            return;
         }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
+        let deadline = cursor_deadline(state);
+        drop(lifecycle);
+        let Ok(mut wait) = self.wait.try_lock() else {
+            return;
+        };
+        if wait.as_ref().is_none_or(|(armed, _)| *armed != deadline) {
+            let clock = self.clock.clone();
+            *wait = Some((
+                deadline,
+                Box::pin(async move { clock.wait_until(deadline).await }),
+            ));
+        }
+        let waker = std::task::Waker::from(self.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let ready = wait
+            .as_mut()
+            .is_some_and(|(_, wait)| wait.as_mut().poll(&mut context).is_ready());
+        if ready {
+            // Latch completion: a failed timer arm is also a one-shot. Reuse
+            // the established monotonic timer for the remaining interval.
+            let now = self.clock.now_ms();
+            if now < deadline {
+                let remaining = deadline.saturating_sub(now);
+                *wait = Some((
+                    deadline,
+                    Box::pin(async move {
+                        let fallback = crate::local_transport::MonotonicDeadlineClock::new();
+                        fallback.wait_until(remaining).await;
+                    }),
+                ));
+                if let Some((_, fallback)) = wait.as_mut() {
+                    let _ = fallback.as_mut().poll(&mut context);
+                }
+            } else {
+                let completed = wait.take();
+                drop(wait);
+                drop(completed);
+                self.drive();
+            }
         }
     }
-    let (clock, mut deadline) = {
+}
+impl std::task::Wake for CursorExpiryWatch {
+    fn wake(self: Arc<Self>) {
+        self.drive();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.drive();
+    }
+}
+
+fn start_cursor_expiry_watch(
+    execution: &Arc<BoundedCursorExecutionState>,
+    accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+) -> std::result::Result<(), BoundedExecutionError> {
+    let clock = {
         let lifecycle = execution
             .lifecycle
             .lock()
@@ -13404,66 +13482,26 @@ fn start_cursor_expiry_watch(
         let BoundedCursorLifecycle::Open(state) = &*lifecycle else {
             return Ok(());
         };
-        (state.context.clock.clone(), cursor_deadline(state))
+        state.context.clock.clone()
     };
-    let weak = Arc::downgrade(execution);
-    std::thread::Builder::new()
-        .name("contextdb-read-expiry".into())
-        .spawn(move || {
-            let thread = std::thread::current();
-            if let Some(execution) = weak.upgrade() {
-                *execution
-                    .expiry_waker
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()) = Some(thread.clone());
-            } else {
-                return;
-            }
-            let waker = std::task::Waker::from(Arc::new(WakeThread(thread)));
-            let mut context = std::task::Context::from_waker(&waker);
-            loop {
-                let mut wait = clock.wait_until(deadline);
-                let mut completed = false;
-                loop {
-                    if !completed {
-                        completed = wait.as_mut().poll(&mut context).is_ready();
-                    }
-                    {
-                        let Some(execution) = weak.upgrade() else {
-                            return;
-                        };
-                        let mut lifecycle = execution
-                            .lifecycle
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner());
-                        let BoundedCursorLifecycle::Open(state) = &mut *lifecycle else {
-                            return;
-                        };
-                        if let Err(error) = state.check_expiry() {
-                            state.finish_plugin_error(&error);
-                            *lifecycle = BoundedCursorLifecycle::Released(
-                                BoundedCursorTerminalReason::Expired,
-                            );
-                            return;
-                        }
-                        let next = cursor_deadline(state);
-                        if next != deadline {
-                            deadline = next;
-                            break;
-                        }
-                    }
-                    if completed {
-                        // A failed timer arm returns ready before its deadline.
-                        std::thread::park_timeout(std::time::Duration::from_millis(
-                            deadline.saturating_sub(clock.now_ms()).max(1),
-                        ));
-                    } else {
-                        std::thread::park();
-                    }
-                }
-            }
-        })
-        .map_err(|error| Error::Other(format!("cursor expiry watcher could not start: {error}")))?;
+    let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+        accountant,
+        std::mem::size_of::<CursorExpiryWatch>().saturating_add(512),
+        "bounded_read",
+        "cursor_deadline_control",
+        "Close a cursor or raise MEMORY_LIMIT.",
+    )?;
+    let watch = Arc::new(CursorExpiryWatch {
+        execution: Arc::downgrade(execution),
+        clock,
+        wait: Mutex::new(None),
+        _memory: memory,
+    });
+    *execution
+        .expiry_watch
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(watch.clone());
+    watch.drive();
     Ok(())
 }
 
@@ -13585,6 +13623,13 @@ pub(super) fn fetch_cursor(
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = cancellation.clone();
     cursor._state.watch_cancellation(&cancellation);
+    struct DriveAfterFetch(Arc<BoundedCursorExecutionState>);
+    impl Drop for DriveAfterFetch {
+        fn drop(&mut self) {
+            self.0.wake_expiry();
+        }
+    }
+    let _drive_after_fetch = DriveAfterFetch(cursor._state.clone());
     let mut lifecycle = cursor_lifecycle(cursor);
     if cursor
         ._state
@@ -13701,6 +13746,8 @@ pub(super) fn close_cursor(
             *lifecycle = BoundedCursorLifecycle::Released(reason);
         }
     }
+    drop(lifecycle);
+    cursor._state.retire_expiry();
     Ok(())
 }
 

@@ -431,7 +431,9 @@ impl Drop for TimerWait {
             state.waker = None;
         }
         self.state.1.notify_all();
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self.thread.take()
+            && thread.thread().id() != std::thread::current().id()
+        {
             let _ = thread.join();
         }
     }

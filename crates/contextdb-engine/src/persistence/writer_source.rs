@@ -37,7 +37,89 @@ pub(crate) struct WriterSnapshot {
     accountant: Arc<MemoryAccountant>,
     _control: OwnedMemoryReservation,
     erasure: parking_lot::RwLock<WriterErasure>,
+    schema: std::sync::OnceLock<WriterSchema>,
     registry: Arc<parking_lot::Mutex<Vec<std::sync::Weak<WriterSnapshot>>>>,
+}
+
+/// Schema is resolved from this exact native image, outside publication locks.
+/// Racing preparers keep their own admission until the losing copy is dropped.
+struct WriterSchema {
+    tables: HashMap<String, TableMeta>,
+    _memory: OwnedMemoryReservation,
+}
+
+impl WriterSnapshot {
+    pub(crate) fn ensure_schema(&self) -> Result<()> {
+        if self.schema.get().is_some() {
+            return Ok(());
+        }
+        let table = match self.read.open_table(META_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                let schema = WriterSchema {
+                    tables: HashMap::new(),
+                    _memory: self.adapter_control(std::mem::size_of::<WriterSchema>())?,
+                };
+                let _ = self.schema.set(schema);
+                return Ok(());
+            }
+            Err(error) => return Err(RedbPersistence::storage_error(error)),
+        };
+        let mut memory = self.adapter_control(std::mem::size_of::<WriterSchema>())?;
+        let mut tables = HashMap::new();
+        for entry in table
+            .range("table:".."table;")
+            .map_err(RedbPersistence::storage_error)?
+        {
+            let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+            let name = key
+                .value()
+                .strip_prefix("table:")
+                .ok_or_else(|| Error::Other("invalid schema key".into()))?;
+            // Bound decode allocations before deserializing, then reconcile the
+            // retained descriptor. No row, posting or history bodies are loaded.
+            let scratch =
+                self.adapter_control(value.value().len().saturating_mul(16).saturating_add(4096))?;
+            let (meta, legacy) = RedbPersistence::decode_table_meta_versioned(value.value())?;
+            if legacy {
+                return Err(Error::Other("unsupported table metadata layout".into()));
+            }
+            memory.try_grow_for(
+                name.len()
+                    .saturating_add(meta.estimated_bytes())
+                    .saturating_add(192),
+                "writer_source",
+                "captured_schema",
+                HINT,
+            )?;
+            tables.insert(name.to_owned(), meta);
+            drop(scratch);
+        }
+        let _ = self.schema.set(WriterSchema {
+            tables,
+            _memory: memory,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn captured_table_meta(&self, table: &str) -> Option<TableMeta> {
+        self.schema
+            .get()
+            .expect("writer scope admits its captured schema")
+            .tables
+            .get(table)
+            .cloned()
+    }
+
+    pub(crate) fn captured_table_names(&self) -> Vec<String> {
+        self.schema
+            .get()
+            .expect("writer scope admits its captured schema")
+            .tables
+            .keys()
+            .cloned()
+            .collect()
+    }
 }
 
 impl Drop for WriterSnapshot {
@@ -179,6 +261,7 @@ impl RedbPersistence {
                 accountant,
                 _control: control,
                 erasure: parking_lot::RwLock::new(WriterErasure::default()),
+                schema: std::sync::OnceLock::new(),
                 registry: self.writer_snapshots.clone(),
             });
             let mut roots = self.writer_snapshots.lock();
@@ -273,13 +356,16 @@ impl WriterSnapshot {
     }
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn control_bytes(&self) -> usize {
-        self._control.bytes().saturating_add(
-            self.erasure
-                .read()
-                ._memory
-                .as_ref()
-                .map_or(0, OwnedMemoryReservation::bytes),
-        )
+        self._control
+            .bytes()
+            .saturating_add(self.schema.get().map_or(0, |schema| schema._memory.bytes()))
+            .saturating_add(
+                self.erasure
+                    .read()
+                    ._memory
+                    .as_ref()
+                    .map_or(0, OwnedMemoryReservation::bytes),
+            )
     }
     pub(super) fn owner_read(&self) -> Arc<redb::ReadTransaction> {
         Arc::clone(&self.read)

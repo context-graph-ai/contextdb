@@ -50,6 +50,26 @@ impl Iterator for OrderedStagedCursor<'_> {
     }
 }
 
+pub struct OrderedStagedPrefixCursor<'a> {
+    range: std::collections::btree_map::Range<'a, (IndexKey, RowId), StagedPosition>,
+    prefix: &'a IndexKey,
+    finished: bool,
+}
+impl Iterator for OrderedStagedPrefixCursor<'_> {
+    type Item = StagedPosition;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let ((key, _), position) = self.range.next()?;
+        if !key.starts_with(self.prefix) {
+            self.finished = true;
+            return None;
+        }
+        Some(*position)
+    }
+}
+
 impl OrderedStagedRows {
     fn key_bytes(key: &IndexKey) -> usize {
         key.iter().fold(
@@ -153,6 +173,30 @@ impl OrderedStagedRows {
             range: postings.ordered.range((lower, upper)),
             reverse,
         })
+    }
+
+    /// The equality prefix is caller scratch. No row values are scanned or copied.
+    pub fn prefix_cursor<'a>(
+        &'a self,
+        table: &str,
+        index: &str,
+        prefix: &'a IndexKey,
+    ) -> Option<OrderedStagedPrefixCursor<'a>> {
+        let postings = self.tables.get(table)?.get(index)?;
+        let lower = (prefix.clone(), RowId(0));
+        Some(OrderedStagedPrefixCursor {
+            range: postings
+                .ordered
+                .range((Bound::Included(&lower), Bound::Unbounded)),
+            prefix,
+            finished: false,
+        })
+    }
+
+    pub fn contains_row(&self, table: &str, row: RowId) -> bool {
+        self.charges
+            .get(table)
+            .is_some_and(|rows| rows.contains_key(&row))
     }
 
     pub fn retained_bytes(&self) -> usize {

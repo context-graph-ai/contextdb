@@ -19,6 +19,14 @@ impl Drop for WriterReadScope {
     }
 }
 impl Database {
+    pub(super) fn scoped_writer_root(&self) -> Option<Arc<WriterSnapshot>> {
+        ROOT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(id, _, _)| *id == Arc::as_ptr(&self.tx_mgr) as usize)
+                .map(|(_, root, _)| root.clone())
+        })
+    }
     pub(crate) fn writer_read_root(&self) -> Result<Option<Arc<WriterSnapshot>>> {
         if self.persistence.is_none() {
             return Ok(None);
@@ -32,13 +40,9 @@ impl Database {
         }) {
             return Ok(Some(root));
         }
-        self.tx_mgr
-            .capture_published_read()
-            .handle
-            .ok_or_else(|| Error::Other("writer publication has no durable root".into()))?
-            .downcast::<WriterSnapshot>()
+        let root = durable_root(self.tx_mgr.capture_published_read().handle)?;
+        root.ok_or_else(|| Error::Other("writer publication has no durable root".into()))
             .map(Some)
-            .map_err(|_| Error::Other("writer publication has an invalid durable root".into()))
     }
     pub(crate) fn enter_writer_read(&self, root: Option<Arc<WriterSnapshot>>) -> WriterReadScope {
         let owner = Arc::as_ptr(&self.tx_mgr) as usize;
@@ -61,7 +65,7 @@ impl Database {
         Ok(self.enter_writer_read(self.writer_read_root()?))
     }
 
-    pub(super) fn retain_writer_output(
+    pub(crate) fn retain_writer_output(
         &self,
         output: crate::memory_accounting::OwnedMemoryReservation,
     ) {
@@ -442,6 +446,81 @@ impl Database {
 }
 
 impl Database {
+    pub(super) fn writer_constraint_staged_match(
+        &self,
+        tx: TxId,
+        table: &str,
+        columns: &[String],
+        values: &[Value],
+        skip: Option<RowId>,
+    ) -> Result<Option<RowId>> {
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let index = meta.indexes.iter().find(|index| {
+            index.columns.len() >= columns.len()
+                && index
+                    .columns
+                    .iter()
+                    .zip(columns)
+                    .all(|((column, _), wanted)| column == wanted)
+        });
+        let _scratch = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            values
+                .iter()
+                .map(Value::estimated_bytes)
+                .sum::<usize>()
+                .saturating_mul(8)
+                .saturating_add(512),
+            "writer_source",
+            "staged_constraint_keys",
+            "Raise MEMORY_LIMIT to validate this key.",
+        )?;
+        let key = index.map(|index| index_key_from_values(&index.columns[..columns.len()], values));
+        self.tx_mgr.with_write_set(tx, |ws| {
+            if let (Some(index), Some(key)) = (index, key.as_ref())
+                && let Some(cursor) = ws
+                    .ordered_staged_rows
+                    .prefix_cursor(table, &index.name, key)
+            {
+                for entry in cursor {
+                    #[cfg(feature = "in-process-test-seams")]
+                    crate::writer_query_test_seams::note_constraint_staged_row();
+                    #[cfg(feature = "test-seams")]
+                    crate::writer_query_test_seams::note_target_entry(table);
+                    let Some((name, row)) = ws.relational_inserts.get(entry.position) else {
+                        return Err(Error::Other("maintained staged position is absent".into()));
+                    };
+                    if name != table || row.row_id != entry.row_id {
+                        return Err(Error::Other(
+                            "maintained staged position names another row".into(),
+                        ));
+                    }
+                    if Some(row.row_id) != skip {
+                        return Ok(Some(row.row_id));
+                    }
+                }
+                return Ok(None);
+            }
+            // A transaction may have staged its rows before this index was declared.
+            // Preserve the existing bounded-memory scan until those rows are restaged.
+            Ok(ws.relational_inserts.iter().rev().find_map(|(name, row)| {
+                #[cfg(feature = "in-process-test-seams")]
+                crate::writer_query_test_seams::note_constraint_staged_row();
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_target_entry(name);
+                (name == table
+                    && Some(row.row_id) != skip
+                    && columns
+                        .iter()
+                        .zip(values)
+                        .all(|(column, value)| row.values.get(column) == Some(value)))
+                .then_some(row.row_id)
+            }))
+        })?
+    }
+
     pub(super) fn writer_indexed_row(
         &self,
         table: &str,
@@ -450,6 +529,28 @@ impl Database {
         snapshot: SnapshotId,
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
+    ) -> Result<Option<Option<RowId>>> {
+        self.writer_indexed_row_with_overlay(
+            table,
+            columns,
+            values,
+            snapshot,
+            skip_deleted,
+            stats,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn writer_indexed_row_with_overlay(
+        &self,
+        table: &str,
+        columns: &[String],
+        values: &[Value],
+        snapshot: SnapshotId,
+        skip_deleted: &HashSet<RowId>,
+        stats: Option<&mut CommitStageStats>,
+        overlay: Option<(TxId, Option<RowId>)>,
     ) -> Result<Option<Option<RowId>>> {
         use contextdb_relational::source::{
             RelationalIndexRange, RelationalReadSource, visible_row,
@@ -517,7 +618,31 @@ impl Database {
             if skip_deleted.contains(&posting.entry.row_id) || !posting.entry.visible_at(snapshot) {
                 continue;
             }
-            if visible_row(&source, table, posting.entry.row_id, snapshot)?.is_some() {
+            if let Some((tx, skip)) = overlay
+                && (skip == Some(posting.entry.row_id)
+                    || self.tx_mgr.with_write_set(tx, |ws| {
+                        ws.ordered_staged_rows
+                            .contains_row(table, posting.entry.row_id)
+                            || ws
+                                .relational_deletes
+                                .iter()
+                                .any(|(name, row, _)| name == table && *row == posting.entry.row_id)
+                    })?)
+            {
+                continue;
+            }
+            if let Some(row) = visible_row(&source, table, posting.entry.row_id, snapshot)? {
+                if let Some((tx, _)) = overlay
+                    && self.tx_mgr.with_write_set(tx, |ws| {
+                        row_matches_delete_predicates(
+                            &ws.relational_delete_predicates,
+                            table,
+                            row.value(),
+                        )
+                    })?
+                {
+                    continue;
+                }
                 return Ok(Some(Some(posting.entry.row_id)));
             }
         }
@@ -544,12 +669,15 @@ pub(super) fn durable_root(
 ) -> Result<Option<Arc<WriterSnapshot>>> {
     handle
         .map(|handle| {
-            handle
-                .downcast::<WriterSnapshot>()
-                .map_err(|_| Error::Other("writer publication has an invalid durable root".into()))
+            let root = handle.downcast::<WriterSnapshot>().map_err(|_| {
+                Error::Other("writer publication has an invalid durable root".into())
+            })?;
+            root.ensure_schema()?;
+            Ok(root)
         })
         .transpose()
 }
+
 impl Database {
     pub(super) fn capture_writer_statement(
         &self,

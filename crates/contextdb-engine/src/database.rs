@@ -25825,7 +25825,7 @@ impl Database {
                 tx,
                 table,
                 row_id,
-                self.committed_row_at(table, row_id, self.snapshot())?
+                self.committed_row_at(table, row_id, self.snapshot_for_read())?
                     .is_some(),
                 |row, admitted| {
                     #[cfg(any(test, feature = "test-seams"))]
@@ -30024,7 +30024,7 @@ impl Database {
             ReceivedUnitFaultPoint::BetweenPublicationComponents,
         );
         let awaits_vector_image = stage.affected_tables.iter().any(|table| {
-            self.table_meta(table).is_some_and(|meta| {
+            self.relational_store.table_meta(table).is_some_and(|meta| {
                 meta.columns
                     .iter()
                     .any(|column| matches!(column.column_type, ColumnType::Vector(_)))
@@ -34675,39 +34675,25 @@ impl Database {
         skip_row_id: Option<RowId>,
     ) -> Result<ConstraintProbe> {
         if self.persistence.is_some() {
-            let (skip, staged) = self.tx_mgr.with_write_set(tx, |ws| {
-                let skip = ws
-                    .relational_deletes
-                    .iter()
-                    .filter(|(t, _, _)| t == table)
-                    .map(|(_, row, _)| *row)
-                    .chain(skip_row_id)
-                    .collect::<HashSet<_>>();
-                let staged = ws
-                    .relational_inserts
-                    .iter()
-                    .rev()
-                    .find(|(t, row)| {
-                        #[cfg(feature = "in-process-test-seams")]
-                        crate::writer_query_test_seams::note_constraint_staged_row();
-                        t == table
-                            && Some(row.row_id) != skip_row_id
-                            && row.values.get(column) == Some(value)
-                    })
-                    .map(|(_, row)| row.row_id);
-                (skip, staged)
-            })?;
-            if let Some(row) = staged {
+            let columns = [column.to_owned()];
+            if let Some(row) = self.writer_constraint_staged_match(
+                tx,
+                table,
+                &columns,
+                std::slice::from_ref(value),
+                skip_row_id,
+            )? {
                 return Ok(ConstraintProbe::Match(row));
             }
             return Ok(
-                match self.writer_indexed_row(
+                match self.writer_indexed_row_with_overlay(
                     table,
-                    &[column.to_owned()],
+                    &columns,
                     std::slice::from_ref(value),
                     snapshot,
-                    &skip,
+                    &HashSet::new(),
                     None,
+                    Some((tx, skip_row_id)),
                 )? {
                     None => ConstraintProbe::NoIndex,
                     Some(None) => ConstraintProbe::NoMatch,
@@ -34834,36 +34820,21 @@ impl Database {
             return Ok(None);
         }
         if self.persistence.is_some() {
-            let (skip, staged) = self.tx_mgr.with_write_set(tx, |ws| {
-                let skip = ws
-                    .relational_deletes
-                    .iter()
-                    .filter(|(t, _, _)| t == table)
-                    .map(|(_, row, _)| *row)
-                    .chain(skip_row_id)
-                    .collect::<HashSet<_>>();
-                let staged = ws
-                    .relational_inserts
-                    .iter()
-                    .rev()
-                    .find(|(t, row)| {
-                        #[cfg(feature = "in-process-test-seams")]
-                        crate::writer_query_test_seams::note_constraint_staged_row();
-                        t == table
-                            && Some(row.row_id) != skip_row_id
-                            && cols
-                                .iter()
-                                .zip(values)
-                                .all(|(column, value)| row.values.get(column) == Some(value))
-                    })
-                    .map(|(_, row)| row.row_id);
-                (skip, staged)
-            })?;
-            if staged.is_some() {
-                return Ok(staged);
+            if let Some(row) =
+                self.writer_constraint_staged_match(tx, table, cols, values, skip_row_id)?
+            {
+                return Ok(Some(row));
             }
             return self
-                .writer_indexed_row(table, cols, values, snapshot, &skip, None)
+                .writer_indexed_row_with_overlay(
+                    table,
+                    cols,
+                    values,
+                    snapshot,
+                    &HashSet::new(),
+                    None,
+                    Some((tx, skip_row_id)),
+                )
                 .map(Option::flatten);
         }
         // Rows this tx has already staged for delete are not obstructions.
@@ -38671,9 +38642,22 @@ impl Database {
     ) -> Result<IndexScanTxOverlay> {
         use crate::executor::{IndexPredicateShape, range_includes};
         let mut overlay = IndexScanTxOverlay::default();
+        let mut memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            0,
+            "query",
+            "staged_index_output",
+            "Reduce query output or raise MEMORY_LIMIT.",
+        )?;
         self.tx_mgr.with_write_set(tx, |ws| {
             for (t, _row_id, _) in &ws.relational_deletes {
                 if t == table {
+                    memory.try_grow_for(
+                        64,
+                        "query",
+                        "staged_index_output",
+                        "Reduce query output or raise MEMORY_LIMIT.",
+                    )?;
                     overlay.deleted_row_ids.insert(*_row_id);
                 }
             }
@@ -38691,10 +38675,19 @@ impl Database {
                     IndexPredicateShape::IsNotNull => v != Value::Null,
                 };
                 if include {
+                    memory.try_grow_for(
+                        row.estimated_bytes()
+                            .saturating_add(std::mem::size_of::<VersionedRow>() * 4),
+                        "query",
+                        "staged_index_output",
+                        "Reduce query output or raise MEMORY_LIMIT.",
+                    )?;
                     overlay.matching_inserts.push(row.clone());
                 }
             }
-        })?;
+            Ok::<_, Error>(())
+        })??;
+        self.retain_writer_output(memory);
         Ok(overlay)
     }
 
@@ -41817,6 +41810,9 @@ impl Database {
 
     pub fn table_names(&self) -> Vec<String> {
         let _operation = self.assert_open_operation();
+        if let Some(root) = self.scoped_writer_root() {
+            return root.captured_table_names();
+        }
         self.relational_store.table_names()
     }
 
@@ -41829,7 +41825,11 @@ impl Database {
 
     pub fn table_meta(&self, table: &str) -> Option<TableMeta> {
         let _operation = self.assert_open_operation();
-        let meta = self.relational_store.table_meta(table);
+        let meta = if let Some(root) = self.scoped_writer_root() {
+            root.captured_table_meta(table)
+        } else {
+            self.relational_store.table_meta(table)
+        };
         if meta.is_none()
             && let Some(access) = &self.received_staging_access
         {
@@ -44448,7 +44448,12 @@ impl Database {
     }
 
     pub(crate) fn snapshot_for_read(&self) -> SnapshotId {
-        SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or_else(|| self.snapshot()))
+        SNAPSHOT_OVERRIDE.with(|cell| {
+            cell.borrow().unwrap_or_else(|| {
+                self.scoped_writer_root()
+                    .map_or_else(|| self.snapshot(), |root| root.snapshot)
+            })
+        })
     }
 
     /// Fallible sibling of `snapshot_for_read`, for a caller that must not
