@@ -762,6 +762,7 @@ impl TableTreeMut<'_> {
         &self,
         cursor: &mut crate::transactions::CompactionCursor,
         maximum: usize,
+        protected_table: Option<&str>,
     ) -> Result<(Option<String>, Vec<PagePath>, usize)> {
         use std::ops::Bound;
         let target = if cursor.phase.is_multiple_of(2) {
@@ -785,6 +786,14 @@ impl TableTreeMut<'_> {
             };
             let entry = entry?;
             let name = entry.key().to_owned();
+            if protected_table == Some(name.as_str()) {
+                // Advance exactly one table without faulting any protected
+                // source pages. A later call resumes the finite traversal.
+                cursor.table = Some(name);
+                cursor.advance_table = true;
+                cursor.position.clear();
+                return Ok((None, Vec::new(), 0));
+            }
             if cursor.table.as_ref() != Some(&name) {
                 cursor.position.clear();
             }

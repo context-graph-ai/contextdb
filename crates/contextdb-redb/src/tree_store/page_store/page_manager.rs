@@ -408,6 +408,10 @@ impl TransactionalMemory {
         self.state.lock().unwrap().allocators.pager().is_some()
     }
 
+    pub(crate) fn has_saved_allocator_source(&self) -> bool {
+        self.state.lock().unwrap().allocators.has_saved_source()
+    }
+
     pub(crate) fn materialize_allocator_source(&self) -> Result {
         let mut state = self.state.lock().unwrap();
         state.allocators.materialize_saved_source()?;

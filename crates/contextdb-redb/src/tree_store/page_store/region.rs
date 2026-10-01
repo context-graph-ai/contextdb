@@ -355,6 +355,12 @@ impl Allocators {
         self.paged.as_ref().map(|paged| &paged.pager)
     }
 
+    pub(super) fn has_saved_source(&self) -> bool {
+        self.paged
+            .as_ref()
+            .is_some_and(|paged| paged.saved_region_limit.load(Ordering::Acquire) != 0)
+    }
+
     pub(super) fn materialize_saved_source(&mut self) -> io::Result<()> {
         let Some(paged) = &self.paged else {
             return Ok(());
@@ -384,7 +390,7 @@ impl Allocators {
 
     /// Retire a small saved allocator table during an ordinary commit. The
     /// complete copy fits in one fixed window set; larger tables stay as the
-    /// lazy source until a repair or compaction explicitly materializes them.
+    /// lazy source until quick repair or explicit whole-file compaction materializes them.
     pub(super) fn materialize_saved_source_if_small(&mut self) -> io::Result<bool> {
         let Some(paged) = &self.paged else {
             return Ok(true);
@@ -433,6 +439,9 @@ impl Allocators {
             if paged.active.as_ref().map(|(loaded, _)| *loaded) != Some(region) {
                 let layout = *paged.layout.lock().unwrap();
                 let regional = layout.region_layout(region);
+                // No holder can borrow the old view across this exclusive
+                // call; release its descriptor owner before building another.
+                paged.active = None;
                 let allocator = BuddyAllocator::new_paged(
                     regional.num_pages(),
                     layout.full_region_layout().num_pages(),

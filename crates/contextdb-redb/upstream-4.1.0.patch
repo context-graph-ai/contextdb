@@ -2471,7 +2471,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +1990,312 @@
+@@ -1823,46 +1990,331 @@
          Ok(progress)
      }
  
@@ -2529,7 +2529,13 @@
 +        maximum: usize,
 +        admit: &mut impl FnMut(usize) -> std::io::Result<()>,
 +    ) -> Result<CompactionProgress> {
-+        self.mem.materialize_allocator_source()?;
++        // The saved allocator tree is a live lazy bitmap source. Keep that
++        // one root reachable instead of copying all its words under the writer
++        // lock before a finite batch's admission. Relocating the system master
++        // tree preserves this table's child root. Quick repair and explicit
++        // whole-file compaction detach the source before replacing its pages.
++        let protected_table = (cursor.phase >= 2 && self.mem.has_saved_allocator_source())
++            .then_some(ALLOCATOR_STATE_TABLE_NAME);
 +        let mut tables = self.tables.lock().unwrap();
 +        let mut system_tables = self.system_tables.lock().unwrap();
 +        let tree = if cursor.phase < 2 {
@@ -2537,7 +2543,8 @@
 +        } else {
 +            &mut system_tables.table_tree
 +        };
-+        let (target, pages, examined) = tree.compaction_page_batch(cursor, maximum)?;
++        let (target, pages, examined) =
++            tree.compaction_page_batch(cursor, maximum, protected_table)?;
 +        let mut relocation_map = HashMap::new();
 +        let pages = pages
 +            .into_iter()
@@ -2547,8 +2554,13 @@
 +            if relocation_map.contains_key(&path.page_number()) {
 +                continue;
 +            }
++            let bytes = self
++                .mem
++                .get_page_size()
++                .checked_shl(u32::from(path.page_number().page_order))
++                .ok_or_else(|| StorageError::Corrupted("relocation extent size overflow".into()))?;
++            admit(bytes.saturating_add(128))?;
 +            let old = self.mem.get_page(path.page_number(), PageHint::None)?;
-+            admit(old.memory().len().saturating_add(128))?;
 +            let mut new = self.mem.allocate_lowest(old.memory().len())?;
 +            let number = new.get_page_number();
 +            new.memory_mut()[0] = old.memory()[0];
@@ -2562,8 +2574,15 @@
 +                if relocation_map.contains_key(parent) {
 +                    continue;
 +                }
++                let bytes = self
++                    .mem
++                    .get_page_size()
++                    .checked_shl(u32::from(parent.page_order))
++                    .ok_or_else(|| {
++                        StorageError::Corrupted("relocation extent size overflow".into())
++                    })?;
++                admit(bytes.saturating_add(128))?;
 +                let old = self.mem.get_page(*parent, PageHint::None)?;
-+                admit(old.memory().len().saturating_add(128))?;
 +                let mut new = self.mem.allocate_lowest(old.memory().len())?;
 +                new.memory_mut()[0] = old.memory()[0];
 +                relocation_map.insert(*parent, new.get_page_number());
@@ -2814,7 +2833,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +2470,18 @@
+@@ -2037,6 +2489,18 @@
          })
      }
  
@@ -2833,7 +2852,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,6 +2552,82 @@
+@@ -2107,6 +2571,82 @@
      tree: TableTree,
  }
  
@@ -2916,7 +2935,7 @@
  impl ReadTransaction {
      pub(crate) fn new(
          mem: Arc<TransactionalMemory>,
-@@ -2121,6 +2642,45 @@
+@@ -2121,6 +2661,45 @@
          })
      }
  
@@ -2962,7 +2981,7 @@
      /// Open the given table
      pub fn open_table<K: Key + 'static, V: Value + 'static>(
          &self,
-@@ -2135,12 +2695,54 @@
+@@ -2135,12 +2714,54 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -3018,7 +3037,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +2763,7 @@
+@@ -2161,7 +2782,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -3027,7 +3046,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +2791,7 @@
+@@ -2189,7 +2810,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -3036,7 +3055,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +2819,7 @@
+@@ -2217,7 +2838,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -3045,7 +3064,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +2865,15 @@
+@@ -2263,7 +2884,15 @@
  
  #[cfg(test)]
  mod test {
@@ -3062,7 +3081,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +2894,840 @@
+@@ -2284,4 +2913,840 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -5983,23 +6002,19 @@
              }
          }
  
-@@ -711,6 +842,31 @@
+@@ -711,6 +842,28 @@
      }
  }
  
 +impl<K: Key + 'static> BtreeMut<'_, K, &'static [u8]> {
 +    /// Reserve an allocator-table value without building a value-sized heap buffer.
-+    /// Anonymous zero pages are copied into the newly allocated B-tree page; the
-+    /// returned guard gives the caller the page's own mutable destination.
++    /// A length-only source zero-fills the allocated B-tree destination. The
++    /// returned guard borrows that destination; no source buffer or mapping exists.
 +    pub(crate) fn insert_zeroed_reserve(
 +        &mut self,
 +        key: &K::SelfType<'_>,
 +        value_length: usize,
 +    ) -> Result<AccessGuardMutInPlace<'_, &'static [u8]>> {
-+        let zeros = memmap2::MmapOptions::new()
-+            .len(value_length)
-+            .map_anon()
-+            .map_err(crate::StorageError::Io)?;
 +        let mut freed_pages = self.freed_pages.lock().unwrap();
 +        let mut operation: MutateHelper<'_, '_, K, &'static [u8]> = MutateHelper::new(
 +            &mut self.root,
@@ -6007,7 +6022,8 @@
 +            freed_pages.as_mut(),
 +            self.allocated_pages.clone(),
 +        );
-+        let (_, guard) = operation.insert(key, &&zeros[..])?;
++        let (_, guard) =
++            operation.insert_value(key, super::btree_base::LeafValue::Zeroes(value_length))?;
 +        Ok(guard)
 +    }
 +}
@@ -6015,7 +6031,7 @@
  pub(crate) struct RawBtree {
      mem: Arc<TransactionalMemory>,
      root: Option<BtreeHeader>,
-@@ -760,6 +916,22 @@
+@@ -760,6 +913,22 @@
          } else {
              Ok(true)
          }
@@ -6038,7 +6054,7 @@
      }
  
      fn verify_checksum_helper(
-@@ -804,12 +976,12 @@
+@@ -804,12 +973,12 @@
  }
  
  pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
@@ -6053,7 +6069,7 @@
      _key_type: PhantomData<K>,
      _value_type: PhantomData<V>,
  }
-@@ -822,7 +994,16 @@
+@@ -822,7 +991,16 @@
          mem: Arc<TransactionalMemory>,
      ) -> Result<Self> {
          let cached_root = if let Some(header) = root {
@@ -6071,7 +6087,7 @@
          } else {
              None
          };
-@@ -837,6 +1018,24 @@
+@@ -837,6 +1015,24 @@
          })
      }
  
@@ -6096,7 +6112,7 @@
      pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
          &self.transaction_guard
      }
-@@ -858,6 +1057,17 @@
+@@ -858,6 +1054,17 @@
              self.hint,
          )
          .verify_checksum()
@@ -6114,7 +6130,7 @@
      }
  
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-@@ -877,6 +1087,10 @@
+@@ -877,6 +1084,10 @@
      pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
          if let Some(ref root_page) = self.cached_root {
              self.get_helper(root_page, K::as_bytes(key).as_ref())
@@ -6125,7 +6141,7 @@
          } else {
              Ok(None)
          }
-@@ -898,8 +1112,10 @@
+@@ -898,8 +1109,10 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(page, K::fixed_width());
@@ -6137,7 +6153,7 @@
                  self.get_helper(&child_page, query)
              }
              _ => unreachable!(),
-@@ -911,6 +1127,10 @@
+@@ -911,6 +1124,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.first_helper(root.clone())
@@ -6148,7 +6164,7 @@
          } else {
              Ok(None)
          }
-@@ -932,7 +1152,10 @@
+@@ -932,7 +1149,10 @@
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
                  let child_page = accessor.child_page(0).unwrap();
@@ -6160,7 +6176,7 @@
              }
              _ => unreachable!(),
          }
-@@ -943,6 +1166,10 @@
+@@ -943,6 +1163,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.last_helper(root.clone())
@@ -6171,7 +6187,7 @@
          } else {
              Ok(None)
          }
-@@ -964,8 +1191,12 @@
+@@ -964,8 +1188,12 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
@@ -6186,7 +6202,7 @@
              }
              _ => unreachable!(),
          }
-@@ -975,12 +1206,35 @@
+@@ -975,12 +1203,35 @@
          &self,
          range: &'_ T,
      ) -> Result<BtreeRangeIter<K, V>> {
@@ -6252,6 +6268,15 @@
          Self {
              page: EitherPage::ArcMemory(page),
              offset: range.start,
+@@ -306,7 +308,7 @@
+             self.entry_index,
+             self.key_width,
+             V::fixed_width(),
+-            value_bytes.as_ref(),
++            value_bytes.as_ref().len(),
+         ) {
+             let mut mutator =
+                 LeafMutator::new(self.page.memory_mut(), self.key_width, V::fixed_width());
 @@ -358,6 +360,12 @@
          self.len = new_end - new_start;
  
@@ -6265,6 +6290,168 @@
      }
  }
  
+@@ -618,8 +626,32 @@
+     }
+ }
+ 
++/// A borrowed serialized value or a length-only reservation. Zero reservations
++/// own no payload; bytes are initialized only in the allocated destination.
++#[derive(Clone, Copy)]
++pub(super) enum LeafValue<'a> {
++    Bytes(&'a [u8]),
++    Zeroes(usize),
++}
++
++impl LeafValue<'_> {
++    pub(super) fn len(self) -> usize {
++        match self {
++            Self::Bytes(bytes) => bytes.len(),
++            Self::Zeroes(len) => len,
++        }
++    }
++
++    fn write(self, destination: &mut [u8]) {
++        match self {
++            Self::Bytes(bytes) => destination.copy_from_slice(bytes),
++            Self::Zeroes(_) => destination.fill(0),
++        }
++    }
++}
++
+ pub(super) struct LeafBuilder<'a, 'b> {
+-    pairs: Vec<(&'a [u8], &'a [u8])>,
++    pairs: Vec<(&'a [u8], LeafValue<'a>)>,
+     fixed_key_size: Option<usize>,
+     fixed_value_size: Option<usize>,
+     total_key_bytes: usize,
+@@ -657,6 +689,10 @@
+     }
+ 
+     pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
++        self.push_value(key, LeafValue::Bytes(value));
++    }
++
++    pub(super) fn push_value(&mut self, key: &'a [u8], value: LeafValue<'a>) {
+         self.total_key_bytes += key.len();
+         self.total_value_bytes += value.len();
+         self.pairs.push((key, value));
+@@ -712,7 +748,7 @@
+             first_split_key_bytes,
+         );
+         for (key, value) in self.pairs.iter().take(division) {
+-            builder.append(key, value);
++            builder.append_value(key, *value);
+         }
+         drop(builder);
+ 
+@@ -731,7 +767,7 @@
+             self.total_key_bytes - first_split_key_bytes,
+         );
+         for (key, value) in &self.pairs[division..] {
+-            builder.append(key, value);
++            builder.append_value(key, *value);
+         }
+         drop(builder);
+ 
+@@ -753,7 +789,7 @@
+             self.total_key_bytes,
+         );
+         for (key, value) in self.pairs {
+-            builder.append(key, value);
++            builder.append_value(key, value);
+         }
+         drop(builder);
+         Ok(page)
+@@ -877,6 +913,10 @@
+     }
+ 
+     pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
++        self.append_value(key, LeafValue::Bytes(value));
++    }
++
++    fn append_value(&mut self, key: &[u8], value: LeafValue<'_>) {
+         if let Some(key_width) = self.fixed_key_size {
+             assert_eq!(key_width, key.len());
+         }
+@@ -915,7 +955,7 @@
+                     .to_le_bytes(),
+             );
+         }
+-        self.page[value_offset..(value_offset + value.len())].copy_from_slice(value);
++        value.write(&mut self.page[value_offset..(value_offset + value.len())]);
+         self.pairs_written += 1;
+     }
+ }
+@@ -959,7 +999,7 @@
+         position: usize,
+         fixed_key_size: Option<usize>,
+         fixed_value_size: Option<usize>,
+-        new_value: &[u8],
++        new_value_length: usize,
+     ) -> bool {
+         let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
+         let remaining = page.memory().len() - accessor.total_length();
+@@ -967,7 +1007,7 @@
+             .value_range(position)
+             .map(|(s, e)| e - s)
+             .unwrap_or_default();
+-        let required_delta = isize::try_from(new_value.len()).unwrap()
++        let required_delta = isize::try_from(new_value_length).unwrap()
+             - isize::try_from(existing_value_len).unwrap();
+         required_delta <= isize::try_from(remaining).unwrap()
+     }
+@@ -978,7 +1018,7 @@
+         fixed_key_size: Option<usize>,
+         fixed_value_size: Option<usize>,
+         new_key: &[u8],
+-        new_value: &[u8],
++        new_value_length: usize,
+     ) -> bool {
+         let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
+         // If this is a large page, only allow in-place appending to avoid write amplification
+@@ -989,7 +1029,7 @@
+             return false;
+         }
+         let remaining = page.memory().len() - accessor.total_length();
+-        let mut required_delta = new_key.len() + new_value.len();
++        let mut required_delta = new_key.len() + new_value_length;
+         if fixed_key_size.is_none() {
+             required_delta += size_of::<u32>();
+         }
+@@ -1001,6 +1041,10 @@
+ 
+     // Replace the value at index `i` with `value`, leaving the key unchanged.
+     pub(crate) fn replace(&mut self, i: usize, value: &[u8]) {
++        self.replace_value(i, LeafValue::Bytes(value));
++    }
++
++    pub(super) fn replace_value(&mut self, i: usize, value: LeafValue<'_>) {
+         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
+         let num_pairs = accessor.num_pairs();
+         let last_value_end = accessor.value_end(num_pairs - 1).unwrap();
+@@ -1031,11 +1075,11 @@
+ 
+         // Write the new value
+         dest -= value.len();
+-        self.page[dest..(dest + value.len())].copy_from_slice(value);
++        value.write(&mut self.page[dest..(dest + value.len())]);
+     }
+ 
+     // Insert the given key, value pair at index i and shift all following pairs to the right
+-    pub(crate) fn insert(&mut self, i: usize, key: &[u8], value: &[u8]) {
++    pub(super) fn insert_value(&mut self, i: usize, key: &[u8], value: LeafValue<'_>) {
+         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
+         let required_delta = {
+             let mut delta = key.len() + value.len();
+@@ -1093,7 +1137,7 @@
+         // Insert the value
+         let inserted_value_end: u32 = dest.try_into().unwrap();
+         dest -= value.len();
+-        self.page[dest..(dest + value.len())].copy_from_slice(value);
++        value.write(&mut self.page[dest..(dest + value.len())]);
+ 
+         // Right shift the trailing key data & preceding value data
+         let start = shift_key_start;
 --- a/src/tree_store/btree_iters.rs
 +++ b/src/tree_store/btree_iters.rs
 @@ -1,10 +1,12 @@
@@ -6521,7 +6708,12 @@
                      page,
 --- a/src/tree_store/btree_mutator.rs
 +++ b/src/tree_store/btree_mutator.rs
-@@ -5,7 +5,7 @@
+@@ -1,11 +1,11 @@
+ use crate::tree_store::btree_base::{
+     BRANCH, BranchAccessor, BranchBuilder, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor,
+-    LeafBuilder, LeafMutator,
++    LeafBuilder, LeafMutator, LeafValue,
+ };
  use crate::tree_store::btree_mutator::DeletionResult::{
      DeletedBranch, DeletedLeaf, PartialBranch, PartialLeaf, Subtree,
  };
@@ -6539,7 +6731,7 @@
          deleted_pair: usize,
      },
      // A branch page subtree with fewer children than desired.
-@@ -39,13 +39,53 @@
+@@ -39,16 +39,58 @@
      DeletedBranch(PageNumber, Checksum),
  }
  
@@ -6593,8 +6785,14 @@
 +    additional_sibling: Option<(InsertionKey, PageNumber, Checksum)>,
      // The inserted value for .insert_reserve() to use
      inserted_value: AccessGuardMutInPlace<'a, V>,
-     // The previous value, if any
-@@ -63,7 +103,7 @@
+-    // The previous value, if any
++    // Whether the key existed, including reservations that discard old bytes.
++    replaced: bool,
++    // The previous value, if requested by an ordinary insertion.
+     old_value: Option<AccessGuard<'a, V>>,
+ }
+ 
+@@ -63,7 +105,7 @@
      _lifetime: PhantomData<&'a ()>,
  }
  
@@ -6603,7 +6801,7 @@
      pub(crate) fn new(
          root: &'b mut Option<BtreeHeader>,
          mem: Arc<TransactionalMemory>,
-@@ -107,9 +147,13 @@
+@@ -107,9 +149,13 @@
              let mut allocated = self.allocated.lock().unwrap();
              if !self.mem.free_if_uncommitted(page_number, &mut allocated) {
                  self.freed.push(page_number);
@@ -6617,16 +6815,71 @@
          }
      }
  
-@@ -191,7 +235,7 @@
+@@ -184,24 +230,25 @@
+         key: &K::SelfType<'_>,
+         value: &V::SelfType<'_>,
+     ) -> Result<(Option<AccessGuard<'a, V>>, AccessGuardMutInPlace<'a, V>)> {
++        let value_bytes = V::as_bytes(value);
++        self.insert_value(key, LeafValue::Bytes(value_bytes.as_ref()))
++    }
++
++    #[allow(clippy::type_complexity)]
++    pub(super) fn insert_value(
++        &mut self,
++        key: &K::SelfType<'_>,
++        value: LeafValue<'_>,
++    ) -> Result<(Option<AccessGuard<'a, V>>, AccessGuardMutInPlace<'a, V>)> {
+         let (new_root, old_value, guard) = if let Some(BtreeHeader {
+             root: p,
+             checksum,
+             length,
          }) = *self.root
          {
-             let result = self.insert_helper(
+-            let result = self.insert_helper(
 -                self.mem.get_page(p, PageHint::None)?,
-+                p,
-                 checksum,
-                 K::as_bytes(key).as_ref(),
-                 V::as_bytes(value).as_ref(),
-@@ -243,11 +287,77 @@
+-                checksum,
+-                K::as_bytes(key).as_ref(),
+-                V::as_bytes(value).as_ref(),
+-            )?;
+-
+-            let new_length = if result.old_value.is_some() {
+-                length
+-            } else {
+-                length + 1
+-            };
++            let result = self.insert_helper(p, checksum, K::as_bytes(key).as_ref(), value)?;
++
++            let new_length = if result.replaced { length } else { length + 1 };
+ 
+             let new_root = if let Some((key, page2, page2_checksum)) = result.additional_sibling {
+                 let mut builder =
+@@ -217,9 +264,7 @@
+             (new_root, result.old_value, result.inserted_value)
+         } else {
+             let key_bytes = K::as_bytes(key);
+-            let value_bytes = V::as_bytes(value);
+             let key_bytes = key_bytes.as_ref();
+-            let value_bytes = value_bytes.as_ref();
+             let mut builder = LeafBuilder::new(
+                 &self.mem,
+                 &self.allocated,
+@@ -227,13 +272,13 @@
+                 K::fixed_width(),
+                 V::fixed_width(),
+             );
+-            builder.push(key_bytes, value_bytes);
++            builder.push_value(key_bytes, value);
+             let page = builder.build()?;
+ 
+             let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+             let offset = accessor.offset_of_first_value();
+             let page_num = page.get_page_number();
+-            let guard = AccessGuardMutInPlace::new(page, offset, value_bytes.len());
++            let guard = AccessGuardMutInPlace::new(page, offset, value.len());
+ 
+             (BtreeHeader::new(page_num, DEFERRED, 1), None, guard)
+         };
+@@ -243,11 +288,78 @@
  
      fn insert_helper(
          &mut self,
@@ -6634,7 +6887,8 @@
 +        page_number: PageNumber,
          page_checksum: Checksum,
          key: &[u8],
-         value: &[u8],
+-        value: &[u8],
++        value: LeafValue<'_>,
      ) -> Result<InsertionResult<'a, V>> {
 +        // Preserve the existing singleton split without faulting its unrelated
 +        // value. Restrict this ordering shortcut to the built-in byte key.
@@ -6680,7 +6934,7 @@
 +                    K::fixed_width(),
 +                    V::fixed_width(),
 +                );
-+                builder.push(key, value);
++                builder.push_value(key, value);
 +                let new_page = builder.build()?;
 +                let new_root = new_page.get_page_number();
 +                let offset =
@@ -6697,6 +6951,7 @@
 +                    root_checksum,
 +                    additional_sibling: Some((separator, sibling, sibling_checksum)),
 +                    inserted_value: AccessGuardMutInPlace::new(new_page, offset, value.len()),
++                    replaced: false,
 +                    old_value: None,
 +                });
 +            }
@@ -6705,7 +6960,16 @@
          let node_mem = page.memory();
          Ok(match node_mem[0] {
              LEAF => {
-@@ -277,7 +387,7 @@
+@@ -265,7 +377,7 @@
+                         K::fixed_width(),
+                         V::fixed_width(),
+                     );
+-                    builder.push(key, value);
++                    builder.push_value(key, value);
+                     let new_page = builder.build()?;
+                     let new_page_number = new_page.get_page_number();
+                     let new_page_accessor =
+@@ -277,11 +389,12 @@
                              new_root: new_page_number,
                              root_checksum: DEFERRED,
                              additional_sibling: Some((
@@ -6714,16 +6978,100 @@
                                  page.get_page_number(),
                                  page_checksum,
                              )),
-@@ -289,7 +399,7 @@
+                             inserted_value: guard,
++                            replaced: false,
+                             old_value: None,
+                         })
+                     } else {
+@@ -289,8 +402,9 @@
                          Ok(InsertionResult {
                              new_root: page.get_page_number(),
                              root_checksum: page_checksum,
 -                            additional_sibling: Some((split_key, new_page_number, DEFERRED)),
 +                            additional_sibling: Some((split_key.into(), new_page_number, DEFERRED)),
                              inserted_value: guard,
++                            replaced: false,
                              old_value: None,
                          })
-@@ -383,6 +493,8 @@
+                     };
+@@ -304,7 +418,7 @@
+                             position,
+                             K::fixed_width(),
+                             V::fixed_width(),
+-                            value,
++                            value.len(),
+                         )
+                     } else {
+                         LeafMutator::sufficient_insert_inplace_space(
+@@ -313,7 +427,7 @@
+                             K::fixed_width(),
+                             V::fixed_width(),
+                             key,
+-                            value,
++                            value.len(),
+                         )
+                     }
+                 };
+@@ -322,10 +436,12 @@
+                     && has_inplace_space()
+                 {
+                     let page_number = page.get_page_number();
+-                    let existing_value = if found {
++                    let existing_value = if found && matches!(value, LeafValue::Bytes(_)) {
+                         let copied_value = accessor.entry(position).unwrap().value().to_vec();
+                         Some(AccessGuard::with_owned_value(copied_value))
+                     } else {
++                        // Reservations discard old bytes, avoiding a second
++                        // value-sized owner during in-place replacement.
+                         None
+                     };
+                     drop(page);
+@@ -333,9 +449,9 @@
+                     let mut mutator =
+                         LeafMutator::new(page_mut.memory_mut(), K::fixed_width(), V::fixed_width());
+                     if found {
+-                        mutator.replace(position, value);
++                        mutator.replace_value(position, value);
+                     } else {
+-                        mutator.insert(position, key, value);
++                        mutator.insert_value(position, key, value);
+                     }
+                     let new_page_accessor =
+                         LeafAccessor::new(page_mut.memory(), K::fixed_width(), V::fixed_width());
+@@ -346,6 +462,7 @@
+                         root_checksum: DEFERRED,
+                         additional_sibling: None,
+                         inserted_value: guard,
++                        replaced: found,
+                         old_value: existing_value,
+                     });
+                 }
+@@ -359,7 +476,7 @@
+                 );
+                 for i in 0..accessor.num_pairs() {
+                     if i == position {
+-                        builder.push(key, value);
++                        builder.push_value(key, value);
+                     }
+                     if !found || i != position {
+                         let entry = accessor.entry(i).unwrap();
+@@ -367,13 +484,13 @@
+                     }
+                 }
+                 if accessor.num_pairs() == position {
+-                    builder.push(key, value);
++                    builder.push_value(key, value);
+                 }
+                 if !builder.should_split() {
+                     let new_page = builder.build()?;
+ 
+                     let page_number = page.get_page_number();
+-                    let existing_value = if found {
++                    let existing_value = if found && matches!(value, LeafValue::Bytes(_)) {
+                         let (start, end) = accessor.value_range(position).unwrap();
+                         if self.modify_uncommitted && self.mem.uncommitted(page_number) {
+                             let arc = page.to_arc();
+@@ -383,6 +500,8 @@
                              Some(AccessGuard::with_arc_page(arc, start..end))
                          } else {
                              self.freed.push(page_number);
@@ -6732,7 +7080,23 @@
                              Some(AccessGuard::with_page(page, start..end))
                          }
                      } else {
-@@ -418,6 +530,8 @@
+@@ -402,13 +521,14 @@
+                         root_checksum: DEFERRED,
+                         additional_sibling: None,
+                         inserted_value: guard,
++                        replaced: found,
+                         old_value: existing_value,
+                     }
+                 } else {
+                     let (new_page1, split_key, new_page2) = builder.build_split()?;
+                     let split_key = split_key.to_vec();
+                     let page_number = page.get_page_number();
+-                    let existing_value = if found {
++                    let existing_value = if found && matches!(value, LeafValue::Bytes(_)) {
+                         let (start, end) = accessor.value_range(position).unwrap();
+                         if self.modify_uncommitted && self.mem.uncommitted(page_number) {
+                             let arc = page.to_arc();
+@@ -418,6 +538,8 @@
                              Some(AccessGuard::with_arc_page(arc, start..end))
                          } else {
                              self.freed.push(page_number);
@@ -6741,16 +7105,18 @@
                              Some(AccessGuard::with_page(page, start..end))
                          }
                      } else {
-@@ -452,7 +566,7 @@
+@@ -452,8 +574,9 @@
                      InsertionResult {
                          new_root: new_page_number,
                          root_checksum: DEFERRED,
 -                        additional_sibling: Some((split_key, new_page_number2, DEFERRED)),
 +                        additional_sibling: Some((split_key.into(), new_page_number2, DEFERRED)),
                          inserted_value: guard,
++                        replaced: found,
                          old_value: existing_value,
                      }
-@@ -462,12 +576,7 @@
+                 }
+@@ -462,12 +585,7 @@
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
                  let (child_index, child_page) = accessor.child_for_key::<K>(key);
                  let child_checksum = accessor.child_checksum(child_index).unwrap();
@@ -6764,7 +7130,23 @@
  
                  // Skip-path: if child page number and checksum haven't changed,
                  // no branch update is needed. This avoids redundant get_page_mut +
-@@ -553,11 +662,18 @@
+@@ -482,6 +600,7 @@
+                         root_checksum: page_checksum,
+                         additional_sibling: None,
+                         inserted_value: sub_result.inserted_value,
++                        replaced: sub_result.replaced,
+                         old_value: sub_result.old_value,
+                     });
+                 }
+@@ -504,6 +623,7 @@
+                         root_checksum: DEFERRED,
+                         additional_sibling: None,
+                         inserted_value: sub_result.inserted_value,
++                        replaced: sub_result.replaced,
+                         old_value: sub_result.old_value,
+                     });
+                 }
+@@ -553,15 +673,23 @@
  
                  let result = if builder.should_split() {
                      let (new_page1, split_key, new_page2) = builder.build_split()?;
@@ -6784,7 +7166,20 @@
                              new_page2.get_page_number(),
                              DEFERRED,
                          )),
-@@ -712,6 +828,8 @@
+                         inserted_value: sub_result.inserted_value,
++                        replaced: sub_result.replaced,
+                         old_value: sub_result.old_value,
+                     }
+                 } else {
+@@ -571,6 +699,7 @@
+                         root_checksum: DEFERRED,
+                         additional_sibling: None,
+                         inserted_value: sub_result.inserted_value,
++                        replaced: sub_result.replaced,
+                         old_value: sub_result.old_value,
+                     }
+                 };
+@@ -712,6 +841,8 @@
              // Won't be freed until the end of the transaction, so returning the page
              // in the AccessGuard below is still safe
              self.freed.push(page.get_page_number());
@@ -6793,7 +7188,7 @@
              Some(AccessGuard::with_page(page, start..end))
          };
          Ok((result, guard))
-@@ -831,14 +949,30 @@
+@@ -831,14 +962,30 @@
  
                  let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
                  debug_assert!(merge_with < accessor.count_children());
@@ -6832,7 +7227,7 @@
                  // Don't try to merge or rebalance, if the sibling contains a single large value
                  if single_large_value {
                      let mut child_builder = LeafBuilder::new(
-@@ -863,6 +997,9 @@
+@@ -863,6 +1010,9 @@
                      return Ok((result, found));
                  }
  
@@ -8350,7 +8745,7 @@
  }
  
  impl FileBackend {
-@@ -19,11 +21,38 @@
+@@ -19,11 +21,37 @@
      pub(crate) fn new_internal(file: File, _: bool) -> Result<Self, DatabaseError> {
          Ok(Self {
              file: Mutex::new(file),
@@ -8377,12 +8772,11 @@
  
  impl StorageBackend for FileBackend {
 +    fn scratch_backend(&self) -> io::Result<Option<Box<dyn ScratchBackend>>> {
-+        let directory = self.scratch_directory.as_ref().ok_or_else(|| {
-+            io::Error::new(
-+                io::ErrorKind::Unsupported,
-+                "file-backed allocator scratch requires a path-based open on this platform",
-+            )
-+        })?;
++        let Some(directory) = &self.scratch_directory else {
++            // A raw handle is opaque on targets without path discovery. Preserve
++            // the same optional-backing contract as other opaque backends.
++            return Ok(None);
++        };
 +        scratch_backend_in_directory(directory).map(Some)
 +    }
 +
@@ -8446,7 +8840,7 @@
                  })
              }
              Err(TryLockError::Error(err)) => Err(err.into()),
-@@ -54,6 +74,20 @@
+@@ -54,6 +74,24 @@
  }
  
  impl StorageBackend for FileBackend {
@@ -8454,7 +8848,11 @@
 +        if let Some(directory) = &self.scratch_directory {
 +            return scratch_backend_in_directory(directory).map(Some);
 +        }
-+        let path = path_from_file_handle(&self.file)?;
++        let path = match path_from_file_handle(&self.file) {
++            Ok(path) => path,
++            Err(error) if error.kind() == io::ErrorKind::Unsupported => return Ok(None),
++            Err(error) => return Err(error),
++        };
 +        let directory = path.parent().ok_or_else(|| {
 +            io::Error::new(
 +                io::ErrorKind::InvalidInput,
@@ -8467,7 +8865,7 @@
      fn len(&self) -> Result<u64, io::Error> {
          Ok(self.file.metadata()?.len())
      }
-@@ -117,6 +151,71 @@
+@@ -117,6 +155,71 @@
  
          Ok(())
      }
@@ -8787,7 +9185,7 @@
  
          assert!(page_size >= DB_HEADER_SIZE);
  
-@@ -285,7 +390,48 @@
+@@ -285,7 +390,52 @@
      }
  
      pub(crate) fn check_io_errors(&self) -> Result {
@@ -8807,6 +9205,10 @@
 +    #[cfg(debug_assertions)]
 +    pub(crate) fn uses_paged_allocator(&self) -> bool {
 +        self.state.lock().unwrap().allocators.pager().is_some()
++    }
++
++    pub(crate) fn has_saved_allocator_source(&self) -> bool {
++        self.state.lock().unwrap().allocators.has_saved_source()
 +    }
 +
 +    pub(crate) fn materialize_allocator_source(&self) -> Result {
@@ -8836,7 +9238,7 @@
      }
  
      #[cfg(debug_assertions)]
-@@ -295,23 +441,30 @@
+@@ -295,23 +445,30 @@
  
      #[cfg(debug_assertions)]
      pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
@@ -8873,7 +9275,7 @@
          }
      }
  
-@@ -346,7 +499,9 @@
+@@ -346,7 +503,9 @@
  
          self.needs_recovery
              .store(header.recovery_required, Ordering::Release);
@@ -8884,7 +9286,7 @@
  
          Ok(was_clean)
      }
-@@ -379,7 +534,8 @@
+@@ -379,7 +538,8 @@
  
      pub(crate) fn begin_repair(&self) -> Result<()> {
          let mut state = self.state.lock().unwrap();
@@ -8894,7 +9296,7 @@
          #[cfg(debug_assertions)]
          self.allocated_pages.lock().unwrap().clear();
  
-@@ -392,7 +548,9 @@
+@@ -392,7 +552,9 @@
          let allocator = state.get_region_mut(region_index);
          allocator.record_alloc(page_number.page_index, page_number.page_order);
          #[cfg(debug_assertions)]
@@ -8905,7 +9307,7 @@
      }
  
      fn write_header(&self, header: &DatabaseHeader) -> Result {
-@@ -405,6 +563,7 @@
+@@ -405,6 +567,7 @@
      }
  
      pub(crate) fn end_repair(&self) -> Result<()> {
@@ -8913,7 +9315,7 @@
          let mut state = self.state.lock().unwrap();
          state.header.recovery_required = false;
          self.write_header(&state.header)?;
-@@ -419,30 +578,25 @@
+@@ -419,30 +582,25 @@
          tree: &mut AllocatorStateTreeMut,
          transaction_id: TransactionId,
      ) -> Result<u32> {
@@ -8957,7 +9359,7 @@
  
          tree.insert(
              &AllocatorStateKey::TransactionId,
-@@ -458,43 +612,43 @@
+@@ -458,43 +616,43 @@
          tree: &mut AllocatorStateTreeMut,
          num_regions: u32,
      ) -> Result<bool> {
@@ -9027,7 +9429,7 @@
          Ok(true)
      }
  
-@@ -519,12 +673,46 @@
+@@ -519,12 +677,46 @@
      pub(crate) fn load_allocator_state(&self, tree: &AllocatorStateTree) -> Result {
          assert!(self.is_valid_allocator_state(tree)?);
  
@@ -9076,7 +9478,7 @@
          }
  
          let region_tracker = RegionTracker::from_bytes(
-@@ -536,12 +724,13 @@
+@@ -536,12 +728,13 @@
          let mut state = self.state.lock().unwrap();
          state.allocators = Allocators {
              region_tracker,
@@ -9092,7 +9494,7 @@
          drop(state);
  
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -554,8 +743,15 @@
+@@ -554,8 +747,15 @@
      pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
          #[cfg(debug_assertions)]
          {
@@ -9110,7 +9512,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -612,6 +808,7 @@
+@@ -612,6 +812,7 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
@@ -9118,7 +9520,7 @@
  
          let old_transaction_id = header.secondary_slot().transaction_id;
          let secondary = header.secondary_slot_mut();
-@@ -678,6 +875,7 @@
+@@ -678,6 +879,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -9126,7 +9528,7 @@
  
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -726,7 +924,9 @@
+@@ -726,7 +928,9 @@
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
              #[cfg(debug_assertions)]
@@ -9137,7 +9539,7 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -774,6 +974,24 @@
+@@ -774,6 +978,24 @@
              #[cfg(debug_assertions)]
              open_pages: self.read_page_ref_counts.clone(),
          })
@@ -9162,7 +9564,7 @@
      }
  
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
-@@ -871,7 +1089,9 @@
+@@ -871,7 +1093,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -9173,7 +9575,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -953,12 +1173,32 @@
+@@ -953,12 +1177,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -9208,7 +9610,7 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -1024,6 +1264,13 @@
+@@ -1024,6 +1268,13 @@
              } else {
                  region.alloc(required_order)
              };
@@ -9222,7 +9624,7 @@
              if let Some(page) = r {
                  return Ok(Some(PageNumber::new(
                      candidate_region,
-@@ -1061,7 +1308,7 @@
+@@ -1061,7 +1312,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -9231,7 +9633,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1107,13 +1354,20 @@
+@@ -1107,13 +1358,20 @@
  
          let result = self.storage.resize(new_layout.len());
          if result.is_err() {
@@ -9253,7 +9655,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1135,7 +1389,7 @@
+@@ -1135,7 +1393,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -9262,7 +9664,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +1399,7 @@
+@@ -1145,7 +1403,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -9271,7 +9673,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +1412,41 @@
+@@ -1158,8 +1416,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -9469,7 +9871,7 @@
          let initial_regions = max(INITIAL_REGIONS, layout.num_regions());
          let mut region_tracker = RegionTracker::new(initial_regions, MAX_MAX_PAGE_ORDER + 1);
          for i in 0..layout.num_regions() {
-@@ -117,30 +201,363 @@
+@@ -117,30 +201,372 @@
              );
              let max_order = allocator.get_max_order();
              region_tracker.mark_free(max_order, i);
@@ -9633,6 +10035,12 @@
 +        self.paged.as_ref().map(|paged| &paged.pager)
 +    }
 +
++    pub(super) fn has_saved_source(&self) -> bool {
++        self.paged
++            .as_ref()
++            .is_some_and(|paged| paged.saved_region_limit.load(Ordering::Acquire) != 0)
++    }
++
 +    pub(super) fn materialize_saved_source(&mut self) -> io::Result<()> {
 +        let Some(paged) = &self.paged else {
 +            return Ok(());
@@ -9662,7 +10070,7 @@
 +
 +    /// Retire a small saved allocator table during an ordinary commit. The
 +    /// complete copy fits in one fixed window set; larger tables stay as the
-+    /// lazy source until a repair or compaction explicitly materializes them.
++    /// lazy source until quick repair or explicit whole-file compaction materializes them.
 +    pub(super) fn materialize_saved_source_if_small(&mut self) -> io::Result<bool> {
 +        let Some(paged) = &self.paged else {
 +            return Ok(true);
@@ -9711,6 +10119,9 @@
 +            if paged.active.as_ref().map(|(loaded, _)| *loaded) != Some(region) {
 +                let layout = *paged.layout.lock().unwrap();
 +                let regional = layout.region_layout(region);
++                // No holder can borrow the old view across this exclusive
++                // call; release its descriptor owner before building another.
++                paged.active = None;
 +                let allocator = BuddyAllocator::new_paged(
 +                    regional.num_pages(),
 +                    layout.full_region_layout().num_pages(),
@@ -9844,7 +10255,7 @@
                  let last_region = new_layout
                      .trailing_region_layout()
                      .unwrap_or_else(|| new_layout.full_region_layout());
-@@ -148,7 +565,7 @@
+@@ -148,7 +574,7 @@
                      cmp::Ordering::Less => true,
                      cmp::Ordering::Equal => {
                          // No-op
@@ -9853,7 +10264,7 @@
                      }
                      cmp::Ordering::Greater => false,
                  }
-@@ -158,26 +575,25 @@
+@@ -158,26 +584,25 @@
  
          if shrink {
              // Drop all regions that were removed
@@ -9885,7 +10296,7 @@
                      assert!(new_region.num_pages() >= allocator.len());
                      if new_region.num_pages() != allocator.len() {
                          allocator.resize(new_region.num_pages());
-@@ -195,9 +611,10 @@
+@@ -195,9 +620,10 @@
                          self.region_tracker.resize(i + 1);
                      }
                      self.region_tracker.mark_free(highest_free, i);
@@ -10050,7 +10461,7 @@
              table
          };
  
-@@ -675,6 +755,95 @@
+@@ -675,6 +755,104 @@
  
          self.tree.relocate(relocation_map)?;
  
@@ -10061,6 +10472,7 @@
 +        &self,
 +        cursor: &mut crate::transactions::CompactionCursor,
 +        maximum: usize,
++        protected_table: Option<&str>,
 +    ) -> Result<(Option<String>, Vec<PagePath>, usize)> {
 +        use std::ops::Bound;
 +        let target = if cursor.phase.is_multiple_of(2) {
@@ -10084,6 +10496,14 @@
 +            };
 +            let entry = entry?;
 +            let name = entry.key().to_owned();
++            if protected_table == Some(name.as_str()) {
++                // Advance exactly one table without faulting any protected
++                // source pages. A later call resumes the finite traversal.
++                cursor.table = Some(name);
++                cursor.advance_table = true;
++                cursor.position.clear();
++                return Ok((None, Vec::new(), 0));
++            }
 +            if cursor.table.as_ref() != Some(&name) {
 +                cursor.position.clear();
 +            }

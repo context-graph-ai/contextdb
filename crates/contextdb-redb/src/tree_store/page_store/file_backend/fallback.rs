@@ -44,12 +44,11 @@ impl FileBackend {
 
 impl StorageBackend for FileBackend {
     fn scratch_backend(&self) -> io::Result<Option<Box<dyn ScratchBackend>>> {
-        let directory = self.scratch_directory.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "file-backed allocator scratch requires a path-based open on this platform",
-            )
-        })?;
+        let Some(directory) = &self.scratch_directory else {
+            // A raw handle is opaque on targets without path discovery. Preserve
+            // the same optional-backing contract as other opaque backends.
+            return Ok(None);
+        };
         scratch_backend_in_directory(directory).map(Some)
     }
 

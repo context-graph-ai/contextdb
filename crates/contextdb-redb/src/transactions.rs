@@ -2044,7 +2044,13 @@ impl WriteTransaction {
         maximum: usize,
         admit: &mut impl FnMut(usize) -> std::io::Result<()>,
     ) -> Result<CompactionProgress> {
-        self.mem.materialize_allocator_source()?;
+        // The saved allocator tree is a live lazy bitmap source. Keep that
+        // one root reachable instead of copying all its words under the writer
+        // lock before a finite batch's admission. Relocating the system master
+        // tree preserves this table's child root. Quick repair and explicit
+        // whole-file compaction detach the source before replacing its pages.
+        let protected_table = (cursor.phase >= 2 && self.mem.has_saved_allocator_source())
+            .then_some(ALLOCATOR_STATE_TABLE_NAME);
         let mut tables = self.tables.lock().unwrap();
         let mut system_tables = self.system_tables.lock().unwrap();
         let tree = if cursor.phase < 2 {
@@ -2052,7 +2058,8 @@ impl WriteTransaction {
         } else {
             &mut system_tables.table_tree
         };
-        let (target, pages, examined) = tree.compaction_page_batch(cursor, maximum)?;
+        let (target, pages, examined) =
+            tree.compaction_page_batch(cursor, maximum, protected_table)?;
         let mut relocation_map = HashMap::new();
         let pages = pages
             .into_iter()
@@ -2062,8 +2069,13 @@ impl WriteTransaction {
             if relocation_map.contains_key(&path.page_number()) {
                 continue;
             }
+            let bytes = self
+                .mem
+                .get_page_size()
+                .checked_shl(u32::from(path.page_number().page_order))
+                .ok_or_else(|| StorageError::Corrupted("relocation extent size overflow".into()))?;
+            admit(bytes.saturating_add(128))?;
             let old = self.mem.get_page(path.page_number(), PageHint::None)?;
-            admit(old.memory().len().saturating_add(128))?;
             let mut new = self.mem.allocate_lowest(old.memory().len())?;
             let number = new.get_page_number();
             new.memory_mut()[0] = old.memory()[0];
@@ -2077,8 +2089,15 @@ impl WriteTransaction {
                 if relocation_map.contains_key(parent) {
                     continue;
                 }
+                let bytes = self
+                    .mem
+                    .get_page_size()
+                    .checked_shl(u32::from(parent.page_order))
+                    .ok_or_else(|| {
+                        StorageError::Corrupted("relocation extent size overflow".into())
+                    })?;
+                admit(bytes.saturating_add(128))?;
                 let old = self.mem.get_page(*parent, PageHint::None)?;
-                admit(old.memory().len().saturating_add(128))?;
                 let mut new = self.mem.allocate_lowest(old.memory().len())?;
                 new.memory_mut()[0] = old.memory()[0];
                 relocation_map.insert(*parent, new.get_page_number());

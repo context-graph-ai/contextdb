@@ -78,7 +78,11 @@ impl StorageBackend for FileBackend {
         if let Some(directory) = &self.scratch_directory {
             return scratch_backend_in_directory(directory).map(Some);
         }
-        let path = path_from_file_handle(&self.file)?;
+        let path = match path_from_file_handle(&self.file) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let directory = path.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
