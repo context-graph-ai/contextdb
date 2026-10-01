@@ -158,11 +158,15 @@ impl Database {
                 return Err(error);
             }
             let Some(posting) = fetched.map_err(E::from)? else {
-                cursor.source_finish_run();
+                if cursor.source_finish_run() {
+                    continue;
+                }
                 return Ok(None);
             };
             if !cursor.source_inside_run(&posting.value().key) {
-                cursor.source_finish_run();
+                if cursor.source_finish_run() {
+                    continue;
+                }
                 return Ok(None);
             }
             let row = if posting.value().entry.visible_at(snapshot) {
@@ -208,6 +212,8 @@ impl Database {
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
         mut touch: impl FnMut() -> std::result::Result<(), E>,
+        mut retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut release: impl FnMut(usize) -> std::result::Result<(), E>,
         mut clone: impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E> {
         use contextdb_relational::source::{RelationalIndexRange, visible_row};
@@ -246,7 +252,9 @@ impl Database {
                 return Err(error);
             }
             let Some(posting) = fetched.map_err(E::from)? else {
+                let bytes = cursor.retained_bytes();
                 cursor.source_finish_probe();
+                release(bytes)?;
                 continue;
             };
             let row = if posting.value().entry.visible_at(snapshot) {
@@ -255,16 +263,16 @@ impl Database {
             } else {
                 None
             };
-            clone(
-                posting
-                    .position_key()
-                    .len()
-                    .saturating_add(row.as_ref().map_or(0, |row| row.value().estimated_bytes())),
-            )?;
-            cursor.source_advance(
+            let bytes = posting.position_key().len();
+            retain(bytes)?;
+            clone(row.as_ref().map_or(0, |row| row.value().estimated_bytes()))?;
+            let previous = cursor.retained_bytes();
+            cursor.source_advance_charged(
                 posting.position_key().to_vec(),
                 posting.value().entry.row_id,
+                bytes,
             );
+            release(previous)?;
             if let Some(row) = row {
                 return Ok(Some(row.value().clone()));
             }
@@ -580,5 +588,86 @@ impl Database {
             .transaction_read(tx.expect("checked transaction"))?;
         let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published.snapshot));
         Ok((snapshot, durable_root(published.handle)?))
+    }
+}
+
+impl Database {
+    pub(super) fn clone_writer_row(&self, row: &VersionedRow) -> Result<VersionedRow> {
+        let output = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            row.estimated_bytes(),
+            "writer_source",
+            "row_output",
+            "Raise MEMORY_LIMIT to return this row.",
+        )?;
+        let row = row.clone();
+        self.retain_writer_output(output);
+        Ok(row)
+    }
+
+    pub(super) fn writer_cursor_storage_pin(
+        &self,
+        root: &WriterSnapshot,
+        budget: &ReadRegistrationBudget,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<crate::persistence::OwnerCursorStoragePin>> {
+        let persistence = self
+            .persistence
+            .as_ref()
+            .ok_or_else(closed_database_error)?;
+        let started = Instant::now();
+        let allowance = budget.remaining()?;
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
+        let cancelled = wake.clone();
+        let _listener = withdrawn.tell_on_cancel(move || {
+            let _state = cancelled.0.lock();
+            cancelled.1.notify_all();
+        });
+        loop {
+            if withdrawn.is_cancelled() {
+                return Ok(None);
+            }
+            budget.remaining()?;
+            let Some(remaining) = allowance.checked_sub(started.elapsed()) else {
+                return Err(budget.elapsed_timeout());
+            };
+            match persistence.owner_cursor_pin_for_root(root) {
+                Ok(pin) => return Ok(Some(pin)),
+                Err(crate::persistence::OwnerCursorPinAdmissionError::Refused(error)) => {
+                    return Err(error);
+                }
+                Err(crate::persistence::OwnerCursorPinAdmissionError::Busy(_)) => {
+                    #[cfg(test)]
+                    {
+                        owner_cursor_pin_retry_tests::after_busy_attempt_for_test();
+                        self.snapshot_registry
+                            .owner_cursor_busy_test_pause
+                            .maybe_pause();
+                    }
+                    let mut state = wake.0.lock();
+                    if !withdrawn.is_cancelled() {
+                        wake.1
+                            .wait_for(&mut state, remaining.min(Duration::from_millis(5)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(super) struct WriterStagedPostingAdmission(
+    pub(super) Arc<crate::memory_accounting::MemoryAccountant>,
+);
+impl contextdb_relational::mem::StagedPostingAdmission for WriterStagedPostingAdmission {
+    fn reserve(&self, bytes: usize) -> Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
+        Ok(Arc::new(
+            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.0.clone(),
+                bytes,
+                "relational",
+                "staged_index_posting",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?,
+        ))
     }
 }

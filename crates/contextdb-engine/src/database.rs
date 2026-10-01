@@ -9262,6 +9262,7 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub staged_row_versions: usize,
     pub staged_row_admissions: usize,
     pub staged_vector_admissions: usize,
+    pub staged_index_postings: usize,
     pub table_metadata: usize,
     pub graph_entries: usize,
     /// Row insert/delete, vector insert/delete, edge insert/delete, in order.
@@ -9282,6 +9283,7 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub named_owner_total: usize,
     pub reconciliation_gap: i64,
     pub published_root_charge: usize,
+    pub captured_root_charge: usize,
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -12437,17 +12439,7 @@ impl ReadPublicationGate {
             self.changed.wait(&mut state);
         }
         state.writer_active = true;
-        let cursors = state
-            .cursors
-            .iter()
-            .filter_map(std::sync::Weak::upgrade)
-            .filter(|cursor| publication_scopes_conflict(tables, &cursor.publication.tables))
-            .collect::<Vec<_>>();
-        state.cursors.retain(|cursor| cursor.strong_count() != 0);
         drop(state);
-        for cursor in cursors {
-            cursor.release_for_erasure();
-        }
         AuthoritativePurgePublicationGuard {
             gate: Arc::clone(self),
         }
@@ -12468,6 +12460,26 @@ impl Drop for AuthoritativeReadPublicationGuard {
         state.wake_generation = state.wake_generation.wrapping_add(1);
         drop(state);
         self.gate.changed.notify_all();
+    }
+}
+
+impl AuthoritativePurgePublicationGuard {
+    fn invalidate_cursors(&self) {
+        let cursors = {
+            let mut state = self.gate.state.lock();
+            let tables = state.writer_scope.as_ref().expect("purge scope is held");
+            let cursors = state
+                .cursors
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .filter(|cursor| publication_scopes_conflict(tables, &cursor.publication.tables))
+                .collect::<Vec<_>>();
+            state.cursors.retain(|cursor| cursor.strong_count() != 0);
+            cursors
+        };
+        for cursor in cursors {
+            cursor.release_for_erasure();
+        }
     }
 }
 
@@ -19138,7 +19150,10 @@ impl Database {
             #[cfg(any(test, feature = "test-seams"))]
             local_schema_between_publication_pause: Arc::new(ApplyPhasePause::new()),
             export_after_capture_pause: Arc::new(ApplyPhasePause::new()),
-            relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
+            relational: MemRelationalExecutor::new(relational, tx_mgr.clone())
+                .with_staged_posting_admission(Arc::new(
+                    writer_read::WriterStagedPostingAdmission(accountant.clone()),
+                )),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
             vector: MemVectorExecutor::new_with_accountant(
                 vector_store,
@@ -20207,7 +20222,10 @@ impl Database {
             relational: MemRelationalExecutor::new(
                 self.relational_store.clone(),
                 self.tx_mgr.clone(),
-            ),
+            )
+            .with_staged_posting_admission(Arc::new(
+                writer_read::WriterStagedPostingAdmission(self.accountant.clone()),
+            )),
             graph: MemGraphExecutor::new(self.graph_store.clone(), self.tx_mgr.clone()),
             vector: MemVectorExecutor::new_with_accountant(
                 self.vector_store.clone(),
@@ -21996,17 +22014,9 @@ impl Database {
         // `try_snapshot_for_read`, not the panicking `snapshot_for_read`:
         // a close landing between the `already_closed` check above and this
         // line must still surface as the typed closed-handle error.
-        let _membership_capture = self.relational_store.begin_membership_capture();
-        let (read_snapshot, root) =
-            self.capture_writer_transaction_statement(*self.session_tx.lock())?;
-        let has_root = root.is_some();
-        let _writer_read = self.enter_writer_read(root);
-        let _snapshot_registration = self
-            .snapshot_registry
-            .register_statement_root(read_snapshot, has_root);
         let cached = self.cached_statement(sql);
         let parsed_stmt;
-        let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
+        let (stmt, _cached_plan) = if let Some(cached) = cached.as_ref() {
             (&cached.stmt, Some(&cached.plan))
         } else {
             parsed_stmt = contextdb_parser::parse(sql)?;
@@ -22028,6 +22038,25 @@ impl Database {
         } else {
             self.enter_schema_publication_gate(Self::statement_changes_table_schema(stmt))
         };
+
+        // DDL may have invalidated a plan while this call acquired the guard.
+        // Fetch the plan again under the same guard as the durable root.
+        let cached = self.cached_statement(sql);
+        let parsed_stmt;
+        let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
+            (&cached.stmt, Some(&cached.plan))
+        } else {
+            parsed_stmt = contextdb_parser::parse(sql)?;
+            (&parsed_stmt, None)
+        };
+        let _membership_capture = self.relational_store.begin_membership_capture();
+        let (read_snapshot, root) =
+            self.capture_writer_transaction_statement(*self.session_tx.lock())?;
+        let has_root = root.is_some();
+        let _writer_read = self.enter_writer_read(root);
+        let _snapshot_registration = self
+            .snapshot_registry
+            .register_statement_root(read_snapshot, has_root);
 
         match stmt {
             Statement::Begin => {
@@ -23643,13 +23672,18 @@ impl Database {
         // Registered for exactly this call's duration -- see
         // `SnapshotFloorRegistry`'s doc comment on `execute`. Fallible form,
         // same reason as `execute`'s own identical line.
-        let _membership_capture = self.relational_store.begin_membership_capture();
-        let (read_snapshot, root) = self.capture_writer_transaction_statement(Some(tx))?;
-        let has_root = root.is_some();
-        let _writer_read = self.enter_writer_read(root);
-        let _snapshot_registration = self
-            .snapshot_registry
-            .register_statement_root(read_snapshot, has_root);
+        let cached = self.cached_statement(sql);
+        let parsed_stmt;
+        let (stmt, _cached_plan) = if let Some(cached) = cached.as_ref() {
+            (&cached.stmt, Some(&cached.plan))
+        } else {
+            parsed_stmt = contextdb_parser::parse(sql)?;
+            (&parsed_stmt, None)
+        };
+        let _schema_publication =
+            self.enter_schema_publication_gate(Self::statement_changes_table_schema(stmt));
+        // DDL may have invalidated a plan while this call acquired the guard.
+        // Fetch the plan again under the same guard as the durable root.
         let cached = self.cached_statement(sql);
         let parsed_stmt;
         let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
@@ -23658,8 +23692,14 @@ impl Database {
             parsed_stmt = contextdb_parser::parse(sql)?;
             (&parsed_stmt, None)
         };
-        let _schema_publication =
-            self.enter_schema_publication_gate(Self::statement_changes_table_schema(stmt));
+        let _membership_capture = self.relational_store.begin_membership_capture();
+        let (read_snapshot, root) = self.capture_writer_transaction_statement(Some(tx))?;
+        let has_root = root.is_some();
+        let _writer_read = self.enter_writer_read(root);
+        let _snapshot_registration = self
+            .snapshot_registry
+            .register_statement_root(read_snapshot, has_root);
+
         let trigger_callback_bound = self.trigger_callback_tx_bound_matches(tx);
         if trigger_callback_bound && matches!(stmt, Statement::Update(_) | Statement::Delete(_)) {
             if let Some(plan) = cached_plan {
@@ -25929,6 +25969,8 @@ impl Database {
             created_at: Some(context.created_at),
         };
         let (outcome, retired_charge) = self.tx_mgr.with_write_set(tx, |ws| {
+            self.relational
+                .stage_ordered_row(ws, table, &row, ws.relational_inserts.len())?;
             let before = current_write_set_counts(ws);
             let retired_charge = ws
                 .relational_inserts
@@ -25966,8 +26008,9 @@ impl Database {
             }
             ws.relational_inserts.push((table_name, row));
             let after = current_write_set_counts(ws);
-            ((row_id, before, after), retired_charge)
-        })?;
+            ws.rebind_ordered_staged_rows();
+            Ok::<_, Error>(((row_id, before, after), retired_charge))
+        })??;
         self.accountant.release(retired_charge);
         Ok(outcome)
     }
@@ -30147,6 +30190,8 @@ impl Database {
     {
         #[cfg(any(test, feature = "test-seams"))]
         let apply_started = std::time::Instant::now();
+        let published = self.tx_mgr.capture_published_read();
+        let _writer_read = self.enter_writer_read(writer_read::durable_root(published.handle)?);
         let _manifest_lock = self.received_schema_manifest_lock.lock();
         #[cfg(any(test, feature = "test-seams"))]
         let _observation_scope = begin_received_schema_apply_observation_for_test(
@@ -34643,6 +34688,8 @@ impl Database {
                     .iter()
                     .rev()
                     .find(|(t, row)| {
+                        #[cfg(feature = "in-process-test-seams")]
+                        crate::writer_query_test_seams::note_constraint_staged_row();
                         t == table
                             && Some(row.row_id) != skip_row_id
                             && row.values.get(column) == Some(value)
@@ -34800,6 +34847,8 @@ impl Database {
                     .iter()
                     .rev()
                     .find(|(t, row)| {
+                        #[cfg(feature = "in-process-test-seams")]
+                        crate::writer_query_test_seams::note_constraint_staged_row();
                         t == table
                             && Some(row.row_id) != skip_row_id
                             && cols
@@ -38100,6 +38149,13 @@ impl Database {
         };
         if let Some(delta) = options.lookup_delta.as_deref_mut() {
             delta.add(table, &inserted);
+        }
+        if let Err(error) =
+            self.relational
+                .stage_ordered_row(ws, table, &inserted, ws.relational_inserts.len())
+        {
+            self.accountant.release(row_bytes);
+            return Err(error);
         }
         ws.set_relational_insert_admitted_bytes(table, inserted.row_id, row_bytes);
         ws.relational_inserts.push((table.to_string(), inserted));
@@ -41834,7 +41890,8 @@ impl Database {
         let table_generation = self.durable_lineage_table_generation(table)?;
         let snapshot = self.snapshot_for_read();
         let local_row_id = self
-            .row_id_for_natural_key_full(table, natural_key, snapshot)
+            .visible_row_by_natural_key(table, natural_key, snapshot, &HashSet::new())?
+            .map(|row| row.row_id)
             .ok_or_else(|| Error::SyncError(format!("cannot purge missing {table} row")))?;
         let row_sidecar_key =
             Self::durable_row_lineage_config_key(table, natural_key, table_generation);
@@ -41911,7 +41968,14 @@ impl Database {
         selection: &AuthoritativePurgeSelection,
     ) -> Result<AuthoritativePurgeLineageWitness> {
         let snapshot = self.snapshot_for_read();
-        if self.row_id_for_natural_key_full(&selection.table, &selection.natural_key, snapshot)
+        if self
+            .visible_row_by_natural_key(
+                &selection.table,
+                &selection.natural_key,
+                snapshot,
+                &HashSet::new(),
+            )?
+            .map(|row| row.row_id)
             != Some(selection.local_row_id)
         {
             return Err(Error::SyncError(
@@ -42163,6 +42227,33 @@ impl Database {
         })
     }
 
+    fn authoritative_purge_selected_row_versions(
+        &self,
+        table: &str,
+        selected: &HashSet<RowId>,
+    ) -> Result<Vec<VersionedRow>> {
+        if let Some(root) = self.writer_read_root()? {
+            let mut rows = Vec::new();
+            for row_id in selected {
+                let mut cursor = root.row_cursor(table, *row_id)?;
+                while let Some(window) = cursor.next_row()? {
+                    rows.push(self.clone_writer_row(&window.value)?);
+                }
+            }
+            return Ok(rows);
+        }
+        Ok(self
+            .relational_store
+            .tables
+            .read()
+            .get(table)
+            .into_iter()
+            .flatten()
+            .filter(|row| selected.contains(&row.row_id))
+            .cloned()
+            .collect())
+    }
+
     fn authoritative_purge_selected_blob_hashes(
         &self,
         selections: &[AuthoritativePurgeSelection],
@@ -42171,13 +42262,12 @@ impl Database {
             return Ok(BTreeSet::new());
         }
         let snapshot = self.snapshot_for_read();
-        let rows = self
-            .relational_store
-            .tables
-            .read()
-            .get("work_jobs")
-            .cloned()
-            .unwrap_or_default();
+        let ids = selections
+            .iter()
+            .filter(|selection| selection.table == "work_jobs")
+            .map(|selection| selection.local_row_id)
+            .collect::<HashSet<_>>();
+        let rows = self.authoritative_purge_selected_row_versions("work_jobs", &ids)?;
         let mut hashes = BTreeSet::new();
         for selected in selections.iter().filter(|s| s.table == "work_jobs") {
             let mut visible = rows
@@ -42235,13 +42325,7 @@ impl Database {
             .map(|selection| selection.local_row_id)
             .collect::<HashSet<_>>();
         let snapshot = self.snapshot_for_read();
-        let rows = self
-            .relational_store
-            .tables
-            .read()
-            .get("work_jobs")
-            .cloned()
-            .unwrap_or_default();
+        let rows = self.committed_rows_at("work_jobs", snapshot)?;
         let mut survivor_hashes = BTreeSet::new();
         for row in rows
             .iter()
@@ -42375,17 +42459,13 @@ impl Database {
             })
             .collect::<Result<Vec<_>>>()?;
         let prepared_snapshot = self.snapshot();
-        let all_rows = self.relational_store.tables.read();
         let selected_table_rows = selected_by_table
-            .keys()
-            .map(|table| {
-                (
-                    table.clone(),
-                    all_rows.get(table).cloned().unwrap_or_default(),
-                )
+            .iter()
+            .map(|(table, ids)| {
+                self.authoritative_purge_selected_row_versions(table, ids)
+                    .map(|rows| (table.clone(), rows))
             })
-            .collect::<BTreeMap<_, _>>();
-        drop(all_rows);
+            .collect::<Result<BTreeMap<_, _>>>()?;
         let mut row_versions = Vec::new();
         let mut selected_versions = Vec::new();
         for candidate in selections {
@@ -42713,11 +42793,26 @@ impl Database {
                 &sink_names,
             )?);
             let before = &selected_table_rows[table];
-            let after = before
-                .iter()
-                .filter(|row| !ids.contains(&row.row_id))
-                .cloned()
-                .collect::<Vec<_>>();
+            let after = if self.relational_store.uses_disk_backed_committed_bodies() {
+                if report_requested && table == "work_jobs" {
+                    self.committed_rows_at(table, prepared_snapshot)?
+                        .into_iter()
+                        .filter(|row| !ids.contains(&row.row_id))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                self.relational_store
+                    .tables
+                    .read()
+                    .get(table)
+                    .into_iter()
+                    .flatten()
+                    .filter(|row| !ids.contains(&row.row_id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
             let report = Self::prepare_authoritative_purge_survivor_report(
                 report_requested,
                 table,
@@ -42759,7 +42854,14 @@ impl Database {
                 RelationalStore::table_projection(table.clone(), meta, after.clone()),
                 sources,
             ));
-            affected_rows.insert(table.clone(), after);
+            affected_rows.insert(
+                table.clone(),
+                if self.relational_store.uses_disk_backed_committed_bodies() {
+                    Vec::new()
+                } else {
+                    after
+                },
+            );
         }
         let mut relational = self
             .relational_store
@@ -43650,6 +43752,10 @@ impl Database {
                     survivor_report: prepared.survivor_report,
                 };
 
+                let writer_erasure = persistence.prepare_writer_erasure(
+                    &publication_tables,
+                    &prepared.canonical_graph_entries,
+                )?;
                 let publication = persistence.prepare_acquired_authoritative_purge_publication(
                     physical_publication
                         .take()
@@ -43668,6 +43774,8 @@ impl Database {
                     }
                     return Err(error);
                 }
+                _read_publication.invalidate_cursors();
+                writer_erasure.publish();
                 #[cfg(feature = "test-seams")]
                 crash_at_purge_publication_boundary_for_test("after-durable-commit");
                 let publication_error = if let Some(publication) = publication {
@@ -44469,6 +44577,50 @@ impl Database {
         })
     }
 
+    pub(crate) fn transaction_ordered_staged_positions(
+        &self,
+        tx: TxId,
+        table: &str,
+        index: &str,
+        reverse: bool,
+        before_clone: &mut dyn FnMut(
+            usize,
+        ) -> std::result::Result<
+            (),
+            crate::executor::BoundedExecutionError,
+        >,
+    ) -> std::result::Result<Option<Vec<usize>>, crate::executor::BoundedExecutionError> {
+        self.tx_mgr
+            .with_write_set(tx, |ws| {
+                let Some(cursor) = ws.ordered_staged_rows.cursor(
+                    table,
+                    index,
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Unbounded,
+                    reverse,
+                ) else {
+                    return Ok(None);
+                };
+                let count = cursor.count();
+                before_clone(count.saturating_mul(std::mem::size_of::<usize>()))?;
+                let mut positions = Vec::with_capacity(count);
+                positions.extend(
+                    ws.ordered_staged_rows
+                        .cursor(
+                            table,
+                            index,
+                            std::ops::Bound::Unbounded,
+                            std::ops::Bound::Unbounded,
+                            reverse,
+                        )
+                        .expect("staged index is held")
+                        .map(|entry| entry.position),
+                );
+                Ok(Some(positions))
+            })
+            .map_err(crate::executor::BoundedExecutionError::from)?
+    }
+
     /// One row the transaction has staged, cloned under the caller's charge.
     ///
     /// The identity is charged before it is read and the values before they
@@ -44711,10 +44863,10 @@ impl Database {
         }
         if self.persistence.is_some() {
             budget.remaining()?;
-            let root = self.writer_read_root()?.ok_or_else(closed_database_error)?;
-            #[cfg(feature = "test-seams")]
-            root.note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
-            let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(root.snapshot));
+            let (snapshot, root) =
+                self.capture_writer_transaction_statement(self.active_read_transaction())?;
+            let root = root.ok_or_else(closed_database_error)?;
+
             let Some(registration) = self
                 .snapshot_registry
                 .register_pinned_root_with_budget(snapshot, None, budget, withdrawn)?
@@ -44856,10 +45008,13 @@ impl Database {
         }
         if self.persistence.is_some() {
             budget.remaining()?;
-            let root = self.writer_read_root()?.ok_or_else(closed_database_error)?;
-            #[cfg(feature = "test-seams")]
-            root.note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
-            let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(root.snapshot));
+            let (snapshot, root) =
+                self.capture_writer_transaction_statement(self.active_read_transaction())?;
+            let root = root.ok_or_else(closed_database_error)?;
+            let Some(storage) = self.writer_cursor_storage_pin(&root, budget, withdrawn)? else {
+                return Ok(None);
+            };
+
             let window = Arc::new(CursorIdleWindow::new(
                 Arc::clone(&clock),
                 idle_ms,
@@ -44878,7 +45033,7 @@ impl Database {
                 snapshot,
                 root.lsn,
                 window,
-                None,
+                Some(storage),
                 Box::new(registration),
                 Some(root),
             )));
@@ -45541,7 +45696,6 @@ impl Database {
         if let Some(root) = self.writer_read_root().map_err(E::from)? {
             let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)
                 .map_err(E::from)?;
-            let _ = (before_retain, release_retained);
             return self.writer_exact_next(
                 &source,
                 table,
@@ -45549,6 +45703,8 @@ impl Database {
                 snapshot,
                 cursor,
                 before_touch,
+                before_retain,
+                release_retained,
                 before_clone,
             );
         }
@@ -49514,6 +49670,7 @@ impl Database {
                 receipt.active_transactions = active.len();
                 for ws in active.values() {
                     receipt.staged_row_versions += ws.relational_inserts.len();
+                    receipt.staged_index_postings += ws.ordered_staged_rows.retained_bytes();
                     for (table, row) in &ws.relational_inserts {
                         receipt.staged_row_admissions += ws
                             .admitted_bytes_for_staged_row(table, row.row_id)
@@ -49587,7 +49744,16 @@ impl Database {
                 .handle
                 .and_then(|root| root.downcast::<crate::persistence::WriterSnapshot>().ok())
                 .map_or(0, |root| root.control_bytes());
+            receipt.captured_root_charge = self
+                .persistence
+                .as_ref()
+                .map_or(0, |persistence| {
+                    persistence.writer_snapshot_charge_for_test()
+                })
+                .saturating_sub(receipt.published_root_charge);
             receipt.named_owner_total = receipt.published_root_charge
+                + receipt.captured_root_charge
+                + receipt.staged_index_postings
                 + receipt.vector.retained_total
                 + receipt.vector.temporary_workspace
                 + receipt.current_row_values
@@ -62005,6 +62171,8 @@ impl Database {
         push_outcome_key: Option<&SyncPushOutcomeContext>,
         unit_reservation: Option<&crate::memory_accounting::SchemaUnitReservation>,
     ) -> Result<ApplyResult> {
+        let published = self.tx_mgr.capture_published_read();
+        let _writer_read = self.enter_writer_read(writer_read::durable_root(published.handle)?);
         let replace_received_vector_image = stage_verified_lineages
             && !changes.vectors.is_empty()
             && self.received_vector_image_pending.load(Ordering::SeqCst);
@@ -65384,6 +65552,21 @@ impl Database {
         }
         let durable = if let Some(source) = &self.retained_relational_source {
             source.relational_row_by_id_lsn(table, &meta, row.row_id, row.lsn)?
+        } else if let Some(root) = self.writer_read_root()? {
+            use contextdb_relational::source::RelationalReadSource;
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+            let mut key = [0u8; 24];
+            key[..8].copy_from_slice(&row.row_id.0.to_be_bytes());
+            key[8..16].copy_from_slice(&row.created_tx.0.to_be_bytes());
+            key[16..].copy_from_slice(&row.lsn.0.to_be_bytes());
+            if let Some(window) = source.exact_row(table, &key)? {
+                if projection.bounded {
+                    (projection.admit)(window.value().estimated_bytes())?;
+                }
+                Some(self.clone_writer_row(window.value())?)
+            } else {
+                None
+            }
         } else {
             let Some(persistence) = self.persistence.as_ref() else {
                 return Ok(Vec::new());
@@ -65442,7 +65625,7 @@ impl Database {
             let mut cursor = source.row_id_cursor(table, row_id, source.snapshot())?;
             while let Some(window) = cursor.next_window()? {
                 if window.value().lsn == lsn {
-                    return Ok(Some(window.value().clone()));
+                    return self.clone_writer_row(window.value()).map(Some);
                 }
             }
             return Ok(None);

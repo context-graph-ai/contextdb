@@ -6,9 +6,14 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
+pub trait StagedPostingAdmission: Send + Sync {
+    fn reserve(&self, bytes: usize) -> Result<Arc<dyn contextdb_tx::StagedPostingCharge>>;
+}
+
 pub struct MemRelationalExecutor<S: WriteSetApplicator> {
     store: Arc<RelationalStore>,
     tx_mgr: Arc<TransactionManager<S>>,
+    staged_posting_admission: Option<Arc<dyn StagedPostingAdmission>>,
 }
 
 /// Position in an ordered B-tree posting walk. The cursor stores only owned
@@ -778,7 +783,14 @@ impl BoundedExactIndexCursor {
     }
 
     #[doc(hidden)]
+    pub fn source_advance_charged(&mut self, source_key: Vec<u8>, row_id: RowId, bytes: usize) {
+        self.source_advance(source_key, row_id);
+        self.retained_bytes = bytes;
+    }
+
+    #[doc(hidden)]
     pub fn source_finish_probe(&mut self) -> bool {
+        self.retained_bytes = 0;
         self.keys.pop_front();
         self.source_key = None;
         self.last_row_id = None;
@@ -892,7 +904,77 @@ fn push_admitted_source_row(
 
 impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     pub fn new(store: Arc<RelationalStore>, tx_mgr: Arc<TransactionManager<S>>) -> Self {
-        Self { store, tx_mgr }
+        Self {
+            store,
+            tx_mgr,
+            staged_posting_admission: None,
+        }
+    }
+
+    pub fn with_staged_posting_admission(
+        mut self,
+        admission: Arc<dyn StagedPostingAdmission>,
+    ) -> Self {
+        self.staged_posting_admission = Some(admission);
+        self
+    }
+
+    /// Stage admitted positions before publishing a row into its write set.
+    pub fn stage_ordered_row(
+        &self,
+        ws: &mut contextdb_tx::WriteSet,
+        table: &str,
+        row: &VersionedRow,
+        position: usize,
+    ) -> Result<()> {
+        let Some(admission) = &self.staged_posting_admission else {
+            return Ok(());
+        };
+        let meta = self.store.table_meta.read();
+        let meta = meta
+            .get(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let scratch_bytes = meta.indexes.iter().fold(256usize, |bytes, index| {
+            bytes.saturating_add(index.name.len()).saturating_add(
+                index
+                    .columns
+                    .iter()
+                    .map(|(column, _)| {
+                        row.values
+                            .get(column)
+                            .map_or(0, Value::estimated_bytes)
+                            .saturating_mul(4)
+                            .saturating_add(128)
+                    })
+                    .sum::<usize>(),
+            )
+        });
+        let _scratch = admission.reserve(scratch_bytes)?;
+        let keys = meta
+            .indexes
+            .iter()
+            .map(|index| {
+                let values = index
+                    .columns
+                    .iter()
+                    .map(|(column, _)| row.values.get(column).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                (
+                    index.name.clone(),
+                    index_key_from_values(&index.columns, &values),
+                )
+            })
+            .collect::<Vec<_>>();
+        ws.ordered_staged_rows.stage(
+            table,
+            contextdb_tx::StagedPosition {
+                position,
+                row_id: row.row_id,
+                created_tx: row.created_tx,
+            },
+            &keys,
+            |bytes| admission.reserve(bytes),
+        )
     }
 
     /// Complete operation output from a captured durable root. The caller
@@ -945,7 +1027,12 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     .saturating_add(ws.relational_inserts.len());
                 let scratch_bytes = scratch_entries.saturating_mul(32);
                 before_clone(scratch_bytes)?;
-                let committed_ids: HashSet<_> = result.iter().map(|row| row.row_id).collect();
+                let staged_ids: HashSet<_> = ws
+                    .relational_inserts
+                    .iter()
+                    .filter(|(t, _)| t == table)
+                    .map(|(_, row)| row.row_id)
+                    .collect();
                 let deleted_ids: HashSet<_> = ws
                     .relational_deletes
                     .iter()
@@ -954,6 +1041,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     .collect();
                 result.retain(|row| {
                     !deleted_ids.contains(&row.row_id)
+                        && !staged_ids.contains(&row.row_id)
                         && !row_matches_delete_predicates(
                             &ws.relational_delete_predicates,
                             table,
@@ -967,7 +1055,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                         && seen.insert(row.row_id)
                         && predicate(row)
                         && (!deleted_ids.contains(&row.row_id)
-                            || committed_ids.contains(&row.row_id))
+                            || crate::source::visible_row(source, table, row.row_id, snapshot)?
+                                .is_some())
                     {
                         push_admitted_source_row(&mut result, row, &mut before_clone)?;
                     }
@@ -1105,6 +1194,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 }
             });
             if removed {
+                ws.ordered_staged_rows.remove(table, row_id);
+                ws.rebind_ordered_staged_rows();
                 ws.forget_relational_insert_admitted_bytes(table, row_id);
             }
             if committed_row_exists
@@ -2116,8 +2207,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {
+            self.stage_ordered_row(ws, table, &row, ws.relational_inserts.len())?;
             ws.relational_inserts.push((table.to_string(), row));
-        })?;
+            Ok::<_, Error>(())
+        })??;
 
         Ok(row_id)
     }
@@ -2201,8 +2294,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {
+            self.stage_ordered_row(ws, table, &row, ws.relational_inserts.len())?;
             ws.relational_inserts.push((table.to_string(), row));
-        })?;
+            Ok::<_, Error>(())
+        })??;
 
         Ok(row_id)
     }
@@ -2306,6 +2401,8 @@ impl<S: WriteSetApplicator> RelationalExecutor for MemRelationalExecutor<S> {
             let table_name = table.to_string();
             ws.relational_inserts
                 .retain(|(t, row)| !(t == table && row.row_id == row_id));
+            ws.ordered_staged_rows.remove(table, row_id);
+            ws.rebind_ordered_staged_rows();
 
             if committed_row_exists
                 && !ws

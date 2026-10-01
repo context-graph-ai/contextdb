@@ -595,8 +595,13 @@ impl RedbKey for DurableRelationalIndexKey {
 
 /// A cursor's native storage pin overlaps publication of its external hold.
 pub(crate) struct OwnerCursorStoragePin {
-    pub(crate) read: redb::ReadTransaction,
+    read: Arc<redb::ReadTransaction>,
     _registration: ReadSnapshotRegistrationGuard,
+}
+impl OwnerCursorStoragePin {
+    pub(crate) fn storage_identity(&self) -> redb::StorageSnapshotIdentity {
+        self.read.storage_snapshot_identity()
+    }
 }
 
 /// A failed nonblocking pin attempt retains the typed refusal and whether
@@ -16809,6 +16814,7 @@ pub struct RedbPersistence {
     /// through this, so a write that cannot fit the configured budget receives
     /// the existing typed refusal instead of allocating anyway.
     proof_accountant: std::sync::OnceLock<Arc<crate::memory_accounting::MemoryAccountant>>,
+    writer_snapshots: Arc<parking_lot::Mutex<Vec<std::sync::Weak<WriterSnapshot>>>>,
     /// What the owning database charged its accountant for this store's Redb
     /// page cache when it opened it, so the close that stops holding the
     /// cache hands back exactly that.
@@ -18713,6 +18719,20 @@ impl RedbPersistence {
     pub(crate) fn owner_cursor_pin_for_admission(
         &self,
     ) -> std::result::Result<OwnerCursorStoragePin, OwnerCursorPinAdmissionError> {
+        self.owner_cursor_pin_from_read(None)
+    }
+
+    pub(crate) fn owner_cursor_pin_for_root(
+        &self,
+        root: &WriterSnapshot,
+    ) -> std::result::Result<OwnerCursorStoragePin, OwnerCursorPinAdmissionError> {
+        self.owner_cursor_pin_from_read(Some(root.owner_read()))
+    }
+
+    fn owner_cursor_pin_from_read(
+        &self,
+        captured: Option<Arc<redb::ReadTransaction>>,
+    ) -> std::result::Result<OwnerCursorStoragePin, OwnerCursorPinAdmissionError> {
         let _coordination = OwnerCursorCoordinationScope::enter();
         let coordination_refusal = |reason| Error::ReaderCoordinationUnavailable {
             operation: "owner cursor pin".to_owned(),
@@ -18750,7 +18770,10 @@ impl RedbPersistence {
         let db = database_guard
             .as_ref()
             .ok_or_else(|| coordination_refusal("database persistence is closed".to_owned()))?;
-        let read = db.begin_read().map_err(Self::storage_error)?;
+        let read = match captured {
+            Some(read) => read,
+            None => Arc::new(db.begin_read().map_err(Self::storage_error)?),
+        };
         let companion = inspect_companion_record(&self.path).map_err(|error| {
             Error::ReaderCoordinationUnavailable {
                 operation: "owner cursor pin".to_owned(),
@@ -19133,6 +19156,7 @@ impl RedbPersistence {
             #[cfg(feature = "test-seams")]
             handoff_prepare_io_fault: AtomicBool::new(false),
             proof_accountant: std::sync::OnceLock::new(),
+            writer_snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
             cache_charge_bytes: std::sync::OnceLock::new(),
             used_legacy_table_meta_layout: AtomicBool::new(false),
         })
@@ -19196,6 +19220,7 @@ impl RedbPersistence {
                         #[cfg(feature = "test-seams")]
                         handoff_prepare_io_fault: AtomicBool::new(false),
                         proof_accountant,
+                        writer_snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
                         cache_charge_bytes: std::sync::OnceLock::new(),
                         used_legacy_table_meta_layout: AtomicBool::new(false),
                     })
@@ -19371,6 +19396,7 @@ impl RedbPersistence {
                     #[cfg(feature = "test-seams")]
                     handoff_prepare_io_fault: AtomicBool::new(false),
                     proof_accountant: std::sync::OnceLock::new(),
+                    writer_snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
                     cache_charge_bytes: std::sync::OnceLock::new(),
                     used_legacy_table_meta_layout: AtomicBool::new(false),
                 };

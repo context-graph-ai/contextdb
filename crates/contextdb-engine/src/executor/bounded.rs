@@ -4844,6 +4844,34 @@ impl ScanState {
             Some(merge) if merge.staged.is_none() => {}
             _ => return Ok(()),
         }
+        let mut maintained_order = false;
+        if let (Some(transaction), ScanMode::Ordered { cursor, .. }) =
+            (&mut self.transaction, &self.mode)
+            && let Some(index) = cursor.index_name()
+        {
+            let reserved = Cell::new(0usize);
+            let positions = db.transaction_ordered_staged_positions(
+                transaction.tx,
+                &self.table,
+                index,
+                cursor.source_reverse(),
+                &mut |bytes| {
+                    context.reserve(BoundedWorkSource::TableScan, bytes)?;
+                    reserved.set(bytes);
+                    Ok(())
+                },
+            )?;
+            if let Some(positions) = positions
+                && positions.len() == transaction.overlay.staged_positions.len()
+            {
+                transaction.overlay.staged_positions = positions;
+                maintained_order = true;
+                // This replaces, rather than adds to, the already admitted position vector.
+                context.release(reserved.get())?;
+            } else {
+                context.release(reserved.get())?;
+            }
+        }
         let mut rows = Vec::new();
         while let Some(staged) = self.next_staged_row(db, context)? {
             rows.push(staged);
@@ -4853,9 +4881,11 @@ impl ScanState {
         };
         // newest_event_merges_staged_order_without_sort observes the real
         // bounded-kernel overlay sort, as well as the eager executor's sort.
-        #[cfg(feature = "in-process-test-seams")]
-        crate::writer_query_test_seams::note_staged_sort(rows.len());
-        rows.sort_by(|left, right| compare_ordered_merge_rows(&left.0, &right.0, &merge.keys));
+        if !maintained_order {
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_query_test_seams::note_staged_sort(rows.len());
+            rows.sort_by(|left, right| compare_ordered_merge_rows(&left.0, &right.0, &merge.keys));
+        }
         merge.held_bytes = rows.iter().map(|(_, bytes)| *bytes).sum();
         merge.staged = Some(rows.into());
         Ok(())
@@ -13316,7 +13346,7 @@ pub(super) fn open_cursor(
             state
                 .storage_snapshot
                 .as_ref()
-                .map(|pin| pin.read.storage_snapshot_identity())
+                .map(|pin| pin.storage_identity())
                 .or_else(|| {
                     state
                         .writer_root
@@ -13337,8 +13367,12 @@ pub(super) fn open_cursor(
         publication: publication.clone(),
         erased: std::sync::atomic::AtomicBool::new(false),
         active_cancellation: Mutex::new(publication.budget.cancellation.clone()),
+        cancellation_listener: Mutex::new(None),
+        expiry_waker: Mutex::new(None),
     });
+    execution.watch_cancellation(&publication.budget.cancellation);
     db.register_writer_cursor(&execution)?;
+    start_cursor_expiry_watch(&execution)?;
     Ok(BoundedCursorOpen {
         cursor: BoundedCursorHandle { _state: execution },
         first_page: first.page,
@@ -13346,6 +13380,100 @@ pub(super) fn open_cursor(
         publication,
         telemetry: first.telemetry,
     })
+}
+
+/// Keep the existing cursor deadlines authoritative while no fetch is active.
+/// The watcher owns only a weak lifecycle reference and the declared clock.
+fn start_cursor_expiry_watch(
+    execution: &Arc<BoundedCursorExecutionState>,
+) -> std::result::Result<(), BoundedExecutionError> {
+    struct WakeThread(std::thread::Thread);
+    impl std::task::Wake for WakeThread {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let (clock, mut deadline) = {
+        let lifecycle = execution
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let BoundedCursorLifecycle::Open(state) = &*lifecycle else {
+            return Ok(());
+        };
+        (state.context.clock.clone(), cursor_deadline(state))
+    };
+    let weak = Arc::downgrade(execution);
+    std::thread::Builder::new()
+        .name("contextdb-read-expiry".into())
+        .spawn(move || {
+            let thread = std::thread::current();
+            if let Some(execution) = weak.upgrade() {
+                *execution
+                    .expiry_waker
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(thread.clone());
+            } else {
+                return;
+            }
+            let waker = std::task::Waker::from(Arc::new(WakeThread(thread)));
+            let mut context = std::task::Context::from_waker(&waker);
+            loop {
+                let mut wait = clock.wait_until(deadline);
+                loop {
+                    let ready = wait.as_mut().poll(&mut context).is_ready();
+                    {
+                        let Some(execution) = weak.upgrade() else {
+                            return;
+                        };
+                        let mut lifecycle = execution
+                            .lifecycle
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        let BoundedCursorLifecycle::Open(state) = &mut *lifecycle else {
+                            return;
+                        };
+                        if let Err(error) = state.check_expiry() {
+                            state.finish_plugin_error(&error);
+                            *lifecycle = BoundedCursorLifecycle::Released(
+                                BoundedCursorTerminalReason::Expired,
+                            );
+                            return;
+                        }
+                        let next = cursor_deadline(state);
+                        if next != deadline {
+                            deadline = next;
+                            break;
+                        }
+                    }
+                    if ready {
+                        // A failed timer arm returns ready before its deadline.
+                        std::thread::park_timeout(std::time::Duration::from_millis(
+                            deadline.saturating_sub(clock.now_ms()).max(1),
+                        ));
+                    } else {
+                        std::thread::park();
+                    }
+                }
+            }
+        })
+        .map_err(|error| Error::Other(format!("cursor expiry watcher could not start: {error}")))?;
+    Ok(())
+}
+
+fn cursor_deadline(state: &CursorState) -> u64 {
+    state
+        .created_ms
+        .saturating_add(state.context.limits.cursor_lifetime_ms)
+        .min(
+            state
+                .last_used_ms
+                .saturating_add(state.context.limits.cursor_idle_ms),
+        )
+        .saturating_add(1)
 }
 
 /// A work refusal names the statement it stopped and the one move that
@@ -13453,6 +13581,7 @@ pub(super) fn fetch_cursor(
         .active_cancellation
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = cancellation.clone();
+    cursor._state.watch_cancellation(&cancellation);
     let mut lifecycle = cursor_lifecycle(cursor);
     if cursor
         ._state
@@ -13534,7 +13663,9 @@ pub(super) fn fetch_cursor(
             Ok(fetch)
         }
         Err(BoundedExecutionError::Cancelled) => {
-            *lifecycle = BoundedCursorLifecycle::Open(state);
+            state.finish_plugin_error(&BoundedExecutionError::Cancelled);
+            *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
+            cursor._state.wake_expiry();
             Err(BoundedExecutionError::Cancelled)
         }
         Err(error) => {

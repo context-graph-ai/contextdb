@@ -454,6 +454,18 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     /// One row the transaction has staged, cloned under the caller's charge,
     /// exactly as a committed row is. `position` is an entry of
     /// [`TransactionTableOverlay::staged_positions`].
+    fn transaction_ordered_staged_positions(
+        &self,
+        tx: TxId,
+        table: &str,
+        index: &str,
+        reverse: bool,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<Vec<usize>>, BoundedExecutionError> {
+        let _ = (tx, table, index, reverse, before_clone);
+        Ok(None)
+    }
+
     fn transaction_staged_row(
         &self,
         tx: TxId,
@@ -1384,6 +1396,24 @@ impl ReadExecutionTarget for Database {
 
     fn transaction_table_overlay(&self, tx: TxId, table: &str) -> Result<TransactionTableOverlay> {
         Database::transaction_table_overlay(self, tx, table)
+    }
+
+    fn transaction_ordered_staged_positions(
+        &self,
+        tx: TxId,
+        table: &str,
+        index: &str,
+        reverse: bool,
+        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
+    ) -> std::result::Result<Option<Vec<usize>>, BoundedExecutionError> {
+        Database::transaction_ordered_staged_positions(
+            self,
+            tx,
+            table,
+            index,
+            reverse,
+            before_clone,
+        )
     }
 
     fn transaction_staged_row(
@@ -2610,9 +2640,42 @@ pub(crate) struct BoundedCursorExecutionState {
     pub(crate) publication: ReadPublicationScope,
     erased: std::sync::atomic::AtomicBool,
     active_cancellation: std::sync::Mutex<OwnerReadCancellation>,
+    cancellation_listener:
+        std::sync::Mutex<Option<contextdb_core::read_contract::CancellationListener>>,
+    expiry_waker: std::sync::Mutex<Option<std::thread::Thread>>,
 }
 
 impl BoundedCursorExecutionState {
+    fn watch_cancellation(self: &Arc<Self>, cancellation: &OwnerReadCancellation) {
+        let weak = Arc::downgrade(self);
+        let listener = cancellation.tell_on_cancel(move || {
+            if let Some(execution) = weak.upgrade() {
+                // Cancellation can originate inside an active source callback.
+                // The active fetch releases itself; a parked read releases here.
+                if let Ok(mut lifecycle) = execution.lifecycle.try_lock() {
+                    *lifecycle =
+                        BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
+                }
+                execution.wake_expiry();
+            }
+        });
+        *self
+            .cancellation_listener
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(listener);
+    }
+
+    fn wake_expiry(&self) {
+        if let Some(thread) = self
+            .expiry_waker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            thread.unpark();
+        }
+    }
+
     pub(crate) fn release_for_erasure(&self) {
         self.erased.store(true, std::sync::atomic::Ordering::SeqCst);
         let cancellation = self
@@ -2623,6 +2686,13 @@ impl BoundedCursorExecutionState {
         cancellation.cancel();
         let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
         *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Erased);
+        self.wake_expiry();
+    }
+}
+
+impl Drop for BoundedCursorExecutionState {
+    fn drop(&mut self) {
+        self.wake_expiry();
     }
 }
 

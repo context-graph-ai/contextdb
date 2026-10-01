@@ -31,14 +31,107 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 /// An admitted durable descriptor prepared before the transaction manager's
 /// publication swap. Only capture_published_read captures statement roots.
 pub(crate) struct WriterSnapshot {
-    read: redb::ReadTransaction,
+    read: Arc<redb::ReadTransaction>,
     pub(crate) snapshot: SnapshotId,
     pub(crate) lsn: Lsn,
     accountant: Arc<MemoryAccountant>,
     _control: OwnedMemoryReservation,
+    erasure: parking_lot::RwLock<WriterErasure>,
+    registry: Arc<parking_lot::Mutex<Vec<std::sync::Weak<WriterSnapshot>>>>,
+}
+
+impl Drop for WriterSnapshot {
+    fn drop(&mut self) {
+        let mut roots = self.registry.lock();
+        roots.retain(|root| !std::ptr::eq(root.as_ptr(), self));
+        roots.shrink_to_fit();
+    }
+}
+
+#[derive(Default)]
+struct WriterErasure {
+    tables: BTreeSet<String>,
+    graph_keys: BTreeSet<Vec<u8>>,
+    _memory: Option<OwnedMemoryReservation>,
+}
+
+pub(crate) struct PreparedWriterErasure(Vec<(Arc<WriterSnapshot>, WriterErasure)>);
+impl PreparedWriterErasure {
+    pub(crate) fn publish(self) {
+        for (root, erasure) in self.0 {
+            *root.erasure.write() = erasure;
+        }
+    }
 }
 
 impl RedbPersistence {
+    /// Prepare capability restrictions before durability. Old descriptors retain
+    /// their native image, but cannot decode erased families after publication.
+    pub(crate) fn prepare_writer_erasure(
+        &self,
+        tables: &BTreeSet<String>,
+        edges: &[AdjEntry],
+    ) -> Result<PreparedWriterErasure> {
+        let roots = {
+            let mut roots = self.writer_snapshots.lock();
+            roots.retain(|root| root.strong_count() != 0);
+            roots
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        let mut replacements = Vec::with_capacity(roots.len());
+        for root in roots {
+            let current = root.erasure.read();
+            let bytes = current
+                .tables
+                .iter()
+                .chain(tables.iter())
+                .map(|table| table.len().saturating_add(96))
+                .sum::<usize>()
+                .saturating_add(
+                    current
+                        .graph_keys
+                        .iter()
+                        .map(|key| key.len().saturating_add(96))
+                        .sum::<usize>(),
+                )
+                .saturating_add(
+                    edges
+                        .iter()
+                        .map(|edge| edge.edge_type.len().saturating_add(160))
+                        .sum::<usize>()
+                        .saturating_mul(2),
+                )
+                .saturating_add(std::mem::size_of::<WriterErasure>());
+            let memory = root.adapter_control(bytes)?;
+            let mut next = WriterErasure {
+                tables: current.tables.clone(),
+                graph_keys: current.graph_keys.clone(),
+                _memory: Some(memory),
+            };
+            next.tables.extend(tables.iter().cloned());
+            for edge in edges {
+                next.graph_keys.insert(RedbPersistence::graph_fwd_key(edge));
+                next.graph_keys.insert(RedbPersistence::graph_rev_key(edge));
+            }
+            drop(current);
+            replacements.push((root, next));
+        }
+        Ok(PreparedWriterErasure(replacements))
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn writer_snapshot_charge_for_test(&self) -> usize {
+        let roots = self
+            .writer_snapshots
+            .lock()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect::<Vec<_>>();
+        roots.iter().map(|root| root.control_bytes()).sum()
+    }
+
     /// Prepare the initial admitted root before constructing the manager.
     /// Pass it to new_with_directory; persistence keeps no publication slot.
     pub(crate) fn initialize_writer_snapshot(
@@ -78,14 +171,20 @@ impl RedbPersistence {
             Error::Other("writer source requires the attached memory accountant".into())
         })?;
         self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            Ok(Arc::new(WriterSnapshot {
+            let read = Arc::new(db.begin_read().map_err(Self::storage_error)?);
+            let root = Arc::new(WriterSnapshot {
                 read,
                 snapshot,
                 lsn,
                 accountant,
                 _control: control,
-            }))
+                erasure: parking_lot::RwLock::new(WriterErasure::default()),
+                registry: self.writer_snapshots.clone(),
+            });
+            let mut roots = self.writer_snapshots.lock();
+            roots.retain(|root| root.strong_count() != 0);
+            roots.push(Arc::downgrade(&root));
+            Ok(root)
         })
     }
 }
@@ -132,6 +231,7 @@ pub(crate) enum WriterCursorFamily {
 pub(crate) struct WriterReadCursor {
     root: Arc<WriterSnapshot>,
     table: String,
+    logical_table: Option<String>,
     family: WriterCursorFamily,
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
@@ -173,8 +273,18 @@ impl WriterSnapshot {
     }
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn control_bytes(&self) -> usize {
-        self._control.bytes()
+        self._control.bytes().saturating_add(
+            self.erasure
+                .read()
+                ._memory
+                .as_ref()
+                .map_or(0, OwnedMemoryReservation::bytes),
+        )
     }
+    pub(super) fn owner_read(&self) -> Arc<redb::ReadTransaction> {
+        Arc::clone(&self.read)
+    }
+
     pub(crate) fn storage_identity(&self) -> redb::StorageSnapshotIdentity {
         self.read.storage_snapshot_identity()
     }
@@ -209,6 +319,7 @@ impl WriterSnapshot {
         Ok(WriterReadCursor {
             root: Arc::clone(self),
             table: table.to_owned(),
+            logical_table: table.strip_prefix("rel_").map(str::to_owned),
             family,
             lower: lower.map(<[u8]>::to_vec),
             upper: upper.map(<[u8]>::to_vec),
@@ -296,7 +407,8 @@ impl WriterSnapshot {
             Bound::Included(&prefix),
             end.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
             false,
-        )
+        )?
+        .with_table_scope(&index.table)
     }
 
     /// Ordered index endpoints use the canonical index codec/comparator,
@@ -315,11 +427,51 @@ impl WriterSnapshot {
         } else {
             RedbPersistence::relational_index_table_name(table, index)
         };
-        self.cursor(&name, WriterCursorFamily::Index, lower, upper, reverse)
+        self.cursor(&name, WriterCursorFamily::Index, lower, upper, reverse)?
+            .with_table_scope(table)
+    }
+}
+
+impl WriterErasure {
+    fn refusal() -> Error {
+        Error::ReadFailure(
+            contextdb_core::read_contract::ReadFailure::new(
+                contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure,
+                contextdb_core::read_contract::ReadFailureDetail::Reason {
+                    reason: "authoritative erasure invalidated this captured storage capability"
+                        .into(),
+                },
+            )
+            .expect("authoritative erasure carries reason detail"),
+        )
+    }
+    fn check_scope(&self, logical: Option<&str>, physical: &str) -> Result<()> {
+        let affected = match logical {
+            Some(table) => self.tables.contains(table),
+            None => !self.tables.is_empty() && !matches!(physical, "graph_fwd" | "graph_rev"),
+        };
+        if affected {
+            Err(Self::refusal())
+        } else {
+            Ok(())
+        }
+    }
+    fn check_key(&self, physical: &str, key: &[u8]) -> Result<()> {
+        if matches!(physical, "graph_fwd" | "graph_rev") && self.graph_keys.contains(key) {
+            Err(Self::refusal())
+        } else {
+            Ok(())
+        }
     }
 }
 
 impl WriterReadCursor {
+    fn with_table_scope(mut self, table: &str) -> Result<Self> {
+        self.continuation
+            .try_grow_for(table.len(), "writer_source", "cursor_keys", HINT)?;
+        self.logical_table = Some(table.to_owned());
+        Ok(self)
+    }
     pub(crate) fn examined_entries(&self) -> u64 {
         self.examined
     }
@@ -395,9 +547,16 @@ impl WriterReadCursor {
         before: &mut dyn FnMut() -> Result<()>,
         decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
     ) -> Result<Option<(Vec<u8>, T)>> {
+        self.root
+            .erasure
+            .read()
+            .check_scope(self.logical_table.as_deref(), &self.table)?;
         let (lower, upper) = self.bounds();
         let finish = |key: &[u8], value: &[u8]| -> Result<(Vec<u8>, T)> {
             before()?;
+            let erasure = self.root.erasure.read();
+            erasure.check_scope(self.logical_table.as_deref(), &self.table)?;
+            erasure.check_key(&self.table, key)?;
             memory.reserve(key.len())?;
             let decoded = memory.scope(|| decode(key, value))?;
             Ok((key.to_vec(), decoded))
@@ -600,6 +759,8 @@ impl WriterSnapshot {
     }
 
     pub(crate) fn sync_source(&self, table: &str, row_id: RowId) -> Result<Option<(Lsn, u8)>> {
+        let erasure = self.erasure.read();
+        erasure.check_scope(Some(table), "sync provenance")?;
         let _scratch = OwnedMemoryReservation::try_new_for(
             Arc::clone(&self.accountant),
             table.len().saturating_add(8),
@@ -789,7 +950,8 @@ impl WriterSnapshot {
             Bound::Included(&lower),
             Bound::Included(&upper),
             false,
-        )
+        )?
+        .with_table_scope(table)
     }
 
     pub(crate) fn change_log_occurrences(&self, lsn: Lsn) -> Result<u64> {
@@ -811,6 +973,8 @@ impl WriterSnapshot {
         &self,
         key: &str,
     ) -> Result<Option<WriterWindow<T>>> {
+        let erasure = self.erasure.read();
+        erasure.check_scope(None, "config")?;
         let table = match self.read.open_table(CONFIG_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
