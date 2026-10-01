@@ -2,8 +2,9 @@ mod membership;
 use membership::with_membership_read;
 #[doc(hidden)]
 pub use membership::{
-    RawVectorMembershipCursor, RawVectorMembershipSource, RawVectorMembershipSummary,
-    RawVectorReverseMembershipCursor, RawVectorReverseMembershipSource,
+    LazyRawVectorMembershipSource, RawVectorMembershipCursor, RawVectorMembershipFactory,
+    RawVectorMembershipSource, RawVectorMembershipSummary, RawVectorReverseMembershipCursor,
+    RawVectorReverseMembershipSource,
 };
 
 use crate::hnsw::ServingPages;
@@ -11799,6 +11800,22 @@ impl VectorStore {
             *column.durable_reverse_memberships.write() = Some(source);
             Ok(())
         })
+    }
+
+    /// Register only captured catalog metadata and a source factory. The
+    /// partition source is opened and verified on its first point/count/cursor
+    /// use, never during writable-open registration.
+    #[doc(hidden)]
+    pub fn register_lazy_durable_raw_partition(
+        &self,
+        partition: &VectorPartitionRef,
+        summary: RawVectorMembershipSummary,
+        factory: Arc<dyn RawVectorMembershipFactory>,
+        loader: Arc<dyn DormantRawVectorLoader>,
+    ) -> Result<Arc<LazyRawVectorMembershipSource>> {
+        let source = Arc::new(LazyRawVectorMembershipSource::new(summary, factory)?);
+        self.register_durable_raw_partition(partition, source.clone(), loader)?;
+        Ok(source)
     }
 
     /// Register a root-backed membership directory without enumerating records.

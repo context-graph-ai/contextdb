@@ -153,3 +153,111 @@ where
         None => result.map_err(E::from),
     }
 }
+
+/// Opens one authenticated partition membership source on first use. Its root
+/// is fixed when the factory is captured; opening must not enumerate records
+/// or retain decoded membership directories. The factory admits any transient
+/// verification scratch itself and calls before_read for every physical read.
+#[doc(hidden)]
+pub trait RawVectorMembershipFactory: Send + Sync {
+    fn load(
+        &self,
+        before_read: &mut dyn FnMut() -> bool,
+    ) -> Result<std::sync::Arc<dyn RawVectorMembershipSource>>;
+}
+
+/// A catalog summary and a lazy, evictable source handle. Registration reads
+/// no membership record. Resolving a handle verifies its published summary
+/// against the captured catalog before any record can be consumed.
+#[doc(hidden)]
+pub struct LazyRawVectorMembershipSource {
+    summary: RawVectorMembershipSummary,
+    factory: std::sync::Arc<dyn RawVectorMembershipFactory>,
+    source: parking_lot::Mutex<Option<std::sync::Arc<dyn RawVectorMembershipSource>>>,
+}
+impl LazyRawVectorMembershipSource {
+    pub fn new(
+        summary: RawVectorMembershipSummary,
+        factory: std::sync::Arc<dyn RawVectorMembershipFactory>,
+    ) -> Result<Self> {
+        if summary.live_entries > summary.entries {
+            return Err(Error::Other(
+                "lazy vector membership catalog count is invalid".into(),
+            ));
+        }
+        Ok(Self {
+            summary,
+            factory,
+            source: parking_lot::Mutex::new(None),
+        })
+    }
+    fn resolve(
+        &self,
+        before_read: &mut dyn FnMut() -> bool,
+    ) -> Result<std::sync::Arc<dyn RawVectorMembershipSource>> {
+        let mut slot = self.source.lock();
+        if let Some(source) = slot.as_ref() {
+            return Ok(std::sync::Arc::clone(source));
+        }
+        let source = self.factory.load(before_read)?;
+        if source.published_summary() != self.summary {
+            return Err(Error::Other(
+                "lazy vector membership source disagrees with its captured catalog".into(),
+            ));
+        }
+        *slot = Some(std::sync::Arc::clone(&source));
+        Ok(source)
+    }
+    /// Drop only this idle handle. Open cursors/readers preserve their own
+    /// source root and reservations; the next operation verifies a new handle.
+    pub fn evict_idle_handle(&self) -> bool {
+        self.source.lock().take().is_some()
+    }
+}
+impl RawVectorMembershipSource for LazyRawVectorMembershipSource {
+    fn published_summary(&self) -> RawVectorMembershipSummary {
+        self.summary
+    }
+    fn visible_count(
+        &self,
+        snapshot: SnapshotId,
+        before_read: &mut dyn FnMut() -> bool,
+    ) -> Result<usize> {
+        self.resolve(before_read)?
+            .visible_count(snapshot, before_read)
+    }
+    fn visible_by_row(
+        &self,
+        row: RowId,
+        snapshot: SnapshotId,
+        before_read: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<RawVectorDirectoryEntry>> {
+        self.resolve(before_read)?
+            .visible_by_row(row, snapshot, before_read)
+    }
+    fn contains_row_lsn(
+        &self,
+        row: RowId,
+        lsn: Lsn,
+        before_read: &mut dyn FnMut() -> bool,
+    ) -> Result<bool> {
+        self.resolve(before_read)?
+            .contains_row_lsn(row, lsn, before_read)
+    }
+    fn identity_by_row_lsn(
+        &self,
+        row: RowId,
+        lsn: Lsn,
+        before_read: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<RawVectorDirectoryEntry>> {
+        self.resolve(before_read)?
+            .identity_by_row_lsn(row, lsn, before_read)
+    }
+    fn open(
+        &self,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<Box<dyn RawVectorMembershipCursor>> {
+        self.resolve(&mut || request(DormantVectorLoadRequest::Checkpoint))?
+            .open(request)
+    }
+}
