@@ -97,6 +97,8 @@ mod history_sync_and_commit_cursors_reload_without_full_directories;
 mod paged_initial_replacement_and_reclamation_progress_under_writes;
 #[path = "engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs"]
 mod unpartitioned_vector_membership_pages_reload_at_constant_residency;
+#[path = "engine_seams/version_pruning_and_compaction_resume_finite_safe_batches.rs"]
+mod version_pruning_and_compaction_resume_finite_safe_batches;
 #[cfg(target_os = "linux")]
 #[path = "engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs"]
 mod writer_reopen_and_doubling_keep_a_fixed_resident_envelope;
