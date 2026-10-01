@@ -27,6 +27,9 @@ use crate::tree_store::file_backend::FileBackend;
 #[cfg(feature = "logging")]
 use log::{debug, info, warn};
 
+#[cfg(feature = "test-seams")]
+mod allocator_metadata_test_seams;
+
 #[allow(clippy::len_without_is_empty)]
 /// Implements persistent storage for a database.
 pub trait StorageBackend: 'static + Debug + Send + Sync {

@@ -13,6 +13,16 @@ pub(crate) struct RegionTracker {
 }
 
 impl RegionTracker {
+    #[cfg(feature = "test-seams")]
+    fn allocator_metadata_bytes_for_test(&self) -> usize {
+        self.order_trackers.capacity() * size_of::<BtreeBitmap>()
+            + self
+                .order_trackers
+                .iter()
+                .map(BtreeBitmap::allocator_metadata_bytes_for_test)
+                .sum::<usize>()
+    }
+
     pub(crate) fn new(regions: u32, orders: u8) -> Self {
         let mut data = vec![];
         for _ in 0..orders {
@@ -105,6 +115,17 @@ pub(super) struct Allocators {
 }
 
 impl Allocators {
+    #[cfg(feature = "test-seams")]
+    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
+        self.region_allocators.capacity() * size_of::<BuddyAllocator>()
+            + self
+                .region_allocators
+                .iter()
+                .map(BuddyAllocator::allocator_metadata_bytes_for_test)
+                .sum::<usize>()
+            + self.region_tracker.allocator_metadata_bytes_for_test()
+    }
+
     pub(super) fn new(layout: DatabaseLayout) -> Self {
         let mut region_allocators = vec![];
         let initial_regions = max(INITIAL_REGIONS, layout.num_regions());

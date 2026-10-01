@@ -34,6 +34,16 @@ pub(crate) struct BuddyAllocator {
 }
 
 impl BuddyAllocator {
+    #[cfg(feature = "test-seams")]
+    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
+        self.free.capacity() * size_of::<BtreeBitmap>()
+            + self
+                .free
+                .iter()
+                .map(BtreeBitmap::allocator_metadata_bytes_for_test)
+                .sum::<usize>()
+    }
+
     pub(crate) fn new(num_pages: u32, max_page_capacity: u32) -> Self {
         let max_order = calculate_usable_order(max_page_capacity);
 
