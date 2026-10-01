@@ -28,7 +28,7 @@ use crate::tree_store::file_backend::FileBackend;
 use log::{debug, info, warn};
 
 #[cfg(feature = "test-seams")]
-mod allocator_metadata_test_seams;
+pub(crate) mod allocator_metadata_test_seams;
 
 #[allow(clippy::len_without_is_empty)]
 /// Implements persistent storage for a database.
@@ -1533,7 +1533,7 @@ impl Builder {
         self
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, fuzzing, feature = "test-seams"))]
     pub fn set_region_size(&mut self, size: u64) -> &mut Self {
         assert!(size.is_power_of_two());
         self.region_size = Some(size);

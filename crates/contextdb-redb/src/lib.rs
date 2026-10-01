@@ -133,3 +133,7 @@ mod read_admission;
 pub use read_admission::{BackendReadObservation, observe_backend_reads};
 #[doc(hidden)]
 pub use read_admission::{ReadPageCharge, with_read_memory_admission, with_read_page_charge};
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use db::allocator_metadata_test_seams::observe_allocator_region_loads_for_test;

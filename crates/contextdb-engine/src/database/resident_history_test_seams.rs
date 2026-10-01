@@ -90,6 +90,33 @@ fn map_capacity<K, V>(map: &HashMap<K, V>) -> usize {
     map.capacity() * (std::mem::size_of::<(K, V)>() + 1)
 }
 impl Database {
+    #[doc(hidden)]
+    pub fn __create_region_fixture_for_test(path: &Path, region_bytes: u64) -> Result<()> {
+        RedbPersistence::create_region_fixture_for_test(path, region_bytes)
+    }
+    #[doc(hidden)]
+    pub fn __durable_ddl_for_test(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        self.persistence
+            .as_ref()
+            .expect("file fixture")
+            .durable_ddl_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn __native_read_transaction_count_for_test(&self, transaction_id: u64) -> Result<u64> {
+        self.persistence
+            .as_ref()
+            .expect("file fixture")
+            .native_read_transaction_count_for_test(transaction_id)
+    }
+    #[doc(hidden)]
+    pub fn __durable_sidecars_for_test(&self) -> Result<(usize, Vec<(String, Vec<u8>)>)> {
+        self.persistence
+            .as_ref()
+            .expect("file fixture")
+            .durable_sidecars_for_test()
+    }
+
     /// Actual resident commit entries, separately from the complete logical inventory.
     #[doc(hidden)]
     pub fn __resident_commit_directory_bytes_for_test(&self) -> usize {
@@ -105,6 +132,14 @@ impl Database {
             .values()
             .map(|rows| rows.capacity() * std::mem::size_of::<VersionedRow>())
             .sum()
+    }
+
+    #[doc(hidden)]
+    pub fn __physical_snapshot_for_test(&self) -> Result<redb::StorageSnapshotIdentity> {
+        self.persistence
+            .as_ref()
+            .expect("file fixture")
+            .physical_snapshot_for_test()
     }
 
     /// Actual retained fork allocator capacities; no charge is synthesized.
@@ -130,6 +165,15 @@ impl Database {
             .as_ref()
             .expect("file fixture")
             .durable_version_count_for_test(table)
+    }
+
+    /// Actual durable relation height for multi-leaf fixture setup.
+    #[doc(hidden)]
+    pub fn __durable_relation_tree_height_for_test(&self, table: &str) -> Result<u32> {
+        self.persistence
+            .as_ref()
+            .expect("file fixture")
+            .durable_relation_tree_height_for_test(table)
     }
 
     #[doc(hidden)]
