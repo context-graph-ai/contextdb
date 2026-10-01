@@ -13,6 +13,14 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+// unpartitioned_vector_membership_pages_reload_at_constant_residency observes private directory owners.
+#[cfg(feature = "test-seams")]
+#[path = "store/resident_directory_test_seams.rs"]
+mod resident_directory_test_seams;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use resident_directory_test_seams::VectorGenerationSourceVisitsForTest;
+
 // The test build forces collisions in the actual admission sets. The ordered
 // partition registry still owns identity through complete typed keys.
 #[cfg(not(test))]
@@ -12147,10 +12155,11 @@ impl VectorStore {
             let directory = state.raw_directory.read();
             let mut raw = 0usize;
             let mut selected = 0usize;
-            for entry in directory
-                .iter()
-                .filter(|entry| entry.created_tx.0 <= snapshot.0)
-            {
+            for entry in directory.iter().filter(|entry| {
+                #[cfg(feature = "test-seams")]
+                resident_directory_test_seams::observe_generation_directory_identity();
+                entry.created_tx.0 <= snapshot.0
+            }) {
                 raw = raw
                     .checked_add(1)
                     .ok_or_else(|| Error::Other("vector snapshot count overflow".into()))?;
@@ -12186,7 +12195,11 @@ impl VectorStore {
                     vectors
                         .entries
                         .iter()
-                        .filter(|entry| entry.created_tx.0 <= snapshot.0)
+                        .filter(|entry| {
+                            #[cfg(feature = "test-seams")]
+                            resident_directory_test_seams::observe_generation_raw_identity();
+                            entry.created_tx.0 <= snapshot.0
+                        })
                         .count(),
                 )
             };
@@ -12199,8 +12212,16 @@ impl VectorStore {
                     vectors
                         .entries
                         .get(position)
-                        .filter(|entry| entry.created_tx.0 <= snapshot.0)
-                        .map(|entry| entry.to_vector_entry(index.clone()))
+                        .filter(|entry| {
+                            #[cfg(feature = "test-seams")]
+                            resident_directory_test_seams::observe_generation_raw_identity();
+                            entry.created_tx.0 <= snapshot.0
+                        })
+                        .map(|entry| {
+                            #[cfg(feature = "test-seams")]
+                            resident_directory_test_seams::observe_generation_entry_copy();
+                            entry.to_vector_entry(index.clone())
+                        })
                 };
                 if let Some(mut entry) = entry {
                     if entry.deleted_tx.is_some_and(|tx| tx.0 > snapshot.0) {
@@ -12236,7 +12257,11 @@ impl VectorStore {
                 .raw_directory
                 .read()
                 .iter()
-                .filter(|entry| selected(entry.created_tx, entry.deleted_tx, entry.lsn))
+                .filter(|entry| {
+                    #[cfg(feature = "test-seams")]
+                    resident_directory_test_seams::observe_generation_directory_identity();
+                    selected(entry.created_tx, entry.deleted_tx, entry.lsn)
+                })
                 .count();
             let (count, snapshot_count) = {
                 let vectors = state.vectors.read();
@@ -12245,7 +12270,11 @@ impl VectorStore {
                     vectors
                         .entries
                         .iter()
-                        .filter(|entry| selected(entry.created_tx, entry.deleted_tx, entry.lsn))
+                        .filter(|entry| {
+                            #[cfg(feature = "test-seams")]
+                            resident_directory_test_seams::observe_generation_raw_identity();
+                            selected(entry.created_tx, entry.deleted_tx, entry.lsn)
+                        })
                         .count(),
                 )
             };
@@ -12261,11 +12290,11 @@ impl VectorStore {
             for position in 0..count {
                 let entry = {
                     let vectors = state.vectors.read();
-                    match vectors
-                        .entries
-                        .get(position)
-                        .filter(|entry| selected(entry.created_tx, entry.deleted_tx, entry.lsn))
-                    {
+                    match vectors.entries.get(position).filter(|entry| {
+                        #[cfg(feature = "test-seams")]
+                        resident_directory_test_seams::observe_generation_raw_identity();
+                        selected(entry.created_tx, entry.deleted_tx, entry.lsn)
+                    }) {
                         Some(entry) => {
                             if entries.len() == snapshot_count {
                                 // Valid writes only append after this frontier
@@ -12277,6 +12306,8 @@ impl VectorStore {
                                         .into(),
                                 });
                             }
+                            #[cfg(feature = "test-seams")]
+                            resident_directory_test_seams::observe_generation_entry_copy();
                             Some(entry.to_vector_entry(index.clone()))
                         }
                         None => None,

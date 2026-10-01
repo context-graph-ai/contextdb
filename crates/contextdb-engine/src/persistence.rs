@@ -8,6 +8,8 @@ pub(crate) mod content_identity;
 pub(crate) mod purge_publication;
 #[cfg(target_os = "linux")]
 mod reader_presence;
+#[cfg(feature = "test-seams")]
+mod resident_history_test_seams;
 mod transaction_repair;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
@@ -9099,6 +9101,12 @@ fn vector_partition_record_payload(
         }
         blake3::hash(&encoded[..checksum_offset])
     };
+    #[cfg(feature = "test-seams")]
+    if expected_kind == VectorPartitionRecordKind::Membership {
+        crate::database::resident_history_test_seams::note(|work| {
+            work.membership_envelopes_verified += 1
+        });
+    }
     if expected_checksum.as_bytes()[..] != encoded[checksum_offset..] {
         return Err("checksum mismatch".to_owned());
     }
@@ -9337,6 +9345,10 @@ fn stream_raw_partition_memberships<T>(
         .map_err(RedbPersistence::storage_error)?
     {
         let (key, _) = item.map_err(RedbPersistence::storage_error)?;
+        #[cfg(feature = "test-seams")]
+        crate::database::resident_history_test_seams::note(|work| {
+            work.membership_keys_examined += 1
+        });
         if !key.value().starts_with(&prefix) {
             break;
         }
@@ -9350,6 +9362,10 @@ fn stream_raw_partition_memberships<T>(
         .map_err(RedbPersistence::storage_error)?
     {
         let (key, value) = item.map_err(RedbPersistence::storage_error)?;
+        #[cfg(feature = "test-seams")]
+        crate::database::resident_history_test_seams::note(|work| {
+            work.membership_keys_examined += 1
+        });
         if !key.value().starts_with(&prefix) {
             break;
         }
@@ -20636,6 +20652,8 @@ impl RedbPersistence {
                     let mut live_versions = Vec::new();
                     for entry in fwd_table.iter().map_err(Self::storage_error)? {
                         let (key, value) = entry.map_err(Self::storage_error)?;
+                        #[cfg(feature = "in-process-test-seams")]
+                        crate::writer_query_test_seams::note_graph_delete_decode();
                         let edge: AdjEntry = Self::decode(value.value())?;
                         if edge.source == *source
                             && edge.target == *target
@@ -21184,7 +21202,11 @@ impl RedbPersistence {
             {
                 stage_started = std::time::Instant::now();
             }
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::BeforeRedb);
             write_txn.commit().map_err(Self::storage_error)?;
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::AfterRedb);
             #[cfg(feature = "test-seams")]
             {
                 observe_append_stage(AppendStage::Commit, &mut stage_started);
@@ -24797,6 +24819,10 @@ impl RedbPersistence {
                             }),
                             None => Self::decode_versioned_row(value.value(), table_meta.as_ref()),
                         }?;
+                        #[cfg(feature = "in-process-test-seams")]
+                        crate::writer_query_test_seams::note_history(
+                            crate::writer_query_test_seams::HistoryFamily::Row,
+                        );
                         visit(row)?;
                     }
                     Ok(())
@@ -24890,6 +24916,12 @@ impl RedbPersistence {
         } else {
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (key, value) = entry.map_err(Self::storage_error)?;
+                #[cfg(feature = "in-process-test-seams")]
+                if kind == VectorPartitionRecordKind::Membership {
+                    crate::writer_query_test_seams::note_history(
+                        crate::writer_query_test_seams::HistoryFamily::VectorMembership,
+                    );
+                }
                 #[cfg(any(test, feature = "test-seams"))]
                 if kind == VectorPartitionRecordKind::Membership {
                     VECTOR_MEMBERSHIP_RECORDS_DECODED
@@ -26097,6 +26129,10 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
             {
                 let (key, value) = entry.map_err(Self::storage_error)?;
+                #[cfg(feature = "test-seams")]
+                crate::database::resident_history_test_seams::note(|work| {
+                    work.maintenance_source_visits += 1
+                });
                 if !key.value().starts_with(&prefix) {
                     break;
                 }
@@ -26151,6 +26187,10 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
             {
                 let (key, value) = entry.map_err(Self::storage_error)?;
+                #[cfg(feature = "test-seams")]
+                crate::database::resident_history_test_seams::note(|work| {
+                    work.maintenance_source_visits += 1
+                });
                 if !key.value().starts_with(&prefix) {
                     break;
                 }
@@ -28103,6 +28143,10 @@ impl RedbPersistence {
             let mut entries = Vec::new();
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (_, value) = entry.map_err(Self::storage_error)?;
+                #[cfg(feature = "in-process-test-seams")]
+                crate::writer_query_test_seams::note_history(
+                    crate::writer_query_test_seams::HistoryFamily::ChangeLog,
+                );
                 entries.push(Self::decode(value.value())?);
             }
             Ok(entries)
@@ -28353,6 +28397,10 @@ impl RedbPersistence {
             let mut index = BTreeMap::new();
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (lsn, tx) = entry.map_err(Self::storage_error)?;
+                #[cfg(feature = "in-process-test-seams")]
+                crate::writer_query_test_seams::note_history(
+                    crate::writer_query_test_seams::HistoryFamily::CommitIndex,
+                );
                 index.insert(Lsn(lsn.value()), TxId(tx.value()));
             }
             Ok(index)
@@ -28374,6 +28422,10 @@ impl RedbPersistence {
                 let Some((stored_last, _)) = table.last().map_err(Self::storage_error)? else {
                     return Ok(());
                 };
+                #[cfg(feature = "in-process-test-seams")]
+                crate::writer_query_test_seams::note_history(
+                    crate::writer_query_test_seams::HistoryFamily::CommitBound,
+                );
                 let stored_last = Lsn(stored_last.value());
                 let frontier = read_authenticated_history_frontiers(
                     &read,
@@ -30555,6 +30607,11 @@ impl RedbPersistence {
             return Err(error);
         }
         let progress = result.map_err(Self::storage_error)?;
+        #[cfg(feature = "test-seams")]
+        crate::database::resident_history_test_seams::note(|work| {
+            work.compaction_pages_examined += progress.pages_examined;
+            work.compaction_pages_relocated += progress.pages_relocated;
+        });
         state.1 = progress;
         for _ in 0..2 {
             let txn = self.with_db(|db| db.begin_write().map_err(Self::storage_error))?;
@@ -31361,6 +31418,10 @@ impl RedbPersistence {
             let mut entries = Vec::new();
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (_, value) = entry.map_err(Self::storage_error)?;
+                #[cfg(feature = "in-process-test-seams")]
+                crate::writer_query_test_seams::note_history(
+                    crate::writer_query_test_seams::HistoryFamily::Graph,
+                );
                 entries.push(Self::decode(value.value())?);
             }
             Ok(entries)

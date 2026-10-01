@@ -12,6 +12,11 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+// writer_reopen_and_doubling_keep_a_fixed_resident_envelope observes the private expiry directory.
+#[cfg(feature = "test-seams")]
+#[path = "store/resident_directory_test_seams.rs"]
+mod resident_directory_test_seams;
+
 /// Values larger than this are row bodies, not directory material.  A
 /// file-backed writer keeps their canonical bytes in Redb and retains only
 /// the columns needed to identify, authorize, index, and place the row.

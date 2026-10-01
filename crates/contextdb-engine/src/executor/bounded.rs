@@ -4828,6 +4828,10 @@ impl ScanState {
         let Some(merge) = self.ordered_merge.as_mut() else {
             return Ok(());
         };
+        // newest_event_merges_staged_order_without_sort observes the real
+        // bounded-kernel overlay sort, as well as the eager executor's sort.
+        #[cfg(feature = "in-process-test-seams")]
+        crate::writer_query_test_seams::note_staged_sort(rows.len());
         rows.sort_by(|left, right| compare_ordered_merge_rows(&left.0, &right.0, &merge.keys));
         merge.held_bytes = rows.iter().map(|(_, bytes)| *bytes).sum();
         merge.staged = Some(rows.into());

@@ -493,7 +493,14 @@ impl redb::StorageBackend for WriterFileView {
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        self.owner()?.file.sync_data()
+        let result = self.owner()?.file.sync_data();
+        #[cfg(feature = "in-process-test-seams")]
+        if result.is_ok() {
+            crate::writer_commit_test_seams::reached(
+                crate::writer_commit_test_seams::CommitBoundary::DuringRedbSync,
+            );
+        }
+        result
     }
 
     #[cfg(unix)]

@@ -1,3 +1,6 @@
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod commit_wait_test_seams;
 pub mod manager;
 pub mod write_set;
 
