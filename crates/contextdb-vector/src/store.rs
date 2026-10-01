@@ -7,6 +7,10 @@ pub use membership::{
 };
 
 use crate::hnsw::ServingPages;
+use crate::hnsw::paged_builder::{
+    PagedGenerationBuilder, PagedGenerationPersistence, PagedVectorBatchPlan, PagedVectorPhase,
+    PagedVectorProgress,
+};
 use crate::memory_budget::{MemoryBudget, VectorWorkspaceReservation};
 use crate::{HnswIndex, quantized::StoredVectorEntry};
 use contextdb_core::{
@@ -1561,6 +1565,7 @@ pub struct IndexState {
     /// Serializes builders for this partition without making foreground
     /// publication wait for graph construction.
     maintenance_build: Mutex<()>,
+    paged_builder: Mutex<Option<(PagedGenerationBuilder, PagedVectorBatchPlan)>>,
     vectors: RwLock<PartitionVectors>,
     raw_directory: RwLock<Vec<RawVectorDirectoryEntry>>,
     #[cfg(test)]
@@ -1691,6 +1696,7 @@ impl IndexState {
             quantization,
             maintenance: Mutex::new(()),
             maintenance_build: Mutex::new(()),
+            paged_builder: Mutex::new(None),
             vectors: RwLock::new(PartitionVectors::default()),
             raw_directory: RwLock::new(Vec::new()),
             #[cfg(test)]
@@ -8666,6 +8672,102 @@ impl VectorStore {
         }
     }
 
+    /// Install the engine's persisted frontier build record and transaction
+    /// callback. Subsequent ordinary maintenance cycles dispatch this finite
+    /// builder and never enter the resident whole-partition build for it.
+    #[doc(hidden)]
+    pub fn register_partition_paged_builder(
+        &self,
+        partition: &VectorPartitionRef,
+        progress: PagedVectorProgress,
+        persistence: Arc<dyn PagedGenerationPersistence>,
+        plan: PagedVectorBatchPlan,
+        accountant: Arc<dyn MemoryBudget>,
+    ) -> Result<()> {
+        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
+            let state = self.partition_state(&partition.index, &partition.partition_key)?;
+            let policy = self
+                .index_layout(&partition.index)?
+                .resolve_policy(progress.total_points, 1);
+            let builder = PagedGenerationBuilder::resume(
+                partition.clone(),
+                progress,
+                policy,
+                state.dimension,
+                state.quantization,
+                persistence,
+                accountant,
+                Arc::clone(&self.workspace_bytes),
+            )?;
+            let mut slot = state.paged_builder.lock();
+            if slot.is_some() {
+                return Err(Error::Other(
+                    "paged vector builder is already registered".into(),
+                ));
+            }
+            *slot = Some((builder, plan));
+            Ok(())
+        })
+    }
+
+    /// Snapshot the small durable progress descriptor without reading nodes.
+    #[doc(hidden)]
+    pub fn partition_paged_build_progress(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> Option<PagedVectorProgress> {
+        self.try_partition_state(&partition.index, &partition.partition_key)
+            .and_then(|state| {
+                state
+                    .paged_builder
+                    .lock()
+                    .as_ref()
+                    .map(|(builder, _)| builder.progress().clone())
+            })
+    }
+
+    /// The engine supplies verified suffix coverage under its commit gate.
+    /// This transaction publishes only a fully encoded generation. Serving
+    /// descriptor installation uses the engine's existing publication boundary.
+    #[doc(hidden)]
+    pub fn publish_partition_paged_build(
+        &self,
+        partition: &VectorPartitionRef,
+        through_lsn: Lsn,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
+            let state = self.partition_state(&partition.index, &partition.partition_key)?;
+            let mut slot = state.paged_builder.lock();
+            let (builder, plan) = slot
+                .as_mut()
+                .ok_or_else(|| Error::Other("paged vector builder is not registered".into()))?;
+            builder.publish(through_lsn, *plan, checkpoint)
+        })
+    }
+
+    /// Explicit finite cleanup after the engine establishes snapshot and
+    /// external-reader floors. The persistence transaction revalidates them.
+    #[doc(hidden)]
+    pub fn reclaim_partition_paged_build(
+        &self,
+        partition: &VectorPartitionRef,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<usize> {
+        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
+            let state = self.partition_state(&partition.index, &partition.partition_key)?;
+            let mut slot = state.paged_builder.lock();
+            let (builder, plan) = slot
+                .as_mut()
+                .ok_or_else(|| Error::Other("paged vector builder is not registered".into()))?;
+            let removed = builder.reclaim(*plan, checkpoint)?;
+            if builder.progress().phase == PagedVectorPhase::Reclaimed {
+                slot.take();
+            }
+            Ok(removed)
+        })
+    }
+
     /// Advance every needy partition in one finite sampled cycle. Queries do
     /// not call this method; caller-driven and engine-owned maintenance share
     /// the same cycle.
@@ -8693,7 +8795,10 @@ impl VectorStore {
             if let Some(column) = self.try_column(index) {
                 for (key, state) in column.partition_snapshots() {
                     let layout = column.layout();
-                    if Self::in_memory_maintenance_request(index, &key, &state, &layout).is_some() {
+                    if state.paged_builder.lock().is_some()
+                        || Self::in_memory_maintenance_request(index, &key, &state, &layout)
+                            .is_some()
+                    {
                         pending.push(VectorPartitionRef::new(index.clone(), key));
                     }
                 }
@@ -8713,16 +8818,27 @@ impl VectorStore {
         let mut built_indexes = HashSet::new();
         let mut first_failure_details = None;
         for partition in pending {
-            let did_build = self.run_sampled_hnsw_maintenance(
-                &partition,
-                accountant.clone(),
-                checkpoint,
-                || {
-                    #[cfg(feature = "test-seams")]
-                    self.pause_registry
-                        .maybe_pause(&partition.index, crate::test_seam::PauseWindow::Build);
-                },
-            );
+            let paged_step = self
+                .try_partition_state(&partition.index, &partition.partition_key)
+                .and_then(|state| {
+                    let mut slot = state.paged_builder.lock();
+                    let (builder, plan) = slot.as_mut()?;
+                    Some(builder.step(*plan, checkpoint).map(|()| false))
+                });
+            let did_build = if let Some(result) = paged_step {
+                result
+            } else {
+                self.run_sampled_hnsw_maintenance(
+                    &partition,
+                    accountant.clone(),
+                    checkpoint,
+                    || {
+                        #[cfg(feature = "test-seams")]
+                        self.pause_registry
+                            .maybe_pause(&partition.index, crate::test_seam::PauseWindow::Build);
+                    },
+                )
+            };
             let did_build = match did_build {
                 Ok(did_build) => did_build,
                 Err(error @ Error::ReadCancelled) => return Err(error),

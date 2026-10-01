@@ -51,6 +51,7 @@ pub struct PagedVectorProgress {
     pub phase: PagedVectorPhase,
     pub encoding_cursor: Option<PointId>,
     pub encoding_bytes: u64,
+    pub encoded_points: usize,
     pub encoding_digest: u64,
     pub cleanup_cursor: Option<Vec<u8>>,
 }
@@ -84,6 +85,7 @@ impl PagedVectorProgress {
             phase: PagedVectorPhase::Inserting,
             encoding_cursor: None,
             encoding_bytes: 0,
+            encoded_points: 0,
             encoding_digest: 0,
             cleanup_cursor: None,
         }
@@ -620,7 +622,7 @@ impl PagedVectorTail {
         }
         // Exact-vector ties use an ordered durable directory. At most k rows
         // need to be read; no population-sized exact bucket is materialized.
-        if let Some(key) = exact_key_for_stored_vector(&stored) {
+        if let Some((key, exact_score)) = super::exact_key_for_query(query, self.quantization) {
             let exact = reader.exact_rows(&key, snapshot, None, k)?;
             if exact.len() > k || exact.windows(2).any(|w| w[0] >= w[1]) {
                 return Err(Error::Other(
@@ -628,7 +630,7 @@ impl PagedVectorTail {
                 ));
             }
             for row in exact {
-                rows.push((row, 1.));
+                rows.push((row, exact_score));
             }
         }
         rows.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -644,4 +646,549 @@ impl PagedVectorTail {
         }
         Ok(output)
     }
+}
+
+/// A retained-frontier source point, already stored in the column's declared
+/// representation. Quantized bytes use the unchanged HNSW payload header;
+/// rebuilding never dequantizes and re-quantizes retained payloads.
+#[derive(Clone, Debug)]
+pub enum PagedVectorValues {
+    F32(Vec<f32>),
+    Quantized(Vec<u8>),
+}
+#[derive(Clone, Debug)]
+pub struct PagedVectorBuildEntry {
+    /// Full key in canonical insertion order: source LSN, creation tx,
+    /// representation insertion key, then row id. Resumption is exclusive.
+    pub source_key: Vec<u8>,
+    pub row_id: RowId,
+    pub lsn: Lsn,
+    pub created_tx: TxId,
+    pub deleted_tx: Option<TxId>,
+    pub values: PagedVectorValues,
+}
+
+/// Actual work performed by one finite cleanup transaction.
+#[derive(Clone, Debug)]
+pub struct PagedVectorReclamation {
+    pub keys_removed: usize,
+    pub last_key: Option<Vec<u8>>,
+    pub complete: bool,
+}
+
+/// Engine-owned finite work that must participate in the same scratch/progress
+/// transaction as point writes. Source reads retain the persisted frontier
+/// floor, authenticate each used interval/body and seek after the full key.
+/// The engine checks source/declaration/erasure validity before each batch.
+pub trait PagedGenerationTransaction: PagedVectorTransaction {
+    fn source_next(
+        &mut self,
+        progress: &PagedVectorProgress,
+        after: Option<&[u8]>,
+    ) -> Result<Option<PagedVectorBuildEntry>>;
+    /// Persist one encoded point in the sealed change page layout, including
+    /// its authenticated identity. Prior sealed pages stay durable, not resident.
+    fn seal_point(&mut self, point: PointId, encoded: &[u8]) -> Result<()>;
+    /// Verify the complete encoded base plus searchable suffix through this
+    /// LSN, and atomically publish descriptor/coverage. Retain old reader roots.
+    fn publish(&mut self, progress: &PagedVectorProgress, through_lsn: Lsn) -> Result<()>;
+    /// Remove at most max_keys eligible keys after the exclusive cursor. The
+    /// engine rechecks reader/external floors and erasure fences transactionally.
+    fn reclaim(
+        &mut self,
+        generation: u64,
+        after: Option<&[u8]>,
+        max_keys: usize,
+    ) -> Result<PagedVectorReclamation>;
+}
+
+/// One persistence invocation for each build, encoding, publication or cleanup
+/// batch. Atomically commit callback mutations with its returned progress;
+/// on cancellation/error discard the current transaction. `previous` is a
+/// complete compare-and-swap record, including RNG and all source cursors.
+pub trait PagedGenerationPersistence: Send + Sync {
+    fn commit_generation_batch(
+        &self,
+        previous: &PagedVectorProgress,
+        plan: PagedVectorBatchPlan,
+        batch: &mut dyn FnMut(&mut dyn PagedGenerationTransaction) -> Result<PagedVectorProgress>,
+    ) -> Result<PagedVectorProgress>;
+}
+
+/// A restartable builder holds only control metadata, never the accumulated
+/// graph. Every successful step commits real source points, sealed point pages
+/// or eligible deletions before advancing its durable cursor.
+pub struct PagedGenerationBuilder {
+    pub partition: VectorPartitionRef,
+    progress: PagedVectorProgress,
+    policy: ResolvedVectorPolicy,
+    dimension: usize,
+    quantization: VectorQuantization,
+    persistence: Arc<dyn PagedGenerationPersistence>,
+    accountant: Arc<dyn MemoryBudget>,
+    live_workspace: Arc<AtomicUsize>,
+}
+impl PagedGenerationBuilder {
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume(
+        partition: VectorPartitionRef,
+        progress: PagedVectorProgress,
+        policy: ResolvedVectorPolicy,
+        dimension: usize,
+        quantization: VectorQuantization,
+        persistence: Arc<dyn PagedGenerationPersistence>,
+        accountant: Arc<dyn MemoryBudget>,
+        live_workspace: Arc<AtomicUsize>,
+    ) -> Result<Self> {
+        if dimension == 0
+            || !graph_policy(policy, quantization).validate()
+            || progress.graph.points > progress.total_points
+            || progress.graph.points != progress.graph.layer_counts.iter().sum::<usize>()
+            || (progress.graph.points == 0) != progress.graph.entry_point.is_none()
+            || progress.encoded_points > progress.graph.points
+            || (matches!(
+                progress.phase,
+                PagedVectorPhase::Complete | PagedVectorPhase::Published
+            ) && progress.encoded_points != progress.graph.points)
+            || progress.encoding_cursor.is_some_and(|id| {
+                id.1 < 0
+                    || id.0 as usize >= 16
+                    || id.1 as usize >= progress.graph.layer_counts[id.0 as usize]
+            })
+            || progress.graph.seed != HNSW_BUILD_SEED
+        {
+            return Err(Error::Other(
+                "invalid paged generation restart record".into(),
+            ));
+        }
+        Ok(Self {
+            partition,
+            progress,
+            policy,
+            dimension,
+            quantization,
+            persistence,
+            accountant,
+            live_workspace,
+        })
+    }
+    pub fn progress(&self) -> &PagedVectorProgress {
+        &self.progress
+    }
+
+    /// Perform one admitted insertion/encoding batch. Publishing and reclaiming
+    /// have separate explicit calls because only the engine knows their floors.
+    pub fn step(
+        &mut self,
+        plan: PagedVectorBatchPlan,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        match self.progress.phase {
+            PagedVectorPhase::Inserting => {
+                self.transact(plan, checkpoint, |builder, tx, previous, checkpoint| {
+                    builder.insert_batch(tx, previous, plan, checkpoint)
+                })
+            }
+            PagedVectorPhase::Encoding => {
+                self.transact(plan, checkpoint, |builder, tx, previous, checkpoint| {
+                    builder.encode_batch(tx, previous, plan, checkpoint)
+                })
+            }
+            PagedVectorPhase::Complete
+            | PagedVectorPhase::Published
+            | PagedVectorPhase::Reclaimed => Ok(()),
+            PagedVectorPhase::Reclaiming => Err(Error::Other(
+                "paged generation cleanup requires explicit floor validation".into(),
+            )),
+        }
+    }
+    fn transact(
+        &mut self,
+        plan: PagedVectorBatchPlan,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+        work: impl FnOnce(
+            &Self,
+            &mut dyn PagedGenerationTransaction,
+            &PagedVectorProgress,
+            &mut dyn FnMut() -> Result<()>,
+        ) -> Result<PagedVectorProgress>,
+    ) -> Result<()> {
+        plan.validate(
+            graph_policy(self.policy, self.quantization),
+            self.dimension,
+            self.quantization,
+        )?;
+        for key in [
+            &self.progress.last_source_key,
+            &self.progress.cleanup_cursor,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if key.len() > plan.source_key_bytes {
+                return Err(Error::Other(
+                    "paged generation cursor exceeds its admitted key window".into(),
+                ));
+            }
+        }
+        let _reservation = VectorWorkspaceReservation::try_new(
+            Arc::clone(&self.accountant),
+            Arc::clone(&self.live_workspace),
+            plan.workspace_bytes()?,
+            "advance_paged_vector_generation",
+            "reduce batch size or release idle serving pages",
+        )?;
+        checkpoint()?;
+        let previous = self.progress.clone();
+        let mut work = Some(work);
+        let mut produced = None;
+        let mut callback = |transaction: &mut dyn PagedGenerationTransaction| {
+            let work = work
+                .take()
+                .ok_or_else(|| Error::Other("paged generation callback invoked twice".into()))?;
+            checkpoint()?;
+            let next = work(self, transaction, &previous, checkpoint)?;
+            produced = Some(next.clone());
+            Ok(next)
+        };
+        let next = self
+            .persistence
+            .commit_generation_batch(&previous, plan, &mut callback)?;
+        if produced.as_ref() != Some(&next) {
+            return Err(Error::Other(
+                "paged generation persistence returned another progress record".into(),
+            ));
+        }
+        self.progress = next;
+        Ok(())
+    }
+    fn insert_batch(
+        &self,
+        transaction: &mut dyn PagedGenerationTransaction,
+        previous: &PagedVectorProgress,
+        plan: PagedVectorBatchPlan,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<PagedVectorProgress> {
+        let mut next = previous.clone();
+        let mut workspace = PagedGraphWorkspace::new(plan.scratch_points);
+        let mut writes = 0;
+        for _ in 0..plan.max_points {
+            checkpoint()?;
+            transaction.checkpoint()?;
+            let Some(entry) = transaction.source_next(previous, next.last_source_key.as_deref())?
+            else {
+                if next.graph.points != next.total_points {
+                    return Err(Error::Other(
+                        "paged generation source count disagrees with its frontier".into(),
+                    ));
+                }
+                next.phase = PagedVectorPhase::Encoding;
+                return Ok(next);
+            };
+            if entry.source_key.len() > plan.source_key_bytes
+                || entry.source_key
+                    != canonical_source_key(entry.row_id, entry.lsn, entry.created_tx)
+                || next
+                    .last_source_key
+                    .as_ref()
+                    .is_some_and(|key| *key >= entry.source_key)
+                || entry.created_tx > next.frontier_tx
+                || entry.lsn > next.frontier_lsn
+                || entry.deleted_tx.is_some_and(|tx| tx <= next.frontier_tx)
+                || next.graph.points >= next.total_points
+            {
+                return Err(Error::Other(
+                    "paged generation source violates the pinned frontier or key order".into(),
+                ));
+            }
+            let mut adapter = PointAdapter {
+                transaction,
+                writes,
+                max_writes: plan.max_node_writes,
+                max_node_bytes: plan.max_node_bytes,
+                dimension: self.dimension,
+                quantization: self.quantization,
+            };
+            let data_id = next.graph.points;
+            let policy = graph_policy(self.policy, self.quantization);
+            let (point, exact_key) = match entry.values {
+                PagedVectorValues::F32(values) if self.quantization == VectorQuantization::F32 => {
+                    if values.len() != self.dimension || values.iter().any(|v| !v.is_finite()) {
+                        return Err(Error::Other(
+                            "paged generation source dimension or values mismatch".into(),
+                        ));
+                    }
+                    let exact_key = super::f32_exact_key(&values);
+                    let id = insert_paged(
+                        &mut adapter,
+                        policy,
+                        &mut next.graph,
+                        &mut workspace,
+                        values,
+                        data_id,
+                        &hnsw_f32_distance(),
+                    )
+                    .map_err(graph_error)?;
+                    (id, exact_key)
+                }
+                PagedVectorValues::Quantized(values)
+                    if self.quantization != VectorQuantization::F32 =>
+                {
+                    let header =
+                        crate::quantized::decode_hnsw_quantized(&values).ok_or_else(|| {
+                            Error::Other("invalid paged generation source payload".into())
+                        })?;
+                    let payload_len = if self.quantization == VectorQuantization::SQ8 {
+                        self.dimension
+                    } else {
+                        self.dimension.div_ceil(2)
+                    };
+                    if header.len != self.dimension
+                        || header.payload.len() != payload_len
+                        || !header.min.is_finite()
+                        || !header.max.is_finite()
+                        || header.min > header.max
+                    {
+                        return Err(Error::Other(
+                            "paged generation source payload definition mismatch".into(),
+                        ));
+                    }
+                    let exact_key = values.clone();
+                    let id = insert_paged(
+                        &mut adapter,
+                        policy,
+                        &mut next.graph,
+                        &mut workspace,
+                        values,
+                        data_id,
+                        &DistQuantizedCosine {
+                            quantization: self.quantization,
+                        },
+                    )
+                    .map_err(graph_error)?;
+                    (id, exact_key)
+                }
+                _ => {
+                    return Err(Error::Other(
+                        "paged generation source representation mismatch".into(),
+                    ));
+                }
+            };
+            writes = adapter.writes;
+            adapter.transaction.store_identity(&PagedVectorIdentity {
+                point,
+                data_id,
+                row_id: entry.row_id,
+                lsn: entry.lsn,
+                created_tx: entry.created_tx,
+                deleted_tx: entry.deleted_tx,
+                exact_key,
+            })?;
+            next.last_source_key = Some(entry.source_key);
+        }
+        // The next cycle verifies terminal source absence before encoding;
+        // completing exactly max_points never fabricates an exhausted cursor.
+        Ok(next)
+    }
+    fn encode_batch(
+        &self,
+        transaction: &mut dyn PagedGenerationTransaction,
+        previous: &PagedVectorProgress,
+        plan: PagedVectorBatchPlan,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<PagedVectorProgress> {
+        let mut next = previous.clone();
+        let mut point = next_point(&next.graph, previous.encoding_cursor);
+        for _ in 0..plan.max_points {
+            let Some(id) = point else {
+                next.phase = PagedVectorPhase::Complete;
+                return Ok(next);
+            };
+            checkpoint()?;
+            transaction.checkpoint()?;
+            let mut adapter = PointAdapter {
+                transaction,
+                writes: 0,
+                max_writes: plan.max_node_writes,
+                max_node_bytes: plan.max_node_bytes,
+                dimension: self.dimension,
+                quantization: self.quantization,
+            };
+            let mut bytes = Vec::with_capacity(plan.max_node_bytes);
+            match self.quantization {
+                VectorQuantization::F32 => {
+                    let node =
+                        <PointAdapter<'_> as PagedPointStorage<f32>>::load_point(&mut adapter, id)?;
+                    if node.id != id {
+                        return Err(Error::Other(
+                            "paged generation encoding point identity mismatch".into(),
+                        ));
+                    }
+                    hnsw_rs::hnswio::encode_paged_point_into(
+                        &node,
+                        &mut FinitePointWriter {
+                            bytes: &mut bytes,
+                            limit: plan.max_node_bytes,
+                        },
+                    )
+                    .map_err(|e| {
+                        Error::Other(format!("paged generation point encoding failed: {e}"))
+                    })?;
+                }
+                VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
+                    let node =
+                        <PointAdapter<'_> as PagedPointStorage<u8>>::load_point(&mut adapter, id)?;
+                    if node.id != id {
+                        return Err(Error::Other(
+                            "paged generation encoding point identity mismatch".into(),
+                        ));
+                    }
+                    hnsw_rs::hnswio::encode_paged_point_into(
+                        &node,
+                        &mut FinitePointWriter {
+                            bytes: &mut bytes,
+                            limit: plan.max_node_bytes,
+                        },
+                    )
+                    .map_err(|e| {
+                        Error::Other(format!("paged generation point encoding failed: {e}"))
+                    })?;
+                }
+            }
+            for byte in &bytes {
+                next.encoding_digest =
+                    (next.encoding_digest ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+            }
+            next.encoding_bytes = next
+                .encoding_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(workspace_overflow)?;
+            adapter.transaction.checkpoint()?;
+            transaction.seal_point(id, &bytes)?;
+            next.encoded_points = next
+                .encoded_points
+                .checked_add(1)
+                .ok_or_else(workspace_overflow)?;
+            next.encoding_cursor = Some(id);
+            point = next_point(&next.graph, Some(id));
+        }
+        if point.is_none() {
+            next.phase = PagedVectorPhase::Complete;
+        }
+        Ok(next)
+    }
+    /// Only a complete generation may publish. The transaction verifies the
+    /// durable sealed pages and later suffix before moving the catalog pointer.
+    pub fn publish(
+        &mut self,
+        through_lsn: Lsn,
+        plan: PagedVectorBatchPlan,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if self.progress.phase != PagedVectorPhase::Complete
+            || through_lsn < self.progress.frontier_lsn
+        {
+            return Err(Error::Other(
+                "paged generation cannot publish incomplete coverage".into(),
+            ));
+        }
+        self.transact(plan, checkpoint, |_, transaction, previous, checkpoint| {
+            checkpoint()?;
+            transaction.publish(previous, through_lsn)?;
+            let mut next = previous.clone();
+            next.phase = PagedVectorPhase::Published;
+            Ok(next)
+        })
+    }
+    /// Reclaim a superseded or cancelled scratch generation in finite batches.
+    /// A published active generation must first be retired by the engine's
+    /// transaction; the engine refuses removal while any reader floor needs it.
+    pub fn reclaim(
+        &mut self,
+        plan: PagedVectorBatchPlan,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<usize> {
+        if self.progress.phase == PagedVectorPhase::Reclaimed {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        self.transact(plan, checkpoint, |_, transaction, previous, checkpoint| {
+            checkpoint()?;
+            let result = transaction.reclaim(
+                previous.generation_id,
+                previous.cleanup_cursor.as_deref(),
+                plan.max_points,
+            )?;
+            if result.keys_removed > plan.max_points
+                || result.last_key.as_ref().is_some_and(|key| {
+                    key.len() > plan.source_key_bytes
+                        || previous
+                            .cleanup_cursor
+                            .as_ref()
+                            .is_some_and(|old| key <= old)
+                })
+                || (!result.complete && (result.keys_removed == 0 || result.last_key.is_none()))
+            {
+                return Err(Error::Other(
+                    "paged generation reclamation returned invalid finite progress".into(),
+                ));
+            }
+            removed = result.keys_removed;
+            let mut next = previous.clone();
+            next.cleanup_cursor = result.last_key.or_else(|| previous.cleanup_cursor.clone());
+            next.phase = if result.complete {
+                PagedVectorPhase::Reclaimed
+            } else {
+                PagedVectorPhase::Reclaiming
+            };
+            Ok(next)
+        })?;
+        Ok(removed)
+    }
+}
+fn next_point(state: &PagedGraphState, after: Option<PointId>) -> Option<PointId> {
+    let (mut layer, mut rank) = after.map_or((0, 0), |id| (id.0 as usize, id.1 as usize + 1));
+    while layer < state.layer_counts.len() {
+        if rank < state.layer_counts[layer] {
+            return i32::try_from(rank)
+                .ok()
+                .map(|rank| PointId(layer as u8, rank));
+        }
+        layer += 1;
+        rank = 0;
+    }
+    None
+}
+struct FinitePointWriter<'a> {
+    bytes: &'a mut Vec<u8>,
+    limit: usize,
+}
+impl std::io::Write for FinitePointWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other(
+                "point encoding exceeds its admitted page window",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Canonical fixed-width ordering used by resident seeded construction.
+/// Engines may build an ordered durable source index using this exact key.
+pub fn canonical_source_key(row: RowId, lsn: Lsn, created: TxId) -> Vec<u8> {
+    let mut x = row.0 ^ lsn.0 ^ created.0;
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    let mut key = Vec::with_capacity(32);
+    for component in [lsn.0, created.0, x, row.0] {
+        key.extend_from_slice(&component.to_be_bytes());
+    }
+    key
 }
