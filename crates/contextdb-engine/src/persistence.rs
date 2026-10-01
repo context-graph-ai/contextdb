@@ -12,7 +12,14 @@ mod transaction_repair;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
 mod writer_file;
+mod writer_history;
+mod writer_recovery;
+pub(crate) mod writer_source;
 use writer_file::{LockedWriterFile, OpenedWriterDatabase};
+#[allow(unused_imports)] // Recovery types are consumed by writer integration.
+pub(crate) use writer_recovery::{WriterOpenBounds, WriterRecoveryBounds};
+#[allow(unused_imports)] // Internal source surface for the store adapters.
+pub(crate) use writer_source::{WriterReadSource, WriterSnapshot};
 
 use crate::blob_repository::{
     BlobAuthoritativePurgeProjection, apply_authoritative_purge_in_write,
@@ -16423,11 +16430,10 @@ pub(crate) const REDB_CACHE_LIMIT_SHARE_OFFSET_BYTES: usize = 64 * 1024;
 /// Redb's cache is process-resident memory the store holds for as long as it
 /// is open, so a declared limit has to bound it: a flat 8 MiB is most of a
 /// small budget and all of a tiny one, and it used to be taken regardless of
-/// what the operator declared. The READ path has priced it this way since it
-/// was written (`load_read_image_with_memory`); this is that same figure, so
-/// both sides of the store answer one rule. A limit at or above about 64 MiB
-/// still gets the whole 8 MiB, so nothing an operator would call a real
-/// budget loses cache.
+/// what the operator declared. This is the unchanged READ allocation used by
+/// `load_read_image_with_memory`; the writer's internal subdivision is in
+/// `redb_writer_cache_bytes_for_limit`. A reader limit at or above about
+/// 64 MiB still gets the whole 8 MiB.
 pub(crate) fn redb_cache_bytes_for_limit(limit: Option<usize>) -> usize {
     limit.map_or(REDB_CACHE_BYTES, |limit| {
         (limit / REDB_CACHE_LIMIT_SHARE_DIVISOR)
@@ -16436,30 +16442,18 @@ pub(crate) fn redb_cache_bytes_for_limit(limit: Option<usize>) -> usize {
     })
 }
 
-/// The same share, floored, for the WRITER -- but never more than the limit's
-/// own share of itself.
-///
-/// A read image that cannot hold its share is refused by its own source
-/// reservation before Redb opens. A writer has no such refusal: it would simply
-/// open with `set_cache_size(0)` and flush every buffered page of every write
-/// transaction synchronously. So the writer's share is floored.
-///
-/// The floor is capped at the limit's own share, and that cap is the whole
-/// point: an operator may declare a limit below what the store currently holds
-/// and be refused at the NEXT admission -- `Database::set_memory_limit` says so,
-/// and `a_low_memory_limit_can_be_raised_and_removed_again` and
-/// `a_refused_limit_transition_rolls_back_runtime_and_durable_state` are that
-/// contract's proofs. An uncapped floor broke it: a store declaring 1 KiB was
-/// handed a 256 KiB cache, charged for it, and was over budget the moment it
-/// opened, so it could not serve even the read that would raise the limit again.
-/// Capped, a tiny limit gets a tiny cache -- never zero, and never more than the
-/// limit budgets for it -- and no declared limit needs refusing anywhere.
+/// Internal writer subdivision of the unchanged memory budget: for limit L,
+/// `max(min(64 MiB, L / 16), min(256 KiB, L / 16))`; without a limit,
+/// 64 MiB. The capped floor preserves small-limit transitions. Reader sizing
+/// remains independent, and the existing page-cache owner charges this share.
 pub(crate) fn redb_writer_cache_bytes_for_limit(limit: Option<usize>) -> usize {
-    let floor = match limit {
-        Some(limit) => REDB_CACHE_FLOOR_BYTES.min(limit / REDB_CACHE_LIMIT_SHARE_DIVISOR),
-        None => REDB_CACHE_FLOOR_BYTES,
-    };
-    redb_cache_bytes_for_limit(limit).max(floor)
+    const WRITER_CACHE_BYTES: usize = 64 * 1024 * 1024;
+    limit.map_or(WRITER_CACHE_BYTES, |limit| {
+        let share = limit / 16;
+        share
+            .min(WRITER_CACHE_BYTES)
+            .max(share.min(REDB_CACHE_FLOOR_BYTES))
+    })
 }
 
 /// Read-only test seam exposing the writer's page-cache reserve for a
@@ -16702,6 +16696,7 @@ pub struct RedbPersistence {
     db: std::sync::RwLock<Option<redb::Database>>,
     writer_file: std::sync::RwLock<Option<Arc<LockedWriterFile>>>,
     lock_file: std::sync::RwLock<Option<CompanionGuard>>,
+    writer_read_source: std::sync::OnceLock<Arc<WriterReadSource>>,
     storage_compaction: Mutex<(redb::CompactionCursor, redb::CompactionProgress, f64)>,
     #[cfg(feature = "test-seams")]
     handoff_prepare_io_fault: AtomicBool,
@@ -19030,6 +19025,7 @@ impl RedbPersistence {
             lock_file: std::sync::RwLock::new(Some(lock_file)),
             db: std::sync::RwLock::new(Some(replacement_db)),
             writer_file: std::sync::RwLock::new(Some(replacement_owner)),
+            writer_read_source: std::sync::OnceLock::new(),
             storage_compaction: Mutex::new(Default::default()),
             #[cfg(feature = "test-seams")]
             handoff_prepare_io_fault: AtomicBool::new(false),
@@ -19093,6 +19089,7 @@ impl RedbPersistence {
                         lock_file: std::sync::RwLock::new(Some(lock_file)),
                         db: std::sync::RwLock::new(Some(db)),
                         writer_file: std::sync::RwLock::new(Some(owner)),
+                        writer_read_source: std::sync::OnceLock::new(),
                         storage_compaction: Mutex::new(Default::default()),
                         #[cfg(feature = "test-seams")]
                         handoff_prepare_io_fault: AtomicBool::new(false),
@@ -19268,6 +19265,7 @@ impl RedbPersistence {
                     lock_file: std::sync::RwLock::new(Some(lock_file)),
                     db: std::sync::RwLock::new(Some(db.database)),
                     writer_file: std::sync::RwLock::new(Some(db.owner)),
+                    writer_read_source: std::sync::OnceLock::new(),
                     storage_compaction: Mutex::new(Default::default()),
                     #[cfg(feature = "test-seams")]
                     handoff_prepare_io_fault: AtomicBool::new(false),
@@ -19758,8 +19756,12 @@ impl RedbPersistence {
             READ_CUSTODY_CONFIG_COMMITMENT_KEY,
             &[0_u8; 40],
         )?;
+        write_txn
+            .open_table(writer_history::WRITER_CHANGE_LOG_TABLE)
+            .map_err(Self::storage_error)?;
         Self::write_vector_body_root_fingerprint(&write_txn)?;
         Self::apply_content_identity_mutations_in_write(&write_txn, &[], admission)?;
+        Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
         write_txn.commit().map_err(Self::storage_error)?;
         Ok(())
     }
@@ -20506,6 +20508,15 @@ impl RedbPersistence {
                 }
             }
 
+            let _replacement_lookup_charge = self.proof_accountant().map(|accountant| {
+                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    accountant, ws.relational_deletes.len().saturating_mul(128).saturating_add(64),
+                    "writer_source", "replacement_lookup", "Raise MEMORY_LIMIT to prepare row replacement identities.",
+                )
+            }).transpose()?;
+            let replaced_rows = ws.relational_deletes.iter()
+                .map(|(table, row_id, _)| (table.as_str(), *row_id))
+                .collect::<HashSet<_>>();
             let mut relational_inserts_by_table = BTreeMap::<&str, Vec<&VersionedRow>>::new();
             for (table, row) in &ws.relational_inserts {
                 relational_inserts_by_table
@@ -20527,11 +20538,7 @@ impl RedbPersistence {
                     // independent F32 witness from the exact prior row id into
                     // its successor; explicitly staged vectors win when the
                     // update did change a vector.
-                    let replaces_same_row = ws.relational_deletes.iter().any(
-                        |(deleted_table, deleted_row_id, _)| {
-                            deleted_table == table && *deleted_row_id == row.row_id
-                        },
-                    );
+                    let replaces_same_row = replaced_rows.contains(&(table, row.row_id));
                     let mut overlay = if replaces_same_row {
                         let (lower, upper) = Self::rel_row_key_range(row.row_id);
                         let mut range = redb_table
@@ -20633,34 +20640,81 @@ impl RedbPersistence {
 
                 let mut encoded = Vec::new();
                 for (source, edge_type, target, deleted_tx) in &ws.adj_deletes {
-                    let mut live_versions = Vec::new();
-                    for entry in fwd_table.iter().map_err(Self::storage_error)? {
-                        let (key, value) = entry.map_err(Self::storage_error)?;
-                        let edge: AdjEntry = Self::decode(value.value())?;
-                        if edge.source == *source
-                            && edge.target == *target
-                            && edge.edge_type == *edge_type
-                            && edge.deleted_tx.is_none()
-                        {
-                            live_versions.push((key.value().to_vec(), edge));
+                    let mut key_charge = self.proof_accountant().map(|accountant| {
+                        crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                            accountant, (33 + edge_type.len()).saturating_mul(2), "writer_source",
+                            "graph_delete_keys", "Raise MEMORY_LIMIT to prepare the selected edge identity.",
+                        )
+                    }).transpose()?;
+                    let mut prefix = Vec::with_capacity(33 + edge_type.len());
+                    prefix.extend_from_slice(source.as_bytes());
+                    prefix.extend_from_slice(target.as_bytes());
+                    prefix.extend_from_slice(edge_type.as_bytes());
+                    prefix.push(0);
+                    let upper = writer_source::prefix_end(&prefix);
+                    let mut after = None::<Vec<u8>>;
+                    let mut found = false;
+                    loop {
+                        let lower = after.as_deref().map_or(
+                            std::ops::Bound::Included(prefix.as_slice()),
+                            std::ops::Bound::Excluded,
+                        );
+                        let upper = upper.as_deref().map_or(
+                            std::ops::Bound::Unbounded,
+                            std::ops::Bound::Excluded,
+                        );
+                        // End the range borrow before changing either direction.
+                        // Only this version's key/body is live in scratch.
+                        let memory = self.proof_accountant().map(|accountant| {
+                            crate::read_image_memory::ImageMemory::charging_for(accountant, "writer_source",
+                                "graph_delete_window", "Raise MEMORY_LIMIT to decode the selected edge version.")
+                        });
+                        let next = {
+                            let mut range = fwd_table.range::<&[u8]>((lower, upper))
+                                .map_err(Self::storage_error)?;
+                            range.next().transpose().map_err(Self::storage_error)?
+                                .map(|(key, value)| {
+                                    if let Some(memory) = &memory {
+                                        memory.reserve(key.value().len().saturating_mul(2)
+                                            .saturating_add(value.value().len().saturating_mul(2)).saturating_add(64))?;
+                                    }
+                                    let edge: AdjEntry = match &memory {
+                                        Some(memory) => memory.scope(|| Self::decode(value.value())),
+                                        None => Self::decode(value.value()),
+                                    }?;
+                                    Ok::<_, Error>((key.value().to_vec(), edge))
+                                }).transpose()?
+                        };
+                        let Some((key, mut edge)) = next else { break; };
+                        if edge.source != *source || edge.target != *target
+                            || edge.edge_type != *edge_type {
+                            return Err(Error::StoreCorrupted {
+                                path: self.path.display().to_string(),
+                                reason: "graph posting is outside its edge identity".into(),
+                            });
                         }
+                        if edge.deleted_tx.is_none() {
+                            found = true;
+                            edge.deleted_tx = Some(*deleted_tx);
+                            let mut encoded = Vec::new();
+                            Self::encode_into(&edge, &mut encoded)?;
+                            let rev_key = Self::graph_rev_key(&edge);
+                            fwd_table.insert(key.as_slice(), encoded.as_slice())
+                                .map_err(Self::storage_error)?;
+                            rev_table.insert(rev_key.as_slice(), encoded.as_slice())
+                                .map_err(Self::storage_error)?;
+                        }
+                        if let Some(charge) = &mut key_charge {
+                            charge.try_grow_for(key.capacity(), "writer_source", "graph_delete_keys",
+                                "Raise MEMORY_LIMIT to retain the selected edge resume key.")?;
+                            if let Some(prior) = after.as_ref() { charge.try_shrink(prior.capacity())?; }
+                        }
+                        after = Some(key);
                     }
-                    if live_versions.is_empty() {
+                    if !found {
                         return Err(Error::NotFound(format!(
                             "edge {source} -[{edge_type}]-> {target} in graph_fwd"
                         )));
-                    }
-                    for (fwd_key, mut edge) in live_versions {
-                        edge.deleted_tx = Some(*deleted_tx);
-                        Self::encode_into(&edge, &mut encoded)?;
-                        let rev_key = Self::graph_rev_key(&edge);
-
-                        fwd_table
-                            .insert(fwd_key.as_slice(), encoded.as_slice())
-                            .map_err(Self::storage_error)?;
-                        rev_table
-                            .insert(rev_key.as_slice(), encoded.as_slice())
-                            .map_err(Self::storage_error)?;
                     }
                 }
 
@@ -20892,6 +20946,7 @@ impl RedbPersistence {
                     table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
+                    Self::write_change_log_selectors_in_write(&write_txn, key.as_str(), encoded.as_slice())?;
                     identity_mutations.push(content_identity::encoded_history_mutation(
                         &key, entry,
                     )?);
@@ -21184,6 +21239,7 @@ impl RedbPersistence {
             {
                 stage_started = std::time::Instant::now();
             }
+            Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
             write_txn.commit().map_err(Self::storage_error)?;
             #[cfg(feature = "test-seams")]
             {
@@ -21315,6 +21371,13 @@ impl RedbPersistence {
                     Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                     Err(error) => return Err(Self::storage_error(error)),
                 }
+                let current_name =
+                    Self::current_relational_index_table_name(table, &declaration.name);
+                let current_definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                    TableDefinition::new(current_name.as_str());
+                write_txn
+                    .delete_table(current_definition)
+                    .map_err(Self::storage_error)?;
             }
             if replacement.is_some() {
                 continue;
@@ -21761,6 +21824,7 @@ impl RedbPersistence {
                     for (key, bytes) in group {
                         let entry = Self::decode::<ChangeLogEntry>(&bytes)?;
                         log.remove(key.as_str()).map_err(Self::storage_error)?;
+                        Self::remove_change_log_selectors_in_write(&write_txn, key.as_str())?;
                         change_log_identity.push(
                             content_identity::remove_encoded_history_mutation(&key, &entry)?,
                         );
@@ -21775,6 +21839,11 @@ impl RedbPersistence {
                         Self::write_change_log_entry_key(lsn, index, &mut key_buf);
                         log.insert(key_buf.as_str(), bytes.as_slice())
                             .map_err(Self::storage_error)?;
+                        Self::write_change_log_selectors_in_write(
+                            &write_txn,
+                            key_buf.as_str(),
+                            bytes.as_slice(),
+                        )?;
                         change_log_identity.push(content_identity::encoded_history_mutation(
                             key_buf.as_str(),
                             &entry,
@@ -21794,6 +21863,11 @@ impl RedbPersistence {
                     Self::encode_into(entry, &mut encoded)?;
                     log.insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
+                    Self::write_change_log_selectors_in_write(
+                        &write_txn,
+                        key.as_str(),
+                        encoded.as_slice(),
+                    )?;
                 }
             }
             let mut committed_config_values = Vec::new();
@@ -22173,6 +22247,7 @@ impl RedbPersistence {
             {
                 crate::custody::durability::before_custody_commit(&write_txn)?;
             }
+            Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -22344,6 +22419,11 @@ impl RedbPersistence {
                     Self::encode_into(entry, &mut encoded)?;
                     log.insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
+                    Self::write_change_log_selectors_in_write(
+                        &write_txn,
+                        key.as_str(),
+                        encoded.as_slice(),
+                    )?;
                 }
             }
             let mut identity_mutations = operational_index_identity_mutations;
@@ -22400,6 +22480,7 @@ impl RedbPersistence {
             }
             #[cfg(feature = "test-seams")]
             let durable_commit_started = std::time::Instant::now();
+            Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
             write_txn.commit().map_err(Self::storage_error)?;
             #[cfg(feature = "test-seams")]
             crate::database::record_received_schema_persistence_profile_for_test(
@@ -22540,6 +22621,7 @@ impl RedbPersistence {
                     "injected received-schema Redb pre-commit failure".to_string(),
                 ));
             }
+            Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -22584,6 +22666,7 @@ impl RedbPersistence {
                 &content_identity::schema_mutations(name, meta)?,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -22651,6 +22734,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -22673,6 +22757,7 @@ impl RedbPersistence {
                 &content_identity::remove_schema_mutations(name),
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -22703,6 +22788,7 @@ impl RedbPersistence {
                 &content_identity::config_mutations(key, Some(&encoded)),
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -22733,6 +22819,7 @@ impl RedbPersistence {
                 &content_identity::config_mutations(key, Some(&encoded)),
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)
         })
     }
@@ -22795,6 +22882,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -22822,6 +22910,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -22905,6 +22994,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)
         })
     }
@@ -22930,6 +23020,7 @@ impl RedbPersistence {
                 &content_identity::config_mutations(key, None),
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23045,6 +23136,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23105,6 +23197,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23129,6 +23222,11 @@ impl RedbPersistence {
                     table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
+                    Self::write_change_log_selectors_in_write(
+                        &write_txn,
+                        key.as_str(),
+                        encoded.as_slice(),
+                    )?;
                     identity_mutations
                         .push(content_identity::encoded_history_mutation(&key, entry)?);
                 }
@@ -23138,6 +23236,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23161,6 +23260,8 @@ impl RedbPersistence {
                 &[content_identity::encoded_history_mutation(&key, change)?],
                 &mut self.proof_admission(),
             )?;
+            Self::raise_noncanonical_writer_floors_in_write(&write_txn, 0, lsn.0, 0)?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23246,6 +23347,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23290,6 +23392,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23377,6 +23480,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23526,6 +23630,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23598,6 +23703,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23666,6 +23772,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -23915,6 +24022,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             #[cfg(any(test, feature = "test-seams"))]
             table_meta_rewrite_checkpoint_for_test(3);
@@ -23963,6 +24071,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -26908,6 +27017,7 @@ impl RedbPersistence {
             self.publish_preencoded_vector_partition_generation_catalog_in_write(
                 &write_txn, prepared,
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)
         })
     }
@@ -27555,6 +27665,7 @@ impl RedbPersistence {
             Self::resize_vector_cleanup_workspace(workspace, fixed_owned, OPERATION)?;
             drop(journal);
             checkpoint()?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(true)
         });
@@ -28146,6 +28257,7 @@ impl RedbPersistence {
                 Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(err) => return Err(Self::storage_error(err)),
             }
+            Self::clear_change_log_selectors_in_write(&write_txn)?;
             {
                 let mut table = write_txn
                     .open_table(CHANGE_LOG_TABLE)
@@ -28167,6 +28279,11 @@ impl RedbPersistence {
                     table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
+                    Self::write_change_log_selectors_in_write(
+                        &write_txn,
+                        key.as_str(),
+                        encoded.as_slice(),
+                    )?;
                     mutations.push(content_identity::encoded_history_mutation(&key, entry)?);
                 }
             }
@@ -28175,6 +28292,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -28318,6 +28436,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(removed)
         })
@@ -28410,6 +28529,7 @@ impl RedbPersistence {
                 }
             }
             if removed {
+                Self::write_writer_recovery_bounds_in_write(&write, None)?;
                 write.commit().map_err(Self::storage_error)?;
             }
             Ok(())
@@ -28439,6 +28559,13 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                entries.values().map(|tx| tx.0).max().unwrap_or(0),
+                0,
+                0,
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -28608,6 +28735,7 @@ impl RedbPersistence {
                 &mut self.proof_admission(),
             )?;
 
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -28640,6 +28768,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -28830,6 +28959,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             #[cfg(any(test, feature = "test-seams"))]
             retention_reclaim_checkpoint_for_test(2);
@@ -28921,6 +29051,7 @@ impl RedbPersistence {
                                 _ => false,
                             };
                             table.remove(key.as_str()).map_err(Self::storage_error)?;
+                            Self::remove_change_log_selectors_in_write(write_txn, key.as_str())?;
                             identity_mutations.push(
                                 content_identity::remove_encoded_history_mutation(&key, &decoded)?,
                             );
@@ -28935,6 +29066,11 @@ impl RedbPersistence {
                             table
                                 .insert(key_buf.as_str(), bytes.as_slice())
                                 .map_err(Self::storage_error)?;
+                            Self::write_change_log_selectors_in_write(
+                                write_txn,
+                                key_buf.as_str(),
+                                bytes.as_slice(),
+                            )?;
                             let decoded: ChangeLogEntry = Self::decode(&bytes)?;
                             identity_mutations.push(content_identity::encoded_history_mutation(
                                 key_buf.as_str(),
@@ -29131,6 +29267,7 @@ impl RedbPersistence {
                     &identity_mutations,
                     admission,
                 )?;
+                Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
                 write_txn.commit().map_err(Self::storage_error)?;
                 #[cfg(test)]
                 currency_reclaim_checkpoint_for_test(3)?;
@@ -29183,6 +29320,7 @@ impl RedbPersistence {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             self.apply_local_erasure(&write_txn, projection, &prepared_vector_generations, marker)?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)
         })
     }
@@ -29519,6 +29657,7 @@ impl RedbPersistence {
                         survivors.push(bytes);
                     }
                     table.remove(key.as_str()).map_err(Self::storage_error)?;
+                    Self::remove_change_log_selectors_in_write(write_txn, key.as_str())?;
                     identity_mutations.push(content_identity::remove_encoded_history_mutation(
                         &key, &decoded,
                     )?);
@@ -29534,6 +29673,11 @@ impl RedbPersistence {
                     table
                         .insert(key_buf.as_str(), bytes.as_slice())
                         .map_err(Self::storage_error)?;
+                    Self::write_change_log_selectors_in_write(
+                        write_txn,
+                        key_buf.as_str(),
+                        bytes.as_slice(),
+                    )?;
                     let decoded: ChangeLogEntry = Self::decode(&bytes)?;
                     identity_mutations.push(content_identity::encoded_history_mutation(
                         key_buf.as_str(),
@@ -29895,6 +30039,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(PruneScopedStats {
                 row_keys_removed: 0,
@@ -30012,6 +30157,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(PruneScopedStats {
                 row_keys_removed: 0,
@@ -30256,6 +30402,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(removed)
         })
@@ -30884,6 +31031,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -30925,6 +31073,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -30998,6 +31147,7 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -31039,6 +31189,17 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                rows.iter()
+                    .flat_map(|row| std::iter::once(row.created_tx).chain(row.deleted_tx))
+                    .map(|tx| tx.0)
+                    .max()
+                    .unwrap_or(0),
+                rows.iter().map(|row| row.lsn.0).max().unwrap_or(0),
+                0,
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -31059,6 +31220,7 @@ impl RedbPersistence {
                 None,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)
         })
     }
@@ -31150,6 +31312,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)
         })
     }
@@ -31189,6 +31352,18 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                edges
+                    .iter()
+                    .flat_map(|edge| std::iter::once(edge.created_tx).chain(edge.deleted_tx))
+                    .map(|tx| tx.0)
+                    .max()
+                    .unwrap_or(0),
+                edges.iter().map(|edge| edge.lsn.0).max().unwrap_or(0),
+                0,
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -31231,6 +31406,22 @@ impl RedbPersistence {
                 &mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                entries
+                    .iter()
+                    .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
+                    .map(|tx| tx.0)
+                    .max()
+                    .unwrap_or(0),
+                entries.iter().map(|entry| entry.lsn.0).max().unwrap_or(0),
+                entries
+                    .iter()
+                    .map(|entry| entry.row_id.0)
+                    .max()
+                    .unwrap_or(0),
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -31262,6 +31453,7 @@ impl RedbPersistence {
                 &[],
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -31291,6 +31483,11 @@ impl RedbPersistence {
                     table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
+                    Self::write_change_log_selectors_in_write(
+                        &write_txn,
+                        key.as_str(),
+                        encoded.as_slice(),
+                    )?;
                     identity_mutations
                         .push(content_identity::encoded_history_mutation(&key, entry)?);
                 }
@@ -31300,6 +31497,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -31344,6 +31542,13 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                0,
+                entries.iter().map(|(lsn, _)| lsn.0).max().unwrap_or(0),
+                0,
+            )?;
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -31716,6 +31921,13 @@ impl RedbPersistence {
         format!("__rel_index_{}", blake3::hash(&name).to_hex())
     }
 
+    fn current_relational_index_table_name(table: &str, index: &str) -> String {
+        format!(
+            "{}_current",
+            Self::relational_index_table_name(table, index)
+        )
+    }
+
     fn relational_index_count_key(
         table: &str,
         columns: &[(String, contextdb_core::SortDirection)],
@@ -31808,6 +32020,23 @@ impl RedbPersistence {
                     }
                     Err(error) => return Err(read_table_error(error)),
                 }
+                let current_name =
+                    Self::current_relational_index_table_name(table, &declaration.name);
+                let current_definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                    TableDefinition::new(current_name.as_str());
+                match read_txn.open_table(current_definition) {
+                    Ok(_) => {}
+                    Err(redb::TableError::TableDoesNotExist(_)) => {
+                        return Err(read_image_corruption(
+                            ReadImageCorruptionCause::MalformedRecord,
+                            format!(
+                                "relational index readiness for {table} names missing current posting table {}",
+                                declaration.name
+                            ),
+                        ));
+                    }
+                    Err(error) => return Err(read_table_error(error)),
+                }
             }
         }
         match read_txn.open_table(RELATIONAL_INDEX_COUNT_TABLE) {
@@ -31836,18 +32065,16 @@ impl RedbPersistence {
             .collect::<HashMap<_, _>>();
         let mut count_changes = BTreeMap::<Vec<u8>, (BTreeSet<RowId>, BTreeSet<RowId>)>::new();
         let mut identity_mutations = Vec::new();
-        for (table, meta) in table_meta {
-            let table_changed = ws
-                .relational_inserts
-                .iter()
-                .any(|(candidate, _)| candidate == table)
-                || ws
-                    .relational_deletes
-                    .iter()
-                    .any(|(candidate, _, _)| candidate == table);
-            if !table_changed {
+        let affected = ws
+            .relational_inserts
+            .iter()
+            .map(|(table, _)| table)
+            .chain(ws.relational_deletes.iter().map(|(table, _, _)| table))
+            .collect::<BTreeSet<_>>();
+        for table in affected {
+            let Some(meta) = table_meta.get(table) else {
                 continue;
-            }
+            };
             let maintain_counts = {
                 let ready = write_txn
                     .open_table(RELATIONAL_INDEX_READY_TABLE)
@@ -31863,6 +32090,13 @@ impl RedbPersistence {
                     TableDefinition::new(name.as_str());
                 let mut index = write_txn
                     .open_table(definition)
+                    .map_err(Self::storage_error)?;
+                let current_name =
+                    Self::current_relational_index_table_name(table, &declaration.name);
+                let current_definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                    TableDefinition::new(current_name.as_str());
+                let mut current = write_txn
+                    .open_table(current_definition)
                     .map_err(Self::storage_error)?;
                 for (deleted_table, row_id, deleted_tx) in &ws.relational_deletes {
                     if deleted_table != table {
@@ -31921,44 +32155,34 @@ impl RedbPersistence {
                     // An update that leaves these indexed columns unchanged
                     // keeps the original posting. Its creating transaction
                     // can therefore precede the current row version's.
-                    let first =
+                    let logical_key =
                         DurableRelationalIndexKey::new(old_key.clone(), old.row_id, TxId(0))?;
-                    let last = DurableRelationalIndexKey::new(
-                        old_key.clone(),
-                        old.row_id,
-                        TxId(u64::MAX),
-                    )?;
-                    let key = {
-                        let mut live = None;
-                        for entry in index.range(first..=last).map_err(Self::storage_error)? {
-                            let (candidate, value) = entry.map_err(Self::storage_error)?;
-                            let deleted: Option<TxId> = Self::decode_exact(value.value())?;
-                            if deleted.is_some() {
-                                continue;
-                            }
-                            let candidate = candidate.value();
-                            let position = candidate.decode_canonical()?;
-                            if position.key != old_key || position.row_id != old.row_id {
-                                return Err(Error::StoreCorrupted {
-                                    path: name.clone(),
-                                    reason: "relational index posting is outside its row run"
-                                        .into(),
-                                });
-                            }
-                            if live.replace(candidate).is_some() {
-                                return Err(Error::StoreCorrupted {
-                                    path: name.clone(),
-                                    reason:
-                                        "relational index has multiple live postings for one row"
-                                            .into(),
-                                });
-                            }
-                        }
-                        live.ok_or_else(|| Error::StoreCorrupted {
+                    let created_tx: TxId = current
+                        .get(&logical_key)
+                        .map_err(Self::storage_error)?
+                        .map(|value| Self::decode_exact(value.value()))
+                        .transpose()?
+                        .ok_or_else(|| Error::StoreCorrupted {
+                            path: current_name.clone(),
+                            reason: "current index has no posting for a deleted row".into(),
+                        })?;
+                    let key = DurableRelationalIndexKey::new(old_key, old.row_id, created_tx)?;
+                    let stamp: Option<TxId> = index
+                        .get(&key)
+                        .map_err(Self::storage_error)?
+                        .map(|value| Self::decode_exact(value.value()))
+                        .transpose()?
+                        .ok_or_else(|| Error::StoreCorrupted {
                             path: name.clone(),
-                            reason: "relational index has no live posting for a deleted row".into(),
-                        })?
-                    };
+                            reason: "current index names a missing versioned posting".into(),
+                        })?;
+                    if stamp.is_some() {
+                        return Err(Error::StoreCorrupted {
+                            path: name.clone(),
+                            reason: "current index names a deleted posting".into(),
+                        });
+                    }
+                    current.remove(&logical_key).map_err(Self::storage_error)?;
                     let deleted = Self::encode(&Some(*deleted_tx))?;
                     index
                         .insert(key, deleted.as_slice())
@@ -32029,6 +32253,10 @@ impl RedbPersistence {
                         row.row_id,
                         TxId(0),
                     )?;
+                    let created = Self::encode(&row.created_tx)?;
+                    current
+                        .insert(&logical_key, created.as_slice())
+                        .map_err(Self::storage_error)?;
                     #[cfg(feature = "test-seams")]
                     observe_index_posting(table, &declaration);
                     identity_mutations.push(content_identity::relational_index_posting_mutation(
@@ -32146,6 +32374,12 @@ impl RedbPersistence {
                 Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(error) => return Err(Self::storage_error(error)),
             }
+            let current_name = Self::current_relational_index_table_name(table, &declaration.name);
+            let current_definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                TableDefinition::new(current_name.as_str());
+            write_txn
+                .delete_table(current_definition)
+                .map_err(Self::storage_error)?;
         }
         if mutations.is_empty() {
             return Ok(());
@@ -32218,6 +32452,12 @@ impl RedbPersistence {
                 Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(error) => return Err(Self::storage_error(error)),
             }
+            let current_name = Self::current_relational_index_table_name(table, &declaration.name);
+            let current_definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
+                TableDefinition::new(current_name.as_str());
+            write_txn
+                .delete_table(current_definition)
+                .map_err(Self::storage_error)?;
             let mut index = write_txn
                 .open_table(definition)
                 .map_err(Self::storage_error)?;
@@ -32272,11 +32512,18 @@ impl RedbPersistence {
             }
             drop(write_row);
             drop(index);
-            for (row_id, (key, _, live)) in active {
+            let mut current = write_txn
+                .open_table(current_definition)
+                .map_err(Self::storage_error)?;
+            for (row_id, (key, created_tx, live)) in active {
                 if !live {
                     continue;
                 }
                 let logical_key = DurableRelationalIndexKey::new(key.clone(), row_id, TxId(0))?;
+                let created = Self::encode(&created_tx)?;
+                current
+                    .insert(&logical_key, created.as_slice())
+                    .map_err(Self::storage_error)?;
                 count_mutations.push(content_identity::relational_index_posting_mutation(
                     table,
                     &declaration.name,
