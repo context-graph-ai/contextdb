@@ -97,6 +97,8 @@ mod writer_reopen_and_doubling_keep_a_fixed_resident_envelope;
 
 #[path = "engine_seams/aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope.rs"]
 mod aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope;
+#[path = "engine_seams/crash_cutpoints_recover_one_complete_row_index_vector_log_commit.rs"]
+mod crash_cutpoints_recover_one_complete_row_index_vector_log_commit;
 
 #[path = "engine_seams/resident_history_support.rs"]
 mod resident_history_support;
