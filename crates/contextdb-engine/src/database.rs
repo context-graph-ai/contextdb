@@ -22617,14 +22617,11 @@ impl Database {
                 self.__bump_rows_examined(result.trace.rows_examined.saturating_sub(contributed));
                 Ok(result)
             }
-            // This door has no ceilings, so a refusal cannot be one; anything
-            // the kernel reports here is the engine's own error, carried out
-            // unchanged.
             Err(crate::executor::BoundedExecutionError::Engine(error)) => Err(error),
-            // An admin-scope refusal remains typed on this uncapped door.
-            Err(crate::executor::BoundedExecutionError::Refused(failure))
-                if failure.kind() == ReadFailureKind::ConstrainedHandleInspectionRefused =>
-            {
+            // Source capabilities and store admission can refuse even when
+            // this door declares no request ceilings. Preserve their shared
+            // typed detail so callers can distinguish erasure and limits.
+            Err(crate::executor::BoundedExecutionError::Refused(failure)) => {
                 Err(Error::ReadFailure(failure))
             }
             Err(other) => Err(Error::Other(format!(
