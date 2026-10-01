@@ -95,6 +95,8 @@ mod buffer_pool_share_evicts_and_recharges_under_the_writer_budget;
 mod history_sync_and_commit_cursors_reload_without_full_directories;
 #[path = "engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs"]
 mod paged_initial_replacement_and_reclamation_progress_under_writes;
+#[path = "engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs"]
+mod unpartitioned_vector_membership_pages_reload_at_constant_residency;
 #[cfg(target_os = "linux")]
 #[path = "engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs"]
 mod writer_reopen_and_doubling_keep_a_fixed_resident_envelope;
