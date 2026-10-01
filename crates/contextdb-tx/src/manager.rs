@@ -1,8 +1,11 @@
+use crate::commit_directory::{CommitDirectory, CommitDirectoryCursor, MemoryCommitDirectory};
 use crate::write_set::{WriteSet, WriteSetApplicator};
 use contextdb_core::read_contract::OwnerReadCancellation;
 use contextdb_core::{AtomicLsn, AtomicTxId, Error, Lsn, Result, RowId, SnapshotId, TxId};
 use parking_lot::{Condvar, Mutex, MutexGuard};
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -35,6 +38,15 @@ impl Drop for CommitLockGuard<'_> {
     }
 }
 
+/// The logical frontier and engine-owned root are captured under one lock.
+/// Downcast the handle to the engine's admitted shared snapshot descriptor.
+#[derive(Clone)]
+pub struct PublishedRead {
+    pub snapshot: SnapshotId,
+    pub lsn: Lsn,
+    pub handle: Option<Arc<dyn Any + Send + Sync>>,
+}
+
 pub struct TransactionManager<S: WriteSetApplicator> {
     next_tx: AtomicTxId,
     committed_watermark: AtomicTxId,
@@ -43,9 +55,9 @@ pub struct TransactionManager<S: WriteSetApplicator> {
     /// One independently readable final-publication point. The two public
     /// atomics above serve existing callers, but cannot be sampled as a pair
     /// while a commit is between their stores.
-    published_read: Mutex<(SnapshotId, Lsn)>,
+    published_read: Mutex<PublishedRead>,
     active_txs: Mutex<HashMap<TxId, WriteSet>>,
-    commit_index: Mutex<BTreeMap<Lsn, TxId>>,
+    commit_index: Arc<dyn CommitDirectory>,
     commit_mutex: Mutex<()>,
     commit_release: Arc<CommitRelease>,
     store: S,
@@ -84,17 +96,38 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         committed_watermark: TxId,
         commit_index: BTreeMap<Lsn, TxId>,
     ) -> Self {
+        Self::new_with_directory(
+            store,
+            next_tx,
+            next_lsn,
+            committed_watermark,
+            Arc::new(MemoryCommitDirectory(Mutex::new(commit_index))),
+            None,
+        )
+    }
+
+    /// File writers attach their durable directory and the initial admitted
+    /// root here, without loading commit history into transaction memory.
+    pub fn new_with_directory(
+        store: S,
+        next_tx: TxId,
+        next_lsn: Lsn,
+        committed_watermark: TxId,
+        directory: Arc<dyn CommitDirectory>,
+        handle: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> Self {
         Self {
             next_tx: AtomicTxId::new(next_tx),
             committed_watermark: AtomicTxId::new(committed_watermark),
             next_lsn: AtomicLsn::new(next_lsn),
             committed_lsn: AtomicLsn::new(Lsn(next_lsn.0.saturating_sub(1))),
-            published_read: Mutex::new((
-                SnapshotId::from_tx(committed_watermark),
-                Lsn(next_lsn.0.saturating_sub(1)),
-            )),
+            published_read: Mutex::new(PublishedRead {
+                snapshot: SnapshotId::from_tx(committed_watermark),
+                lsn: Lsn(next_lsn.0.saturating_sub(1)),
+                handle,
+            }),
             active_txs: Mutex::new(HashMap::new()),
-            commit_index: Mutex::new(commit_index),
+            commit_index: directory,
             commit_mutex: Mutex::new(()),
             commit_release: Arc::new(CommitRelease::default()),
             store,
@@ -109,14 +142,21 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     }
 
     pub fn snapshot(&self) -> SnapshotId {
-        SnapshotId::from_tx(self.committed_watermark.load(Ordering::SeqCst))
+        self.published_read.lock().snapshot
     }
 
     /// The last complete commit's snapshot and LSN, copied together without
     /// taking the commit mutex. A bounded reader may register this root while
     /// the next writer is still applying, then inspect only that snapshot.
     pub fn published_read_snapshot(&self) -> (SnapshotId, Lsn) {
-        *self.published_read.lock()
+        let published = self.published_read.lock();
+        (published.snapshot, published.lsn)
+    }
+
+    /// Clone a complete descriptor while a durable write is in flight. This
+    /// takes neither the writer serialization lock nor an admission/I/O path.
+    pub fn capture_published_read(&self) -> PublishedRead {
+        self.published_read.lock().clone()
     }
 
     pub fn with_write_set<F, R>(&self, tx: TxId, f: F) -> Result<R>
@@ -126,6 +166,30 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         let mut active = self.active_txs.lock();
         let ws = active.get_mut(&tx).ok_or(Error::TxNotFound(tx))?;
         Ok(f(ws))
+    }
+
+    /// Walk the maintained index while borrowing its transaction frontier.
+    /// The closure admits each row copy before using its returned position;
+    /// it must not re-enter transaction mutation while holding this borrow.
+    pub fn with_ordered_staged_cursor<F, R>(
+        &self,
+        tx: TxId,
+        table: &str,
+        index: &str,
+        bounds: crate::ordered_staged::OrderedStagedBounds<'_>,
+        reverse: bool,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(Option<crate::ordered_staged::OrderedStagedCursor<'_>>, &WriteSet) -> R,
+    {
+        let active = self.active_txs.lock();
+        let ws = active.get(&tx).ok_or(Error::TxNotFound(tx))?;
+        Ok(f(
+            ws.ordered_staged_rows
+                .cursor(table, index, bounds.0, bounds.1, reverse),
+            ws,
+        ))
     }
 
     /// Observe the mutex used by `with_write_set` without waiting for it.
@@ -226,11 +290,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
                 write_set: Some(Box::new(ws)),
             });
         }
-        self.commit_index.lock().insert(lsn, visibility_tx);
-        self.committed_watermark
-            .fetch_max(visibility_tx, Ordering::SeqCst);
-        self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
-        self.publish_read_snapshot(lsn);
+        self.commit_index.record_applied(lsn, visibility_tx);
+        self.publish_read_snapshot(lsn, Some(visibility_tx));
         Ok((lsn, ws))
     }
 
@@ -304,11 +365,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         // reader that can see a row must also be able to see the creation and
         // delete evidence published for the same commit.
         after_apply(lsn, &ws);
-        self.commit_index.lock().insert(lsn, visibility_tx);
-        self.committed_watermark
-            .fetch_max(visibility_tx, Ordering::SeqCst);
-        self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
-        self.publish_read_snapshot(lsn);
+        self.commit_index.record_applied(lsn, visibility_tx);
+        self.publish_read_snapshot(lsn, Some(visibility_tx));
         Ok((lsn, ws))
     }
 
@@ -386,11 +444,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         // complete. This is the atomic visibility boundary for engine-owned
         // sidecars that are not part of the generic store.
         after_apply(lsn, &ws);
-        self.commit_index.lock().insert(lsn, visibility_tx);
-        self.committed_watermark
-            .fetch_max(visibility_tx, Ordering::SeqCst);
-        self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
-        self.publish_read_snapshot(lsn);
+        self.commit_index.record_applied(lsn, visibility_tx);
+        self.publish_read_snapshot(lsn, Some(visibility_tx));
         Ok((lsn, ws))
     }
 
@@ -471,124 +526,124 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         self.committed_lsn.load(Ordering::SeqCst)
     }
 
-    fn publish_read_snapshot(&self, lsn: Lsn) {
-        *self.published_read.lock() = (self.snapshot(), lsn);
-    }
-
-    /// Commit-index entries at or below `up_to`. Read this inside the same
-    /// commit-mutex window (see [`TransactionManager::with_commit_lock`]) that captures
-    /// the committed watermark and committed LSN, so the returned prefix is
-    /// consistent with both. Snapshot-capture seam for checkpoint export.
-    pub fn commit_index_prefix(&self, up_to: Lsn) -> BTreeMap<Lsn, TxId> {
-        self.commit_index
-            .lock()
-            .range(..=up_to)
-            .map(|(lsn, tx)| (*lsn, *tx))
-            .collect()
-    }
-
-    /// Replace the commit index with `retained`, returning how many entries
-    /// were removed. Retention pruning calls this to stop the index growing
-    /// with every commit ever made; the caller owns the floor policy, because
-    /// only it knows which LSNs a consumer can still name.
-    pub fn replace_commit_index(&self, retained: BTreeMap<Lsn, TxId>) -> u64 {
-        let mut commit_index = self.commit_index.lock();
-        let before = commit_index.len();
-        *commit_index = retained;
-        (before.saturating_sub(commit_index.len())) as u64
-    }
-
-    /// Remove exactly the named entries, candidate-only — the scoped
-    /// counterpart of `replace_commit_index`: a version-cleanup pass that
-    /// only touched a handful of LSNs removes only those candidates (each
-    /// already proven safe to drop by the caller's own floor computation,
-    /// e.g. `retained_commit_index_after_prune`), never re-derives the whole
-    /// index. Returns how many of the named entries were actually present.
-    pub fn remove_commit_index_entries(&self, lsns: &[Lsn]) -> u64 {
-        let mut commit_index = self.commit_index.lock();
-        let mut removed = 0u64;
-        for lsn in lsns {
-            if commit_index.remove(lsn).is_some() {
-                removed = removed.saturating_add(1);
+    fn publish_read_snapshot(&self, lsn: Lsn, visibility_tx: Option<TxId>) {
+        // The applicator prepared/reserved the root outside this lock. The
+        // descriptor swap alone is the publication critical section. The old
+        // root may release pages/accounting, so drop it after unlocking.
+        let handle = self.store.publication_handle();
+        let prior = {
+            let mut published = self.published_read.lock();
+            if let Some(tx) = visibility_tx {
+                self.committed_watermark.fetch_max(tx, Ordering::SeqCst);
             }
+            self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
+            let next = PublishedRead {
+                snapshot: SnapshotId::from_tx(self.committed_watermark.load(Ordering::SeqCst)),
+                lsn,
+                handle,
+            };
+            std::mem::replace(&mut *published, next)
+        };
+        drop(prior);
+    }
+
+    pub fn commit_directory_cursor(
+        &self,
+        lower: Bound<Lsn>,
+        upper: Bound<Lsn>,
+    ) -> Result<Box<dyn CommitDirectoryCursor>> {
+        self.commit_index.cursor(lower, upper)
+    }
+
+    /// Collection results belong to the caller; durable cursors never retain
+    /// decoded history in the transaction manager. Engine consumers should
+    /// prefer the cursor and fallible point APIs on file-backed stores.
+    pub fn try_commit_index_prefix(&self, up_to: Lsn) -> Result<BTreeMap<Lsn, TxId>> {
+        let mut cursor = self.commit_directory_cursor(Bound::Unbounded, Bound::Included(up_to))?;
+        let mut entries = BTreeMap::new();
+        while let Some((lsn, tx)) = cursor.next_entry()? {
+            entries.insert(lsn, tx);
         }
-        removed
+        Ok(entries)
     }
 
-    /// A copy of the commit index, for a caller computing a retention floor.
-    /// How many committed LSNs the commit index holds.
+    pub fn commit_index_prefix(&self, up_to: Lsn) -> BTreeMap<Lsn, TxId> {
+        self.try_commit_index_prefix(up_to)
+            .expect("commit directory read failed")
+    }
+
+    pub fn try_replace_commit_index(&self, retained: BTreeMap<Lsn, TxId>) -> Result<u64> {
+        self.commit_index.replace(retained)
+    }
+
+    pub fn replace_commit_index(&self, retained: BTreeMap<Lsn, TxId>) -> u64 {
+        self.try_replace_commit_index(retained)
+            .expect("commit directory replacement failed")
+    }
+
+    pub fn try_remove_commit_index_entries(&self, lsns: &[Lsn]) -> Result<u64> {
+        self.commit_index.remove(lsns)
+    }
+
+    pub fn remove_commit_index_entries(&self, lsns: &[Lsn]) -> u64 {
+        self.try_remove_commit_index_entries(lsns)
+            .expect("commit directory removal failed")
+    }
+
+    pub fn try_commit_index_census(&self) -> Result<(usize, Lsn)> {
+        self.commit_index.census()
+    }
+
     pub fn commit_index_len(&self) -> usize {
-        self.commit_index.lock().len()
+        self.commit_index_census().0
     }
 
-    /// The commit index in LSN order, copied once into exactly the space it
-    /// needs.
     pub fn commit_index_entries(&self) -> Vec<(Lsn, TxId)> {
-        let index = self.commit_index.lock();
-        let mut entries = Vec::with_capacity(index.len());
-        entries.extend(index.iter().map(|(lsn, tx)| (*lsn, *tx)));
-        entries
+        self.commit_index_snapshot().into_iter().collect()
     }
 
     pub fn commit_index_snapshot(&self) -> BTreeMap<Lsn, TxId> {
-        self.commit_index
-            .lock()
-            .iter()
-            .map(|(lsn, tx)| (*lsn, *tx))
-            .collect()
+        self.commit_index_prefix(Lsn(u64::MAX))
     }
 
-    /// The single commit-index entry immediately below `lsn` (exclusive), if
-    /// any — a targeted range query that never clones the whole index,
-    /// unlike [`Self::commit_index_snapshot`]. Used by a scoped
-    /// cleanup/retention pass to find its anchor entry (the fallback a
-    /// query below the lowest still-nameable LSN resolves against) without
-    /// paying for the whole index's size, which — unlike the change log a
-    /// scoped pass actually cleans — is never itself scoped to the
-    /// cleaned table.
+    pub fn try_commit_index_floor(&self, upper: Bound<Lsn>) -> Result<Option<(Lsn, TxId)>> {
+        self.commit_index.floor(upper)
+    }
+
     pub fn commit_index_floor_below(&self, lsn: Lsn) -> Option<(Lsn, TxId)> {
-        self.commit_index
-            .lock()
-            .range(..lsn)
-            .next_back()
-            .map(|(lsn, tx)| (*lsn, *tx))
+        self.try_commit_index_floor(Bound::Excluded(lsn))
+            .expect("commit directory seek failed")
     }
 
-    /// The single most recent commit-index entry, if any — the same
-    /// targeted-lookup rationale as [`Self::commit_index_floor_below`],
-    /// used for the degenerate "nothing in the change log survives" anchor
-    /// fallback.
     pub fn commit_index_last(&self) -> Option<(Lsn, TxId)> {
-        self.commit_index
-            .lock()
-            .iter()
-            .next_back()
-            .map(|(lsn, tx)| (*lsn, *tx))
+        self.try_commit_index_floor(Bound::Unbounded)
+            .expect("commit directory seek failed")
     }
 
-    /// Whether `lsn` is currently present in the commit index — a targeted
-    /// point lookup, never a clone of the whole index.
+    pub fn try_commit_index_contains(&self, lsn: Lsn) -> Result<bool> {
+        self.commit_index.contains(lsn)
+    }
+
     pub fn commit_index_contains(&self, lsn: Lsn) -> bool {
-        self.commit_index.lock().contains_key(&lsn)
+        self.try_commit_index_contains(lsn)
+            .expect("commit directory probe failed")
     }
 
-    /// Entry count and the lowest LSN still retained. `Lsn(0)` when the index
-    /// is empty — an index that has never been written to has no lowest entry
-    /// to name.
     pub fn commit_index_census(&self) -> (usize, Lsn) {
-        let commit_index = self.commit_index.lock();
-        let lowest = commit_index.keys().next().copied().unwrap_or(Lsn(0));
-        (commit_index.len(), lowest)
+        self.try_commit_index_census()
+            .expect("commit directory bounds failed")
+    }
+
+    pub fn try_snapshot_at_lsn(&self, lsn: Lsn) -> Result<SnapshotId> {
+        Ok(SnapshotId::from_tx(
+            self.try_commit_index_floor(Bound::Included(lsn))?
+                .map_or(TxId(0), |(_, tx)| tx),
+        ))
     }
 
     pub fn snapshot_at_lsn(&self, lsn: Lsn) -> SnapshotId {
-        let commit_index = self.commit_index.lock();
-        let tx = commit_index
-            .range(..=lsn)
-            .next_back()
-            .map(|(_, tx)| *tx)
-            .unwrap_or(TxId(0));
-        SnapshotId::from_tx(tx)
+        self.try_snapshot_at_lsn(lsn)
+            .expect("commit directory seek failed")
     }
 
     pub fn allocate_ddl_lsn<F, R>(&self, f: F) -> Result<R>
@@ -599,8 +654,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         match f(lsn) {
             Ok(result) => {
-                self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
-                self.publish_read_snapshot(lsn);
+                self.publish_read_snapshot(lsn, None);
                 Ok(result)
             }
             Err(err) => {
@@ -618,8 +672,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         match f(lsn) {
             Ok(Some(result)) => {
-                self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
-                self.publish_read_snapshot(lsn);
+                self.publish_read_snapshot(lsn, None);
                 Ok(Some(result))
             }
             Ok(None) => {

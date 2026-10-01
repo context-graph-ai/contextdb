@@ -10,6 +10,8 @@ pub struct RelationalDeletePredicate {
 #[derive(Debug, Default, Clone)]
 pub struct WriteSet {
     pub relational_inserts: Vec<(TableName, VersionedRow)>,
+    /// Maintained by the engine's admitted declared-index staging doors.
+    pub ordered_staged_rows: crate::ordered_staged::OrderedStagedRows,
     pub relational_deletes: Vec<(TableName, RowId, TxId)>,
     pub relational_delete_predicates: Vec<RelationalDeletePredicate>,
     pub adj_inserts: Vec<AdjEntry>,
@@ -105,6 +107,24 @@ impl WriteSet {
             inserts.reverse();
             self.relational_inserts = inserts;
         }
+        self.rebind_ordered_staged_rows();
+    }
+
+    /// Call after checkpoint truncation/restoration as well as canonicalization.
+    pub fn rebind_ordered_staged_rows(&mut self) {
+        if self.ordered_staged_rows.is_empty() {
+            return;
+        }
+        // Posting admission reserves this transient position/control map as
+        // well as retained keys. No row values or index keys are copied here.
+        let mut positions: HashMap<&str, HashMap<RowId, (usize, TxId)>> = HashMap::new();
+        for (position, (table, row)) in self.relational_inserts.iter().enumerate() {
+            positions
+                .entry(table.as_str())
+                .or_default()
+                .insert(row.row_id, (position, row.created_tx));
+        }
+        self.ordered_staged_rows.rebind(&positions);
     }
 
     pub fn reassign_tx(&mut self, from: TxId, to: TxId) {
@@ -112,6 +132,7 @@ impl WriteSet {
             return;
         }
 
+        self.ordered_staged_rows.reassign_tx(from, to);
         for (_, row) in &mut self.relational_inserts {
             if row.created_tx == from {
                 row.created_tx = to;
@@ -196,6 +217,7 @@ impl WriteSet {
     /// staged versions in bulk; a record left behind for one of them would be
     /// read again if the same row identity were staged a second time.
     pub fn forget_admitted_bytes_for_unstaged_rows(&mut self) {
+        self.rebind_ordered_staged_rows();
         if self.relational_insert_admitted_bytes.is_empty() {
             return;
         }
@@ -275,9 +297,19 @@ pub fn row_matches_delete_predicates(
 pub trait WriteSetApplicator: Send + Sync {
     fn apply(&self, ws: &WriteSet) -> Result<()>;
     fn new_row_id(&self) -> RowId;
+    /// Return the already prepared root after successful durable apply. All
+    /// fallible reservation/root creation belongs to prepare/apply; a failure
+    /// after durability must poison the writer, never report rollback.
+    fn publication_handle(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
 }
 
 impl WriteSetApplicator for Box<dyn WriteSetApplicator> {
+    fn publication_handle(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        (**self).publication_handle()
+    }
+
     fn apply(&self, ws: &WriteSet) -> Result<()> {
         (**self).apply(ws)
     }
