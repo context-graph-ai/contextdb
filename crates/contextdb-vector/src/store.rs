@@ -1,3 +1,11 @@
+mod membership;
+use membership::with_membership_read;
+#[doc(hidden)]
+pub use membership::{
+    RawVectorMembershipCursor, RawVectorMembershipSource, RawVectorMembershipSummary,
+    RawVectorReverseMembershipCursor, RawVectorReverseMembershipSource,
+};
+
 use crate::hnsw::ServingPages;
 use crate::memory_budget::{MemoryBudget, VectorWorkspaceReservation};
 use crate::{HnswIndex, quantized::StoredVectorEntry};
@@ -1560,6 +1568,7 @@ pub struct IndexState {
     raw_directory_by_row: RwLock<HashMap<RowId, Vec<usize>>>,
     visibility_counts: RwLock<VectorVisibilityCounts>,
     raw_loader: RwLock<Option<Arc<dyn DormantRawVectorLoader>>>,
+    durable_memberships: RwLock<Option<Arc<dyn RawVectorMembershipSource>>>,
     raw_residency_gate: RwLock<()>,
     raw_resident: AtomicBool,
     raw_resident_bytes: AtomicUsize,
@@ -1689,6 +1698,7 @@ impl IndexState {
             raw_directory_by_row: RwLock::new(HashMap::new()),
             visibility_counts: RwLock::new(VectorVisibilityCounts::default()),
             raw_loader: RwLock::new(None),
+            durable_memberships: RwLock::new(None),
             raw_residency_gate: RwLock::new(()),
             raw_resident: AtomicBool::new(true),
             raw_resident_bytes: AtomicUsize::new(0),
@@ -1918,6 +1928,143 @@ impl IndexState {
         Ok(())
     }
 
+    pub(crate) fn durable_membership_source(&self) -> Option<Arc<dyn RawVectorMembershipSource>> {
+        self.durable_memberships.read().clone()
+    }
+
+    pub(crate) fn try_directory_has_visible_row(
+        &self,
+        row: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        Ok(self
+            .try_visible_directory_entry_by_row(row, snapshot)?
+            .is_some())
+    }
+
+    pub(crate) fn try_directory_visible_entry_count(
+        &self,
+        snapshot: SnapshotId,
+        candidates: Option<&roaring::RoaringTreemap>,
+    ) -> Result<usize> {
+        let Some(source) = self.durable_membership_source() else {
+            return Ok(self.directory_visible_entry_count(snapshot, candidates));
+        };
+        if let Some(ids) = candidates {
+            let mut count = 0usize;
+            for id in ids.iter() {
+                count += usize::from(self.try_directory_has_visible_row(RowId(id), snapshot)?);
+            }
+            return Ok(count);
+        }
+        source.visible_count(snapshot, &mut || true)
+    }
+
+    pub(crate) fn try_visible_directory_entry_by_row(
+        &self,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<Option<RawVectorDirectoryEntry>> {
+        if let Some(source) = self.durable_membership_source() {
+            return source.visible_by_row(row_id, snapshot, &mut || true);
+        }
+        Ok(self.visible_directory_entry_by_row(row_id, snapshot))
+    }
+
+    fn bounded_visible_directory_entry_by_row<E: From<Error>>(
+        &self,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        before_read: &mut impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<RawVectorDirectoryEntry>, E> {
+        if let Some(source) = self.durable_membership_source() {
+            return with_membership_read(before_read, |before_read| {
+                source.visible_by_row(row_id, snapshot, before_read)
+            });
+        }
+        Ok(self.visible_directory_entry_by_row(row_id, snapshot))
+    }
+
+    fn load_vector_for_row_lsn(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        lsn: Lsn,
+    ) -> Result<Option<Vec<f32>>> {
+        let Some(source) = self.durable_membership_source() else {
+            if !self.directory_has_row_lsn(row_id, lsn) {
+                return Ok(None);
+            }
+            self.ensure_raw_vectors_loaded()?;
+            return Ok(self.vector_for_row_lsn(row_id, lsn));
+        };
+        let Some(identity) = source.identity_by_row_lsn(row_id, lsn, &mut || true)? else {
+            return Ok(None);
+        };
+        if identity.row_id != row_id || identity.lsn != lsn {
+            return Err(Error::Other(
+                "durable vector membership returned another row version".into(),
+            ));
+        }
+        let loader = self.raw_loader.read().clone().ok_or_else(|| {
+            Error::Other("durable vector membership has no raw-body loader".into())
+        })?;
+        let mut loaded = loader.load_candidate(&identity, false, &mut |request| {
+            !matches!(request, DormantVectorLoadRequest::Reserve(_))
+        })?;
+        let entry = loaded.entry();
+        if entry.index != *index
+            || entry.row_id != identity.row_id
+            || entry.created_tx != identity.created_tx
+            || entry.deleted_tx != identity.deleted_tx
+            || entry.lsn != identity.lsn
+            || entry.vector.len() != self.dimension
+        {
+            return Err(Error::Other(
+                "raw vector body disagrees with durable membership".into(),
+            ));
+        }
+        // Move the loader-admitted decode into the caller-owned projection;
+        // never copy a body or hydrate the owning partition.
+        Ok(Some(std::mem::take(&mut loaded.entry.vector)))
+    }
+
+    fn load_visible_entry_by_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VectorEntry>> {
+        if let Some(source) = self.durable_membership_source() {
+            let Some(identity) = source.visible_by_row(row_id, snapshot, &mut || true)? else {
+                return Ok(None);
+            };
+            let loader = self.raw_loader.read().clone().ok_or_else(|| {
+                Error::Other("durable vector membership has no raw-body loader".into())
+            })?;
+            let loaded = loader.load_candidate(&identity, false, &mut |request| {
+                !matches!(request, DormantVectorLoadRequest::Reserve(_))
+            })?;
+            let entry = loaded.entry();
+            if entry.index != *index
+                || entry.row_id != identity.row_id
+                || entry.created_tx != identity.created_tx
+                || entry.deleted_tx != identity.deleted_tx
+                || entry.lsn != identity.lsn
+                || entry.vector.len() != self.dimension
+            {
+                return Err(Error::Other(
+                    "raw vector body disagrees with durable membership".into(),
+                ));
+            }
+            // The loader funds the complete decode/copy window. The returned
+            // owned entry follows the existing caller-owned projection contract.
+            return Ok(Some(entry.clone()));
+        }
+        self.ensure_raw_vectors_loaded()?;
+        Ok(self.visible_entry_by_row(index, row_id, snapshot))
+    }
+
     pub(crate) fn ensure_raw_vectors_loaded(&self) -> Result<()> {
         self.ensure_raw_vectors_loaded_with_copy_preference(false)
     }
@@ -1928,6 +2075,11 @@ impl IndexState {
     ) -> Result<()> {
         if self.raw_resident.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        if self.durable_membership_source().is_some() {
+            return Err(Error::Other(
+                "durable vector memberships require bounded point or cursor access".to_string(),
+            ));
         }
         let _gate = self.raw_residency_gate.write();
         if self.raw_resident.load(Ordering::SeqCst) {
@@ -2209,17 +2361,113 @@ impl IndexState {
         snapshot: SnapshotId,
         candidates: Option<&[u64]>,
         mut before_entry: impl FnMut() -> std::result::Result<(), E>,
-    ) -> std::result::Result<usize, E> {
+    ) -> std::result::Result<usize, E>
+    where
+        E: From<Error>,
+    {
         before_entry()?;
+        let source = self.durable_membership_source();
         let Some(ids) = candidates else {
-            return Ok(self.visibility_counts.read().count(snapshot));
+            return match source {
+                Some(source) => with_membership_read(&mut before_entry, |before_read| {
+                    source.visible_count(snapshot, before_read)
+                }),
+                None => Ok(self.visibility_counts.read().count(snapshot)),
+            };
         };
         let mut count = 0;
         for id in ids {
             before_entry()?;
-            count += usize::from(self.directory_has_visible_row(RowId(*id), snapshot));
+            count += usize::from(
+                self.bounded_visible_directory_entry_by_row(
+                    RowId(*id),
+                    snapshot,
+                    &mut before_entry,
+                )?
+                .is_some(),
+            );
         }
         Ok(count)
+    }
+
+    pub(crate) fn bounded_visit_visible_ids_charged<E>(
+        &self,
+        snapshot: SnapshotId,
+        mut before_entry: impl FnMut() -> std::result::Result<(), E>,
+        mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut release_retained: impl FnMut(usize),
+        mut visit: impl FnMut(RowId) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<Error>,
+    {
+        if let Some(source) = self.durable_membership_source() {
+            let mut reserved = 0usize;
+            let mut interrupted = None;
+            let opened = source.open(&mut |request| {
+                if interrupted.is_some() {
+                    return false;
+                }
+                let result = match request {
+                    DormantVectorLoadRequest::Reserve(bytes) => match reserved.checked_add(bytes) {
+                        Some(total) => before_retain(bytes).map(|()| reserved = total),
+                        None => Err(E::from(Error::Other(
+                            "membership window charge overflow".into(),
+                        ))),
+                    },
+                    _ => before_entry(),
+                };
+                if let Err(error) = result {
+                    interrupted = Some(error);
+                    false
+                } else {
+                    true
+                }
+            });
+            let result = (|| {
+                if let Some(error) = interrupted.take() {
+                    return Err(error);
+                }
+                let mut cursor = opened.map_err(E::from)?;
+                loop {
+                    before_entry()?;
+                    let mut interrupted = None;
+                    let next = cursor.next(&mut |request| {
+                        if interrupted.is_some() {
+                            return false;
+                        }
+                        let result = match request {
+                            DormantVectorLoadRequest::Reserve(_) => Err(E::from(Error::Other(
+                                "membership cursor must reserve its fixed window before opening"
+                                    .into(),
+                            ))),
+                            _ => before_entry(),
+                        };
+                        if let Err(error) = result {
+                            interrupted = Some(error);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if let Some(error) = interrupted {
+                        return Err(error);
+                    }
+                    let Some(entry) = next.map_err(E::from)? else {
+                        break;
+                    };
+                    if entry.created_tx.0 <= snapshot.0
+                        && entry.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+                    {
+                        visit(entry.row_id)?;
+                    }
+                }
+                Ok(())
+            })();
+            release_retained(reserved);
+            return result;
+        }
+        self.bounded_visit_visible_ids(snapshot, before_entry, visit)
     }
 
     pub(crate) fn bounded_visit_visible_ids<E>(
@@ -2299,15 +2547,22 @@ impl IndexState {
     }
 
     pub fn vector_count(&self) -> usize {
+        if let Some(source) = self.durable_membership_source() {
+            return source.published_summary().live_entries;
+        }
         self.visibility_counts.read().count(SnapshotId(u64::MAX))
     }
 
     pub fn max_tx(&self) -> TxId {
+        if let Some(source) = self.durable_membership_source() {
+            return source.published_summary().max_tx;
+        }
         self.visibility_counts.read().max_tx()
     }
 
     /// Eligibility shares the snapshot boundary index used by ordinary counts.
-    /// One checkpoint admits the lookup; excluded history is never enumerated.
+    /// Durable historical probes checkpoint and charge every physical record;
+    /// resident counts use their snapshot boundary index.
     pub(crate) fn bounded_hnsw_eligibility<E>(
         &self,
         snapshot_tx: TxId,
@@ -2317,6 +2572,14 @@ impl IndexState {
         E: From<Error>,
     {
         before_source_entry()?;
+        if let Some(source) = self.durable_membership_source() {
+            return Ok(BoundedIndexEligibility {
+                entry_count: source.published_summary().entries,
+                live_count: with_membership_read(&mut before_source_entry, |before_read| {
+                    source.visible_count(SnapshotId(snapshot_tx.0), before_read)
+                })?,
+            });
+        }
         let counts = self.visibility_counts.read();
         Ok(BoundedIndexEligibility {
             entry_count: counts.created.len(),
@@ -2658,7 +2921,9 @@ impl IndexState {
             return Ok(Some(score));
         }
 
-        let Some(identity) = self.visible_directory_entry_by_row(row_id, snapshot) else {
+        let Some(identity) =
+            self.bounded_visible_directory_entry_by_row(row_id, snapshot, before_checkpoint)?
+        else {
             return Ok(None);
         };
         // A page this statement has already authenticated answers every vector
@@ -2949,6 +3214,9 @@ impl IndexState {
     }
 
     pub fn entry_count(&self) -> usize {
+        if let Some(source) = self.durable_membership_source() {
+            return source.published_summary().entries;
+        }
         self.raw_directory.read().len()
     }
 
@@ -3156,6 +3424,7 @@ impl IndexState {
         self.raw_directory_by_row.write().clear();
         *self.visibility_counts.write() = VectorVisibilityCounts::default();
         self.raw_loader.write().take();
+        self.durable_memberships.write().take();
         self.raw_resident_bytes.store(0, Ordering::SeqCst);
         self.raw_accountant.write().take();
         self.raw_resident.store(true, Ordering::SeqCst);
@@ -6457,16 +6726,18 @@ fn prepared_directory_growth_upper_bound_matching(
     requested: &HashMap<VectorIndexRef, PartitionKeySet>,
     matches: impl Fn(&VectorIndexRef) -> bool,
 ) -> usize {
-    let directory_entry = std::mem::size_of::<RawVectorDirectoryEntry>()
+    let directory_entry = (6 * std::mem::size_of::<usize>())
+        .saturating_add(2 * std::mem::size_of::<VectorPartitionKey>())
+        .saturating_add(std::mem::size_of::<RawVectorDirectoryEntry>())
         .saturating_add(std::mem::size_of::<StoredVectorEntry>())
         .saturating_add(std::mem::size_of::<(usize, usize)>())
         .saturating_add(crate::quantized::shared_payload_header_bytes())
         .saturating_add(4 * std::mem::size_of::<TxId>() + 8 * std::mem::size_of::<(u64, u64)>())
         .saturating_add(std::mem::size_of::<(RowId, Vec<usize>)>())
         .saturating_add(std::mem::size_of::<usize>())
-        .saturating_add(std::mem::size_of::<(RowId, VectorPartitionKey)>())
+        .saturating_add(std::mem::size_of::<(RowId, Arc<VectorPartitionKey>)>())
         .saturating_sub(std::mem::size_of::<VectorPartitionKey>())
-        .saturating_add(std::mem::size_of::<(RowId, Vec<VectorPartitionKey>)>())
+        .saturating_add(std::mem::size_of::<(RowId, Vec<Arc<VectorPartitionKey>>)>())
         .saturating_add(std::mem::size_of::<VectorPartitionKey>());
     let mut bytes = inserts
         .iter()
@@ -6575,11 +6846,12 @@ impl Drop for VectorPolicyBuildGuard {
 struct VectorColumnState {
     layout: RwLock<VectorIndexLayout>,
     partitions: RwLock<BTreeMap<VectorPartitionKey, Arc<IndexState>>>,
-    row_to_partition: RwLock<HashMap<RowId, VectorPartitionKey>>,
+    row_to_partition: RwLock<HashMap<RowId, Arc<VectorPartitionKey>>>,
+    durable_reverse_memberships: RwLock<Option<Arc<dyn RawVectorReverseMembershipSource>>>,
     /// Every physical partition in which a row identity has retained history.
     /// The current directory above stays the fast path; this one makes an old
     /// snapshot resolve its own placement without probing every partition.
-    row_partition_history: RwLock<HashMap<RowId, Vec<VectorPartitionKey>>>,
+    row_partition_history: RwLock<HashMap<RowId, Vec<Arc<VectorPartitionKey>>>>,
     /// File-backed open reserves the lightweight registry/directory image as
     /// one retained category. The column keeps that exact reservation so a
     /// later DROP COLUMN/TABLE returns it once, independent of cache state.
@@ -6605,6 +6877,7 @@ impl VectorColumnState {
             layout: RwLock::new(layout),
             partitions: RwLock::new(partitions),
             row_to_partition: RwLock::new(HashMap::new()),
+            durable_reverse_memberships: RwLock::new(None),
             row_partition_history: RwLock::new(HashMap::new()),
             directory_accounting: Mutex::new(None),
         }
@@ -6739,7 +7012,10 @@ impl VectorColumnState {
     }
 
     fn current_partition(&self, row_id: RowId) -> Option<VectorPartitionKey> {
-        self.row_to_partition.read().get(&row_id).cloned()
+        self.row_to_partition
+            .read()
+            .get(&row_id)
+            .map(|key| (**key).clone())
     }
 
     fn with_partition_candidates_for_row<E, T>(
@@ -6749,32 +7025,57 @@ impl VectorColumnState {
             &VectorPartitionKey,
             &Arc<IndexState>,
         ) -> std::result::Result<Option<T>, E>,
-    ) -> std::result::Result<Option<T>, E> {
-        let current_rows = self.row_to_partition.read();
-        let history = self.row_partition_history.read();
-        let partitions = self.partitions.read();
+    ) -> std::result::Result<Option<T>, E>
+    where
+        E: From<Error>,
+    {
         #[cfg(feature = "test-seams")]
         crate::mem::observe_bounded_candidate_grouping_for_test(
             crate::mem::BoundedCandidateGroupingEventForTest::RowDirectoryLookup,
         );
-        let current = current_rows.get(&row_id);
-
-        if let Some(key) = current
-            && let Some(state) = partitions.get(key)
-            && let Some(value) = inspect_partition(key, state)?
+        let reverse = self.durable_reverse_memberships.read().clone();
+        if let Some(reverse) = reverse {
+            let mut cursor = reverse.open_row(row_id, &mut || true).map_err(E::from)?;
+            while let Some(key) = cursor.next(&mut || true).map_err(E::from)? {
+                let state = self.partition_state(&key).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "durable vector reverse directory names an absent partition".into(),
+                    ))
+                })?;
+                if let Some(value) = inspect_partition(&key, &state)? {
+                    return Ok(Some(value));
+                }
+            }
+            return Ok(None);
+        }
+        // Copy one handle/key at a time, releasing every directory guard before
+        // any callback can admit memory, perform storage IO, or reenter the store.
+        let current = self.row_to_partition.read().get(&row_id).cloned();
+        if let Some(key) = current.as_ref()
+            && let Some(state) = self.partition_state(key)
+            && let Some(value) = inspect_partition(key, &state)?
         {
             return Ok(Some(value));
         }
-        if let Some(keys) = history.get(&row_id) {
-            for key in keys {
-                if current == Some(key) {
-                    continue;
-                }
-                if let Some(state) = partitions.get(key)
-                    && let Some(value) = inspect_partition(key, state)?
-                {
-                    return Ok(Some(value));
-                }
+        let mut position = 0;
+        loop {
+            let key = self
+                .row_partition_history
+                .read()
+                .get(&row_id)
+                .and_then(|keys| keys.get(position))
+                .cloned();
+            let Some(key) = key else {
+                break;
+            };
+            position += 1;
+            if current.as_ref() == Some(&key) {
+                continue;
+            }
+            if let Some(state) = self.partition_state(&key)
+                && let Some(value) = inspect_partition(&key, &state)?
+            {
+                return Ok(Some(value));
             }
         }
         Ok(None)
@@ -6792,15 +7093,49 @@ impl VectorColumnState {
         ) -> std::result::Result<Option<T>, E>,
     ) -> std::result::Result<Option<T>, E>
     where
+        E: From<Error>,
         C: FnMut() -> std::result::Result<(), E>,
     {
+        let reverse = self.durable_reverse_memberships.read().clone();
+        if let Some(reverse) = reverse {
+            before_visibility_probe()?;
+            #[cfg(feature = "test-seams")]
+            crate::mem::observe_bounded_candidate_grouping_for_test(
+                crate::mem::BoundedCandidateGroupingEventForTest::RowDirectoryLookup,
+            );
+            let key = with_membership_read(before_visibility_probe, |before_read| {
+                reverse.visible_partition(row_id, snapshot, before_read)
+            })?;
+            let Some(key) = key else {
+                return Ok(None);
+            };
+            let state = self.partition_state(&key).ok_or_else(|| {
+                E::from(Error::Other(
+                    "durable vector reverse directory names an absent partition".into(),
+                ))
+            })?;
+            // The reverse directory and partition source share one pinned root.
+            // Authenticate the forward identity too, detecting inconsistent sidecars.
+            if state
+                .bounded_visible_directory_entry_by_row(row_id, snapshot, before_visibility_probe)?
+                .is_none()
+            {
+                return Err(E::from(Error::Other(
+                    "durable vector reverse and partition memberships disagree".into(),
+                )));
+            }
+            return inspect_visible_partition(&key, &state, before_visibility_probe);
+        }
         self.with_partition_candidates_for_row(row_id, |key, state| {
             before_visibility_probe()?;
             #[cfg(feature = "test-seams")]
             crate::mem::observe_bounded_candidate_grouping_for_test(
                 crate::mem::BoundedCandidateGroupingEventForTest::SnapshotVisibilityProbe,
             );
-            if state.directory_has_visible_row(row_id, snapshot) {
+            if state
+                .bounded_visible_directory_entry_by_row(row_id, snapshot, before_visibility_probe)?
+                .is_some()
+            {
                 inspect_visible_partition(key, state, before_visibility_probe)
             } else {
                 Ok(None)
@@ -6817,11 +7152,11 @@ impl VectorColumnState {
         let keys = history
             .entry(row_id)
             .or_insert_with(|| Vec::with_capacity(1));
-        if let Err(position) = keys.binary_search(key) {
+        if let Err(position) = keys.binary_search_by(|candidate| candidate.as_ref().cmp(key)) {
             if keys.len() == keys.capacity() {
                 keys.reserve_exact(1);
             }
-            keys.insert(position, key.clone());
+            keys.insert(position, Arc::new(key.clone()));
         }
     }
 
@@ -6830,14 +7165,17 @@ impl VectorColumnState {
         if entry.deleted_tx.is_none() {
             self.row_to_partition
                 .write()
-                .insert(entry.row_id, key.clone());
+                .insert(entry.row_id, Arc::new(key.clone()));
         }
     }
 
     fn note_tombstone(&self, key: &VectorPartitionKey, row_id: RowId) {
         self.note_partition_history(row_id, key);
         let mut rows = self.row_to_partition.write();
-        if rows.get(&row_id).is_some_and(|current| current == key) {
+        if rows
+            .get(&row_id)
+            .is_some_and(|current| current.as_ref() == key)
+        {
             rows.remove(&row_id);
         }
     }
@@ -6854,27 +7192,27 @@ impl VectorColumnState {
         let mut rows = self.row_to_partition.write();
         if rows
             .get(&old_row_id)
-            .is_some_and(|current| current == source_key)
+            .is_some_and(|current| current.as_ref() == source_key)
         {
             rows.remove(&old_row_id);
         }
-        rows.insert(new_row_id, target_key.clone());
+        rows.insert(new_row_id, Arc::new(target_key.clone()));
     }
 
     fn rebuild_current_rows(&self) {
         let partitions = self.partition_snapshots();
-        let mut latest = HashMap::<RowId, (TxId, Lsn, VectorPartitionKey)>::new();
-        let mut history = HashMap::<RowId, Vec<VectorPartitionKey>>::new();
+        let mut latest = HashMap::<RowId, (TxId, Lsn, Arc<VectorPartitionKey>)>::new();
+        let mut history = HashMap::<RowId, Vec<Arc<VectorPartitionKey>>>::new();
         for (key, state) in partitions {
             for entry in state.raw_directory.read().iter() {
                 let keys = history
                     .entry(entry.row_id)
                     .or_insert_with(|| Vec::with_capacity(1));
-                if keys.last() != Some(&key) {
+                if keys.last().is_none_or(|prior| prior.as_ref() != &key) {
                     if keys.len() == keys.capacity() {
                         keys.reserve_exact(1);
                     }
-                    keys.push(key.clone());
+                    keys.push(Arc::new(key.clone()));
                 }
                 if entry.deleted_tx.is_some() {
                     continue;
@@ -6883,7 +7221,10 @@ impl VectorColumnState {
                     .get(&entry.row_id)
                     .is_none_or(|(tx, lsn, _)| (entry.created_tx, entry.lsn) > (*tx, *lsn));
                 if replace {
-                    latest.insert(entry.row_id, (entry.created_tx, entry.lsn, key.clone()));
+                    latest.insert(
+                        entry.row_id,
+                        (entry.created_tx, entry.lsn, Arc::new(key.clone())),
+                    );
                 }
             }
         }
@@ -6911,7 +7252,7 @@ impl VectorColumnState {
         if !removed.is_empty() {
             let mut history = self.row_partition_history.write();
             history.retain(|_, keys| {
-                keys.retain(|key| !removed.contains(key));
+                keys.retain(|key| !removed.contains(key.as_ref()));
                 keys.shrink_to_fit();
                 !keys.is_empty()
             });
@@ -7014,33 +7355,34 @@ impl VectorColumnState {
         }
         drop(partitions);
         let rows = self.row_to_partition.read();
-        let key_header = std::mem::size_of::<VectorPartitionKey>();
+        let key_header = 0;
         ownership.partition_vectors = ownership.partition_vectors.saturating_add(
             rows.len()
-                .saturating_mul(std::mem::size_of::<(RowId, VectorPartitionKey)>())
+                .saturating_mul(std::mem::size_of::<(RowId, Arc<VectorPartitionKey>)>())
                 .saturating_sub(rows.len().saturating_mul(key_header)),
         );
         for key in rows.values() {
             ownership.typed_partition_keys = ownership
                 .typed_partition_keys
-                .saturating_add(key.estimated_bytes());
+                .saturating_add(key.estimated_bytes())
+                .saturating_add(2 * std::mem::size_of::<usize>());
         }
         drop(rows);
         let history = self.row_partition_history.read();
         ownership.partition_vectors = ownership.partition_vectors.saturating_add(
             history
                 .len()
-                .saturating_mul(std::mem::size_of::<(RowId, Vec<VectorPartitionKey>)>()),
+                .saturating_mul(std::mem::size_of::<(RowId, Vec<Arc<VectorPartitionKey>>)>()),
         );
         for keys in history.values() {
             ownership.partition_vectors = ownership.partition_vectors.saturating_add(
                 keys.capacity()
-                    .saturating_mul(std::mem::size_of::<VectorPartitionKey>()),
+                    .saturating_mul(std::mem::size_of::<Arc<VectorPartitionKey>>()),
             );
             for key in keys {
                 ownership.typed_partition_keys = ownership.typed_partition_keys.saturating_add(
                     key.estimated_bytes()
-                        .saturating_sub(std::mem::size_of::<VectorPartitionKey>()),
+                        .saturating_add(2 * std::mem::size_of::<usize>()),
                 );
             }
         }
@@ -10135,6 +10477,24 @@ impl VectorStore {
         })
     }
 
+    /// Fallible body-free current ownership probe for durable memberships.
+    #[doc(hidden)]
+    pub fn try_current_partition_for_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+    ) -> Result<Option<VectorPartitionKey>> {
+        let Some(column) = self.try_column(index) else {
+            return Ok(None);
+        };
+        column.with_snapshot_visible_partition_for_row(
+            row_id,
+            SnapshotId(u64::MAX),
+            &mut || Ok::<(), Error>(()),
+            |key, _, _| Ok(Some(key.clone())),
+        )
+    }
+
     /// Visit the current partition and then the row's retained historical
     /// partitions until the callback resolves one. The callback borrows each
     /// key/state in place, so it can charge and test snapshot membership before
@@ -10152,14 +10512,12 @@ impl VectorStore {
     where
         E: From<Error>,
     {
-        self.with_bulk_read(|| {
-            let column = self.try_column(index).ok_or_else(|| {
-                E::from(Error::UnknownVectorIndex {
-                    index: index.clone(),
-                })
-            })?;
-            column.with_partition_candidates_for_row(row_id, inspect_partition)
-        })
+        let column = self.try_column(index).ok_or_else(|| {
+            E::from(Error::UnknownVectorIndex {
+                index: index.clone(),
+            })
+        })?;
+        column.with_partition_candidates_for_row(row_id, inspect_partition)
     }
 
     /// Resolve the row's snapshot-visible physical partition through the
@@ -10183,19 +10541,17 @@ impl VectorStore {
         E: From<Error>,
         C: FnMut() -> std::result::Result<(), E>,
     {
-        self.with_bulk_read(|| {
-            let column = self.try_column(index).ok_or_else(|| {
-                E::from(Error::UnknownVectorIndex {
-                    index: index.clone(),
-                })
-            })?;
-            column.with_snapshot_visible_partition_for_row(
-                row_id,
-                snapshot,
-                before_visibility_probe,
-                inspect_visible_partition,
-            )
-        })
+        let column = self.try_column(index).ok_or_else(|| {
+            E::from(Error::UnknownVectorIndex {
+                index: index.clone(),
+            })
+        })?;
+        column.with_snapshot_visible_partition_for_row(
+            row_id,
+            snapshot,
+            before_visibility_probe,
+            inspect_visible_partition,
+        )
     }
 
     pub fn live_entry_for_row_in_partition(
@@ -11301,6 +11657,96 @@ impl VectorStore {
         })
     }
 
+    /// Attach the column's row-id reverse directory before durable partitions.
+    /// The engine publishes it together with forward sources against one root.
+    /// Registration reads no membership records and retains no decoded rows.
+    #[doc(hidden)]
+    pub fn register_durable_raw_reverse_source(
+        &self,
+        index: &VectorIndexRef,
+        source: Arc<dyn RawVectorReverseMembershipSource>,
+    ) -> Result<()> {
+        self.with_bulk_maintenance(|| {
+            let column = self
+                .try_column(index)
+                .ok_or_else(|| Error::UnknownVectorIndex {
+                    index: index.clone(),
+                })?;
+            if !column.row_to_partition.read().is_empty()
+                || !column.row_partition_history.read().is_empty()
+                || column.durable_reverse_memberships.read().is_some()
+            {
+                return Err(Error::Other(
+                    "durable vector reverse source requires an empty column directory".into(),
+                ));
+            }
+            *column.durable_reverse_memberships.write() = Some(source);
+            Ok(())
+        })
+    }
+
+    /// Register a root-backed membership directory without enumerating records.
+    /// The engine owns catalog validation, current-root publication and the
+    /// source's admitted scratch. Register this on the empty registry at open;
+    /// row commits update durable memberships and catalog counts atomically.
+    #[doc(hidden)]
+    pub fn register_durable_raw_partition(
+        &self,
+        partition: &VectorPartitionRef,
+        memberships: Arc<dyn RawVectorMembershipSource>,
+        loader: Arc<dyn DormantRawVectorLoader>,
+    ) -> Result<()> {
+        self.with_bulk_maintenance(|| {
+            if !loader.supports_bounded_candidate_load() {
+                return Err(Error::Other(
+                    "durable vector memberships require bounded raw-body point access".into(),
+                ));
+            }
+            let column =
+                self.try_column(&partition.index)
+                    .ok_or_else(|| Error::UnknownVectorIndex {
+                        index: partition.index.clone(),
+                    })?;
+            let layout = column.layout();
+            Self::validate_partition_key(&partition.index, &layout, &partition.partition_key)?;
+            if column.durable_reverse_memberships.read().is_none() {
+                return Err(Error::Other(
+                    "durable vector partition requires a column reverse source".into(),
+                ));
+            }
+            let summary = memberships.published_summary();
+            if summary.live_entries > summary.entries {
+                return Err(Error::Other(
+                    "durable vector membership live count exceeds total count".to_string(),
+                ));
+            }
+            let state = {
+                let mut states = column.partitions.write();
+                states
+                    .entry(partition.partition_key.clone())
+                    .or_insert_with(|| {
+                        Arc::new(IndexState::new(layout.dimension, layout.quantization))
+                    })
+                    .clone()
+            };
+            let _gate = state.raw_residency_gate.write();
+            if state.entry_count() != 0 || state.durable_membership_source().is_some() {
+                return Err(Error::Other(
+                    "durable vector membership source requires an empty partition".to_string(),
+                ));
+            }
+            *state.durable_memberships.write() = Some(memberships);
+            *state.raw_loader.write() = Some(loader);
+            state.raw_resident.store(false, Ordering::SeqCst);
+            *state.raw_payload_counter.write() = self.raw_payload_bytes.clone();
+            *state.raw_payload_header_counter.write() = self.raw_payload_header_bytes.clone();
+            if summary.live_entries == 0 && summary.entries != 0 {
+                state.historical_only.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        })
+    }
+
     /// Install only durable identities for a file-backed open. Vector bodies
     /// remain behind each partition's loader until a read or mutation selects
     /// that partition.
@@ -12352,6 +12798,32 @@ impl VectorStore {
         })
     }
 
+    /// Count source-backed membership without hydrating directory records.
+    #[doc(hidden)]
+    pub fn try_visible_entry_count(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+    ) -> Result<usize> {
+        let Some(column) = self.try_column(index) else {
+            return Ok(0);
+        };
+        let mut count = 0usize;
+        let mut position = 0usize;
+        loop {
+            // Only a cheap state handle crosses the storage callback. No
+            // registry, partition-directory or bulk guard may be held there.
+            let state = column.partitions.read().values().nth(position).cloned();
+            let Some(state) = state else {
+                return Ok(count);
+            };
+            position += 1;
+            count = count
+                .checked_add(state.try_directory_visible_entry_count(snapshot, None)?)
+                .ok_or_else(|| Error::Other("vector visible count overflow".into()))?;
+        }
+    }
+
     pub fn vector_count(&self) -> usize {
         self.with_bulk_read(|| {
             self.registry
@@ -13130,40 +13602,20 @@ impl VectorStore {
                     index, row_id, snapshot, query, None, checkpoint, distance, retain, release,
                 )
             };
-            let current = column.current_partition(row_id);
-            if let Some(key) = current.as_ref()
-                && let Some(state) = column.partition_state(key)
-                && let Some(value) = score(
-                    &state,
-                    &mut before_checkpoint,
-                    &mut before_distance,
-                    &mut before_retain,
-                    &mut release_retained,
-                )?
-            {
-                return Ok(Some(value));
-            }
-            // Historical placement is metadata-only; every inspected partition
-            // is cancellable and charged before its row directory is touched.
-            for (key, state) in column.partitions.read().iter() {
-                if current.as_ref() == Some(key) {
-                    continue;
-                }
-                before_checkpoint()?;
-                if !state.directory_has_visible_row(row_id, snapshot) {
-                    continue;
-                }
-                if let Some(value) = score(
-                    state,
-                    &mut before_checkpoint,
-                    &mut before_distance,
-                    &mut before_retain,
-                    &mut release_retained,
-                )? {
-                    return Ok(Some(value));
-                }
-            }
-            Ok(None)
+            column.with_snapshot_visible_partition_for_row(
+                row_id,
+                snapshot,
+                &mut before_checkpoint,
+                |_, state, before_checkpoint| {
+                    score(
+                        state,
+                        before_checkpoint,
+                        &mut before_distance,
+                        &mut before_retain,
+                        &mut release_retained,
+                    )
+                },
+            )
         })
     }
 
@@ -13177,29 +13629,12 @@ impl VectorStore {
             let Some(column) = self.try_column(index) else {
                 return Ok(None);
             };
-            // The live row-to-partition directory is the primary source for
-            // current reads. Consult it before the historical directory walk:
-            // newly committed partitioned rows already have this canonical
-            // ownership even when a persisted-directory image has not yet
-            // been rebuilt by maintenance.
-            if let Some(partition_key) = column.current_partition(row_id)
-                && let Some(state) = column.partition_state(&partition_key)
-            {
-                state.ensure_raw_vectors_loaded()?;
-                if let Some(entry) = state.visible_entry_by_row(index, row_id, snapshot) {
-                    return Ok(Some(entry));
-                }
-            }
-            for (_, state) in column.partition_snapshots() {
-                if !state.directory_has_visible_row(row_id, snapshot) {
-                    continue;
-                }
-                state.ensure_raw_vectors_loaded()?;
-                if let Some(entry) = state.visible_entry_by_row(index, row_id, snapshot) {
-                    return Ok(Some(entry));
-                }
-            }
-            Ok(None)
+            column.with_snapshot_visible_partition_for_row(
+                row_id,
+                snapshot,
+                &mut || Ok::<(), Error>(()),
+                |_, state, _| state.load_visible_entry_by_row(index, row_id, snapshot),
+            )
         })
     }
 
@@ -13254,6 +13689,30 @@ impl VectorStore {
         })
     }
 
+    /// Durable counterpart of the resident-only existence probe. Integrity and
+    /// storage errors remain errors rather than an absent row.
+    #[doc(hidden)]
+    pub fn try_has_live_entry_for_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        self.with_bulk_read(|| {
+            let Some(column) = self.try_column(index) else {
+                return Ok(false);
+            };
+            Ok(column
+                .with_snapshot_visible_partition_for_row(
+                    row_id,
+                    snapshot,
+                    &mut || Ok::<(), Error>(()),
+                    |_, _, _| Ok(Some(())),
+                )?
+                .is_some())
+        })
+    }
+
     /// Whether a row has any visible vector column. This is the body-free
     /// existence check used by row delete and replacement planning.
     pub fn has_any_live_entry_for_row(
@@ -13271,6 +13730,31 @@ impl VectorStore {
         })
     }
 
+    #[doc(hidden)]
+    pub fn try_has_any_live_entry_for_row(
+        &self,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        self.with_bulk_read(|| {
+            let columns: Vec<_> = self.registry.read().values().cloned().collect();
+            for column in columns {
+                if column
+                    .with_snapshot_visible_partition_for_row(
+                        row_id,
+                        snapshot,
+                        &mut || Ok::<(), Error>(()),
+                        |_, _, _| Ok(Some(())),
+                    )?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
     /// Load only partitions that contain a visible value for this row, then
     /// return every vector column owned by that row.
     pub fn load_live_entries_for_row(
@@ -13284,14 +13768,13 @@ impl VectorStore {
                 let Some(column) = self.try_column(&index) else {
                     continue;
                 };
-                for (_, state) in column.partition_snapshots() {
-                    if !state.directory_has_visible_row(row_id, snapshot) {
-                        continue;
-                    }
-                    state.ensure_raw_vectors_loaded()?;
-                    if let Some(entry) = state.visible_entry_by_row(&index, row_id, snapshot) {
-                        entries.push(entry);
-                    }
+                if let Some(entry) = column.with_snapshot_visible_partition_for_row(
+                    row_id,
+                    snapshot,
+                    &mut || Ok::<(), Error>(()),
+                    |_, state, _| state.load_visible_entry_by_row(&index, row_id, snapshot),
+                )? {
+                    entries.push(entry);
                 }
             }
             Ok(entries)
@@ -13380,20 +13863,11 @@ impl VectorStore {
         row_id: RowId,
         lsn: Lsn,
     ) -> Result<Option<Vec<f32>>> {
-        self.with_bulk_read(|| {
-            let Some(column) = self.try_column(index) else {
-                return Ok(None);
-            };
-            for (_, state) in column.partition_snapshots() {
-                if !state.directory_has_row_lsn(row_id, lsn) {
-                    continue;
-                }
-                state.ensure_raw_vectors_loaded()?;
-                if let Some(vector) = state.vector_for_row_lsn(row_id, lsn) {
-                    return Ok(Some(vector));
-                }
-            }
-            Ok(None)
+        let Some(column) = self.try_column(index) else {
+            return Ok(None);
+        };
+        column.with_partition_candidates_for_row(row_id, |_, state| {
+            state.load_vector_for_row_lsn(index, row_id, lsn)
         })
     }
 
