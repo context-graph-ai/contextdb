@@ -525,6 +525,23 @@ impl BoundedOrderedRowCursor {
     }
 
     #[doc(hidden)]
+    pub fn source_advance_charged(
+        &mut self,
+        position: Vec<u8>,
+        key: IndexKey,
+        row: RowId,
+        bytes: usize,
+    ) -> Result<()> {
+        self.key_generation = self
+            .key_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("ordered cursor key generation overflow".into()))?;
+        self.retained_key_bytes = bytes;
+        self.source_advance(position, key, row);
+        Ok(())
+    }
+
+    #[doc(hidden)]
     pub fn source_finish_run(&mut self) -> bool {
         self.source_key = None;
         self.source_cache_key = None;
@@ -889,6 +906,20 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         table: &str,
         snapshot: SnapshotId,
         source: &dyn crate::source::RelationalReadSource,
+        before_clone: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<VersionedRow>> {
+        self.scan_filter_with_source(tx, table, snapshot, source, &|_| true, before_clone)
+    }
+
+    /// Filter borrowed windows before copying output; unrelated row bodies
+    /// never become retained operation output.
+    pub fn scan_filter_with_source(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        snapshot: SnapshotId,
+        source: &dyn crate::source::RelationalReadSource,
+        predicate: &dyn Fn(&VersionedRow) -> bool,
         mut before_clone: impl FnMut(usize) -> Result<()>,
     ) -> Result<Vec<VersionedRow>> {
         self.ensure_table_exists(table)?;
@@ -902,7 +933,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         while let Some(window) = cursor.next_window()? {
             self.store.bump_scan_rows_touched(1);
             let row = window.value();
-            if row.visible_at(snapshot) {
+            if row.visible_at(snapshot) && predicate(row) {
                 push_admitted_source_row(&mut result, row, &mut before_clone)?;
             }
         }
@@ -934,6 +965,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 for (t, row) in ws.relational_inserts.iter().rev() {
                     if t == table
                         && seen.insert(row.row_id)
+                        && predicate(row)
                         && (!deleted_ids.contains(&row.row_id)
                             || committed_ids.contains(&row.row_id))
                     {
@@ -1031,18 +1063,34 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         tx: TxId,
         table: &str,
         row_id: RowId,
+        staged_charge: impl FnMut(&VersionedRow, Option<usize>) -> usize,
+    ) -> Result<usize> {
+        let committed_row_exists = self
+            .store
+            .row_by_id(table, row_id, SnapshotId::from_raw_wire(u64::MAX))
+            .is_some();
+        self.delete_retiring_staged_charge_with_presence(
+            tx,
+            table,
+            row_id,
+            committed_row_exists,
+            staged_charge,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn delete_retiring_staged_charge_with_presence(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        committed_row_exists: bool,
         mut staged_charge: impl FnMut(&VersionedRow, Option<usize>) -> usize,
     ) -> Result<usize> {
         self.ensure_table_exists(table)?;
         if self.store.is_immutable(table) {
             return Err(Error::ImmutableTable(table.to_string()));
         }
-
-        let committed_row_exists = self
-            .store
-            .row_by_id(table, row_id, SnapshotId::from_raw_wire(u64::MAX))
-            .is_some();
-
         self.tx_mgr.with_write_set(tx, |ws| {
             let admitted = ws.admitted_bytes_for_staged_row(table, row_id);
             let mut retired = 0usize;

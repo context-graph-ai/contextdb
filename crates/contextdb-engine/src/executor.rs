@@ -41,8 +41,14 @@ pub(crate) type BoundedCursorSnapshotPin = (
     Arc<crate::database::CursorIdleWindow>,
     Option<crate::persistence::OwnerCursorStoragePin>,
     Box<dyn Send + Sync>,
+    Option<Arc<crate::persistence::WriterSnapshot>>,
 );
-pub(crate) type BoundedReadSnapshotPin = (SnapshotId, Lsn, Box<dyn Send + Sync>);
+pub(crate) type BoundedReadSnapshotPin = (
+    SnapshotId,
+    Lsn,
+    Box<dyn Send + Sync>,
+    Option<Arc<crate::persistence::WriterSnapshot>>,
+);
 
 /// Exact lineage a completed read may expose at its publication boundary.
 #[derive(Clone)]
@@ -277,6 +283,17 @@ impl TransactionVectorOverlay {
 }
 
 pub(crate) trait ReadExecutionTarget: Send + Sync {
+    fn register_writer_cursor(&self, _cursor: &Arc<BoundedCursorExecutionState>) -> Result<()> {
+        Ok(())
+    }
+
+    fn enter_writer_read(
+        &self,
+        _root: Option<Arc<crate::persistence::WriterSnapshot>>,
+    ) -> Option<crate::database::writer_read::WriterReadScope> {
+        None
+    }
+
     /// The value a row's vector column holds, taken from the store that holds
     /// it. A column declared with space-saving storage keeps its value there
     /// and nowhere else, so a read that names such a column asks here.
@@ -1222,6 +1239,17 @@ impl BoundedCursorTarget {
 /// these questions.
 #[allow(clippy::too_many_arguments)]
 impl ReadExecutionTarget for Database {
+    fn register_writer_cursor(&self, cursor: &Arc<BoundedCursorExecutionState>) -> Result<()> {
+        Database::register_writer_cursor(self, cursor)
+    }
+
+    fn enter_writer_read(
+        &self,
+        root: Option<Arc<crate::persistence::WriterSnapshot>>,
+    ) -> Option<crate::database::writer_read::WriterReadScope> {
+        Some(Database::enter_writer_read(self, root))
+    }
+
     fn load_row_vector_for_column(
         &self,
         tx: Option<TxId>,
@@ -1445,7 +1473,7 @@ impl ReadExecutionTarget for Database {
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<BoundedReadSnapshotPin>> {
-        Database::bounded_read_snapshot_registration(self, budget, withdrawn)
+        Database::bounded_read_snapshot_registration_with_root(self, budget, withdrawn)
     }
 
     fn bounded_cursor_snapshot_registration(
@@ -1455,7 +1483,9 @@ impl ReadExecutionTarget for Database {
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<BoundedCursorSnapshotPin>> {
-        Database::bounded_cursor_snapshot_registration(self, clock, idle_ms, budget, withdrawn)
+        Database::bounded_cursor_snapshot_registration_with_root(
+            self, clock, idle_ms, budget, withdrawn,
+        )
     }
 
     fn assert_table_read_allowed(&self, table: &str) -> Result<()> {
@@ -2575,9 +2605,25 @@ impl std::fmt::Debug for BoundedCursorHandle {
     }
 }
 
-struct BoundedCursorExecutionState {
+pub(crate) struct BoundedCursorExecutionState {
     lifecycle: std::sync::Mutex<BoundedCursorLifecycle>,
-    publication: ReadPublicationScope,
+    pub(crate) publication: ReadPublicationScope,
+    erased: std::sync::atomic::AtomicBool,
+    active_cancellation: std::sync::Mutex<OwnerReadCancellation>,
+}
+
+impl BoundedCursorExecutionState {
+    pub(crate) fn release_for_erasure(&self) {
+        self.erased.store(true, std::sync::atomic::Ordering::SeqCst);
+        let cancellation = self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        cancellation.cancel();
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Erased);
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -2592,6 +2638,7 @@ enum BoundedCursorTerminalReason {
     Refused,
     Expired,
     ExplicitClose,
+    Erased,
 }
 
 pub(crate) fn observe_bounded_access_control_row() {
@@ -7291,8 +7338,7 @@ fn exec_update(
                 };
                 let committed_row_exists = row.created_tx != txid
                     || db
-                        .relational_store()
-                        .row_by_id(&p.table, row.row_id, SnapshotId::from_raw_wire(u64::MAX))
+                        .committed_row_at(&p.table, row.row_id, db.snapshot())?
                         .is_some();
                 let (new_row_id, before_counts, after_counts) = match db
                     .replace_row_after_update_validation_counted(
@@ -10976,6 +11022,20 @@ fn execute_index_scan(
         return Ok((Vec::new(), 0));
     }
 
+    if db.writer_read_root()?.is_some() {
+        return execute_writer_index_scan(
+            db,
+            table,
+            pick,
+            snapshot,
+            tx,
+            access_mode,
+            materialized_columns,
+            residual_filter,
+            params,
+        );
+    }
+
     // A plan can outlive a concurrent DROP INDEX. Do not turn that race into
     // an empty result: there is no physical posting list to trust, so use the
     // normal visibility-aware table scan and let the caller's predicate path
@@ -11325,6 +11385,101 @@ fn execute_index_scan(
         out = db.filter_rows_for_read_in_tx(tx, table, out, snapshot)?;
     }
     Ok((out, rows_examined))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_writer_index_scan(
+    db: &Database,
+    table: &str,
+    pick: &IndexPick,
+    snapshot: contextdb_core::SnapshotId,
+    tx: Option<TxId>,
+    access_mode: IndexScanAccessMode,
+    materialized_columns: Option<&[String]>,
+    residual_filter: Option<&Expr>,
+    params: &HashMap<String, Value>,
+) -> Result<(Vec<VersionedRow>, u64)> {
+    let pick = match coerce_pick_shape_to_column_type(db, table, pick) {
+        Ok(pick) => pick,
+        Err(_) => return Ok((Vec::new(), 0)),
+    };
+    if pick_matches_nothing(&pick) {
+        return Ok((Vec::new(), 0));
+    }
+    let Some(meta) = db.table_meta(table) else {
+        return Err(Error::TableNotFound(table.into()));
+    };
+    if !meta.indexes.iter().any(|decl| decl.name == pick.name) {
+        let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+        let examined = rows.len() as u64;
+        return Ok((rows, examined));
+    }
+    let (column, direction) = pick
+        .columns
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::Other("index has no leading column".into()))?;
+    let mut admission = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+        db.bounded_read_accountant(),
+        planned_index_run_construction_bytes(&pick)?,
+        "query",
+        "eager_index_output",
+        "Reduce query output or raise MEMORY_LIMIT.",
+    )?;
+    let cursor =
+        contextdb_relational::mem::BoundedOrderedRowCursor::for_index(pick.name.clone(), false);
+    let mut cursor = if matches!(
+        pick.shape,
+        IndexPredicateShape::Equality(_)
+            | IndexPredicateShape::InList(_)
+            | IndexPredicateShape::IsNull
+    ) {
+        cursor.seeking_runs(expanded_index_runs(&pick)?)
+    } else {
+        let (lower, upper, prefix) = bounded::declared_index_run(&pick, direction, false);
+        cursor.seeking_run_with_prefix_len(lower, upper, prefix)
+    };
+    cursor.source_configure(pick.columns.len());
+    let mut examined = 0u64;
+    let mut out = Vec::new();
+    while let Some(row) = db.bounded_ordered_table_row_next(
+        table,
+        &column,
+        direction,
+        snapshot,
+        &mut cursor,
+        || Ok::<_, Error>(()),
+        || {
+            examined = examined.saturating_add(1);
+            Ok::<_, Error>(())
+        },
+        |bytes| {
+            admission.try_grow_for(
+                bytes.saturating_add(std::mem::size_of::<VersionedRow>()),
+                "query",
+                "eager_index_output",
+                "Reduce query output or raise MEMORY_LIMIT.",
+            )
+        },
+    )? {
+        out.push(row);
+    }
+    if let Some(tx) = tx {
+        let overlay = db.index_scan_tx_overlay(tx, table, &pick.pushed_column, &pick.shape)?;
+        out.retain(|row| !overlay.deleted_row_ids.contains(&row.row_id));
+        out = merge_staged_rows_in_index_order(out, overlay.matching_inserts, &pick.columns);
+    }
+    db.supplement_selected_vector_columns(table, snapshot, tx, materialized_columns, &mut out)?;
+    let anchor = access_mode == IndexScanAccessMode::Select
+        && residual_filter
+            .is_some_and(|filter| is_anchor_shape_index_pick(db, table, &pick, filter, params));
+    if anchor {
+        out = filter_rows_by_predicate(out, residual_filter, params)?;
+        out = db.filter_rows_for_anchor_read_in_tx(tx, table, out, snapshot)?;
+    } else {
+        out = db.filter_rows_for_read_in_tx(tx, table, out, snapshot)?;
+    }
+    Ok((out, examined))
 }
 
 fn compare_rows_by_index_columns(
@@ -18861,6 +19016,17 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn relational_membership_store(&self) -> &contextdb_relational::RelationalStore {
         self.store.relational_membership_store()
+    }
+
+    fn register_writer_cursor(&self, cursor: &Arc<BoundedCursorExecutionState>) -> Result<()> {
+        self.store.register_writer_cursor(cursor)
+    }
+
+    fn enter_writer_read(
+        &self,
+        root: Option<Arc<crate::persistence::WriterSnapshot>>,
+    ) -> Option<crate::database::writer_read::WriterReadScope> {
+        self.store.enter_writer_read(root)
     }
 
     fn retained_relational_membership_source(&self) -> bool {

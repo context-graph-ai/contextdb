@@ -13,6 +13,7 @@ mod resident_history_test_seams;
 mod transaction_repair;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
+pub(crate) mod writer_adapters;
 mod writer_commit_directory;
 mod writer_file;
 mod writer_history;

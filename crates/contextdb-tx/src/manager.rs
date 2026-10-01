@@ -50,6 +50,15 @@ pub struct PublishedRead {
     pub handle: Option<Arc<dyn Any + Send + Sync>>,
 }
 
+impl std::fmt::Debug for PublishedRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublishedRead")
+            .field("snapshot", &self.snapshot)
+            .field("lsn", &self.lsn)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct TransactionManager<S: WriteSetApplicator> {
     next_tx: AtomicTxId,
     committed_watermark: AtomicTxId,
@@ -139,9 +148,20 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
 
     pub fn begin(&self) -> TxId {
         let tx_id = self.next_tx.fetch_add(1, Ordering::SeqCst);
+        let mut write_set = WriteSet::new();
+        write_set.base_read = Some(self.capture_published_read());
         let mut active = self.active_txs.lock();
-        active.insert(tx_id, WriteSet::new());
+        active.insert(tx_id, write_set);
         tx_id
+    }
+
+    /// The immutable read view held from begin until commit or rollback.
+    pub fn transaction_read(&self, tx: TxId) -> Result<PublishedRead> {
+        let active = self.active_txs.lock();
+        let ws = active.get(&tx).ok_or(Error::TxNotFound(tx))?;
+        ws.base_read
+            .clone()
+            .ok_or_else(|| Error::Other("transaction has no captured read view".into()))
     }
 
     pub fn snapshot(&self) -> SnapshotId {

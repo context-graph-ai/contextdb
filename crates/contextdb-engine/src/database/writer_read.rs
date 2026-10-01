@@ -1,0 +1,584 @@
+//! A scoped borrow of the manager's admitted published root. Nested calls to
+//! the same database retain that root; another database gets its own scope.
+use super::*;
+use crate::persistence::WriterSnapshot;
+type OutputOwners =
+    std::rc::Rc<std::cell::RefCell<Vec<crate::memory_accounting::OwnedMemoryReservation>>>;
+type ScopedRoot = (usize, Arc<WriterSnapshot>, OutputOwners);
+thread_local! { static ROOT: std::cell::RefCell<Option<ScopedRoot>> = const { std::cell::RefCell::new(None) }; }
+pub(crate) struct WriterReadScope {
+    prior: Option<ScopedRoot>,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl Drop for WriterReadScope {
+    fn drop(&mut self) {
+        let prior = self.prior.take();
+        ROOT.with(|slot| {
+            *slot.borrow_mut() = prior;
+        });
+    }
+}
+impl Database {
+    pub(crate) fn writer_read_root(&self) -> Result<Option<Arc<WriterSnapshot>>> {
+        if self.persistence.is_none() {
+            return Ok(None);
+        }
+        let owner = Arc::as_ptr(&self.tx_mgr) as usize;
+        if let Some(root) = ROOT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(id, _, _)| *id == owner)
+                .map(|(_, root, _)| root.clone())
+        }) {
+            return Ok(Some(root));
+        }
+        self.tx_mgr
+            .capture_published_read()
+            .handle
+            .ok_or_else(|| Error::Other("writer publication has no durable root".into()))?
+            .downcast::<WriterSnapshot>()
+            .map(Some)
+            .map_err(|_| Error::Other("writer publication has an invalid durable root".into()))
+    }
+    pub(crate) fn enter_writer_read(&self, root: Option<Arc<WriterSnapshot>>) -> WriterReadScope {
+        let owner = Arc::as_ptr(&self.tx_mgr) as usize;
+        let owners = ROOT
+            .with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .filter(|(id, _, _)| *id == owner)
+                    .map(|(_, _, owners)| owners.clone())
+            })
+            .unwrap_or_default();
+        let next = root.map(|root| (owner, root, owners));
+        let prior = ROOT.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), next));
+        WriterReadScope {
+            prior,
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+    pub(super) fn writer_read_scope(&self) -> Result<WriterReadScope> {
+        Ok(self.enter_writer_read(self.writer_read_root()?))
+    }
+
+    pub(super) fn retain_writer_output(
+        &self,
+        output: crate::memory_accounting::OwnedMemoryReservation,
+    ) {
+        ROOT.with(|slot| {
+            if let Some((owner, _, owners)) = slot.borrow().as_ref()
+                && *owner == Arc::as_ptr(&self.tx_mgr) as usize
+            {
+                owners.borrow_mut().push(output);
+            }
+        });
+    }
+}
+
+impl Database {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn writer_ordered_next<E: From<Error>>(
+        &self,
+        source: &dyn contextdb_relational::source::RelationalReadSource,
+        table: &str,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
+        mut boundary: impl FnMut() -> std::result::Result<(), E>,
+        mut touch: impl FnMut() -> std::result::Result<(), E>,
+        mut clone: impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E> {
+        use contextdb_relational::source::{RelationalIndexRange, visible_row};
+        use std::ops::Bound;
+        if cursor.is_exhausted() {
+            return Ok(None);
+        }
+        loop {
+            let reverse = cursor.source_reverse();
+            let current = snapshot == source.snapshot();
+            let endpoint = if cursor.source_position().is_none() {
+                match cursor.source_seek() {
+                    Bound::Included(key) => Some((
+                        true,
+                        source
+                            .index_position_key(
+                                current,
+                                &key.to_vec(),
+                                if reverse { RowId(u64::MAX) } else { RowId(0) },
+                                if reverse { TxId(u64::MAX) } else { TxId(0) },
+                            )
+                            .map_err(E::from)?,
+                    )),
+                    Bound::Excluded(key) => Some((
+                        false,
+                        source
+                            .index_position_key(
+                                current,
+                                &key.to_vec(),
+                                if reverse { RowId(0) } else { RowId(u64::MAX) },
+                                if reverse { TxId(0) } else { TxId(u64::MAX) },
+                            )
+                            .map_err(E::from)?,
+                    )),
+                    Bound::Unbounded => None,
+                }
+            } else {
+                None
+            };
+            let edge = match cursor.source_position() {
+                Some(key) => Bound::Excluded(key),
+                None => endpoint
+                    .as_ref()
+                    .map_or(Bound::Unbounded, |(included, key)| {
+                        if *included {
+                            Bound::Included(key.as_bytes())
+                        } else {
+                            Bound::Excluded(key.as_bytes())
+                        }
+                    }),
+            };
+            let range = RelationalIndexRange {
+                current,
+                lower: if reverse { Bound::Unbounded } else { edge },
+                upper: if reverse { edge } else { Bound::Unbounded },
+                reverse,
+            };
+            let index = cursor
+                .index_name()
+                .ok_or_else(|| E::from(Error::Other("ordered cursor has no index".into())))?;
+            boundary()?;
+            let mut physical = source.index_cursor(table, index, range).map_err(E::from)?;
+            let mut callback_error = None;
+            let fetched = physical.next_window_before(&mut || {
+                touch().map_err(|error| {
+                    callback_error = Some(error);
+                    Error::Other("posting work admission refused".into())
+                })
+            });
+            if let Some(error) = callback_error {
+                return Err(error);
+            }
+            let Some(posting) = fetched.map_err(E::from)? else {
+                cursor.source_finish_run();
+                return Ok(None);
+            };
+            if !cursor.source_inside_run(&posting.value().key) {
+                cursor.source_finish_run();
+                return Ok(None);
+            }
+            let row = if posting.value().entry.visible_at(snapshot) {
+                visible_row(source, table, posting.value().entry.row_id, snapshot)
+                    .map_err(E::from)?
+            } else {
+                None
+            };
+            let bytes = posting.position_key().len().saturating_add(
+                posting
+                    .value()
+                    .key
+                    .iter()
+                    .map(|part| match part {
+                        DirectedValue::Asc(value) => value.0.estimated_bytes(),
+                        DirectedValue::Desc(value) => value.0.estimated_bytes(),
+                    })
+                    .sum::<usize>(),
+            );
+            clone(
+                bytes.saturating_add(row.as_ref().map_or(0, |row| row.value().estimated_bytes())),
+            )?;
+            cursor
+                .source_advance_charged(
+                    posting.position_key().to_vec(),
+                    posting.value().key.clone(),
+                    posting.value().entry.row_id,
+                    bytes,
+                )
+                .map_err(E::from)?;
+            if let Some(row) = row {
+                return Ok(Some(row.value().clone()));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn writer_exact_next<E: From<Error>>(
+        &self,
+        source: &dyn contextdb_relational::source::RelationalReadSource,
+        table: &str,
+        index: &str,
+        snapshot: SnapshotId,
+        cursor: &mut contextdb_relational::mem::BoundedExactIndexCursor,
+        mut touch: impl FnMut() -> std::result::Result<(), E>,
+        mut clone: impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E> {
+        use contextdb_relational::source::{RelationalIndexRange, visible_row};
+        use std::ops::Bound;
+        while let Some(key) = cursor.source_probe() {
+            let current = snapshot == source.snapshot();
+            let start = source
+                .index_position_key(current, key, RowId(0), TxId(0))
+                .map_err(E::from)?;
+            let end = source
+                .index_position_key(current, key, RowId(u64::MAX), TxId(u64::MAX))
+                .map_err(E::from)?;
+            let lower = cursor
+                .source_position()
+                .map_or(Bound::Included(start.as_bytes()), Bound::Excluded);
+            let mut physical = source
+                .index_cursor(
+                    table,
+                    index,
+                    RelationalIndexRange {
+                        current,
+                        lower,
+                        upper: Bound::Included(end.as_bytes()),
+                        reverse: false,
+                    },
+                )
+                .map_err(E::from)?;
+            let mut callback_error = None;
+            let fetched = physical.next_window_before(&mut || {
+                touch().map_err(|error| {
+                    callback_error = Some(error);
+                    Error::Other("posting work admission refused".into())
+                })
+            });
+            if let Some(error) = callback_error {
+                return Err(error);
+            }
+            let Some(posting) = fetched.map_err(E::from)? else {
+                cursor.source_finish_probe();
+                continue;
+            };
+            let row = if posting.value().entry.visible_at(snapshot) {
+                visible_row(source, table, posting.value().entry.row_id, snapshot)
+                    .map_err(E::from)?
+            } else {
+                None
+            };
+            clone(
+                posting
+                    .position_key()
+                    .len()
+                    .saturating_add(row.as_ref().map_or(0, |row| row.value().estimated_bytes())),
+            )?;
+            cursor.source_advance(
+                posting.position_key().to_vec(),
+                posting.value().entry.row_id,
+            );
+            if let Some(row) = row {
+                return Ok(Some(row.value().clone()));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Database {
+    pub(super) fn relational_point_with_tx(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        col: &str,
+        value: &Value,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VersionedRow>> {
+        use contextdb_relational::source::{RelationalReadSource, visible_row};
+        let Some(root) = self.writer_read_root()? else {
+            return self
+                .relational
+                .point_lookup_with_tx(tx, table, col, value, snapshot);
+        };
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        if let Some(tx) = tx {
+            let staged = self.tx_mgr.with_write_set(tx, |ws| {
+                ws.relational_inserts
+                    .iter()
+                    .rev()
+                    .find(|(t, row)| t == table && row.values.get(col) == Some(value))
+                    .map(|(_, row)| {
+                        output.try_grow_for(
+                            row.estimated_bytes(),
+                            "writer_source",
+                            "point_output",
+                            "Raise MEMORY_LIMIT to return this row.",
+                        )?;
+                        Ok::<_, Error>(row.clone())
+                    })
+                    .transpose()
+            })??;
+            if staged.is_some() {
+                self.retain_writer_output(output);
+                return Ok(staged);
+            }
+        }
+        if let Some(index) = meta
+            .indexes
+            .iter()
+            .find(|index| index.columns.len() == 1 && index.columns[0].0 == col)
+        {
+            let key = vec![match index.columns[0].1 {
+                SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value.clone())),
+                SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value.clone())),
+            }];
+            let mut postings = source.exact_index_cursor(
+                table,
+                &index.name,
+                snapshot == source.snapshot(),
+                &key,
+            )?;
+            while let Some(posting) = postings.next_window()? {
+                if !posting.value().entry.visible_at(snapshot) {
+                    continue;
+                }
+                let hidden = match tx {
+                    Some(tx) => self.tx_mgr.with_write_set(tx, |ws| {
+                        ws.relational_deletes
+                            .iter()
+                            .any(|(t, row, _)| t == table && *row == posting.value().entry.row_id)
+                            || ws.relational_inserts.iter().any(|(t, row)| {
+                                t == table && row.row_id == posting.value().entry.row_id
+                            })
+                    })?,
+                    None => false,
+                };
+                if hidden {
+                    continue;
+                }
+                if let Some(row) =
+                    visible_row(&source, table, posting.value().entry.row_id, snapshot)?
+                {
+                    if let Some(tx) = tx
+                        && self.tx_mgr.with_write_set(tx, |ws| {
+                            row_matches_delete_predicates(
+                                &ws.relational_delete_predicates,
+                                table,
+                                row.value(),
+                            )
+                        })?
+                    {
+                        continue;
+                    }
+                    output.try_grow_for(
+                        row.value().estimated_bytes(),
+                        "writer_source",
+                        "point_output",
+                        "Raise MEMORY_LIMIT to return this row.",
+                    )?;
+                    let row = row.value().clone();
+                    self.retain_writer_output(output);
+                    return Ok(Some(row));
+                }
+            }
+            return Ok(None);
+        }
+        let rows = self.relational.scan_filter_with_source(
+            tx,
+            table,
+            snapshot,
+            &source,
+            &|row| row.values.get(col) == Some(value),
+            |bytes| {
+                output.try_grow_for(
+                    bytes,
+                    "writer_source",
+                    "point_output",
+                    "Raise MEMORY_LIMIT to find this row.",
+                )
+            },
+        )?;
+        let row = rows
+            .into_iter()
+            .find(|row| row.values.get(col) == Some(value));
+        self.retain_writer_output(output);
+        Ok(row)
+    }
+
+    pub(super) fn relational_scan_filter_with_tx(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        snapshot: SnapshotId,
+        predicate: &dyn Fn(&VersionedRow) -> bool,
+    ) -> Result<Vec<VersionedRow>> {
+        let Some(root) = self.writer_read_root()? else {
+            return self
+                .relational
+                .scan_filter_with_tx(tx, table, snapshot, predicate);
+        };
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let rows = self.relational.scan_filter_with_source(
+            tx,
+            table,
+            snapshot,
+            &source,
+            predicate,
+            |bytes| {
+                output.try_grow_for(
+                    bytes,
+                    "writer_source",
+                    "scan_output",
+                    "Raise MEMORY_LIMIT to return these rows.",
+                )
+            },
+        )?;
+        self.retain_writer_output(output);
+        Ok(rows)
+    }
+}
+
+impl Database {
+    pub(super) fn writer_indexed_row(
+        &self,
+        table: &str,
+        columns: &[String],
+        values: &[Value],
+        snapshot: SnapshotId,
+        skip_deleted: &HashSet<RowId>,
+        stats: Option<&mut CommitStageStats>,
+    ) -> Result<Option<Option<RowId>>> {
+        use contextdb_relational::source::{
+            RelationalIndexRange, RelationalReadSource, visible_row,
+        };
+        use std::ops::Bound;
+        let Some(root) = self.writer_read_root()? else {
+            return Ok(None);
+        };
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let Some(index) = meta.indexes.iter().find(|index| {
+            index.columns.len() >= columns.len()
+                && index
+                    .columns
+                    .iter()
+                    .zip(columns)
+                    .all(|((have, _), want)| have == want)
+        }) else {
+            return Ok(None);
+        };
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+        let mut scratch =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        scratch.try_grow_for(
+            values
+                .iter()
+                .map(Value::estimated_bytes)
+                .sum::<usize>()
+                .saturating_mul(8)
+                .saturating_add(256),
+            "writer_source",
+            "constraint_keys",
+            "Raise MEMORY_LIMIT to validate this key.",
+        )?;
+        let key = index_key_from_values(&index.columns[..columns.len()], values);
+        let current = snapshot == source.snapshot();
+        let mut cursor = if index.columns.len() == columns.len() {
+            source.exact_index_cursor(table, &index.name, current, &key)?
+        } else {
+            let endpoint = source.index_position_key(current, &key, RowId(0), TxId(0))?;
+            source.index_cursor(
+                table,
+                &index.name,
+                RelationalIndexRange {
+                    current,
+                    lower: Bound::Included(endpoint.as_bytes()),
+                    upper: Bound::Unbounded,
+                    reverse: false,
+                },
+            )?
+        };
+        if let Some(stats) = stats {
+            stats.indexed_probes = stats.indexed_probes.saturating_add(1);
+        }
+        while let Some(window) = cursor.next_window()? {
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_query_test_seams::note_constraint_posting();
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
+            let posting = window.value();
+            if !posting.key.starts_with(&key) {
+                break;
+            }
+            if skip_deleted.contains(&posting.entry.row_id) || !posting.entry.visible_at(snapshot) {
+                continue;
+            }
+            if visible_row(&source, table, posting.entry.row_id, snapshot)?.is_some() {
+                return Ok(Some(Some(posting.entry.row_id)));
+            }
+        }
+        Ok(Some(None))
+    }
+}
+
+impl Database {
+    pub(crate) fn writer_graph_root(
+        &self,
+    ) -> Result<Option<Arc<dyn contextdb_graph::source::GraphSnapshot>>> {
+        self.writer_read_root()?
+            .map(|root| {
+                crate::persistence::writer_adapters::WriterGraphSnapshot::new(root).map(|source| {
+                    Arc::new(source) as Arc<dyn contextdb_graph::source::GraphSnapshot>
+                })
+            })
+            .transpose()
+    }
+}
+
+pub(super) fn durable_root(
+    handle: Option<Arc<dyn std::any::Any + Send + Sync>>,
+) -> Result<Option<Arc<WriterSnapshot>>> {
+    handle
+        .map(|handle| {
+            handle
+                .downcast::<WriterSnapshot>()
+                .map_err(|_| Error::Other("writer publication has an invalid durable root".into()))
+        })
+        .transpose()
+}
+impl Database {
+    pub(super) fn capture_writer_statement(
+        &self,
+    ) -> Result<(SnapshotId, Option<Arc<WriterSnapshot>>)> {
+        if self.already_closed() {
+            return Err(closed_database_error());
+        }
+        if let Some(root) = ROOT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(owner, _, _)| *owner == Arc::as_ptr(&self.tx_mgr) as usize)
+                .map(|(_, root, _)| root.clone())
+        }) {
+            let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(root.snapshot));
+            return Ok((snapshot, Some(root)));
+        }
+        let published = self.tx_mgr.capture_published_read();
+        let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published.snapshot));
+        Ok((snapshot, durable_root(published.handle)?))
+    }
+}
+
+impl Database {
+    pub(super) fn capture_writer_transaction_statement(
+        &self,
+        tx: Option<TxId>,
+    ) -> Result<(SnapshotId, Option<Arc<WriterSnapshot>>)> {
+        if self.persistence.is_none() || tx.is_none() {
+            return self.capture_writer_statement();
+        }
+        if self.already_closed() {
+            return Err(closed_database_error());
+        }
+        let published = self
+            .tx_mgr
+            .transaction_read(tx.expect("checked transaction"))?;
+        let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published.snapshot));
+        Ok((snapshot, durable_root(published.handle)?))
+    }
+}

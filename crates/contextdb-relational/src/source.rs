@@ -14,6 +14,14 @@ pub trait RelationalWindow<T>: Send {
 
 pub trait RelationalCursor<T>: Send {
     fn next_window(&mut self) -> Result<Option<Box<dyn RelationalWindow<T>>>>;
+    /// Admit work after a record exists and before decoding its payload.
+    fn next_window_before(
+        &mut self,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Box<dyn RelationalWindow<T>>>> {
+        before()?;
+        self.next_window()
+    }
     /// Physical source steps, including invisible versions.
     fn examined_entries(&self) -> u64;
 }

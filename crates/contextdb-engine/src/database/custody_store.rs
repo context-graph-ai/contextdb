@@ -276,7 +276,7 @@ impl Database {
             return Ok(());
         }
         let mut selectors = BTreeSet::new();
-        for (table, rows) in self.deleted_row_snapshots_by_table(ws) {
+        for (table, rows) in self.deleted_row_snapshots_by_table(ws)? {
             let Some(meta) = self.table_meta(&table) else {
                 continue;
             };

@@ -11416,7 +11416,7 @@ fn ordered_scan<'a>(
 /// on the leading indexed component. A shape that names no run — an exclusion,
 /// or a prefix already known to be empty — declares none, and the source walks
 /// as it would with no predicate at all.
-fn declared_index_run(
+pub(super) fn declared_index_run(
     pick: &IndexPick,
     direction: contextdb_core::SortDirection,
     reverse: bool,
@@ -12200,12 +12200,14 @@ pub(super) fn execute(
             probe,
         )?;
         let schema_capture = db.capture_read_schema();
-        let membership_capture = db.relational_membership_store().begin_membership_capture();
-        let Some((snapshot, publication_lsn, _snapshot_registration)) =
+        let membership_capture = (!db.retained_relational_membership_source())
+            .then(|| db.relational_membership_store().begin_membership_capture());
+        let Some((snapshot, publication_lsn, _snapshot_registration, writer_root)) =
             db.bounded_read_snapshot_registration(&context.registration_budget(), &withdrawn)?
         else {
             return Err(context.withdrawn_failure());
         };
+        let _writer_read = db.enter_writer_read(writer_root);
         #[cfg(feature = "test-seams")]
         if let Some(probe) = context.probe() {
             probe.registered_snapshot_for_test(snapshot);
@@ -12411,6 +12413,7 @@ pub(super) struct CursorState {
     _snapshot: SnapshotId,
     _snapshot_registration: Box<dyn Send + Sync>,
     storage_snapshot: Option<crate::persistence::OwnerCursorStoragePin>,
+    writer_root: Option<Arc<crate::persistence::WriterSnapshot>>,
     publication: ReadPublicationScope,
     /// The idle window this cursor's registration is judged by. Stamped
     /// beside `last_used_ms` on every page handed back, so removal reads the
@@ -12789,6 +12792,7 @@ impl CursorState {
         &mut self,
         rows: NonZeroUsize,
     ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
+        let _writer_read = self.database.enter_writer_read(self.writer_root.clone());
         let row_limit = u64::try_from(rows.get()).map_err(|_| {
             RequestContext::limit_failure(
                 ReadFailureLimit::ResultRows,
@@ -13126,17 +13130,25 @@ pub(super) fn open_cursor(
             probe,
         )?;
         let schema_capture = db.capture_read_schema();
-        let membership_capture = db.relational_membership_store().begin_membership_capture();
-        let Some((snapshot, publication_lsn, idle_window, storage_snapshot, snapshot_registration)) =
-            db.bounded_cursor_snapshot_registration(
-                Arc::clone(&clock),
-                limits.cursor_idle_ms,
-                &context.registration_budget(),
-                &withdrawn,
-            )?
+        let membership_capture = (!db.retained_relational_membership_source())
+            .then(|| db.relational_membership_store().begin_membership_capture());
+        let Some((
+            snapshot,
+            publication_lsn,
+            idle_window,
+            storage_snapshot,
+            snapshot_registration,
+            writer_root,
+        )) = db.bounded_cursor_snapshot_registration(
+            Arc::clone(&clock),
+            limits.cursor_idle_ms,
+            &context.registration_budget(),
+            &withdrawn,
+        )?
         else {
             return Err(context.withdrawn_failure());
         };
+        let _writer_read = db.enter_writer_read(writer_root.clone());
         #[cfg(feature = "test-seams")]
         if let Some(probe) = context.probe() {
             probe.registered_snapshot_for_test(snapshot);
@@ -13250,6 +13262,7 @@ pub(super) fn open_cursor(
             _snapshot: snapshot,
             _snapshot_registration: snapshot_registration,
             storage_snapshot,
+            writer_root,
             publication,
             idle_window,
             context,
@@ -13304,6 +13317,12 @@ pub(super) fn open_cursor(
                 .storage_snapshot
                 .as_ref()
                 .map(|pin| pin.read.storage_snapshot_identity())
+                .or_else(|| {
+                    state
+                        .writer_root
+                        .as_ref()
+                        .map(|root| root.storage_identity())
+                })
         })
         .flatten();
     let lifecycle = if first.page.has_more {
@@ -13313,13 +13332,15 @@ pub(super) fn open_cursor(
         state.finish_plugin_success();
         BoundedCursorLifecycle::Exhausted(columns)
     };
+    let execution = Arc::new(BoundedCursorExecutionState {
+        lifecycle: Mutex::new(lifecycle),
+        publication: publication.clone(),
+        erased: std::sync::atomic::AtomicBool::new(false),
+        active_cancellation: Mutex::new(publication.budget.cancellation.clone()),
+    });
+    db.register_writer_cursor(&execution)?;
     Ok(BoundedCursorOpen {
-        cursor: BoundedCursorHandle {
-            _state: Arc::new(BoundedCursorExecutionState {
-                lifecycle: Mutex::new(lifecycle),
-                publication: publication.clone(),
-            }),
-        },
+        cursor: BoundedCursorHandle { _state: execution },
         first_page: first.page,
         storage_snapshot,
         publication,
@@ -13427,7 +13448,20 @@ pub(super) fn fetch_cursor(
     cancellation: OwnerReadCancellation,
     #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
+    *cursor
+        ._state
+        .active_cancellation
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = cancellation.clone();
     let mut lifecycle = cursor_lifecycle(cursor);
+    if cursor
+        ._state
+        .erased
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Erased);
+        return Err(cursor_not_found());
+    }
     let current = std::mem::replace(
         &mut *lifecycle,
         BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::ExplicitClose),

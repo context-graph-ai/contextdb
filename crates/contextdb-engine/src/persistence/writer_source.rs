@@ -145,15 +145,42 @@ pub(crate) struct WriterReadCursor {
 pub(crate) struct WriterWindow<T> {
     pub(crate) value: T,
     _memory: Arc<ImageMemory>,
+    pub(super) position: Vec<u8>,
 }
 
+impl<T> WriterWindow<T> {
+    pub(super) fn map<U>(self, f: impl FnOnce(T) -> U) -> WriterWindow<U> {
+        WriterWindow {
+            value: f(self.value),
+            _memory: self._memory,
+            position: self.position,
+        }
+    }
+    pub(super) fn boxed(self) -> Result<Box<Self>> {
+        self._memory.reserve(std::mem::size_of::<Self>())?;
+        Ok(Box::new(self))
+    }
+}
 impl WriterSnapshot {
+    pub(super) fn adapter_control(&self, bytes: usize) -> Result<OwnedMemoryReservation> {
+        OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            bytes,
+            "writer_source",
+            "store_adapter",
+            HINT,
+        )
+    }
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn control_bytes(&self) -> usize {
         self._control.bytes()
     }
     pub(crate) fn storage_identity(&self) -> redb::StorageSnapshotIdentity {
         self.read.storage_snapshot_identity()
+    }
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn note_read_source(&self, family: crate::writer_query_test_seams::PhysicalFamily) {
+        crate::writer_query_test_seams::note_physical_source(family, &self.read);
     }
 
     pub(crate) fn cursor(
@@ -319,6 +346,14 @@ impl WriterReadCursor {
         &mut self,
         decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
     ) -> Result<Option<WriterWindow<T>>> {
+        self.next_before(&mut || Ok(()), decode)
+    }
+
+    pub(crate) fn next_before<T>(
+        &mut self,
+        before: &mut dyn FnMut() -> Result<()>,
+        decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
+    ) -> Result<Option<WriterWindow<T>>> {
         if self.finished {
             return Ok(None);
         }
@@ -328,7 +363,7 @@ impl WriterReadCursor {
             "cursor_window",
             HINT,
         );
-        let result = self.read_one(&memory, decode)?;
+        let result = self.read_one(&memory, before, decode)?;
         let Some((key, value)) = result else {
             self.finished = true;
             if let Some(prior) = self.after.take() {
@@ -344,9 +379,12 @@ impl WriterReadCursor {
         if let Some(prior) = self.after.replace(key) {
             self.continuation.try_shrink(prior.capacity())?;
         }
-        memory.release(self.after.as_ref().expect("resume key installed").len());
+        // The decode owner retains the copied physical position; the cursor
+        // separately owns and admits its resume key.
+        let position = self.after.as_ref().expect("resume key installed").clone();
         Ok(Some(WriterWindow {
             value,
+            position,
             _memory: memory,
         }))
     }
@@ -354,10 +392,12 @@ impl WriterReadCursor {
     fn read_one<T>(
         &self,
         memory: &Arc<ImageMemory>,
+        before: &mut dyn FnMut() -> Result<()>,
         decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
     ) -> Result<Option<(Vec<u8>, T)>> {
         let (lower, upper) = self.bounds();
         let finish = |key: &[u8], value: &[u8]| -> Result<(Vec<u8>, T)> {
+            before()?;
             memory.reserve(key.len())?;
             let decoded = memory.scope(|| decode(key, value))?;
             Ok((key.to_vec(), decoded))
@@ -455,6 +495,9 @@ impl WriterReadCursor {
     }
 
     pub(crate) fn next_row(&mut self) -> Result<Option<WriterWindow<VersionedRow>>> {
+        #[cfg(feature = "test-seams")]
+        self.root
+            .note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
         self.next(|key, value| {
             let row = RedbPersistence::decode_versioned_row(value, None)?;
             if RedbPersistence::rel_row_key(&row) != key {
@@ -593,7 +636,17 @@ impl WriterReadCursor {
         &mut self,
         current: bool,
     ) -> Result<Option<WriterWindow<WriterIndexPosting>>> {
-        self.next(|key, value| {
+        self.next_index_before(current, &mut || Ok(()))
+    }
+    pub(crate) fn next_index_before(
+        &mut self,
+        current: bool,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<WriterWindow<WriterIndexPosting>>> {
+        #[cfg(feature = "test-seams")]
+        self.root
+            .note_read_source(crate::writer_query_test_seams::PhysicalFamily::Posting);
+        self.next_before(before, |key, value| {
             let encoded = decode_window_exact::<EncodedRelationalIndexPosition>(key)?;
             crate::read_image_memory::reserve(key.len().saturating_mul(2))?;
             if RedbPersistence::encode(&encoded)? != key {
@@ -775,6 +828,7 @@ impl WriterSnapshot {
         let value = memory.scope(|| decode_window_exact(value.value()))?;
         Ok(Some(WriterWindow {
             value,
+            position: Vec::new(),
             _memory: memory,
         }))
     }
@@ -878,6 +932,7 @@ impl WriterSnapshot {
         let key = DurableRelationalIndexKey::new(tuple.clone(), row_id, created_tx)?;
         Ok(WriterWindow {
             value: key.0,
+            position: Vec::new(),
             _memory: memory,
         })
     }

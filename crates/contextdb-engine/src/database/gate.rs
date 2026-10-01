@@ -1657,7 +1657,7 @@ impl Database {
                 return Ok(staged);
             }
         }
-        Ok(self.relational_store.row_by_id(table, row_id, snapshot))
+        self.committed_row_at(table, row_id, snapshot)
     }
 
     fn raw_row_missing_due_to_staged_delete(&self, tx: TxId, table: &str, row_id: RowId) -> bool {
@@ -3345,13 +3345,14 @@ impl Database {
             }
         }
         self.graph
-            .bounded_bfs_cursor(
+            .bounded_bfs_cursor_at_source(
                 start,
                 edge_types,
                 direction,
                 min_depth,
                 max_depth,
                 snapshot,
+                self.writer_graph_root().map_err(E::from)?,
                 before_retain,
                 release_retained,
             )

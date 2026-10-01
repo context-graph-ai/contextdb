@@ -9,6 +9,8 @@ pub struct RelationalDeletePredicate {
 
 #[derive(Debug, Default, Clone)]
 pub struct WriteSet {
+    /// Captured once at begin; owned with the transaction's staged state.
+    pub base_read: Option<crate::manager::PublishedRead>,
     pub relational_inserts: Vec<(TableName, VersionedRow)>,
     /// Maintained by the engine's admitted declared-index staging doors.
     pub ordered_staged_rows: crate::ordered_staged::OrderedStagedRows,

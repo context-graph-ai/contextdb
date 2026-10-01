@@ -30,6 +30,7 @@ mod vector_quarantine_inventory_admission_tests;
 #[cfg(all(test, feature = "test-seams"))]
 mod vector_retry_frontier_integrity_tests;
 mod vector_source_page_admission;
+pub(crate) mod writer_read;
 #[cfg(test)]
 mod writer_row_charge_tests;
 use vector_maintenance_inventory::{
@@ -12297,6 +12298,7 @@ struct DatabaseOperationGuard<'a> {
     // Local/received DDL already owns the write side before entering here, so
     // this re-entrant read acquisition never attempts a read-to-write upgrade.
     _schema_publication: Option<SchemaPublicationGuard<'a>>,
+    _writer_read: writer_read::WriterReadScope,
 }
 
 #[derive(Default)]
@@ -12305,6 +12307,7 @@ struct ReadPublicationGateState {
     writer_scope: Option<BTreeSet<String>>,
     writer_active: bool,
     wake_generation: u64,
+    cursors: Vec<std::sync::Weak<crate::executor::BoundedCursorExecutionState>>,
 }
 
 #[derive(Default)]
@@ -12434,6 +12437,17 @@ impl ReadPublicationGate {
             self.changed.wait(&mut state);
         }
         state.writer_active = true;
+        let cursors = state
+            .cursors
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|cursor| publication_scopes_conflict(tables, &cursor.publication.tables))
+            .collect::<Vec<_>>();
+        state.cursors.retain(|cursor| cursor.strong_count() != 0);
+        drop(state);
+        for cursor in cursors {
+            cursor.release_for_erasure();
+        }
         AuthoritativePurgePublicationGuard {
             gate: Arc::clone(self),
         }
@@ -13924,6 +13938,28 @@ impl SnapshotFloorRegistry {
         }
     }
 
+    fn register_statement_root(
+        self: &Arc<Self>,
+        snapshot: SnapshotId,
+        has_root: bool,
+    ) -> StatementSnapshotRegistration {
+        if !has_root {
+            return self.register_statement(snapshot);
+        }
+        let registration = self.admit(
+            self.state.lock(),
+            snapshot,
+            SnapshotRegistrationClass::Statement,
+            None,
+        );
+        STATEMENT_SNAPSHOT_REGISTRATION_STACK
+            .with(|stack| stack.borrow_mut().push(registration.token));
+        StatementSnapshotRegistration {
+            registration,
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+
     /// Register `snapshot` for a caller that can withdraw the read it is
     /// registering for -- a bounded read, whose holder may cancel while this
     /// call is parked behind an in-flight pass. The blocking rule is exactly
@@ -13962,6 +13998,32 @@ impl SnapshotFloorRegistry {
             return Ok(None);
         }
         budget.remaining()?;
+        Ok(Some(self.admit(
+            state,
+            snapshot,
+            SnapshotRegistrationClass::ReaderHeld,
+            idle_window,
+        )))
+    }
+
+    /// A durable root already protects the physical versions selected by this
+    /// read. Register its logical floor without waiting for a sampled removal
+    /// pass; its source handle remains owned by the reader through completion.
+    fn register_pinned_root_with_budget(
+        self: &Arc<Self>,
+        snapshot: SnapshotId,
+        idle_window: Option<Arc<CursorIdleWindow>>,
+        budget: &ReadRegistrationBudget,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<SnapshotRegistration>> {
+        if withdrawn.is_cancelled() {
+            return Ok(None);
+        }
+        budget.remaining()?;
+        let state = self.state.lock();
+        if withdrawn.is_cancelled() {
+            return Ok(None);
+        }
         Ok(Some(self.admit(
             state,
             snapshot,
@@ -14264,6 +14326,7 @@ fn any_registered_snapshot_sees_version(
 pub struct SnapshotPin<'a> {
     _database: &'a Database,
     _registration: SnapshotRegistration,
+    _root: Option<Arc<crate::persistence::WriterSnapshot>>,
 }
 
 /// Whether a maintenance cycle's currency pass runs unconditionally (an
@@ -21934,10 +21997,13 @@ impl Database {
         // a close landing between the `already_closed` check above and this
         // line must still surface as the typed closed-handle error.
         let _membership_capture = self.relational_store.begin_membership_capture();
-        let Some(read_snapshot) = self.try_snapshot_for_read() else {
-            return Err(closed_database_error());
-        };
-        let _snapshot_registration = self.snapshot_registry.register_statement(read_snapshot);
+        let (read_snapshot, root) =
+            self.capture_writer_transaction_statement(*self.session_tx.lock())?;
+        let has_root = root.is_some();
+        let _writer_read = self.enter_writer_read(root);
+        let _snapshot_registration = self
+            .snapshot_registry
+            .register_statement_root(read_snapshot, has_root);
         let cached = self.cached_statement(sql);
         let parsed_stmt;
         let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
@@ -23578,10 +23644,12 @@ impl Database {
         // `SnapshotFloorRegistry`'s doc comment on `execute`. Fallible form,
         // same reason as `execute`'s own identical line.
         let _membership_capture = self.relational_store.begin_membership_capture();
-        let Some(read_snapshot) = self.try_snapshot_for_read() else {
-            return Err(closed_database_error());
-        };
-        let _snapshot_registration = self.snapshot_registry.register_statement(read_snapshot);
+        let (read_snapshot, root) = self.capture_writer_transaction_statement(Some(tx))?;
+        let has_root = root.is_some();
+        let _writer_read = self.enter_writer_read(root);
+        let _snapshot_registration = self
+            .snapshot_registry
+            .register_statement_root(read_snapshot, has_root);
         let cached = self.cached_statement(sql);
         let parsed_stmt;
         let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
@@ -23678,13 +23746,8 @@ impl Database {
         }
 
         let snapshot = self.snapshot();
-        let Some(mut row) = self.relational.point_lookup_with_tx(
-            Some(tx),
-            table,
-            key_column,
-            key_value,
-            snapshot,
-        )?
+        let Some(mut row) =
+            self.relational_point_with_tx(Some(tx), table, key_column, key_value, snapshot)?
         else {
             return Ok(false);
         };
@@ -25716,9 +25779,15 @@ impl Database {
                 meta.as_ref(),
             );
         }
-        let charge =
-            self.relational
-                .delete_retiring_staged_charge(tx, table, row_id, |row, admitted| {
+        let charge = self
+            .relational
+            .delete_retiring_staged_charge_with_presence(
+                tx,
+                table,
+                row_id,
+                self.committed_row_at(table, row_id, self.snapshot())?
+                    .is_some(),
+                |row, admitted| {
                     #[cfg(any(test, feature = "test-seams"))]
                     STAGED_DELETE_RACE_HOOK_FOR_TEST.with(|slot| {
                         if let Some(hook) = slot.borrow().as_ref() {
@@ -25728,7 +25797,8 @@ impl Database {
                     admitted.unwrap_or_else(|| {
                         retained_row_bytes_with_optional_meta(table, row, meta.as_ref())
                     })
-                })?;
+                },
+            )?;
         #[cfg(any(test, feature = "test-seams"))]
         STAGED_DELETE_RACE_HOOK_FOR_TEST.with(|slot| {
             if let Some(hook) = slot.borrow().as_ref() {
@@ -34323,7 +34393,7 @@ impl Database {
                 ConstraintProbe::NoIndex => {
                     // Fallback to full scan for PK columns without an index.
                     if visible_rows_cache.is_none() {
-                        visible_rows_cache = Some(self.relational.scan_filter_with_tx(
+                        visible_rows_cache = Some(self.relational_scan_filter_with_tx(
                             Some(tx),
                             table,
                             snapshot,
@@ -34369,7 +34439,7 @@ impl Database {
                 ConstraintProbe::NoMatch => Vec::new(),
                 ConstraintProbe::NoIndex => {
                     if visible_rows_cache.is_none() {
-                        visible_rows_cache = Some(self.relational.scan_filter_with_tx(
+                        visible_rows_cache = Some(self.relational_scan_filter_with_tx(
                             Some(tx),
                             table,
                             snapshot,
@@ -34432,7 +34502,7 @@ impl Database {
                 Vec::new()
             } else {
                 if visible_rows_cache.is_none() {
-                    visible_rows_cache = Some(self.relational.scan_filter_with_tx(
+                    visible_rows_cache = Some(self.relational_scan_filter_with_tx(
                         Some(tx),
                         table,
                         snapshot,
@@ -34559,6 +34629,45 @@ impl Database {
         snapshot: SnapshotId,
         skip_row_id: Option<RowId>,
     ) -> Result<ConstraintProbe> {
+        if self.persistence.is_some() {
+            let (skip, staged) = self.tx_mgr.with_write_set(tx, |ws| {
+                let skip = ws
+                    .relational_deletes
+                    .iter()
+                    .filter(|(t, _, _)| t == table)
+                    .map(|(_, row, _)| *row)
+                    .chain(skip_row_id)
+                    .collect::<HashSet<_>>();
+                let staged = ws
+                    .relational_inserts
+                    .iter()
+                    .rev()
+                    .find(|(t, row)| {
+                        t == table
+                            && Some(row.row_id) != skip_row_id
+                            && row.values.get(column) == Some(value)
+                    })
+                    .map(|(_, row)| row.row_id);
+                (skip, staged)
+            })?;
+            if let Some(row) = staged {
+                return Ok(ConstraintProbe::Match(row));
+            }
+            return Ok(
+                match self.writer_indexed_row(
+                    table,
+                    &[column.to_owned()],
+                    std::slice::from_ref(value),
+                    snapshot,
+                    &skip,
+                    None,
+                )? {
+                    None => ConstraintProbe::NoIndex,
+                    Some(None) => ConstraintProbe::NoMatch,
+                    Some(Some(row)) => ConstraintProbe::Match(row),
+                },
+            );
+        }
         use contextdb_core::{DirectedValue, TotalOrdAsc};
         let (tx_staged_deletes, tx_delete_predicates, staged_overlap) =
             self.tx_mgr.with_write_set(tx, |ws| {
@@ -34676,6 +34785,37 @@ impl Database {
     ) -> Result<Option<RowId>> {
         if cols.is_empty() || values.is_empty() || cols.len() != values.len() {
             return Ok(None);
+        }
+        if self.persistence.is_some() {
+            let (skip, staged) = self.tx_mgr.with_write_set(tx, |ws| {
+                let skip = ws
+                    .relational_deletes
+                    .iter()
+                    .filter(|(t, _, _)| t == table)
+                    .map(|(_, row, _)| *row)
+                    .chain(skip_row_id)
+                    .collect::<HashSet<_>>();
+                let staged = ws
+                    .relational_inserts
+                    .iter()
+                    .rev()
+                    .find(|(t, row)| {
+                        t == table
+                            && Some(row.row_id) != skip_row_id
+                            && cols
+                                .iter()
+                                .zip(values)
+                                .all(|(column, value)| row.values.get(column) == Some(value))
+                    })
+                    .map(|(_, row)| row.row_id);
+                (skip, staged)
+            })?;
+            if staged.is_some() {
+                return Ok(staged);
+            }
+            return self
+                .writer_indexed_row(table, cols, values, snapshot, &skip, None)
+                .map(Option::flatten);
         }
         // Rows this tx has already staged for delete are not obstructions.
         let (tx_staged_deletes, tx_delete_predicates): (
@@ -34870,7 +35010,10 @@ impl Database {
                 delivery_registrations: Vec::new(),
             }
         };
-        let snapshot = self.snapshot();
+        let published = self.tx_mgr.capture_published_read();
+        let snapshot = published.snapshot;
+        let root = writer_read::durable_root(published.handle)?;
+        let _writer_read = self.enter_writer_read(root);
         let mut stats_guard = CommitStageStatsGuard::new(self);
         #[cfg(feature = "test-seams")]
         let mut stage_timer = CommitStageTimer::new();
@@ -34885,8 +35028,8 @@ impl Database {
         stage_timer.record(stats_guard.stats_mut(), 0);
         self.validate_vector_schema_epochs(ws, &metadata.vector_schema_epochs)?;
         self.validate_vector_write_set_schema(ws)?;
-        self.discard_deletes_of_rows_that_are_already_gone(ws);
-        let mut deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws);
+        self.discard_deletes_of_rows_that_are_already_gone(ws)?;
+        let mut deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws)?;
         self.validate_unique_constraints_in_write_set(
             ws,
             snapshot,
@@ -35226,11 +35369,11 @@ impl Database {
     /// raise an outbound deletion obligation for a row this node did not
     /// delete. A row this same transaction is inserting is not gone -- it has
     /// simply not been committed yet -- so its delete stays.
-    fn discard_deletes_of_rows_that_are_already_gone(&self, ws: &mut WriteSet) {
+    fn discard_deletes_of_rows_that_are_already_gone(&self, ws: &mut WriteSet) -> Result<()> {
         if ws.relational_deletes.is_empty() {
-            return;
+            return Ok(());
         }
-        let live = self.deleted_row_snapshots_by_table(ws);
+        let live = self.deleted_row_snapshots_by_table(ws)?;
         let staged = ws
             .relational_inserts
             .iter()
@@ -35248,7 +35391,7 @@ impl Database {
             keep
         });
         if discarded.is_empty() {
-            return;
+            return Ok(());
         }
         // The delete also staged this row's outgoing deletion obligation. That
         // obligation is the part a peer would see, so a traceless no-op has to
@@ -35270,6 +35413,7 @@ impl Database {
             };
             !discarded.contains(&(record.table.clone(), row_id))
         });
+        Ok(())
     }
 
     fn deleted_row_ids_by_table(ws: &WriteSet) -> HashMap<String, HashSet<RowId>> {
@@ -35283,9 +35427,9 @@ impl Database {
     fn deleted_row_snapshots_by_table(
         &self,
         ws: &WriteSet,
-    ) -> HashMap<String, HashMap<RowId, VersionedRow>> {
+    ) -> Result<HashMap<String, HashMap<RowId, VersionedRow>>> {
         if ws.relational_deletes.is_empty() {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
         let mut seen = HashSet::new();
         let mut keys = Vec::with_capacity(ws.relational_deletes.len());
@@ -35294,7 +35438,26 @@ impl Database {
                 keys.push((table.clone(), *row_id));
             }
         }
-        self.relational_store.live_rows_by_id(&keys)
+        if self.persistence.is_some() {
+            let mut rows = HashMap::<String, HashMap<RowId, VersionedRow>>::new();
+            let snapshot = self.snapshot();
+            let mut output =
+                crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+            for (table, row_id) in keys {
+                if let Some(row) = self.committed_row_at(&table, row_id, snapshot)? {
+                    output.try_grow_for(
+                        row.estimated_bytes().saturating_add(128),
+                        "writer_source",
+                        "deleted_row_output",
+                        "Raise MEMORY_LIMIT to prepare these deletions.",
+                    )?;
+                    rows.entry(table).or_default().insert(row_id, row);
+                }
+            }
+            self.retain_writer_output(output);
+            return Ok(rows);
+        }
+        Ok(self.relational_store.live_rows_by_id(&keys))
     }
 
     fn relational_insert_prefix_identity(ws: &WriteSet, end: usize) -> Vec<(String, RowId)> {
@@ -35439,22 +35602,20 @@ impl Database {
             snapshot,
             skip_deleted,
             stats.as_deref_mut(),
-        ) {
+        )? {
             return Ok(row_id);
         }
 
         let before_scan_rows = stats
             .as_ref()
             .map(|_| self.relational_store.scan_rows_touched());
-        let rows = self
-            .relational
-            .scan_filter_with_tx(None, table, snapshot, &|row| {
-                !skip_deleted.contains(&row.row_id)
-                    && columns
-                        .iter()
-                        .zip(values.iter())
-                        .all(|(column, value)| row.values.get(column) == Some(value))
-            })?;
+        let rows = self.relational_scan_filter_with_tx(None, table, snapshot, &|row| {
+            !skip_deleted.contains(&row.row_id)
+                && columns
+                    .iter()
+                    .zip(values.iter())
+                    .all(|(column, value)| row.values.get(column) == Some(value))
+        })?;
         if let (Some(stats), Some(before_scan_rows)) = (stats, before_scan_rows) {
             stats.scan_rows_touched = stats.scan_rows_touched.saturating_add(
                 self.relational_store
@@ -35473,9 +35634,13 @@ impl Database {
         snapshot: SnapshotId,
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
-    ) -> Option<Option<RowId>> {
+    ) -> Result<Option<Option<RowId>>> {
         if columns.is_empty() || columns.len() != values.len() {
-            return Some(None);
+            return Ok(Some(None));
+        }
+
+        if self.persistence.is_some() {
+            return self.writer_indexed_row(table, columns, values, snapshot, skip_deleted, stats);
         }
 
         fn visible_posting(
@@ -35584,13 +35749,13 @@ impl Database {
         };
 
         if !index_checked {
-            return None;
+            return Ok(None);
         }
 
         if let Some(stats) = stats {
             stats.indexed_probes = stats.indexed_probes.saturating_add(1);
         }
-        Some(indexed_row_id)
+        Ok(Some(indexed_row_id))
     }
 
     fn required_indexed_visible_row_by_columns(
@@ -35608,13 +35773,17 @@ impl Database {
             snapshot,
             skip_deleted,
             None,
-        ) else {
+        )?
+        else {
             return Err(Error::Other(format!(
                 "exact sync key probe on {table}({}) has no covering index",
                 columns.join(", ")
             )));
         };
-        Ok(row_id.and_then(|row_id| self.relational_store.row_by_id(table, row_id, snapshot)))
+        row_id
+            .map(|row_id| self.committed_row_at(table, row_id, snapshot))
+            .transpose()
+            .map(Option::flatten)
     }
 
     fn required_indexed_visible_row_by_column(
@@ -35656,7 +35825,7 @@ impl Database {
         else {
             return Ok(None);
         };
-        Ok(self.relational_store.row_by_id(table, row_id, snapshot))
+        self.committed_row_at(table, row_id, snapshot)
     }
 
     fn committed_unique_probe_required_for_replacement(
@@ -35765,6 +35934,22 @@ impl Database {
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
     ) -> Result<bool> {
+        if self.persistence.is_some() {
+            if let Some(row) = self.writer_indexed_row(
+                table,
+                &[column.to_owned()],
+                std::slice::from_ref(value),
+                snapshot,
+                skip_deleted,
+                stats,
+            )? {
+                return Ok(row.is_some());
+            }
+            let rows = self.relational_scan_filter_with_tx(None, table, snapshot, &|row| {
+                !skip_deleted.contains(&row.row_id) && row.values.get(column) == Some(value)
+            })?;
+            return Ok(!rows.is_empty());
+        }
         let mut stats = stats;
         if let Some(exists) = self.indexed_visible_row_exists(
             table,
@@ -35780,11 +35965,9 @@ impl Database {
         let before_scan_rows = stats
             .as_ref()
             .map(|_| self.relational_store.scan_rows_touched());
-        let rows = self
-            .relational
-            .scan_filter_with_tx(None, table, snapshot, &|row| {
-                !skip_deleted.contains(&row.row_id) && row.values.get(column) == Some(value)
-            })?;
+        let rows = self.relational_scan_filter_with_tx(None, table, snapshot, &|row| {
+            !skip_deleted.contains(&row.row_id) && row.values.get(column) == Some(value)
+        })?;
         if let (Some(stats), Some(before_scan_rows)) = (stats, before_scan_rows) {
             stats.scan_rows_touched = stats.scan_rows_touched.saturating_add(
                 self.relational_store
@@ -35822,6 +36005,19 @@ impl Database {
         skip_deleted: &HashSet<RowId>,
         stats: Option<&mut CommitStageStats>,
     ) -> Result<bool> {
+        if self.persistence.is_some() {
+            let row =
+                self.writer_indexed_row(table, columns, values, snapshot, skip_deleted, stats)?;
+            let Some(row) = row else {
+                self.fk_full_scan_fallbacks.fetch_add(1, Ordering::SeqCst);
+                return Err(Error::Other(format!(
+                    "composite foreign key probe on {table}({}) has no covering index",
+                    columns.join(", ")
+                )));
+            };
+            self.fk_indexed_tuple_probes.fetch_add(1, Ordering::SeqCst);
+            return Ok(row.is_some());
+        }
         if columns.is_empty() || columns.len() != values.len() {
             return Ok(false);
         }
@@ -36417,7 +36613,7 @@ impl Database {
             )? {
                 staged_lookup.apply_delta(&staged_tuple_columns, &rewrite.lookup_delta);
                 deleted_by_table = Self::deleted_row_ids_by_table(ws);
-                *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws);
+                *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws)?;
                 index =
                     Self::relational_insert_index_by_row(ws, &rewrite.table, rewrite.row_id, index)
                         .unwrap_or_else(|| index.min(ws.relational_inserts.len()));
@@ -36513,7 +36709,7 @@ impl Database {
                     {
                         staged_lookup.apply_delta(&staged_tuple_columns, &rewrite.lookup_delta);
                         deleted_by_table = Self::deleted_row_ids_by_table(ws);
-                        *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws);
+                        *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws)?;
                         index = Self::relational_insert_index_by_row(
                             ws,
                             &rewrite.table,
@@ -36626,7 +36822,7 @@ impl Database {
                     {
                         staged_lookup.apply_delta(&staged_tuple_columns, &rewrite.lookup_delta);
                         deleted_by_table = Self::deleted_row_ids_by_table(ws);
-                        *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws);
+                        *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws)?;
                         index = Self::relational_insert_index_by_row(
                             ws,
                             &rewrite.table,
@@ -37097,9 +37293,7 @@ impl Database {
                         .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
                         .map(|column| column.name.as_str())
                         .collect::<HashSet<_>>();
-                    let resident =
-                        self.relational_store
-                            .row_by_id(&guard.table, guard.row_id, snapshot);
+                    let resident = self.committed_row_at(&guard.table, guard.row_id, snapshot)?;
                     let needs_body = resident.as_ref().is_some_and(|row| {
                         predicate_columns.iter().any(|column| {
                             !vector_columns.contains(column.as_str())
@@ -37154,8 +37348,7 @@ impl Database {
     ) -> Result<()> {
         for guard in guards {
             let unchanged = self
-                .relational_store
-                .row_by_id(&guard.table, guard.row_id, snapshot)
+                .committed_row_at(&guard.table, guard.row_id, snapshot)?
                 .is_some_and(|row| row.values == guard.values);
             if !unchanged {
                 return Err(Error::SyncError(format!(
@@ -37314,7 +37507,7 @@ impl Database {
             };
 
             let state_column = state_machine.column.clone();
-            let Some(existing) = self.relational.point_lookup_with_tx(
+            let Some(existing) = self.relational_point_with_tx(
                 Some(tx),
                 &entry.table,
                 "id",
@@ -37954,8 +38147,7 @@ impl Database {
         }
 
         let committed_row_exists = self
-            .relational_store
-            .row_by_id(table, row_id, SnapshotId::from_raw_wire(u64::MAX))
+            .committed_row_at(table, row_id, self.snapshot())?
             .is_some();
         if committed_row_exists
             && !ws
@@ -38077,7 +38269,7 @@ impl Database {
                     continue;
                 }
 
-                let rows = match self.relational.scan_filter_with_tx(
+                let rows = match self.relational_scan_filter_with_tx(
                     Some(ctx.tx),
                     owner_table,
                     ctx.snapshot,
@@ -38144,8 +38336,7 @@ impl Database {
 
             for node in bfs.nodes {
                 if self
-                    .relational
-                    .point_lookup_with_tx(
+                    .relational_point_with_tx(
                         Some(ctx.tx),
                         source.table,
                         "id",
@@ -38240,7 +38431,7 @@ impl Database {
         };
         self.ensure_trigger_table_ready(table, "delete_row")?;
         self.assert_row_id_write_allowed(Some(tx), table, row_id, self.snapshot_for_read())?;
-        if let Some(row) = self.row_visible_at_snapshot(table, row_id, self.snapshot_for_read())
+        if let Some(row) = self.committed_row_at(table, row_id, self.snapshot_for_read())?
             && let Some(meta) = self.table_meta(table)
             && let Some(natural_key) = natural_key_from_row_values(&meta, &row.values)
         {
@@ -38296,32 +38487,46 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
-        if self.relational_store.uses_disk_backed_committed_bodies() {
-            let meta = self
-                .table_meta(table)
-                .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
-            return self
-                .persistence
-                .as_ref()
-                .expect("disk-backed relational bodies require persistence")
-                .load_relational_row_by_id_at(table, &meta, row_id, snapshot);
+        if let Some(root) = self.writer_read_root()? {
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+            let window =
+                contextdb_relational::source::visible_row(&source, table, row_id, snapshot)?;
+            let mut output =
+                crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+            let row = window
+                .map(|window| {
+                    output.try_grow_for(
+                        window.value().estimated_bytes(),
+                        "writer_source",
+                        "row_output",
+                        "Raise MEMORY_LIMIT to return this row.",
+                    )?;
+                    Ok(window.value().clone())
+                })
+                .transpose();
+            self.retain_writer_output(output);
+            return row;
         }
         Ok(self.relational_store.row_by_id(table, row_id, snapshot))
     }
 
     fn committed_rows_at(&self, table: &str, snapshot: SnapshotId) -> Result<Vec<VersionedRow>> {
-        if self.relational_store.uses_disk_backed_committed_bodies() {
-            self.table_meta(table)
-                .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        if let Some(root) = self.writer_read_root()? {
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+            let mut output =
+                crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
             let rows = self
-                .persistence
-                .as_ref()
-                .expect("disk-backed relational bodies require persistence")
-                .load_relational_table(table)?;
-            return Ok(rows
-                .into_iter()
-                .filter(|row| row.visible_at(snapshot))
-                .collect());
+                .relational
+                .scan_with_source(None, table, snapshot, &source, |bytes| {
+                    output.try_grow_for(
+                        bytes,
+                        "writer_source",
+                        "scan_output",
+                        "Raise MEMORY_LIMIT to return these rows.",
+                    )
+                });
+            self.retain_writer_output(output);
+            return rows;
         }
         self.relational.scan(table, snapshot)
     }
@@ -38459,7 +38664,7 @@ impl Database {
     ) -> Result<Option<VersionedRow>> {
         let _operation = self.open_operation()?;
         self.assert_table_read_allowed(table)?;
-        let Some(row) = self.relational.point_lookup(table, col, value, snapshot)? else {
+        let Some(row) = self.relational_point_with_tx(None, table, col, value, snapshot)? else {
             return Ok(None);
         };
         let row = self
@@ -38489,9 +38694,7 @@ impl Database {
         value: &Value,
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
-        let row = self
-            .relational
-            .point_lookup_with_tx(Some(tx), table, col, value, snapshot)?;
+        let row = self.relational_point_with_tx(Some(tx), table, col, value, snapshot)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -38727,8 +38930,15 @@ impl Database {
     ) -> Result<TraversalResult> {
         let _operation = self.open_operation()?;
         if self.access_is_admin() {
-            self.graph
-                .bfs(start, edge_types, direction, 1, max_depth, snapshot)
+            self.graph.bfs_at_source(
+                start,
+                edge_types,
+                direction,
+                1,
+                max_depth,
+                snapshot,
+                self.writer_graph_root()?,
+            )
         } else {
             self.query_bfs_gated(start, edge_types, direction, 1, max_depth, snapshot)
         }
@@ -38741,6 +38951,31 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<usize> {
         let _operation = self.open_operation()?;
+        if let Some(root) = self.writer_graph_root()? {
+            let mut cursor = root.cursor(contextdb_graph::source::GraphQuery {
+                node: source,
+                direction: Direction::Outgoing,
+                identity: None,
+            })?;
+            let mut count = 0;
+            while let Some(window) = cursor.next_edge()? {
+                let edge = window.edge();
+                if edge.edge_type == edge_type
+                    && edge.visible_at(snapshot)
+                    && (self.access_is_admin()
+                        || (self.node_read_allowed(edge.target, snapshot)?
+                            && self.edge_read_allowed(
+                                edge.source,
+                                edge.target,
+                                &edge.edge_type,
+                                snapshot,
+                            )?))
+                {
+                    count += 1;
+                }
+            }
+            return Ok(count);
+        }
         if self.access_is_admin() {
             return Ok(self.graph.edge_count(source, edge_type, snapshot));
         }
@@ -41446,7 +41681,7 @@ impl Database {
         {
             return Ok(false);
         }
-        let row = self.row_visible_at_snapshot(table, row_id, snapshot);
+        let row = self.committed_row_at(table, row_id, snapshot)?;
         let Some(row) = row else {
             return Ok(false);
         };
@@ -43874,9 +44109,23 @@ impl Database {
     /// held-snapshot boundary above, unchanged. A pin whose `snapshot` is
     /// not older than any in-flight pass's own floor never blocks.
     pub fn pin_snapshot(&self, snapshot: SnapshotId) -> SnapshotPin<'_> {
+        let root = self
+            .writer_read_root()
+            .expect("an open database has a published read root");
+        let registration = if root.is_some() {
+            self.snapshot_registry.admit(
+                self.snapshot_registry.state.lock(),
+                snapshot,
+                SnapshotRegistrationClass::ReaderHeld,
+                None,
+            )
+        } else {
+            self.snapshot_registry.register(snapshot)
+        };
         SnapshotPin {
             _database: self,
-            _registration: self.snapshot_registry.register(snapshot),
+            _registration: registration,
+            _root: root,
         }
     }
 
@@ -44407,13 +44656,79 @@ impl Database {
             .map_err(crate::executor::BoundedExecutionError::from)
     }
 
+    #[cfg(test)]
     pub(crate) fn bounded_read_snapshot_registration(
+        &self,
+        budget: &ReadRegistrationBudget,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<(SnapshotId, Lsn, Box<dyn Send + Sync>)>> {
+        Ok(self
+            .bounded_read_snapshot_registration_with_root(budget, withdrawn)?
+            .map(|(snapshot, lsn, registration, root)| {
+                (
+                    snapshot,
+                    lsn,
+                    Box::new((registration, root)) as Box<dyn Send + Sync>,
+                )
+            }))
+    }
+    #[cfg(test)]
+    pub(crate) fn bounded_cursor_snapshot_registration(
+        &self,
+        clock: Arc<dyn DeadlineClock>,
+        idle_ms: u64,
+        budget: &ReadRegistrationBudget,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<
+        Option<(
+            SnapshotId,
+            Lsn,
+            Arc<CursorIdleWindow>,
+            Option<crate::persistence::OwnerCursorStoragePin>,
+            Box<dyn Send + Sync>,
+        )>,
+    > {
+        Ok(self
+            .bounded_cursor_snapshot_registration_with_root(clock, idle_ms, budget, withdrawn)?
+            .map(|(snapshot, lsn, window, storage, registration, root)| {
+                (
+                    snapshot,
+                    lsn,
+                    window,
+                    storage,
+                    Box::new((registration, root)) as Box<dyn Send + Sync>,
+                )
+            }))
+    }
+
+    pub(crate) fn bounded_read_snapshot_registration_with_root(
         &self,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<crate::executor::BoundedReadSnapshotPin>> {
         if withdrawn.is_cancelled() {
             return Ok(None);
+        }
+        if self.persistence.is_some() {
+            budget.remaining()?;
+            let root = self.writer_read_root()?.ok_or_else(closed_database_error)?;
+            #[cfg(feature = "test-seams")]
+            root.note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
+            let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(root.snapshot));
+            let Some(registration) = self
+                .snapshot_registry
+                .register_pinned_root_with_budget(snapshot, None, budget, withdrawn)?
+            else {
+                return Ok(None);
+            };
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_query_test_seams::note_read_snapshot(snapshot);
+            return Ok(Some((
+                snapshot,
+                root.lsn,
+                Box::new(registration),
+                Some(root),
+            )));
         }
         let (snapshot, publication_lsn, registration) = if self.persistence.is_none() {
             // A memory source can use the last complete publication while a
@@ -44511,6 +44826,7 @@ impl Database {
             snapshot,
             publication_lsn,
             Box::new(registration) as Box<dyn Send + Sync>,
+            None,
         )))
     }
 
@@ -44528,7 +44844,7 @@ impl Database {
     /// holding rows back once that window passes. The returned window is the
     /// cursor's to stamp on every page it hands out. `None` carries the same
     /// meaning as on the read above: the caller withdrew during admission.
-    pub(crate) fn bounded_cursor_snapshot_registration(
+    pub(crate) fn bounded_cursor_snapshot_registration_with_root(
         &self,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
@@ -44537,6 +44853,35 @@ impl Database {
     ) -> Result<Option<crate::executor::BoundedCursorSnapshotPin>> {
         if withdrawn.is_cancelled() {
             return Ok(None);
+        }
+        if self.persistence.is_some() {
+            budget.remaining()?;
+            let root = self.writer_read_root()?.ok_or_else(closed_database_error)?;
+            #[cfg(feature = "test-seams")]
+            root.note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
+            let snapshot = SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(root.snapshot));
+            let window = Arc::new(CursorIdleWindow::new(
+                Arc::clone(&clock),
+                idle_ms,
+                clock.now_ms(),
+            ));
+            let Some(registration) = self.snapshot_registry.register_pinned_root_with_budget(
+                snapshot,
+                Some(Arc::clone(&window)),
+                budget,
+                withdrawn,
+            )?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some((
+                snapshot,
+                root.lsn,
+                window,
+                None,
+                Box::new(registration),
+                Some(root),
+            )));
         }
         if self.persistence.is_none() {
             budget.remaining()?;
@@ -44567,6 +44912,7 @@ impl Database {
                     window,
                     None,
                     Box::new(registration) as Box<dyn Send + Sync>,
+                    None,
                 )));
             }
             drop(registration);
@@ -44606,6 +44952,7 @@ impl Database {
                         window,
                         None,
                         Box::new(registration) as Box<dyn Send + Sync>,
+                        None,
                     )))
                 },
             ) else {
@@ -44679,6 +45026,7 @@ impl Database {
                                 window,
                                 storage,
                                 Box::new(registration) as Box<dyn Send + Sync>,
+                        None,
                             )
                         }))
                 },
@@ -44739,7 +45087,7 @@ impl Database {
     }
 
     pub(crate) fn uses_retained_relational_source(&self) -> bool {
-        self.retained_relational_source.is_some()
+        self.retained_relational_source.is_some() || self.persistence.is_some()
     }
 
     pub(crate) fn release_statement_proof_reuse(&self) {
@@ -44903,19 +45251,19 @@ impl Database {
         if let Some(row) = resident {
             return Ok(Some(row));
         }
-        let Some(persistence) = &self.persistence else {
+        let Some(root) = self.writer_read_root().map_err(E::from)? else {
             return Ok(None);
         };
-        let meta = self
-            .table_meta(table)
-            .ok_or_else(|| E::from(Error::TableNotFound(table.to_owned())))?;
-        let row = persistence
-            .load_relational_row_by_id_at(table, &meta, row_id, snapshot)
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)
             .map_err(E::from)?;
-        if let Some(row) = row.as_ref() {
-            before_clone(row.estimated_bytes())?;
+        let window = contextdb_relational::source::visible_row(&source, table, row_id, snapshot)
+            .map_err(E::from)?;
+        if let Some(window) = window {
+            before_clone(window.value().estimated_bytes())?;
+            Ok(Some(window.value().clone()))
+        } else {
+            Ok(None)
         }
-        Ok(row)
     }
 
     pub(crate) fn bounded_physical_table_cursor(
@@ -44926,6 +45274,9 @@ impl Database {
             self.table_meta(table)
                 .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
             return Ok(contextdb_relational::mem::BoundedPhysicalCursor::default());
+        }
+        if self.persistence.is_some() {
+            return self.relational.bounded_physical_cursor_from_source(table);
         }
         self.relational.bounded_physical_cursor(table)
     }
@@ -44954,39 +45305,16 @@ impl Database {
                 &mut before_clone,
             );
         }
-        if self.relational_store.uses_disk_backed_committed_bodies() {
-            let row =
-                self.relational
-                    .bounded_physical_row_next(table, cursor, before_touch, |_| Ok(()))?;
-            let Some(directory) = row else {
-                return Ok(None);
-            };
-            let meta = self
-                .table_meta(table)
-                .ok_or_else(|| E::from(Error::TableNotFound(table.to_owned())))?;
-            let row = self
-                .persistence
-                .as_ref()
-                .expect("disk-backed relational bodies require persistence")
-                .load_relational_row_version(
-                    table,
-                    &meta,
-                    directory.row_id,
-                    directory.created_tx,
-                    directory.lsn,
-                )
-                .map_err(E::from)?
-                .ok_or_else(|| {
-                    E::from(Error::StoreCorrupted {
-                        path: self.bounded_store_path(),
-                        reason: format!(
-                            "relational table {table} is missing saved row version {}:{}:{}",
-                            directory.row_id.0, directory.created_tx.0, directory.lsn.0
-                        ),
-                    })
-                })?;
-            before_clone(row.estimated_bytes())?;
-            return Ok(Some(row));
+        if let Some(root) = self.writer_read_root().map_err(E::from)? {
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)
+                .map_err(E::from)?;
+            return self.relational.bounded_physical_row_next_from_source(
+                &source,
+                table,
+                cursor,
+                before_touch,
+                before_clone,
+            );
         }
         self.relational
             .bounded_physical_row_next(table, cursor, before_touch, before_clone)
@@ -45064,69 +45392,18 @@ impl Database {
                 &mut before_clone,
             );
         }
-        if self.relational_store.uses_disk_backed_committed_bodies() {
-            let directory_charge = std::cell::Cell::new(0usize);
-            let row = self.relational.bounded_ordered_row_next(
+        if let Some(root) = self.writer_read_root().map_err(E::from)? {
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)
+                .map_err(E::from)?;
+            return self.writer_ordered_next(
+                &source,
                 table,
-                column,
-                direction,
                 snapshot,
                 cursor,
+                check_boundary,
                 before_touch,
-                |bytes| {
-                    directory_charge.set(bytes);
-                    Ok(())
-                },
-            )?;
-            let Some(directory) = row else {
-                if directory_charge.get() != 0 {
-                    before_clone(directory_charge.get())?;
-                }
-                return Ok(None);
-            };
-            let key_bytes = directory_charge
-                .get()
-                .saturating_sub(directory.estimated_bytes());
-            let metadata = self.relational_store.table_meta.read();
-            let meta = metadata
-                .get(table)
-                .ok_or_else(|| E::from(Error::TableNotFound(table.to_owned())))?;
-            let row = if directory.lsn == Lsn(0) {
-                None
-            } else {
-                self.persistence
-                    .as_ref()
-                    .expect("disk-backed relational bodies require persistence")
-                    .load_relational_row_version(
-                        table,
-                        meta,
-                        directory.row_id,
-                        directory.created_tx,
-                        directory.lsn,
-                    )
-                    .map_err(E::from)?
-            };
-            drop(metadata);
-            // An identities-only index cursor carries a synthetic row with
-            // no durable LSN. Resolve that one by its visible row identity.
-            let row = if directory.lsn == Lsn(0) {
-                self.committed_row_at(table, directory.row_id, snapshot)
-                    .map_err(E::from)?
-            } else {
-                Some(row.ok_or_else(|| {
-                    E::from(Error::StoreCorrupted {
-                        path: self.bounded_store_path(),
-                        reason: format!(
-                            "relational table {table} is missing saved row version {}:{}:{}",
-                            directory.row_id.0, directory.created_tx.0, directory.lsn.0
-                        ),
-                    })
-                })?)
-            };
-            if let Some(row) = row.as_ref() {
-                before_clone(row.estimated_bytes().saturating_add(key_bytes))?;
-            }
-            return Ok(row);
+                before_clone,
+            );
         }
         self.relational.bounded_ordered_row_next(
             table,
@@ -45261,58 +45538,19 @@ impl Database {
                 &mut before_clone,
             );
         }
-        if self.relational_store.uses_disk_backed_committed_bodies() {
-            let row = self.relational.bounded_exact_index_row_next(
+        if let Some(root) = self.writer_read_root().map_err(E::from)? {
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)
+                .map_err(E::from)?;
+            let _ = (before_retain, release_retained);
+            return self.writer_exact_next(
+                &source,
                 table,
                 index,
                 snapshot,
                 cursor,
                 before_touch,
-                before_retain,
-                release_retained,
-                |_| Ok(()),
-            )?;
-            let Some(directory) = row else {
-                return Ok(None);
-            };
-            let metadata = self.relational_store.table_meta.read();
-            let meta = metadata
-                .get(table)
-                .ok_or_else(|| E::from(Error::TableNotFound(table.to_owned())))?;
-            let row = if directory.lsn == Lsn(0) {
-                None
-            } else {
-                self.persistence
-                    .as_ref()
-                    .expect("disk-backed relational bodies require persistence")
-                    .load_relational_row_version(
-                        table,
-                        meta,
-                        directory.row_id,
-                        directory.created_tx,
-                        directory.lsn,
-                    )
-                    .map_err(E::from)?
-            };
-            drop(metadata);
-            let row = if directory.lsn == Lsn(0) {
-                self.committed_row_at(table, directory.row_id, snapshot)
-                    .map_err(E::from)?
-            } else {
-                Some(row.ok_or_else(|| {
-                    E::from(Error::StoreCorrupted {
-                        path: self.bounded_store_path(),
-                        reason: format!(
-                            "relational table {table} is missing saved row version {}:{}:{}",
-                            directory.row_id.0, directory.created_tx.0, directory.lsn.0
-                        ),
-                    })
-                })?)
-            };
-            if let Some(row) = row.as_ref() {
-                before_clone(row.estimated_bytes())?;
-            }
-            return Ok(row);
+                before_clone,
+            );
         }
         self.relational.bounded_exact_index_row_next(
             table,
@@ -48245,6 +48483,28 @@ impl Database {
         publish()
     }
 
+    pub(crate) fn register_writer_cursor(
+        &self,
+        cursor: &Arc<crate::executor::BoundedCursorExecutionState>,
+    ) -> Result<()> {
+        let _publication = self
+            .read_publication_gate
+            .acquire_read(&cursor.publication)?;
+        let mut state = self.read_publication_gate.state.lock();
+        if state
+            .writer_scope
+            .as_ref()
+            .is_some_and(|tables| publication_scopes_conflict(tables, &cursor.publication.tables))
+        {
+            drop(state);
+            cursor.release_for_erasure();
+            return Err(Error::ReadCancelled);
+        }
+        state.cursors.retain(|cursor| cursor.strong_count() != 0);
+        state.cursors.push(Arc::downgrade(cursor));
+        Ok(())
+    }
+
     pub(crate) fn authorize_authoritative_read_publication(
         &self,
         scope: &crate::executor::ReadPublicationScope,
@@ -48906,6 +49166,7 @@ impl Database {
                 db_id,
                 _lock: None,
                 _schema_publication: None,
+                _writer_read: self.writer_read_scope()?,
             });
         }
 
@@ -48924,6 +49185,7 @@ impl Database {
             db_id,
             _lock: Some(lock),
             _schema_publication: Some(schema_publication),
+            _writer_read: self.writer_read_scope()?,
         })
     }
 
@@ -55059,7 +55321,7 @@ impl Database {
             {
                 continue;
             }
-            for row in self.committed_rows_at(&table, SnapshotId::from_raw_wire(u64::MAX))? {
+            for row in self.committed_rows_at(&table, self.snapshot())? {
                 if let Some(edge_type) = row.values.get("edge_type").and_then(Value::as_text) {
                     types.insert(edge_type.to_owned());
                 }
@@ -55334,8 +55596,7 @@ impl Database {
                         .insert((sync_identity_key(&table, &natural_key), lsn), row_id);
                     let snapshot = self.snapshot_before_lsn(lsn);
                     if !self.access_is_admin() {
-                        let Some(row) = self.row_visible_at_snapshot(&table, row_id, snapshot)
-                        else {
+                        let Some(row) = self.committed_row_at(&table, row_id, snapshot)? else {
                             continue;
                         };
                         if !self.row_read_allowed_for_change(&table, &row, snapshot) {
@@ -65064,8 +65325,7 @@ impl Database {
         let snapshot = self.snapshot();
         for vector in vectors {
             (projection.checkpoint)()?;
-            let Some(row) =
-                self.row_visible_at_snapshot(&vector.index.table, vector.row_id, snapshot)
+            let Some(row) = self.committed_row_at(&vector.index.table, vector.row_id, snapshot)?
             else {
                 continue;
             };
@@ -65173,6 +65433,20 @@ impl Database {
             };
             return source.relational_row_by_id_lsn(table, &meta, row_id, lsn);
         }
+        if let Some(root) = self.writer_read_root()? {
+            use contextdb_relational::source::RelationalReadSource;
+            if self.table_meta(table).is_none() {
+                return Ok(None);
+            }
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+            let mut cursor = source.row_id_cursor(table, row_id, source.snapshot())?;
+            while let Some(window) = cursor.next_window()? {
+                if window.value().lsn == lsn {
+                    return Ok(Some(window.value().clone()));
+                }
+            }
+            return Ok(None);
+        }
         Ok(self
             .relational_store
             .row_by_id_at_lsn_or_latest(table, row_id, lsn))
@@ -65184,7 +65458,9 @@ impl Database {
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Option<VersionedRow> {
-        self.relational_store.row_by_id(table, row_id, snapshot)
+        self.committed_row_at(table, row_id, snapshot)
+            .ok()
+            .flatten()
     }
 
     fn snapshot_before_lsn(&self, lsn: Lsn) -> SnapshotId {
