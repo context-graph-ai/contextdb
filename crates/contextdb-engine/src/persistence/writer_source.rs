@@ -112,13 +112,16 @@ impl WriterSnapshot {
     }
 
     pub(crate) fn captured_table_names(&self) -> Vec<String> {
-        self.schema
+        let mut names = self
+            .schema
             .get()
             .expect("writer scope admits its captured schema")
             .tables
             .keys()
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 }
 

@@ -19,6 +19,53 @@ impl Drop for WriterReadScope {
     }
 }
 impl Database {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn insert_relational_row_from_read(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        values: HashMap<ColName, Value>,
+        snapshot: SnapshotId,
+        created_at: Option<Wallclock>,
+    ) -> Result<RowId> {
+        if self.writer_read_root()?.is_none() {
+            return match created_at {
+                Some(created_at) => self
+                    .relational
+                    .insert_with_row_id_at(tx, table, row_id, values, snapshot, created_at),
+                None => self
+                    .relational
+                    .insert_with_row_id(tx, table, row_id, values, snapshot),
+            };
+        }
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let existing = if meta
+            .state_machine
+            .as_ref()
+            .is_some_and(|sm| matches!(values.get(&sm.column), Some(Value::Text(_))))
+        {
+            match values.get("id") {
+                Some(id @ Value::Uuid(_)) => {
+                    self.relational_point_with_tx(Some(tx), table, "id", id, snapshot)?
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.relational.insert_with_row_id_from_descriptor(
+            tx,
+            table,
+            row_id,
+            values,
+            &meta,
+            existing.as_ref(),
+            created_at,
+        )
+    }
     pub(super) fn scoped_writer_root(&self) -> Option<Arc<WriterSnapshot>> {
         ROOT.with(|slot| {
             slot.borrow()

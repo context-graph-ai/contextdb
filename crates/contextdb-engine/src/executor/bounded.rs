@@ -13449,8 +13449,13 @@ impl CursorExpiryWatch {
                         fallback.wait_until(remaining).await;
                     }),
                 ));
-                if let Some((_, fallback)) = wait.as_mut() {
-                    let _ = fallback.as_mut().poll(&mut context);
+                let fallback_ready = wait
+                    .as_mut()
+                    .is_some_and(|(_, fallback)| fallback.as_mut().poll(&mut context).is_ready());
+                if fallback_ready {
+                    let completed = wait.take();
+                    drop(wait);
+                    drop(completed);
                 }
             } else {
                 let completed = wait.take();

@@ -25697,12 +25697,13 @@ impl Database {
                 }
                 return Ok(inserted);
             }
-            let inserted = self.relational.insert_with_row_id(
+            let inserted = self.insert_relational_row_from_read(
                 tx,
                 table,
                 row_id,
                 values,
                 self.snapshot_for_read(),
+                None,
             )?;
             self.write_row_vectors_or_unstage(
                 tx,
@@ -25718,12 +25719,13 @@ impl Database {
         }
         let row_id = self.relational_store.new_row_id();
         self.assert_row_write_allowed(table, row_id, &values, self.snapshot_for_read())?;
-        let inserted = self.relational.insert_with_row_id(
+        let inserted = self.insert_relational_row_from_read(
             tx,
             table,
             row_id,
             values,
             self.snapshot_for_read(),
+            None,
         )?;
         self.write_row_vectors_or_unstage(tx, table, inserted, &row_vectors_source, staged_before)?;
         if let Some(key) = creation_key {
@@ -25765,12 +25767,13 @@ impl Database {
             Vec::new()
         };
         self.blank_quantized_vector_values(table, &mut values);
-        let inserted = self.relational.insert_with_row_id(
+        let inserted = self.insert_relational_row_from_read(
             tx,
             table,
             old_row_id,
             values,
             self.snapshot_for_read(),
+            None,
         )?;
         self.write_row_vectors(tx, inserted, row_vectors)?;
         Ok(inserted)
@@ -25786,8 +25789,7 @@ impl Database {
     ) -> Result<RowId> {
         self.validate_primary_key_values_present(table, &values)?;
         self.delete_relational_row_releasing_staged(tx, table, row_id)?;
-        self.relational
-            .insert_with_row_id(tx, table, row_id, values, snapshot)
+        self.insert_relational_row_from_read(tx, table, row_id, values, snapshot, None)
     }
 
     /// A relational delete discards a same-transaction insert before commit.
@@ -26183,12 +26185,15 @@ impl Database {
             "Reduce sync batch size or raise MEMORY_LIMIT before receiving rows.",
         )?;
         let inserted = match created_at {
-            Some(created_at) => self
-                .relational
-                .insert_with_row_id_at(tx, table, row_id, values, snapshot, created_at),
-            None => self
-                .relational
-                .insert_with_row_id(tx, table, row_id, values, snapshot),
+            Some(created_at) => self.insert_relational_row_from_read(
+                tx,
+                table,
+                row_id,
+                values,
+                snapshot,
+                Some(created_at),
+            ),
+            None => self.insert_relational_row_from_read(tx, table, row_id, values, snapshot, None),
         };
         match &inserted {
             Ok(row_id) => self.record_staged_row_admission(tx, table, *row_id, row_bytes),
@@ -34188,12 +34193,13 @@ impl Database {
                 let staged_before = self.staged_row_count(tx);
                 let mut values = values;
                 self.blank_quantized_vector_values(table, &mut values);
-                let inserted = self.relational.insert_with_row_id(
+                let inserted = self.insert_relational_row_from_read(
                     tx,
                     table,
                     row_id,
                     values,
                     self.snapshot_for_read(),
+                    None,
                 )?;
                 self.write_row_vectors_or_unstage(
                     tx,
@@ -34275,9 +34281,8 @@ impl Database {
             let staged_before = self.staged_row_count(tx);
             let mut values = values;
             self.blank_quantized_vector_values(table, &mut values);
-            let inserted = self
-                .relational
-                .insert_with_row_id(tx, table, row_id, values, snapshot)?;
+            let inserted =
+                self.insert_relational_row_from_read(tx, table, row_id, values, snapshot, None)?;
             self.write_row_vectors_or_unstage(
                 tx,
                 table,
@@ -34329,9 +34334,14 @@ impl Database {
         let row_vectors = self.row_vector_values(table, &values);
         let mut values = values;
         self.blank_quantized_vector_values(table, &mut values);
-        let replaced =
-            self.relational
-                .insert_with_row_id(tx, table, existing.row_id, values, snapshot)?;
+        let replaced = self.insert_relational_row_from_read(
+            tx,
+            table,
+            existing.row_id,
+            values,
+            snapshot,
+            None,
+        )?;
         self.write_row_vectors(tx, replaced, row_vectors)?;
 
         if let (Some(uuid), Some(state), Some(_meta)) =
@@ -39064,6 +39074,39 @@ impl Database {
                 || !self.edge_read_allowed(source, target, edge_type, snapshot)?)
         {
             return Ok(None);
+        }
+        if let Some(root) = self.writer_graph_root()? {
+            let mut cursor = root.cursor(contextdb_graph::source::GraphQuery {
+                node: source,
+                direction: Direction::Outgoing,
+                identity: Some((target, edge_type)),
+            })?;
+            let mut properties = None;
+            let mut output =
+                crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+            while let Some(window) = cursor.next_edge()? {
+                let edge = window.edge();
+                if edge.visible_at(snapshot) {
+                    let bytes = edge
+                        .properties
+                        .iter()
+                        .map(|(name, value)| {
+                            name.len()
+                                .saturating_add(value.estimated_bytes())
+                                .saturating_add(96)
+                        })
+                        .sum();
+                    output.try_grow_for(
+                        bytes,
+                        "writer_source",
+                        "edge_property_output",
+                        "Raise MEMORY_LIMIT to return edge properties.",
+                    )?;
+                    properties = Some(edge.properties.clone());
+                }
+            }
+            self.retain_writer_output(output);
+            return Ok(properties);
         }
         let props = self
             .graph_store
@@ -44646,28 +44689,16 @@ impl Database {
             crate::executor::BoundedExecutionError,
         >,
     ) -> std::result::Result<Option<VersionedRow>, crate::executor::BoundedExecutionError> {
-        // Measured before it is copied, so the charge precedes the
-        // allocation it pays for, exactly as it does for a committed row.
-        let measured = self
-            .tx_mgr
-            .with_write_set(tx, |ws| {
-                ws.relational_inserts
-                    .get(position)
-                    .map(|(_, row)| row.estimated_bytes())
-            })
-            .map_err(crate::executor::BoundedExecutionError::from)?;
-        let Some(bytes) = measured else {
-            return Ok(None);
-        };
-        before_touch()?;
-        before_clone(bytes)?;
         self.tx_mgr
             .with_write_set(tx, |ws| {
-                ws.relational_inserts
-                    .get(position)
-                    .map(|(_, row)| row.clone())
+                let Some((_, row)) = ws.relational_inserts.get(position) else {
+                    return Ok(None);
+                };
+                before_touch()?;
+                before_clone(row.estimated_bytes())?;
+                Ok(Some(row.clone()))
             })
-            .map_err(crate::executor::BoundedExecutionError::from)
+            .map_err(crate::executor::BoundedExecutionError::from)?
     }
 
     /// What an open transaction changes about the vectors one index can be

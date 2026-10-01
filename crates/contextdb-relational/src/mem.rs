@@ -2245,6 +2245,47 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         self.stage_insert_with_row_id_at(tx, table, row_id, values, created_at)
     }
 
+    /// Stage through the normal insertion owner using the caller's captured
+    /// schema and visible base-plus-overlay row, without a resident lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_with_row_id_from_descriptor(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        values: HashMap<ColName, Value>,
+        meta: &TableMeta,
+        existing: Option<&VersionedRow>,
+        created_at: Option<Wallclock>,
+    ) -> Result<RowId> {
+        self.ensure_table_exists(table)?;
+        if let Some(sm) = &meta.state_machine
+            && let Some(Value::Text(new_status)) = values.get(&sm.column)
+            && matches!(values.get("id"), Some(Value::Uuid(_)))
+            && let Some(existing) = existing
+        {
+            let old_status = existing
+                .values
+                .get(&sm.column)
+                .and_then(Value::as_text)
+                .unwrap_or("");
+            if !RelationalStore::validate_state_transition_for_meta(
+                meta, &sm.column, old_status, new_status,
+            ) {
+                return Err(Error::InvalidStateTransition(format!(
+                    "{old_status} -> {new_status}"
+                )));
+            }
+        }
+        self.stage_insert_with_row_id_at(
+            tx,
+            table,
+            row_id,
+            values,
+            created_at.unwrap_or_else(Wallclock::now),
+        )
+    }
+
     pub fn insert_with_row_id_assume_no_state_machine(
         &self,
         tx: TxId,

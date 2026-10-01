@@ -3182,12 +3182,23 @@ impl RelationalStore {
         self.table_meta
             .read()
             .get(table)
-            .and_then(|m| m.state_machine.as_ref())
+            .is_none_or(|meta| Self::validate_state_transition_for_meta(meta, column, from, to))
+    }
+
+    /// Validate against the metadata owned by the caller's committed image.
+    pub fn validate_state_transition_for_meta(
+        meta: &TableMeta,
+        column: &str,
+        from: &str,
+        to: &str,
+    ) -> bool {
+        meta.state_machine
+            .as_ref()
             .filter(|sm| sm.column == column)
             .is_none_or(|sm| {
                 sm.transitions
                     .get(from)
-                    .is_some_and(|targets| targets.iter().any(|t| t == to))
+                    .is_some_and(|targets| targets.iter().any(|target| target == to))
             })
     }
 
