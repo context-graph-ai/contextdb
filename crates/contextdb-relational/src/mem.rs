@@ -927,13 +927,26 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         row: &VersionedRow,
         position: usize,
     ) -> Result<()> {
-        let Some(admission) = &self.staged_posting_admission else {
+        if self.staged_posting_admission.is_none() {
             return Ok(());
-        };
+        }
         let meta = self.store.table_meta.read();
         let meta = meta
             .get(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        self.stage_ordered_row_from_descriptor(ws, table, row, position, meta)
+    }
+    pub fn stage_ordered_row_from_descriptor(
+        &self,
+        ws: &mut contextdb_tx::WriteSet,
+        table: &str,
+        row: &VersionedRow,
+        position: usize,
+        meta: &TableMeta,
+    ) -> Result<()> {
+        let Some(admission) = &self.staged_posting_admission else {
+            return Ok(());
+        };
         let scratch_bytes = meta.indexes.iter().fold(256usize, |bytes, index| {
             bytes.saturating_add(index.name.len()).saturating_add(
                 index
@@ -949,7 +962,15 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     .sum::<usize>(),
             )
         });
-        let _scratch = admission.reserve(scratch_bytes)?;
+        let _scratch = admission
+            .reserve(scratch_bytes.saturating_add(meta.estimated_bytes().saturating_mul(2)))?;
+        let schema_charge = admission.reserve(
+            contextdb_tx::ordered_staged::StagedSchema::bytes_for_meta(meta),
+        )?;
+        let schema = Arc::new(contextdb_tx::ordered_staged::StagedSchema::from_meta(
+            meta,
+            schema_charge,
+        ));
         let keys = meta
             .indexes
             .iter()
@@ -965,9 +986,13 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 )
             })
             .collect::<Vec<_>>();
-        let statement_row =
-            ws.ordered_staged_rows
-                .prepare_statement_row(table, row, &keys, |bytes| admission.reserve(bytes))?;
+        let statement_row = ws.ordered_staged_rows.prepare_statement_row(
+            table,
+            row,
+            &keys,
+            schema.clone(),
+            |bytes| admission.reserve(bytes),
+        )?;
         ws.ordered_staged_rows.stage(
             table,
             contextdb_tx::StagedPosition {
@@ -976,6 +1001,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 created_tx: row.created_tx,
             },
             &keys,
+            &schema,
             |bytes| admission.reserve(bytes),
         )?;
         ws.ordered_staged_rows
@@ -2265,7 +2291,6 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         existing: Option<&VersionedRow>,
         created_at: Option<Wallclock>,
     ) -> Result<RowId> {
-        self.ensure_table_exists(table)?;
         if let Some(sm) = &meta.state_machine
             && let Some(Value::Text(new_status)) = values.get(&sm.column)
             && matches!(values.get("id"), Some(Value::Uuid(_)))
@@ -2284,13 +2309,26 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 )));
             }
         }
-        self.stage_insert_with_row_id_at(
-            tx,
-            table,
+        let row = VersionedRow {
             row_id,
             values,
-            created_at.unwrap_or_else(Wallclock::now),
-        )
+            created_tx: tx,
+            deleted_tx: None,
+            lsn: Lsn(0),
+            created_at: Some(created_at.unwrap_or_else(Wallclock::now)),
+        };
+        self.tx_mgr.with_write_set(tx, |ws| {
+            self.stage_ordered_row_from_descriptor(
+                ws,
+                table,
+                &row,
+                ws.relational_inserts.len(),
+                meta,
+            )?;
+            ws.relational_inserts.push((table.to_owned(), row));
+            Ok::<_, Error>(())
+        })??;
+        Ok(row_id)
     }
 
     pub fn insert_with_row_id_assume_no_state_machine(

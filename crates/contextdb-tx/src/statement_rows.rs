@@ -11,6 +11,7 @@ struct RowOwner {
     row: VersionedRow,
     sequence: usize,
     keys: Vec<(String, IndexKey)>,
+    schema: Arc<crate::ordered_staged::StagedSchema>,
     _charge: Arc<dyn StagedPostingCharge>,
 }
 
@@ -83,11 +84,19 @@ impl PartialOrd for StatementIndexKey {
     }
 }
 
+pub struct PreparedStatementRemoval {
+    replacement: Option<Arc<StatementRows>>,
+}
+#[derive(Debug, Clone)]
+struct StatementIndex {
+    schema: Arc<crate::ordered_staged::StagedSchema>,
+    postings: BTreeMap<StatementIndexKey, RowId>,
+}
 #[derive(Debug, Clone, Default)]
 pub struct StatementRows {
     rows: BTreeMap<RowId, Arc<RowOwner>>,
     sequence: BTreeMap<usize, RowId>,
-    indexes: BTreeMap<String, BTreeMap<StatementIndexKey, RowId>>,
+    indexes: BTreeMap<String, StatementIndex>,
     next_sequence: usize,
     copy_charge: Option<Arc<dyn StagedPostingCharge>>,
     control_charge: Option<Arc<dyn StagedPostingCharge>>,
@@ -101,10 +110,33 @@ impl StatementRows {
     }
 
     pub fn retained_bytes(&self) -> usize {
+        // Each staged mutation owns one schema; index controls may outlive
+        // that row and share its reservation. Count those owners once without
+        // allocating scratch in this admission estimator.
+        let mut schema_bytes = self
+            .rows
+            .values()
+            .map(|owner| owner.schema.retained_bytes())
+            .sum::<usize>();
+        for (position, index) in self.indexes.values().enumerate() {
+            if !self
+                .rows
+                .values()
+                .any(|owner| Arc::ptr_eq(&owner.schema, &index.schema))
+                && !self
+                    .indexes
+                    .values()
+                    .take(position)
+                    .any(|prior| Arc::ptr_eq(&prior.schema, &index.schema))
+            {
+                schema_bytes = schema_bytes.saturating_add(index.schema.retained_bytes());
+            }
+        }
         self.rows
             .values()
             .map(|owner| owner._charge.retained_bytes())
             .sum::<usize>()
+            .saturating_add(schema_bytes)
             .saturating_add(
                 self.copy_charge
                     .as_ref()
@@ -136,10 +168,10 @@ impl StatementRows {
         let (sequence, row) = self.sequence.range((lower, Bound::Unbounded)).next()?;
         Some((*sequence, &self.rows.get(row)?.row))
     }
-    pub fn has_index(&self, index: &str) -> bool {
-        self.indexes
-            .get(index)
-            .is_some_and(|postings| postings.len() == self.rows.len())
+    pub fn has_index_for(&self, index: &str, meta: &contextdb_core::TableMeta) -> bool {
+        self.indexes.get(index).is_some_and(|postings| {
+            postings.postings.len() == self.rows.len() && postings.schema.matches_meta(meta, index)
+        })
     }
     pub fn next_ordered(
         &self,
@@ -168,7 +200,7 @@ impl StatementRows {
         end: &Bound<IndexKey>,
         prefix_len: usize,
     ) -> Option<(&(IndexKey, RowId), &VersionedRow)> {
-        let postings = self.indexes.get(index)?;
+        let postings = &self.indexes.get(index)?.postings;
         let endpoint = |bound: &Bound<IndexKey>, lower: bool| match bound {
             Bound::Unbounded => Bound::Unbounded,
             Bound::Included(key) | Bound::Excluded(key) => {
@@ -222,14 +254,7 @@ impl StatementRows {
                     bytes
                         .saturating_add(256)
                         .saturating_add(name.len())
-                        .saturating_add(
-                            key.iter()
-                                .map(|v| match v {
-                                    contextdb_core::DirectedValue::Asc(v) => v.0.estimated_bytes(),
-                                    contextdb_core::DirectedValue::Desc(v) => v.0.estimated_bytes(),
-                                })
-                                .sum::<usize>(),
-                        )
+                        .saturating_add(crate::ordered_staged::staged_key_bytes(key))
                 })
         })
     }
@@ -249,22 +274,14 @@ impl StatementRows {
         snapshot: &Arc<Self>,
         row: &VersionedRow,
         keys: &[(String, IndexKey)],
+        schema: Arc<crate::ordered_staged::StagedSchema>,
         mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
     ) -> Result<PreparedStatementRow> {
         let bytes = row.estimated_bytes().saturating_add(256).saturating_add(
             keys.iter()
                 .map(|(name, key)| {
                     name.len().saturating_add(256).saturating_add(
-                        key.iter()
-                            .map(|v| match v {
-                                contextdb_core::DirectedValue::Asc(v) => {
-                                    v.0.estimated_bytes().saturating_mul(3)
-                                }
-                                contextdb_core::DirectedValue::Desc(v) => {
-                                    v.0.estimated_bytes().saturating_mul(3)
-                                }
-                            })
-                            .sum::<usize>(),
+                        crate::ordered_staged::staged_key_bytes(key).saturating_mul(2),
                     )
                 })
                 .sum::<usize>(),
@@ -281,6 +298,7 @@ impl StatementRows {
                 row: row.clone(),
                 sequence: snapshot.next_sequence,
                 keys: keys.to_vec(),
+                schema,
                 _charge: charge,
             }),
             copy_charge,
@@ -303,9 +321,20 @@ impl StatementRows {
             .checked_add(1)
             .expect("staged sequence fits usize");
         for (name, key) in &owner.keys {
-            rows.indexes
+            let index = rows
+                .indexes
                 .entry(name.clone())
-                .or_default()
+                .or_insert_with(|| StatementIndex {
+                    schema: owner.schema.clone(),
+                    postings: BTreeMap::new(),
+                });
+            if !index.schema.matches_index(&owner.schema, name) {
+                index.postings.clear();
+                index.schema = owner.schema.clone();
+            }
+            index.schema = owner.schema.clone();
+            index
+                .postings
                 .insert(StatementIndexKey::Row((key.clone(), row_id)), row_id);
         }
         rows.sequence.insert(owner.sequence, row_id);
@@ -315,10 +344,43 @@ impl StatementRows {
         if let Some(owner) = self.rows.remove(&row) {
             self.sequence.remove(&owner.sequence);
             for (name, key) in &owner.keys {
-                if let Some(index) = self.indexes.get_mut(name) {
-                    index.remove(&StatementIndexKey::Row((key.clone(), row)));
+                if let Some(index) = self.indexes.get_mut(name)
+                    && index.schema.matches_index(&owner.schema, name)
+                {
+                    index
+                        .postings
+                        .remove(&StatementIndexKey::Row((key.clone(), row)));
                 }
             }
+        }
+        self.indexes.retain(|_, index| !index.postings.is_empty());
+    }
+    pub(crate) fn prepare_removal(snapshot: &Arc<Self>) -> Result<PreparedStatementRemoval> {
+        let replacement = if Arc::strong_count(snapshot) > 1 {
+            let Some(owner) = snapshot.rows.values().next() else {
+                return Ok(PreparedStatementRemoval { replacement: None });
+            };
+            let charge = owner._charge.reserve_copy(snapshot.control_bytes())?;
+            let mut next = (**snapshot).clone();
+            next.copy_charge = Some(charge);
+            Some(Arc::new(next))
+        } else {
+            None
+        };
+        Ok(PreparedStatementRemoval { replacement })
+    }
+    pub(crate) fn publish_removal(
+        snapshot: &mut Arc<Self>,
+        prepared: PreparedStatementRemoval,
+        rows: impl Iterator<Item = RowId>,
+    ) {
+        if let Some(replacement) = prepared.replacement {
+            *snapshot = replacement;
+        }
+        let private = Arc::get_mut(snapshot)
+            .expect("statement removals were prepared under the write-set mutex");
+        for row in rows {
+            private.remove_private(row);
         }
     }
     pub(crate) fn remove(snapshot: &mut Arc<Self>, row: RowId) -> Result<()> {

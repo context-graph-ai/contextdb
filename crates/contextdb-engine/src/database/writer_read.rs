@@ -527,6 +527,9 @@ impl Database {
         let key = index.map(|index| index_key_from_values(&index.columns[..columns.len()], values));
         self.tx_mgr.with_write_set(tx, |ws| {
             if let (Some(index), Some(key)) = (index, key.as_ref())
+                && ws
+                    .ordered_staged_rows
+                    .has_index_for(table, &index.name, &meta)
                 && let Some(cursor) = ws
                     .ordered_staged_rows
                     .prefix_cursor(table, &index.name, key)

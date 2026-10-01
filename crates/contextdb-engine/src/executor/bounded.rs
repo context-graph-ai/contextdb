@@ -4943,7 +4943,7 @@ impl ScanState {
                 .overlay
                 .staged_rows
                 .as_ref()
-                .is_some_and(|rows| rows.has_index(index))
+                .is_some_and(|rows| rows.has_index_for(index, &self.meta))
         {
             let (start, end, _) = cursor.source_run_bounds();
             let control = std::mem::size_of::<OrderedStatementPosition>()

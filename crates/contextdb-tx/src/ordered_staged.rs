@@ -1,5 +1,7 @@
 //! Incrementally maintained index order for admitted transaction rows.
-use contextdb_core::{DirectedValue, IndexKey, Result, RowId, TxId};
+use contextdb_core::{
+    ColumnType, DirectedValue, IndexDecl, IndexKey, Result, RowId, TableMeta, TxId, Value,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -18,6 +20,99 @@ pub trait StagedPostingCharge: Debug + Send + Sync {
     }
 }
 
+/// Exact admitted schema identity for a staged comparator domain.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct StagedSchema {
+    layout: Vec<(String, ColumnType)>,
+    indexes: Vec<IndexDecl>,
+    charge: Arc<dyn StagedPostingCharge>,
+}
+impl StagedSchema {
+    pub fn from_meta(meta: &TableMeta, charge: Arc<dyn StagedPostingCharge>) -> Self {
+        Self {
+            layout: meta
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.column_type.clone()))
+                .collect(),
+            indexes: meta.indexes.clone(),
+            charge,
+        }
+    }
+    pub fn matches_index(&self, other: &Self, index: &str) -> bool {
+        self.layout == other.layout
+            && self.indexes.iter().find(|i| i.name == index)
+                == other.indexes.iter().find(|i| i.name == index)
+    }
+    pub fn matches_meta(&self, meta: &TableMeta, index: &str) -> bool {
+        self.layout.len() == meta.columns.len()
+            && self
+                .layout
+                .iter()
+                .zip(&meta.columns)
+                .all(|((name, kind), c)| name == &c.name && kind == &c.column_type)
+            && self.indexes.iter().find(|i| i.name == index)
+                == meta.indexes.iter().find(|i| i.name == index)
+    }
+    pub fn bytes_for_meta(meta: &TableMeta) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                meta.columns
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, ColumnType)>()),
+            )
+            .saturating_add(
+                meta.columns
+                    .iter()
+                    .map(|c| c.name.capacity())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                meta.indexes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<IndexDecl>()),
+            )
+            .saturating_add(
+                meta.indexes
+                    .iter()
+                    .map(IndexDecl::estimated_bytes)
+                    .sum::<usize>(),
+            )
+    }
+    pub fn retained_bytes(&self) -> usize {
+        self.charge.retained_bytes()
+    }
+}
+
+/// Owned key slots plus scalar payload allocation, shared by posting/COW doors.
+#[doc(hidden)]
+pub fn staged_key_bytes(key: &IndexKey) -> usize {
+    key.iter().fold(
+        key.capacity()
+            .saturating_mul(std::mem::size_of::<DirectedValue>()),
+        |bytes, value| {
+            let value = match value {
+                DirectedValue::Asc(v) => &v.0,
+                DirectedValue::Desc(v) => &v.0,
+            };
+            let payload = match value {
+                Value::Text(text) => value
+                    .estimated_bytes()
+                    .saturating_add(text.capacity().saturating_sub(text.len())),
+                Value::Vector(items) => value.estimated_bytes().saturating_add(
+                    items
+                        .capacity()
+                        .saturating_sub(items.len())
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                ),
+                _ => value.estimated_bytes(),
+            };
+            bytes.saturating_add(payload)
+        },
+    )
+}
+
 pub type OrderedStagedBounds<'a> = (Bound<&'a (IndexKey, RowId)>, Bound<&'a (IndexKey, RowId)>);
 type RowCharges = BTreeMap<RowId, (usize, Arc<dyn StagedPostingCharge>)>;
 
@@ -32,6 +127,7 @@ pub struct StagedPosition {
 struct IndexPostings {
     ordered: BTreeMap<(IndexKey, RowId), StagedPosition>,
     latest: BTreeMap<RowId, IndexKey>,
+    schema: Option<Arc<StagedSchema>>,
 }
 
 /// Retained postings contain identities/positions only, never row payloads.
@@ -89,10 +185,11 @@ impl OrderedStagedRows {
         table: &str,
         row: &contextdb_core::VersionedRow,
         keys: &[(String, IndexKey)],
+        schema: Arc<StagedSchema>,
         mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
     ) -> Result<crate::statement_rows::PreparedStatementRow> {
         if let Some(snapshot) = self.statement_rows.get(table) {
-            return crate::StatementRows::prepare(snapshot, row, keys, reserve);
+            return crate::StatementRows::prepare(snapshot, row, keys, schema, reserve);
         }
         let charge = reserve(
             std::mem::size_of::<crate::StatementRows>()
@@ -100,7 +197,7 @@ impl OrderedStagedRows {
                 .saturating_add(192),
         )?;
         let snapshot = Arc::new(crate::StatementRows::with_control(charge));
-        let mut prepared = crate::StatementRows::prepare(&snapshot, row, keys, reserve)?;
+        let mut prepared = crate::StatementRows::prepare(&snapshot, row, keys, schema, reserve)?;
         prepared.new_table = Some(snapshot);
         Ok(prepared)
     }
@@ -125,18 +222,47 @@ impl OrderedStagedRows {
         }
         Ok(())
     }
-    fn key_bytes(key: &IndexKey) -> usize {
-        key.iter().fold(
-            key.capacity()
-                .saturating_mul(std::mem::size_of::<DirectedValue>()),
-            |bytes, value| {
-                let value = match value {
-                    DirectedValue::Asc(value) => &value.0,
-                    DirectedValue::Desc(value) => &value.0,
-                };
-                bytes.saturating_add(value.estimated_bytes())
-            },
-        )
+    pub fn has_index_for(&self, table: &str, index: &str, meta: &TableMeta) -> bool {
+        self.statement_rows
+            .get(table)
+            .is_some_and(|rows| rows.has_index_for(index, meta))
+    }
+    /// Prepare all table copies before publishing any removal.
+    pub fn prepare_statement_removals(
+        &self,
+        selected: &std::collections::BTreeSet<(String, RowId)>,
+    ) -> Result<Vec<(String, crate::statement_rows::PreparedStatementRemoval)>> {
+        let mut prepared = Vec::new();
+        for (table, snapshot) in &self.statement_rows {
+            if selected
+                .iter()
+                .any(|(name, row)| name == table && snapshot.contains(row))
+            {
+                prepared.push((
+                    table.clone(),
+                    crate::StatementRows::prepare_removal(snapshot)?,
+                ));
+            }
+        }
+        Ok(prepared)
+    }
+    pub fn publish_statement_removals(
+        &mut self,
+        prepared: Vec<(String, crate::statement_rows::PreparedStatementRemoval)>,
+        selected: &std::collections::BTreeSet<(String, RowId)>,
+    ) {
+        for (table, replacement) in prepared {
+            crate::StatementRows::publish_removal(
+                self.statement_rows
+                    .get_mut(&table)
+                    .expect("prepared statement table"),
+                replacement,
+                selected
+                    .iter()
+                    .filter(|(name, _)| name == &table)
+                    .map(|(_, row)| *row),
+            );
+        }
     }
 
     /// Input keys have already been projected under engine scratch admission.
@@ -148,6 +274,7 @@ impl OrderedStagedRows {
         table: &str,
         position: StagedPosition,
         keys: &[(String, IndexKey)],
+        schema: &Arc<StagedSchema>,
         mut reserve: F,
     ) -> Result<()>
     where
@@ -159,7 +286,7 @@ impl OrderedStagedRows {
                 bytes
                     .saturating_add(512)
                     .saturating_add(index.len())
-                    .saturating_add(Self::key_bytes(key).saturating_mul(2))
+                    .saturating_add(staged_key_bytes(key).saturating_mul(2))
             },
         );
         let charge = reserve(bytes)?;
@@ -171,6 +298,15 @@ impl OrderedStagedRows {
         }
         for (index, key) in keys {
             let postings = indexes.entry(index.clone()).or_default();
+            if postings
+                .schema
+                .as_ref()
+                .is_some_and(|old| !old.matches_index(schema, index))
+            {
+                postings.ordered.clear();
+                postings.latest.clear();
+            }
+            postings.schema = Some(schema.clone());
             postings.latest.insert(position.row_id, key.clone());
             postings
                 .ordered

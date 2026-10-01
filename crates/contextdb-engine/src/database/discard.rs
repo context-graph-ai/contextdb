@@ -176,10 +176,11 @@ impl Database {
         // Selection and every policy check have completed before changing the overlay.
         let mut removed = WriteSet::default();
         self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
-            for (table, row_id) in &selected_rows {
-                ws.ordered_staged_rows
-                    .remove_statement_row(table, *row_id)?;
-            }
+            let prepared = ws
+                .ordered_staged_rows
+                .prepare_statement_removals(&selected_rows)?;
+            ws.ordered_staged_rows
+                .publish_statement_removals(prepared, &selected_rows);
             // The admitted figure travels with the version it describes, so
             // the release below answers what storing the row took instead of
             // re-pricing it against the table's current shape.

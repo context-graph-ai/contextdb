@@ -25984,8 +25984,13 @@ impl Database {
             created_at: Some(context.created_at),
         };
         let (outcome, retired_charge) = self.tx_mgr.with_write_set(tx, |ws| {
-            self.relational
-                .stage_ordered_row(ws, table, &row, ws.relational_inserts.len())?;
+            self.relational.stage_ordered_row_from_descriptor(
+                ws,
+                table,
+                &row,
+                ws.relational_inserts.len(),
+                context.meta,
+            )?;
             let before = current_write_set_counts(ws);
             let retired_charge = ws
                 .relational_inserts
@@ -38146,10 +38151,13 @@ impl Database {
         if let Some(delta) = options.lookup_delta.as_deref_mut() {
             delta.add(table, &inserted);
         }
-        if let Err(error) =
-            self.relational
-                .stage_ordered_row(ws, table, &inserted, ws.relational_inserts.len())
-        {
+        if let Err(error) = self.relational.stage_ordered_row_from_descriptor(
+            ws,
+            table,
+            &inserted,
+            ws.relational_inserts.len(),
+            &meta,
+        ) {
             self.accountant.release(row_bytes);
             return Err(error);
         }
