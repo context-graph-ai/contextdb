@@ -389,11 +389,7 @@ impl Database {
                         erasure.publish();
                     }
                     // The enclosing commit still owns the matching writer fence.
-                    let publication_guard =
-                        std::mem::ManuallyDrop::new(AuthoritativePurgePublicationGuard {
-                            gate: read_gate,
-                        });
-                    publication_guard.invalidate_cursors();
+                    read_gate.invalidate_cursors();
                     relational_store.publish_prepared_received_schema(publication.relational);
                     *change_log.write() = publication.change_log;
                     *change_log_table_index.write() = publication.change_log_table_index;

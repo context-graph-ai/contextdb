@@ -1,6 +1,7 @@
 //! Immutable admitted statement views of staged table rows and index order.
 use crate::StagedPostingCharge;
 use contextdb_core::{IndexKey, Result, RowId, VersionedRow};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -19,11 +20,74 @@ pub struct PreparedStatementRow {
     copy_charge: Option<Arc<dyn StagedPostingCharge>>,
 }
 
+// Boundary probes sort before or after every full key sharing their logical
+// prefix. Only Row keys are stored; prefix keys are admitted query scratch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StatementIndexKey {
+    PrefixStart(IndexKey),
+    Row((IndexKey, RowId)),
+    PrefixEnd(IndexKey),
+}
+impl StatementIndexKey {
+    fn key(&self) -> &IndexKey {
+        match self {
+            Self::PrefixStart(key) | Self::PrefixEnd(key) => key,
+            Self::Row((key, _)) => key,
+        }
+    }
+    fn rank(&self) -> u8 {
+        match self {
+            Self::PrefixStart(_) => 0,
+            Self::Row(_) => 1,
+            Self::PrefixEnd(_) => 2,
+        }
+    }
+}
+impl Ord for StatementIndexKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let left = self.key();
+        let right = other.key();
+        let common = left.len().min(right.len());
+        let order = left[..common].cmp(&right[..common]);
+        if !order.is_eq() {
+            return order;
+        }
+        match left.len().cmp(&right.len()) {
+            Ordering::Less => {
+                if matches!(self, Self::PrefixEnd(_)) {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            Ordering::Greater => {
+                if matches!(other, Self::PrefixEnd(_)) {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            Ordering::Equal => self
+                .rank()
+                .cmp(&other.rank())
+                .then_with(|| match (self, other) {
+                    (Self::Row((_, left)), Self::Row((_, right))) => left.cmp(right),
+                    _ => Ordering::Equal,
+                }),
+        }
+    }
+}
+impl PartialOrd for StatementIndexKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StatementRows {
     rows: BTreeMap<RowId, Arc<RowOwner>>,
     sequence: BTreeMap<usize, RowId>,
-    indexes: BTreeMap<String, BTreeMap<(IndexKey, RowId), RowId>>,
+    indexes: BTreeMap<String, BTreeMap<StatementIndexKey, RowId>>,
     next_sequence: usize,
     copy_charge: Option<Arc<dyn StagedPostingCharge>>,
     control_charge: Option<Arc<dyn StagedPostingCharge>>,
@@ -73,7 +137,9 @@ impl StatementRows {
         Some((*sequence, &self.rows.get(row)?.row))
     }
     pub fn has_index(&self, index: &str) -> bool {
-        self.indexes.contains_key(index)
+        self.indexes
+            .get(index)
+            .is_some_and(|postings| postings.len() == self.rows.len())
     }
     pub fn next_ordered(
         &self,
@@ -81,14 +147,71 @@ impl StatementRows {
         reverse: bool,
         after: Option<&(IndexKey, RowId)>,
     ) -> Option<(&(IndexKey, RowId), &VersionedRow)> {
+        self.next_ordered_in_run(
+            index,
+            reverse,
+            after,
+            &Bound::Unbounded,
+            &Bound::Unbounded,
+            0,
+        )
+    }
+    /// Seek the same logical run as the committed cursor. The caller admits
+    /// endpoint copies before calling; no neighboring prefix is inspected.
+    #[allow(clippy::too_many_arguments)]
+    pub fn next_ordered_in_run(
+        &self,
+        index: &str,
+        reverse: bool,
+        after: Option<&(IndexKey, RowId)>,
+        start: &Bound<IndexKey>,
+        end: &Bound<IndexKey>,
+        prefix_len: usize,
+    ) -> Option<(&(IndexKey, RowId), &VersionedRow)> {
         let postings = self.indexes.get(index)?;
-        let edge = after.map_or(Bound::Unbounded, Bound::Excluded);
-        let entry = if reverse {
-            postings.range((Bound::Unbounded, edge)).next_back()
+        let endpoint = |bound: &Bound<IndexKey>, lower: bool| match bound {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(key) | Bound::Excluded(key) => {
+                let key = key[..prefix_len.min(key.len())].to_vec();
+                let before = matches!(bound, Bound::Included(_)) == lower;
+                Bound::Included(if before {
+                    StatementIndexKey::PrefixStart(key)
+                } else {
+                    StatementIndexKey::PrefixEnd(key)
+                })
+            }
+        };
+        let mut lower = endpoint(start, true);
+        let mut upper = endpoint(end, false);
+        if let Some(after) = after {
+            let after = Bound::Excluded(StatementIndexKey::Row(after.clone()));
+            if reverse {
+                upper = after;
+            } else {
+                lower = after;
+            }
+        }
+        fn key(bound: &Bound<StatementIndexKey>) -> Option<&StatementIndexKey> {
+            match bound {
+                Bound::Included(key) | Bound::Excluded(key) => Some(key),
+                Bound::Unbounded => None,
+            }
+        }
+        if let (Some(lower), Some(upper)) = (key(&lower), key(&upper))
+            && lower >= upper
+        {
+            return None;
+        }
+        let mut range = postings.range((lower, upper));
+        let (position, row) = if reverse {
+            range.next_back()
         } else {
-            postings.range((edge, Bound::Unbounded)).next()
+            range.next()
         }?;
-        Some((entry.0, &self.rows.get(entry.1)?.row))
+        let StatementIndexKey::Row(position) = position else {
+            unreachable!("only row keys are stored")
+        };
+        Some((position, &self.rows.get(row)?.row))
     }
     fn control_bytes(&self) -> usize {
         self.rows.values().fold(256usize, |bytes, owner| {
@@ -183,7 +306,7 @@ impl StatementRows {
             rows.indexes
                 .entry(name.clone())
                 .or_default()
-                .insert((key.clone(), row_id), row_id);
+                .insert(StatementIndexKey::Row((key.clone(), row_id)), row_id);
         }
         rows.sequence.insert(owner.sequence, row_id);
         rows.rows.insert(row_id, owner);
@@ -193,7 +316,7 @@ impl StatementRows {
             self.sequence.remove(&owner.sequence);
             for (name, key) in &owner.keys {
                 if let Some(index) = self.indexes.get_mut(name) {
-                    index.remove(&(key.clone(), row));
+                    index.remove(&StatementIndexKey::Row((key.clone(), row)));
                 }
             }
         }

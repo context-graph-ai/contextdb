@@ -1539,7 +1539,28 @@ fn ordered_merge_keys_capacity_bytes(
 
 /// The open transaction this scan is reading inside, and how far through its
 /// staged rows the scan has got.
-type OrderedStatementPosition = (String, bool, Option<(IndexKey, RowId)>);
+struct OrderedStatementPosition {
+    index: String,
+    cursor: BoundedOrderedRowCursor,
+    after: Option<(IndexKey, RowId)>,
+}
+
+fn staged_run_bound_bytes(bound: &Bound<IndexKey>) -> usize {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => key
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DirectedValue>())
+            .saturating_add(
+                key.iter()
+                    .map(|value| match value {
+                        DirectedValue::Asc(value) => value.0.estimated_bytes(),
+                        DirectedValue::Desc(value) => value.0.estimated_bytes(),
+                    })
+                    .sum::<usize>(),
+            ),
+        Bound::Unbounded => 0,
+    }
+}
 
 struct ScanTransactionOverlay {
     overlay: crate::executor::TransactionTableOverlay,
@@ -4761,20 +4782,44 @@ impl ScanState {
         };
         state.committed_exhausted = true;
         loop {
-            let staged = state.overlay.staged_rows.as_ref().and_then(|rows| {
-                if let Some((index, reverse, after)) = &state.ordered_staged {
-                    rows.next_ordered(index, *reverse, after.as_ref())
-                        .map(|(key, row)| (Some(key), None, row))
+            let staged = if let Some(rows) = state.overlay.staged_rows.as_ref() {
+                if let Some(ordered) = state.ordered_staged.as_mut() {
+                    loop {
+                        let (start, end, prefix_len) = ordered.cursor.source_run_bounds();
+                        let scratch = staged_run_bound_bytes(start)
+                            .saturating_add(staged_run_bound_bytes(end))
+                            .saturating_add(state.staged_key_bytes)
+                            .saturating_add(128);
+                        context.reserve(BoundedWorkSource::TableScan, scratch)?;
+                        let next = rows.next_ordered_in_run(
+                            &ordered.index,
+                            ordered.cursor.source_reverse(),
+                            ordered.after.as_ref(),
+                            start,
+                            end,
+                            prefix_len,
+                        );
+                        context.release(scratch)?;
+                        if let Some((key, row)) = next {
+                            break Some((Some(key), None, row));
+                        }
+                        ordered.after = None;
+                        if !ordered.cursor.source_finish_run() {
+                            break None;
+                        }
+                    }
                 } else {
                     rows.next_unordered(state.published)
                         .map(|(sequence, row)| (None, Some(sequence), row))
                 }
-            });
+            } else {
+                None
+            };
             let Some((key, sequence, staged)) = staged else {
                 let held = std::mem::take(&mut state.overlay.bytes);
+                state.ordered_staged = None;
                 context.release(held)?;
                 context.release(std::mem::take(&mut state.staged_key_bytes))?;
-                state.ordered_staged = None;
                 return Ok(None);
             };
             context.charge(BoundedWorkSource::TableScan, BoundedSourceTouch::TableRow)?;
@@ -4796,8 +4841,8 @@ impl ScanState {
                     )
                     .saturating_add(32);
                 context.reserve(BoundedWorkSource::TableScan, bytes)?;
-                if let Some((_, _, after)) = &mut state.ordered_staged {
-                    *after = Some(key.clone());
+                if let Some(ordered) = &mut state.ordered_staged {
+                    ordered.after = Some(key.clone());
                 }
                 context.release(state.staged_key_bytes)?;
                 state.staged_key_bytes = bytes;
@@ -4860,10 +4905,9 @@ impl ScanState {
         }
     }
 
-    /// Read the transaction's staged rows once and put them in this read's
-    /// order, so the walk below can fold them into the committed run. Each is
-    /// charged exactly as it is on the unordered route -- this only changes
-    /// WHEN they are read, not what they cost.
+    /// Keep one matching staged head in the committed cursor's run and order.
+    /// An index that does not cover every frozen row uses the admitted sorted
+    /// fallback, preserving rows staged before that index was declared.
     fn materialize_ordered_staged(
         &mut self,
         db: &dyn ReadExecutionTarget,
@@ -4901,7 +4945,19 @@ impl ScanState {
                 .as_ref()
                 .is_some_and(|rows| rows.has_index(index))
         {
-            transaction.ordered_staged = Some((index.to_owned(), cursor.source_reverse(), None));
+            let (start, end, _) = cursor.source_run_bounds();
+            let control = std::mem::size_of::<OrderedStatementPosition>()
+                .saturating_add(index.len())
+                .saturating_add(staged_run_bound_bytes(start))
+                .saturating_add(staged_run_bound_bytes(end))
+                .saturating_add(cursor.pending_run_bytes().saturating_mul(2));
+            context.reserve(BoundedWorkSource::TableScan, control)?;
+            transaction.overlay.bytes = transaction.overlay.bytes.saturating_add(control);
+            transaction.ordered_staged = Some(OrderedStatementPosition {
+                index: index.to_owned(),
+                cursor: cursor.clone(),
+                after: None,
+            });
             maintained_order = true;
         }
         let mut rows = Vec::new();
