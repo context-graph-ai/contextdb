@@ -50,3 +50,6 @@ mod bounded_route_graph_candidate_shortfall;
 mod bounded_user_table_named_dual;
 #[path = "bounded/composite_prefix_newest_row_examines_constant_entries.rs"]
 mod composite_prefix_newest_row_examines_constant_entries;
+
+#[path = "bounded/stream_resume_seeks_after_prefix_and_exclusive_ordinal.rs"]
+mod stream_resume_seeks_after_prefix_and_exclusive_ordinal;
