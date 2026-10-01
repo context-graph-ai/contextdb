@@ -148,6 +148,10 @@ pub(crate) struct WriterWindow<T> {
 }
 
 impl WriterSnapshot {
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn control_bytes(&self) -> usize {
+        self._control.bytes()
+    }
     pub(crate) fn storage_identity(&self) -> redb::StorageSnapshotIdentity {
         self.read.storage_snapshot_identity()
     }

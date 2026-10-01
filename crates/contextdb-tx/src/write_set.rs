@@ -130,7 +130,9 @@ impl WriteSet {
     }
 
     pub fn reassign_tx(&mut self, from: TxId, to: TxId) {
-        if self.finalized_tx == Some(from) { self.finalized_tx = Some(to); }
+        if self.finalized_tx == Some(from) {
+            self.finalized_tx = Some(to);
+        }
         if from == to {
             return;
         }
@@ -303,12 +305,41 @@ pub trait WriteSetApplicator: Send + Sync {
     /// Return the already prepared root after successful durable apply. All
     /// fallible reservation/root creation belongs to prepare/apply; a failure
     /// after durability must poison the writer, never report rollback.
+    /// Admit the successor root before a direct metadata persistence callback.
+    fn reserve_metadata_publication(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        Ok(None)
+    }
+    /// Durability has succeeded; failure must terminate serving, never roll back.
+    fn complete_metadata_publication(
+        &self,
+        _reservation: Option<Box<dyn std::any::Any + Send>>,
+        _snapshot: SnapshotId,
+        _lsn: Lsn,
+    ) {
+    }
+    fn publication_interrupted(&self) -> bool {
+        false
+    }
     fn publication_handle(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         None
     }
 }
 
 impl WriteSetApplicator for Box<dyn WriteSetApplicator> {
+    fn reserve_metadata_publication(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        (**self).reserve_metadata_publication()
+    }
+    fn complete_metadata_publication(
+        &self,
+        reservation: Option<Box<dyn std::any::Any + Send>>,
+        snapshot: SnapshotId,
+        lsn: Lsn,
+    ) {
+        (**self).complete_metadata_publication(reservation, snapshot, lsn);
+    }
+    fn publication_interrupted(&self) -> bool {
+        (**self).publication_interrupted()
+    }
     fn publication_handle(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         (**self).publication_handle()
     }

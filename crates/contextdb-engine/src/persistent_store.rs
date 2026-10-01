@@ -30,6 +30,9 @@ pub struct PersistentCompositeStore {
     trigger: Option<Arc<TriggerState>>,
     received_schema_stages: ReceivedSchemaStageRegistry,
     local_schema_stages: LocalSchemaStageRegistry,
+    prepared_publication:
+        parking_lot::Mutex<Option<Arc<crate::persistence::writer_source::WriterSnapshot>>>,
+    publication_interrupted: std::sync::atomic::AtomicBool,
 }
 
 impl PersistentCompositeStore {
@@ -48,6 +51,8 @@ impl PersistentCompositeStore {
             trigger,
             received_schema_stages,
             local_schema_stages,
+            prepared_publication: parking_lot::Mutex::new(None),
+            publication_interrupted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -240,7 +245,51 @@ impl PersistentCompositeStore {
     }
 }
 
+impl PersistentCompositeStore {
+    fn prepare_publication(
+        &self,
+        control: crate::memory_accounting::OwnedMemoryReservation,
+        snapshot: SnapshotId,
+        lsn: contextdb_core::Lsn,
+    ) {
+        let root = self
+            .persistence
+            .prepare_writer_snapshot(control, snapshot, lsn)
+            .unwrap_or_else(|error| {
+                self.publication_interrupted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                panic!("durable publication root preparation failed: {error}");
+            });
+        *self.prepared_publication.lock() = Some(root);
+    }
+}
 impl WriteSetApplicator for PersistentCompositeStore {
+    fn reserve_metadata_publication(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
+        Ok(Some(Box::new(self.persistence.reserve_writer_snapshot()?)))
+    }
+    fn complete_metadata_publication(
+        &self,
+        reservation: Option<Box<dyn std::any::Any + Send>>,
+        snapshot: SnapshotId,
+        lsn: contextdb_core::Lsn,
+    ) {
+        let control = *reservation
+            .expect("reserved metadata publication")
+            .downcast::<crate::memory_accounting::OwnedMemoryReservation>()
+            .unwrap_or_else(|_| panic!("invalid publication reservation"));
+        self.prepare_publication(control, snapshot, lsn);
+    }
+    fn publication_interrupted(&self) -> bool {
+        self.publication_interrupted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn publication_handle(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.prepared_publication
+            .lock()
+            .take()
+            .map(|root| root as Arc<dyn std::any::Any + Send + Sync>)
+    }
+
     fn apply(&self, ws: &WriteSet) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if FAIL_NEXT_LOCAL_APPLY.with(|armed| armed.replace(false)) {
@@ -251,7 +300,18 @@ impl WriteSetApplicator for PersistentCompositeStore {
         let registered_snapshots = self
             .inner
             .take_vector_partition_snapshot_stage(ws.commit_lsn);
-        self.apply_with_vector_reclamation(ws, HashSet::new(), registered_snapshots.as_deref())
+        let snapshot = SnapshotId::from_tx(ws.finalized_tx.ok_or_else(|| {
+            contextdb_core::Error::Other(
+                "durable commit has no finalized transaction identity".into(),
+            )
+        })?);
+        let lsn = ws.commit_lsn.ok_or_else(|| {
+            contextdb_core::Error::Other("durable commit has no finalized LSN".into())
+        })?;
+        let control = self.persistence.reserve_writer_snapshot()?;
+        self.apply_with_vector_reclamation(ws, HashSet::new(), registered_snapshots.as_deref())?;
+        self.prepare_publication(control, snapshot, lsn);
+        Ok(())
     }
 
     fn new_row_id(&self) -> RowId {

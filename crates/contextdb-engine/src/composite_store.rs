@@ -1338,9 +1338,14 @@ impl CompositeStore {
         // the moment this apply returns. Both exist once the commit is
         // durable, so the charge cannot refuse here -- the typed refusal
         // fires on the next admission, which is what a declared limit is for.
-        self.accountant.charge_retained(
-            change_log_retained_bytes(&log_entries).saturating_add(COMMIT_INDEX_ENTRY_BYTES),
-        );
+        self.accountant
+            .charge_retained(change_log_retained_bytes(&log_entries).saturating_add(
+                if self.relational.uses_disk_backed_committed_bodies() {
+                    0
+                } else {
+                    COMMIT_INDEX_ENTRY_BYTES
+                },
+            ));
         record_change_log_entries(
             &mut self.change_log_table_index.write(),
             &mut self.change_log_lsn_refcounts.write(),

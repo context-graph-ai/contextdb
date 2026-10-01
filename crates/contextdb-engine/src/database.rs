@@ -9280,6 +9280,7 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub pending_schema_stages: usize,
     pub named_owner_total: usize,
     pub reconciliation_gap: i64,
+    pub published_root_charge: usize,
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -20616,13 +20617,9 @@ impl Database {
         // A reopen re-charges what it rehydrates: the log and the commit
         // index the store loads are memory it holds from this moment, exactly
         // as the entries it appends later are.
-        accountant.charge_retained(
-            crate::composite_store::change_log_retained_bytes(&loaded_change_log).saturating_add(
-                commit_index
-                    .len()
-                    .saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES),
-            ),
-        );
+        accountant.charge_retained(crate::composite_store::change_log_retained_bytes(
+            &loaded_change_log,
+        ));
         let change_log = Arc::new(RwLock::new(loaded_change_log));
         let change_log_table_index = Arc::new(RwLock::new(initial_table_index));
         let change_log_lsn_refcounts = Arc::new(RwLock::new(initial_lsn_refcounts));
@@ -20658,12 +20655,15 @@ impl Database {
             local_schema_stages.clone(),
         );
         let store: DynStore = Box::new(persistent);
-        let tx_mgr = Arc::new(TransactionManager::new_with_counters_and_commit_index(
+        let initial_root =
+            persistence.initialize_writer_snapshot(SnapshotId::from_tx(max_tx), max_lsn)?;
+        let tx_mgr = Arc::new(TransactionManager::new_with_directory(
             store,
             TxId(max_tx.0.saturating_add(1)),
             Lsn(max_lsn.0.saturating_add(1)),
             max_tx,
-            commit_index,
+            persistence.clone(),
+            Some(initial_root),
         ));
         let blob_repository = BlobRepository::shared(persistence.clone());
 
@@ -30019,8 +30019,10 @@ impl Database {
         // This prepared path bypasses CompositeStore::apply_write_set, whose
         // ordinary path charges the commit-index entry alongside log entries.
         // The transaction manager still retains one entry for this commit.
-        self.accountant
-            .charge_retained(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES);
+        if self.persistence.is_none() {
+            self.accountant
+                .charge_retained(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES);
+        }
         self.relational_store
             .fetch_max_next_row_id(stage.next_row_id);
         stage.memory_swap.commit_after_swap();
@@ -35063,11 +35065,13 @@ impl Database {
             return 0;
         }
         crate::composite_store::change_log_retained_bytes(&self.change_log.read())
-            .saturating_add(
+            .saturating_add(if self.persistence.is_none() {
                 self.tx_mgr
                     .commit_index_len()
-                    .saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES),
-            )
+                    .saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES)
+            } else {
+                0
+            })
             .saturating_add(
                 self.persistence
                     .as_ref()
@@ -48874,6 +48878,7 @@ impl Database {
         );
         if self.resource_owner {
             self.resource_closed.store(true, Ordering::SeqCst);
+            self.tx_mgr.release_publication_handle();
             self.blob_repository.close();
             self.subscriptions.lock().subscribers.clear();
             if !event_bus_shutdown.deferred_resource_cleanup() {
@@ -48935,7 +48940,9 @@ impl Database {
     /// later operation; reopening recovers the complete committed state from
     /// the durable image.
     fn refuse_after_interrupted_publication(&self) -> Result<()> {
-        if self.publication_interrupted.load(Ordering::SeqCst) {
+        if self.publication_interrupted.load(Ordering::SeqCst)
+            || self.tx_mgr.store().publication_interrupted()
+        {
             return Err(Error::PublicationInterrupted);
         }
         Ok(())
@@ -49284,10 +49291,14 @@ impl Database {
                 receipt.change_log_charges[kind] +=
                     crate::composite_store::change_log_entry_retained_bytes(entry);
             }
-            receipt.commit_index_entries = self.tx_mgr.commit_index_prefix(Lsn(u64::MAX)).len();
-            receipt.commit_index_charge = receipt
-                .commit_index_entries
-                .saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES);
+            receipt.commit_index_entries = self.tx_mgr.commit_index_len();
+            receipt.commit_index_charge = if self.persistence.is_none() {
+                receipt
+                    .commit_index_entries
+                    .saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES)
+            } else {
+                0
+            };
             receipt.persistence_cache = self.persistence.as_ref().map_or(0, |p| p.cache_charge());
             (
                 receipt.current_membership_charge,
@@ -49308,7 +49319,14 @@ impl Database {
             receipt.pending_schema_stages = self.pending_local_schema_stages.lock().len()
                 + self.local_schema_stages.lock().len()
                 + self.received_schema_stages.lock().len();
-            receipt.named_owner_total = receipt.vector.retained_total
+            receipt.published_root_charge = self
+                .tx_mgr
+                .capture_published_read()
+                .handle
+                .and_then(|root| root.downcast::<crate::persistence::WriterSnapshot>().ok())
+                .map_or(0, |root| root.control_bytes());
+            receipt.named_owner_total = receipt.published_root_charge
+                + receipt.vector.retained_total
                 + receipt.vector.temporary_workspace
                 + receipt.current_row_values
                 + receipt.current_row_side_maps
@@ -51727,7 +51745,11 @@ impl Database {
     ) -> usize {
         let entries = self.change_log_since(since_lsn);
         crate::composite_store::change_log_retained_bytes(&entries).saturating_add(
-            crate::composite_store::COMMIT_INDEX_ENTRY_BYTES.saturating_mul(commits),
+            if self.persistence.is_none() {
+                crate::composite_store::COMMIT_INDEX_ENTRY_BYTES.saturating_mul(commits)
+            } else {
+                0
+            },
         )
     }
 
@@ -67721,6 +67743,20 @@ fn prune_expired_rows(
         scoped_commit_index_candidates(tx_mgr, &lsn_refcounts, &removed_lsn_counts, &affected_lsns)?
     };
 
+    // Capture candidate membership before the same durable transaction removes
+    // it. The file directory has no second resident map to remove afterward.
+    let durable_directory_removals = if persistence.is_some() {
+        commit_index_candidates
+            .iter()
+            .try_fold(0u64, |count, lsn| {
+                tx_mgr
+                    .try_commit_index_contains(*lsn)
+                    .map(|present| count + u64::from(present))
+            })?
+    } else {
+        0
+    };
+
     let generation_cleanup = prepare_retention_cleanup_generations(
         vector_store,
         persistence,
@@ -67768,11 +67804,15 @@ fn prune_expired_rows(
     // `scoped_commit_index_removal`'s own doc comment).
     let pruned_commit_index_entries = if commit_index_candidates.is_empty() {
         0
+    } else if persistence.is_some() {
+        durable_directory_removals
     } else {
-        let removed = tx_mgr.remove_commit_index_entries(&commit_index_candidates);
-        accountant.release(
-            (removed as usize).saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES),
-        );
+        let removed = tx_mgr.try_remove_commit_index_entries(&commit_index_candidates)?;
+        if persistence.is_none() {
+            accountant.release(
+                (removed as usize).saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES),
+            );
+        }
         removed
     };
 
@@ -68531,6 +68571,20 @@ fn compact_currency_versions_inner(
         scoped_commit_index_candidates(tx_mgr, &lsn_refcounts, &removed_lsn_counts, &affected_lsns)?
     };
 
+    // Capture candidate membership before the same durable transaction removes
+    // it. The file directory has no second resident map to remove afterward.
+    let durable_directory_removals = if persistence.is_some() {
+        commit_index_candidates
+            .iter()
+            .try_fold(0u64, |count, lsn| {
+                tx_mgr
+                    .try_commit_index_contains(*lsn)
+                    .map(|present| count + u64::from(present))
+            })?
+    } else {
+        0
+    };
+
     let generation_cleanup = prepare_cleanup_generations(
         vector_store,
         persistence,
@@ -68586,11 +68640,15 @@ fn compact_currency_versions_inner(
     // count is always 0 even though the in-memory index genuinely shrinks).
     let commit_index_keys_removed = if commit_index_candidates.is_empty() {
         0
+    } else if persistence.is_some() {
+        durable_directory_removals
     } else {
-        let removed = tx_mgr.remove_commit_index_entries(&commit_index_candidates);
-        accountant.release(
-            (removed as usize).saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES),
-        );
+        let removed = tx_mgr.try_remove_commit_index_entries(&commit_index_candidates)?;
+        if persistence.is_none() {
+            accountant.release(
+                (removed as usize).saturating_mul(crate::composite_store::COMMIT_INDEX_ENTRY_BYTES),
+            );
+        }
         removed
     };
     for (table, versions) in &pruned_versions_by_table {

@@ -287,6 +287,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             });
         }
 
+        // Prepare may replace the write set; the manager remains the identity authority.
+        ws.finalized_tx = Some(visibility_tx);
         if let Err(error) = self.store.apply(&ws) {
             self.next_lsn.store(lsn, Ordering::SeqCst);
             return Err(CommitFailure {
@@ -358,6 +360,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             });
         }
 
+        // Prepare may replace the write set; the manager remains the identity authority.
+        ws.finalized_tx = Some(visibility_tx);
         if let Err(error) = self.store.apply(&ws) {
             self.next_lsn.store(lsn, Ordering::SeqCst);
             return Err(CommitFailure {
@@ -400,7 +404,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             }
             let visibility_tx = self.visibility_tx_for_commit(tx, ws.visibility_floor);
             ws.reassign_tx(tx, visibility_tx);
-        ws.finalized_tx = Some(visibility_tx);
+            ws.finalized_tx = Some(visibility_tx);
             visibility_tx
         };
 
@@ -440,6 +444,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             });
         }
 
+        // Prepare may replace the write set; the manager remains the identity authority.
+        ws.finalized_tx = Some(visibility_tx);
         if let Err(error) = self.store.apply(&ws) {
             self.next_lsn.store(lsn, Ordering::SeqCst);
             return Err(CommitFailure {
@@ -554,6 +560,13 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         drop(prior);
     }
 
+    /// Release the writer's root after accepted reads have drained on close.
+    /// Outstanding readers retain their independent shared handle.
+    pub fn release_publication_handle(&self) {
+        let prior = self.published_read.lock().handle.take();
+        drop(prior);
+    }
+
     pub fn commit_directory_cursor(
         &self,
         lower: Bound<Lsn>,
@@ -658,9 +671,12 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn) -> Result<R>,
     {
         let _lock = self.lock_commit_boundary();
+        let publication = self.store.reserve_metadata_publication()?;
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         match f(lsn) {
             Ok(result) => {
+                self.store
+                    .complete_metadata_publication(publication, self.snapshot(), lsn);
                 self.publish_read_snapshot(lsn, None);
                 Ok(result)
             }
@@ -676,9 +692,12 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn) -> Result<Option<R>>,
     {
         let _lock = self.lock_commit_boundary();
+        let publication = self.store.reserve_metadata_publication()?;
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         match f(lsn) {
             Ok(Some(result)) => {
+                self.store
+                    .complete_metadata_publication(publication, self.snapshot(), lsn);
                 self.publish_read_snapshot(lsn, None);
                 Ok(Some(result))
             }
