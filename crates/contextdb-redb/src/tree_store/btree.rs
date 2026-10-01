@@ -842,6 +842,31 @@ impl<'a, K: Key + 'a, V: MutInPlaceValue + 'a> BtreeMut<'a, K, V> {
     }
 }
 
+impl<K: Key + 'static> BtreeMut<'_, K, &'static [u8]> {
+    /// Reserve an allocator-table value without building a value-sized heap buffer.
+    /// Anonymous zero pages are copied into the newly allocated B-tree page; the
+    /// returned guard gives the caller the page's own mutable destination.
+    pub(crate) fn insert_zeroed_reserve(
+        &mut self,
+        key: &K::SelfType<'_>,
+        value_length: usize,
+    ) -> Result<AccessGuardMutInPlace<'_, &'static [u8]>> {
+        let zeros = memmap2::MmapOptions::new()
+            .len(value_length)
+            .map_anon()
+            .map_err(crate::StorageError::Io)?;
+        let mut freed_pages = self.freed_pages.lock().unwrap();
+        let mut operation: MutateHelper<'_, '_, K, &'static [u8]> = MutateHelper::new(
+            &mut self.root,
+            self.mem.clone(),
+            freed_pages.as_mut(),
+            self.allocated_pages.clone(),
+        );
+        let (_, guard) = operation.insert(key, &&zeros[..])?;
+        Ok(guard)
+    }
+}
+
 pub(crate) struct RawBtree {
     mem: Arc<TransactionalMemory>,
     root: Option<BtreeHeader>,

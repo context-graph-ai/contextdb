@@ -64,8 +64,8 @@
 
 pub use db::{
     Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
-    ReadableDatabase, RepairSession, StorageBackend, TableDefinition, TableHandle,
-    UntypedMultimapTableHandle, UntypedTableHandle,
+    ReadableDatabase, RepairSession, ScratchBackend, StorageBackend, TableDefinition, TableHandle,
+    UntypedMultimapTableHandle, UntypedTableHandle, scratch_backend_in_directory,
 };
 pub use error::{
     CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,

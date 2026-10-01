@@ -1,6 +1,7 @@
-use crate::{DatabaseError, Result, StorageBackend};
+use crate::{DatabaseError, Result, ScratchBackend, StorageBackend, scratch_backend_in_directory};
 use std::fs::{File, TryLockError};
 use std::io;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "logging")]
 use log::warn;
@@ -16,12 +17,29 @@ use std::os::windows::fs::FileExt;
 pub struct FileBackend {
     lock_supported: bool,
     file: File,
+    scratch_directory: Option<PathBuf>,
 }
 
 impl FileBackend {
     /// Creates a new backend which stores data to the given file.
     pub fn new(file: File) -> Result<Self, DatabaseError> {
         Self::new_internal(file, false)
+    }
+
+    pub(crate) fn new_with_path(file: File, path: &Path) -> Result<Self, DatabaseError> {
+        let directory = path
+            .canonicalize()?
+            .parent()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "database file has no directory",
+                )
+            })?
+            .to_path_buf();
+        let mut backend = Self::new(file)?;
+        backend.scratch_directory = Some(directory);
+        Ok(backend)
     }
 
     pub(crate) fn new_internal(file: File, read_only: bool) -> Result<Self, DatabaseError> {
@@ -35,6 +53,7 @@ impl FileBackend {
             Ok(()) => Ok(Self {
                 file,
                 lock_supported: true,
+                scratch_directory: None,
             }),
             Err(TryLockError::WouldBlock) => Err(DatabaseError::DatabaseAlreadyOpen),
             Err(TryLockError::Error(err)) if err.kind() == io::ErrorKind::Unsupported => {
@@ -46,6 +65,7 @@ impl FileBackend {
                 Ok(Self {
                     file,
                     lock_supported: false,
+                    scratch_directory: None,
                 })
             }
             Err(TryLockError::Error(err)) => Err(err.into()),
@@ -54,6 +74,20 @@ impl FileBackend {
 }
 
 impl StorageBackend for FileBackend {
+    fn scratch_backend(&self) -> io::Result<Option<Box<dyn ScratchBackend>>> {
+        if let Some(directory) = &self.scratch_directory {
+            return scratch_backend_in_directory(directory).map(Some);
+        }
+        let path = path_from_file_handle(&self.file)?;
+        let directory = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "database file has no directory",
+            )
+        })?;
+        scratch_backend_in_directory(directory).map(Some)
+    }
+
     fn len(&self) -> Result<u64, io::Error> {
         Ok(self.file.metadata()?.len())
     }
@@ -117,6 +151,71 @@ impl StorageBackend for FileBackend {
 
         Ok(())
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn path_from_file_handle(file: &File) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(target_os = "macos")]
+fn path_from_file_handle(file: &File) -> io::Result<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    // F_GETPATH is the path of this open descriptor, including files opened
+    // through FileBackend::new(File) with no separate pathname argument.
+    let mut path = [0i8; 1024];
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = unsafe { CStr::from_ptr(path.as_ptr()) }.to_bytes();
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(windows)]
+fn path_from_file_handle(file: &File) -> io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(
+            handle: *mut std::ffi::c_void,
+            path: *mut u16,
+            length: u32,
+            flags: u32,
+        ) -> u32;
+    }
+    let handle = file.as_raw_handle();
+    let required = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0) };
+    if required == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut path = vec![0u16; required as usize + 1];
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, path.as_mut_ptr(), path.len() as u32, 0) };
+    if written == 0 || written as usize >= path.len() {
+        return Err(io::Error::last_os_error());
+    }
+    path.truncate(written as usize);
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&path)))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
+fn path_from_file_handle(_file: &File) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file-backed allocator scratch requires a path-based open on this platform",
+    ))
 }
 
 // TODO: replace these with wasi::FileExt when https://github.com/rust-lang/rust/issues/71213

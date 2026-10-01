@@ -52,6 +52,12 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
     /// Writes the specified array to the storage.
     fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
 
+    /// Create non-durable allocator scratch storage beside this backend's file.
+    /// Backends without a file may retain the in-memory allocator instead.
+    fn scratch_backend(&self) -> std::result::Result<Option<Box<dyn ScratchBackend>>, io::Error> {
+        Ok(None)
+    }
+
     /// Release any resources held by the backend
     ///
     /// Note: redb will not access the backend after calling this method and will call it exactly
@@ -59,6 +65,54 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
     fn close(&self) -> std::result::Result<(), io::Error> {
         Ok(())
     }
+}
+
+/// Seekable, non-durable backing for allocator working state. Its contents are
+/// discarded when the database closes or reopens; committed system tables stay
+/// the durable authority.
+#[allow(clippy::len_without_is_empty)]
+pub trait ScratchBackend: Debug + Send + Sync {
+    fn len(&self) -> io::Result<u64>;
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()>;
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()>;
+    fn set_len(&self, len: u64) -> io::Result<()>;
+}
+
+/// Create an allocator scratch file in the database file's directory.
+/// The directory entry is removed immediately. An open handle keeps the
+/// scratch usable, and process death cannot leave a named orphan behind.
+pub fn scratch_backend_in_directory(directory: &Path) -> io::Result<Box<dyn ScratchBackend>> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct TemporaryScratch(Mutex<std::fs::File>);
+
+    impl ScratchBackend for TemporaryScratch {
+        fn len(&self) -> io::Result<u64> {
+            Ok(self.0.lock().unwrap().metadata()?.len())
+        }
+
+        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+            let mut file = self.0.lock().unwrap();
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(out)
+        }
+
+        fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+            let mut file = self.0.lock().unwrap();
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(data)
+        }
+
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            self.0.lock().unwrap().set_len(len)
+        }
+    }
+
+    Ok(Box::new(TemporaryScratch(Mutex::new(
+        tempfile::tempfile_in(directory)?,
+    ))))
 }
 
 pub trait TableHandle: Sealed {
@@ -577,6 +631,17 @@ impl ReadableDatabase for Database {
 }
 
 impl Database {
+    /// Upper bound on the allocator's resident heap owner. Paged file
+    /// backends have a fixed envelope regardless of durable region count.
+    pub fn allocator_resident_bytes(&self) -> usize {
+        self.mem.allocator_resident_bytes()
+    }
+
+    /// Return `(loaded_regions, total_regions)` for allocator state.
+    pub fn allocator_region_counts(&self) -> (usize, usize) {
+        self.mem.allocator_region_counts()
+    }
+
     /// Opens the specified file as a redb database.
     /// * if the file does not exist, or is an empty file, a new database will be initialized in it
     /// * if the file is a valid redb database, it will be opened
@@ -630,9 +695,17 @@ impl Database {
     /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
     /// alive when this method is called.
     pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
-        let allocator_hash = self.mem.allocator_hash();
+        if Arc::strong_count(&self.mem) != 1 {
+            return Err(DatabaseError::TransactionInProgress);
+        }
+        // The lazy allocator source holds a weak reference to this memory.
+        // Materialize it before Arc::get_mut, which requires no weak owners.
+        self.mem.materialize_allocator_source()?;
         let mem = Arc::get_mut(&mut self.mem).ok_or(DatabaseError::TransactionInProgress)?;
         let mut was_clean = mem.clear_cache_and_reload()?;
+        // The committed header may be smaller than a free tail left by an
+        // aborted write. Compare allocator states at committed geometry.
+        let allocator_hash = self.mem.allocator_hash();
 
         let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
 
@@ -1190,7 +1263,12 @@ impl Database {
             info!("Found valid allocator state, full repair not needed");
             mem.load_allocator_state(&tree)?;
             #[cfg(debug_assertions)]
-            Self::mark_allocated_page_for_debug(&mut mem)?;
+            // Unit tests exercise the legacy exact-extent debug inventory.
+            // Normal file-backed writers keep that inventory empty so it
+            // cannot grow with the durable page count.
+            if cfg!(test) || !mem.uses_paged_allocator() {
+                Self::mark_allocated_page_for_debug(&mut mem)?;
+            }
         } else {
             #[cfg(feature = "logging")]
             warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
@@ -1545,6 +1623,7 @@ impl Builder {
     /// * if the file is a valid redb database, it will be opened
     /// * otherwise this function will return an error
     pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
+        let path = path.as_ref();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1553,7 +1632,7 @@ impl Builder {
             .open(path)?;
 
         Database::new(
-            Box::new(FileBackend::new(file)?),
+            Box::new(FileBackend::new_with_path(file, path)?),
             true,
             self.page_size,
             self.region_size,
@@ -1566,10 +1645,11 @@ impl Builder {
 
     /// Opens an existing redb database.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
+        let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         Database::new(
-            Box::new(FileBackend::new(file)?),
+            Box::new(FileBackend::new_with_path(file, path)?),
             false,
             self.page_size,
             None,

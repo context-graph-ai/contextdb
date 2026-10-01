@@ -1583,7 +1583,7 @@ impl WriteTransaction {
             crate::commit_work::observe_commit_span_count();
             crate::commit_work::observe_commit_span(
                 crate::commit_work::CommitSpan::FlushAndClose,
-                span_started.elapsed().as_nanos() as u64,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
             span_started = std::time::Instant::now();
         }
@@ -1602,7 +1602,7 @@ impl WriteTransaction {
         #[cfg(feature = "test-seams")]
         crate::commit_work::observe_commit_span(
             crate::commit_work::CommitSpan::StorePageLists,
-            span_started.elapsed().as_nanos() as u64,
+            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
 
         #[cfg(feature = "logging")]
@@ -1771,7 +1771,7 @@ impl WriteTransaction {
         {
             crate::commit_work::observe_commit_span(
                 crate::commit_work::CommitSpan::ProcessFreedPages,
-                span_started.elapsed().as_nanos() as u64,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
             span_started = std::time::Instant::now();
         }
@@ -1779,9 +1779,17 @@ impl WriteTransaction {
         let mut system_tables = self.system_tables.lock().unwrap();
         let system_freed_pages = system_tables.system_freed_pages();
         let system_tree = system_tables.table_tree.flush_table_root_updates()?;
-        system_tree
-            .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
-            .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
+        let retire_saved_allocator = if self.quick_repair {
+            self.mem.materialize_allocator_source()?;
+            true
+        } else {
+            self.mem.materialize_small_allocator_source()?
+        };
+        if retire_saved_allocator {
+            system_tree
+                .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+                .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
+        }
 
         if self.quick_repair {
             system_tree.create_table_and_flush_table_root(
@@ -1827,7 +1835,7 @@ impl WriteTransaction {
         {
             crate::commit_work::observe_commit_span(
                 crate::commit_work::CommitSpan::SystemTree,
-                span_started.elapsed().as_nanos() as u64,
+                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
             span_started = std::time::Instant::now();
         }
@@ -1842,7 +1850,7 @@ impl WriteTransaction {
         #[cfg(feature = "test-seams")]
         crate::commit_work::observe_commit_span(
             crate::commit_work::CommitSpan::StorageCommit,
-            span_started.elapsed().as_nanos() as u64,
+            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
 
         // Mark any pending non-durable commits as fully committed.
@@ -1922,6 +1930,9 @@ impl WriteTransaction {
     // Relocate pages to lower number regions/pages
     // Returns true if a page(s) was moved
     pub(crate) fn compact_pages(&mut self) -> Result<bool> {
+        // Relocation can replace the allocator-state tree's source pages. Copy
+        // its lazy bitmap words to scratch before those pages become reusable.
+        self.mem.materialize_allocator_source()?;
         let mut progress = false;
 
         // Find the 1M highest pages
@@ -2033,6 +2044,7 @@ impl WriteTransaction {
         maximum: usize,
         admit: &mut impl FnMut(usize) -> std::io::Result<()>,
     ) -> Result<CompactionProgress> {
+        self.mem.materialize_allocator_source()?;
         let mut tables = self.tables.lock().unwrap();
         let mut system_tables = self.system_tables.lock().unwrap();
         let tree = if cursor.phase < 2 {
