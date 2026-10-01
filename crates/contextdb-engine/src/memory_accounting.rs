@@ -1442,3 +1442,92 @@ mod tests {
         );
     }
 }
+
+/// Fork allocator ownership is independent of the redb page cache. The fork
+/// must obtain this admission before opening/growing allocator metadata and
+/// report actual capacities, including overlapping resize copies. Naming a
+/// charge does not itself supply a structural allocator residency bound.
+#[derive(Debug)]
+#[allow(dead_code)] // Admission seam awaiting the fork allocator capacity oracle.
+pub(crate) struct RedbAllocatorStateCharge {
+    reservation: OwnedMemoryReservation,
+    pub(crate) resident_bytes: usize,
+    pub(crate) resize_copy_bytes: usize,
+    pub(crate) region_bookkeeping_bytes: usize,
+}
+
+#[allow(dead_code)] // Consumed by the separately owned fork integration.
+impl RedbAllocatorStateCharge {
+    pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {
+        Self {
+            reservation: OwnedMemoryReservation::new(accountant),
+            resident_bytes: 0,
+            resize_copy_bytes: 0,
+            region_bookkeeping_bytes: 0,
+        }
+    }
+
+    /// The caller supplies capacities from the allocator, never file size or
+    /// logical page counts. Growth refuses before the corresponding allocation;
+    /// shrinking follows release of the old allocation.
+    pub(crate) fn resize(
+        &mut self,
+        resident_bytes: usize,
+        resize_copy_bytes: usize,
+        region_bookkeeping_bytes: usize,
+    ) -> contextdb_core::Result<()> {
+        let next = resident_bytes
+            .checked_add(resize_copy_bytes)
+            .and_then(|bytes| bytes.checked_add(region_bookkeeping_bytes))
+            .ok_or_else(|| contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem: "redb".into(),
+                operation: "redb_allocator_state".into(),
+                requested_bytes: usize::MAX,
+                available_bytes: 0,
+                budget_limit_bytes: usize::MAX,
+                hint: "Allocator capacity accounting overflowed.".into(),
+            })?;
+        let held = self.reservation.bytes();
+        if next > held {
+            self.reservation.try_grow_for(
+                next - held,
+                "redb",
+                "redb_allocator_state",
+                "Raise MEMORY_LIMIT to admit redb allocator metadata.",
+            )?;
+        } else {
+            self.reservation.try_shrink(held - next)?;
+        }
+        self.resident_bytes = resident_bytes;
+        self.resize_copy_bytes = resize_copy_bytes;
+        self.region_bookkeeping_bytes = region_bookkeeping_bytes;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod redb_allocator_state_tests {
+    use super::*;
+
+    #[test]
+    fn allocator_capacity_owner_keeps_prior_charge_when_growth_refuses() {
+        let accountant = Arc::new(MemoryAccountant::with_budget(128));
+        let mut owner = RedbAllocatorStateCharge::new(Arc::clone(&accountant));
+        owner.resize(32, 16, 8).unwrap();
+        assert_eq!(accountant.usage().used, 56);
+        assert!(owner.resize(64, 128, 8).is_err());
+        assert_eq!(accountant.usage().used, 56);
+        assert_eq!(
+            (
+                owner.resident_bytes,
+                owner.resize_copy_bytes,
+                owner.region_bookkeeping_bytes
+            ),
+            (32, 16, 8)
+        );
+        owner.resize(32, 0, 8).unwrap();
+        assert_eq!(accountant.usage().used, 40);
+        drop(owner);
+        assert_eq!(accountant.usage().used, 0);
+    }
+}
