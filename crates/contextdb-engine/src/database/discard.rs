@@ -175,7 +175,11 @@ impl Database {
         }
         // Selection and every policy check have completed before changing the overlay.
         let mut removed = WriteSet::default();
-        self.tx_mgr.with_write_set(tx, |ws| {
+        self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
+            for (table, row_id) in &selected_rows {
+                ws.ordered_staged_rows
+                    .remove_statement_row(table, *row_id)?;
+            }
             // The admitted figure travels with the version it describes, so
             // the release below answers what storing the row took instead of
             // re-pricing it against the table's current shape.
@@ -222,7 +226,9 @@ impl Database {
                 ws.relational_deletes
                     .push((selection.table.clone(), selection.local_row_id, tx));
             }
-        })?;
+            ws.rebind_ordered_staged_rows();
+            Ok(())
+        })??;
         self.release_insert_allocations(&removed);
         result.rows_affected = selected_rows.len() as u64;
         let mut pending = self.pending_commit_metadata.lock();
@@ -249,6 +255,7 @@ impl Database {
         selections: &[AuthoritativePurgeSelection],
         token: event_bus::AuthoritativePurgeQueueMutationToken,
         guard: &crate::blob_repository::BlobExclusiveHashSetGuard,
+        read_publication: &AuthoritativePurgePublicationGuard,
     ) -> Result<CommitStageRegistration<Stage>> {
         let lsn = ws
             .commit_lsn
@@ -341,6 +348,18 @@ impl Database {
                 lineage.records.remove(&owner.lifecycle_record_key);
             }
         }
+        let erased_tables = selections
+            .iter()
+            .map(|selection| selection.table.clone())
+            .collect::<BTreeSet<_>>();
+        let writer_erasure = self
+            .persistence
+            .as_ref()
+            .map(|persistence| {
+                persistence.prepare_writer_erasure(&erased_tables, &durable.graph_entries)
+            })
+            .transpose()?;
+        let read_gate = read_publication.gate.clone();
         let publication = prepared.publication_replacements;
         let mut memory = PreparedMemorySwap::prepare(
             self.accountant.clone(),
@@ -366,6 +385,15 @@ impl Database {
                 durable,
                 _vector_workspace: vector_workspace,
                 publish: Box::new(move || {
+                    if let Some(erasure) = writer_erasure {
+                        erasure.publish();
+                    }
+                    // The enclosing commit still owns the matching writer fence.
+                    let publication_guard =
+                        std::mem::ManuallyDrop::new(AuthoritativePurgePublicationGuard {
+                            gate: read_gate,
+                        });
+                    publication_guard.invalidate_cursors();
                     relational_store.publish_prepared_received_schema(publication.relational);
                     *change_log.write() = publication.change_log;
                     *change_log_table_index.write() = publication.change_log_table_index;

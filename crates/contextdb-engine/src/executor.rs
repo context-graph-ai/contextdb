@@ -214,13 +214,11 @@ pub(crate) struct TransactionTableOverlay {
     pub(crate) deleted: std::collections::HashSet<RowId>,
     /// Deletions the transaction staged by value rather than by identity.
     pub(crate) delete_predicates: Vec<contextdb_tx::RelationalDeletePredicate>,
-    /// Where this table's staged rows sit in the transaction's write set,
-    /// newest version per row, in the order the transaction staged them.
-    pub(crate) staged_positions: Vec<usize>,
-    /// The identities of those staged rows, so a committed row the
-    /// transaction has rewritten is passed over and its staged version
-    /// published instead.
-    pub(crate) staged_identities: std::collections::HashSet<RowId>,
+    /// Immutable table-scoped row versions and maintained index order.
+    /// Capturing a statement clones the owner; later write-set mutations
+    /// reserve their replacement controls before detaching from it.
+    pub(crate) staged_rows: Option<Arc<contextdb_tx::StatementRows>>,
+    pub(crate) _memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
     /// What holding the above costs.
     pub(crate) bytes: usize,
 }
@@ -231,7 +229,7 @@ impl TransactionTableOverlay {
     pub(crate) fn is_empty(&self) -> bool {
         self.deleted.is_empty()
             && self.delete_predicates.is_empty()
-            && self.staged_positions.is_empty()
+            && self.staged_rows.as_ref().is_none_or(|rows| rows.is_empty())
     }
 }
 
@@ -449,32 +447,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     fn transaction_table_overlay(&self, tx: TxId, table: &str) -> Result<TransactionTableOverlay> {
         let _ = (tx, table);
         Ok(TransactionTableOverlay::default())
-    }
-
-    /// One row the transaction has staged, cloned under the caller's charge,
-    /// exactly as a committed row is. `position` is an entry of
-    /// [`TransactionTableOverlay::staged_positions`].
-    fn transaction_ordered_staged_positions(
-        &self,
-        tx: TxId,
-        table: &str,
-        index: &str,
-        reverse: bool,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-    ) -> std::result::Result<Option<Vec<usize>>, BoundedExecutionError> {
-        let _ = (tx, table, index, reverse, before_clone);
-        Ok(None)
-    }
-
-    fn transaction_staged_row(
-        &self,
-        tx: TxId,
-        position: usize,
-        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
-        let _ = (tx, position, before_touch, before_clone);
-        Ok(None)
     }
 
     /// What that transaction changes about the vectors one index can be
@@ -1396,34 +1368,6 @@ impl ReadExecutionTarget for Database {
 
     fn transaction_table_overlay(&self, tx: TxId, table: &str) -> Result<TransactionTableOverlay> {
         Database::transaction_table_overlay(self, tx, table)
-    }
-
-    fn transaction_ordered_staged_positions(
-        &self,
-        tx: TxId,
-        table: &str,
-        index: &str,
-        reverse: bool,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-    ) -> std::result::Result<Option<Vec<usize>>, BoundedExecutionError> {
-        Database::transaction_ordered_staged_positions(
-            self,
-            tx,
-            table,
-            index,
-            reverse,
-            before_clone,
-        )
-    }
-
-    fn transaction_staged_row(
-        &self,
-        tx: TxId,
-        position: usize,
-        before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
-    ) -> std::result::Result<Option<VersionedRow>, BoundedExecutionError> {
-        Database::transaction_staged_row(self, tx, position, before_touch, before_clone)
     }
 
     fn transaction_vector_overlay(

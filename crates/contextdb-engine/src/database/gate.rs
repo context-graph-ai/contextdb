@@ -1040,30 +1040,9 @@ impl Database {
         // withdrew, dropped by the identity they were granted under.
         let mut staged_grants = Vec::new();
         let mut withdrawn = HashSet::new();
-        for position in &overlay.staged_positions {
-            let measured = self
-                .tx_mgr
-                .with_write_set(tx, |ws| {
-                    ws.relational_inserts
-                        .get(*position)
-                        .map(|(_, row)| row.estimated_bytes())
-                })
-                .map_err(E::from)?;
-            let Some(bytes) = measured else {
-                continue;
-            };
-            before_access_row(bytes)?;
-            let staged = self
-                .tx_mgr
-                .with_write_set(tx, |ws| {
-                    ws.relational_inserts
-                        .get(*position)
-                        .map(|(_, row)| row.clone())
-                })
-                .map_err(E::from)?;
-            if let Some(staged) = staged {
-                staged_grants.push(staged);
-            }
+        for staged in overlay.staged_rows.iter().flat_map(|rows| rows.rows()) {
+            before_access_row(staged.estimated_bytes())?;
+            staged_grants.push(staged.clone());
         }
         for row_id in &overlay.deleted {
             let withdrawn_grant = {

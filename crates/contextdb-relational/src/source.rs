@@ -47,6 +47,9 @@ pub trait RelationalPositionKey: Send {
 /// WriterSnapshot; this interface has no publication or root-capture door.
 pub trait RelationalReadSource: Send + Sync {
     fn snapshot(&self) -> SnapshotId;
+    fn validate_table(&self, _table: &str) -> Result<()> {
+        Ok(())
+    }
     fn lsn(&self) -> Lsn;
     fn row_cursor(
         &self,

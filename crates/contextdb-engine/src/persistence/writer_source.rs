@@ -37,89 +37,25 @@ pub(crate) struct WriterSnapshot {
     accountant: Arc<MemoryAccountant>,
     _control: OwnedMemoryReservation,
     erasure: parking_lot::RwLock<WriterErasure>,
-    schema: std::sync::OnceLock<WriterSchema>,
+    schema: Arc<WriterSchema>,
     registry: Arc<parking_lot::Mutex<Vec<std::sync::Weak<WriterSnapshot>>>>,
 }
 
-/// Schema is resolved from this exact native image, outside publication locks.
-/// Racing preparers keep their own admission until the losing copy is dropped.
-struct WriterSchema {
+/// An immutable schema owner, admitted before its durable publication.
+/// Data commits share it; schema writes build a replacement from their exact
+/// prepared mutation, without consulting a newer catalog during capture.
+pub(crate) struct WriterSchema {
     tables: HashMap<String, TableMeta>,
     _memory: OwnedMemoryReservation,
 }
 
 impl WriterSnapshot {
-    pub(crate) fn ensure_schema(&self) -> Result<()> {
-        if self.schema.get().is_some() {
-            return Ok(());
-        }
-        let table = match self.read.open_table(META_TABLE) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                let schema = WriterSchema {
-                    tables: HashMap::new(),
-                    _memory: self.adapter_control(std::mem::size_of::<WriterSchema>())?,
-                };
-                let _ = self.schema.set(schema);
-                return Ok(());
-            }
-            Err(error) => return Err(RedbPersistence::storage_error(error)),
-        };
-        let mut memory = self.adapter_control(std::mem::size_of::<WriterSchema>())?;
-        let mut tables = HashMap::new();
-        for entry in table
-            .range("table:".."table;")
-            .map_err(RedbPersistence::storage_error)?
-        {
-            let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
-            let name = key
-                .value()
-                .strip_prefix("table:")
-                .ok_or_else(|| Error::Other("invalid schema key".into()))?;
-            // Bound decode allocations before deserializing, then reconcile the
-            // retained descriptor. No row, posting or history bodies are loaded.
-            let scratch =
-                self.adapter_control(value.value().len().saturating_mul(16).saturating_add(4096))?;
-            let (meta, legacy) = RedbPersistence::decode_table_meta_versioned(value.value())?;
-            if legacy {
-                return Err(Error::Other("unsupported table metadata layout".into()));
-            }
-            memory.try_grow_for(
-                name.len()
-                    .saturating_add(meta.estimated_bytes())
-                    .saturating_add(192),
-                "writer_source",
-                "captured_schema",
-                HINT,
-            )?;
-            tables.insert(name.to_owned(), meta);
-            drop(scratch);
-        }
-        let _ = self.schema.set(WriterSchema {
-            tables,
-            _memory: memory,
-        });
-        Ok(())
-    }
-
     pub(crate) fn captured_table_meta(&self, table: &str) -> Option<TableMeta> {
-        self.schema
-            .get()
-            .expect("writer scope admits its captured schema")
-            .tables
-            .get(table)
-            .cloned()
+        self.schema.tables.get(table).cloned()
     }
 
     pub(crate) fn captured_table_names(&self) -> Vec<String> {
-        let mut names = self
-            .schema
-            .get()
-            .expect("writer scope admits its captured schema")
-            .tables
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut names = self.schema.tables.keys().cloned().collect::<Vec<_>>();
         names.sort();
         names
     }
@@ -150,6 +86,132 @@ impl PreparedWriterErasure {
 }
 
 impl RedbPersistence {
+    /// Startup alone resolves metadata from disk, outside publication locks.
+    fn prepared_writer_schema(&self) -> Result<Arc<WriterSchema>> {
+        if let Some(schema) = self.writer_schema.lock().as_ref().cloned() {
+            return Ok(schema);
+        }
+        let accountant = self
+            .proof_accountant()
+            .ok_or_else(|| Error::Other("writer schema requires its accountant".into()))?;
+        let mut memory = OwnedMemoryReservation::try_new_for(
+            accountant.clone(),
+            std::mem::size_of::<WriterSchema>(),
+            "writer_source",
+            "captured_schema",
+            HINT,
+        )?;
+        let tables = self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read.open_table(META_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let mut tables = HashMap::new();
+            for entry in table
+                .range("table:".."table;")
+                .map_err(Self::storage_error)?
+            {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                let name = key
+                    .value()
+                    .strip_prefix("table:")
+                    .ok_or_else(|| Error::Other("invalid schema key".into()))?;
+                let scratch = OwnedMemoryReservation::try_new_for(
+                    accountant.clone(),
+                    value.value().len().saturating_mul(16).saturating_add(4096),
+                    "writer_source",
+                    "schema_decode",
+                    HINT,
+                )?;
+                let (meta, legacy) = Self::decode_table_meta_versioned(value.value())?;
+                if legacy {
+                    return Err(Error::Other("unsupported table metadata layout".into()));
+                }
+                memory.try_grow_for(
+                    name.len()
+                        .saturating_add(meta.estimated_bytes())
+                        .saturating_add(192),
+                    "writer_source",
+                    "captured_schema",
+                    HINT,
+                )?;
+                tables.insert(name.to_owned(), meta);
+                drop(scratch);
+            }
+            Ok(tables)
+        })?;
+        let schema = Arc::new(WriterSchema {
+            tables,
+            _memory: memory,
+        });
+        let prior = self.writer_schema.lock().replace(schema.clone());
+        drop(prior);
+        Ok(schema)
+    }
+
+    /// The caller supplies exactly the metadata its write transaction installs.
+    /// This preparation can refuse; it occurs before opening that transaction.
+    pub(crate) fn prepare_writer_schema_change<'a>(
+        &self,
+        removed: impl Iterator<Item = &'a str>,
+        installed: impl Iterator<Item = (&'a str, &'a TableMeta)>,
+    ) -> Result<Option<Arc<WriterSchema>>> {
+        if self.proof_accountant().is_none() {
+            return Ok(None);
+        }
+        let base = self.prepared_writer_schema()?;
+        let removed = removed.collect::<Vec<_>>();
+        let installed = installed.collect::<Vec<_>>();
+        let bytes = base
+            .tables
+            .iter()
+            .filter(|(name, _)| {
+                !removed.contains(&name.as_str())
+                    && !installed.iter().any(|(table, _)| *table == name.as_str())
+            })
+            .map(|(name, meta)| {
+                name.len()
+                    .saturating_add(meta.estimated_bytes())
+                    .saturating_add(192)
+            })
+            .chain(installed.iter().map(|(name, meta)| {
+                name.len()
+                    .saturating_add(meta.estimated_bytes())
+                    .saturating_add(192)
+            }))
+            .fold(std::mem::size_of::<WriterSchema>(), usize::saturating_add);
+        let memory = OwnedMemoryReservation::try_new_for(
+            self.proof_accountant().unwrap(),
+            bytes,
+            "writer_source",
+            "captured_schema",
+            HINT,
+        )?;
+        let mut tables = HashMap::new();
+        for (name, meta) in &base.tables {
+            if !removed.contains(&name.as_str())
+                && !installed.iter().any(|(table, _)| *table == name.as_str())
+            {
+                tables.insert(name.clone(), meta.clone());
+            }
+        }
+        for (name, meta) in installed {
+            tables.insert(name.to_owned(), meta.clone());
+        }
+        Ok(Some(Arc::new(WriterSchema {
+            tables,
+            _memory: memory,
+        })))
+    }
+
+    pub(crate) fn complete_writer_schema_change(&self, schema: Option<Arc<WriterSchema>>) {
+        if let Some(schema) = schema {
+            let prior = self.writer_schema.lock().replace(schema);
+            drop(prior);
+        }
+    }
     /// Prepare capability restrictions before durability. Old descriptors retain
     /// their native image, but cannot decode erased families after publication.
     pub(crate) fn prepare_writer_erasure(
@@ -214,7 +276,18 @@ impl RedbPersistence {
             .iter()
             .filter_map(std::sync::Weak::upgrade)
             .collect::<Vec<_>>();
-        roots.iter().map(|root| root.control_bytes()).sum()
+        let mut schemas = std::collections::HashSet::new();
+        roots
+            .iter()
+            .map(|root| {
+                let bytes = root.control_bytes();
+                if schemas.insert(Arc::as_ptr(&root.schema) as usize) {
+                    bytes
+                } else {
+                    bytes.saturating_sub(root.schema._memory.bytes())
+                }
+            })
+            .sum()
     }
 
     /// Prepare the initial admitted root before constructing the manager.
@@ -231,6 +304,7 @@ impl RedbPersistence {
     /// Reserve this before durable commit. Failed reservation leaves the
     /// existing root untouched and must abort commit preparation.
     pub(crate) fn reserve_writer_snapshot(&self) -> Result<OwnedMemoryReservation> {
+        let _schema = self.prepared_writer_schema()?;
         let accountant = self.proof_accountant().ok_or_else(|| {
             Error::Other("writer source requires the attached memory accountant".into())
         })?;
@@ -255,6 +329,9 @@ impl RedbPersistence {
         let accountant = self.proof_accountant().ok_or_else(|| {
             Error::Other("writer source requires the attached memory accountant".into())
         })?;
+        let schema = self.writer_schema.lock().as_ref().cloned().ok_or_else(|| {
+            Error::Other("publication schema was not prepared before durability".into())
+        })?;
         self.with_db(|db| {
             let read = Arc::new(db.begin_read().map_err(Self::storage_error)?);
             let root = Arc::new(WriterSnapshot {
@@ -264,7 +341,7 @@ impl RedbPersistence {
                 accountant,
                 _control: control,
                 erasure: parking_lot::RwLock::new(WriterErasure::default()),
-                schema: std::sync::OnceLock::new(),
+                schema,
                 registry: self.writer_snapshots.clone(),
             });
             let mut roots = self.writer_snapshots.lock();
@@ -361,7 +438,7 @@ impl WriterSnapshot {
     pub(crate) fn control_bytes(&self) -> usize {
         self._control
             .bytes()
-            .saturating_add(self.schema.get().map_or(0, |schema| schema._memory.bytes()))
+            .saturating_add(self.schema._memory.bytes())
             .saturating_add(
                 self.erasure
                     .read()

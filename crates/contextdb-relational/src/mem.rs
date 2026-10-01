@@ -965,6 +965,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 )
             })
             .collect::<Vec<_>>();
+        let statement_row =
+            ws.ordered_staged_rows
+                .prepare_statement_row(table, row, &keys, |bytes| admission.reserve(bytes))?;
         ws.ordered_staged_rows.stage(
             table,
             contextdb_tx::StagedPosition {
@@ -974,7 +977,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             },
             &keys,
             |bytes| admission.reserve(bytes),
-        )
+        )?;
+        ws.ordered_staged_rows
+            .publish_statement_row(table, statement_row);
+        Ok(())
     }
 
     /// Complete operation output from a captured durable root. The caller
@@ -1004,7 +1010,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         predicate: &dyn Fn(&VersionedRow) -> bool,
         mut before_clone: impl FnMut(usize) -> Result<()>,
     ) -> Result<Vec<VersionedRow>> {
-        self.ensure_table_exists(table)?;
+        source.validate_table(table)?;
         if snapshot.0 > source.snapshot().0 {
             return Err(Error::Other(
                 "relational snapshot exceeds the captured source frontier".into(),
@@ -1181,6 +1187,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             return Err(Error::ImmutableTable(table.to_string()));
         }
         self.tx_mgr.with_write_set(tx, |ws| {
+            ws.ordered_staged_rows.remove_statement_row(table, row_id)?;
             let admitted = ws.admitted_bytes_for_staged_row(table, row_id);
             let mut retired = 0usize;
             let mut removed = false;
@@ -1206,8 +1213,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             {
                 ws.relational_deletes.push((table.to_string(), row_id, tx));
             }
-            retired
-        })
+            Ok(retired)
+        })?
     }
 
     /// Number of physical versions currently addressable by a pull scan.
@@ -2439,6 +2446,7 @@ impl<S: WriteSetApplicator> RelationalExecutor for MemRelationalExecutor<S> {
             .is_some();
 
         self.tx_mgr.with_write_set(tx, |ws| {
+            ws.ordered_staged_rows.remove_statement_row(table, row_id)?;
             let table_name = table.to_string();
             ws.relational_inserts
                 .retain(|(t, row)| !(t == table && row.row_id == row_id));
@@ -2453,7 +2461,8 @@ impl<S: WriteSetApplicator> RelationalExecutor for MemRelationalExecutor<S> {
             {
                 ws.relational_deletes.push((table_name, row_id, tx));
             }
-        })?;
+            Ok::<_, Error>(())
+        })??;
 
         Ok(())
     }

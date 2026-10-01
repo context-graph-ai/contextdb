@@ -342,7 +342,23 @@ impl Drop for ScopedMemoryReservation<'_> {
 }
 
 // Ordered staged postings retain the same engine admission owner.
-impl contextdb_tx::StagedPostingCharge for OwnedMemoryReservation {}
+impl contextdb_tx::StagedPostingCharge for OwnedMemoryReservation {
+    fn retained_bytes(&self) -> usize {
+        self.bytes()
+    }
+    fn reserve_copy(
+        &self,
+        bytes: usize,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_tx::StagedPostingCharge>> {
+        Ok(Arc::new(Self::try_new_for(
+            self.accountant.clone(),
+            bytes,
+            "relational",
+            "statement_overlay",
+            "Reduce staged rows or raise MEMORY_LIMIT.",
+        )?))
+    }
+}
 
 impl OwnedMemoryReservation {
     pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {

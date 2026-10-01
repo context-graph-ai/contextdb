@@ -20,6 +20,7 @@ thread_local! {
     /// per thread, because the thread that starts one is the thread that asked for
     /// the wait, and per-thread counting stays honest beside other tests sharing
     /// the binary.
+    static FAILED_TIMER_ARMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TIMER_THREADS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -33,6 +34,13 @@ fn note_timer_thread_started_for_test() {
 #[doc(hidden)]
 pub fn reset_timer_threads_started_for_test() {
     TIMER_THREADS_STARTED.with(|started| started.set(0));
+}
+
+/// Refuse the next timer arms on this thread, including a fallback clock.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn fail_next_timer_arms_for_test(count: usize) {
+    FAILED_TIMER_ARMS.with(|remaining| remaining.set(count));
 }
 
 /// Timer threads this thread has started since the reset.
@@ -320,7 +328,13 @@ impl DeadlineClock for MonotonicDeadlineClock {
             return Box::pin(std::future::ready(()));
         }
         #[cfg(any(test, feature = "test-seams"))]
-        if self.fail_timer_arm {
+        if self.fail_timer_arm
+            || FAILED_TIMER_ARMS.with(|remaining| {
+                let count = remaining.get();
+                remaining.set(count.saturating_sub(1));
+                count != 0
+            })
+        {
             self.timer_arm_failure_waits.fetch_add(1, Ordering::SeqCst);
             return Box::pin(InjectedTimerArmFailureWait {
                 completed: false,

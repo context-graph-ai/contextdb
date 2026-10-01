@@ -16815,6 +16815,7 @@ pub struct RedbPersistence {
     /// the existing typed refusal instead of allocating anyway.
     proof_accountant: std::sync::OnceLock<Arc<crate::memory_accounting::MemoryAccountant>>,
     writer_snapshots: Arc<parking_lot::Mutex<Vec<std::sync::Weak<WriterSnapshot>>>>,
+    writer_schema: parking_lot::Mutex<Option<Arc<writer_source::WriterSchema>>>,
     /// What the owning database charged its accountant for this store's Redb
     /// page cache when it opened it, so the close that stops holding the
     /// cache hands back exactly that.
@@ -19157,6 +19158,7 @@ impl RedbPersistence {
             handoff_prepare_io_fault: AtomicBool::new(false),
             proof_accountant: std::sync::OnceLock::new(),
             writer_snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            writer_schema: parking_lot::Mutex::new(None),
             cache_charge_bytes: std::sync::OnceLock::new(),
             used_legacy_table_meta_layout: AtomicBool::new(false),
         })
@@ -19221,6 +19223,7 @@ impl RedbPersistence {
                         handoff_prepare_io_fault: AtomicBool::new(false),
                         proof_accountant,
                         writer_snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                        writer_schema: parking_lot::Mutex::new(None),
                         cache_charge_bytes: std::sync::OnceLock::new(),
                         used_legacy_table_meta_layout: AtomicBool::new(false),
                     })
@@ -19397,6 +19400,7 @@ impl RedbPersistence {
                     handoff_prepare_io_fault: AtomicBool::new(false),
                     proof_accountant: std::sync::OnceLock::new(),
                     writer_snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    writer_schema: parking_lot::Mutex::new(None),
                     cache_charge_bytes: std::sync::OnceLock::new(),
                     used_legacy_table_meta_layout: AtomicBool::new(false),
                 };
@@ -19420,6 +19424,8 @@ impl RedbPersistence {
     }
 
     pub fn close(&self) {
+        let schema = self.writer_schema.lock().take();
+        drop(schema);
         let mut db = self
             .db
             .write()
@@ -21660,6 +21666,13 @@ impl RedbPersistence {
             .iter()
             .map(|(sink, _)| sink.clone())
             .collect::<BTreeSet<_>>();
+        let schema = self.prepare_writer_schema_change(
+            stage.affected_tables.iter().map(String::as_str),
+            stage
+                .table_meta
+                .iter()
+                .map(|(name, meta)| (name.as_str(), meta)),
+        )?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             let indexes_to_rebuild = {
@@ -22382,6 +22395,7 @@ impl RedbPersistence {
             }
             Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
             write_txn.commit().map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
             Ok(())
         })
     }
@@ -22647,6 +22661,13 @@ impl RedbPersistence {
                 "local schema stage contains no DDL".to_string(),
             ));
         }
+        let schema = self.prepare_writer_schema_change(
+            std::iter::empty(),
+            stage
+                .affected_table_meta
+                .iter()
+                .map(|(name, meta)| (name.as_str(), meta)),
+        )?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
 
@@ -22756,6 +22777,7 @@ impl RedbPersistence {
             }
             Self::write_writer_recovery_bounds_in_write(&write_txn, Some(ws))?;
             write_txn.commit().map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
             Ok(())
         })
     }
@@ -22774,6 +22796,8 @@ impl RedbPersistence {
         }
     }
     pub fn flush_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
+        let schema =
+            self.prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             {
@@ -22801,6 +22825,7 @@ impl RedbPersistence {
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
             Ok(())
         })
     }
@@ -22817,6 +22842,8 @@ impl RedbPersistence {
         lsn: Lsn,
         ddl: &DdlChange,
     ) -> Result<()> {
+        let schema =
+            self.prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             let mut identity_mutations = content_identity::schema_mutations(name, meta)?;
@@ -22870,11 +22897,14 @@ impl RedbPersistence {
             Self::raise_noncanonical_writer_floors_in_write(&write_txn, 0, lsn.0, 0)?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
             Ok(())
         })
     }
 
     pub fn remove_table_meta(&self, name: &str) -> Result<()> {
+        let schema =
+            self.prepare_writer_schema_change(std::iter::once(name), std::iter::empty())?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             {
@@ -22893,6 +22923,7 @@ impl RedbPersistence {
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
             Ok(())
         })
     }
@@ -23542,6 +23573,8 @@ impl RedbPersistence {
     ) -> Result<()> {
         let rows = self.load_relational_table(name)?;
         let sources = self.load_sync_source_lsns()?;
+        let schema =
+            self.prepare_writer_schema_change(std::iter::once(name), std::iter::empty())?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             let mut identity_mutations = content_identity::remove_schema_mutations(name);
@@ -23617,6 +23650,7 @@ impl RedbPersistence {
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
             Ok(())
         })
     }
@@ -23638,6 +23672,8 @@ impl RedbPersistence {
             .into_iter()
             .filter(|entry| entry.index.table == name)
             .collect::<Vec<_>>();
+        let schema =
+            self.prepare_writer_schema_change(std::iter::once(name), std::iter::empty())?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             let mut identity_mutations = content_identity::remove_schema_mutations(name);
@@ -23767,6 +23803,7 @@ impl RedbPersistence {
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
             Ok(())
         })
     }
@@ -23986,6 +24023,8 @@ impl RedbPersistence {
             .filter(|column| !renamed_from.contains(*column))
             .cloned()
             .collect::<HashSet<_>>();
+        let schema =
+            self.prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             let mut identity_mutations = content_identity::schema_mutations(name, meta)?;
@@ -24159,6 +24198,7 @@ impl RedbPersistence {
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
+            self.complete_writer_schema_change(schema);
             #[cfg(any(test, feature = "test-seams"))]
             table_meta_rewrite_checkpoint_for_test(3);
             Ok(())

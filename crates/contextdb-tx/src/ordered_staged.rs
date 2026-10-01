@@ -7,7 +7,16 @@ use std::sync::Arc;
 
 /// Engine admission ownership; dropping the final owner releases the charge.
 /// Implemented by the engine's existing owned reservation, never a tx cache.
-pub trait StagedPostingCharge: Debug + Send + Sync {}
+pub trait StagedPostingCharge: Debug + Send + Sync {
+    fn retained_bytes(&self) -> usize {
+        0
+    }
+    fn reserve_copy(&self, _bytes: usize) -> Result<Arc<dyn StagedPostingCharge>> {
+        Err(contextdb_core::Error::Other(
+            "staged snapshot copying requires admission".into(),
+        ))
+    }
+}
 
 pub type OrderedStagedBounds<'a> = (Bound<&'a (IndexKey, RowId)>, Bound<&'a (IndexKey, RowId)>);
 type RowCharges = BTreeMap<RowId, (usize, Arc<dyn StagedPostingCharge>)>;
@@ -32,6 +41,7 @@ struct IndexPostings {
 pub struct OrderedStagedRows {
     tables: BTreeMap<String, BTreeMap<String, IndexPostings>>,
     charges: BTreeMap<String, RowCharges>,
+    statement_rows: BTreeMap<String, Arc<crate::StatementRows>>,
 }
 
 pub struct OrderedStagedCursor<'a> {
@@ -71,6 +81,50 @@ impl Iterator for OrderedStagedPrefixCursor<'_> {
 }
 
 impl OrderedStagedRows {
+    pub fn statement_rows(&self, table: &str) -> Option<Arc<crate::StatementRows>> {
+        self.statement_rows.get(table).cloned()
+    }
+    pub fn prepare_statement_row(
+        &mut self,
+        table: &str,
+        row: &contextdb_core::VersionedRow,
+        keys: &[(String, IndexKey)],
+        mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    ) -> Result<crate::statement_rows::PreparedStatementRow> {
+        if let Some(snapshot) = self.statement_rows.get(table) {
+            return crate::StatementRows::prepare(snapshot, row, keys, reserve);
+        }
+        let charge = reserve(
+            std::mem::size_of::<crate::StatementRows>()
+                .saturating_add(table.len())
+                .saturating_add(192),
+        )?;
+        let snapshot = Arc::new(crate::StatementRows::with_control(charge));
+        let mut prepared = crate::StatementRows::prepare(&snapshot, row, keys, reserve)?;
+        prepared.new_table = Some(snapshot);
+        Ok(prepared)
+    }
+    pub fn publish_statement_row(
+        &mut self,
+        table: &str,
+        mut prepared: crate::statement_rows::PreparedStatementRow,
+    ) {
+        if let Some(snapshot) = prepared.new_table.take() {
+            self.statement_rows.insert(table.to_owned(), snapshot);
+        }
+        crate::StatementRows::publish(
+            self.statement_rows
+                .get_mut(table)
+                .expect("prepared table owner"),
+            prepared,
+        );
+    }
+    pub fn remove_statement_row(&mut self, table: &str, row: RowId) -> Result<()> {
+        if let Some(snapshot) = self.statement_rows.get_mut(table) {
+            crate::StatementRows::remove(snapshot, row)?;
+        }
+        Ok(())
+    }
     fn key_bytes(key: &IndexKey) -> usize {
         key.iter().fold(
             key.capacity()
@@ -204,6 +258,12 @@ impl OrderedStagedRows {
             .values()
             .flat_map(|rows| rows.values())
             .fold(0usize, |bytes, (charge, _)| bytes.saturating_add(*charge))
+            .saturating_add(
+                self.statement_rows
+                    .values()
+                    .map(|rows| rows.retained_bytes())
+                    .sum::<usize>(),
+            )
     }
 
     /// Canonicalization only changes positions/visibility identity, never keys.

@@ -4,6 +4,8 @@ pub mod commit_directory;
 pub mod commit_wait_test_seams;
 pub mod manager;
 pub mod ordered_staged;
+pub mod statement_rows;
+pub use statement_rows::StatementRows;
 pub mod write_set;
 
 pub use commit_directory::{CommitDirectory, CommitDirectoryCursor};

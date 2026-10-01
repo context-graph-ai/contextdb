@@ -719,7 +719,6 @@ pub(super) fn durable_root(
             let root = handle.downcast::<WriterSnapshot>().map_err(|_| {
                 Error::Other("writer publication has an invalid durable root".into())
             })?;
-            root.ensure_schema()?;
             Ok(root)
         })
         .transpose()

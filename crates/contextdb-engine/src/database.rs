@@ -12463,10 +12463,10 @@ impl Drop for AuthoritativeReadPublicationGuard {
     }
 }
 
-impl AuthoritativePurgePublicationGuard {
+impl ReadPublicationGate {
     fn invalidate_cursors(&self) {
         let cursors = {
-            let mut state = self.gate.state.lock();
+            let mut state = self.state.lock();
             let tables = state.writer_scope.as_ref().expect("purge scope is held");
             let cursors = state
                 .cursors
@@ -12480,6 +12480,12 @@ impl AuthoritativePurgePublicationGuard {
         for cursor in cursors {
             cursor.release_for_erasure();
         }
+    }
+}
+
+impl AuthoritativePurgePublicationGuard {
+    fn invalidate_cursors(&self) {
+        self.gate.invalidate_cursors();
     }
 }
 
@@ -24326,6 +24332,15 @@ impl Database {
                     .acquire_exclusive_sorted(&discard_hashes)?,
             )
         };
+        let discard_publication = if discard_selections.is_empty() {
+            None
+        } else {
+            let tables = discard_selections
+                .iter()
+                .map(|selection| selection.table.clone())
+                .collect();
+            Some(self.read_publication_gate.acquire_write(&tables))
+        };
         let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
         let sync_pull_pre_trigger_creation_keys = std::cell::RefCell::new(HashSet::<String>::new());
         let sync_pull_pre_trigger_rows = std::cell::RefCell::new(HashSet::<(String, RowId)>::new());
@@ -24721,6 +24736,7 @@ impl Database {
                                     &discard_selections,
                                     drain.freeze_for_commit_locked_purge(),
                                     discard_blob_guard.as_ref().expect("discard hash fence"),
+                                    discard_publication.as_ref().expect("discard read publication fence"),
                                 )?);
                             #[cfg(test)]
                             take_local_commit_stage_fault_for_test(
@@ -44558,147 +44574,57 @@ impl Database {
         tx: TxId,
         table: &str,
     ) -> Result<crate::executor::TransactionTableOverlay> {
-        self.tx_mgr.with_write_set(tx, |ws| {
-            let deleted: std::collections::HashSet<RowId> = ws
+        self.tx_mgr.with_write_set(tx, |ws| -> Result<_> {
+            let bytes = ws
                 .relational_deletes
                 .iter()
-                .filter(|(staged_table, _, _)| staged_table == table)
-                .map(|(_, row_id, _)| *row_id)
-                .collect();
-            let delete_predicates: Vec<_> = ws
-                .relational_delete_predicates
-                .iter()
-                .filter(|predicate| predicate.table == table)
-                .cloned()
-                .collect();
-            // Newest version per row wins, and the surviving rows keep the
-            // order the transaction staged them in -- the same rule the
-            // uncapped merge follows, so both paths publish one answer.
-            let mut staged_identities = std::collections::HashSet::new();
-            let mut staged_positions: Vec<usize> = ws
-                .relational_inserts
-                .iter()
-                .enumerate()
-                .rev()
-                .filter(|(_, (staged_table, row))| {
-                    staged_table == table && staged_identities.insert(row.row_id)
-                })
-                .map(|(position, _)| position)
-                .collect();
-            staged_positions.reverse();
-            let bytes = deleted
-                .len()
-                .saturating_mul(std::mem::size_of::<RowId>())
+                .filter(|(name, _, _)| name == table)
+                .count()
+                .saturating_mul(96)
                 .saturating_add(
-                    staged_identities
-                        .len()
-                        .saturating_mul(std::mem::size_of::<RowId>()),
-                )
-                .saturating_add(
-                    staged_positions
-                        .len()
-                        .saturating_mul(std::mem::size_of::<usize>()),
-                )
-                .saturating_add(
-                    delete_predicates
+                    ws.relational_delete_predicates
                         .iter()
-                        .map(|predicate| {
-                            predicate.table.len().saturating_add(
-                                predicate
-                                    .predicates
+                        .filter(|p| p.table == table)
+                        .map(|p| {
+                            p.table.len().saturating_add(128).saturating_add(
+                                p.predicates
                                     .iter()
-                                    .map(|(column, value)| {
-                                        column.len().saturating_add(value.estimated_bytes())
+                                    .map(|(name, value)| {
+                                        name.len()
+                                            .saturating_add(value.estimated_bytes())
+                                            .saturating_add(96)
                                     })
                                     .sum::<usize>(),
                             )
                         })
                         .sum::<usize>(),
-                );
-            crate::executor::TransactionTableOverlay {
-                deleted,
-                delete_predicates,
-                staged_positions,
-                staged_identities,
+                )
+                .saturating_add(128);
+            let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
                 bytes,
-            }
-        })
-    }
-
-    pub(crate) fn transaction_ordered_staged_positions(
-        &self,
-        tx: TxId,
-        table: &str,
-        index: &str,
-        reverse: bool,
-        before_clone: &mut dyn FnMut(
-            usize,
-        ) -> std::result::Result<
-            (),
-            crate::executor::BoundedExecutionError,
-        >,
-    ) -> std::result::Result<Option<Vec<usize>>, crate::executor::BoundedExecutionError> {
-        self.tx_mgr
-            .with_write_set(tx, |ws| {
-                let Some(cursor) = ws.ordered_staged_rows.cursor(
-                    table,
-                    index,
-                    std::ops::Bound::Unbounded,
-                    std::ops::Bound::Unbounded,
-                    reverse,
-                ) else {
-                    return Ok(None);
-                };
-                let count = cursor.count();
-                before_clone(count.saturating_mul(std::mem::size_of::<usize>()))?;
-                let mut positions = Vec::with_capacity(count);
-                positions.extend(
-                    ws.ordered_staged_rows
-                        .cursor(
-                            table,
-                            index,
-                            std::ops::Bound::Unbounded,
-                            std::ops::Bound::Unbounded,
-                            reverse,
-                        )
-                        .expect("staged index is held")
-                        .map(|entry| entry.position),
-                );
-                Ok(Some(positions))
+                "relational",
+                "statement_overlay",
+                "Reduce staged rows or raise MEMORY_LIMIT.",
+            )?;
+            Ok(crate::executor::TransactionTableOverlay {
+                deleted: ws
+                    .relational_deletes
+                    .iter()
+                    .filter(|(name, _, _)| name == table)
+                    .map(|(_, id, _)| *id)
+                    .collect(),
+                delete_predicates: ws
+                    .relational_delete_predicates
+                    .iter()
+                    .filter(|p| p.table == table)
+                    .cloned()
+                    .collect(),
+                staged_rows: ws.ordered_staged_rows.statement_rows(table),
+                bytes: 0,
+                _memory: Some(memory),
             })
-            .map_err(crate::executor::BoundedExecutionError::from)?
-    }
-
-    /// One row the transaction has staged, cloned under the caller's charge.
-    ///
-    /// The identity is charged before it is read and the values before they
-    /// are copied, so a row this handle staged costs a bounded read exactly
-    /// what a committed row of the same shape costs.
-    pub(crate) fn transaction_staged_row(
-        &self,
-        tx: TxId,
-        position: usize,
-        before_touch: &mut dyn FnMut() -> std::result::Result<
-            (),
-            crate::executor::BoundedExecutionError,
-        >,
-        before_clone: &mut dyn FnMut(
-            usize,
-        ) -> std::result::Result<
-            (),
-            crate::executor::BoundedExecutionError,
-        >,
-    ) -> std::result::Result<Option<VersionedRow>, crate::executor::BoundedExecutionError> {
-        self.tx_mgr
-            .with_write_set(tx, |ws| {
-                let Some((_, row)) = ws.relational_inserts.get(position) else {
-                    return Ok(None);
-                };
-                before_touch()?;
-                before_clone(row.estimated_bytes())?;
-                Ok(Some(row.clone()))
-            })
-            .map_err(crate::executor::BoundedExecutionError::from)?
+        })?
     }
 
     /// What an open transaction changes about the vectors one index can be
@@ -45467,7 +45393,9 @@ impl Database {
             return Ok(contextdb_relational::mem::BoundedPhysicalCursor::default());
         }
         if self.persistence.is_some() {
-            return self.relational.bounded_physical_cursor_from_source(table);
+            self.table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+            return Ok(contextdb_relational::mem::BoundedPhysicalCursor::default());
         }
         self.relational.bounded_physical_cursor(table)
     }
@@ -46443,7 +46371,11 @@ impl Database {
         };
         let best_row_id = best_row_id.filter(|row_id| {
             overlay.as_ref().is_none_or(|overlay| {
-                !overlay.deleted.contains(row_id) && !overlay.staged_identities.contains(row_id)
+                !overlay.deleted.contains(row_id)
+                    && !overlay
+                        .staged_rows
+                        .as_ref()
+                        .is_some_and(|rows| rows.contains(row_id))
             })
         });
         let committed = 'committed: {
@@ -46614,56 +46546,19 @@ impl Database {
             .table_meta(&policy.joined_table)
             .ok_or_else(|| E::from(Error::TableNotFound(policy.joined_table.clone())))?;
         let mut best: Option<(VersionedRow, usize)> = None;
-        for position in &overlay.staged_positions {
+        for staged in overlay.staged_rows.iter().flat_map(|rows| rows.rows()) {
             before_candidate()?;
-            let measured = self
-                .tx_mgr
-                .with_write_set(tx, |ws| {
-                    ws.relational_inserts.get(*position).map(|(_, row)| {
-                        (
-                            row.row_id,
-                            row.values
-                                .get(&policy.joined_column)
-                                .is_some_and(|value| values_equal_for_rank_join(value, join_value)),
-                        )
-                    })
-                })
-                .map_err(E::from)?;
-            let Some((row_id, matches)) = measured else {
-                continue;
-            };
-            // Only a row that beats what is already in hand is worth copying,
-            // so a transaction that staged many rows for this join pays for
-            // one copy, not one per row.
+            let row_id = staged.row_id;
+            let matches = staged
+                .values
+                .get(&policy.joined_column)
+                .is_some_and(|value| values_equal_for_rank_join(value, join_value));
             if !matches || best.as_ref().is_some_and(|(best, _)| best.row_id >= row_id) {
                 continue;
             }
-            let planned = self
-                .tx_mgr
-                .with_write_set(tx, |ws| {
-                    ws.relational_inserts
-                        .get(*position)
-                        .map(|(_, row)| bounded_rank_row_clone_planned_bytes(row))
-                })
-                .map_err(E::from)?
-                .transpose()
-                .map_err(E::from)?;
-            let Some(planned) = planned else {
-                continue;
-            };
+            let planned = bounded_rank_row_clone_planned_bytes(staged).map_err(E::from)?;
             before_clone(planned)?;
-            let cloned = self
-                .tx_mgr
-                .with_write_set(tx, |ws| {
-                    ws.relational_inserts
-                        .get(*position)
-                        .map(|(_, row)| row.clone())
-                })
-                .map_err(E::from)?;
-            let Some(cloned) = cloned else {
-                release_clone(planned)?;
-                continue;
-            };
+            let cloned = staged.clone();
             let actual = match bounded_rank_row_retained_bytes(&cloned) {
                 Ok(actual) => actual,
                 Err(error) => {

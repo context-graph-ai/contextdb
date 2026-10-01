@@ -1539,8 +1539,9 @@ fn ordered_merge_keys_capacity_bytes(
 
 /// The open transaction this scan is reading inside, and how far through its
 /// staged rows the scan has got.
+type OrderedStatementPosition = (String, bool, Option<(IndexKey, RowId)>);
+
 struct ScanTransactionOverlay {
-    tx: TxId,
     overlay: crate::executor::TransactionTableOverlay,
     predicate_deleted: Vec<RowId>,
     committed_predicates_resolved: bool,
@@ -1550,7 +1551,9 @@ struct ScanTransactionOverlay {
     /// leaves the reinserted row -- which is what this set is for.
     restaged_over_committed: std::collections::HashSet<RowId>,
     /// How many of the staged rows have been published.
-    published: usize,
+    published: Option<usize>,
+    ordered_staged: Option<OrderedStatementPosition>,
+    staged_key_bytes: usize,
     /// Set once the committed source is exhausted and the staged rows start.
     committed_exhausted: bool,
 }
@@ -1561,7 +1564,12 @@ impl ScanTransactionOverlay {
     /// values, or it restaged the row and its own version is published
     /// instead.
     fn hides_committed(&mut self, table: &str, row: &VersionedRow) -> bool {
-        if self.overlay.staged_identities.contains(&row.row_id) {
+        if self
+            .overlay
+            .staged_rows
+            .as_ref()
+            .is_some_and(|rows| rows.contains(&row.row_id))
+        {
             // Recorded whether or not the row is also hidden: what makes a
             // staged row publishable is that its original exists here at all.
             let _ = self.restaged_over_committed.insert(row.row_id);
@@ -4753,28 +4761,49 @@ impl ScanState {
         };
         state.committed_exhausted = true;
         loop {
-            let Some(position) = state.overlay.staged_positions.get(state.published).copied()
-            else {
-                state.predicate_deleted = Vec::new();
+            let staged = state.overlay.staged_rows.as_ref().and_then(|rows| {
+                if let Some((index, reverse, after)) = &state.ordered_staged {
+                    rows.next_ordered(index, *reverse, after.as_ref())
+                        .map(|(key, row)| (Some(key), None, row))
+                } else {
+                    rows.next_unordered(state.published)
+                        .map(|(sequence, row)| (None, Some(sequence), row))
+                }
+            });
+            let Some((key, sequence, staged)) = staged else {
                 let held = std::mem::take(&mut state.overlay.bytes);
                 context.release(held)?;
+                context.release(std::mem::take(&mut state.staged_key_bytes))?;
+                state.ordered_staged = None;
                 return Ok(None);
             };
-            state.published = state.published.saturating_add(1);
-            let reserved = Cell::new(0_usize);
-            let staged = db.transaction_staged_row(
-                state.tx,
-                position,
-                &mut || context.charge(BoundedWorkSource::TableScan, BoundedSourceTouch::TableRow),
-                &mut |bytes| {
-                    context.reserve(BoundedWorkSource::TableScan, bytes)?;
-                    reserved.set(bytes);
-                    Ok(())
-                },
-            )?;
-            let Some(row) = staged else {
-                continue;
-            };
+            context.charge(BoundedWorkSource::TableScan, BoundedSourceTouch::TableRow)?;
+            let reserved = Cell::new(staged.estimated_bytes());
+            context.reserve(BoundedWorkSource::TableScan, reserved.get())?;
+            if let Some(key) = key {
+                let bytes = key
+                    .0
+                    .iter()
+                    .map(|v| match v {
+                        DirectedValue::Asc(v) => v.0.estimated_bytes(),
+                        DirectedValue::Desc(v) => v.0.estimated_bytes(),
+                    })
+                    .sum::<usize>()
+                    .saturating_add(
+                        key.0
+                            .len()
+                            .saturating_mul(std::mem::size_of::<DirectedValue>()),
+                    )
+                    .saturating_add(32);
+                context.reserve(BoundedWorkSource::TableScan, bytes)?;
+                if let Some((_, _, after)) = &mut state.ordered_staged {
+                    *after = Some(key.clone());
+                }
+                context.release(state.staged_key_bytes)?;
+                state.staged_key_bytes = bytes;
+            }
+            state.published = sequence;
+            let row = staged.clone();
             #[cfg(feature = "test-seams")]
             if self.vector_candidate_source {
                 db.note_vector_candidate_materialized();
@@ -4842,39 +4871,48 @@ impl ScanState {
     ) -> std::result::Result<(), BoundedExecutionError> {
         match self.ordered_merge.as_ref() {
             Some(merge) if merge.staged.is_none() => {}
+            Some(merge)
+                if merge.staged.as_ref().is_some_and(VecDeque::is_empty)
+                    && self
+                        .transaction
+                        .as_ref()
+                        .is_some_and(|tx| tx.ordered_staged.is_some()) =>
+            {
+                if let Some(staged) = self.next_staged_row(db, context)? {
+                    let merge = self.ordered_merge.as_mut().expect("ordered merge is held");
+                    merge.held_bytes = merge.held_bytes.saturating_add(staged.1);
+                    merge
+                        .staged
+                        .as_mut()
+                        .expect("ordered merge is initialized")
+                        .push_back(staged);
+                }
+                return Ok(());
+            }
             _ => return Ok(()),
         }
         let mut maintained_order = false;
         if let (Some(transaction), ScanMode::Ordered { cursor, .. }) =
             (&mut self.transaction, &self.mode)
             && let Some(index) = cursor.index_name()
+            && transaction
+                .overlay
+                .staged_rows
+                .as_ref()
+                .is_some_and(|rows| rows.has_index(index))
         {
-            let reserved = Cell::new(0usize);
-            let positions = db.transaction_ordered_staged_positions(
-                transaction.tx,
-                &self.table,
-                index,
-                cursor.source_reverse(),
-                &mut |bytes| {
-                    context.reserve(BoundedWorkSource::TableScan, bytes)?;
-                    reserved.set(bytes);
-                    Ok(())
-                },
-            )?;
-            if let Some(positions) = positions
-                && positions.len() == transaction.overlay.staged_positions.len()
-            {
-                transaction.overlay.staged_positions = positions;
-                maintained_order = true;
-                // This replaces, rather than adds to, the already admitted position vector.
-                context.release(reserved.get())?;
-            } else {
-                context.release(reserved.get())?;
-            }
+            transaction.ordered_staged = Some((index.to_owned(), cursor.source_reverse(), None));
+            maintained_order = true;
         }
         let mut rows = Vec::new();
-        while let Some(staged) = self.next_staged_row(db, context)? {
-            rows.push(staged);
+        if maintained_order {
+            if let Some(staged) = self.next_staged_row(db, context)? {
+                rows.push(staged);
+            }
+        } else {
+            while let Some(staged) = self.next_staged_row(db, context)? {
+                rows.push(staged);
+            }
         }
         let Some(merge) = self.ordered_merge.as_mut() else {
             return Ok(());
@@ -4933,8 +4971,8 @@ impl ScanState {
         db: &dyn ReadExecutionTarget,
         context: &Arc<RequestContext>,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
-        self.materialize_ordered_staged(db, context)?;
         loop {
+            self.materialize_ordered_staged(db, context)?;
             if self.pending_row.is_none()
                 && let Some(merge) = self.ordered_merge.as_mut()
                 && let Some(held) = merge.deferred.take()
@@ -10695,10 +10733,11 @@ fn scan_transaction_overlay(
     Ok(Some(ScanTransactionOverlay {
         predicate_deleted: Vec::new(),
         committed_predicates_resolved: false,
-        tx,
         overlay,
         restaged_over_committed: std::collections::HashSet::new(),
-        published: 0,
+        published: None,
+        ordered_staged: None,
+        staged_key_bytes: 0,
         committed_exhausted: false,
     }))
 }
@@ -13456,6 +13495,23 @@ impl CursorExpiryWatch {
                     let completed = wait.take();
                     drop(wait);
                     drop(completed);
+                    // No independently armed wake exists. Retire the parked
+                    // resources now rather than leaving a completed future
+                    // in the observer and retaining the snapshot forever.
+                    let mut lifecycle = execution
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let BoundedCursorLifecycle::Open(state) = &mut *lifecycle {
+                        let error = BoundedExecutionError::Engine(Error::Other(
+                            "cursor deadline timer could not be armed".into(),
+                        ));
+                        state.finish_plugin_error(&error);
+                        *lifecycle =
+                            BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
+                    }
+                    drop(lifecycle);
+                    execution.retire_expiry();
                 }
             } else {
                 let completed = wait.take();

@@ -57,7 +57,10 @@ pub use deadlines::{
     retry_route_with_deadline, serve_request_with_deadline, write_request_with_deadline,
 };
 #[cfg(any(test, feature = "test-seams"))]
-pub use deadlines::{reset_timer_threads_started_for_test, timer_threads_started_for_test};
+pub use deadlines::{
+    fail_next_timer_arms_for_test, reset_timer_threads_started_for_test,
+    timer_threads_started_for_test,
+};
 pub use engine_answer::{
     ALL_TAGS, BodyField, ReadChannelError, TAG_ACL_DENIED, TAG_BFS_DEPTH_EXCEEDED,
     TAG_BFS_VISITED_EXCEEDED, TAG_COLUMN_NOT_FOUND, TAG_COLUMN_TYPE_MISMATCH,

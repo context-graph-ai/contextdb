@@ -86,6 +86,12 @@ impl RelationalCursor<RelationalPosting> for PostingCursor {
     }
 }
 impl RelationalReadSource for WriterRelationalSource {
+    fn validate_table(&self, table: &str) -> Result<()> {
+        self.root
+            .captured_table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))
+            .map(|_| ())
+    }
     fn snapshot(&self) -> SnapshotId {
         self.root.snapshot
     }
@@ -99,6 +105,7 @@ impl RelationalReadSource for WriterRelationalSource {
         upper: Bound<&[u8]>,
         reverse: bool,
     ) -> Result<Box<dyn RelationalCursor<VersionedRow>>> {
+        self.validate_table(table)?;
         Ok(Box::new(RowCursor(self.root.cursor(
             &RedbPersistence::rel_table_name(table),
             WriterCursorFamily::Bytes,
@@ -130,6 +137,7 @@ impl RelationalReadSource for WriterRelationalSource {
         table: &str,
         position: &[u8; 24],
     ) -> Result<Option<Box<dyn RelationalWindow<VersionedRow>>>> {
+        self.validate_table(table)?;
         RowCursor(self.root.exact_row(table, position)?).next_window()
     }
     fn index_cursor(
@@ -138,6 +146,7 @@ impl RelationalReadSource for WriterRelationalSource {
         index: &str,
         range: RelationalIndexRange<'_>,
     ) -> Result<Box<dyn RelationalCursor<RelationalPosting>>> {
+        self.validate_table(table)?;
         Ok(Box::new(PostingCursor {
             cursor: self.root.index_cursor(
                 table,
@@ -157,6 +166,7 @@ impl RelationalReadSource for WriterRelationalSource {
         current: bool,
         key: &IndexKey,
     ) -> Result<Box<dyn RelationalCursor<RelationalPosting>>> {
+        self.validate_table(table)?;
         Ok(Box::new(PostingCursor {
             cursor: self.root.exact_index_cursor(table, index, current, key)?,
             current,
@@ -176,6 +186,7 @@ impl RelationalReadSource for WriterRelationalSource {
         )?))
     }
     fn sync_source(&self, table: &str, row: RowId) -> Result<Option<(Lsn, SyncSourceKind)>> {
+        self.validate_table(table)?;
         self.root
             .sync_source(table, row)?
             .map(|(lsn, kind)| match kind {
