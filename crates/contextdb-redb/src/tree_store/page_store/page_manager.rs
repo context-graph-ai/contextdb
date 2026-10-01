@@ -138,6 +138,16 @@ impl TransactionalMemory {
             .allocator_metadata_bytes_for_test()
     }
 
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn allocator_regions_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .allocators
+            .region_allocators
+            .len()
+    }
+
     pub(crate) fn new(
         file: Box<dyn StorageBackend>,
         // Allow initializing a new database in an empty file
@@ -544,6 +554,8 @@ impl TransactionalMemory {
         for region in
             tree.range(&(AllocatorStateKey::Region(0)..=AllocatorStateKey::Region(u32::MAX)))?
         {
+            #[cfg(feature = "test-seams")]
+            crate::db::allocator_metadata_test_seams::note_loaded_regions(1);
             region_allocators.push(BuddyAllocator::from_bytes(region?.value()));
         }
 

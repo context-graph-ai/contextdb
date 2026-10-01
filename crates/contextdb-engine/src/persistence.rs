@@ -6883,6 +6883,11 @@ impl RetainedReadSource {
         expected_dimension: usize,
         quantization: VectorQuantization,
     ) -> Result<Vec<VectorEntry>> {
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Vector,
+            read,
+        );
         let table = read
             .open_table(VECTORS_TABLE)
             .map_err(|error| match error {
@@ -7209,6 +7214,11 @@ impl RetainedReadSource {
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Row,
+            read,
+        );
         let name = RedbPersistence::rel_table_name(table);
         let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
         let relation = read.open_table(definition).map_err(|error| match error {
@@ -7219,11 +7229,27 @@ impl RetainedReadSource {
             other => RedbPersistence::storage_error(other),
         })?;
         let (lower, upper) = RedbPersistence::rel_row_key_range(row_id);
-        let mut versions = relation
-            .range(lower.as_slice()..upper.as_slice())
-            .map_err(RedbPersistence::storage_error)?;
-        while let Some(entry) = versions.next_back() {
+        let mut versions = {
+            #[cfg(feature = "test-seams")]
+            let _target_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Row,
+                table,
+            );
+            relation
+                .range(lower.as_slice()..upper.as_slice())
+                .map_err(RedbPersistence::storage_error)?
+        };
+        while let Some(entry) = {
+            #[cfg(feature = "test-seams")]
+            let _target_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Row,
+                table,
+            );
+            versions.next_back()
+        } {
             let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
             let row = RedbPersistence::decode_relational_source_row(table, meta, value.value())?;
             self.authenticate_relational_physical_key(table, key.value(), &row)?;
             if row.created_tx.0 > snapshot.0 {
@@ -7244,6 +7270,11 @@ impl RetainedReadSource {
         snapshot: SnapshotId,
         mut authentication: Option<&mut content_identity::ReadAuthenticationBatch<'_>>,
     ) -> Result<Option<VersionedRow>> {
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Row,
+            read,
+        );
         let name = RedbPersistence::rel_table_name(table);
         let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
         let relation = read.open_table(definition).map_err(|error| match error {
@@ -7254,11 +7285,27 @@ impl RetainedReadSource {
             other => RedbPersistence::storage_error(other),
         })?;
         let (lower, upper) = RedbPersistence::rel_row_key_range(row_id);
-        let mut versions = relation
-            .range(lower.as_slice()..upper.as_slice())
-            .map_err(RedbPersistence::storage_error)?;
-        while let Some(entry) = versions.next_back() {
+        let mut versions = {
+            #[cfg(feature = "test-seams")]
+            let _target_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Row,
+                table,
+            );
+            relation
+                .range(lower.as_slice()..upper.as_slice())
+                .map_err(RedbPersistence::storage_error)?
+        };
+        while let Some(entry) = {
+            #[cfg(feature = "test-seams")]
+            let _target_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Row,
+                table,
+            );
+            versions.next_back()
+        } {
             let (key, value) = entry.map_err(RedbPersistence::storage_error)?;
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
             let row = RedbPersistence::decode_relational_source_row(table, meta, value.value())?;
             self.authenticate_relational_physical_key(table, key.value(), &row)?;
             if row.created_tx.0 > snapshot.0 {
@@ -7357,14 +7404,34 @@ impl RetainedReadSource {
             }
             Ok(())
         };
-        for entry in relation
-            .iter()
-            .map_err(RedbPersistence::storage_error)
-            .map_err(E::from)?
-        {
+        let versions = {
+            #[cfg(feature = "test-seams")]
+            let _target_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Row,
+                table,
+            );
+            relation
+                .iter()
+                .map_err(RedbPersistence::storage_error)
+                .map_err(E::from)?
+        };
+        #[cfg(feature = "test-seams")]
+        let versions = {
+            let mut versions = versions;
+            std::iter::from_fn(move || {
+                let _target_reads = crate::writer_query_test_seams::physical_operation(
+                    crate::writer_query_test_seams::PhysicalFamily::Row,
+                    table,
+                );
+                versions.next()
+            })
+        };
+        for entry in versions {
             let (key, value) = entry
                 .map_err(RedbPersistence::storage_error)
                 .map_err(E::from)?;
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
             let row = RedbPersistence::decode_relational_source_row(table, meta, value.value())
                 .map_err(E::from)?;
             self.authenticate_relational_physical_key(table, key.value(), &row)
@@ -7596,6 +7663,8 @@ impl RetainedReadSource {
                 // A posting delivered by the proof walk is physical stored data:
                 // decode it exactly and canonically before anything orders,
                 // compares or continues from it.
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_target_entry(table);
                 let logical = DurableRelationalIndexKey(logical_key.to_vec())
                     .decode_canonical()
                     .map_err(|error| self.content_identity_error(error))
@@ -7697,6 +7766,11 @@ impl RetainedReadSource {
                 let name = RedbPersistence::relational_index_table_name(table, &declaration.name);
                 let definition: TableDefinition<DurableRelationalIndexKey, &[u8]> =
                     TableDefinition::new(name.as_str());
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_physical_source(
+                    crate::writer_query_test_seams::PhysicalFamily::Posting,
+                    &read,
+                );
                 let index = read.open_table(definition).map_err(|error| {
                     E::from(self.content_identity_corruption(format!(
                         "cannot read physical index {}: {error}",
@@ -7718,6 +7792,15 @@ impl RetainedReadSource {
                 opened
             }
         };
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Posting,
+            &physical._read,
+        );
+        // Only data-page fetches belong to the targeted cold-posting observation.
+        // Transaction admission and catalog/table setup are observed separately.
+        #[cfg(feature = "test-seams")]
+        let _target_reads = crate::writer_query_test_seams::posting_operation(table, cursor);
         let index = &physical.physical;
         use std::ops::Bound::{Excluded, Included, Unbounded};
         let bounds = match (after.as_deref(), cursor.source_seek(), reverse) {
@@ -7789,6 +7872,8 @@ impl RetainedReadSource {
             let entry = entry
                 .map_err(RedbPersistence::storage_error)
                 .map_err(E::from)?;
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
             let (_, position, deleted_tx) =
                 decode_relational_index_entry(&self.database_path, Some(entry))
                     .map_err(E::from)?
@@ -7901,6 +7986,8 @@ impl RetainedReadSource {
                 &mut batch,
                 &mut before_page,
                 &mut |logical_key| {
+                    #[cfg(feature = "test-seams")]
+                    crate::writer_query_test_seams::note_target_entry(table);
                     let logical = DurableRelationalIndexKey(logical_key.to_vec())
                         .decode_canonical()
                         .map_err(|error| self.content_identity_error(error))
@@ -24064,6 +24151,10 @@ impl RedbPersistence {
                 if !key.starts_with(prefix) {
                     break;
                 }
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_enumeration(key);
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_decode(key);
                 out.push((key.to_string(), Self::decode(value.value())?));
             }
             Ok(out)
@@ -24110,8 +24201,12 @@ impl RedbPersistence {
                     more = true;
                     break;
                 }
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_enumeration(key);
                 let bytes = value.value();
                 memory.reserve(key.len().saturating_add(bytes.len()))?;
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_decode(key);
                 let decoded = memory.scope(|| Self::decode(bytes))?;
                 page.push((key.to_owned(), decoded));
             }
@@ -24154,8 +24249,12 @@ impl RedbPersistence {
                     "read_held_replay",
                     "Raise MEMORY_LIMIT before replaying this held data unit.",
                 );
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_enumeration(key);
                 let bytes = value.value();
                 memory.reserve(key.len().saturating_add(bytes.len()))?;
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_decode(key);
                 let decoded: T = memory.scope(|| Self::decode(bytes))?;
                 let Some(position) = source_lsn(&decoded) else {
                     continue;
@@ -24199,6 +24298,8 @@ impl RedbPersistence {
                 if !key.starts_with(prefix) {
                     break;
                 }
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_enumeration(key);
                 out.push((key.to_string(), value.value().to_vec()));
             }
             Ok(out)
@@ -24264,6 +24365,8 @@ impl RedbPersistence {
                 if after.is_some_and(|after| key <= after) {
                     continue;
                 }
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_enumeration(key);
                 memory.reserve(key.len())?;
                 return Ok(Some(key.to_owned()));
             }
@@ -24293,6 +24396,8 @@ impl RedbPersistence {
                 return Ok(None);
             };
             memory.reserve(value.value().len())?;
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_config_decode(key);
             memory.scope(|| Self::decode(value.value())).map(Some)
         })
     }
@@ -24318,6 +24423,8 @@ impl RedbPersistence {
                     continue;
                 };
                 memory.reserve(value.value().len())?;
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_decode(key);
                 values.push(memory.scope(|| Self::decode(value.value()))?);
             }
             Ok(values)
@@ -24357,6 +24464,8 @@ impl RedbPersistence {
                         break;
                     }
                     memory.reserve(value.value().len().saturating_add(128))?;
+                    #[cfg(feature = "test-seams")]
+                    crate::writer_query_test_seams::note_selection_entry();
                     let primary: String = memory.scope(|| Self::decode(value.value()))?;
                     keys.insert(primary);
                 }
@@ -24367,6 +24476,10 @@ impl RedbPersistence {
                     continue;
                 };
                 memory.reserve(value.value().len().saturating_add(key.len()))?;
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_enumeration(&key);
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_config_decode(&key);
                 let decoded = memory.scope(|| Self::decode(value.value()))?;
                 values.push((key, decoded));
             }
@@ -24386,7 +24499,11 @@ impl RedbPersistence {
                 Err(err) => return Err(Self::storage_error(err)),
             };
             let value = match config_table.get(key).map_err(Self::storage_error)? {
-                Some(value) => Some(Self::decode(value.value())?),
+                Some(value) => {
+                    #[cfg(feature = "test-seams")]
+                    crate::writer_query_test_seams::note_config_decode(key);
+                    Some(Self::decode(value.value())?)
+                }
                 None => None,
             };
             Ok(value)
@@ -24421,6 +24538,11 @@ impl RedbPersistence {
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Row,
+            read,
+        );
         let name = Self::rel_table_name(table);
         let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
         let relation = match read.open_table(definition) {
@@ -24434,11 +24556,27 @@ impl RedbPersistence {
             Err(error) => return Err(Self::storage_error(error)),
         };
         let (lower, upper) = Self::rel_row_key_range(row_id);
-        let mut versions = relation
-            .range(lower.as_slice()..upper.as_slice())
-            .map_err(Self::storage_error)?;
-        while let Some(entry) = versions.next_back() {
+        let mut versions = {
+            #[cfg(feature = "test-seams")]
+            let _target_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Row,
+                table,
+            );
+            relation
+                .range(lower.as_slice()..upper.as_slice())
+                .map_err(Self::storage_error)?
+        };
+        while let Some(entry) = {
+            #[cfg(feature = "test-seams")]
+            let _target_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Row,
+                table,
+            );
+            versions.next_back()
+        } {
             let (key, value) = entry.map_err(Self::storage_error)?;
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
             let row = Self::decode_relational_source_row(table, meta, value.value())?;
             if Self::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn) != key.value() {
                 return Err(Error::StoreCorrupted {
@@ -24483,10 +24621,28 @@ impl RedbPersistence {
             Err(error) => return Err(Self::storage_error(error)),
         };
         let (lower, upper) = Self::rel_row_key_range(row_id);
-        for entry in relation
-            .range(lower.as_slice()..upper.as_slice())
-            .map_err(Self::storage_error)?
-        {
+        let versions = {
+            #[cfg(feature = "test-seams")]
+            let _target_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Row,
+                table,
+            );
+            relation
+                .range(lower.as_slice()..upper.as_slice())
+                .map_err(Self::storage_error)?
+        };
+        #[cfg(feature = "test-seams")]
+        let versions = {
+            let mut versions = versions;
+            std::iter::from_fn(move || {
+                let _target_reads = crate::writer_query_test_seams::physical_operation(
+                    crate::writer_query_test_seams::PhysicalFamily::Row,
+                    table,
+                );
+                versions.next()
+            })
+        };
+        for entry in versions {
             let (key, value) = entry.map_err(Self::storage_error)?;
             let encoded_key = key.value();
             if encoded_key.len() != 24 {
@@ -24503,6 +24659,8 @@ impl RedbPersistence {
             if key_lsn != lsn.0 {
                 continue;
             }
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
             let row = Self::decode_relational_source_row(table, meta, value.value())?;
             if row.row_id != row_id
                 || row.lsn != lsn
@@ -25147,6 +25305,11 @@ impl RedbPersistence {
         expected_dimension: usize,
         quantization: Option<VectorQuantization>,
     ) -> Result<Vec<VectorEntry>> {
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Vector,
+            read_txn,
+        );
         let verifier = quantization
             .map(|_| {
                 content_identity::ContentIdentityReadVerifier::open(
@@ -26520,6 +26683,9 @@ impl RedbPersistence {
         );
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_physical_source(crate::writer_query_test_seams::PhysicalFamily::Graph, &read_txn);
+
             let table = read_txn
                 .open_byte_table_bounded(VECTOR_PARTITION_BASE_GENERATION_TABLE)
                 .map_err(|error| match error {
@@ -26948,6 +27114,10 @@ impl RedbPersistence {
             self.publish_preencoded_vector_partition_generation_catalog_in_write(
                 &write_txn, prepared,
             )?;
+            #[cfg(feature = "test-seams")]
+            crate::writer_commit_test_seams::reached(
+                crate::writer_commit_test_seams::CommitBoundary::GenerationBeforeRedb,
+            );
             write_txn.commit().map_err(Self::storage_error)
         })
     }
@@ -28243,6 +28413,8 @@ impl RedbPersistence {
                     .unwrap_or(key)
                     .parse::<u64>()
                     .map_err(|err| Error::Other(format!("invalid ddl log key: {err}")))?;
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_ddl_occurrence();
                 entries.push((Lsn(lsn), Self::decode(value.value())?));
             }
             Ok(entries)

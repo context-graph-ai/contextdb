@@ -17990,6 +17990,8 @@ impl MaintenanceContext {
                         persistence
                             .publish_prepared_vector_partition_generation_candidate(&prepared)?;
                         #[cfg(feature = "test-seams")]
+                        crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::GenerationAfterRedb);
+                        #[cfg(feature = "test-seams")]
                         if partition_state_present {
                             self.vector.observe_durable_base_publication(
                                 partition,
@@ -34581,6 +34583,8 @@ impl Database {
                 let overlap = ws.relational_inserts.iter().find_map(|(t, row)| {
                     #[cfg(feature = "in-process-test-seams")]
                     crate::writer_query_test_seams::note_constraint_staged_row();
+                    #[cfg(feature = "test-seams")]
+                    crate::writer_query_test_seams::note_target_entry(t);
                     if t != table {
                         return None;
                     }
@@ -34628,6 +34632,8 @@ impl Database {
                 .unwrap_or_default()
         };
         for entry in entries {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
             #[cfg(feature = "in-process-test-seams")]
             crate::writer_query_test_seams::note_constraint_posting();
             if let Some(sid) = skip_row_id
@@ -34733,6 +34739,8 @@ impl Database {
             }
         };
         for entry in entries {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_target_entry(table);
             if let Some(sid) = skip_row_id
                 && entry.row_id == sid
             {
@@ -34756,6 +34764,8 @@ impl Database {
         // Tx-staged inserts.
         let overlap = self.tx_mgr.with_write_set(tx, |ws| {
             for (t, row) in &ws.relational_inserts {
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_target_entry(t);
                 if t != table {
                     continue;
                 }
@@ -35468,13 +35478,18 @@ impl Database {
         }
 
         fn visible_posting(
+            #[cfg(feature = "test-seams")] table: &str,
             entries: &[contextdb_relational::IndexEntry],
             snapshot: SnapshotId,
             skip_deleted: &HashSet<RowId>,
         ) -> Option<RowId> {
             entries
                 .iter()
-                .find(|entry| !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot))
+                .find(|entry| {
+                    #[cfg(feature = "test-seams")]
+                    crate::writer_query_test_seams::note_target_entry(table);
+                    !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot)
+                })
                 .map(|entry| entry.row_id)
         }
 
@@ -35505,7 +35520,13 @@ impl Database {
                         (
                             true,
                             storage.exact_postings(&key).and_then(|entries| {
-                                visible_posting(entries, snapshot, skip_deleted)
+                                visible_posting(
+                                    #[cfg(feature = "test-seams")]
+                                    table,
+                                    entries,
+                                    snapshot,
+                                    skip_deleted,
+                                )
                             }),
                         )
                     }
@@ -35529,7 +35550,13 @@ impl Database {
                             index_key_from_values(&storage.columns[..columns.len()], values);
                         let row_id = if storage.columns.len() == columns.len() {
                             storage.exact_postings(&prefix).and_then(|entries| {
-                                visible_posting(entries, snapshot, skip_deleted)
+                                visible_posting(
+                                    #[cfg(feature = "test-seams")]
+                                    table,
+                                    entries,
+                                    snapshot,
+                                    skip_deleted,
+                                )
                             })
                         } else {
                             storage
@@ -35539,7 +35566,13 @@ impl Database {
                                     key.len() >= prefix.len() && key[..prefix.len()] == prefix[..]
                                 })
                                 .find_map(|(_, entries)| {
-                                    visible_posting(entries, snapshot, skip_deleted)
+                                    visible_posting(
+                                        #[cfg(feature = "test-seams")]
+                                        table,
+                                        entries,
+                                        snapshot,
+                                        skip_deleted,
+                                    )
                                 })
                         };
                         (true, row_id)
@@ -35714,9 +35747,11 @@ impl Database {
             stats.indexed_probes = stats.indexed_probes.saturating_add(1);
         }
         Some(storage.exact_postings(&key).is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot))
+            entries.iter().any(|entry| {
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_target_entry(table);
+                !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot)
+            })
         }))
     }
 
@@ -35791,13 +35826,18 @@ impl Database {
         }
 
         fn visible_posting(
+            #[cfg(feature = "test-seams")] table: &str,
             entries: &[contextdb_relational::IndexEntry],
             snapshot: SnapshotId,
             skip_deleted: &HashSet<RowId>,
         ) -> Option<RowId> {
             entries
                 .iter()
-                .find(|entry| !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot))
+                .find(|entry| {
+                    #[cfg(feature = "test-seams")]
+                    crate::writer_query_test_seams::note_target_entry(table);
+                    !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot)
+                })
                 .map(|entry| entry.row_id)
         }
 
@@ -35827,9 +35867,15 @@ impl Database {
             }
             let prefix = index_key_from_values(&storage.columns[..columns.len()], values);
             if storage.columns.len() == columns.len() {
-                storage
-                    .exact_postings(&prefix)
-                    .and_then(|entries| visible_posting(entries, snapshot, skip_deleted))
+                storage.exact_postings(&prefix).and_then(|entries| {
+                    visible_posting(
+                        #[cfg(feature = "test-seams")]
+                        table,
+                        entries,
+                        snapshot,
+                        skip_deleted,
+                    )
+                })
             } else {
                 storage
                     .tree
@@ -35837,7 +35883,15 @@ impl Database {
                     .take_while(|(key, _)| {
                         key.len() >= prefix.len() && key[..prefix.len()] == prefix[..]
                     })
-                    .find_map(|(_, entries)| visible_posting(entries, snapshot, skip_deleted))
+                    .find_map(|(_, entries)| {
+                        visible_posting(
+                            #[cfg(feature = "test-seams")]
+                            table,
+                            entries,
+                            snapshot,
+                            skip_deleted,
+                        )
+                    })
             }
         };
         Ok(row_id.is_some())

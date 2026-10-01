@@ -11,6 +11,8 @@ pub enum CommitBoundary {
     DuringRedbSync,
     AfterRedb,
     BeforeMemoryPublication,
+    GenerationBeforeRedb,
+    GenerationAfterRedb,
 }
 
 type Observer = Arc<dyn Fn(CommitBoundary) + Send + Sync>;

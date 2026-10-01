@@ -515,6 +515,17 @@ impl TransactionTracker {
         !self.state.lock().unwrap().live_read_transactions.is_empty()
     }
 
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn native_read_transaction_count_for_test(&self, transaction_id: u64) -> u64 {
+        self.state
+            .lock()
+            .unwrap()
+            .live_read_transactions
+            .get(&TransactionId::new(transaction_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
     // Returns the transaction id of the oldest non-durable transaction which has not been processed
     // for freeing, which has live read transactions
     pub(crate) fn oldest_live_read_nondurable_transaction(&self) -> Option<TransactionId> {
