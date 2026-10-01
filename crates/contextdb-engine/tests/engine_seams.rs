@@ -101,6 +101,8 @@ mod aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope;
 mod crash_cutpoints_recover_one_complete_row_index_vector_log_commit;
 #[path = "engine_seams/first_search_after_writer_reopen_uses_saved_pages_without_build.rs"]
 mod first_search_after_writer_reopen_uses_saved_pages_without_build;
+#[path = "engine_seams/graph_delete_seeks_only_its_edge_identity.rs"]
+mod graph_delete_seeks_only_its_edge_identity;
 
 #[path = "engine_seams/resident_history_support.rs"]
 mod resident_history_support;
