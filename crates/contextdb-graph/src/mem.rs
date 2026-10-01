@@ -1,3 +1,4 @@
+use crate::source::{GraphCursorHandle, GraphQuery, GraphReadHandle, GraphSnapshot};
 use crate::store::GraphStore;
 use contextdb_core::*;
 use contextdb_tx::{TransactionManager, WriteSetApplicator};
@@ -81,6 +82,7 @@ struct BoundedCurrentEntry {
     /// paired with the slot it occupied. A suspended continuation resumes
     /// from this identity, never from `position` alone.
     anchor: Option<AdjacencyAnchor>,
+    source_cursor: Option<GraphCursorHandle>,
 }
 
 /// Identity of one adjacency entry, owned by a suspended continuation. The
@@ -140,6 +142,7 @@ pub struct BoundedBfsCursor {
     min_depth: u32,
     max_depth: u32,
     snapshot: SnapshotId,
+    source_root: Option<GraphReadHandle>,
     // Membership does not participate in traversal order. HashSet avoids
     // sorted-vector shifting while exposing its live element capacity.
     visited: HashSet<NodeId>,
@@ -785,15 +788,71 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     }
 
     pub fn edge_count(&self, source: NodeId, edge_type: &str, snapshot: SnapshotId) -> usize {
-        let fwd = self.store.forward_adj.read();
-        fwd.get(&source)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|entry| entry.edge_type == edge_type && entry.visible_at(snapshot))
-                    .count()
-            })
-            .unwrap_or(0)
+        self.try_edge_count(source, edge_type, snapshot)
+            .expect("graph source read failed; use try_edge_count for fallible reads")
+    }
+
+    pub fn try_edge_count(
+        &self,
+        source: NodeId,
+        edge_type: &str,
+        snapshot: SnapshotId,
+    ) -> Result<usize> {
+        let root = self.store.capture_source(snapshot)?;
+        let mut count = 0;
+        self.store.visit_edges(
+            root.as_ref(),
+            GraphQuery {
+                node: source,
+                direction: Direction::Outgoing,
+                identity: None,
+            },
+            |entry| {
+                if entry.edge_type == edge_type && entry.visible_at(snapshot) {
+                    count += 1;
+                }
+                Ok(true)
+            },
+        )?;
+        Ok(count)
+    }
+
+    fn visit_neighbors(
+        &self,
+        root: Option<&Arc<dyn GraphSnapshot>>,
+        node: NodeId,
+        edge_types: Option<&[EdgeType]>,
+        direction: Direction,
+        snapshot: SnapshotId,
+        mut visit: impl FnMut(NodeId, &AdjEntry) -> Result<()>,
+    ) -> Result<()> {
+        for part in [Direction::Outgoing, Direction::Incoming] {
+            if !matches!(direction, Direction::Both) && direction != part {
+                continue;
+            }
+            self.store.visit_edges(
+                root,
+                GraphQuery {
+                    node,
+                    direction: part,
+                    identity: None,
+                },
+                |entry| {
+                    if entry.visible_at(snapshot)
+                        && edge_types.is_none_or(|types| types.contains(&entry.edge_type))
+                    {
+                        let neighbor = if matches!(part, Direction::Outgoing) {
+                            entry.target
+                        } else {
+                            entry.source
+                        };
+                        visit(neighbor, entry)?;
+                    }
+                    Ok(true)
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn bfs_with_write_set(
@@ -825,25 +884,37 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                 (inserts, deletes)
             })?;
 
+        let snapshot = self.tx_mgr.snapshot();
+        let root = self.store.capture_source(snapshot)?;
+
         while let Some(current) = queue.pop_front() {
-            {
-                let fwd = self.store.forward_adj.read();
-                if let Some(entries) = fwd.get(&current) {
-                    for e in entries {
-                        if e.edge_type != edge_type || e.deleted_tx.is_some() {
-                            continue;
-                        }
-                        if ws_deletes.contains(&(e.source, e.target)) {
-                            continue;
-                        }
-                        if e.target == goal {
-                            return Ok(true);
-                        }
-                        if visited.insert(e.target) {
-                            queue.push_back(e.target);
-                        }
+            let mut found = false;
+            self.store.visit_edges(
+                root.as_ref(),
+                GraphQuery {
+                    node: current,
+                    direction: Direction::Outgoing,
+                    identity: None,
+                },
+                |e| {
+                    if e.edge_type != edge_type
+                        || !e.visible_at(snapshot)
+                        || ws_deletes.contains(&(e.source, e.target))
+                    {
+                        return Ok(true);
                     }
-                }
+                    if e.target == goal {
+                        found = true;
+                        return Ok(false);
+                    }
+                    if visited.insert(e.target) {
+                        queue.push_back(e.target);
+                    }
+                    Ok(true)
+                },
+            )?;
+            if found {
+                return Ok(true);
             }
 
             for (src, tgt) in &ws_inserts {
@@ -872,12 +943,50 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize),
+    ) -> std::result::Result<BoundedBfsCursor, E>
+    where
+        E: From<Error>,
+    {
+        let root = self.store.capture_source(snapshot).map_err(E::from)?;
+        self.bounded_bfs_cursor_at_source(
+            start,
+            edge_types,
+            direction,
+            min_depth,
+            max_depth,
+            snapshot,
+            root,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    /// Use the root already captured by the enclosing statement. The engine
+    /// supplies the same handle used by relational and vector consumers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_bfs_cursor_at_source<E>(
+        &self,
+        start: NodeId,
+        edge_types: Option<&[EdgeType]>,
+        direction: Direction,
+        min_depth: u32,
+        max_depth: u32,
+        snapshot: SnapshotId,
+        root: Option<Arc<dyn GraphSnapshot>>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
     ) -> std::result::Result<BoundedBfsCursor, E>
     where
         E: From<Error>,
     {
+        if self.store.is_source_backed() && root.is_none() {
+            return Err(E::from(Error::Other(
+                "graph traversal requires a captured source root".into(),
+            )));
+        }
+        let source_root = root.map(GraphReadHandle);
         let (edge_types, edge_types_bytes) =
             bounded_graph_edge_types(edge_types, &mut before_retain, &mut release_retained)?;
         let (visited, visited_bytes) =
@@ -921,6 +1030,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             min_depth,
             max_depth,
             snapshot,
+            source_root,
             visited,
             queue_input,
             queue_output: None,
@@ -1020,6 +1130,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             if cursor.current.is_none() {
                 if cursor.queue_input.is_none() && cursor.queue_output.is_none() {
                     cursor.exhausted = true;
+                    cursor.source_root = None;
                     return Ok(None);
                 }
                 let queue_entry_bytes = std::mem::size_of::<BoundedQueueEntry>();
@@ -1053,6 +1164,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     phase,
                     position: 0,
                     anchor: None,
+                    source_cursor: None,
                 });
             }
 
@@ -1241,6 +1353,69 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                 )?;
                 // The record was this walk's to hold and is done being held.
                 release_retained(edge_bytes);
+                continue;
+            }
+            if let Some(root) = cursor.source_root.as_ref() {
+                before_edge()?;
+                let current = cursor.current.as_mut().ok_or_else(|| {
+                    E::from(Error::Other(
+                        "graph continuation lost its source cursor".into(),
+                    ))
+                })?;
+                if current.source_cursor.is_none() {
+                    current.source_cursor = Some(GraphCursorHandle(
+                        root.0
+                            .cursor(GraphQuery {
+                                node,
+                                direction: phase.direction(),
+                                identity: None,
+                            })
+                            .map_err(E::from)?,
+                    ));
+                }
+                let window = current
+                    .source_cursor
+                    .as_mut()
+                    .expect("source cursor installed")
+                    .0
+                    .next_edge()
+                    .map_err(E::from)?;
+                let Some(window) = window else {
+                    current.source_cursor = None;
+                    current.phase = phase.next(cursor.direction);
+                    current.position = 0;
+                    continue;
+                };
+                let entry = window.edge();
+                let type_allowed = bounded_edge_type_allowed(
+                    &cursor.edge_types,
+                    &entry.edge_type,
+                    &mut before_edge,
+                )?;
+                if !entry.visible_at(cursor.snapshot) || !type_allowed {
+                    continue;
+                }
+                let neighbor = if matches!(phase, AdjacencyPhase::Incoming) {
+                    entry.source
+                } else {
+                    entry.target
+                };
+                if !edge_allowed(neighbor, entry.source, entry.target, &entry.edge_type)? {
+                    continue;
+                }
+                entry_read();
+                self.admit_bounded_neighbor(
+                    cursor,
+                    node,
+                    neighbor,
+                    &entry.edge_type,
+                    &mut before_edge,
+                    &mut before_path_element,
+                    &mut before_retain,
+                    &mut release_retained,
+                    visited_cap,
+                )?;
+                // The admitted window is dropped before advancing or parking.
                 continue;
             }
             {
@@ -1604,10 +1779,96 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok(())
     }
 
-    /// Carry one edge forward with a new property set, as one replacement:
-    /// the occurrence that held the old properties is retired and the one
-    /// that holds the new set takes its place, so the edge is never twice
-    /// live and never briefly absent.
+    /// Traverse using the enclosing statement's pinned source root.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bfs_at_source(
+        &self,
+        start: NodeId,
+        edge_types: Option<&[EdgeType]>,
+        direction: Direction,
+        min_depth: u32,
+        max_depth: u32,
+        snapshot: SnapshotId,
+        root: Option<Arc<dyn GraphSnapshot>>,
+    ) -> Result<TraversalResult> {
+        let mut visited = HashSet::new();
+        visited.insert(start);
+
+        type BfsEntry = (NodeId, u32, Vec<(NodeId, EdgeType)>);
+        let mut queue: VecDeque<BfsEntry> = VecDeque::new();
+        queue.push_back((start, 0, vec![]));
+
+        let mut result_nodes = Vec::new();
+
+        while let Some((current, depth, path)) = queue.pop_front() {
+            if depth > 0 && depth >= min_depth {
+                result_nodes.push(TraversalNode {
+                    id: current,
+                    depth,
+                    path: path.clone(),
+                });
+            }
+
+            if depth >= max_depth {
+                continue;
+            }
+
+            self.visit_neighbors(
+                root.as_ref(),
+                current,
+                edge_types,
+                direction,
+                snapshot,
+                |neighbor_id, entry| {
+                    if !visited.insert(neighbor_id) {
+                        return Ok(());
+                    }
+                    let cap = self
+                        .bfs_visited_cap
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if visited.len() > cap {
+                        return Err(Error::BfsVisitedExceeded(cap));
+                    }
+                    let mut new_path = path.clone();
+                    new_path.push((current, entry.edge_type.clone()));
+                    queue.push_back((neighbor_id, depth + 1, new_path));
+                    Ok(())
+                },
+            )?;
+        }
+
+        Ok(TraversalResult {
+            nodes: result_nodes,
+        })
+    }
+
+    fn current_edge_properties(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        edge_type: &str,
+    ) -> Result<Option<std::collections::HashMap<String, Value>>> {
+        let snapshot = self.tx_mgr.snapshot();
+        let root = self.store.capture_source(snapshot)?;
+        let mut existing = None;
+        self.store.visit_edges(
+            root.as_ref(),
+            GraphQuery {
+                node: source,
+                direction: Direction::Outgoing,
+                identity: Some((target, edge_type)),
+            },
+            |entry| {
+                if entry.visible_at(snapshot) {
+                    existing = Some(entry.properties.clone());
+                }
+                Ok(true)
+            },
+        )?;
+        Ok(existing)
+    }
+
+    /// Carry one edge forward with a new property set, as one replacement.
     fn replace_edge_properties(
         &self,
         tx: TxId,
@@ -1654,51 +1915,10 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         max_depth: u32,
         snapshot: SnapshotId,
     ) -> Result<TraversalResult> {
-        let mut visited = HashSet::new();
-        visited.insert(start);
-
-        type BfsEntry = (NodeId, u32, Vec<(NodeId, EdgeType)>);
-        let mut queue: VecDeque<BfsEntry> = VecDeque::new();
-        queue.push_back((start, 0, vec![]));
-
-        let mut result_nodes = Vec::new();
-
-        while let Some((current, depth, path)) = queue.pop_front() {
-            if depth > 0 && depth >= min_depth {
-                result_nodes.push(TraversalNode {
-                    id: current,
-                    depth,
-                    path: path.clone(),
-                });
-            }
-
-            if depth >= max_depth {
-                continue;
-            }
-
-            let neighbors = self.neighbors(current, edge_types, direction, snapshot)?;
-            for (neighbor_id, edge_type, _) in neighbors {
-                if visited.contains(&neighbor_id) {
-                    continue;
-                }
-                visited.insert(neighbor_id);
-
-                let cap = self
-                    .bfs_visited_cap
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if visited.len() > cap {
-                    return Err(Error::BfsVisitedExceeded(cap));
-                }
-
-                let mut new_path = path.clone();
-                new_path.push((current, edge_type));
-                queue.push_back((neighbor_id, depth + 1, new_path));
-            }
-        }
-
-        Ok(TraversalResult {
-            nodes: result_nodes,
-        })
+        let root = self.store.capture_source(snapshot)?;
+        self.bfs_at_source(
+            start, edge_types, direction, min_depth, max_depth, snapshot, root,
+        )
     }
 
     fn neighbors(
@@ -1708,41 +1928,19 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         direction: Direction,
         snapshot: SnapshotId,
     ) -> Result<Vec<(NodeId, EdgeType, std::collections::HashMap<String, Value>)>> {
+        let root = self.store.capture_source(snapshot)?;
         let mut results = Vec::new();
-
-        if matches!(direction, Direction::Outgoing | Direction::Both) {
-            let fwd = self.store.forward_adj.read();
-            if let Some(entries) = fwd.get(&node) {
-                for e in entries {
-                    if !e.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&e.edge_type)
-                    {
-                        continue;
-                    }
-                    results.push((e.target, e.edge_type.clone(), e.properties.clone()));
-                }
-            }
-        }
-
-        if matches!(direction, Direction::Incoming | Direction::Both) {
-            let rev = self.store.reverse_adj.read();
-            if let Some(entries) = rev.get(&node) {
-                for e in entries {
-                    if !e.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&e.edge_type)
-                    {
-                        continue;
-                    }
-                    results.push((e.source, e.edge_type.clone(), e.properties.clone()));
-                }
-            }
-        }
+        self.visit_neighbors(
+            root.as_ref(),
+            node,
+            edge_types,
+            direction,
+            snapshot,
+            |neighbor, entry| {
+                results.push((neighbor, entry.edge_type.clone(), entry.properties.clone()));
+                Ok(())
+            },
+        )?;
 
         Ok(results)
     }
@@ -1762,18 +1960,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         })?;
 
         {
-            let existing = {
-                let fwd = self.store.forward_adj.read();
-                fwd.get(&source).and_then(|entries| {
-                    entries
-                        .iter()
-                        .rev()
-                        .find(|e| {
-                            e.target == target && e.edge_type == edge_type && e.deleted_tx.is_none()
-                        })
-                        .map(|e| e.properties.clone())
-                })
-            };
+            let existing = self.current_edge_properties(source, target, &edge_type)?;
             if let Some(existing) = existing
                 && !deleted_in_ws
             {
@@ -1843,16 +2030,24 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
     }
 
     fn delete_edge(&self, tx: TxId, source: NodeId, target: NodeId, edge_type: &str) -> Result<()> {
-        let committed_edge_exists = {
-            let fwd = self.store.forward_adj.read();
-            fwd.get(&source).is_some_and(|entries| {
-                entries.iter().any(|entry| {
-                    entry.target == target
-                        && entry.edge_type == edge_type
-                        && entry.deleted_tx.is_none()
-                })
-            })
-        };
+        let snapshot = self.tx_mgr.snapshot();
+        let root = self.store.capture_source(snapshot)?;
+        let mut committed_edge_exists = false;
+        self.store.visit_edges(
+            root.as_ref(),
+            GraphQuery {
+                node: source,
+                direction: Direction::Outgoing,
+                identity: Some((target, edge_type)),
+            },
+            |entry| {
+                if entry.visible_at(snapshot) {
+                    committed_edge_exists = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
 
         self.tx_mgr.with_write_set(tx, |ws| {
             ws.adj_inserts.retain(|entry| {
