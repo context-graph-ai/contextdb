@@ -32,6 +32,7 @@
 
 use super::*;
 use hnsw_rs::hnsw::{Point, PointIndexation};
+use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
 
@@ -47,7 +48,27 @@ pub(crate) struct HnswUnionLayer<'a> {
     /// points hold them: a row whose superseded version still sits in a
     /// sealed layer beside its current one is one row here.
     pub(crate) live_count: usize,
-    pub(crate) seed_rows: Option<&'a [u64]>,
+    pub(crate) seed_rows: Option<UnionSeedRows<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum UnionSeedRows<'a> {
+    Slice(&'a [u64]),
+    Iterator(&'a dyn Fn() -> Box<dyn Iterator<Item = u64> + 'a>),
+}
+impl<'a> UnionSeedRows<'a> {
+    fn iter(self) -> Box<dyn Iterator<Item = u64> + 'a> {
+        match self {
+            Self::Slice(rows) => Box::new(rows.iter().copied()),
+            Self::Iterator(rows) => rows(),
+        }
+    }
+    fn contains(&self, row: u64) -> bool {
+        match self {
+            Self::Slice(rows) => rows.binary_search(&row).is_ok(),
+            Self::Iterator(rows) => rows().any(|value| value == row),
+        }
+    }
 }
 
 /// One row a union search hands back, tagged with the partition and layer
@@ -110,6 +131,7 @@ pub(crate) struct HnswUnionSearchResult {
     pub(crate) budget: usize,
     pub(crate) admission_evaluations: usize,
     pub(crate) expansion_evaluations: usize,
+    pub(crate) allowed_admissions: usize,
     /// The most evaluations the walk could spend beyond opening its layers,
     /// as its first pass started.
     pub(crate) expansion_cap: usize,
@@ -125,7 +147,7 @@ struct Reached {
     row_id: RowId,
     layer: u32,
     point: PointId,
-    origin: u32,
+    origin: usize,
 }
 
 /// One kept result: the point that reached it and the logical row it is.
@@ -194,6 +216,10 @@ impl Ord for Farthest {
 /// or out of a graph held in memory -- a sealed generation on the owner route,
 /// or any partition's mutable tail.
 enum LayerGraph<'a> {
+    Durable {
+        tail: Arc<paged_builder::PagedVectorTail>,
+        reader: RefCell<Box<dyn paged_builder::PagedVectorReader>>,
+    },
     Paged {
         paged: &'a PagedHnsw,
         /// This layer's page reader and the walk's own directory of the
@@ -328,6 +354,7 @@ impl<'a> OpenLayer<'a> {
 
     fn entry(&self) -> Option<PointId> {
         match &self.graph {
+            LayerGraph::Durable { tail, .. } => tail.progress().graph.entry_point,
             LayerGraph::Paged { paged, .. } => paged.entry_point,
             LayerGraph::ResidentF32 { points, .. } => points.entry_point_id(),
             LayerGraph::ResidentQuantized { points, .. } => points.entry_point_id(),
@@ -335,8 +362,20 @@ impl<'a> OpenLayer<'a> {
     }
 
     /// The client id of one point, or `None` when the layer does not hold it.
-    fn origin(&self, point: PointId) -> Option<usize> {
-        match &self.graph {
+    fn origin<E: From<Error>, S: FnMut() -> std::result::Result<(), E>>(
+        &self,
+        point: PointId,
+        before_source: &mut S,
+    ) -> std::result::Result<Option<usize>, E> {
+        Ok(match &self.graph {
+            LayerGraph::Durable { reader, .. } => {
+                before_source()?;
+                let value = reader.borrow_mut().load_point(point).map_err(E::from)?;
+                Some(match value {
+                    paged_builder::PagedVectorPoint::F32(p) => p.origin_id,
+                    paged_builder::PagedVectorPoint::Quantized(p) => p.origin_id,
+                })
+            }
             LayerGraph::Paged { paged, .. } => paged.point(point).map(|point| point.origin_id),
             LayerGraph::ResidentF32 { points, .. } => points
                 .resident_point(&point)
@@ -344,23 +383,80 @@ impl<'a> OpenLayer<'a> {
             LayerGraph::ResidentQuantized { points, .. } => points
                 .resident_point(&point)
                 .map(|point| point.get_origin_id()),
+        })
+    }
+    fn row<E: From<Error>, S: FnMut() -> std::result::Result<(), E>>(
+        &self,
+        origin: usize,
+        before_source: &mut S,
+    ) -> std::result::Result<Option<RowId>, E> {
+        match &self.graph {
+            LayerGraph::Durable { reader, .. } => {
+                before_source()?;
+                Ok(Some(
+                    reader
+                        .borrow_mut()
+                        .identity(origin)
+                        .map_err(E::from)?
+                        .row_id,
+                ))
+            }
+            _ => Ok(self.id_to_row.get(&origin).copied()),
         }
     }
 
     /// The neighbours `point` keeps at `level`, or `None` when the layer does
     /// not hold the point or the level.
-    fn neighbours<'h, E, A>(
+    fn neighbours<'h, E, A, S>(
         &self,
         point: PointId,
         level: usize,
         scratch: &'h mut HopScratch,
         acquire: &mut A,
+        before_source: &mut S,
     ) -> std::result::Result<Option<Hops<'h>>, E>
     where
         'a: 'h,
+        E: From<Error>,
+        S: FnMut() -> std::result::Result<(), E>,
         A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
     {
         match &self.graph {
+            LayerGraph::Durable { tail, reader } => {
+                // The node decode belongs to the captured-root reader's finite
+                // admitted workspace; only this one neighbour list is copied.
+                let wanted = tail.definition().2.hnsw_m * 2;
+                if wanted > scratch.charged {
+                    acquire(HnswSearchScratchEvent::Reserve {
+                        container: HnswSearchScratchContainer::Result,
+                        previous_capacity: scratch.charged,
+                        requested_capacity: wanted,
+                        element_bytes: HopScratch::ELEMENT_BYTES,
+                    })?;
+                    scratch.charged = wanted;
+                    scratch.ids.clear();
+                    scratch.ids.reserve_exact(wanted);
+                }
+                before_source()?;
+                let value = reader.borrow_mut().load_point(point).map_err(E::from)?;
+                let neighbours = match &value {
+                    paged_builder::PagedVectorPoint::F32(p) => &p.neighbours,
+                    paged_builder::PagedVectorPoint::Quantized(p) => &p.neighbours,
+                };
+                let Some(edges) = neighbours.get(level) else {
+                    return Ok(None);
+                };
+                if edges.len() > wanted {
+                    return Err(E::from(Error::Other(
+                        "paged graph degree exceeds its policy".into(),
+                    )));
+                }
+                scratch.ids.clear();
+                scratch
+                    .ids
+                    .extend(edges.iter().map(|edge| (edge.point_id, edge.origin_id)));
+                Ok(Some(Hops::Copied(&scratch.ids)))
+            }
             LayerGraph::Paged { paged, .. } => {
                 let paged: &'a PagedHnsw = paged;
                 Ok(paged
@@ -406,6 +502,31 @@ impl<'a> OpenLayer<'a> {
         R: FnMut(HnswSearchScratchEvent),
     {
         match &mut self.graph {
+            LayerGraph::Durable { tail, reader } => {
+                before_source_entry()?;
+                let value = reader.borrow_mut().load_point(point).map_err(E::from)?;
+                before_distance()?;
+                let distance = match value {
+                    paged_builder::PagedVectorPoint::F32(point) => {
+                        hnsw_f32_distance().eval(query.values, &point.values)
+                    }
+                    paged_builder::PagedVectorPoint::Quantized(point) => DistQuantizedCosine {
+                        quantization: tail.definition().1,
+                    }
+                    .eval(
+                        query.encoded.ok_or_else(|| {
+                            E::from(Error::Other(
+                                "paged quantized graph requires an encoded query".into(),
+                            ))
+                        })?,
+                        &point.values,
+                    ),
+                };
+                if !distance.is_finite() {
+                    return Err(E::from(Error::Other("invalid paged graph distance".into())));
+                }
+                Ok(Some(distance))
+            }
             LayerGraph::Paged { paged, reader } => {
                 let Some(stored) = paged.point(point) else {
                     return Ok(None);
@@ -455,12 +576,16 @@ enum Stop {
     Limit(HnswAllowedSearchIncomplete),
 }
 
+#[derive(Default)]
+struct PointVisit {
+    marked: bool,
+    score: Option<f32>,
+}
+const VISIT_ELEMENT_BYTES: usize = std::mem::size_of::<(usize, PointVisit)>() + 1;
+
 struct Walk {
-    reached: Vec<u64>,
-    /// One score per physical point touched while admitting layers. `Some`
-    /// marks an evaluated point even if the frontier cap later drops it.
-    /// Expansion reuses that score at the same traversal step as before.
-    admission_scores: Vec<Option<f32>>,
+    reached: HashMap<usize, PointVisit>,
+    visit_buckets: usize,
     frontier: BinaryHeap<Nearest>,
     /// The most entries the frontier may ever hold: one per evaluation the
     /// budget allows, and never more than the admitted layers' points.
@@ -493,16 +618,43 @@ struct Walk {
 }
 
 impl Walk {
-    fn mark(&mut self, bit: usize) -> bool {
-        let word = bit / 64;
-        let mask = 1u64 << (bit % 64);
-        match self.reached.get_mut(word) {
-            Some(value) if *value & mask == 0 => {
-                *value |= mask;
-                true
-            }
-            _ => false,
+    fn visit_entry<
+        E: From<Error>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+    >(
+        &mut self,
+        bit: usize,
+        acquire: &mut A,
+    ) -> std::result::Result<&mut PointVisit, E> {
+        if !self.reached.contains_key(&bit) && self.reached.len() == self.reached.capacity() {
+            let wanted = self.reached.capacity().saturating_mul(2).max(4);
+            let buckets = wanted.saturating_mul(8).div_ceil(7).next_power_of_two();
+            acquire(HnswSearchScratchEvent::Reserve {
+                container: HnswSearchScratchContainer::VisitedPoints,
+                previous_capacity: self.visit_buckets,
+                requested_capacity: buckets,
+                element_bytes: VISIT_ELEMENT_BYTES,
+            })?;
+            self.visit_buckets = buckets;
+            self.reached
+                .try_reserve(wanted.saturating_sub(self.reached.len()))
+                .map_err(|_| {
+                    E::from(Error::Other(
+                        "cannot allocate admitted graph visit scratch".into(),
+                    ))
+                })?;
         }
+        Ok(self.reached.entry(bit).or_default())
+    }
+    fn mark<E: From<Error>, A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>>(
+        &mut self,
+        bit: usize,
+        acquire: &mut A,
+    ) -> std::result::Result<bool, E> {
+        let entry = self.visit_entry(bit, acquire)?;
+        let fresh = !entry.marked;
+        entry.marked = true;
+        Ok(fresh)
     }
 
     fn keep(&mut self, kept: Kept) {
@@ -674,6 +826,7 @@ impl HnswIndex {
             HnswInner::QuantizedMutable(graph) => graph.get_max_nb_connection_layer0(),
             HnswInner::QuantizedSealed(graph) => graph.get_max_nb_connection_layer0(),
             HnswInner::F32Paged(graph) => graph.layer0_max_degree,
+            HnswInner::DurablePages(_) => self.m * 2,
         }
     }
 }
@@ -708,6 +861,15 @@ where
             .collect()
     }
     Ok(Some(match &graph.hnsw {
+        HnswInner::DurablePages(handle) => {
+            let tail = Arc::clone(&handle.read());
+            if tail.progress().graph.entry_point.is_none() {
+                return Ok(None);
+            }
+            let levels = tail.progress().graph.layer_counts.to_vec();
+            let reader = RefCell::new(tail.graph_reader().map_err(E::from)?);
+            (LayerGraph::Durable { tail, reader }, levels, graph.m)
+        }
         HnswInner::F32Paged(paged) => {
             if paged.entry_point.is_none() {
                 return Ok(None);
@@ -815,6 +977,7 @@ where
         budget,
         admission_evaluations: 0,
         expansion_evaluations: 0,
+        allowed_admissions: 0,
         expansion_cap: 0,
         layers_admitted: 0,
         frontier_exhausted: true,
@@ -823,6 +986,16 @@ where
         return Ok(empty(HnswAllowedSearchStatus::Complete));
     }
 
+    // Finite per-layer controls and both sixteen-level directories are
+    // admitted before opening any root or allocating their owner vector.
+    let open_element_bytes =
+        std::mem::size_of::<OpenLayer<'_>>() + 32 * std::mem::size_of::<usize>();
+    acquire(HnswSearchScratchEvent::Reserve {
+        container: HnswSearchScratchContainer::ServingPageDirectory,
+        previous_capacity: 0,
+        requested_capacity: layers.len(),
+        element_bytes: open_element_bytes,
+    })?;
     // Open every layer: how it is read, its identity map, its seed directory.
     let mut open = Vec::<OpenLayer<'_>>::with_capacity(layers.len());
     let mut total_points = 0usize;
@@ -843,23 +1016,48 @@ where
             let partition = layer.partition;
             let mut layer_allowed = |row: RowId| is_allowed(partition, row);
             let seed_all = layer.seed_rows.is_none();
-            let seed_rows = layer.seed_rows.unwrap_or(&[]);
+            let seed_rows = || {
+                layer.seed_rows.map_or_else(
+                    || Box::new(std::iter::empty()) as Box<dyn Iterator<Item = u64>>,
+                    |rows| rows.iter(),
+                )
+            };
             if matches!(layer.graph.hnsw, HnswInner::F32Paged(ref paged) if paged.entry_point.is_none())
             {
                 continue;
             }
-            let directory = layer.graph.allowed_seed_directory(
-                k,
-                required_results.min(layer.allowed_count),
-                layer.allowed_count,
-                ef,
-                &|| seed_rows.iter().copied(),
-                seed_all,
-                &mut layer_allowed,
-                &mut before_source_entry,
-                &mut acquire,
-                &mut release,
-            )?;
+            let Some((graph, level_lens, degree)) =
+                layer_graph(layer.graph, &mut acquire, &mut directory_entries)?
+            else {
+                continue;
+            };
+            let directory = match &graph {
+                LayerGraph::Durable { tail, .. } => layer.graph.paged_seed_directory(
+                    tail,
+                    k,
+                    required_results.min(layer.allowed_count),
+                    layer.allowed_count,
+                    ef,
+                    &seed_rows,
+                    seed_all,
+                    &mut layer_allowed,
+                    &mut before_source_entry,
+                    &mut acquire,
+                    &mut release,
+                )?,
+                _ => layer.graph.allowed_seed_directory(
+                    k,
+                    required_results.min(layer.allowed_count),
+                    layer.allowed_count,
+                    ef,
+                    &seed_rows,
+                    seed_all,
+                    &mut layer_allowed,
+                    &mut before_source_entry,
+                    &mut acquire,
+                    &mut release,
+                )?,
+            };
             seed_bytes = seed_bytes.saturating_add(
                 directory
                     .points
@@ -872,12 +1070,11 @@ where
             if !seed_all && directory.supplied_seed_rows && directory.points.is_empty() {
                 continue;
             }
-            let Some((graph, level_lens, degree)) =
-                layer_graph(layer.graph, &mut acquire, &mut directory_entries)?
-            else {
-                continue;
-            };
-            if matches!(graph, LayerGraph::ResidentQuantized { .. }) && encoded_query.is_none() {
+            if (matches!(graph, LayerGraph::ResidentQuantized { .. })
+                || matches!(graph, LayerGraph::Durable { .. })
+                    && layer.graph.quantization != VectorQuantization::F32)
+                && encoded_query.is_none()
+            {
                 let mut scratch = VectorSearchScratch {
                     acquire: &mut acquire,
                     release: &mut release,
@@ -935,12 +1132,23 @@ where
     };
     if let Err(error) = opened {
         drop(open);
+        release(HnswSearchScratchEvent::Release {
+            container: HnswSearchScratchContainer::ServingPageDirectory,
+            capacity: layers.len(),
+            element_bytes: open_element_bytes,
+        });
         release_encoded(&mut acquire, &mut release, encoded_query);
         release_directories(&mut release, directory_entries);
         release_seeds(&mut release, seed_bytes);
         return Err(error);
     }
     if open.is_empty() {
+        drop(open);
+        release(HnswSearchScratchEvent::Release {
+            container: HnswSearchScratchContainer::ServingPageDirectory,
+            capacity: layers.len(),
+            element_bytes: open_element_bytes,
+        });
         release_encoded(&mut acquire, &mut release, encoded_query);
         release_directories(&mut release, directory_entries);
         release_seeds(&mut release, seed_bytes);
@@ -959,22 +1167,11 @@ where
         .min(budget.min(evaluation_cap).saturating_add(1))
         .max(1);
     let kept_capacity = ef.max(required_results).min(total_points).max(1);
-    let reached_words = total_points.div_ceil(64).max(1);
     let reservations = [
         (
             HnswSearchScratchContainer::ReturnHeap,
             kept_capacity,
             std::mem::size_of::<Farthest>(),
-        ),
-        (
-            HnswSearchScratchContainer::VisitedPoints,
-            reached_words,
-            std::mem::size_of::<u64>(),
-        ),
-        (
-            HnswSearchScratchContainer::VisitedPoints,
-            total_points,
-            std::mem::size_of::<Option<f32>>(),
         ),
         // One map entry per kept row, with the table's own control bytes and
         // its load-factor headroom.
@@ -1004,6 +1201,11 @@ where
                 });
             }
             drop(open);
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::ServingPageDirectory,
+                capacity: layers.len(),
+                element_bytes: open_element_bytes,
+            });
             release_encoded(&mut acquire, &mut release, encoded_query);
             release_directories(&mut release, directory_entries);
             release_seeds(&mut release, seed_bytes);
@@ -1011,8 +1213,8 @@ where
         }
     }
     let mut walk = Walk {
-        reached: vec![0u64; reached_words],
-        admission_scores: vec![None; total_points],
+        reached: HashMap::new(),
+        visit_buckets: 0,
         frontier: BinaryHeap::new(),
         frontier_capacity,
         frontier_charged: 0,
@@ -1050,7 +1252,9 @@ where
                 // The admitted rows did not reach each other. Walk again,
                 // navigating through excluded points, inside what is left of
                 // the same budget.
-                walk.reached.iter_mut().for_each(|word| *word = 0);
+                walk.reached
+                    .values_mut()
+                    .for_each(|entry| entry.marked = false);
                 walk.frontier.clear();
                 walk.kept.clear();
                 walk.kept_rows.clear();
@@ -1133,8 +1337,8 @@ where
             break;
         }
         let expansion_cap = expansion_cap.unwrap_or(0);
-        let status = outcome.unwrap_or(HnswAllowedSearchStatus::Complete);
-        let terminal = match status {
+        let mut status = outcome.unwrap_or(HnswAllowedSearchStatus::Complete);
+        let mut terminal = match status {
             HnswAllowedSearchStatus::Incomplete(_) => UnionTerminal::Refused,
             HnswAllowedSearchStatus::Complete if walk.kept.len() >= k => {
                 UnionTerminal::AnswerComplete
@@ -1184,24 +1388,58 @@ where
         let key = exact_key.as_deref().or(union_query.encoded);
         // The query's own score is taken only when some layer files a vector
         // equal to the query, so a search with no such row pays nothing for it.
-        let equal_vector_filed = key.is_some_and(|key| {
-            layers.iter().any(|layer| {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                key.hash(&mut hasher);
-                let fingerprint = hasher.finish().to_le_bytes();
-                let lookup_key = if matches!(layer.graph.hnsw, HnswInner::F32Paged(_)) {
-                    fingerprint.as_slice()
-                } else {
-                    key
-                };
-                layer
-                    .graph
-                    .exact_rows
-                    .read()
-                    .get(lookup_key)
-                    .is_some_and(|bucket| !bucket.is_empty())
-            })
-        });
+        let equal_vector_filed = (|| -> std::result::Result<bool, E> {
+            let mut equal_vector_filed = false;
+            if let Some(key) = key {
+                for open_layer in &open {
+                    if let LayerGraph::Durable { reader, .. } = &open_layer.graph {
+                        before_source_entry()?;
+                        if reader
+                            .borrow_mut()
+                            .exact_graph_row_after(key, None)
+                            .map_err(E::from)?
+                            .is_some()
+                        {
+                            equal_vector_filed = true;
+                            break;
+                        }
+                    } else {
+                        let graph = layers[open_layer.source_layer].graph;
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        key.hash(&mut hasher);
+                        let fingerprint = hasher.finish().to_le_bytes();
+                        let lookup = if matches!(graph.hnsw, HnswInner::F32Paged(_)) {
+                            fingerprint.as_slice()
+                        } else {
+                            key
+                        };
+                        if graph
+                            .exact_rows
+                            .read()
+                            .get(lookup)
+                            .is_some_and(|bucket| !bucket.is_empty())
+                        {
+                            equal_vector_filed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(equal_vector_filed)
+        })();
+        let equal_vector_filed = match equal_vector_filed {
+            Ok(found) => found,
+            Err(error) => {
+                if let Some(exact_key) = exact_key {
+                    VectorSearchScratch {
+                        acquire: &mut acquire,
+                        release: &mut release,
+                    }
+                    .free_vec(exact_key, HnswSearchScratchContainer::ExactKey);
+                }
+                return Err(error);
+            }
+        };
         let exact_score = if equal_vector_filed {
             match query_self_scores.score(
                 query,
@@ -1251,6 +1489,55 @@ where
             };
             for (position, layer) in layers.iter().enumerate() {
                 before_source_entry()?;
+                if let Some(open_layer) = open.iter().find(|opened| opened.source_layer == position)
+                    && let LayerGraph::Durable { reader, .. } = &open_layer.graph
+                {
+                    let mut after = None;
+                    loop {
+                        before_source_entry()?;
+                        let Some(row_id) = reader
+                            .borrow_mut()
+                            .exact_graph_row_after(key, after)
+                            .map_err(E::from)?
+                        else {
+                            break;
+                        };
+                        if after.is_some_and(|last| row_id <= last) {
+                            return Err(E::from(Error::Other(
+                                "paged exact directory did not advance".into(),
+                            )));
+                        }
+                        after = Some(row_id);
+                        if layer.seed_rows.is_some_and(|rows| !rows.contains(row_id.0))
+                            || !is_allowed(layer.partition, row_id)
+                        {
+                            continue;
+                        }
+                        if ties.len() < kept_capacity {
+                            ties.push((position, row_id))
+                        } else if let Some((worst, worst_id)) = ties
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_, (_, row))| *row)
+                            .map(|(position, (_, row))| (position, *row))
+                            && row_id < worst_id
+                        {
+                            ties[worst] = (position, row_id)
+                        }
+                        // Directory is ordered; this layer cannot improve its
+                        // retained exact ties after the global heap is full.
+                        if ties.len() == kept_capacity
+                            && ties
+                                .iter()
+                                .map(|(_, row)| *row)
+                                .max()
+                                .is_some_and(|worst| row_id >= worst)
+                        {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 let exact_rows = layer.graph.exact_rows.read();
                 if let HnswInner::F32Paged(paged) = &layer.graph.hnsw {
                     paged
@@ -1265,9 +1552,7 @@ where
                             &mut release,
                             |row_id, before_source_entry, _, _| {
                                 before_source_entry()?;
-                                if layer
-                                    .seed_rows
-                                    .is_some_and(|rows| rows.binary_search(&row_id.0).is_err())
+                                if layer.seed_rows.is_some_and(|rows| !rows.contains(row_id.0))
                                     || !is_allowed(layer.partition, row_id)
                                 {
                                     return Ok(false);
@@ -1294,10 +1579,7 @@ where
                 };
                 for row_id in bucket {
                     before_source_entry()?;
-                    if layer
-                        .seed_rows
-                        .is_some_and(|rows| rows.binary_search(&row_id.0).is_err())
-                    {
+                    if layer.seed_rows.is_some_and(|rows| !rows.contains(row_id.0)) {
                         continue;
                     }
                     if is_allowed(layer.partition, *row_id) {
@@ -1329,6 +1611,35 @@ where
             return Err(error);
         }
         ties.sort_unstable_by_key(|(_, row_id)| *row_id);
+        // An authenticated exact directory can supply rows a fragmented
+        // traversal missed. Accept its completion proof only when every
+        // authoritative allowed row is present, or enough rows have the
+        // maximum possible cosine score. Work-limit/floor refusals remain.
+        let distinct_ties = ties
+            .iter()
+            .enumerate()
+            .filter(|(ordinal, (position, row))| {
+                !ties[..*ordinal].iter().any(|(prior_position, prior_row)| {
+                    layers[*prior_position].partition == layers[*position].partition
+                        && prior_row == row
+                })
+            })
+            .count();
+        if below_floor.is_none()
+            && status
+                == HnswAllowedSearchStatus::Incomplete(
+                    HnswAllowedSearchIncomplete::InsufficientAllowedCandidates,
+                )
+            && distinct_ties >= required_results
+            && (distinct_ties >= total_allowed || exact_score.is_some_and(|score| score >= 1.0))
+        {
+            status = HnswAllowedSearchStatus::Complete;
+            terminal = if distinct_ties >= k {
+                UnionTerminal::AnswerComplete
+            } else {
+                UnionTerminal::FrontierExhausted
+            };
+        }
         let capacity = ordered.len().saturating_add(ties.len());
         if let Err(error) = acquire(HnswSearchScratchEvent::Reserve {
             container: HnswSearchScratchContainer::Result,
@@ -1392,6 +1703,7 @@ where
             budget,
             admission_evaluations,
             expansion_evaluations,
+            allowed_admissions: walk.admissions,
             expansion_cap,
             layers_admitted,
             frontier_exhausted,
@@ -1400,9 +1712,17 @@ where
 
     // Each charge goes back only once what it covers has been dropped.
     let frontier_charged = walk.frontier_charged;
+    let visit_buckets = walk.visit_buckets;
     let hops = std::mem::take(&mut walk.hops);
     let bridges = std::mem::take(&mut walk.bridges);
     drop(walk);
+    if visit_buckets != 0 {
+        release(HnswSearchScratchEvent::Release {
+            container: HnswSearchScratchContainer::VisitedPoints,
+            capacity: visit_buckets,
+            element_bytes: VISIT_ELEMENT_BYTES,
+        });
+    }
     hops.release(&mut release);
     bridges.release(&mut release);
     for (container, capacity, element_bytes) in reservations {
@@ -1420,6 +1740,11 @@ where
         });
     }
     drop(open);
+    release(HnswSearchScratchEvent::Release {
+        container: HnswSearchScratchContainer::ServingPageDirectory,
+        capacity: layers.len(),
+        element_bytes: open_element_bytes,
+    });
     release_encoded(&mut acquire, &mut release, encoded_query);
     release_directories(&mut release, directory_entries);
     release_seeds(&mut release, seed_bytes);
@@ -1456,7 +1781,7 @@ where
     let Some(bit) = layer.bit(point) else {
         return Ok(Ok(None));
     };
-    if let Some(distance) = walk.admission_scores[bit] {
+    if let Some(distance) = walk.reached.get(&bit).and_then(|entry| entry.score) {
         return Ok(Ok(Some(distance)));
     }
     if let Err(stop) = walk.charge() {
@@ -1475,7 +1800,7 @@ where
     };
     walk.visited += 1;
     walk.evaluations += 1;
-    walk.admission_scores[bit] = Some(distance);
+    walk.visit_entry(bit, acquire)?.score = Some(distance);
     Ok(Ok(Some(distance)))
 }
 
@@ -1546,14 +1871,42 @@ where
     let mut layers = 0usize;
     for (position, layer) in open.iter_mut().enumerate() {
         let partition = layer.partition;
-        let Some(entry_id) = layer.entry() else {
+        let Some(mut entry_id) = layer.entry() else {
             continue;
         };
-        let admits = |id_to_row: &HashMap<usize, RowId>, origin: usize, is_allowed: &mut F| {
-            id_to_row
-                .get(&origin)
-                .is_some_and(|row| is_allowed(partition, *row))
-        };
+        // Match the fork's stable allowed entry substitution: inspect only
+        // the oldest physical slot in each level, without evaluating excluded
+        // history or scanning the population to discover an allowed seed.
+        if !allow_bridges {
+            let origin = layer
+                .origin(entry_id, before_source_entry)?
+                .ok_or_else(|| E::from(Error::Other("graph entry identity".into())))?;
+            if !layer
+                .row(origin, before_source_entry)?
+                .is_some_and(|row| is_allowed(partition, row))
+            {
+                let mut oldest = None;
+                for (level, count) in layer.level_lens.iter().copied().enumerate() {
+                    if count == 0 {
+                        continue;
+                    }
+                    let point = PointId(level as u8, 0);
+                    let origin = layer
+                        .origin(point, before_source_entry)?
+                        .ok_or_else(|| E::from(Error::Other("graph oldest identity".into())))?;
+                    if oldest.is_none_or(|(_, prior)| origin < prior) {
+                        oldest = Some((point, origin));
+                    }
+                }
+                if let Some((point, origin)) = oldest
+                    && layer
+                        .row(origin, before_source_entry)?
+                        .is_some_and(|row| is_allowed(partition, row))
+                {
+                    entry_id = point;
+                }
+            }
+        }
         let mut pivot_id = entry_id;
         let mut pivot_distance = match score_admission(
             layer,
@@ -1578,13 +1931,23 @@ where
             loop {
                 let mut changed = false;
                 let neighbours = layer
-                    .neighbours(pivot_id, level as usize, &mut *hops, acquire)?
+                    .neighbours(
+                        pivot_id,
+                        level as usize,
+                        &mut *hops,
+                        acquire,
+                        before_source_entry,
+                    )?
                     .ok_or_else(|| {
                         E::from(Error::Other("graph admission neighbours".to_string()))
                     })?;
                 for hop in 0..neighbours.len() {
                     let (neighbour_id, neighbour_origin) = neighbours.get(hop);
-                    if !allow_bridges && !admits(&layer.id_to_row, neighbour_origin, is_allowed) {
+                    if !allow_bridges
+                        && !layer
+                            .row(neighbour_origin, before_source_entry)?
+                            .is_some_and(|row| is_allowed(partition, row))
+                    {
                         continue;
                     }
                     let distance = match score_admission(
@@ -1618,24 +1981,22 @@ where
             }
         }
         let pivot_origin = layer
-            .origin(pivot_id)
+            .origin(pivot_id, before_source_entry)?
             .ok_or_else(|| E::from(Error::Other("graph entry point".to_string())))?;
         if let Some(bit) = layer.bit(pivot_id) {
-            walk.mark(bit);
+            walk.mark(bit, acquire)?;
         }
         let reached = Reached {
             distance: pivot_distance,
             row_id: layer
-                .id_to_row
-                .get(&pivot_origin)
-                .copied()
+                .row(pivot_origin, before_source_entry)?
                 .unwrap_or(RowId(u64::MAX)),
             layer: position as u32,
             point: pivot_id,
-            origin: pivot_origin as u32,
+            origin: pivot_origin,
         };
         walk.push_frontier(reached, acquire)?;
-        if let Some(row_id) = layer.id_to_row.get(&pivot_origin).copied()
+        if let Some(row_id) = layer.row(pivot_origin, before_source_entry)?
             && is_allowed(partition, row_id)
         {
             walk.keep(Kept {
@@ -1650,17 +2011,16 @@ where
                 let Some(bit) = layer.bit(*seed) else {
                     continue;
                 };
-                if walk
-                    .reached
-                    .get(bit / 64)
-                    .is_some_and(|word| word & (1 << (bit % 64)) != 0)
-                {
+                if walk.reached.get(&bit).is_some_and(|entry| entry.marked) {
                     continue;
                 }
-                let Some(origin) = layer.origin(*seed) else {
+                let Some(origin) = layer.origin(*seed, before_source_entry)? else {
                     continue;
                 };
-                if !admits(&layer.id_to_row, origin, is_allowed) {
+                if !layer
+                    .row(origin, before_source_entry)?
+                    .is_some_and(|row| is_allowed(partition, row))
+                {
                     continue;
                 }
                 let distance = match score_admission(
@@ -1677,20 +2037,18 @@ where
                     Ok(None) => continue,
                     Err(stop) => return Ok(Some(stop)),
                 };
-                walk.mark(bit);
+                walk.mark(bit, acquire)?;
                 let reached = Reached {
                     distance,
                     row_id: layer
-                        .id_to_row
-                        .get(&origin)
-                        .copied()
+                        .row(origin, before_source_entry)?
                         .unwrap_or(RowId(u64::MAX)),
                     layer: position as u32,
                     point: *seed,
-                    origin: origin as u32,
+                    origin,
                 };
                 walk.push_frontier(reached, acquire)?;
-                if let Some(row_id) = layer.id_to_row.get(&origin).copied() {
+                if let Some(row_id) = layer.row(origin, before_source_entry)? {
                     walk.keep(Kept {
                         reached,
                         partition,
@@ -1847,14 +2205,13 @@ where
             }
             let layer = &mut open[candidate.layer as usize];
             let neighbours = layer
-                .neighbours(candidate.point, 0, &mut hops, acquire)?
+                .neighbours(candidate.point, 0, &mut hops, acquire, before_source_entry)?
                 .ok_or_else(|| E::from(Error::Other("graph layer-zero neighbours".to_string())))?;
             for hop in 0..neighbours.len() {
                 let (neighbour_id, neighbour_origin) = neighbours.get(hop);
                 let neighbour_is_allowed = layer
-                    .id_to_row
-                    .get(&neighbour_origin)
-                    .is_some_and(|row| is_allowed(layer.partition, *row));
+                    .row(neighbour_origin, before_source_entry)?
+                    .is_some_and(|row| is_allowed(layer.partition, row));
                 if let Some(stop) = consider(
                     layer,
                     candidate.layer as usize,
@@ -1878,7 +2235,13 @@ where
                 }
                 // The excluded neighbour is where the admitted points stop
                 // reaching each other. Step through it once, as navigation.
-                let Some(bridge_hops) = layer.neighbours(neighbour_id, 0, &mut bridges, acquire)?
+                let Some(bridge_hops) = layer.neighbours(
+                    neighbour_id,
+                    0,
+                    &mut bridges,
+                    acquire,
+                    before_source_entry,
+                )?
                 else {
                     continue;
                 };
@@ -1942,17 +2305,13 @@ where
     let Some(bit) = layer.bit(point_id) else {
         return Ok(None);
     };
-    if walk
-        .reached
-        .get(bit / 64)
-        .is_none_or(|word| word & (1 << (bit % 64)) != 0)
-    {
+    if walk.reached.get(&bit).is_some_and(|entry| entry.marked) {
         return Ok(None);
     }
-    let Some(origin) = layer.origin(point_id) else {
+    let Some(origin) = layer.origin(point_id, before_source_entry)? else {
         return Ok(None);
     };
-    let row_id = layer.id_to_row.get(&origin).copied();
+    let row_id = layer.row(origin, before_source_entry)?;
     let admitted = row_id.is_some_and(|row| is_allowed(layer.partition, row));
     if !allow_bridges && !admitted {
         #[cfg(feature = "test-seams")]
@@ -1961,7 +2320,7 @@ where
         }
         return Ok(None);
     }
-    let distance = if let Some(distance) = walk.admission_scores[bit] {
+    let distance = if let Some(distance) = walk.reached.get(&bit).and_then(|entry| entry.score) {
         distance
     } else {
         if let Err(stop) = walk.charge() {
@@ -1982,13 +2341,13 @@ where
         walk.evaluations += 1;
         distance
     };
-    walk.mark(bit);
+    walk.mark(bit, acquire)?;
     let reached = Reached {
         distance,
         row_id: row_id.unwrap_or(RowId(u64::MAX)),
         layer: position as u32,
         point: point_id,
-        origin: origin as u32,
+        origin,
     };
     walk.push_frontier(reached, acquire)?;
     if admitted && let Some(row_id) = row_id {
@@ -2072,8 +2431,8 @@ mod canonical_tie_tests {
     #[test]
     fn a_full_result_heap_replaces_larger_row_ids_at_equal_distance() {
         let mut walk = Walk {
-            reached: Vec::new(),
-            admission_scores: Vec::new(),
+            reached: HashMap::new(),
+            visit_buckets: 0,
             frontier: BinaryHeap::new(),
             frontier_capacity: 0,
             frontier_charged: 0,
@@ -2101,7 +2460,7 @@ mod canonical_tie_tests {
                     row_id: RowId(row_id),
                     layer: partition as u32,
                     point: PointId(0, row_id as i32),
-                    origin: row_id as u32,
+                    origin: row_id as usize,
                 },
                 partition,
                 row_id: RowId(row_id),
@@ -2119,7 +2478,7 @@ mod canonical_tie_tests {
             row_id: RowId(row_id),
             layer: 0,
             point: PointId(0, row_id as i32),
-            origin: row_id as u32,
+            origin: row_id as usize,
         };
         assert!(!walk.frontier_is_farther_than_kept(reached(1.0, 4), 3));
         assert!(!walk.frontier_is_farther_than_kept(reached(1.0, 2), 3));
@@ -2141,13 +2500,13 @@ mod canonical_tie_tests {
             row_id: RowId(row_id),
             layer: 0,
             point: PointId(0, row_id as i32),
-            origin: row_id as u32,
+            origin: row_id as usize,
         };
         let mut observed = Vec::new();
         for breadth in [32_usize, 64, 128, 256] {
             let mut walk = Walk {
-                reached: Vec::new(),
-                admission_scores: Vec::new(),
+                reached: HashMap::new(),
+                visit_buckets: 0,
                 frontier: BinaryHeap::new(),
                 frontier_capacity: 0,
                 frontier_charged: 0,

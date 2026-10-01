@@ -9,8 +9,8 @@ pub use membership::{
 
 use crate::hnsw::ServingPages;
 use crate::hnsw::paged_builder::{
-    PagedGenerationBuilder, PagedGenerationPersistence, PagedVectorBatchPlan, PagedVectorPhase,
-    PagedVectorProgress,
+    PagedBuilderProgress, PagedGenerationBuilder, PagedGenerationPersistence, PagedVectorBatchPlan,
+    PagedVectorPhase, PagedVectorProgress, PagedVectorTail,
 };
 use crate::memory_budget::{MemoryBudget, VectorWorkspaceReservation};
 use crate::{HnswIndex, quantized::StoredVectorEntry};
@@ -18,9 +18,7 @@ use contextdb_core::{
     Error, Lsn, Result, RowId, SnapshotId, TxId, VectorEntry, VectorIndexRef, VectorPartitionKey,
     VectorQuantization, VectorSearchMode,
 };
-#[cfg(any(test, feature = "test-seams"))]
-use parking_lot::Condvar;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -914,9 +912,13 @@ pub(crate) struct SnapshotCompatibleLayer<'s> {
     len: usize,
 }
 
+#[allow(clippy::large_enum_variant)] // Captured root wrapper stays inside the charged layer vector.
 enum HeldLayer<'s> {
     Sealed(SealedHnswGeneration),
     Tail(parking_lot::MappedRwLockReadGuard<'s, HnswIndex>),
+    /// A paged tail holds a captured immutable root and needs no graph lock
+    /// while a reader admits pages or executes statement callbacks.
+    PagedTail(HnswIndex),
     /// A tail whose search has finished. Its lock is given back before the
     /// statement resolves its candidates, because resolving reads the
     /// partition under its publication lock, and a publication waiting for
@@ -924,12 +926,23 @@ enum HeldLayer<'s> {
     Released,
 }
 
+impl HeldLayer<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Sealed(generation) => generation.graph().len(),
+            Self::Tail(graph) => graph.len(),
+            Self::PagedTail(graph) => graph.len(),
+            Self::Released => 0,
+        }
+    }
+}
 impl SnapshotCompatibleLayer<'_> {
     /// The layer's graph, while the search holds it.
     pub(crate) fn graph(&self) -> Option<&HnswIndex> {
         match &self.held {
             HeldLayer::Sealed(sealed) => Some(sealed.graph()),
             HeldLayer::Tail(tail) => Some(tail),
+            HeldLayer::PagedTail(tail) => Some(tail),
             HeldLayer::Released => None,
         }
     }
@@ -1559,6 +1572,112 @@ impl std::fmt::Debug for SealedPageScoring {
     }
 }
 
+#[derive(Default)]
+struct PagedBuildSlot {
+    pending: Option<(PagedGenerationBuilder, PagedVectorBatchPlan)>,
+    in_flight: bool,
+    invalidating: bool,
+    progress: Option<Arc<PagedBuilderProgress>>,
+}
+impl PagedBuildSlot {
+    fn active(&self) -> bool {
+        self.pending.is_some() || self.in_flight || self.invalidating
+    }
+}
+/// Move the finite operation out before admission or persistence callbacks.
+/// On failure/panic Drop restores its last committed descriptor. Neither the
+/// partition publication lock nor the slot mutex crosses a callback boundary.
+struct PagedBuildOperation {
+    state: Arc<IndexState>,
+    work: Option<(PagedGenerationBuilder, PagedVectorBatchPlan)>,
+    cleanup: bool,
+    finished: bool,
+    invalidating: bool,
+}
+impl PagedBuildOperation {
+    fn take(state: Arc<IndexState>, cleanup: bool) -> Result<Option<Self>> {
+        let mut slot = if cleanup {
+            state.paged_reclaimer.lock()
+        } else {
+            state.paged_builder.lock()
+        };
+        if slot.in_flight || slot.invalidating {
+            return Err(Error::Other(
+                "paged generation operation is already active".into(),
+            ));
+        }
+        let Some(work) = slot.pending.take() else {
+            return Ok(None);
+        };
+        slot.progress = Some(work.0.progress_snapshot());
+        slot.in_flight = true;
+        drop(slot);
+        Ok(Some(Self {
+            state,
+            work: Some(work),
+            cleanup,
+            finished: false,
+            invalidating: false,
+        }))
+    }
+    fn take_for_abandon(state: Arc<IndexState>) -> Result<Self> {
+        let mut slot = state.paged_builder.lock();
+        if slot.invalidating {
+            return Err(Error::Other(
+                "paged build invalidation is already active".into(),
+            ));
+        }
+        slot.invalidating = true;
+        // Quarantine the slot before waiting. The running operation returns
+        // its last committed state, but no maintenance or registration can
+        // use it before the durable abandon fence completes. No engine gate
+        // may be held by this caller; the persistence callback owns that gate.
+        while slot.in_flight {
+            state.paged_build_finished.wait(&mut slot);
+        }
+        let Some(work) = slot.pending.take() else {
+            slot.invalidating = false;
+            return Err(Error::Other(
+                "paged vector builder is not registered".into(),
+            ));
+        };
+        slot.progress = Some(work.0.progress_snapshot());
+        slot.in_flight = true;
+        drop(slot);
+        Ok(Self {
+            state,
+            work: Some(work),
+            cleanup: false,
+            finished: false,
+            invalidating: true,
+        })
+    }
+    fn work(&mut self) -> &mut (PagedGenerationBuilder, PagedVectorBatchPlan) {
+        self.work.as_mut().expect("owned paged operation")
+    }
+}
+impl Drop for PagedBuildOperation {
+    fn drop(&mut self) {
+        let mut slot = if self.cleanup {
+            self.state.paged_reclaimer.lock()
+        } else {
+            self.state.paged_builder.lock()
+        };
+        slot.in_flight = false;
+        if self.finished {
+            slot.progress = None;
+        } else if let Some(work) = self.work.take() {
+            slot.progress = Some(work.0.progress_snapshot());
+            slot.pending = Some(work);
+        }
+        if self.invalidating {
+            slot.invalidating = false;
+        }
+        drop(slot);
+        self.state.paged_build_finished.notify_all();
+    }
+}
+
 pub struct IndexState {
     dimension: usize,
     quantization: VectorQuantization,
@@ -1566,7 +1685,10 @@ pub struct IndexState {
     /// Serializes builders for this partition without making foreground
     /// publication wait for graph construction.
     maintenance_build: Mutex<()>,
-    paged_builder: Mutex<Option<(PagedGenerationBuilder, PagedVectorBatchPlan)>>,
+    paged_builder: Mutex<PagedBuildSlot>,
+    paged_build_finished: Condvar,
+    paged_reclaimer: Mutex<PagedBuildSlot>,
+    paged_storage: AtomicBool,
     vectors: RwLock<PartitionVectors>,
     raw_directory: RwLock<Vec<RawVectorDirectoryEntry>>,
     #[cfg(test)]
@@ -1697,7 +1819,10 @@ impl IndexState {
             quantization,
             maintenance: Mutex::new(()),
             maintenance_build: Mutex::new(()),
-            paged_builder: Mutex::new(None),
+            paged_builder: Mutex::new(PagedBuildSlot::default()),
+            paged_build_finished: Condvar::new(),
+            paged_reclaimer: Mutex::new(PagedBuildSlot::default()),
+            paged_storage: AtomicBool::new(false),
             vectors: RwLock::new(PartitionVectors::default()),
             raw_directory: RwLock::new(Vec::new()),
             #[cfg(test)]
@@ -5113,6 +5238,14 @@ impl IndexState {
                     tail.as_ref().filter(|tail| !tail.is_empty())
                 })
                 .ok()
+                .map(|graph| {
+                    if let Some(root) = graph.paged_tail_snapshot() {
+                        drop(graph);
+                        HeldLayer::PagedTail(HnswIndex::from_paged_root(root))
+                    } else {
+                        HeldLayer::Tail(graph)
+                    }
+                })
             })
         };
         let Some(location) = Self::selected_chain_location(&sealed, snapshot_tx) else {
@@ -5140,7 +5273,7 @@ impl IndexState {
                 VectorGraphLayerAvailability::Ready,
                 vec![SnapshotCompatibleLayer {
                     identity: None,
-                    held: HeldLayer::Tail(tail),
+                    held: tail,
                     len,
                 }],
             );
@@ -5174,7 +5307,7 @@ impl IndexState {
             let len = tail.len();
             layers.push(SnapshotCompatibleLayer {
                 identity: None,
-                held: HeldLayer::Tail(tail),
+                held: tail,
                 len,
             });
         }
@@ -5281,75 +5414,14 @@ impl IndexState {
                 }
             }
         }
-        let publication = self.generation_publication.lock();
-        let sealed = self.sealed_hnsw.read();
-        if sealed.quarantine.is_some() {
-            return Ok((VectorGraphLayerAvailability::Unavailable, Vec::new()));
-        }
-        let location = Self::selected_chain_location(&sealed, snapshot_tx);
-        let Some(location) = location else {
-            let tail = self.hnsw.get().map(|tail| tail.read());
-            let tail_only = sealed.base.is_none()
-                && sealed.dormant_base.is_none()
-                && sealed.change.is_none()
-                && sealed.dormant_change.is_none()
-                && self.serving_policy().is_some()
-                && !self.maintenance_sample_active.load(Ordering::SeqCst)
-                && self.max_tx() <= snapshot_tx;
-            let Some(tail_graph) = tail
-                .as_ref()
-                .and_then(|tail| tail.as_ref())
-                .filter(|tail| tail_only && !tail.is_empty())
-            else {
-                return Ok((VectorGraphLayerAvailability::Unavailable, Vec::new()));
-            };
-            drop(sealed);
-            drop(publication);
-            #[cfg(any(test, feature = "test-seams"))]
-            if let Some(slot) = self.graph_callback_pause.lock().clone() {
-                slot.pause_after(0);
+        let (availability, layers) = self.snapshot_compatible_owned_layers(snapshot);
+        let mut results = Vec::with_capacity(layers.len());
+        for layer in &layers {
+            if let Some(graph) = layer.graph() {
+                results.push((layer.identity, visit(graph)?));
             }
-            return Ok((
-                VectorGraphLayerAvailability::Ready,
-                vec![(None, visit(tail_graph)?)],
-            ));
-        };
-        let (base, change, include_tail) =
-            match Self::selected_chain_layers(&sealed, location, snapshot_tx) {
-                Ok(layers) => layers,
-                Err(availability) => return Ok((availability, Vec::new())),
-            };
-        // Sealed generations are immutable and carry their reservation in a
-        // shared owner. Clone the selected chain while it is registered, then
-        // release the registry before arbitrary query callbacks run. A
-        // concurrent replacement can publish immediately, while the old
-        // graph and its charge remain alive until this search drops its clone.
-        drop(sealed);
-        let tail = if include_tail {
-            self.hnsw.get().map(|tail| tail.read())
-        } else {
-            None
-        };
-        drop(publication);
-        let mut results = Vec::with_capacity(
-            1usize
-                .saturating_add(usize::from(change.is_some()))
-                .saturating_add(usize::from(
-                    include_tail && tail.as_ref().is_some_and(|tail| tail.is_some()),
-                )),
-        );
-        #[cfg(any(test, feature = "test-seams"))]
-        if let Some(slot) = self.graph_callback_pause.lock().clone() {
-            slot.pause_after(0);
         }
-        results.push((Some(base.identity), visit(base.graph())?));
-        if let Some(change) = change {
-            results.push((Some(change.identity), visit(change.graph())?));
-        }
-        if include_tail && let Some(tail) = tail.as_ref().and_then(|tail| tail.as_ref()) {
-            results.push((None, visit(tail)?));
-        }
-        Ok((VectorGraphLayerAvailability::Ready, results))
+        Ok((availability, results))
     }
 
     pub fn raw_hnsw_search(
@@ -8428,6 +8500,9 @@ impl VectorStore {
         state: &Arc<IndexState>,
         layout: &VectorIndexLayout,
     ) -> Option<(ResolvedVectorPolicy, &'static str)> {
+        if state.paged_storage.load(Ordering::SeqCst) {
+            return None;
+        }
         let info = Self::partition_info_snapshot(index, partition_key, state, layout);
         let need = layout.maintenance_need(&info);
         if let Some((sample_tx, _)) = state.sampled_maintenance_frontier() {
@@ -8685,33 +8760,79 @@ impl VectorStore {
         plan: PagedVectorBatchPlan,
         accountant: Arc<dyn MemoryBudget>,
     ) -> Result<()> {
+        self.register_paged_operation(partition, progress, persistence, plan, accountant, false)
+    }
+    /// Reopen a retired durable cleanup record independently of the pending
+    /// replacement builder. The engine inventory owns retired identities; this
+    /// partition retains at most one finite cleanup operation at a time.
+    #[doc(hidden)]
+    pub fn register_partition_paged_reclaimer(
+        &self,
+        partition: &VectorPartitionRef,
+        progress: PagedVectorProgress,
+        persistence: Arc<dyn PagedGenerationPersistence>,
+        plan: PagedVectorBatchPlan,
+        accountant: Arc<dyn MemoryBudget>,
+    ) -> Result<()> {
+        if !matches!(
+            progress.phase,
+            PagedVectorPhase::Published
+                | PagedVectorPhase::Abandoned
+                | PagedVectorPhase::Reclaiming
+        ) {
+            return Err(Error::Other(
+                "cleanup requires a retired published generation".into(),
+            ));
+        }
+        self.register_paged_operation(partition, progress, persistence, plan, accountant, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn register_paged_operation(
+        &self,
+        partition: &VectorPartitionRef,
+        progress: PagedVectorProgress,
+        persistence: Arc<dyn PagedGenerationPersistence>,
+        plan: PagedVectorBatchPlan,
+        accountant: Arc<dyn MemoryBudget>,
+        cleanup: bool,
+    ) -> Result<()> {
+        let state = self.partition_state(&partition.index, &partition.partition_key)?;
+        let policy = self
+            .index_layout(&partition.index)?
+            .resolve_policy(progress.total_points, 1);
+        let builder = PagedGenerationBuilder::resume_for_partition(
+            partition,
+            progress,
+            policy,
+            state.dimension,
+            state.quantization,
+            persistence,
+            accountant,
+            Arc::clone(&self.workspace_bytes),
+        )?;
         self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self.partition_state(&partition.index, &partition.partition_key)?;
-            let policy = self
-                .index_layout(&partition.index)?
-                .resolve_policy(progress.total_points, 1);
-            let builder = PagedGenerationBuilder::resume(
-                partition.clone(),
-                progress,
-                policy,
-                state.dimension,
-                state.quantization,
-                persistence,
-                accountant,
-                Arc::clone(&self.workspace_bytes),
-            )?;
-            let mut slot = state.paged_builder.lock();
-            if slot.is_some() {
+            let current = self.partition_state(&partition.index, &partition.partition_key)?;
+            if !Arc::ptr_eq(&state, &current) {
                 return Err(Error::Other(
-                    "paged vector builder is already registered".into(),
+                    "paged generation partition changed during registration".into(),
                 ));
             }
-            *slot = Some((builder, plan));
+            let mut slot = if cleanup {
+                state.paged_reclaimer.lock()
+            } else {
+                state.paged_builder.lock()
+            };
+            if slot.active() {
+                return Err(Error::Other(
+                    "paged generation operation is already registered".into(),
+                ));
+            }
+            slot.progress = Some(builder.progress_snapshot());
+            slot.pending = Some((builder, plan));
+            state.paged_storage.store(true, Ordering::SeqCst);
             Ok(())
         })
     }
-
-    /// Snapshot the small durable progress descriptor without reading nodes.
     #[doc(hidden)]
     pub fn partition_paged_build_progress(
         &self,
@@ -8719,54 +8840,179 @@ impl VectorStore {
     ) -> Option<PagedVectorProgress> {
         self.try_partition_state(&partition.index, &partition.partition_key)
             .and_then(|state| {
-                state
-                    .paged_builder
-                    .lock()
+                let slot = state.paged_builder.lock();
+                slot.pending
                     .as_ref()
                     .map(|(builder, _)| builder.progress().clone())
+                    .or_else(|| slot.progress.as_ref().map(|progress| (***progress).clone()))
             })
     }
-
-    /// The engine supplies verified suffix coverage under its commit gate.
-    /// This transaction publishes only a fully encoded generation. Serving
-    /// descriptor installation uses the engine's existing publication boundary.
+    /// Complete storage publication under the engine's commit gate, then
+    /// release the pending-build slot. Serving roots are installed through
+    /// install_loaded_sealed_generation / publish_replacement_base_generation;
+    /// retired cleanup records remain in the engine's durable inventory.
     #[doc(hidden)]
     pub fn publish_partition_paged_build(
         &self,
         partition: &VectorPartitionRef,
         through_lsn: Lsn,
         checkpoint: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<()> {
-        self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self.partition_state(&partition.index, &partition.partition_key)?;
-            let mut slot = state.paged_builder.lock();
-            let (builder, plan) = slot
-                .as_mut()
-                .ok_or_else(|| Error::Other("paged vector builder is not registered".into()))?;
-            builder.publish(through_lsn, *plan, checkpoint)
-        })
+    ) -> Result<PagedVectorProgress> {
+        let state = self.partition_state(&partition.index, &partition.partition_key)?;
+        let mut operation = PagedBuildOperation::take(state, false)?
+            .ok_or_else(|| Error::Other("paged vector builder is not registered".into()))?;
+        let (builder, plan) = operation.work();
+        builder.publish(through_lsn, *plan, checkpoint)?;
+        let progress = builder.progress().clone();
+        operation.finished = true;
+        Ok(progress)
     }
-
-    /// Explicit finite cleanup after the engine establishes snapshot and
-    /// external-reader floors. The persistence transaction revalidates them.
+    /// Invalidate an obsolete pinned frontier through the engine's explicit
+    /// durable abandon fence, freeing the build slot for a new frontier.
+    /// Cleanup can resume independently from the returned inventory record.
+    /// Call outside the engine commit gate: an in-flight finite batch finishes
+    /// before the persistence callback acquires that gate for the abandon CAS.
+    #[doc(hidden)]
+    pub fn abandon_partition_paged_build(
+        &self,
+        partition: &VectorPartitionRef,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<PagedVectorProgress> {
+        let state = self.partition_state(&partition.index, &partition.partition_key)?;
+        let mut operation = PagedBuildOperation::take_for_abandon(state)?;
+        let (builder, plan) = operation.work();
+        builder.abandon(*plan, checkpoint)?;
+        let progress = builder.progress().clone();
+        operation.finished = true;
+        Ok(progress)
+    }
     #[doc(hidden)]
     pub fn reclaim_partition_paged_build(
         &self,
         partition: &VectorPartitionRef,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<usize> {
+        let state = self.partition_state(&partition.index, &partition.partition_key)?;
+        let mut operation = PagedBuildOperation::take(state, true)?
+            .ok_or_else(|| Error::Other("paged vector reclaimer is not registered".into()))?;
+        let (builder, plan) = operation.work();
+        let removed = builder.reclaim(*plan, checkpoint)?;
+        operation.finished = builder.progress().phase == PagedVectorPhase::Reclaimed;
+        Ok(removed)
+    }
+    /// Install a captured-root fresh tail before enabling ordinary writer
+    /// maintenance. Admission precedes the short state publication boundary.
+    #[doc(hidden)]
+    pub fn install_partition_paged_tail(
+        &self,
+        partition: &VectorPartitionRef,
+        tail: PagedVectorTail,
+        accountant: Arc<dyn MemoryBudget>,
+    ) -> Result<()> {
+        let state = self.partition_state(&partition.index, &partition.partition_key)?;
+        let (dimension, quantization, policy) = tail.definition();
+        if tail.partition() != partition
+            || dimension != state.dimension
+            || quantization != state.quantization
+        {
+            return Err(Error::Other(
+                "paged tail declaration does not match its partition".into(),
+            ));
+        }
+        let through_lsn = tail.progress().frontier_lsn;
+        let graph = HnswIndex::from_paged_tail(tail);
+        let bytes = graph.estimated_resident_bytes();
+        accountant.try_allocate_for(
+            bytes,
+            "vector_index",
+            "install_paged_vector_tail",
+            "release idle serving pages",
+        )?;
+        let mut charge = RetainedMemoryCharge {
+            bytes,
+            accountant: Arc::clone(&accountant),
+        };
         self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
-            let state = self.partition_state(&partition.index, &partition.partition_key)?;
-            let mut slot = state.paged_builder.lock();
-            let (builder, plan) = slot
-                .as_mut()
-                .ok_or_else(|| Error::Other("paged vector builder is not registered".into()))?;
-            let removed = builder.reclaim(*plan, checkpoint)?;
-            if builder.progress().phase == PagedVectorPhase::Reclaimed {
-                slot.take();
+            let current = self.partition_state(&partition.index, &partition.partition_key)?;
+            if !Arc::ptr_eq(&state, &current) {
+                return Err(Error::Other(
+                    "paged tail partition changed during installation".into(),
+                ));
             }
-            Ok(removed)
+            let _publication = state.generation_publication.lock();
+            let old_bytes = state.remove_hnsw_graph();
+            let old_accountant = state.hnsw_accountant.write().take();
+            *state.hnsw.get_or_init(|| RwLock::new(None)).write() = Some(graph);
+            state.hnsw_bytes.store(bytes, Ordering::SeqCst);
+            *state.hnsw_accountant.write() = Some(accountant);
+            state.paged_storage.store(true, Ordering::SeqCst);
+            state.set_serving_policy(policy);
+            state
+                .fresh_tail_replayed_through_lsn
+                .store(through_lsn.0, Ordering::SeqCst);
+            state
+                .fresh_tail_replay_frontier_active
+                .store(true, Ordering::SeqCst);
+            state.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
+            charge.bytes = 0;
+            drop(_publication);
+            if let Some(accountant) = old_accountant {
+                accountant.release(old_bytes)
+            }
+            Ok(())
         })
+    }
+    /// The callback must commit row bodies/MVCC, journal, graph pages and the
+    /// successor root together. No vector registry/publication lock is held
+    /// during admission or that callback. The engine serializes this operation
+    /// with DDL/purge and ordinary commits using its existing commit gate.
+    #[doc(hidden)]
+    pub fn append_partition_paged_tail(
+        &self,
+        partition: &VectorPartitionRef,
+        entries: &[VectorEntry],
+        plan: PagedVectorBatchPlan,
+    ) -> Result<()> {
+        let state = self.partition_state(&partition.index, &partition.partition_key)?;
+        let tail = state
+            .hnsw
+            .get()
+            .and_then(|lock| {
+                lock.read()
+                    .as_ref()
+                    .and_then(HnswIndex::paged_tail_snapshot)
+            })
+            .ok_or_else(|| Error::Other("paged vector tail is not installed".into()))?;
+        let mut next = (*tail).clone();
+        next.append(entries, plan)?;
+        let _publication = state.generation_publication.lock();
+        let current = self
+            .try_partition_state(&partition.index, &partition.partition_key)
+            .ok_or_else(|| Error::Other("paged tail partition retired during commit".into()))?;
+        if !Arc::ptr_eq(&state, &current) {
+            return Err(Error::Other(
+                "paged tail partition changed outside the engine commit gate".into(),
+            ));
+        }
+        let lock = state.hnsw.get().expect("installed tail");
+        let mut graph = lock.write();
+        let graph = graph.as_mut().ok_or_else(|| {
+            Error::Other("paged tail removed outside the engine commit gate".into())
+        })?;
+        graph.publish_paged_tail_root(&tail, next)?;
+        let through_lsn = entries
+            .iter()
+            .map(|entry| entry.lsn.0)
+            .max()
+            .unwrap_or(tail.progress().frontier_lsn.0);
+        state
+            .fresh_tail_replayed_through_lsn
+            .store(through_lsn, Ordering::SeqCst);
+        state
+            .fresh_tail_mutated_through_lsn
+            .store(through_lsn, Ordering::SeqCst);
+        state.fresh_tail_revision.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Advance every needy partition in one finite sampled cycle. Queries do
@@ -8796,7 +9042,7 @@ impl VectorStore {
             if let Some(column) = self.try_column(index) {
                 for (key, state) in column.partition_snapshots() {
                     let layout = column.layout();
-                    if state.paged_builder.lock().is_some()
+                    if state.paged_builder.lock().active()
                         || Self::in_memory_maintenance_request(index, &key, &state, &layout)
                             .is_some()
                     {
@@ -8819,13 +9065,24 @@ impl VectorStore {
         let mut built_indexes = HashSet::new();
         let mut first_failure_details = None;
         for partition in pending {
-            let paged_step = self
-                .try_partition_state(&partition.index, &partition.partition_key)
-                .and_then(|state| {
-                    let mut slot = state.paged_builder.lock();
-                    let (builder, plan) = slot.as_mut()?;
-                    Some(builder.step(*plan, checkpoint).map(|()| false))
-                });
+            let paged_step = if let Some(state) =
+                self.try_partition_state(&partition.index, &partition.partition_key)
+            {
+                if state.paged_builder.lock().in_flight {
+                    Some(Ok(false))
+                } else {
+                    match PagedBuildOperation::take(state, false) {
+                        Ok(Some(mut operation)) => {
+                            let (builder, plan) = operation.work();
+                            Some(builder.step(*plan, checkpoint).map(|()| false))
+                        }
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                }
+            } else {
+                None
+            };
             let did_build = if let Some(result) = paged_step {
                 result
             } else {

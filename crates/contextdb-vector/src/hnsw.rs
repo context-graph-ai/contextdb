@@ -20,7 +20,7 @@ use std::sync::{Arc, Weak};
 
 pub mod paged_builder;
 mod unfiltered;
-mod union;
+pub(crate) mod union;
 pub use union::UnionTerminal;
 #[cfg(feature = "test-seams")]
 pub(crate) use union::record_union_search;
@@ -104,6 +104,7 @@ enum HnswInner {
     QuantizedMutable(Hnsw<'static, u8, DistQuantizedCosine>),
     QuantizedSealed(LoadedHnsw<u8, DistQuantizedCosine>),
     F32Paged(PagedHnsw),
+    DurablePages(RwLock<Arc<paged_builder::PagedVectorTail>>),
 }
 
 /// Snapshot-bound source for immutable graph point values. Implementations
@@ -3165,6 +3166,72 @@ pub struct HnswGraphStats {
 }
 
 impl HnswIndex {
+    /// Install a root-bound paged graph. Its topology and lookup directories
+    /// remain in durable point pages; the three legacy maps stay empty.
+    pub fn from_paged_tail(tail: paged_builder::PagedVectorTail) -> Self {
+        Self::from_paged_root(Arc::new(tail))
+    }
+    pub(crate) fn from_paged_root(tail: Arc<paged_builder::PagedVectorTail>) -> Self {
+        let (dimension, quantization, policy) = tail.definition();
+        Self {
+            hnsw: HnswInner::DurablePages(RwLock::new(tail)),
+            id_to_row: RwLock::new(HashMap::new()),
+            row_to_point: RwLock::new(BTreeMap::new()),
+            exact_rows: RwLock::new(HashMap::new()),
+            next_id: AtomicUsize::new(0),
+            build_serial: NEXT_HNSW_BUILD_SERIAL.fetch_add(1, Ordering::Relaxed) as u64,
+            dimension,
+            quantization,
+            m: policy.hnsw_m,
+            ef_construction: policy.hnsw_ef_construction,
+            ef_search: policy.hnsw_ef_search,
+        }
+    }
+    pub(crate) fn paged_tail_snapshot(&self) -> Option<Arc<paged_builder::PagedVectorTail>> {
+        match &self.hnsw {
+            HnswInner::DurablePages(tail) => Some(Arc::clone(&tail.read())),
+            _ => None,
+        }
+    }
+    pub(crate) fn publish_paged_tail_root(
+        &self,
+        previous: &Arc<paged_builder::PagedVectorTail>,
+        next: paged_builder::PagedVectorTail,
+    ) -> Result<()> {
+        let HnswInner::DurablePages(tail) = &self.hnsw else {
+            return Err(Error::Other("graph no longer uses paged pages".into()));
+        };
+        let mut current = tail.write();
+        if !Arc::ptr_eq(&current, previous) {
+            return Err(Error::Other(
+                "paged graph changed outside serialized row publication".into(),
+            ));
+        }
+        *current = Arc::new(next);
+        Ok(())
+    }
+    /// Row persistence commits its pages before swapping this small root
+    /// pointer. Searches already holding the preceding Arc keep their view.
+    pub fn append_paged_tail(
+        &self,
+        entries: &[VectorEntry],
+        plan: paged_builder::PagedVectorBatchPlan,
+    ) -> Result<()> {
+        let HnswInner::DurablePages(tail) = &self.hnsw else {
+            return Err(Error::Other("graph does not use a paged tail".into()));
+        };
+        let previous = Arc::clone(&tail.read());
+        let mut next = (*previous).clone();
+        next.append(entries, plan)?;
+        let mut current = tail.write();
+        if !Arc::ptr_eq(&current, &previous) {
+            return Err(Error::Other(
+                "paged graph root changed outside serialized row publication".into(),
+            ));
+        }
+        *current = Arc::new(next);
+        Ok(())
+    }
     /// Build a fresh mutable graph with the caller's resolved column policy.
     /// Restart uses this for the journal suffix after a sealed generation.
     #[doc(hidden)]
@@ -3318,7 +3385,10 @@ impl HnswIndex {
                     progress(inserted_count)?;
                 }
             }
-            HnswInner::F32Sealed(_) | HnswInner::QuantizedSealed(_) | HnswInner::F32Paged(_) => {
+            HnswInner::F32Sealed(_)
+            | HnswInner::QuantizedSealed(_)
+            | HnswInner::F32Paged(_)
+            | HnswInner::DurablePages(_) => {
                 unreachable!("a freshly constructed HNSW graph is always mutable")
             }
         }
@@ -3350,6 +3420,11 @@ impl HnswIndex {
         entry: &StoredVectorEntry,
         additional_inserts: usize,
     ) -> Result<PreparedHnswInsertion> {
+        if matches!(self.hnsw, HnswInner::DurablePages(_)) {
+            return Err(Error::Other(
+                "paged tail insertion requires the row transaction callback".into(),
+            ));
+        }
         if entry.deleted_tx.is_some() {
             return Err(Error::Other(
                 "cannot insert a deleted vector into a mutable HNSW graph".to_string(),
@@ -3582,7 +3657,10 @@ impl HnswIndex {
         match &self.hnsw {
             HnswInner::F32Mutable(graph) => encode_owned_graph_into(graph, &mut envelope),
             HnswInner::QuantizedMutable(graph) => encode_owned_graph_into(graph, &mut envelope),
-            HnswInner::F32Sealed(_) | HnswInner::QuantizedSealed(_) | HnswInner::F32Paged(_) => {
+            HnswInner::F32Sealed(_)
+            | HnswInner::QuantizedSealed(_)
+            | HnswInner::F32Paged(_)
+            | HnswInner::DurablePages(_) => {
                 return Err(Error::Other(
                     "a sealed durable HNSW graph is already a generation and cannot be re-encoded"
                         .to_string(),
@@ -3759,7 +3837,10 @@ impl HnswIndex {
         let graph_points = match &hnsw {
             HnswInner::F32Sealed(graph) => graph.get_nb_point(),
             HnswInner::QuantizedSealed(graph) => graph.get_nb_point(),
-            HnswInner::F32Mutable(_) | HnswInner::QuantizedMutable(_) | HnswInner::F32Paged(_) => {
+            HnswInner::F32Mutable(_)
+            | HnswInner::QuantizedMutable(_)
+            | HnswInner::F32Paged(_)
+            | HnswInner::DurablePages(_) => {
                 unreachable!()
             }
         };
@@ -3777,7 +3858,10 @@ impl HnswIndex {
                 .get_point_indexation()
                 .into_iter()
                 .all(|point| id_to_row.contains_key(&point.get_origin_id())),
-            HnswInner::F32Mutable(_) | HnswInner::QuantizedMutable(_) | HnswInner::F32Paged(_) => {
+            HnswInner::F32Mutable(_)
+            | HnswInner::QuantizedMutable(_)
+            | HnswInner::F32Paged(_)
+            | HnswInner::DurablePages(_) => {
                 unreachable!()
             }
         };
@@ -4509,7 +4593,10 @@ impl HnswIndex {
 
     /// Number of vectors currently indexed in the HNSW graph.
     pub fn len(&self) -> usize {
-        self.next_id.load(Ordering::Acquire)
+        match &self.hnsw {
+            HnswInner::DurablePages(tail) => tail.read().len(),
+            _ => self.next_id.load(Ordering::Acquire),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -4585,6 +4672,8 @@ impl HnswIndex {
     pub fn estimated_resident_bytes(&self) -> usize {
         match &self.hnsw {
             HnswInner::F32Paged(graph) => graph.resident_bytes.load(Ordering::SeqCst),
+            // Tail/source controls carry a separate final-holder receipt.
+            HnswInner::DurablePages(_) => std::mem::size_of::<Self>(),
             _ => Self::estimated_resident_bytes_with_m(
                 self.len(),
                 self.dimension,
@@ -4653,6 +4742,19 @@ impl HnswIndex {
     #[doc(hidden)]
     pub fn graph_stats(&self) -> HnswGraphStats {
         let (point_count, layer0_neighbor_edges, max_level_observed) = match &self.hnsw {
+            HnswInner::DurablePages(tail) => {
+                let tail = tail.read();
+                let graph = &tail.progress().graph;
+                (
+                    graph.points,
+                    graph.layer0_edges,
+                    graph
+                        .layer_counts
+                        .iter()
+                        .rposition(|count| *count != 0)
+                        .unwrap_or(0) as u8,
+                )
+            }
             HnswInner::F32Mutable(hnsw) => hnsw_stats(hnsw),
             HnswInner::F32Sealed(hnsw) => hnsw_loaded_stats(hnsw),
             HnswInner::QuantizedMutable(hnsw) => hnsw_stats(hnsw),
@@ -4712,7 +4814,7 @@ impl HnswIndex {
                     crate::quantized::quantized_hnsw_query_score(stored, query, self.quantization)
                 })
                 .flatten(),
-            HnswInner::F32Paged(_) => None,
+            HnswInner::F32Paged(_) | HnswInner::DurablePages(_) => None,
         }
     }
 
@@ -4745,8 +4847,38 @@ impl HnswIndex {
             });
         }
 
+        if matches!(self.hnsw, HnswInner::DurablePages(_)) {
+            let mut scores = BoundedHnswQuerySelfScores::new(query);
+            let result = self.search_durable_union(
+                index,
+                query,
+                k,
+                self.len(),
+                HnswAllowedSearchLimits {
+                    max_visited_nodes: usize::MAX,
+                    max_vector_evaluations: usize::MAX,
+                },
+                ef_search,
+                &mut scores,
+                std::iter::empty,
+                true,
+                |_| true,
+                || Ok::<(), Error>(()),
+                || Ok::<(), Error>(()),
+                |_| Ok::<(), Error>(()),
+                |_| {},
+            )?;
+            if matches!(result.status, HnswAllowedSearchStatus::Incomplete(_)) {
+                drop(result.rows);
+                return Err(Error::VectorIndexedRouteUnavailable {
+                    index: index.clone(),
+                });
+            }
+            return Ok(result.rows);
+        }
         let ef = hnsw_search_ef(ef_search, k);
         let neighbors = match &self.hnsw {
+            HnswInner::DurablePages(_) => unreachable!("paged union dispatched above"),
             HnswInner::F32Mutable(hnsw) => {
                 search_resident_f32(
                     hnsw.get_point_indexation(),
@@ -4962,6 +5094,41 @@ impl HnswIndex {
             }));
         }
 
+        if matches!(self.hnsw, HnswInner::DurablePages(_)) {
+            let result = self.search_durable_union(
+                index,
+                query,
+                k,
+                self.len(),
+                HnswAllowedSearchLimits {
+                    max_visited_nodes: usize::MAX,
+                    max_vector_evaluations: usize::MAX,
+                },
+                ef_search,
+                query_self_scores,
+                std::iter::empty,
+                true,
+                |_| true,
+                before_source_entry,
+                before_distance,
+                &mut acquire,
+                &mut release,
+            )?;
+            if matches!(result.status, HnswAllowedSearchStatus::Incomplete(_)) {
+                VectorSearchScratch {
+                    acquire: &mut acquire,
+                    release: &mut release,
+                }
+                .free_vec(result.rows, HnswSearchScratchContainer::Result);
+                return Err(E::from(Error::VectorIndexedRouteUnavailable {
+                    index: index.clone(),
+                }));
+            }
+            return Ok(HnswSearchMemoryResult {
+                rows: result.rows,
+                retained_bytes: result.retained_bytes,
+            });
+        }
         let ef = hnsw_search_ef(ef_search, k);
         let mut encoded_query = None;
         if matches!(
@@ -4979,6 +5146,7 @@ impl HnswIndex {
             )?);
         }
         let searched = match &self.hnsw {
+            HnswInner::DurablePages(_) => unreachable!("paged union dispatched above"),
             HnswInner::F32Mutable(hnsw) => search_resident_f32(
                 hnsw.get_point_indexation(),
                 hnsw.get_distance(),
@@ -5468,6 +5636,283 @@ impl HnswIndex {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn paged_seed_directory<E, S, A, R, F, I>(
+        &self,
+        tail: &paged_builder::PagedVectorTail,
+        k: usize,
+        mut required_results: usize,
+        allowed_count: usize,
+        ef: usize,
+        seed_rows: &impl Fn() -> I,
+        seed_all: bool,
+        is_allowed: &mut F,
+        before_source_entry: &mut S,
+        acquire: &mut A,
+        release: &mut R,
+    ) -> std::result::Result<AllowedSeedDirectory, E>
+    where
+        I: Iterator<Item = u64>,
+        E: From<Error>,
+        S: FnMut() -> std::result::Result<(), E>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
+        F: FnMut(RowId) -> bool,
+    {
+        let mut reader = tail.graph_reader().map_err(E::from)?;
+        before_source_entry()?;
+        let bounds = reader.row_bounds().map_err(E::from)?;
+        let count = bounds.map_or(0, |(_, _, count)| count);
+        let mut layer_allowed_count = allowed_count.min(count);
+        let mut points = Vec::new();
+        let mut supplied_seed_rows = false;
+        let result = (|| -> std::result::Result<(), E> {
+            let mut scratch = VectorSearchScratch {
+                acquire: &mut *acquire,
+                release: &mut *release,
+            };
+            if seed_all {
+                let capacity = dispersed_seed_budget(required_results, allowed_count, count, ef);
+                scratch.ensure_vec_capacity(
+                    &mut points,
+                    HnswSearchScratchContainer::Result,
+                    capacity,
+                    "paged graph seed directory",
+                    &mut *before_source_entry,
+                )?;
+                if let Some((first, last, _)) = bounds {
+                    let mut next = first;
+                    let inspected = if count <= ef { count } else { capacity };
+                    for slot in 0..inspected {
+                        if points.len() == capacity {
+                            break;
+                        }
+                        before_source_entry()?;
+                        let raw = if count <= ef {
+                            next.0
+                        } else {
+                            (first.0 as u128
+                                + (last.0 - first.0) as u128 * slot as u128
+                                    / capacity.saturating_sub(1).max(1) as u128)
+                                as u64
+                        };
+                        let Some((row, point)) =
+                            reader.point_at_or_after(RowId(raw)).map_err(E::from)?
+                        else {
+                            break;
+                        };
+                        if is_allowed(row) && !points.contains(&point) {
+                            points.push(point);
+                        }
+                        if row.0 == u64::MAX {
+                            break;
+                        }
+                        next = RowId(row.0 + 1);
+                    }
+                }
+            } else {
+                let mut members = 0;
+                for raw in seed_rows() {
+                    supplied_seed_rows = true;
+                    before_source_entry()?;
+                    if reader
+                        .graph_point_for_row(RowId(raw))
+                        .map_err(E::from)?
+                        .is_some()
+                        && is_allowed(RowId(raw))
+                    {
+                        members += 1;
+                    }
+                }
+                if supplied_seed_rows {
+                    layer_allowed_count = members;
+                    required_results = k.min(members);
+                }
+                let capacity = ef.min(members);
+                scratch.ensure_vec_capacity(
+                    &mut points,
+                    HnswSearchScratchContainer::Result,
+                    capacity,
+                    "paged graph seed directory",
+                    &mut *before_source_entry,
+                )?;
+                let mut selected = 0;
+                for raw in seed_rows() {
+                    if points.len() == capacity {
+                        break;
+                    }
+                    before_source_entry()?;
+                    let Some(point) = reader.graph_point_for_row(RowId(raw)).map_err(E::from)?
+                    else {
+                        continue;
+                    };
+                    if !is_allowed(RowId(raw)) {
+                        continue;
+                    }
+                    let next = (points.len() as u128 * members as u128 / capacity as u128) as usize;
+                    if selected == next {
+                        points.push(point)
+                    }
+                    selected += 1;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            VectorSearchScratch { acquire, release }
+                .free_vec(points, HnswSearchScratchContainer::Result);
+            return Err(error);
+        }
+        Ok(AllowedSeedDirectory {
+            points,
+            layer_allowed_count,
+            required_results,
+            supplied_seed_rows,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_durable_union<E, S, D, A, R, F, I>(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        allowed_count: usize,
+        limits: HnswAllowedSearchLimits,
+        ef_search: usize,
+        query_self_scores: &mut BoundedHnswQuerySelfScores<'_>,
+        seed_rows: impl Fn() -> I,
+        seed_all: bool,
+        mut is_allowed: F,
+        mut before_source: S,
+        mut before_distance: D,
+        mut acquire: A,
+        mut release: R,
+    ) -> std::result::Result<HnswAllowedSearchMemoryResult, E>
+    where
+        I: Iterator<Item = u64>,
+        E: From<Error>,
+        S: FnMut() -> std::result::Result<(), E>,
+        D: FnMut() -> std::result::Result<(), E>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
+        F: FnMut(RowId) -> bool,
+    {
+        if query.len() != self.dimension {
+            return Err(E::from(Error::VectorIndexDimensionMismatch {
+                index: index.clone(),
+                expected: self.dimension,
+                actual: query.len(),
+            }));
+        }
+        let seed_factory = || Box::new(seed_rows()) as Box<dyn Iterator<Item = u64>>;
+        let tail = self
+            .paged_tail_snapshot()
+            .ok_or_else(|| E::from(Error::Other("paged graph root missing".into())))?;
+        let frozen = Self::from_paged_root(Arc::clone(&tail));
+        let layers = [HnswUnionLayer {
+            graph: &frozen,
+            partition: 0,
+            allowed_count,
+            live_count: allowed_count,
+            seed_rows: if seed_all {
+                None
+            } else {
+                Some(union::UnionSeedRows::Iterator(&seed_factory))
+            },
+        }];
+        let result = search_union_allowed_bounded(
+            &layers,
+            query,
+            k,
+            ef_search,
+            union_candidate_budget(ef_search, k, self.layer0_max_degree()),
+            limits,
+            true,
+            false,
+            query_self_scores,
+            |_, row| is_allowed(row),
+            |_, _, _, _| Ok(None),
+            &mut before_source,
+            &mut before_distance,
+            &mut acquire,
+            &mut release,
+        )?;
+        let mut rows = Vec::new();
+        let mapped = (|| -> std::result::Result<(), E> {
+            let mut scratch = VectorSearchScratch {
+                acquire: &mut acquire,
+                release: &mut release,
+            };
+            scratch.ensure_vec_capacity(
+                &mut rows,
+                HnswSearchScratchContainer::Result,
+                result.candidates.len(),
+                "paged graph results",
+                &mut before_source,
+            )?;
+            let mut reader = tail.graph_reader().map_err(E::from)?;
+            for candidate in &result.candidates {
+                let score = if let Some(score) = candidate.resolved_score {
+                    score
+                } else {
+                    before_source()?;
+                    let point = reader
+                        .graph_point_for_row(candidate.row_id)
+                        .map_err(E::from)?
+                        .ok_or_else(|| {
+                            E::from(Error::Other("paged result row missing its point".into()))
+                        })?;
+                    before_source()?;
+                    let stored = reader.load_point(point).map_err(E::from)?;
+                    before_distance()?;
+                    match stored {
+                        paged_builder::PagedVectorPoint::F32(p) => {
+                            crate::cosine_similarity(&p.values, query)
+                        }
+                        paged_builder::PagedVectorPoint::Quantized(p) => {
+                            crate::quantized::quantized_hnsw_query_score(
+                                &p.values,
+                                query,
+                                self.quantization,
+                            )
+                            .ok_or_else(|| {
+                                E::from(Error::Other("invalid paged quantized point".into()))
+                            })?
+                        }
+                    }
+                };
+                rows.push((candidate.row_id, score));
+            }
+            rows.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            rows.dedup_by_key(|row| row.0);
+            rows.truncate(hnsw_search_candidate_cap(ef_search, k));
+            Ok(())
+        })();
+        VectorSearchScratch {
+            acquire: &mut acquire,
+            release: &mut release,
+        }
+        .free_vec(result.candidates, HnswSearchScratchContainer::Result);
+        if let Err(error) = mapped {
+            VectorSearchScratch {
+                acquire: &mut acquire,
+                release: &mut release,
+            }
+            .free_vec(rows, HnswSearchScratchContainer::Result);
+            return Err(error);
+        }
+        let retained_bytes = rows.capacity() * std::mem::size_of::<(RowId, f32)>();
+        Ok(HnswAllowedSearchMemoryResult {
+            rows,
+            retained_bytes,
+            status: result.status,
+            visited_nodes: result.admission_evaluations + result.expansion_evaluations,
+            vector_evaluations: result.admission_evaluations + result.expansion_evaluations,
+            allowed_admissions: result.allowed_admissions,
+        })
+    }
+
     /// The seed directory an allowed-row walk starts from, beside the graph's
     /// own entry point: bounded, dispersed rows of the whole directory when
     /// every row may be admitted, or evenly spaced eligible rows of an explicit
@@ -5495,6 +5940,21 @@ impl HnswIndex {
         R: FnMut(HnswSearchScratchEvent),
         F: FnMut(RowId) -> bool,
     {
+        if let Some(tail) = self.paged_tail_snapshot() {
+            return self.paged_seed_directory(
+                &tail,
+                k,
+                required_results,
+                allowed_count,
+                ef,
+                seed_rows,
+                seed_all,
+                is_allowed,
+                before_source_entry,
+                acquire,
+                release,
+            );
+        }
         let mut required_results = required_results;
         let mut seed_points = Vec::new();
         let mut supplied_seed_rows = false;
@@ -5645,6 +6105,24 @@ impl HnswIndex {
         R: FnMut(HnswSearchScratchEvent),
         F: FnMut(RowId) -> bool,
     {
+        if matches!(self.hnsw, HnswInner::DurablePages(_)) {
+            return self.search_durable_union(
+                index,
+                query,
+                k,
+                allowed_count,
+                limits,
+                ef_search,
+                query_self_scores,
+                seed_rows,
+                seed_all,
+                is_allowed,
+                before_source_entry,
+                before_distance,
+                acquire,
+                release,
+            );
+        }
         let required_results = k.min(allowed_count);
         let candidate_capacity = hnsw_search_ef(ef_search, k);
         if required_results == 0 {
@@ -5733,6 +6211,7 @@ impl HnswIndex {
             });
         }
         let searched = match &self.hnsw {
+            HnswInner::DurablePages(_) => unreachable!("paged union dispatched above"),
             HnswInner::F32Mutable(hnsw) => hnsw.search_allowed_with_bounded_control(
                 query,
                 required_results,
@@ -6125,6 +6604,52 @@ impl HnswIndex {
             HnswInner::QuantizedMutable(hnsw) => hnsw_topology_digest(hnsw),
             HnswInner::QuantizedSealed(hnsw) => hnsw_loaded_topology_digest(hnsw),
             HnswInner::F32Paged(hnsw) => paged_topology_digest(hnsw),
+            HnswInner::DurablePages(_) => {
+                let tail = self.paged_tail_snapshot().expect("paged root");
+                let mut reader = tail.graph_reader().expect("verified reader");
+                let graph = &tail.progress().graph;
+                let mut digest = 0xcbf2_9ce4_8422_2325u64;
+                digest_u64(&mut digest, graph.points as u64);
+                digest_u64(&mut digest, graph.layer_counts.len() as u64);
+                digest_u64(
+                    &mut digest,
+                    graph
+                        .layer_counts
+                        .iter()
+                        .rposition(|count| *count != 0)
+                        .unwrap_or(0) as u64,
+                );
+                for (level, count) in graph.layer_counts.iter().enumerate() {
+                    digest_u64(&mut digest, level as u64);
+                    for rank in 0..*count {
+                        let point = reader
+                            .load_point(PointId(level as u8, rank as i32))
+                            .expect("verified point");
+                        let (origin, id, neighbours) = match &point {
+                            paged_builder::PagedVectorPoint::F32(point) => {
+                                (point.origin_id, point.id, &point.neighbours)
+                            }
+                            paged_builder::PagedVectorPoint::Quantized(point) => {
+                                (point.origin_id, point.id, &point.neighbours)
+                            }
+                        };
+                        digest_u64(&mut digest, origin as u64);
+                        digest_u64(&mut digest, id.0 as u64);
+                        digest_i32(&mut digest, id.1);
+                        for (level, edges) in neighbours.iter().enumerate() {
+                            digest_u64(&mut digest, level as u64);
+                            digest_u64(&mut digest, edges.len() as u64);
+                            for edge in edges {
+                                digest_u64(&mut digest, edge.origin_id as u64);
+                                digest_u64(&mut digest, edge.distance.to_bits() as u64);
+                                digest_u64(&mut digest, edge.point_id.0 as u64);
+                                digest_i32(&mut digest, edge.point_id.1);
+                            }
+                        }
+                    }
+                }
+                digest
+            }
         }
     }
 }
@@ -6800,7 +7325,8 @@ mod tests {
                 HnswInner::QuantizedMutable(graph) => encode_owned_graph(graph),
                 HnswInner::F32Sealed(_)
                 | HnswInner::QuantizedSealed(_)
-                | HnswInner::F32Paged(_) => {
+                | HnswInner::F32Paged(_)
+                | HnswInner::DurablePages(_) => {
                     return Err(Error::Other(
                         "a sealed durable HNSW graph is already a generation and cannot be re-encoded"
                             .to_string(),

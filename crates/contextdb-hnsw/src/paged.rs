@@ -64,6 +64,7 @@ pub struct PagedGraphState {
     pub layer_counts: [usize; NB_LAYER_MAX as usize],
     pub entry_point: Option<PointId>,
     pub points: usize,
+    pub layer0_edges: usize,
 }
 impl PagedGraphState {
     pub fn new(seed: u64) -> Self {
@@ -73,6 +74,7 @@ impl PagedGraphState {
             layer_counts: [0; NB_LAYER_MAX as usize],
             entry_point: None,
             points: 0,
+            layer0_edges: 0,
         }
     }
     fn next_level(&mut self, m: usize, max_layer: usize) -> usize {
@@ -123,6 +125,39 @@ pub trait PagedPointStorage<T> {
     }
     fn before_visit(&mut self) -> Result<(), Self::Error> {
         self.checkpoint()
+    }
+    /// Filtered serving charges admitted points to the statement's visit and
+    /// distance limits. Excluded history remains cancellation/read-budget
+    /// checked while it provides graph bridges. Construction uses the ordinary
+    /// hooks above and is unaffected by allowed membership.
+    fn before_allowed_visit(&mut self, origin: usize) -> Result<(), Self::Error> {
+        if self.is_allowed(origin)? {
+            self.before_visit()
+        } else {
+            self.checkpoint()
+        }
+    }
+    fn before_allowed_distance(&mut self, origin: usize) -> Result<(), Self::Error> {
+        if self.is_allowed(origin)? {
+            self.before_distance()
+        } else {
+            self.checkpoint()
+        }
+    }
+    /// Search-local spill storage. Providers may place the visited identities
+    /// and pending priority queue in transaction-local pages. Returning None
+    /// keeps the finite in-memory implementation for small resident adapters.
+    fn begin_search_scratch(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn visit_search_scratch(&mut self, _id: PointId) -> Result<Option<bool>, Self::Error> {
+        Ok(None)
+    }
+    fn push_search_candidate(&mut self, _edge: PagedEdge) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+    fn pop_search_candidate(&mut self) -> Result<Option<Option<PagedEdge>>, Self::Error> {
+        Ok(None)
     }
     /// Allowed-set admission affects retained results, while navigation may
     /// pass through excluded nodes. Construction uses unfiltered traversal.
@@ -249,6 +284,45 @@ fn distance<T: Send + Sync, D: Distance<T>, E>(
     Ok(value)
 }
 
+fn visit_search<T, S: PagedPointStorage<T>>(
+    storage: &mut S,
+    workspace: &mut PagedGraphWorkspace,
+    id: PointId,
+    allowed_origin: Option<usize>,
+) -> Result<bool, PagedGraphError<S::Error>> {
+    let fresh = match storage.visit_search_scratch(id)? {
+        Some(fresh) => fresh,
+        None => workspace.visit(id)?,
+    };
+    if fresh {
+        if let Some(origin) = allowed_origin {
+            storage.before_allowed_visit(origin)?;
+        } else {
+            storage.before_visit()?;
+        }
+    }
+    Ok(fresh)
+}
+fn push_search<T, S: PagedPointStorage<T>>(
+    storage: &mut S,
+    workspace: &mut PagedGraphWorkspace,
+    edge: PagedEdge,
+) -> Result<(), PagedGraphError<S::Error>> {
+    if !storage.push_search_candidate(edge)? {
+        PagedGraphWorkspace::push(workspace.capacity, &mut workspace.candidates, edge)?;
+    }
+    Ok(())
+}
+fn pop_search<T, S: PagedPointStorage<T>>(
+    storage: &mut S,
+    workspace: &mut PagedGraphWorkspace,
+) -> Result<Option<PagedEdge>, PagedGraphError<S::Error>> {
+    Ok(match storage.pop_search_candidate()? {
+        Some(edge) => edge,
+        None => workspace.candidates.pop(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn search_layer<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
     storage: &mut S,
@@ -260,8 +334,10 @@ fn search_layer<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
     ef: usize,
     layer: usize,
     metric: &D,
+    allowed_work: bool,
 ) -> Result<(), PagedGraphError<S::Error>> {
     workspace.clear_search();
+    storage.begin_search_scratch()?;
     if state.layer_counts[layer] == 0 {
         return Ok(());
     }
@@ -272,42 +348,59 @@ fn search_layer<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
     let first = PagedEdge {
         point_id: pivot,
         origin_id: entry.origin_id,
-        distance: measured_distance(storage, metric, values, &entry.values)?,
+        distance: measured_search_distance(
+            storage,
+            metric,
+            values,
+            &entry.values,
+            entry.origin_id,
+            allowed_work,
+        )?,
     };
-    storage.before_visit()?;
-    workspace.visit(pivot)?;
-    PagedGraphWorkspace::push(
-        workspace.capacity,
-        &mut workspace.candidates,
-        first.reversed(),
+    visit_search(
+        storage,
+        workspace,
+        pivot,
+        allowed_work.then_some(entry.origin_id),
     )?;
+    push_search(storage, workspace, first.reversed())?;
     PagedGraphWorkspace::push(workspace.capacity, &mut workspace.results, first)?;
-    while let Some(candidate) = workspace.candidates.pop() {
+    while let Some(candidate) = pop_search(storage, workspace)? {
         if -candidate.distance > workspace.results.peek().unwrap().distance {
             break;
         }
         let point = load(storage, candidate.point_id, policy)?;
         for edge in point.neighbours.get(layer).into_iter().flatten() {
-            if workspace.visited.contains(&edge.point_id) {
-                continue;
-            }
-            storage.before_visit()?;
-            if !workspace.visit(edge.point_id)? {
-                continue;
-            }
-            let neighbour = load(storage, edge.point_id, policy)?;
-            let score = measured_distance(storage, metric, values, &neighbour.values)?;
+            let neighbour = if allowed_work {
+                if workspace.visited.contains(&edge.point_id) {
+                    continue;
+                }
+                let point = load(storage, edge.point_id, policy)?;
+                if !visit_search(storage, workspace, edge.point_id, Some(point.origin_id))? {
+                    continue;
+                }
+                point
+            } else {
+                if !visit_search(storage, workspace, edge.point_id, None)? {
+                    continue;
+                }
+                load(storage, edge.point_id, policy)?
+            };
+            let score = measured_search_distance(
+                storage,
+                metric,
+                values,
+                &neighbour.values,
+                neighbour.origin_id,
+                allowed_work,
+            )?;
             if score < workspace.results.peek().unwrap().distance || workspace.results.len() < ef {
                 let scored = PagedEdge {
                     point_id: edge.point_id,
                     origin_id: neighbour.origin_id,
                     distance: score,
                 };
-                PagedGraphWorkspace::push(
-                    workspace.capacity,
-                    &mut workspace.candidates,
-                    scored.reversed(),
-                )?;
+                push_search(storage, workspace, scored.reversed())?;
                 // Remove first when full: the just-admitted node must be better
                 // than the current farthest, so this preserves heap semantics.
                 if workspace.results.len() >= ef {
@@ -467,6 +560,7 @@ pub fn insert_paged<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
             1,
             layer,
             metric,
+            false,
         )?;
         if let Some(edge) = workspace.results.pop() {
             new_point.neighbours[layer].push(edge);
@@ -487,6 +581,7 @@ pub fn insert_paged<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
             policy.ef_construction,
             layer,
             metric,
+            false,
         )?;
         workspace.candidates.clear();
         while let Some(edge) = workspace.results.pop() {
@@ -515,6 +610,10 @@ pub fn insert_paged<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
         }
     }
     storage.store_point(&new_point)?;
+    successor.layer0_edges = successor
+        .layer0_edges
+        .checked_add(new_point.neighbours[0].len())
+        .ok_or(PagedGraphError::InvalidState)?;
     for layer in (0..=level).rev() {
         for edge in &new_point.neighbours[layer] {
             if edge.point_id == id {
@@ -527,6 +626,7 @@ pub fn insert_paged<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
             if point.neighbours[layer].iter().any(|e| e.point_id == id) {
                 continue;
             }
+            let prior_degree = point.neighbours[layer].len();
             workspace.candidates.clear();
             for old in &point.neighbours[layer] {
                 PagedGraphWorkspace::push(
@@ -564,6 +664,13 @@ pub fn insert_paged<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
                 });
             }
             point.neighbours[layer].sort_unstable();
+            if layer == 0 {
+                successor.layer0_edges = successor
+                    .layer0_edges
+                    .checked_add(point.neighbours[layer].len())
+                    .and_then(|n| n.checked_sub(prior_degree))
+                    .ok_or(PagedGraphError::InvalidState)?;
+            }
             storage.store_point(&point)?;
         }
     }
@@ -593,14 +700,14 @@ pub fn search_paged<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
     };
     for layer in (1..=pivot.0 as usize).rev() {
         search_layer(
-            storage, policy, state, workspace, values, pivot, 1, layer, metric,
+            storage, policy, state, workspace, values, pivot, 1, layer, metric, false,
         )?;
         if let Some(nearest) = workspace.results.pop() {
             pivot = nearest.point_id;
         }
     }
     search_layer(
-        storage, policy, state, workspace, values, pivot, ef, 0, metric,
+        storage, policy, state, workspace, values, pivot, ef, 0, metric, false,
     )?;
     let mut results = Vec::with_capacity(workspace.results.len());
     while let Some(edge) = workspace.results.pop() {
@@ -617,6 +724,22 @@ fn measured_distance<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
     right: &[T],
 ) -> Result<f32, PagedGraphError<S::Error>> {
     storage.before_distance()?;
+    distance(metric, left, right)
+}
+
+fn measured_search_distance<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
+    storage: &mut S,
+    metric: &D,
+    left: &[T],
+    right: &[T],
+    origin: usize,
+    allowed: bool,
+) -> Result<f32, PagedGraphError<S::Error>> {
+    if allowed {
+        storage.before_allowed_distance(origin)?;
+    } else {
+        storage.before_distance()?;
+    }
     distance(metric, left, right)
 }
 
@@ -649,7 +772,7 @@ pub fn search_paged_allowed<T: Send + Sync, S: PagedPointStorage<T>, D: Distance
     };
     for layer in (1..=pivot.0 as usize).rev() {
         search_layer(
-            storage, policy, state, workspace, values, pivot, 1, layer, metric,
+            storage, policy, state, workspace, values, pivot, 1, layer, metric, true,
         )?;
         if let Some(nearest) = workspace.results.pop() {
             pivot = nearest.point_id;
@@ -663,9 +786,16 @@ pub fn search_paged_allowed<T: Send + Sync, S: PagedPointStorage<T>, D: Distance
     let first = PagedEdge {
         point_id: pivot,
         origin_id: entry.origin_id,
-        distance: measured_distance(storage, metric, values, &entry.values)?,
+        distance: measured_search_distance(
+            storage,
+            metric,
+            values,
+            &entry.values,
+            entry.origin_id,
+            true,
+        )?,
     };
-    storage.before_visit()?;
+    storage.before_allowed_visit(entry.origin_id)?;
     workspace.visit(pivot)?;
     PagedGraphWorkspace::push(
         workspace.capacity,
@@ -686,10 +816,17 @@ pub fn search_paged_allowed<T: Send + Sync, S: PagedPointStorage<T>, D: Distance
             if workspace.visited.contains(&edge.point_id) {
                 continue;
             }
-            storage.before_visit()?;
-            workspace.visit(edge.point_id)?;
             let neighbour = load(storage, edge.point_id, policy)?;
-            let score = measured_distance(storage, metric, values, &neighbour.values)?;
+            storage.before_allowed_visit(neighbour.origin_id)?;
+            workspace.visit(edge.point_id)?;
+            let score = measured_search_distance(
+                storage,
+                metric,
+                values,
+                &neighbour.values,
+                neighbour.origin_id,
+                true,
+            )?;
             if workspace.results.len() < ef || score < workspace.results.peek().unwrap().distance {
                 let scored = PagedEdge {
                     point_id: edge.point_id,

@@ -62,6 +62,7 @@ pub enum PagedVectorPhase {
     Encoding,
     Complete,
     Published,
+    Abandoned,
     Reclaiming,
     Reclaimed,
 }
@@ -148,7 +149,14 @@ impl PagedVectorBatchPlan {
         if self.max_points == 0
             || self.max_node_writes == 0
             || !policy.validate()
-            || self.scratch_points <= policy.ef_construction.max(2 * policy.m)
+            || self.scratch_points
+                <= policy
+                    .ef_construction
+                    .max((2 * policy.m + 1) * (2 * policy.m + 1))
+            || self.max_node_writes
+                < self
+                    .max_points
+                    .saturating_mul(1 + 2 * policy.m * policy.max_layer)
             || self.max_node_bytes < minimum_node
             || self.progress_bytes < std::mem::size_of::<PagedVectorProgress>()
         {
@@ -194,6 +202,21 @@ pub trait PagedVectorReader: Send {
         after: Option<RowId>,
         limit: usize,
     ) -> Result<Vec<RowId>>;
+    /// Unique graph row directory bounds, independent of visibility. These
+    /// preserve the existing dispersed-seed ordering without an owned map.
+    fn row_bounds(&mut self) -> Result<Option<(RowId, RowId, usize)>>;
+    fn point_at_or_after(&mut self, row: RowId) -> Result<Option<(RowId, PointId)>>;
+    /// Graph directory membership independent of MVCC visibility. The shared
+    /// union caller admits rows with its authoritative snapshot predicate.
+    fn graph_point_for_row(&mut self, row: RowId) -> Result<Option<PointId>> {
+        Ok(self
+            .point_at_or_after(row)?
+            .filter(|(found, _)| *found == row)
+            .map(|(_, point)| point))
+    }
+    /// Finite ordered exact-key graph membership window, including retained
+    /// intervals. Statement allowed membership determines which rows may win.
+    fn exact_graph_row_after(&mut self, key: &[u8], after: Option<RowId>) -> Result<Option<RowId>>;
 }
 
 /// All mutations go directly into the engine's one admitted transaction. Its
@@ -202,6 +225,14 @@ pub trait PagedVectorReader: Send {
 pub trait PagedVectorTransaction: PagedVectorReader {
     fn store_point(&mut self, point: &PagedVectorPoint) -> Result<()>;
     fn store_identity(&mut self, identity: &PagedVectorIdentity) -> Result<()>;
+    /// Clear transaction-local search scratch. Visited identities and pending
+    /// candidates use finite admitted page buffers, and are never accumulated
+    /// in a resident population-sized collection. The queue orders PagedEdge
+    /// exactly as the fork BinaryHeap (maximum edge first).
+    fn begin_search_scratch(&mut self) -> Result<()>;
+    fn visit_search_scratch(&mut self, id: PointId) -> Result<bool>;
+    fn push_search_candidate(&mut self, edge: hnsw_rs::paged::PagedEdge) -> Result<()>;
+    fn pop_search_candidate(&mut self) -> Result<Option<hnsw_rs::paged::PagedEdge>>;
 }
 
 /// Exactly one persistence entry per insertion batch. The callback runs inside
@@ -210,14 +241,29 @@ pub trait PagedVectorTransaction: PagedVectorReader {
 /// The complete previous record is compared before work, rejecting stale or
 /// cancelled builders. Source floors/root and declaration validity are checked
 /// under the same gate. A successful return carries the durable successor.
+/// One immutable published root. Readers clone this handle, never begin a
+/// fresh writer read for a prior descriptor. The engine shares its captured
+/// durable root/buffer pool and admits every page/record window it serves.
+pub trait PagedVectorGraphSource: Send + Sync {
+    fn reader(&self) -> Result<Box<dyn PagedVectorReader>>;
+    /// Exclusive resident source controls transferred to each fresh tail root.
+    /// Return a fresh exclusive Arc for these controls; captured pool/root
+    /// handles shared elsewhere retain their own existing charge. Every reader
+    /// owns its finite decode/page reservations and captures the reader root.
+    fn retained_bytes(&self) -> usize;
+}
+pub struct PagedVectorCommittedBatch {
+    pub progress: PagedVectorProgress,
+    pub source: Arc<dyn PagedVectorGraphSource>,
+}
+
 pub trait PagedVectorPersistence: Send + Sync {
     fn commit_batch(
         &self,
         previous: &PagedVectorProgress,
         plan: PagedVectorBatchPlan,
         batch: &mut dyn FnMut(&mut dyn PagedVectorTransaction) -> Result<PagedVectorProgress>,
-    ) -> Result<PagedVectorProgress>;
-    fn reader(&self, progress: &PagedVectorProgress) -> Result<Box<dyn PagedVectorReader>>;
+    ) -> Result<PagedVectorCommittedBatch>;
 }
 
 struct PointAdapter<'a> {
@@ -297,6 +343,19 @@ impl PagedPointStorage<f32> for PointAdapter<'_> {
     fn before_visit(&mut self) -> Result<()> {
         self.transaction.before_visit()
     }
+    fn begin_search_scratch(&mut self) -> Result<()> {
+        self.transaction.begin_search_scratch()
+    }
+    fn visit_search_scratch(&mut self, id: PointId) -> Result<Option<bool>> {
+        self.transaction.visit_search_scratch(id).map(Some)
+    }
+    fn push_search_candidate(&mut self, edge: hnsw_rs::paged::PagedEdge) -> Result<bool> {
+        self.transaction.push_search_candidate(edge)?;
+        Ok(true)
+    }
+    fn pop_search_candidate(&mut self) -> Result<Option<Option<hnsw_rs::paged::PagedEdge>>> {
+        self.transaction.pop_search_candidate().map(Some)
+    }
 }
 impl PagedPointStorage<u8> for PointAdapter<'_> {
     type Error = Error;
@@ -338,6 +397,19 @@ impl PagedPointStorage<u8> for PointAdapter<'_> {
     fn before_visit(&mut self) -> Result<()> {
         self.transaction.before_visit()
     }
+    fn begin_search_scratch(&mut self) -> Result<()> {
+        self.transaction.begin_search_scratch()
+    }
+    fn visit_search_scratch(&mut self, id: PointId) -> Result<Option<bool>> {
+        self.transaction.visit_search_scratch(id).map(Some)
+    }
+    fn push_search_candidate(&mut self, edge: hnsw_rs::paged::PagedEdge) -> Result<bool> {
+        self.transaction.push_search_candidate(edge)?;
+        Ok(true)
+    }
+    fn pop_search_candidate(&mut self) -> Result<Option<Option<hnsw_rs::paged::PagedEdge>>> {
+        self.transaction.pop_search_candidate().map(Some)
+    }
 }
 fn graph_error(error: PagedGraphError<Error>) -> Error {
     match error {
@@ -359,19 +431,125 @@ fn graph_policy(
     }
 }
 
+struct PagedRootCharge {
+    accountant: Arc<dyn MemoryBudget>,
+    bytes: usize,
+}
+impl PagedRootCharge {
+    fn new(accountant: Arc<dyn MemoryBudget>, bytes: usize) -> Result<Self> {
+        accountant.try_allocate_for(
+            bytes,
+            "vector_index",
+            "retain_paged_vector_root",
+            "release idle serving roots",
+        )?;
+        Ok(Self { accountant, bytes })
+    }
+    fn shrink(&mut self, bytes: usize) {
+        self.accountant.release(self.bytes - bytes);
+        self.bytes = bytes;
+    }
+}
+impl Drop for PagedRootCharge {
+    fn drop(&mut self) {
+        self.accountant.release(self.bytes);
+    }
+}
+// The source's exclusive controls and descriptor are paid for until the last
+// tail/root/reader drops them, independently of the store's graph wrapper.
+struct RetainedPagedPartition {
+    partition: VectorPartitionRef,
+    charge: PagedRootCharge,
+}
+struct RetainedPagedReader {
+    reader: Box<dyn PagedVectorReader>,
+    _charge: Arc<PagedRootCharge>,
+}
+impl PagedVectorReader for RetainedPagedReader {
+    fn load_point(&mut self, id: PointId) -> Result<PagedVectorPoint> {
+        self.reader.load_point(id)
+    }
+    fn identity(&mut self, id: usize) -> Result<PagedVectorIdentity> {
+        self.reader.identity(id)
+    }
+    fn point_for_row(&mut self, row: RowId, snapshot: SnapshotId) -> Result<Option<PointId>> {
+        self.reader.point_for_row(row, snapshot)
+    }
+    fn exact_rows(
+        &mut self,
+        key: &[u8],
+        snapshot: SnapshotId,
+        after: Option<RowId>,
+        limit: usize,
+    ) -> Result<Vec<RowId>> {
+        self.reader.exact_rows(key, snapshot, after, limit)
+    }
+    fn checkpoint(&mut self) -> Result<()> {
+        self.reader.checkpoint()
+    }
+    fn before_distance(&mut self) -> Result<()> {
+        self.reader.before_distance()
+    }
+    fn before_visit(&mut self) -> Result<()> {
+        self.reader.before_visit()
+    }
+    fn visible_count(&mut self, snapshot: SnapshotId) -> Result<usize> {
+        self.reader.visible_count(snapshot)
+    }
+    fn row_window(
+        &mut self,
+        snapshot: SnapshotId,
+        after: Option<RowId>,
+        limit: usize,
+    ) -> Result<Vec<RowId>> {
+        self.reader.row_window(snapshot, after, limit)
+    }
+    fn row_bounds(&mut self) -> Result<Option<(RowId, RowId, usize)>> {
+        self.reader.row_bounds()
+    }
+    fn point_at_or_after(&mut self, row: RowId) -> Result<Option<(RowId, PointId)>> {
+        self.reader.point_at_or_after(row)
+    }
+    fn graph_point_for_row(&mut self, row: RowId) -> Result<Option<PointId>> {
+        self.reader.graph_point_for_row(row)
+    }
+    fn exact_graph_row_after(&mut self, key: &[u8], after: Option<RowId>) -> Result<Option<RowId>> {
+        self.reader.exact_graph_row_after(key, after)
+    }
+}
+fn root_control_head() -> usize {
+    std::mem::size_of::<PagedVectorTail>()
+        + std::mem::size_of::<PagedRootCharge>()
+        + 6 * std::mem::size_of::<usize>()
+}
+fn root_control_bytes(
+    progress: &PagedVectorProgress,
+    source: &dyn PagedVectorGraphSource,
+) -> Result<usize> {
+    root_control_head()
+        .checked_add(std::mem::size_of::<PagedVectorProgress>())
+        .and_then(|n| n.checked_add(progress.last_source_key.as_ref().map_or(0, Vec::capacity)))
+        .and_then(|n| n.checked_add(progress.cleanup_cursor.as_ref().map_or(0, Vec::capacity)))
+        .and_then(|n| n.checked_add(source.retained_bytes()))
+        .ok_or_else(workspace_overflow)
+}
+
 /// A mutable tail's constant-size control handle. Nodes, row and exact
 /// directories are engine-owned pages. Each append is searchable immediately
 /// after the row transaction atomically publishes its successor descriptor.
 /// Readers opened earlier retain the preceding root through `reader`.
+#[derive(Clone)]
 pub struct PagedVectorTail {
-    pub partition: VectorPartitionRef,
-    progress: PagedVectorProgress,
+    partition: Arc<RetainedPagedPartition>,
+    progress: Arc<PagedVectorProgress>,
     policy: ResolvedVectorPolicy,
     dimension: usize,
     quantization: VectorQuantization,
     persistence: Arc<dyn PagedVectorPersistence>,
+    source: Arc<dyn PagedVectorGraphSource>,
     accountant: Arc<dyn MemoryBudget>,
     live_workspace: Arc<AtomicUsize>,
+    root_charge: Arc<PagedRootCharge>,
 }
 impl PagedVectorTail {
     #[allow(clippy::too_many_arguments)]
@@ -382,26 +560,73 @@ impl PagedVectorTail {
         dimension: usize,
         quantization: VectorQuantization,
         persistence: Arc<dyn PagedVectorPersistence>,
+        source: Arc<dyn PagedVectorGraphSource>,
         accountant: Arc<dyn MemoryBudget>,
         live_workspace: Arc<AtomicUsize>,
     ) -> Result<Self> {
         if dimension == 0 || !graph_policy(policy, quantization).validate() {
             return Err(Error::Other("invalid paged vector tail definition".into()));
         }
+        // Exclusive source controls transfer into this root. Shared pool
+        // ownership remains separately charged by the engine source.
+        if source.retained_bytes() != 0 && Arc::strong_count(&source) != 1 {
+            return Err(Error::Other(
+                "paged root requires exclusive uncharged source controls".into(),
+            ));
+        }
+        let partition_bytes = std::mem::size_of::<RetainedPagedPartition>()
+            .checked_add(2 * std::mem::size_of::<usize>())
+            .and_then(|n| n.checked_add(partition.index.table.capacity()))
+            .and_then(|n| n.checked_add(partition.index.column.capacity()))
+            .and_then(|n| {
+                n.checked_add(
+                    partition.partition_key.estimated_bytes()
+                        - std::mem::size_of::<contextdb_core::VectorPartitionKey>(),
+                )
+            })
+            .ok_or_else(workspace_overflow)?;
+        let partition_charge = PagedRootCharge::new(Arc::clone(&accountant), partition_bytes)?;
+        let root_charge = Arc::new(PagedRootCharge::new(
+            Arc::clone(&accountant),
+            root_control_bytes(&progress, source.as_ref())?,
+        )?);
         Ok(Self {
-            partition,
-            progress,
+            partition: Arc::new(RetainedPagedPartition {
+                partition,
+                charge: partition_charge,
+            }),
+            progress: Arc::new(progress),
             policy,
             dimension,
             quantization,
             persistence,
+            source,
             accountant,
             live_workspace,
+            root_charge,
         })
+    }
+    pub fn partition(&self) -> &VectorPartitionRef {
+        &self.partition.partition
     }
     pub fn progress(&self) -> &PagedVectorProgress {
         &self.progress
     }
+    pub(super) fn graph_reader(&self) -> Result<Box<dyn PagedVectorReader>> {
+        Ok(Box::new(RetainedPagedReader {
+            reader: self.source.reader()?,
+            _charge: Arc::clone(&self.root_charge),
+        }))
+    }
+    pub(crate) fn definition(&self) -> (usize, VectorQuantization, ResolvedVectorPolicy) {
+        (self.dimension, self.quantization, self.policy)
+    }
+    /// Retained root/source charge plus the shared immutable partition charge.
+    /// Clones share both receipts; successor roots retain the partition once.
+    pub fn retained_control_bytes(&self) -> usize {
+        self.root_charge.bytes + self.partition.charge.bytes
+    }
+
     pub fn len(&self) -> usize {
         self.progress.graph.points
     }
@@ -430,13 +655,23 @@ impl PagedVectorTail {
     /// must include its row publication in this same transaction. On failure,
     /// both the durable state and this handle retain the previous progress.
     pub fn append(&mut self, entries: &[VectorEntry], plan: PagedVectorBatchPlan) -> Result<()> {
+        if self.progress.phase != PagedVectorPhase::Inserting {
+            return Err(Error::Other(
+                "sealed paged generation cannot accept tail inserts".into(),
+            ));
+        }
         if entries.len() > plan.max_points {
             return Err(Error::Other(
                 "paged vector append exceeds its admitted batch".into(),
             ));
         }
         let _reservation = self.reserve(plan, "append_paged_vector_tail")?;
-        let previous = self.progress.clone();
+        let previous = self.progress.as_ref().clone();
+        let retained_bound = root_control_head()
+            .checked_add(plan.progress_bytes)
+            .ok_or_else(workspace_overflow)?;
+        let mut next_root_charge =
+            PagedRootCharge::new(Arc::clone(&self.accountant), retained_bound)?;
         let mut invoked = false;
         let mut produced = None;
         let mut batch = |transaction: &mut dyn PagedVectorTransaction| {
@@ -460,11 +695,17 @@ impl PagedVectorTail {
                 self.insert_entry(&mut adapter, &mut workspace, &mut next, entry)?;
             }
             next.total_points = next.graph.points;
+            for entry in entries {
+                next.frontier_lsn = next.frontier_lsn.max(entry.lsn);
+                next.frontier_tx = next.frontier_tx.max(entry.created_tx);
+            }
             produced = Some(next.clone());
             Ok(next)
         };
-        let next = self.persistence.commit_batch(&previous, plan, &mut batch)?;
+        let committed = self.persistence.commit_batch(&previous, plan, &mut batch)?;
+        let next = committed.progress;
         if !invoked
+            || produced.as_ref() != Some(&next)
             || next.generation_id != previous.generation_id
             || next.graph.points != previous.graph.points + entries.len()
         {
@@ -472,7 +713,18 @@ impl PagedVectorTail {
                 "paged vector persistence returned an invalid successor".into(),
             ));
         }
-        self.progress = next;
+        let retained_bytes = root_control_bytes(&next, committed.source.as_ref())?;
+        if retained_bytes > retained_bound
+            || committed.source.retained_bytes() != 0 && Arc::strong_count(&committed.source) != 1
+        {
+            return Err(Error::Other(
+                "committed paged source controls exceed their admitted exclusive root owner".into(),
+            ));
+        }
+        next_root_charge.shrink(retained_bytes);
+        self.progress = Arc::new(next);
+        self.source = committed.source;
+        self.root_charge = Arc::new(next_root_charge);
         Ok(())
     }
     fn insert_entry(
@@ -667,7 +919,7 @@ impl PagedVectorTail {
             ));
         }
         let output = {
-            let mut reader = self.persistence.reader(&self.progress)?;
+            let mut reader = self.graph_reader()?;
             let visible_count = reader.visible_count(snapshot)?;
             let count = allowed_count.unwrap_or(visible_count);
             if count > visible_count || visible_count > self.progress.graph.points {
@@ -738,6 +990,9 @@ impl PagedVectorTail {
                 snapshot,
                 predicate,
             };
+            // The exact-key directory participates in allowed refill below.
+            // Require completeness only after merging both candidate sources;
+            // a short graph walk alone is not a refusal for an exact tie set.
             let neighbours = match self.quantization {
                 VectorQuantization::F32 => search_paged_allowed(
                     &mut adapter,
@@ -746,7 +1001,7 @@ impl PagedVectorTail {
                     &mut workspace,
                     query,
                     ef,
-                    required,
+                    0,
                     count,
                     &hnsw_f32_distance(),
                 ),
@@ -757,7 +1012,7 @@ impl PagedVectorTail {
                     &mut workspace,
                     &stored.to_hnsw_u8(),
                     ef,
-                    required,
+                    0,
                     count,
                     &DistQuantizedCosine {
                         quantization: self.quantization,
@@ -774,7 +1029,15 @@ impl PagedVectorTail {
                     ));
                 }
                 let score = match self.quantization {
-                    VectorQuantization::F32 => 1. - neighbour.distance,
+                    VectorQuantization::F32 => {
+                        let PagedVectorPoint::F32(point) =
+                            adapter.reader.load_point(neighbour.point_id)?
+                        else {
+                            return Err(Error::Other("paged graph representation mismatch".into()));
+                        };
+                        adapter.reader.before_distance()?;
+                        crate::cosine_similarity(&point.values, query)
+                    }
                     VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
                         let PagedVectorPoint::Quantized(point) =
                             adapter.reader.load_point(neighbour.point_id)?
@@ -937,6 +1200,17 @@ pub trait PagedGenerationTransaction: PagedVectorTransaction {
 /// on cancellation/error discard the current transaction. `previous` is a
 /// complete compare-and-swap record, including RNG and all source cursors.
 pub trait PagedGenerationPersistence: Send + Sync {
+    /// Fenced metadata-only invalidation. CAS the complete previous record,
+    /// reject any serving/external-reader exposure, and atomically install
+    /// next (Abandoned) plus cleanup inventory. A stale declaration/frontier
+    /// may be abandoned even though it cannot admit another construction batch.
+    /// Preserve its cleanup identity and floors until this marker is durable.
+    fn abandon_generation(
+        &self,
+        previous: &PagedVectorProgress,
+        next: &PagedVectorProgress,
+        plan: PagedVectorBatchPlan,
+    ) -> Result<PagedVectorProgress>;
     fn commit_generation_batch(
         &self,
         previous: &PagedVectorProgress,
@@ -945,18 +1219,51 @@ pub trait PagedGenerationPersistence: Send + Sync {
     ) -> Result<PagedVectorProgress>;
 }
 
+pub(crate) struct PagedBuilderProgress {
+    value: PagedVectorProgress,
+    _charge: PagedRootCharge,
+}
+impl std::ops::Deref for PagedBuilderProgress {
+    type Target = PagedVectorProgress;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+fn builder_progress_bytes(progress: &PagedVectorProgress) -> Result<usize> {
+    std::mem::size_of::<PagedBuilderProgress>()
+        .checked_add(2 * std::mem::size_of::<usize>())
+        .and_then(|n| n.checked_add(progress.last_source_key.as_ref().map_or(0, Vec::capacity)))
+        .and_then(|n| n.checked_add(progress.cleanup_cursor.as_ref().map_or(0, Vec::capacity)))
+        .ok_or_else(workspace_overflow)
+}
+fn partition_heap_bytes(partition: &VectorPartitionRef) -> Result<usize> {
+    partition
+        .index
+        .table
+        .capacity()
+        .checked_add(partition.index.column.capacity())
+        .and_then(|n| {
+            n.checked_add(
+                partition.partition_key.estimated_bytes()
+                    - std::mem::size_of::<contextdb_core::VectorPartitionKey>(),
+            )
+        })
+        .ok_or_else(workspace_overflow)
+}
+
 /// A restartable builder holds only control metadata, never the accumulated
 /// graph. Every successful step commits real source points, sealed point pages
 /// or eligible deletions before advancing its durable cursor.
 pub struct PagedGenerationBuilder {
     pub partition: VectorPartitionRef,
-    progress: PagedVectorProgress,
+    progress: Arc<PagedBuilderProgress>,
     policy: ResolvedVectorPolicy,
     dimension: usize,
     quantization: VectorQuantization,
     persistence: Arc<dyn PagedGenerationPersistence>,
     accountant: Arc<dyn MemoryBudget>,
     live_workspace: Arc<AtomicUsize>,
+    _partition_charge: PagedRootCharge,
 }
 impl PagedGenerationBuilder {
     #[allow(clippy::too_many_arguments)]
@@ -969,6 +1276,61 @@ impl PagedGenerationBuilder {
         persistence: Arc<dyn PagedGenerationPersistence>,
         accountant: Arc<dyn MemoryBudget>,
         live_workspace: Arc<AtomicUsize>,
+    ) -> Result<Self> {
+        let partition_charge =
+            PagedRootCharge::new(Arc::clone(&accountant), partition_heap_bytes(&partition)?)?;
+        Self::resume_admitted(
+            partition,
+            progress,
+            policy,
+            dimension,
+            quantization,
+            persistence,
+            accountant,
+            live_workspace,
+            partition_charge,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resume_for_partition(
+        partition: &VectorPartitionRef,
+        progress: PagedVectorProgress,
+        policy: ResolvedVectorPolicy,
+        dimension: usize,
+        quantization: VectorQuantization,
+        persistence: Arc<dyn PagedGenerationPersistence>,
+        accountant: Arc<dyn MemoryBudget>,
+        live_workspace: Arc<AtomicUsize>,
+    ) -> Result<Self> {
+        // Admit the catalog-key copy before creating it. Registry key ownership
+        // is independent of this restartable builder's retained copy.
+        let mut partition_charge =
+            PagedRootCharge::new(Arc::clone(&accountant), partition_heap_bytes(partition)?)?;
+        let partition = partition.clone();
+        partition_charge.shrink(partition_heap_bytes(&partition)?);
+        Self::resume_admitted(
+            partition,
+            progress,
+            policy,
+            dimension,
+            quantization,
+            persistence,
+            accountant,
+            live_workspace,
+            partition_charge,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn resume_admitted(
+        partition: VectorPartitionRef,
+        progress: PagedVectorProgress,
+        policy: ResolvedVectorPolicy,
+        dimension: usize,
+        quantization: VectorQuantization,
+        persistence: Arc<dyn PagedGenerationPersistence>,
+        accountant: Arc<dyn MemoryBudget>,
+        live_workspace: Arc<AtomicUsize>,
+        partition_charge: PagedRootCharge,
     ) -> Result<Self> {
         if dimension == 0
             || !graph_policy(policy, quantization).validate()
@@ -991,19 +1353,32 @@ impl PagedGenerationBuilder {
                 "invalid paged generation restart record".into(),
             ));
         }
+        let progress_charge =
+            PagedRootCharge::new(Arc::clone(&accountant), builder_progress_bytes(&progress)?)?;
         Ok(Self {
             partition,
-            progress,
+            progress: Arc::new(PagedBuilderProgress {
+                value: progress,
+                _charge: progress_charge,
+            }),
             policy,
             dimension,
             quantization,
             persistence,
             accountant,
             live_workspace,
+            _partition_charge: partition_charge,
         })
     }
     pub fn progress(&self) -> &PagedVectorProgress {
         &self.progress
+    }
+    pub(crate) fn progress_snapshot(&self) -> Arc<PagedBuilderProgress> {
+        Arc::clone(&self.progress)
+    }
+    /// Final-holder charge for the builder's partition and progress controls.
+    pub fn retained_control_bytes(&self) -> usize {
+        self._partition_charge.bytes + self.progress._charge.bytes
     }
 
     /// Perform one admitted insertion/encoding batch. Publishing and reclaiming
@@ -1027,7 +1402,7 @@ impl PagedGenerationBuilder {
             PagedVectorPhase::Complete
             | PagedVectorPhase::Published
             | PagedVectorPhase::Reclaimed => Ok(()),
-            PagedVectorPhase::Reclaiming => Err(Error::Other(
+            PagedVectorPhase::Abandoned | PagedVectorPhase::Reclaiming => Err(Error::Other(
                 "paged generation cleanup requires explicit floor validation".into(),
             )),
         }
@@ -1068,8 +1443,13 @@ impl PagedGenerationBuilder {
             "advance_paged_vector_generation",
             "reduce batch size or release idle serving pages",
         )?;
+        let retained_bound = std::mem::size_of::<PagedBuilderProgress>()
+            .checked_add(2 * std::mem::size_of::<usize>())
+            .and_then(|n| n.checked_add(plan.progress_bytes))
+            .ok_or_else(workspace_overflow)?;
+        let mut next_charge = PagedRootCharge::new(Arc::clone(&self.accountant), retained_bound)?;
         checkpoint()?;
-        let previous = self.progress.clone();
+        let previous = self.progress.value.clone();
         let mut work = Some(work);
         let mut produced = None;
         let mut callback = |transaction: &mut dyn PagedGenerationTransaction| {
@@ -1078,6 +1458,11 @@ impl PagedGenerationBuilder {
                 .ok_or_else(|| Error::Other("paged generation callback invoked twice".into()))?;
             checkpoint()?;
             let next = work(self, transaction, &previous, checkpoint)?;
+            if builder_progress_bytes(&next)? > retained_bound {
+                return Err(Error::Other(
+                    "paged generation successor exceeds admitted controls".into(),
+                ));
+            }
             produced = Some(next.clone());
             Ok(next)
         };
@@ -1089,7 +1474,11 @@ impl PagedGenerationBuilder {
                 "paged generation persistence returned another progress record".into(),
             ));
         }
-        self.progress = next;
+        next_charge.shrink(builder_progress_bytes(&next)?);
+        self.progress = Arc::new(PagedBuilderProgress {
+            value: next,
+            _charge: next_charge,
+        });
         Ok(())
     }
     fn insert_batch(
@@ -1330,6 +1719,78 @@ impl PagedGenerationBuilder {
             Ok(next)
         })
     }
+    /// Persist an explicit abandon fence before releasing the pending slot.
+    /// This path does not require a still-valid construction frontier, and
+    /// admission includes only the finite progress/marker workspace.
+    pub fn abandon(
+        &mut self,
+        plan: PagedVectorBatchPlan,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if self.progress.phase == PagedVectorPhase::Abandoned {
+            return Ok(());
+        }
+        if !matches!(
+            self.progress.phase,
+            PagedVectorPhase::Inserting | PagedVectorPhase::Encoding | PagedVectorPhase::Complete
+        ) {
+            return Err(Error::Other(
+                "only an unpublished paged build can be abandoned".into(),
+            ));
+        }
+        let metadata = std::mem::size_of::<PagedVectorProgress>()
+            .checked_add(
+                self.progress
+                    .last_source_key
+                    .as_ref()
+                    .map_or(0, Vec::capacity),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.progress
+                        .cleanup_cursor
+                        .as_ref()
+                        .map_or(0, Vec::capacity),
+                )
+            })
+            .ok_or_else(workspace_overflow)?;
+        if plan.progress_bytes < metadata {
+            return Err(Error::Other(
+                "abandon marker exceeds admitted progress workspace".into(),
+            ));
+        }
+        let _reservation = VectorWorkspaceReservation::try_new(
+            Arc::clone(&self.accountant),
+            Arc::clone(&self.live_workspace),
+            plan.progress_bytes,
+            "abandon_paged_vector_generation",
+            "release idle serving pages",
+        )?;
+        let retained_bound = std::mem::size_of::<PagedBuilderProgress>()
+            .checked_add(2 * std::mem::size_of::<usize>())
+            .and_then(|n| n.checked_add(plan.progress_bytes))
+            .ok_or_else(workspace_overflow)?;
+        let mut next_charge = PagedRootCharge::new(Arc::clone(&self.accountant), retained_bound)?;
+        checkpoint()?;
+        let previous = self.progress.value.clone();
+        let mut next = previous.clone();
+        next.phase = PagedVectorPhase::Abandoned;
+        let committed = self
+            .persistence
+            .abandon_generation(&previous, &next, plan)?;
+        if committed != next {
+            return Err(Error::Other(
+                "paged abandon returned another progress record".into(),
+            ));
+        }
+        next_charge.shrink(builder_progress_bytes(&committed)?);
+        self.progress = Arc::new(PagedBuilderProgress {
+            value: committed,
+            _charge: next_charge,
+        });
+        Ok(())
+    }
+
     /// Reclaim a superseded or cancelled scratch generation in finite batches.
     /// A published active generation must first be retired by the engine's
     /// transaction; the engine refuses removal while any reader floor needs it.
@@ -1340,6 +1801,16 @@ impl PagedGenerationBuilder {
     ) -> Result<usize> {
         if self.progress.phase == PagedVectorPhase::Reclaimed {
             return Ok(0);
+        }
+        if !matches!(
+            self.progress.phase,
+            PagedVectorPhase::Published
+                | PagedVectorPhase::Abandoned
+                | PagedVectorPhase::Reclaiming
+        ) {
+            return Err(Error::Other(
+                "unpublished paged build requires a durable abandon fence before cleanup".into(),
+            ));
         }
         let mut removed = 0;
         self.transact(plan, checkpoint, |_, transaction, previous, checkpoint| {

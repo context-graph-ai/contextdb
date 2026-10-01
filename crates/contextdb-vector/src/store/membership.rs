@@ -173,7 +173,12 @@ pub trait RawVectorMembershipFactory: Send + Sync {
 pub struct LazyRawVectorMembershipSource {
     summary: RawVectorMembershipSummary,
     factory: std::sync::Arc<dyn RawVectorMembershipFactory>,
-    source: parking_lot::Mutex<Option<std::sync::Arc<dyn RawVectorMembershipSource>>>,
+    source: parking_lot::Mutex<LazyMembershipSlot>,
+}
+#[derive(Default)]
+struct LazyMembershipSlot {
+    source: Option<std::sync::Arc<dyn RawVectorMembershipSource>>,
+    epoch: u64,
 }
 impl LazyRawVectorMembershipSource {
     pub fn new(
@@ -188,30 +193,50 @@ impl LazyRawVectorMembershipSource {
         Ok(Self {
             summary,
             factory,
-            source: parking_lot::Mutex::new(None),
+            source: parking_lot::Mutex::new(LazyMembershipSlot::default()),
         })
     }
     fn resolve(
         &self,
         before_read: &mut dyn FnMut() -> bool,
     ) -> Result<std::sync::Arc<dyn RawVectorMembershipSource>> {
-        let mut slot = self.source.lock();
-        if let Some(source) = slot.as_ref() {
-            return Ok(std::sync::Arc::clone(source));
-        }
+        let epoch = {
+            let slot = self.source.lock();
+            if let Some(source) = slot.source.as_ref() {
+                return Ok(std::sync::Arc::clone(source));
+            }
+            slot.epoch
+        };
+        // Admission and physical reads may evict an idle handle, including
+        // this wrapper. No handle mutex is held across that callback.
         let source = self.factory.load(before_read)?;
         if source.published_summary() != self.summary {
             return Err(Error::Other(
                 "lazy vector membership source disagrees with its captured catalog".into(),
             ));
         }
-        *slot = Some(std::sync::Arc::clone(&source));
+        let mut slot = self.source.lock();
+        if let Some(current) = slot.source.as_ref() {
+            return Ok(std::sync::Arc::clone(current));
+        }
+        if slot.epoch == epoch {
+            slot.source = Some(std::sync::Arc::clone(&source));
+        }
+        // An eviction that raced this load wins installation. The operation
+        // may still use its own verified captured-root handle.
         Ok(source)
     }
     /// Drop only this idle handle. Open cursors/readers preserve their own
     /// source root and reservations; the next operation verifies a new handle.
     pub fn evict_idle_handle(&self) -> bool {
-        self.source.lock().take().is_some()
+        let removed = {
+            let mut slot = self.source.lock();
+            slot.epoch = slot.epoch.wrapping_add(1);
+            slot.source.take()
+        };
+        let existed = removed.is_some();
+        drop(removed);
+        existed
     }
 }
 impl RawVectorMembershipSource for LazyRawVectorMembershipSource {

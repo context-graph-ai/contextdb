@@ -3275,6 +3275,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 // graph (quarantined, an incomplete chain, nothing maintained,
                 // or a chain whose layers hold no point) is refused under
                 // INDEXED and compared row by row under AUTO.
+                // The selected chain has at most base, change and tail. Charge
+                // its finite owner vector before capturing any paged root.
+                let admitted_layer_bytes = 3usize.saturating_mul(std::mem::size_of::<
+                    crate::store::SnapshotCompatibleLayer<'_>,
+                >());
+                before_retain(admitted_layer_bytes)?;
                 let (availability, owned_layers) = state.snapshot_compatible_owned_layers(snapshot);
                 if availability == VectorGraphLayerAvailability::Ready && !owned_layers.is_empty() {
                     self.store.mark_sealed_graph_used(state);
@@ -3283,7 +3289,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             crate::store::SnapshotCompatibleLayer<'_>,
                         >()),
                     );
-                    before_retain(charged_bytes)?;
+                    let layer_bytes =
+                        owned_layers.capacity().saturating_mul(std::mem::size_of::<
+                            crate::store::SnapshotCompatibleLayer<'_>,
+                        >());
+                    if let Err(error) = before_retain(std::mem::size_of::<UnionPartition<'_>>()) {
+                        drop(owned_layers);
+                        release_retained(admitted_layer_bytes);
+                        return Err(error);
+                    }
+                    release_retained(admitted_layer_bytes.saturating_sub(layer_bytes));
                     union_partitions.push(UnionPartition {
                         source_position: partition_position - 1,
                         candidates,
@@ -3300,6 +3315,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     continue;
                 }
                 drop(owned_layers);
+                release_retained(admitted_layer_bytes);
                 let graph_ready = availability == VectorGraphLayerAvailability::Ready;
                 if mode == VectorSearchMode::Indexed {
                     return Ok(if graph_ready {
@@ -3833,7 +3849,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     partition: position,
                     allowed_count: partition.allowed_count,
                     live_count: partition.live_count,
-                    seed_rows: partition.candidates,
+                    seed_rows: partition
+                        .candidates
+                        .map(crate::hnsw::union::UnionSeedRows::Slice),
                 });
                 layer_owner.push((position, layer_position));
             }
