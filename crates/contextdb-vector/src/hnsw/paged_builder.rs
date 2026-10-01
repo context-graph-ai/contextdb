@@ -11,7 +11,7 @@ use contextdb_core::{
 use hnsw_rs::hnsw::PointId;
 use hnsw_rs::paged::{
     PagedGraphError, PagedGraphPolicy, PagedGraphState, PagedGraphWorkspace, PagedPoint,
-    PagedPointStorage, insert_paged, search_paged,
+    PagedPointStorage, insert_paged, search_paged_allowed,
 };
 use std::sync::{Arc, atomic::AtomicUsize};
 
@@ -182,6 +182,18 @@ pub trait PagedVectorReader: Send {
         limit: usize,
     ) -> Result<Vec<RowId>>;
     fn checkpoint(&mut self) -> Result<()>;
+    fn before_distance(&mut self) -> Result<()>;
+    fn before_visit(&mut self) -> Result<()>;
+    /// Authenticated count of visible graph points at this captured root.
+    fn visible_count(&mut self, snapshot: SnapshotId) -> Result<usize>;
+    /// Finite ordered visible row directory window at this root. Used when
+    /// every vector has the same mathematical score (a zero-norm query).
+    fn row_window(
+        &mut self,
+        snapshot: SnapshotId,
+        after: Option<RowId>,
+        limit: usize,
+    ) -> Result<Vec<RowId>>;
 }
 
 /// All mutations go directly into the engine's one admitted transaction. Its
@@ -279,6 +291,12 @@ impl PagedPointStorage<f32> for PointAdapter<'_> {
     fn checkpoint(&mut self) -> Result<()> {
         self.transaction.checkpoint()
     }
+    fn before_distance(&mut self) -> Result<()> {
+        self.transaction.before_distance()
+    }
+    fn before_visit(&mut self) -> Result<()> {
+        self.transaction.before_visit()
+    }
 }
 impl PagedPointStorage<u8> for PointAdapter<'_> {
     type Error = Error;
@@ -313,6 +331,12 @@ impl PagedPointStorage<u8> for PointAdapter<'_> {
     }
     fn checkpoint(&mut self) -> Result<()> {
         self.transaction.checkpoint()
+    }
+    fn before_distance(&mut self) -> Result<()> {
+        self.transaction.before_distance()
+    }
+    fn before_visit(&mut self) -> Result<()> {
+        self.transaction.before_visit()
     }
 }
 fn graph_error(error: PagedGraphError<Error>) -> Error {
@@ -435,6 +459,7 @@ impl PagedVectorTail {
             for entry in entries {
                 self.insert_entry(&mut adapter, &mut workspace, &mut next, entry)?;
             }
+            next.total_points = next.graph.points;
             produced = Some(next.clone());
             Ok(next)
         };
@@ -500,11 +525,45 @@ impl PagedVectorTail {
     }
 }
 
-struct ReadAdapter<'a>(&'a mut dyn PagedVectorReader);
+/// Returned rows keep their actual allocation charged through final drop. The
+/// engine may move both parts together when transferring statement ownership.
+pub struct PagedVectorSearchResult {
+    rows: Vec<(RowId, f32)>,
+    reservation: Option<VectorWorkspaceReservation>,
+}
+impl PagedVectorSearchResult {
+    pub fn rows(&self) -> &[(RowId, f32)] {
+        &self.rows
+    }
+    pub fn into_parts(self) -> (Vec<(RowId, f32)>, Option<VectorWorkspaceReservation>) {
+        (self.rows, self.reservation)
+    }
+}
+struct ReadAdapter<'a> {
+    reader: &'a mut dyn PagedVectorReader,
+    snapshot: SnapshotId,
+    predicate: &'a mut dyn FnMut(RowId) -> Result<bool>,
+}
+impl ReadAdapter<'_> {
+    fn allowed(&mut self, origin: usize) -> Result<bool> {
+        let identity = self.reader.identity(origin)?;
+        if identity.data_id != origin {
+            return Err(Error::Other("paged graph row identity mismatch".into()));
+        }
+        if identity.created_tx > TxId::from_snapshot(self.snapshot)
+            || identity
+                .deleted_tx
+                .is_some_and(|tx| tx <= TxId::from_snapshot(self.snapshot))
+        {
+            return Ok(false);
+        }
+        (self.predicate)(identity.row_id)
+    }
+}
 impl PagedPointStorage<f32> for ReadAdapter<'_> {
     type Error = Error;
     fn load_point(&mut self, id: PointId) -> Result<PagedPoint<f32>> {
-        match self.0.load_point(id)? {
+        match self.reader.load_point(id)? {
             PagedVectorPoint::F32(point) => Ok(point),
             _ => Err(Error::Other("paged graph representation mismatch".into())),
         }
@@ -515,13 +574,22 @@ impl PagedPointStorage<f32> for ReadAdapter<'_> {
         ))
     }
     fn checkpoint(&mut self) -> Result<()> {
-        self.0.checkpoint()
+        self.reader.checkpoint()
+    }
+    fn before_distance(&mut self) -> Result<()> {
+        self.reader.before_distance()
+    }
+    fn before_visit(&mut self) -> Result<()> {
+        self.reader.before_visit()
+    }
+    fn is_allowed(&mut self, origin: usize) -> Result<bool> {
+        self.allowed(origin)
     }
 }
 impl PagedPointStorage<u8> for ReadAdapter<'_> {
     type Error = Error;
     fn load_point(&mut self, id: PointId) -> Result<PagedPoint<u8>> {
-        match self.0.load_point(id)? {
+        match self.reader.load_point(id)? {
             PagedVectorPoint::Quantized(point) => Ok(point),
             _ => Err(Error::Other("paged graph representation mismatch".into())),
         }
@@ -532,81 +600,188 @@ impl PagedPointStorage<u8> for ReadAdapter<'_> {
         ))
     }
     fn checkpoint(&mut self) -> Result<()> {
-        self.0.checkpoint()
+        self.reader.checkpoint()
+    }
+    fn before_distance(&mut self) -> Result<()> {
+        self.reader.before_distance()
+    }
+    fn before_visit(&mut self) -> Result<()> {
+        self.reader.before_visit()
+    }
+    fn is_allowed(&mut self, origin: usize) -> Result<bool> {
+        self.allowed(origin)
     }
 }
 impl PagedVectorTail {
-    /// Serving never builds, seals or loads a whole graph. The reader's page
-    /// cache is engine-admitted and evictable; this call owns finite scratch.
+    /// Serving performs no build work. Visibility enters graph admission,
+    /// rather than filtering the final nearest candidates after the walk.
     pub fn search(
         &self,
         query: &[f32],
         k: usize,
         snapshot: SnapshotId,
         plan: PagedVectorBatchPlan,
-    ) -> Result<Vec<(RowId, f32)>> {
+    ) -> Result<PagedVectorSearchResult> {
+        self.search_with_predicate(query, k, snapshot, plan, None, &mut |_| Ok(true))
+    }
+    /// The caller supplies its authoritative visible allowed count and shared
+    /// predicate. Physical read, distance and visit work use the captured
+    /// reader's statement hooks; no independent query budget is reset here.
+    pub fn search_allowed(
+        &self,
+        query: &[f32],
+        k: usize,
+        snapshot: SnapshotId,
+        plan: PagedVectorBatchPlan,
+        allowed_count: usize,
+        predicate: &mut dyn FnMut(RowId) -> Result<bool>,
+    ) -> Result<PagedVectorSearchResult> {
+        self.search_with_predicate(query, k, snapshot, plan, Some(allowed_count), predicate)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn search_with_predicate(
+        &self,
+        query: &[f32],
+        k: usize,
+        snapshot: SnapshotId,
+        plan: PagedVectorBatchPlan,
+        allowed_count: Option<usize>,
+        predicate: &mut dyn FnMut(RowId) -> Result<bool>,
+    ) -> Result<PagedVectorSearchResult> {
         if query.len() != self.dimension || query.iter().any(|v| !v.is_finite()) {
             return Err(Error::Other(
                 "paged vector query dimension or values mismatch".into(),
             ));
         }
         if k == 0 {
-            return Ok(Vec::new());
+            return Ok(PagedVectorSearchResult {
+                rows: Vec::new(),
+                reservation: None,
+            });
         }
-        let _reservation = self.reserve(plan, "search_paged_vector_tail")?;
+        let mut reservation = self.reserve(plan, "search_paged_vector_tail")?;
         let ef = self.policy.hnsw_ef_search.max(k);
         if ef >= plan.scratch_points {
             return Err(Error::Other(
                 "paged vector search exceeds its admitted breadth".into(),
             ));
         }
-        let mut reader = self.persistence.reader(&self.progress)?;
-        let mut workspace = PagedGraphWorkspace::new(plan.scratch_points);
-        let stored = StoredVector::from_f32(query, self.quantization);
-        let neighbours = match self.quantization {
-            VectorQuantization::F32 => search_paged(
-                &mut ReadAdapter(reader.as_mut()),
-                graph_policy(self.policy, self.quantization),
-                &self.progress.graph,
-                &mut workspace,
-                query,
-                ef,
-                &hnsw_f32_distance(),
-            ),
-            VectorQuantization::SQ8 | VectorQuantization::SQ4 => search_paged(
-                &mut ReadAdapter(reader.as_mut()),
-                graph_policy(self.policy, self.quantization),
-                &self.progress.graph,
-                &mut workspace,
-                &stored.to_hnsw_u8(),
-                ef,
-                &DistQuantizedCosine {
-                    quantization: self.quantization,
-                },
-            ),
-        }
-        .map_err(graph_error)?;
-        let mut rows = Vec::with_capacity(ef + k);
-        for neighbour in neighbours {
-            let identity = reader.identity(neighbour.origin_id)?;
-            if identity.point != neighbour.point_id || identity.data_id != neighbour.origin_id {
+        let output = {
+            let mut reader = self.persistence.reader(&self.progress)?;
+            let visible_count = reader.visible_count(snapshot)?;
+            let count = allowed_count.unwrap_or(visible_count);
+            if count > visible_count || visible_count > self.progress.graph.points {
                 return Err(Error::Other(
-                    "paged vector point and row directory disagree".into(),
+                    "paged graph visible count disagrees with allowed membership".into(),
                 ));
             }
-            if identity.created_tx <= TxId::from_snapshot(snapshot)
-                && identity
-                    .deleted_tx
-                    .is_none_or(|tx| TxId::from_snapshot(snapshot) < tx)
-            {
+            let required = k.min(count);
+            if query.iter().all(|value| *value == 0.) {
+                let mut output = Vec::with_capacity(required);
+                let mut after = None;
+                while output.len() < required {
+                    reader.checkpoint()?;
+                    let window = reader.row_window(snapshot, after, k)?;
+                    if window.len() > k
+                        || window.windows(2).any(|w| w[0] >= w[1])
+                        || window
+                            .first()
+                            .is_some_and(|row| after.is_some_and(|old| *row <= old))
+                    {
+                        return Err(Error::Other(
+                            "paged vector row directory returned an invalid window".into(),
+                        ));
+                    }
+                    if window.is_empty() {
+                        break;
+                    }
+                    let full = window.len() == k;
+                    for row in window {
+                        after = Some(row);
+                        if !predicate(row)? {
+                            continue;
+                        }
+                        reader.before_distance()?;
+                        output.push((row, 0.));
+                        if output.len() == required {
+                            break;
+                        }
+                    }
+                    if !full {
+                        break;
+                    }
+                }
+                if output.len() < required {
+                    return Err(Error::Other(
+                        "paged vector row directory disagrees with its visible count".into(),
+                    ));
+                }
+                drop(reader);
+                let bytes = output
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(RowId, f32)>())
+                    .ok_or_else(workspace_overflow)?;
+                reservation.resize(
+                    bytes,
+                    "retain_paged_vector_search_result",
+                    "retain the result reservation with its rows",
+                )?;
+                return Ok(PagedVectorSearchResult {
+                    rows: output,
+                    reservation: Some(reservation),
+                });
+            }
+            let mut workspace = PagedGraphWorkspace::new(plan.scratch_points);
+            let stored = StoredVector::from_f32(query, self.quantization);
+            let mut adapter = ReadAdapter {
+                reader: reader.as_mut(),
+                snapshot,
+                predicate,
+            };
+            let neighbours = match self.quantization {
+                VectorQuantization::F32 => search_paged_allowed(
+                    &mut adapter,
+                    graph_policy(self.policy, self.quantization),
+                    &self.progress.graph,
+                    &mut workspace,
+                    query,
+                    ef,
+                    required,
+                    count,
+                    &hnsw_f32_distance(),
+                ),
+                VectorQuantization::SQ8 | VectorQuantization::SQ4 => search_paged_allowed(
+                    &mut adapter,
+                    graph_policy(self.policy, self.quantization),
+                    &self.progress.graph,
+                    &mut workspace,
+                    &stored.to_hnsw_u8(),
+                    ef,
+                    required,
+                    count,
+                    &DistQuantizedCosine {
+                        quantization: self.quantization,
+                    },
+                ),
+            }
+            .map_err(graph_error)?;
+            let mut rows = Vec::with_capacity(ef + k);
+            for neighbour in neighbours {
+                let identity = adapter.reader.identity(neighbour.origin_id)?;
+                if identity.point != neighbour.point_id || identity.data_id != neighbour.origin_id {
+                    return Err(Error::Other(
+                        "paged vector point and row directory disagree".into(),
+                    ));
+                }
                 let score = match self.quantization {
                     VectorQuantization::F32 => 1. - neighbour.distance,
                     VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
                         let PagedVectorPoint::Quantized(point) =
-                            reader.load_point(neighbour.point_id)?
+                            adapter.reader.load_point(neighbour.point_id)?
                         else {
                             return Err(Error::Other("paged graph representation mismatch".into()));
                         };
+                        adapter.reader.before_distance()?;
                         crate::quantized::quantized_hnsw_query_score(
                             &point.values,
                             query,
@@ -619,32 +794,87 @@ impl PagedVectorTail {
                 };
                 rows.push((identity.row_id, score));
             }
-        }
-        // Exact-vector ties use an ordered durable directory. At most k rows
-        // need to be read; no population-sized exact bucket is materialized.
-        if let Some((key, exact_score)) = super::exact_key_for_query(query, self.quantization) {
-            let exact = reader.exact_rows(&key, snapshot, None, k)?;
-            if exact.len() > k || exact.windows(2).any(|w| w[0] >= w[1]) {
+            // Reuse the established self-score contract, including zero norms
+            // and quantization loss. Ordered windows refill through excluded
+            // ties instead of materializing the entire exact-key bucket.
+            let key = exact_key_for_stored_vector(&stored).unwrap_or_default();
+            let mut after = None;
+            let mut exact_kept = 0;
+            let mut exact_score = None;
+            while exact_kept < required {
+                adapter.reader.checkpoint()?;
+                let exact = adapter.reader.exact_rows(&key, snapshot, after, k)?;
+                if exact.len() > k
+                    || exact.windows(2).any(|w| w[0] >= w[1])
+                    || exact
+                        .first()
+                        .is_some_and(|row| after.is_some_and(|old| *row <= old))
+                {
+                    return Err(Error::Other(
+                        "paged vector exact directory returned an invalid window".into(),
+                    ));
+                }
+                if exact.is_empty() {
+                    break;
+                }
+                let full = exact.len() == k;
+                for row in exact {
+                    after = Some(row);
+                    if !(adapter.predicate)(row)? {
+                        continue;
+                    }
+                    let score = match exact_score {
+                        Some(score) => score,
+                        None => {
+                            adapter.reader.before_distance()?;
+                            let score = stored.cosine_similarity(query);
+                            exact_score = Some(score);
+                            score
+                        }
+                    };
+                    rows.push((row, score));
+                    exact_kept += 1;
+                    if exact_kept == required {
+                        break;
+                    }
+                }
+                if !full {
+                    break;
+                }
+            }
+            rows.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let mut output = Vec::with_capacity(required);
+            for (row, score) in rows {
+                if output.iter().any(|(id, _)| *id == row) {
+                    continue;
+                }
+                output.push((row, score));
+                if output.len() == required {
+                    break;
+                }
+            }
+            if output.len() < required {
                 return Err(Error::Other(
-                    "paged vector exact directory returned an invalid window".into(),
+                    "paged graph did not reach the required visible allowed rows".into(),
                 ));
             }
-            for row in exact {
-                rows.push((row, exact_score));
-            }
-        }
-        rows.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let mut output = Vec::with_capacity(k);
-        for (row, score) in rows {
-            if output.iter().any(|(id, _)| *id == row) {
-                continue;
-            }
-            output.push((row, score));
-            if output.len() == k {
-                break;
-            }
-        }
-        Ok(output)
+            output
+        };
+        // Every page/heap/decode scratch owner above is gone before shrinking
+        // the token. The returned row allocation keeps its actual charge.
+        let bytes = output
+            .capacity()
+            .checked_mul(std::mem::size_of::<(RowId, f32)>())
+            .ok_or_else(workspace_overflow)?;
+        reservation.resize(
+            bytes,
+            "retain_paged_vector_search_result",
+            "retain the result reservation with its rows",
+        )?;
+        Ok(PagedVectorSearchResult {
+            rows: output,
+            reservation: Some(reservation),
+        })
     }
 }
 
