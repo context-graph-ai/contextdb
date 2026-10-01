@@ -1,5 +1,5 @@
 //! Passive ownership observation for resident commit-directory tests.
-use super::{Lsn, TransactionManager, TxId, WriteSetApplicator};
+use super::{TransactionManager, WriteSetApplicator};
 
 impl<S: WriteSetApplicator> TransactionManager<S> {
     /// Lower-bound bytes held by the actual resident commit-directory entries.
@@ -11,9 +11,6 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     /// resident map in place; it does not clone or load durable inventory.
     #[doc(hidden)]
     pub fn retained_commit_directory_bytes_for_test(&self) -> usize {
-        let commit_index = self.commit_index.lock();
-        commit_index
-            .len()
-            .saturating_mul(std::mem::size_of::<Lsn>() + std::mem::size_of::<TxId>())
+        self.commit_index.retained_entry_bytes()
     }
 }

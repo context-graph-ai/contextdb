@@ -20778,6 +20778,8 @@ impl RedbPersistence {
                                         memory.reserve(key.value().len().saturating_mul(2)
                                             .saturating_add(value.value().len().saturating_mul(2)).saturating_add(64))?;
                                     }
+                                    #[cfg(feature = "test-seams")]
+                                    crate::writer_query_test_seams::note_graph_delete_decode();
                                     let edge: AdjEntry = match &memory {
                                         Some(memory) => memory.scope(|| Self::decode(value.value())),
                                         None => Self::decode(value.value()),
@@ -22838,6 +22840,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::raise_noncanonical_writer_floors_in_write(&write_txn, 0, lsn.0, 0)?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
@@ -22986,6 +22989,7 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
+            Self::raise_noncanonical_writer_floors_in_write(&write_txn, 0, lsn.0, 0)?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
@@ -31864,6 +31868,9 @@ impl RedbPersistence {
     }
 
     fn write_set_visibility_tx(ws: &WriteSet) -> Option<TxId> {
+        if let Some(tx) = ws.finalized_tx {
+            return Some(tx);
+        }
         ws.relational_inserts
             .iter()
             .flat_map(|(_, row)| std::iter::once(row.created_tx).chain(row.deleted_tx))

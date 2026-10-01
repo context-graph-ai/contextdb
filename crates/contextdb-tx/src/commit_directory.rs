@@ -26,6 +26,10 @@ pub trait CommitDirectory: Send + Sync {
     /// File-backed apply has already written this entry in its atomic durable
     /// transaction. Its adapter does nothing here; the memory backend inserts.
     fn record_applied(&self, lsn: Lsn, tx: TxId);
+    #[cfg(feature = "test-seams")]
+    fn retained_entry_bytes(&self) -> usize {
+        0
+    }
 }
 
 pub(crate) struct MemoryCommitDirectory(pub Mutex<BTreeMap<Lsn, TxId>>);
@@ -80,6 +84,13 @@ impl CommitDirectory for MemoryCommitDirectory {
         let removed = entries.len().saturating_sub(retained.len()) as u64;
         *entries = retained;
         Ok(removed)
+    }
+    #[cfg(feature = "test-seams")]
+    fn retained_entry_bytes(&self) -> usize {
+        self.0
+            .lock()
+            .len()
+            .saturating_mul(std::mem::size_of::<Lsn>() + std::mem::size_of::<TxId>())
     }
     fn record_applied(&self, lsn: Lsn, tx: TxId) {
         self.0.lock().insert(lsn, tx);
