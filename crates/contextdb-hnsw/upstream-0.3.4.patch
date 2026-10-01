@@ -59,7 +59,12 @@
 +use std::collections::{BTreeMap, binary_heap::BinaryHeap};
 @@ -27,0 +28 @@
 +use crate::datamap::DataMap;
-@@ -127,0 +129,34 @@
+@@ -43 +44,3 @@
+-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++#[derive(
++    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
++)]
+@@ -127,0 +131,34 @@
 +struct MappedPointData<T> {
 +    backing: Arc<DataMap>,
 +    origin_id: DataId,
@@ -94,13 +99,13 @@
 +        .expect("mapped HNSW point is missing from its owned backing")
 +}
 +
-@@ -132 +167 @@
+@@ -132 +169 @@
 -    // areference to a mmaped slice
 +    // a reference to an externally owned mmaped slice (legacy API)
-@@ -133,0 +169,2 @@
+@@ -133,0 +171,2 @@
 +    // a mmaped point that owns the mapping from which each temporary slice is read
 +    M(MappedPointData<T>),
-@@ -146,0 +184,11 @@
+@@ -146,0 +186,11 @@
 +    fn new_m(backing: Arc<DataMap>, origin_id: DataId) -> Self
 +    where
 +        T: 'static + std::fmt::Debug,
@@ -112,23 +117,23 @@
 +        })
 +    }
 +
-@@ -150,0 +199 @@
+@@ -150,0 +201 @@
 +            PointData::M(mapped) => (mapped.get_data)(mapped.backing.as_ref(), &mapped.origin_id),
-@@ -155,2 +204,2 @@
+@@ -155,2 +206,2 @@
 -/// The basestructure representing a data point.  
 -/// Its constains data as coming from the client, its client id,  
 +/// The basestructure representing a data point.
 +/// Its constains data as coming from the client, its client id,
-@@ -159 +208,2 @@
+@@ -159 +210,2 @@
 -// neighbours table : one vector by layer so neighbours is allocated to NB_LAYER_MAX
 +// Store headers only through the point's highest populated or assigned layer. Public/durable views
 +// still expose NB_LAYER_MAX layers, padding absent layers with empty lists.
-@@ -171 +221,3 @@
+@@ -171 +223,3 @@
 -    pub(crate) neighbours: Arc<RwLock<Vec<Vec<Arc<PointWithOrder<'b, T>>>>>>,
 +    // Edges share the destination point, without a separate allocation and
 +    // reference count for each immutable distance record.
 +    pub(crate) neighbours: Arc<RwLock<Vec<Vec<PointWithOrder<'b, T>>>>>,
-@@ -176,5 +228,4 @@
+@@ -176,5 +230,4 @@
 -        let mut neighbours = Vec::with_capacity(NB_LAYER_MAX as usize);
 -        // CAVEAT, perhaps pass nb layer as arg ?
 -        for _ in 0..NB_LAYER_MAX {
@@ -138,7 +143,7 @@
 +            .saturating_add(1)
 +            .min(NB_LAYER_MAX as usize);
 +        let neighbours = (0..layer_count).map(|_| Vec::new()).collect();
-@@ -190,5 +241,4 @@
+@@ -190,5 +243,4 @@
 -        let mut neighbours = Vec::with_capacity(NB_LAYER_MAX as usize);
 -        // CAVEAT, perhaps pass nb layer as arg ?
 -        for _ in 0..NB_LAYER_MAX {
@@ -148,7 +153,7 @@
 +            .saturating_add(1)
 +            .min(NB_LAYER_MAX as usize);
 +        let neighbours = (0..layer_count).map(|_| Vec::new()).collect();
-@@ -202,0 +253,20 @@
+@@ -202,0 +255,20 @@
 +    pub(crate) fn new_from_owned_mmap(
 +        backing: Arc<DataMap>,
 +        origin_id: usize,
@@ -169,7 +174,7 @@
 +        }
 +    }
 +
-@@ -215,0 +286,43 @@
+@@ -215,0 +288,43 @@
 +    }
 +
 +    /// How many neighbours this point keeps at `level`.
@@ -213,31 +218,31 @@
 +            )
 +        }));
 +        taken
-@@ -222 +335 @@
+@@ -222 +337 @@
 -        let nb_layer = ref_neighbours.len();
 +        let nb_layer = NB_LAYER_MAX as usize;
-@@ -226 +339,2 @@
+@@ -226 +341,2 @@
 -            let nb_ngbh = ref_neighbours[i].len();
 +            let layer = ref_neighbours.get(i).map(Vec::as_slice).unwrap_or_default();
 +            let nb_ngbh = layer.len();
-@@ -229 +343 @@
+@@ -229 +345 @@
 -                for pointwo in &ref_neighbours[i] {
 +                for pointwo in layer {
-@@ -273,2 +387,4 @@
+@@ -273,2 +389,4 @@
 -    fn eq(&self, other: &PointWithOrder<T>) -> bool {
 -        self.dist_to_ref == other.dist_to_ref
 +    fn eq(&self, other: &Self) -> bool {
 +        self.dist_to_ref.total_cmp(&other.dist_to_ref) == Ordering::Equal
 +            && self.point_ref.p_id == other.point_ref.p_id
 +            && self.point_ref.origin_id == other.point_ref.origin_id
-@@ -281 +396,0 @@
+@@ -281 +398,0 @@
 -#[allow(clippy::non_canonical_partial_ord_impl)]
-@@ -283,2 +398,2 @@
+@@ -283,2 +400,2 @@
 -    fn partial_cmp(&self, other: &PointWithOrder<T>) -> Option<Ordering> {
 -        self.dist_to_ref.partial_cmp(&other.dist_to_ref)
 +    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 +        Some(self.cmp(other))
-@@ -289,6 +404,5 @@
+@@ -289,6 +406,5 @@
 -    fn cmp(&self, other: &PointWithOrder<T>) -> Ordering {
 -        if !self.dist_to_ref.is_nan() && !other.dist_to_ref.is_nan() {
 -            self.dist_to_ref.partial_cmp(&other.dist_to_ref).unwrap()
@@ -249,7 +254,7 @@
 +            .total_cmp(&other.dist_to_ref)
 +            .then_with(|| self.point_ref.p_id.cmp(&other.point_ref.p_id))
 +            .then_with(|| self.point_ref.origin_id.cmp(&other.point_ref.origin_id))
-@@ -325,0 +440,8 @@
+@@ -325,0 +442,8 @@
 +        Self::new_with_rng(max_nb_connection, maxlevel, StdRng::from_os_rng())
 +    }
 +
@@ -258,10 +263,10 @@
 +    }
 +
 +    fn new_with_rng(max_nb_connection: usize, maxlevel: usize, rng: rand::rngs::StdRng) -> Self {
-@@ -328 +450 @@
+@@ -328 +452 @@
 -            rng: Arc::new(Mutex::new(StdRng::from_os_rng())),
 +            rng: Arc::new(Mutex::new(rng)),
-@@ -447,0 +570,28 @@
+@@ -447,0 +572,28 @@
 +        Self::new_with_rng(
 +            max_nb_connection,
 +            max_layer,
@@ -290,20 +295,20 @@
 +        max_elements: usize,
 +        rng: rand::rngs::StdRng,
 +    ) -> Self {
-@@ -457 +607 @@
+@@ -457 +609 @@
 -        let layer_g = LayerGenerator::new(max_nb_connection, max_layer);
 +        let layer_g = LayerGenerator::new_with_rng(max_nb_connection, max_layer, rng);
-@@ -578,2 +728,2 @@
+@@ -578,2 +730,2 @@
 -    /// returns (**by cloning**) the data inside a point given it PointId, or None if PointId is not coherent.  
 -    /// Can be useful after reloading from a dump.   
 +    /// returns (**by cloning**) the data inside a point given it PointId, or None if PointId is not coherent.
 +    /// Can be useful after reloading from a dump.
-@@ -595,2 +745,2 @@
+@@ -595,2 +747,2 @@
 -    /// returns (**by Arc::clone**) the point given it PointId, or None if PointId is not coherent.  
 -    /// Can be useful after reloading from a dump.   
 +    /// returns (**by Arc::clone**) the point given it PointId, or None if PointId is not coherent.
 +    /// Can be useful after reloading from a dump.
-@@ -611,0 +762,23 @@
+@@ -611,0 +764,23 @@
 +
 +    /// The entry point's identity, if the graph has one yet.
 +    pub fn entry_point_id(&self) -> Option<PointId> {
@@ -327,13 +332,13 @@
 +    pub fn with_point_data<R>(&self, p_id: &PointId, f: impl FnOnce(&[T]) -> R) -> Option<R> {
 +        self.get_point(p_id).map(|point| f(point.data.get_v()))
 +    }
-@@ -660,0 +834,3 @@
+@@ -660,0 +836,3 @@
 +            // A graph without an entry point holds no points: there is no
 +            // upper layer to reach.
 +            let entry_point_level = entry_point_ref.as_ref()?.p_id.0;
-@@ -662 +837,0 @@
+@@ -662 +839,0 @@
 -            let entry_point_level = entry_point_ref.as_ref().unwrap().p_id.0;
-@@ -727,0 +903,9 @@
+@@ -727,0 +905,9 @@
 +/// The most neighbours a point keeps on the bottom layer (layer 0) of a graph
 +/// built with `max_nb_connection` neighbours per upper layer: twice that, as
 +/// Malkov and Yashunin's construction prescribes (`M_max0 = 2 * M`). Insertion
@@ -343,17 +348,17 @@
 +    max_nb_connection.saturating_mul(2)
 +}
 +
-@@ -729 +913 @@
+@@ -729 +915 @@
 -/// The Base structure for hnsw implementation.  
 +/// The Base structure for hnsw implementation.
-@@ -731 +915 @@
+@@ -731 +917 @@
 -/// as described in trait AnnT.  
 +/// as described in trait AnnT.
-@@ -757,0 +942,3 @@
+@@ -757,0 +944,3 @@
 +    /// Controls low-level insertion. Fresh graphs and the legacy raw loader
 +    /// retain their historical behavior; the owned lifecycle facade seals it.
 +    pub(crate) insertable: bool,
-@@ -759,0 +947,576 @@
+@@ -759,0 +949,576 @@
 +/// An owned graph reconstructed from durable state.
 +///
 +/// This facade deliberately exposes no insertion method, `Deref`, or inner
@@ -930,7 +935,7 @@
 +    }
 +}
 +
-@@ -761,4 +1524,4 @@
+@@ -761,4 +1526,4 @@
 -    /// allocation function  
 -    /// . max_nb_connection : number of neighbours stored, by layer, in tables. Must be less than 256.
 -    /// . ef_construction : controls numbers of neighbours explored during construction. See README or paper.  
@@ -939,7 +944,7 @@
 +    /// . max_nb_connection : number of neighbours stored, by layer, in tables.
 +    /// . ef_construction : controls numbers of neighbours explored during construction. See README or paper.
 +    /// . max_elements : hint to speed up allocation tables. number of elements expected.
-@@ -772,0 +1536,36 @@
+@@ -772,0 +1538,36 @@
 +        Self::new_with_rng(
 +            max_nb_connection,
 +            max_elements,
@@ -976,7 +981,7 @@
 +        f: D,
 +        rng: rand::rngs::StdRng,
 +    ) -> Self {
-@@ -774,2 +1573,6 @@
+@@ -774,2 +1575,6 @@
 -        let layer_indexed_points =
 -            PointIndexation::<T>::new(max_nb_connection, adjusted_max_layer, max_elements);
 +        let layer_indexed_points = PointIndexation::<T>::new_with_rng(
@@ -985,20 +990,20 @@
 +            max_elements,
 +            rng,
 +        );
-@@ -778,6 +1580,0 @@
+@@ -778,6 +1582,0 @@
 -        //
 -        if max_nb_connection > 256 {
 -            println!("error max_nb_connection must be less equal than 256");
 -            std::process::exit(1);
 -        }
 -        //
-@@ -801,2 +1598,3 @@
+@@ -801,2 +1600,3 @@
 -        }
 -    } // end of new
 +            insertable: true,
 +        }
 +    } // end of new_with_seed
-@@ -818,2 +1616,7 @@
+@@ -818,2 +1618,7 @@
 -    pub fn get_max_nb_connection(&self) -> u8 {
 -        self.max_nb_connection as u8
 +    pub fn get_max_nb_connection(&self) -> usize {
@@ -1008,7 +1013,7 @@
 +    /// the construction makes wider than the upper layers'
 +    pub fn get_max_nb_connection_layer0(&self) -> usize {
 +        layer0_max_nb_connection(self.max_nb_connection)
-@@ -825 +1628,7 @@
+@@ -825 +1630,7 @@
 -    /// set searching mode.  
 +
 +    /// Whether this low-level graph handle accepts incremental insertion.
@@ -1017,25 +1022,25 @@
 +        self.insertable
 +    }
 +    /// set searching mode.
-@@ -827 +1636 @@
+@@ -827 +1638 @@
 -    /// so to enable searching after parallel insertion the flag must be set to true.  
 +    /// so to enable searching after parallel insertion the flag must be set to true.
-@@ -849 +1658 @@
+@@ -849 +1660 @@
 -    /// set extend_candidates to given flag. By default it is false.  
 +    /// set extend_candidates to given flag. By default it is false.
-@@ -863 +1672 @@
+@@ -863 +1674 @@
 -    /// so the probability of having more than l levels decrease as **exp(-l * ln(max_nb_conn))**.  
 +    /// so the probability of having more than l levels decrease as **exp(-l * ln(max_nb_conn))**.
-@@ -865 +1674 @@
+@@ -865 +1676 @@
 -    /// This reduce the number of levels generated and can provide better precision, reduce memory with marginally more cpu used.  
 +    /// This reduce the number of levels generated and can provide better precision, reduce memory with marginally more cpu used.
-@@ -920 +1729 @@
+@@ -920 +1731 @@
 -    ) -> BinaryHeap<Arc<PointWithOrder<'b, T>>> {
 +    ) -> BinaryHeap<PointWithOrder<'b, T>> {
-@@ -931 +1740 @@
+@@ -931 +1742 @@
 -        let mut return_points = BinaryHeap::<Arc<PointWithOrder<T>>>::with_capacity(skiplist_size);
 +        let mut return_points = BinaryHeap::<PointWithOrder<T>>::with_capacity(skiplist_size);
-@@ -949,10 +1758,3 @@
+@@ -949,10 +1760,3 @@
 -        let mut candidate_points =
 -            BinaryHeap::<Arc<PointWithOrder<T>>>::with_capacity(skiplist_size);
 -        candidate_points.push(Arc::new(PointWithOrder::new(
@@ -1049,27 +1054,27 @@
 +        let mut candidate_points = BinaryHeap::<PointWithOrder<T>>::with_capacity(skiplist_size);
 +        candidate_points.push(PointWithOrder::new(&entry_point, -dist_to_entry_point));
 +        return_points.push(PointWithOrder::new(&entry_point, dist_to_entry_point));
-@@ -997 +1799,5 @@
+@@ -997 +1801,5 @@
 -            let neighbours_c_l = &c.point_ref.neighbours.read()[layer as usize];
 +            let neighbours_guard = c.point_ref.neighbours.read();
 +            let neighbours_c_l = neighbours_guard
 +                .get(layer as usize)
 +                .map(Vec::as_slice)
 +                .unwrap_or_default();
-@@ -1020 +1826 @@
+@@ -1020 +1828 @@
 -                        let e_prime = Arc::new(PointWithOrder::new(&e.point_ref, e_dist_to_p));
 +                        let e_prime = PointWithOrder::new(&e.point_ref, e_dist_to_p);
-@@ -1026,2 +1832 @@
+@@ -1026,2 +1834 @@
 -                        candidate_points
 -                            .push(Arc::new(PointWithOrder::new(&e.point_ref, -e_dist_to_p)));
 +                        candidate_points.push(PointWithOrder::new(&e.point_ref, -e_dist_to_p));
-@@ -1029 +1834 @@
+@@ -1029 +1836 @@
 -                            return_points.push(Arc::clone(&e_prime));
 +                            return_points.push(e_prime.clone());
-@@ -1039 +1844 @@
+@@ -1039 +1846 @@
 -                                return_points.push(Arc::clone(&e_prime))
 +                                return_points.push(e_prime.clone())
-@@ -1056,0 +1862,490 @@
+@@ -1056,0 +1864,490 @@
 +    #[allow(clippy::too_many_arguments)]
 +    fn bounded_search_layer<E>(
 +        &self,
@@ -1560,12 +1565,12 @@
 +        }
 +    }
 +
-@@ -1065,2 +2360,2 @@
+@@ -1065,2 +2362,2 @@
 -    ///  Insert a data slice with its external id as given by the client.   
 -    ///  The insertion method gives the point an internal id.  
 +    ///  Insert a data slice with its external id as given by the client.
 +    ///  The insertion method gives the point an internal id.
-@@ -1068,0 +2364,9 @@
+@@ -1068,0 +2366,9 @@
 +        self.insert_slice_with_point_id(data_with_id);
 +    }
 +
@@ -1575,16 +1580,16 @@
 +            self.insertable,
 +            "cannot insert into a sealed HNSW graph; create a fresh mutable graph"
 +        );
-@@ -1092 +2396 @@
+@@ -1092 +2398 @@
 -                    return;
 +                    return new_point.p_id;
-@@ -1099 +2403 @@
+@@ -1099 +2405 @@
 -            return;
 +            return new_point.p_id;
-@@ -1131,2 +2434,0 @@
+@@ -1131,2 +2436,0 @@
 -                if new_point.neighbours.read()[l as usize].len()
 -                    < self.get_max_nb_connection() as usize
-@@ -1134 +2436,10 @@
+@@ -1134 +2438,10 @@
 -                    new_point.neighbours.write()[l as usize].push(Arc::clone(&ep));
 +                    let mut neighbours = new_point.neighbours.write();
 +                    let layer_count = usize::from(l) + 1;
@@ -1596,35 +1601,35 @@
 +                    if neighbours[l as usize].len() < self.get_max_nb_connection() {
 +                        neighbours[l as usize].push(ep.clone());
 +                    }
-@@ -1169 +2480 @@
+@@ -1169 +2482 @@
 -                    nb_conn = 2 * self.max_nb_connection;
 +                    nb_conn = self.get_max_nb_connection_layer0();
-@@ -1175 +2486 @@
+@@ -1175 +2488 @@
 -                let mut neighbours = Vec::<Arc<PointWithOrder<T>>>::with_capacity(nb_conn);
 +                let mut neighbours = Vec::<PointWithOrder<T>>::with_capacity(nb_conn);
-@@ -1201 +2512 @@
+@@ -1201 +2514 @@
 -        self.reverse_update_neighborhood_simple(Arc::clone(&new_point));
 +        self.reverse_update_neighborhood(Arc::clone(&new_point));
-@@ -1205,0 +2517 @@
+@@ -1205,0 +2519 @@
 +        new_point.p_id
-@@ -1208,3 +2520,3 @@
+@@ -1208,3 +2522,3 @@
 -    /// Insert in parallel a slice of Vec\<T\> each associated to its id.    
 -    /// It uses Rayon for threading so the number of insertions asked for must be large enough to be efficient.  
 -    /// Typically 1000 * the number of threads.  
 +    /// Insert in parallel a slice of Vec\<T\> each associated to its id.
 +    /// It uses Rayon for threading so the number of insertions asked for must be large enough to be efficient.
 +    /// Typically 1000 * the number of threads.
-@@ -1220,3 +2532,3 @@
+@@ -1220,3 +2534,3 @@
 -    /// Insert in parallel slices of \[T\] each associated to its id.    
 -    /// It uses Rayon for threading so the number of insertions asked for must be large enough to be efficient.  
 -    /// Typically 1000 * the number of threads.  
 +    /// Insert in parallel slices of \[T\] each associated to its id.
 +    /// It uses Rayon for threading so the number of insertions asked for must be large enough to be efficient.
 +    /// Typically 1000 * the number of threads.
-@@ -1229 +2541 @@
+@@ -1229 +2543 @@
 -    fn reverse_update_neighborhood_simple(&self, new_point: Arc<Point<T>>) {
 +    fn reverse_update_neighborhood(&self, new_point: Arc<Point<'b, T>>) {
-@@ -1243,3 +2555,8 @@
+@@ -1243,3 +2557,8 @@
 -                    // must be sure that we add a point at the correct level. See the comment to search_layer!
 -                    // this ensures that reverse updating do not add problems.
 -                    let l_n = n_to_add.point_ref.p_id.0 as usize;
@@ -1636,13 +1641,13 @@
 +                    if q_point_neighbours.len() <= l_n {
 +                        q_point_neighbours.resize_with(l_n + 1, Vec::new);
 +                    }
-@@ -1256 +2573 @@
+@@ -1256 +2575 @@
 -                    q_point_neighbours[l_n].push(Arc::new(n_to_add));
 +                    q_point_neighbours[l_n].push(n_to_add);
-@@ -1263 +2580 @@
+@@ -1263 +2582 @@
 -                        2 * self.max_nb_connection
 +                        self.get_max_nb_connection_layer0()
-@@ -1265,7 +2582,20 @@
+@@ -1265,7 +2584,20 @@
 -                    let shrink = nbn_at_l > threshold_shrinking;
 -                    {
 -                        // sort and shring if necessary
@@ -1670,28 +1675,28 @@
 +                            &mut selected,
 +                        );
 +                        q_point_neighbours[l_n] = selected;
-@@ -1272,0 +2603 @@
+@@ -1272,0 +2605 @@
 +                    q_point_neighbours[l_n].sort_unstable();
-@@ -1277 +2608 @@
+@@ -1277 +2610 @@
 -    } // end of reverse_update_neighborhood_simple
 +    } // end of reverse_update_neighborhood
-@@ -1290 +2621 @@
+@@ -1290 +2623 @@
 -        candidates: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
 +        candidates: &mut BinaryHeap<PointWithOrder<'b, T>>,
-@@ -1295 +2626 @@
+@@ -1295 +2628 @@
 -        neighbours_vec: &mut Vec<Arc<PointWithOrder<'b, T>>>,
 +        neighbours_vec: &mut Vec<PointWithOrder<'b, T>>,
-@@ -1312,2 +2643 @@
+@@ -1312,2 +2645 @@
 -                    neighbours_vec
 -                        .push(Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref)));
 +                    neighbours_vec.push(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
-@@ -1325 +2655 @@
+@@ -1325 +2657 @@
 -            let mut candidates_set = HashMap::<PointId, Arc<Point<T>>>::new();
 +            let mut candidates_set = BTreeMap::<PointId, Arc<Point<T>>>::new();
-@@ -1329 +2659 @@
+@@ -1329 +2661 @@
 -            let mut new_candidates_set = HashMap::<PointId, Arc<Point<T>>>::new();
 +            let mut new_candidates_set = BTreeMap::<PointId, Arc<Point<T>>>::new();
-@@ -1331,2 +2661,6 @@
+@@ -1331,2 +2663,6 @@
 -            for (_p_id, p_point) in candidates_set.iter() {
 -                let n_p_layer = &p_point.neighbours.read()[layer as usize];
 +            for p_point in candidates_set.values() {
@@ -1700,34 +1705,34 @@
 +                    .get(layer as usize)
 +                    .map(Vec::as_slice)
 +                    .unwrap_or_default();
-@@ -1346 +2680 @@
+@@ -1346 +2682 @@
 -            for (_p_id, p_point) in new_candidates_set.iter() {
 +            for p_point in new_candidates_set.values() {
-@@ -1348 +2682 @@
+@@ -1348 +2684 @@
 -                candidates.push(Arc::new(PointWithOrder::new(p_point, -dist_topoint)));
 +                candidates.push(PointWithOrder::new(p_point, -dist_topoint));
-@@ -1352 +2686 @@
+@@ -1352 +2688 @@
 -        let mut discarded_points = BinaryHeap::<Arc<PointWithOrder<T>>>::new();
 +        let mut discarded_points = BinaryHeap::<PointWithOrder<T>>::new();
-@@ -1367,4 +2701 @@
+@@ -1367,4 +2703 @@
 -                    neighbours_vec.push(Arc::new(PointWithOrder::new(
 -                        &e_p.point_ref,
 -                        -e_p.dist_to_ref,
 -                    )));
 +                    neighbours_vec.push(PointWithOrder::new(&e_p.point_ref, -e_p.dist_to_ref));
-@@ -1376,4 +2707 @@
+@@ -1376,4 +2709 @@
 -                        discarded_points.push(Arc::new(PointWithOrder::new(
 -                            &e_p.point_ref,
 -                            e_p.dist_to_ref,
 -                        )));
 +                        discarded_points.push(PointWithOrder::new(&e_p.point_ref, e_p.dist_to_ref));
-@@ -1392 +2720 @@
+@@ -1392 +2722 @@
 -                neighbours_vec.push(Arc::new(PointWithOrder::new(
 +                neighbours_vec.push(PointWithOrder::new(
-@@ -1395 +2723 @@
+@@ -1395 +2725 @@
 -                )));
 +                ));
-@@ -1460,7 +2788 @@
+@@ -1460,7 +2790 @@
 -            .map(|p| {
 -                Neighbour::new(
 -                    p.as_ref().point_ref.origin_id,
@@ -1736,29 +1741,29 @@
 -                )
 -            })
 +            .map(|p| Neighbour::new(p.point_ref.origin_id, p.dist_to_ref, p.point_ref.p_id))
-@@ -1472,2 +2794,2 @@
+@@ -1472,2 +2796,2 @@
 -    /// a filtered version of [`Self::search`].  
 -    /// A filter can be added to the search to get nodes with a particular property or id constraint.  
 +    /// a filtered version of [`Self::search`].
 +    /// A filter can be added to the search to get nodes with a particular property or id constraint.
-@@ -1503 +2825,5 @@
+@@ -1503 +2827,5 @@
 -                let neighbours = &pivot.neighbours.read()[layer as usize];
 +                let neighbours_guard = pivot.neighbours.read();
 +                let neighbours = neighbours_guard
 +                    .get(layer as usize)
 +                    .map(Vec::as_slice)
 +                    .unwrap_or_default();
-@@ -1541 +2867 @@
+@@ -1541 +2869 @@
 -                    if filter_t.hnsw_filter(&p.as_ref().point_ref.origin_id) {
 +                    if filter_t.hnsw_filter(&p.point_ref.origin_id) {
-@@ -1543,3 +2869,3 @@
+@@ -1543,3 +2871,3 @@
 -                            p.as_ref().point_ref.origin_id,
 -                            p.as_ref().dist_to_ref,
 -                            p.as_ref().point_ref.p_id,
 +                            p.point_ref.origin_id,
 +                            p.dist_to_ref,
 +                            p.point_ref.p_id,
-@@ -1559,7 +2885 @@
+@@ -1559,7 +2887 @@
 -                .map(|p| {
 -                    Neighbour::new(
 -                        p.as_ref().point_ref.origin_id,
@@ -1767,13 +1772,13 @@
 -                    )
 -                })
 +                .map(|p| Neighbour::new(p.point_ref.origin_id, p.dist_to_ref, p.point_ref.p_id))
-@@ -1583 +2903 @@
+@@ -1583 +2905 @@
 -    /// search the first knbn nearest neigbours of a data and returns a Vector of Neighbour.   
 +    /// search the first knbn nearest neigbours of a data and returns a Vector of Neighbour.
-@@ -1585 +2905 @@
+@@ -1585 +2907 @@
 -    /// than number of neighbours asked.  
 +    /// than number of neighbours asked.
-@@ -1588,0 +2909,439 @@
+@@ -1588,0 +2911,439 @@
 +    }
 +
 +    /// Additive request-bounded search. Source-entry and distance controls are
@@ -2213,29 +2218,29 @@
 +            .map(HnswAllowedSearchStatus::Incomplete)
 +            .unwrap_or(HnswAllowedSearchStatus::Complete);
 +        Ok(traversal.result(result, status))
-@@ -1633,2 +3392,2 @@
+@@ -1633,2 +3394,2 @@
 -    heap_points: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
 -) -> Vec<Arc<PointWithOrder<'b, T>>> {
 +    heap_points: &mut BinaryHeap<PointWithOrder<'b, T>>,
 +) -> Vec<PointWithOrder<'b, T>> {
-@@ -1636 +3395 @@
+@@ -1636 +3397 @@
 -    let mut vec_points = Vec::<Arc<PointWithOrder<T>>>::with_capacity(nb_points);
 +    let mut vec_points = Vec::<PointWithOrder<T>>::with_capacity(nb_points);
-@@ -1640 +3399 @@
+@@ -1640 +3401 @@
 -        let reverse_p = Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
 +        let reverse_p = PointWithOrder::new(&p.point_ref, -p.dist_to_ref);
-@@ -1655,2 +3414,2 @@
+@@ -1655,2 +3416,2 @@
 -    positive_heap: &mut BinaryHeap<Arc<PointWithOrder<'b, T>>>,
 -) -> BinaryHeap<Arc<PointWithOrder<'b, T>>> {
 +    positive_heap: &mut BinaryHeap<PointWithOrder<'b, T>>,
 +) -> BinaryHeap<PointWithOrder<'b, T>> {
-@@ -1658 +3417 @@
+@@ -1658 +3419 @@
 -    let mut negative_heap = BinaryHeap::<Arc<PointWithOrder<T>>>::with_capacity(nb_points);
 +    let mut negative_heap = BinaryHeap::<PointWithOrder<T>>::with_capacity(nb_points);
-@@ -1662 +3421 @@
+@@ -1662 +3423 @@
 -        let reverse_p = Arc::new(PointWithOrder::new(&p.point_ref, -p.dist_to_ref));
 +        let reverse_p = PointWithOrder::new(&p.point_ref, -p.dist_to_ref);
-@@ -1751,0 +3511,75 @@
+@@ -1751,0 +3513,75 @@
 +    #[test]
 +    fn reverse_edge_pruning_preserves_a_distinct_direction_within_the_degree_limit() {
 +        let mut graph = Hnsw::new_with_seed(2, 6, 16, 8, dist::DistL1, 17);
@@ -2311,7 +2316,7 @@
 +        assert_eq!(result.neighbours[0].d_id, 3);
 +    }
 +
-@@ -1804,0 +3639,6 @@
+@@ -1804,0 +3641,6 @@
 +    fn iterating_a_graph_with_no_points_yields_nothing() {
 +        let hns = Hnsw::<f32, dist::DistL1>::new(10, 1, 16, 25, dist::DistL1 {});
 +        assert_eq!(hns.get_point_indexation().into_iter().count(), 0);
@@ -2847,7 +2852,172 @@
 @@ -1372 +1737 @@
 -            max_nb_connection: self.get_max_nb_connection(),
 +            max_nb_connection,
-@@ -1396,0 +1762,76 @@
+@@ -1393,0 +1759,164 @@
++/// Stream a provider-backed graph using the existing owned graph layout. The
++/// provider admits and authenticates one point at a time; no topology or
++/// generation-sized encoded buffer is retained by this encoder.
++pub fn encode_paged_graph_into<T, S, W>(
++    storage: &mut S,
++    state: &crate::paged::PagedGraphState,
++    policy: crate::paged::PagedGraphPolicy,
++    dimension: usize,
++    mut output: W,
++) -> std::result::Result<(), crate::paged::PagedGraphError<S::Error>>
++where
++    T: Serialize,
++    S: crate::paged::PagedPointStorage<T>,
++    W: std::io::Write,
++{
++    use crate::paged::PagedGraphError;
++    if !policy.validate() {
++        return Err(PagedGraphError::InvalidPolicy);
++    }
++    let codec = bincode::DefaultOptions::new().with_fixint_encoding();
++    // Encoding failures are separate from provider errors; the storage
++    // transaction owns the output and must roll it back after either one.
++    let write = |result: bincode::Result<()>| result.map_err(|_| PagedGraphError::Encoding);
++    write(codec.serialize_into(
++        &mut output,
++        &(
++            CONTEXTDB_OWNED_GRAPH_FORMAT_VERSION,
++            policy.m,
++            policy.ef_construction,
++            policy.extend_candidates,
++            policy.keep_pruned,
++            policy.max_layer,
++            dimension,
++            1. / (policy.m as f64).ln(),
++        ),
++    ))?;
++    write(codec.serialize_into(&mut output, &(policy.max_layer as u64)))?;
++    for layer in 0..policy.max_layer {
++        write(codec.serialize_into(&mut output, &(state.layer_counts[layer] as u64)))?;
++        for rank in 0..state.layer_counts[layer] {
++            storage.checkpoint().map_err(PagedGraphError::Storage)?;
++            let id = PointId(
++                layer as u8,
++                i32::try_from(rank).map_err(|_| PagedGraphError::InvalidState)?,
++            );
++            let point = storage.load_point(id).map_err(PagedGraphError::Storage)?;
++            if point.id != id {
++                return Err(PagedGraphError::InvalidPoint);
++            }
++            write(codec.serialize_into(
++                &mut output,
++                &(
++                    point.origin_id,
++                    OwnedPointId {
++                        layer: id.0,
++                        rank: id.1,
++                    },
++                    point.values.as_slice(),
++                ),
++            ))?;
++            write(codec.serialize_into(&mut output, &(point.neighbours.len() as u64)))?;
++            for neighbours in &point.neighbours {
++                write(codec.serialize_into(&mut output, &(neighbours.len() as u64)))?;
++                for neighbour in neighbours {
++                    write(codec.serialize_into(
++                        &mut output,
++                        &OwnedNeighbour {
++                            origin_id: neighbour.origin_id,
++                            point_id: OwnedPointId {
++                                layer: neighbour.point_id.0,
++                                rank: neighbour.point_id.1,
++                            },
++                            distance: neighbour.distance,
++                        },
++                    ))?;
++                }
++            }
++        }
++    }
++    let entry = state.entry_point.map(|id| OwnedPointId {
++        layer: id.0,
++        rank: id.1,
++    });
++    write(codec.serialize_into(&mut output, &entry))?;
++    std::result::Result::Ok(())
++}
++
++/// Encode an independently stored point in the existing sealed graph point
++/// layout. The page owner adds its identity envelope and checksum.
++pub fn encode_paged_point_into<T: Serialize, W: std::io::Write>(
++    point: &crate::paged::PagedPoint<T>,
++    mut output: W,
++) -> Result<()> {
++    let codec = bincode::DefaultOptions::new().with_fixint_encoding();
++    codec.serialize_into(
++        &mut output,
++        &(
++            point.origin_id,
++            OwnedPointId {
++                layer: point.id.0,
++                rank: point.id.1,
++            },
++            point.values.as_slice(),
++        ),
++    )?;
++    codec.serialize_into(&mut output, &(point.neighbours.len() as u64))?;
++    for layer in &point.neighbours {
++        codec.serialize_into(&mut output, &(layer.len() as u64))?;
++        for edge in layer {
++            codec.serialize_into(
++                &mut output,
++                &OwnedNeighbour {
++                    origin_id: edge.origin_id,
++                    point_id: OwnedPointId {
++                        layer: edge.point_id.0,
++                        rank: edge.point_id.1,
++                    },
++                    distance: edge.distance,
++                },
++            )?;
++        }
++    }
++    Ok(())
++}
++
++/// Decode one sealed-layout point after its page envelope was authenticated.
++/// The byte limit is the caller's admitted finite decode window.
++pub fn decode_paged_point<T: DeserializeOwned>(
++    bytes: &[u8],
++    byte_limit: usize,
++) -> Result<crate::paged::PagedPoint<T>> {
++    if bytes.len() > byte_limit {
++        return Err(anyhow!("HNSW point exceeds its admitted decode window"));
++    }
++    let point: OwnedGraphPoint<T> = bincode::DefaultOptions::new()
++        .with_fixint_encoding()
++        .with_limit(byte_limit as u64)
++        .reject_trailing_bytes()
++        .deserialize(bytes)?;
++    if point.point_id.layer >= 16 || point.point_id.rank < 0 || point.neighbours.len() > 16 {
++        return Err(anyhow!("invalid HNSW point identity or layer count"));
++    }
++    let neighbours = point
++        .neighbours
++        .into_iter()
++        .map(|layer| {
++            layer
++                .into_iter()
++                .map(|edge| crate::paged::PagedEdge {
++                    point_id: PointId(edge.point_id.layer, edge.point_id.rank),
++                    origin_id: edge.origin_id,
++                    distance: edge.distance,
++                })
++                .collect()
++        })
++        .collect();
++    Ok(crate::paged::PagedPoint {
++        id: PointId(point.point_id.layer, point.point_id.rank),
++        origin_id: point.origin_id,
++        values: point.values,
++        neighbours,
++    })
++}
++
+@@ -1396,0 +1926,76 @@
 +    #[test]
 +    fn inactive_layer_headers_are_absent_while_public_and_durable_layers_stay_complete() {
 +        use super::*;
@@ -2924,10 +3094,10 @@
 +        );
 +    }
 +
-@@ -1401,2 +1841,0 @@
+@@ -1401,2 +2005,0 @@
 -    use log::error;
 -
-@@ -1413,0 +1853,41 @@
+@@ -1413,0 +2017,41 @@
 +    fn durable_roundtrip_fixture() -> Vec<(DataId, Vec<f32>)> {
 +        vec![
 +            (9_001, vec![0.0, 0.0, 0.0, 0.0]),
@@ -2969,9 +3139,9 @@
 +        }
 +    }
 +
-@@ -1416 +1895,0 @@
+@@ -1416 +2059,0 @@
 -        println!("\n\n test_dump_reload_1");
-@@ -1418,32 +1896,0 @@
+@@ -1418,32 +2060,0 @@
 -        // generate a random test
 -        let mut rng = rand::rng();
 -        let unif = Uniform::<f32>::new(0., 1.).unwrap();
@@ -3004,7 +3174,7 @@
 -        hnsw.dump_layer_info();
 -        // dump in a file.  Must take care of name as tests runs in // !!!
 -        let fname = "dumpreloadtest1";
-@@ -1451,10 +1898,7 @@
+@@ -1451,10 +2062,7 @@
 -        let _res = hnsw.file_dump(directory.path(), fname);
 -        //
 -        // reload
@@ -3022,9 +3192,9 @@
 +
 +        assert!(!loaded.is_mmap_backed());
 +        assert_loaded_roundtrip_search(&loaded);
-@@ -1465 +1908,0 @@
+@@ -1465 +2072,0 @@
 -        println!("\n\n test_dump_reload_myfn");
-@@ -1467,18 +1910 @@
+@@ -1467,18 +2074 @@
 -        // generate a random test
 -        let mut rng = rand::rng();
 -        let unif = Uniform::<f32>::new(0., 1.).unwrap();
@@ -3044,19 +3214,19 @@
 -        let ef_construct = 25;
 -        let nb_connection = 10;
 +        let fixture = durable_roundtrip_fixture();
-@@ -1486,3 +1912,3 @@
+@@ -1486,3 +2076,3 @@
 -        let hnsw = Hnsw::<f32, dist::DistPtr<f32, f32>>::new(
 -            nb_connection,
 -            nbcolumn,
 +        let hnsw = Hnsw::<f32, dist::DistPtr<f32, f32>>::new_with_seed(
 +            8,
 +            fixture.len(),
-@@ -1490 +1916 @@
+@@ -1490 +2080 @@
 -            ef_construct,
 +            32,
-@@ -1491,0 +1918 @@
+@@ -1491,0 +2082 @@
 +            0x5355_5050_4c49_4544,
-@@ -1493,6 +1920,3 @@
+@@ -1493,6 +2084,3 @@
 -        for (i, d) in data.iter().enumerate() {
 -            hnsw.insert((d, i));
 -        }
@@ -3066,7 +3236,7 @@
 +        for (external_id, vector) in &fixture {
 +            hnsw.insert((vector, *external_id));
 +        }
-@@ -1500,7 +1924,6 @@
+@@ -1500,7 +2088,6 @@
 -
 -        let _res = hnsw.file_dump(directory.path(), fname);
 -        // This will dump in 2 files named dumpreloadtest.hnsw.graph and dumpreloadtest.hnsw.data
@@ -3080,7 +3250,7 @@
 +        drop(hnsw);
 +
 +        let options = ReloadOptions::default().set_mmap(true);
-@@ -1508,2 +1931,9 @@
+@@ -1508,2 +2095,9 @@
 -        let _hnsw_loaded: Hnsw<f32, DistPtr<f32, f32>> =
 -            reloader.load_hnsw_with_dist(mydist).unwrap();
 +        let loaded = HnswIo::new_with_options(directory.path(), &dumpname, options)
@@ -3092,12 +3262,12 @@
 +            assert_eq!(found[0].d_id, external_id);
 +            assert!(found[0].distance.abs() <= f32::EPSILON);
 +        }
-@@ -1560 +1990 @@
+@@ -1560 +2154 @@
 -    // this tests reloads a dump with memory mapping of data, inserts new data and redump
 +    // The loaded graph owns its mmap and is searched after the source graph and loader are gone.
-@@ -1563 +1992,0 @@
+@@ -1563 +2156,0 @@
 -        println!("\n\n hnswio tests : reload_with_mmap");
-@@ -1565,35 +1993,0 @@
+@@ -1565,35 +2157,0 @@
 -        // generate a random test
 -        let mut rng = rand::rng();
 -        let unif = Uniform::<f32>::new(0., 1.).unwrap();
@@ -3133,7 +3303,7 @@
 -        hnsw.dump_layer_info();
 -        // dump in a file.  Must take care of name as tests runs in // !!!
 -        let fname = "mmapreloadtest";
-@@ -1601,67 +1995,8 @@
+@@ -1601,67 +2159,8 @@
 -        let dumpname = hnsw.file_dump(directory.path(), fname).unwrap();
 -        debug!("dump succeeded in file basename : {}", dumpname);
 -        //
@@ -3218,8 +3388,747 @@
 +    clippy::option_filter_map,
 +    clippy::unnecessary_unwrap
 +)]
+@@ -14,0 +21 @@
++pub mod paged;
 --- a/src/libext.rs
 +++ b/src/libext.rs
 @@ -2 +2 @@
 -//! The AnnT trait is implemented with macros for u32, u16, u8, f32, f64 and i32.  
 +//! The AnnT trait is implemented with macros for u32, u16, u8, f32, f64 and i32.
+--- /dev/null
++++ b/src/paged.rs
+@@ -0,0 +1,734 @@
++//! Storage-access version of the seeded, sequential HNSW construction algorithm.
++//!
++//! A provider owns node persistence and transactions. This module retains only
++//! one insertion's finite workspace; it never caches the population of nodes.
++use crate::hnsw::{NB_LAYER_MAX, PointId};
++use anndists::dist::distances::Distance;
++use rand::{Rng, SeedableRng, distr::Uniform};
++use rand_chacha::ChaCha12Rng;
++use serde::{Deserialize, Serialize};
++use std::cmp::Ordering;
++use std::collections::{BinaryHeap, HashSet};
++
++/// One independently loadable point. Adjacency is bounded by the graph degree
++/// and layer count, rather than by graph population.
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct PagedPoint<T> {
++    pub id: PointId,
++    pub origin_id: usize,
++    pub values: Vec<T>,
++    pub neighbours: Vec<Vec<PagedEdge>>,
++}
++
++#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
++pub struct PagedEdge {
++    pub point_id: PointId,
++    pub origin_id: usize,
++    pub distance: f32,
++}
++
++impl PartialEq for PagedEdge {
++    fn eq(&self, other: &Self) -> bool {
++        self.cmp(other) == Ordering::Equal
++    }
++}
++impl Eq for PagedEdge {}
++impl PartialOrd for PagedEdge {
++    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
++        Some(self.cmp(other))
++    }
++}
++impl Ord for PagedEdge {
++    fn cmp(&self, other: &Self) -> Ordering {
++        self.distance
++            .total_cmp(&other.distance)
++            .then_with(|| self.point_id.cmp(&other.point_id))
++            .then_with(|| self.origin_id.cmp(&other.origin_id))
++    }
++}
++impl PagedEdge {
++    fn reversed(self) -> Self {
++        Self {
++            distance: -self.distance,
++            ..self
++        }
++    }
++}
++
++/// Durable generator position. ChaCha12 is rand 0.9's seeded StdRng; retaining
++/// the word position resumes the identical stream without replaying old draws.
++#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
++pub struct PagedGraphState {
++    pub seed: u64,
++    pub rng_word_position: u128,
++    pub layer_counts: [usize; NB_LAYER_MAX as usize],
++    pub entry_point: Option<PointId>,
++    pub points: usize,
++}
++impl PagedGraphState {
++    pub fn new(seed: u64) -> Self {
++        Self {
++            seed,
++            rng_word_position: 0,
++            layer_counts: [0; NB_LAYER_MAX as usize],
++            entry_point: None,
++            points: 0,
++        }
++    }
++    fn next_level(&mut self, m: usize, max_layer: usize) -> usize {
++        let mut rng = ChaCha12Rng::seed_from_u64(self.seed);
++        rng.set_word_pos(self.rng_word_position);
++        let sample = rng.sample(Uniform::<f64>::new(0., 1.).unwrap());
++        let mut level = (-sample.ln() * (1. / (m as f64).ln())).floor() as usize;
++        if level >= max_layer {
++            level = rng.sample(Uniform::<usize>::new(0, max_layer).unwrap());
++        }
++        self.rng_word_position = rng.get_word_pos();
++        level
++    }
++}
++
++#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
++pub struct PagedGraphPolicy {
++    pub m: usize,
++    pub ef_construction: usize,
++    pub max_layer: usize,
++    pub extend_candidates: bool,
++    pub keep_pruned: bool,
++}
++impl PagedGraphPolicy {
++    pub fn validate(&self) -> bool {
++        self.m > 1
++            && self.m <= 256
++            && self.ef_construction > 0
++            && self.max_layer > 0
++            && self.max_layer <= NB_LAYER_MAX as usize
++    }
++    fn degree(&self, layer: usize) -> usize {
++        self.m * if layer == 0 { 2 } else { 1 }
++    }
++}
++
++/// All reads authenticate identity and payload, and admit their finite node
++/// decode buffers. Writes modify only the caller's current transaction. Failed
++/// insertion requires dropping that transaction; no partial point is published.
++pub trait PagedPointStorage<T> {
++    type Error;
++    fn load_point(&mut self, id: PointId) -> Result<PagedPoint<T>, Self::Error>;
++    fn store_point(&mut self, point: &PagedPoint<T>) -> Result<(), Self::Error>;
++    fn checkpoint(&mut self) -> Result<(), Self::Error>;
++}
++
++#[derive(Debug)]
++pub enum PagedGraphError<E> {
++    Storage(E),
++    InvalidPolicy,
++    InvalidState,
++    InvalidPoint,
++    ScratchExhausted,
++    InvalidDistance,
++    Encoding,
++}
++impl<E> From<E> for PagedGraphError<E> {
++    fn from(error: E) -> Self {
++        Self::Storage(error)
++    }
++}
++
++/// Fixed-capacity insertion scratch. Allocate this only after reserving
++/// `allocation_bound(capacity)` bytes. All containers refuse growth at their
++/// admitted capacity; no population-sized allocation is made implicitly.
++pub struct PagedGraphWorkspace {
++    capacity: usize,
++    visited: HashSet<PointId>,
++    candidates: BinaryHeap<PagedEdge>,
++    results: BinaryHeap<PagedEdge>,
++    selected: Vec<PagedEdge>,
++    discarded: BinaryHeap<PagedEdge>,
++    extension: Vec<PointId>,
++}
++impl PagedGraphWorkspace {
++    pub fn allocation_bound(capacity: usize) -> Option<usize> {
++        let buckets = capacity
++            .checked_mul(8)?
++            .checked_div(7)?
++            .checked_add(1)?
++            .checked_next_power_of_two()?
++            .max(4);
++        capacity
++            .checked_mul(8 * std::mem::size_of::<PagedEdge>() + std::mem::size_of::<PointId>())?
++            .checked_add(
++                buckets
++                    .checked_mul(std::mem::size_of::<PointId>() + 1)?
++                    .checked_add(32)?,
++            )
++    }
++    pub fn new(capacity: usize) -> Self {
++        Self {
++            capacity,
++            visited: HashSet::with_capacity(capacity),
++            candidates: BinaryHeap::with_capacity(capacity),
++            results: BinaryHeap::with_capacity(capacity),
++            selected: Vec::with_capacity(capacity),
++            discarded: BinaryHeap::with_capacity(capacity),
++            extension: Vec::with_capacity(capacity),
++        }
++    }
++    fn clear_search(&mut self) {
++        self.visited.clear();
++        self.candidates.clear();
++        self.results.clear();
++    }
++    fn push<E>(
++        capacity: usize,
++        heap: &mut BinaryHeap<PagedEdge>,
++        point: PagedEdge,
++    ) -> Result<(), PagedGraphError<E>> {
++        if heap.len() >= capacity {
++            return Err(PagedGraphError::ScratchExhausted);
++        }
++        heap.push(point);
++        Ok(())
++    }
++    fn visit<E>(&mut self, id: PointId) -> Result<bool, PagedGraphError<E>> {
++        if self.visited.contains(&id) {
++            return Ok(false);
++        }
++        if self.visited.len() >= self.capacity {
++            return Err(PagedGraphError::ScratchExhausted);
++        }
++        self.visited.insert(id);
++        Ok(true)
++    }
++}
++
++fn load<T, S: PagedPointStorage<T>>(
++    storage: &mut S,
++    id: PointId,
++    policy: PagedGraphPolicy,
++) -> Result<PagedPoint<T>, PagedGraphError<S::Error>> {
++    storage.checkpoint()?;
++    let point = storage.load_point(id)?;
++    if point.id != id
++        || id.1 < 0
++        || id.0 as usize >= policy.max_layer
++        || point.neighbours.len() > policy.max_layer
++        || point.neighbours.iter().enumerate().any(|(l, edges)| {
++            edges.len() > policy.degree(l)
++                || edges
++                    .iter()
++                    .any(|e| !e.distance.is_finite() || e.distance < 0.)
++        })
++    {
++        return Err(PagedGraphError::InvalidPoint);
++    }
++    Ok(point)
++}
++fn distance<T: Send + Sync, D: Distance<T>, E>(
++    distance: &D,
++    left: &[T],
++    right: &[T],
++) -> Result<f32, PagedGraphError<E>> {
++    let value = distance.eval(left, right);
++    if !value.is_finite() || value < 0. {
++        return Err(PagedGraphError::InvalidDistance);
++    }
++    Ok(value)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn search_layer<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
++    storage: &mut S,
++    policy: PagedGraphPolicy,
++    state: &PagedGraphState,
++    workspace: &mut PagedGraphWorkspace,
++    values: &[T],
++    pivot: PointId,
++    ef: usize,
++    layer: usize,
++    metric: &D,
++) -> Result<(), PagedGraphError<S::Error>> {
++    workspace.clear_search();
++    if state.layer_counts[layer] == 0 {
++        return Ok(());
++    }
++    if ef == 0 || ef >= workspace.capacity {
++        return Err(PagedGraphError::ScratchExhausted);
++    }
++    let entry = load(storage, pivot, policy)?;
++    let first = PagedEdge {
++        point_id: pivot,
++        origin_id: entry.origin_id,
++        distance: distance(metric, values, &entry.values)?,
++    };
++    workspace.visit(pivot)?;
++    PagedGraphWorkspace::push(
++        workspace.capacity,
++        &mut workspace.candidates,
++        first.reversed(),
++    )?;
++    PagedGraphWorkspace::push(workspace.capacity, &mut workspace.results, first)?;
++    while let Some(candidate) = workspace.candidates.pop() {
++        if -candidate.distance > workspace.results.peek().unwrap().distance {
++            break;
++        }
++        let point = load(storage, candidate.point_id, policy)?;
++        for edge in point.neighbours.get(layer).into_iter().flatten() {
++            if !workspace.visit(edge.point_id)? {
++                continue;
++            }
++            let neighbour = load(storage, edge.point_id, policy)?;
++            let score = distance(metric, values, &neighbour.values)?;
++            if score < workspace.results.peek().unwrap().distance || workspace.results.len() < ef {
++                let scored = PagedEdge {
++                    point_id: edge.point_id,
++                    origin_id: neighbour.origin_id,
++                    distance: score,
++                };
++                PagedGraphWorkspace::push(
++                    workspace.capacity,
++                    &mut workspace.candidates,
++                    scored.reversed(),
++                )?;
++                // Remove first when full: the just-admitted node must be better
++                // than the current farthest, so this preserves heap semantics.
++                if workspace.results.len() >= ef {
++                    workspace.results.pop();
++                }
++                PagedGraphWorkspace::push(workspace.capacity, &mut workspace.results, scored)?;
++            }
++        }
++    }
++    Ok(())
++}
++
++#[allow(clippy::too_many_arguments)]
++fn select<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
++    storage: &mut S,
++    policy: PagedGraphPolicy,
++    workspace: &mut PagedGraphWorkspace,
++    values: &[T],
++    cap: usize,
++    layer: usize,
++    extend: bool,
++    metric: &D,
++) -> Result<(), PagedGraphError<S::Error>> {
++    workspace.selected.clear();
++    workspace.discarded.clear();
++    workspace.extension.clear();
++    if workspace.candidates.len() <= cap && !extend {
++        while let Some(edge) = workspace.candidates.pop() {
++            workspace.selected.push(edge.reversed());
++        }
++        return Ok(());
++    }
++    if workspace.candidates.len() <= cap && extend {
++        for candidate in workspace.candidates.iter() {
++            let point = load(storage, candidate.point_id, policy)?;
++            for edge in point.neighbours.get(layer).into_iter().flatten() {
++                if workspace
++                    .candidates
++                    .iter()
++                    .any(|c| c.point_id == edge.point_id)
++                    || workspace.extension.contains(&edge.point_id)
++                {
++                    continue;
++                }
++                if workspace.extension.len() >= workspace.capacity {
++                    return Err(PagedGraphError::ScratchExhausted);
++                }
++                workspace.extension.push(edge.point_id);
++            }
++        }
++        workspace.extension.sort_unstable();
++        for id in &workspace.extension {
++            let point = load(storage, *id, policy)?;
++            let score = distance(metric, values, &point.values)?;
++            PagedGraphWorkspace::push(
++                workspace.capacity,
++                &mut workspace.candidates,
++                PagedEdge {
++                    point_id: *id,
++                    origin_id: point.origin_id,
++                    distance: -score,
++                },
++            )?;
++        }
++    }
++    while workspace.selected.len() < cap {
++        let Some(candidate) = workspace.candidates.pop() else {
++            break;
++        };
++        let point = load(storage, candidate.point_id, policy)?;
++        let mut accepted = true;
++        for prior in &workspace.selected {
++            let previous = load(storage, prior.point_id, policy)?;
++            if distance(metric, &point.values, &previous.values)? <= -candidate.distance {
++                accepted = false;
++                break;
++            }
++        }
++        if accepted {
++            if workspace.selected.len() >= workspace.capacity {
++                return Err(PagedGraphError::ScratchExhausted);
++            }
++            workspace.selected.push(candidate.reversed());
++        } else if policy.keep_pruned {
++            PagedGraphWorkspace::push(workspace.capacity, &mut workspace.discarded, candidate)?;
++        }
++    }
++    if policy.keep_pruned {
++        while workspace.selected.len() < cap {
++            let Some(candidate) = workspace.discarded.pop() else {
++                break;
++            };
++            if workspace.selected.len() >= workspace.capacity {
++                return Err(PagedGraphError::ScratchExhausted);
++            }
++            workspace.selected.push(candidate.reversed());
++        }
++    }
++    Ok(())
++}
++
++/// Insert one point using the same descent, diversity selection, reciprocal
++/// pruning, tie order and seeded level sampling as sequential resident HNSW.
++/// `state` is updated only after success. Transaction rollback must discard all
++/// writes on any error, including workspace exhaustion or cancellation.
++pub fn insert_paged<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
++    storage: &mut S,
++    policy: PagedGraphPolicy,
++    state: &mut PagedGraphState,
++    workspace: &mut PagedGraphWorkspace,
++    values: Vec<T>,
++    origin_id: usize,
++    metric: &D,
++) -> Result<PointId, PagedGraphError<S::Error>> {
++    if !policy.validate() {
++        return Err(PagedGraphError::InvalidPolicy);
++    }
++    let mut successor = state.clone();
++    let level = successor.next_level(policy.m, policy.max_layer);
++    let rank =
++        i32::try_from(successor.layer_counts[level]).map_err(|_| PagedGraphError::InvalidState)?;
++    let id = PointId(level as u8, rank);
++    successor.layer_counts[level] = successor.layer_counts[level]
++        .checked_add(1)
++        .ok_or(PagedGraphError::InvalidState)?;
++    successor.points = successor
++        .points
++        .checked_add(1)
++        .ok_or(PagedGraphError::InvalidState)?;
++    let mut new_point = PagedPoint {
++        id,
++        origin_id,
++        values,
++        neighbours: vec![Vec::new(); policy.max_layer],
++    };
++    let Some(mut pivot) = state.entry_point else {
++        if state.points != 0 {
++            return Err(PagedGraphError::InvalidState);
++        }
++        storage.store_point(&new_point)?;
++        successor.entry_point = Some(id);
++        *state = successor;
++        return Ok(id);
++    };
++    let mut dist_to_entry = distance(
++        metric,
++        &new_point.values,
++        &load(storage, pivot, policy)?.values,
++    )?;
++    for layer in ((level + 1)..(pivot.0 as usize + 1)).rev() {
++        search_layer(
++            storage,
++            policy,
++            &successor,
++            workspace,
++            &new_point.values,
++            pivot,
++            1,
++            layer,
++            metric,
++        )?;
++        if let Some(edge) = workspace.results.pop() {
++            new_point.neighbours[layer].push(edge);
++            if edge.distance < dist_to_entry {
++                pivot = edge.point_id;
++                dist_to_entry = edge.distance;
++            }
++        }
++    }
++    for layer in (0..=level).rev() {
++        search_layer(
++            storage,
++            policy,
++            &successor,
++            workspace,
++            &new_point.values,
++            pivot,
++            policy.ef_construction,
++            layer,
++            metric,
++        )?;
++        workspace.candidates.clear();
++        while let Some(edge) = workspace.results.pop() {
++            PagedGraphWorkspace::push(
++                workspace.capacity,
++                &mut workspace.candidates,
++                edge.reversed(),
++            )?;
++        }
++        if !workspace.candidates.is_empty() {
++            select(
++                storage,
++                policy,
++                workspace,
++                &new_point.values,
++                policy.degree(layer),
++                layer,
++                layer == 0 && policy.extend_candidates,
++                metric,
++            )?;
++            workspace.selected.sort_unstable();
++            new_point.neighbours[layer] = workspace.selected.clone();
++            if let Some(edge) = workspace.selected.first() {
++                pivot = edge.point_id;
++            }
++        }
++    }
++    storage.store_point(&new_point)?;
++    for layer in (0..=level).rev() {
++        for edge in &new_point.neighbours[layer] {
++            if edge.point_id == id {
++                continue;
++            }
++            let mut point = load(storage, edge.point_id, policy)?;
++            if point.neighbours.len() <= layer {
++                point.neighbours.resize_with(layer + 1, Vec::new);
++            }
++            if point.neighbours[layer].iter().any(|e| e.point_id == id) {
++                continue;
++            }
++            workspace.candidates.clear();
++            for old in &point.neighbours[layer] {
++                PagedGraphWorkspace::push(
++                    workspace.capacity,
++                    &mut workspace.candidates,
++                    old.reversed(),
++                )?;
++            }
++            PagedGraphWorkspace::push(
++                workspace.capacity,
++                &mut workspace.candidates,
++                PagedEdge {
++                    point_id: id,
++                    origin_id,
++                    distance: -edge.distance,
++                },
++            )?;
++            if workspace.candidates.len() > policy.degree(layer) {
++                select(
++                    storage,
++                    policy,
++                    workspace,
++                    &point.values,
++                    policy.degree(layer),
++                    layer,
++                    false,
++                    metric,
++                )?;
++                point.neighbours[layer] = workspace.selected.clone();
++            } else {
++                point.neighbours[layer].push(PagedEdge {
++                    point_id: id,
++                    origin_id,
++                    distance: edge.distance,
++                });
++            }
++            point.neighbours[layer].sort_unstable();
++            storage.store_point(&point)?;
++        }
++    }
++    if id.0 > state.entry_point.unwrap().0 {
++        successor.entry_point = Some(id);
++    }
++    *state = successor;
++    Ok(id)
++}
++
++/// Search an already published graph through point reads. This performs zero
++/// build work and uses the same finite workspace as insertion.
++pub fn search_paged<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
++    storage: &mut S,
++    policy: PagedGraphPolicy,
++    state: &PagedGraphState,
++    workspace: &mut PagedGraphWorkspace,
++    values: &[T],
++    ef: usize,
++    metric: &D,
++) -> Result<Vec<PagedEdge>, PagedGraphError<S::Error>> {
++    if !policy.validate() {
++        return Err(PagedGraphError::InvalidPolicy);
++    }
++    let Some(mut pivot) = state.entry_point else {
++        return Ok(Vec::new());
++    };
++    for layer in (1..=pivot.0 as usize).rev() {
++        search_layer(
++            storage, policy, state, workspace, values, pivot, 1, layer, metric,
++        )?;
++        if let Some(nearest) = workspace.results.pop() {
++            pivot = nearest.point_id;
++        }
++    }
++    search_layer(
++        storage, policy, state, workspace, values, pivot, ef, 0, metric,
++    )?;
++    let mut results = Vec::with_capacity(workspace.results.len());
++    while let Some(edge) = workspace.results.pop() {
++        results.push(edge);
++    }
++    results.sort_unstable();
++    Ok(results)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::hnsw::Hnsw;
++    use anndists::dist::distances::DistL2;
++    use std::collections::BTreeMap;
++
++    #[derive(Default, Clone)]
++    struct Storage(BTreeMap<PointId, PagedPoint<f32>>);
++    impl PagedPointStorage<f32> for Storage {
++        type Error = ();
++        fn load_point(&mut self, id: PointId) -> Result<PagedPoint<f32>, ()> {
++            self.0.get(&id).cloned().ok_or(())
++        }
++        fn store_point(&mut self, point: &PagedPoint<f32>) -> Result<(), ()> {
++            self.0.insert(point.id, point.clone());
++            Ok(())
++        }
++        fn checkpoint(&mut self) -> Result<(), ()> {
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn provider_insertion_and_restart_preserve_resident_seeded_topology() {
++        for (extend, keep) in [(false, false), (true, true)] {
++            let policy = PagedGraphPolicy {
++                m: 8,
++                ef_construction: 32,
++                max_layer: 16,
++                extend_candidates: extend,
++                keep_pruned: keep,
++            };
++            let mut resident = Hnsw::new_with_seed(8, 300, 16, 32, DistL2 {}, 91);
++            resident.set_extend_candidates(extend);
++            resident.set_keeping_pruned(keep);
++            let mut storage = Storage::default();
++            let mut state = PagedGraphState::new(91);
++            let mut workspace = PagedGraphWorkspace::new(4096);
++            for i in 0..300 {
++                let values = vec![
++                    ((i * 17) % 83) as f32,
++                    ((i * 19) % 59) as f32,
++                    ((i * 7) % 97) as f32,
++                ];
++                let id = insert_paged(
++                    &mut storage,
++                    policy,
++                    &mut state,
++                    &mut workspace,
++                    values.clone(),
++                    i,
++                    &DistL2 {},
++                )
++                .unwrap();
++                assert_eq!(id, resident.insert_slice_with_point_id((&values, i)));
++                // Recover from a durable state representation between insertions.
++                state = bincode::deserialize(&bincode::serialize(&state).unwrap()).unwrap();
++            }
++            for point in resident.get_point_indexation() {
++                let saved = &storage.0[&point.get_point_id()];
++                let neighbours = point.get_neighborhood_id();
++                assert_eq!(saved.neighbours.len(), neighbours.len());
++                for (a, b) in saved.neighbours.iter().zip(neighbours) {
++                    assert_eq!(
++                        a.iter()
++                            .map(|e| (e.point_id, e.origin_id, e.distance.to_bits()))
++                            .collect::<Vec<_>>(),
++                        b.iter()
++                            .map(|e| (e.p_id, e.d_id, e.distance.to_bits()))
++                            .collect::<Vec<_>>()
++                    );
++                }
++            }
++            let mut bytes = Vec::new();
++            crate::hnswio::encode_paged_graph_into::<f32, _, _>(
++                &mut storage,
++                &state,
++                policy,
++                3,
++                &mut bytes,
++            )
++            .unwrap();
++            assert_eq!(bytes, crate::hnswio::encode_owned_graph(&resident).unwrap());
++        }
++    }
++
++    #[test]
++    fn scratch_exhaustion_leaves_recoverable_state_unchanged() {
++        let policy = PagedGraphPolicy {
++            m: 8,
++            ef_construction: 32,
++            max_layer: 16,
++            extend_candidates: false,
++            keep_pruned: false,
++        };
++        let mut storage = Storage::default();
++        let mut state = PagedGraphState::new(1);
++        let mut small = PagedGraphWorkspace::new(1);
++        insert_paged(
++            &mut storage,
++            policy,
++            &mut state,
++            &mut small,
++            vec![1., 0.],
++            0,
++            &DistL2 {},
++        )
++        .unwrap();
++        let before = state.clone();
++        let saved = storage.clone();
++        assert!(matches!(
++            insert_paged(
++                &mut storage,
++                policy,
++                &mut state,
++                &mut small,
++                vec![0., 1.],
++                1,
++                &DistL2 {}
++            ),
++            Err(PagedGraphError::ScratchExhausted)
++        ));
++        assert_eq!(state, before);
++        storage = saved;
++        let mut larger = PagedGraphWorkspace::new(256);
++        insert_paged(
++            &mut storage,
++            policy,
++            &mut state,
++            &mut larger,
++            vec![0., 1.],
++            1,
++            &DistL2 {},
++        )
++        .unwrap();
++        assert_eq!(state.points, 2);
++    }
++}

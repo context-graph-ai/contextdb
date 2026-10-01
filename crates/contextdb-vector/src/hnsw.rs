@@ -18,6 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
+pub mod paged_builder;
 mod unfiltered;
 mod union;
 pub use union::UnionTerminal;
