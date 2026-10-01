@@ -26,6 +26,23 @@ contextdb-engine        Database struct — wires all subsystems, plugin API, su
     └── contextdb-cli       Interactive REPL binary
 ```
 
+Modules that carry the bounded writer working set (details in each crate's `AGENTS.md`):
+
+| Crate | Module | What it does |
+|---|---|---|
+| `contextdb-redb` | `tree_store/page_store/allocator_pager.rs` | Pages allocator bitmap words through 32 fixed windows with same-directory scratch spill |
+| `contextdb-hnsw` | `paged.rs` | Builds and searches an HNSW graph over caller-supplied point storage, keeping one insertion's workspace |
+| `contextdb-vector` | `hnsw/paged_builder.rs`, `store/membership.rs` | Transactional paged graph builder and tail; durable raw-membership sources with no retained directory |
+| `contextdb-relational` | `source.rs` | Root-pinned row and index reads with staged-row merge |
+| `contextdb-graph` | `source.rs` | Root-pinned adjacency reads with an edge overlay |
+| `contextdb-tx` | `commit_directory.rs`, `ordered_staged.rs` | Durable commit-history seam; ordered staged rows |
+| `contextdb-engine` | `persistence/writer_*.rs`, `database/writer_read.rs` | Pinned-root writer reads, durable history cursors, open bounds, statement read scope |
+
+A writable file store keeps a bounded working set however long its history is: it opens without
+reading row versions, change log or commit index, serves reads from roots pinned at publication,
+and releases pages, indexes and history after use; readers keep the view they opened with.
+<!-- enforced by: writable_open_never_touches_history_families::writable_open_never_touches_history_families, writer_reopen_and_doubling_keep_a_fixed_resident_envelope::writer_reopen_and_doubling_keep_a_fixed_resident_envelope, writer_reader_root_survives_commit_eviction_and_cleanup::writer_reader_root_survives_commit_eviction_and_cleanup -->
+
 Dependencies flow downward. `contextdb-engine` owns the `Database` struct and is the crate applications depend on.
 
 `contextdb-hnsw` is the eleventh crate and the one exception to "in-house surface": it is a

@@ -24,6 +24,23 @@ route, second read opener, duplicate refusal type, or consumer-specific executio
 Detailed reader, reclamation, vector generation, and maintenance mechanisms live in
 [architecture](../../docs/architecture.md); their guards are indexed below.
 
+## Writer working set
+
+A writable file store keeps a bounded working set however much durable history it holds. The
+durable file is the source of truth and the writer reads it through roots pinned at publication
+boundaries: `persistence/writer_source.rs` (`WriterSnapshot`, `WriterReadCursor`, `WriterWindow`)
+hands out one admitted record at a time, `persistence/writer_adapters.rs` presents that as the
+relational and graph read sources, and `database/writer_read.rs` scopes a statement to the
+published root it captured, so a reader keeps its committed view across later commits, cache
+eviction and cleanup. Uncommitted rows live in a staged overlay (ordered by the tx crate) and are
+merged over the durable answer. Row versions, the change log and the commit index are read through
+durable cursors (`persistence/writer_history.rs`, `writer_commit_directory.rs`) and are never
+loaded at open; `persistence/writer_recovery.rs` stores the few identity floors and end-key bounds
+open needs. Redb's allocator metadata is paged (see the redb guide) and its retained bytes are
+charged against the writer budget (`memory_accounting.rs`). Vector partitions build, reload and
+search through paged tails and builders (see the vector guide). Cleanup, version pruning and
+compaction run in finite batches.
+
 ## Seams
 
 Below: core, tx, relational, graph, vector, parser, planner, redb. Above: CLI, server, embedders.
@@ -118,6 +135,15 @@ Paths below are relative to this crate unless they start with `crates/` or `../.
 | Retention admits surviving position/index rebuilds, partition inventories, membership chains and affected-LSN sibling buffers before durable reclamation | `src/database/bounded_retention_preparation_tests.rs::surviving_wide_index_rebuild_is_admitted_before_durable_reclamation`, `::wide_partition_inventory_is_admitted_before_reclamation`, `::repeated_wide_membership_copies_are_admitted_before_reclamation`, `::affected_lsn_siblings_are_admitted_before_reclamation` |
 | Retention identity repair admits selected durable row bodies omitted from the resident directory before reclamation | `src/database/bounded_retention_preparation_tests.rs::current_row_identity_body_is_admitted_for_selected_lifetime_only` |
 | Writer residency attribution is reconciled only at quiescent samples; its per-row figures are workload observations, not capacity claims | `tests/vector/writer_residency_attribution.rs::cursor_held_during_update_bounds_attribution_to_quiescent_samples` |
+| A resumed indexed stream seeks past completed entries instead of scanning them | `tests/bounded/stream_resume_seeks_after_prefix_and_exclusive_ordinal.rs::stream_resume_seeks_after_prefix_and_exclusive_ordinal` |
+| Newest-event lookup and composite-prefix newest-row reads examine a constant number of entries | `tests/bounded/newest_event_merges_staged_order_without_sort.rs::newest_event_merges_staged_order_without_sort`, `tests/bounded/composite_prefix_newest_row_examines_constant_entries.rs::composite_prefix_newest_row_examines_constant_entries` |
+| Writable open never reads the history families | `tests/engine_seams/writable_open_never_touches_history_families.rs::writable_open_never_touches_history_families` |
+| A reader's captured root survives later commits, cache eviction and cleanup | `tests/engine_seams/writer_reader_root_survives_commit_eviction_and_cleanup.rs::writer_reader_root_survives_commit_eviction_and_cleanup` |
+| Writer reopen and a doubling of stored data keep the same resident envelope | `tests/engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs::writer_reopen_and_doubling_keep_a_fixed_resident_envelope` |
+| The page-cache share evicts and recharges under the writer budget | `tests/engine_seams/buffer_pool_share_evicts_and_recharges_under_the_writer_budget.rs::buffer_pool_share_evicts_and_recharges_under_the_writer_budget` |
+| A crash at any cut point recovers one complete row, index, vector and log commit | `tests/engine_seams/crash_cutpoints_recover_one_complete_row_index_vector_log_commit.rs::crash_cutpoints_recover_one_complete_row_index_vector_log_commit` |
+| Version pruning and compaction resume in finite safe batches beside external readers | `tests/engine_seams/version_pruning_and_compaction_resume_finite_safe_batches.rs::version_pruning_and_compaction_resume_finite_safe_batches` |
+| Commit and sync history cursors reload without full directories | `tests/engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs::history_sync_and_commit_cursors_reload_without_full_directories` |
 
 ## Where a change lives
 
@@ -143,6 +169,7 @@ Paths below are relative to this crate unless they start with `crates/` or `../.
 | Sync request and reply flow | `sync_client.rs`, `sync_server.rs`; shared records and wire types live in `sync_types.rs`, `protocol.rs`. |
 | Work-ledger state and delivery | `work_ledger.rs`; server owns polling and flags. |
 | Memory charges and append-work observation | `memory_accounting.rs`, `append_work.rs`; database and persistence call these at admission and durable publication. |
+| Writer reads at a pinned root, staged-overlay merge, durable history cursors, open bounds | `persistence/writer_source.rs`, `writer_adapters.rs`, `writer_history.rs`, `writer_commit_directory.rs`, `writer_recovery.rs`; statement scope in `database/writer_read.rs`; the store seams are in the relational, graph and tx guides. |
 | Maintained count installation and query | `maintained_counts.rs`, `database.rs`, `persistence.rs`, `executor.rs`, `executor/bounded.rs`. |
 | Read image authentication and memory | `read_image.rs`, `read_image_memory.rs`, `direct_file_reader.rs`, `persistent_store.rs`; bounded execution remains in `executor/bounded.rs`. |
 | CLI rendering and status | `cli_render.rs`, `metadata_page.rs`; the CLI crate formats its own output. |
