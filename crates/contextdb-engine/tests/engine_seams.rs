@@ -88,3 +88,10 @@ mod writer_recycle_baseline_cost;
 #[cfg(unix)]
 #[path = "engine_seams/writer_file_ownership_survives_recycle.rs"]
 mod writer_file_ownership_survives_recycle;
+
+#[cfg(target_os = "linux")]
+#[path = "engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs"]
+mod writer_reopen_and_doubling_keep_a_fixed_resident_envelope;
+
+#[path = "engine_seams/resident_history_support.rs"]
+mod resident_history_support;
