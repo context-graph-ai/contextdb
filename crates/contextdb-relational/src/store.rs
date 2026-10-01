@@ -12,11 +12,6 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Values larger than this are row bodies, not directory material.  A
-/// file-backed writer keeps their canonical bytes in Redb and retains only
-/// the columns needed to identify, authorize, index, and place the row.
-const MAX_INLINE_COMMITTED_VALUE_BYTES: usize = 1024;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
     pub row_id: RowId,
@@ -299,6 +294,7 @@ pub struct IndexStorage {
     /// Loaded automatic composites start tree-only until an accountant is
     /// available, so opening them never creates an uncharged duplicate tree.
     current_complete: bool,
+    source_backed: bool,
 }
 
 /// A complete, already-indexed replacement for one table.  Received-schema
@@ -391,7 +387,42 @@ impl IndexStorage {
             current: MembershipImage::default(),
             maintain_current: true,
             current_complete: true,
+            source_backed: false,
         }
+    }
+
+    /// Metadata-only descriptor; durable postings stay in the captured source.
+    pub fn new_source_backed(
+        columns: Vec<(String, SortDirection)>,
+        exact_only: bool,
+        automatic: bool,
+    ) -> Self {
+        Self {
+            columns,
+            tree: BTreeMap::new(),
+            exact: ExactMap::default(),
+            exact_filter: None,
+            exact_only,
+            automatic,
+            current: MembershipImage::default(),
+            maintain_current: false,
+            current_complete: false,
+            source_backed: true,
+        }
+    }
+
+    pub fn uses_source(&self) -> bool {
+        self.source_backed
+    }
+
+    fn discard_resident_postings(&mut self) {
+        self.tree = BTreeMap::new();
+        self.exact = ExactMap::default();
+        self.exact_filter = None;
+        self.current = MembershipImage::default();
+        self.maintain_current = false;
+        self.current_complete = false;
+        self.source_backed = true;
     }
 
     /// Number of live (non-tombstoned) postings, useful for leak detection.
@@ -440,6 +471,9 @@ impl IndexStorage {
         key: IndexKey,
         entry: IndexEntry,
     ) -> contextdb_core::Result<()> {
+        if self.source_backed {
+            return Ok(());
+        }
         if !self.exact_only && self.maintain_current {
             self.current.insert(&key, entry.clone())?;
         }
@@ -457,6 +491,9 @@ impl IndexStorage {
 
     /// Stamp `deleted_tx` on the posting matching `row_id` at `key`.
     pub fn tombstone_posting(&mut self, key: &IndexKey, row_id: RowId, deleted_tx: TxId) {
+        if self.source_backed {
+            return;
+        }
         if !self.exact_only && self.maintain_current {
             self.current
                 .remove(key, row_id, deleted_tx)
@@ -537,6 +574,10 @@ impl IndexStorage {
         &mut self,
         budget: Arc<dyn ReadMemoryBudget>,
     ) -> contextdb_core::Result<()> {
+        if self.source_backed {
+            return Ok(());
+        }
+
         if !self.exact_only {
             if self.current_complete {
                 self.current.admit(budget)?;
@@ -748,6 +789,9 @@ pub struct RetainedStructureBytes {
     pub index_exact_filters: usize,
     /// Every index's current membership image.
     pub index_membership: usize,
+    /// Retained table/index map capacity and declared key columns; independent
+    /// of row history, including map buckets retained after schema removal.
+    pub index_descriptors: usize,
 }
 
 impl RetainedStructureBytes {
@@ -760,6 +804,7 @@ impl RetainedStructureBytes {
             .saturating_add(self.index_exact)
             .saturating_add(self.index_exact_filters)
             .saturating_add(self.index_membership)
+            .saturating_add(self.index_descriptors)
     }
 }
 
@@ -888,12 +933,23 @@ impl RelationalStore {
         }
     }
 
-    /// File-backed stores call this before loading or publishing rows.  It is
-    /// deliberately an internal storage choice: SQL values remain canonical
-    /// in Redb and callers must hydrate bodies through the engine.
+    /// Select the durable source backend before exposing the store. Committed
+    /// rows, postings and sidecars remain in storage; callers supply an already
+    /// captured source to reads. This method does not capture or publish roots.
     pub fn enable_disk_backed_committed_bodies(&self) {
         self.disk_backed_committed_bodies
             .store(true, Ordering::Release);
+        *self.tables.write() = HashMap::new();
+        *self.row_positions.write() = HashMap::new();
+        *self.row_version_positions.write() = HashMap::new();
+        *self.sync_source_lsns.write() = HashMap::new();
+        *self.sync_source_kinds.write() = HashMap::new();
+        *self.retention_expiries.write() = HashMap::new();
+        for indexes in self.indexes.write().values_mut() {
+            for storage in indexes.values_mut() {
+                storage.discard_resident_postings();
+            }
+        }
     }
 
     pub fn uses_disk_backed_committed_bodies(&self) -> bool {
@@ -902,32 +958,16 @@ impl RelationalStore {
 
     fn committed_directory_row_for_meta(
         disk_backed: bool,
-        meta: Option<&TableMeta>,
+        _meta: Option<&TableMeta>,
         row: &VersionedRow,
     ) -> VersionedRow {
-        if !disk_backed {
-            return row.clone();
-        }
-        let required = Self::resident_required_columns(meta);
-        let values = row
-            .values
-            .iter()
-            .filter(|(column, value)| {
-                required.contains(*column)
-                    || match value {
-                        Value::Vector(_) => false,
-                        Value::Text(value) => value.len() <= MAX_INLINE_COMMITTED_VALUE_BYTES,
-                        Value::Json(value) => {
-                            value.to_string().len() <= MAX_INLINE_COMMITTED_VALUE_BYTES
-                        }
-                        _ => true,
-                    }
-            })
-            .map(|(column, value)| (column.clone(), value.clone()))
-            .collect();
         VersionedRow {
             row_id: row.row_id,
-            values,
+            values: if disk_backed {
+                HashMap::new()
+            } else {
+                row.values.clone()
+            },
             created_tx: row.created_tx,
             deleted_tx: row.deleted_tx,
             lsn: row.lsn,
@@ -935,59 +975,10 @@ impl RelationalStore {
         }
     }
 
-    /// Columns a disk-backed store keeps resident whatever their size: the
-    /// ones keys, indexes, constraints and read policy consult without a
-    /// Redb read.
-    fn resident_required_columns(meta: Option<&TableMeta>) -> HashSet<String> {
-        let mut required = HashSet::<String>::new();
-        if let Some(meta) = meta {
-            for index in &meta.indexes {
-                required.extend(index.columns.iter().map(|(column, _)| column.clone()));
-            }
-            required.extend(meta.primary_key_columns.iter().cloned());
-            required.extend(meta.unique_constraints.iter().flatten().cloned());
-            required.extend(meta.natural_key_column.iter().cloned());
-            required.extend(meta.expires_column.iter().cloned());
-            if let Some(state_machine) = &meta.state_machine {
-                required.insert(state_machine.column.clone());
-            }
-            for column in &meta.columns {
-                if column.primary_key
-                    || column.unique
-                    || column.context_id
-                    || column.scope_label.is_some()
-                    || column.acl_ref.is_some()
-                    || column.expires
-                    || column.references.is_some()
-                {
-                    required.insert(column.name.clone());
-                }
-                if let Some(columns) = &column.partition_key_columns {
-                    required.extend(columns.iter().cloned());
-                }
-            }
-            for foreign_key in &meta.composite_foreign_keys {
-                required.extend(foreign_key.child_columns.iter().cloned());
-            }
-        }
-        required
-    }
-
-    /// Whether a resident committed row may be missing a column its durable
-    /// Redb body carries. A disk-backed store sheds large text/JSON values and
-    /// vectors from the resident directory; a caller that must hand on every
-    /// committed column (sync changesets, custody digests) reads the durable
-    /// version when this answers `true`. A declared column absent from the
-    /// resident row and not kept resident by [`Self::resident_required_columns`]
-    /// is the only sign: the shed value's size is no longer known here.
-    pub fn committed_row_may_omit_columns(&self, meta: &TableMeta, row: &VersionedRow) -> bool {
-        if !self.uses_disk_backed_committed_bodies() {
-            return false;
-        }
-        let required = Self::resident_required_columns(Some(meta));
-        meta.columns.iter().any(|column| {
-            !row.values.contains_key(&column.name) && !required.contains(&column.name)
-        })
+    /// Source reads return complete admitted bodies; no resident row image
+    /// omits columns in either backend.
+    pub fn committed_row_may_omit_columns(&self, _meta: &TableMeta, _row: &VersionedRow) -> bool {
+        false
     }
 
     fn committed_directory_row(&self, table: &str, row: &VersionedRow) -> VersionedRow {
@@ -1007,15 +998,18 @@ impl RelationalStore {
         if !disk_backed {
             return rows;
         }
-        rows.into_iter()
-            .map(|row| Self::committed_directory_row_for_meta(true, Some(meta), &row))
-            .collect()
+        let _ = meta;
+        Vec::new()
     }
 
     /// Bytes retained after a durable commit, used by the engine to return
     /// the admitted body allocation once Redb owns the canonical row.
     pub fn committed_directory_estimated_bytes(&self, table: &str, row: &VersionedRow) -> usize {
-        self.committed_directory_row(table, row).estimated_bytes()
+        if self.uses_disk_backed_committed_bodies() {
+            0
+        } else {
+            self.committed_directory_row(table, row).estimated_bytes()
+        }
     }
 
     /// Resident bytes for a row published with projected metadata. This is
@@ -1026,6 +1020,10 @@ impl RelationalStore {
         meta: &TableMeta,
         row: &VersionedRow,
     ) -> usize {
+        if self.uses_disk_backed_committed_bodies() {
+            return 0;
+        }
+
         Self::committed_directory_row_for_meta(
             self.uses_disk_backed_committed_bodies(),
             Some(meta),
@@ -1081,6 +1079,9 @@ impl RelationalStore {
         identities: Vec<(TableName, RowId, TxId, Lsn)>,
         budget: Arc<dyn ReadMemoryBudget>,
     ) -> contextdb_core::Result<Vec<PreparedRetentionExpiry>> {
+        if self.uses_disk_backed_committed_bodies() {
+            return Ok(Vec::new());
+        }
         identities
             .into_iter()
             .map(|identity| {
@@ -1092,6 +1093,10 @@ impl RelationalStore {
     }
 
     pub fn publish_retention_expiries(&self, prepared: Vec<PreparedRetentionExpiry>) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         self.retention_expiries.write().extend(prepared);
     }
 
@@ -1127,6 +1132,18 @@ impl RelationalStore {
         inserts: &[(TableName, VersionedRow)],
         budget: Arc<dyn ReadMemoryBudget>,
     ) -> contextdb_core::Result<PreparedMembershipBatch> {
+        if self.uses_disk_backed_committed_bodies() {
+            let credit = membership_credit(budget, 0)?;
+            self.membership_captures.lock().preparations += 1;
+            return Ok(PreparedMembershipBatch {
+                roots: Vec::new(),
+                _credit: credit,
+                _capture_preparation: MembershipCapturePreparation(
+                    self.membership_captures.clone(),
+                ),
+            });
+        }
+
         let affected_count = deletes.len().saturating_add(inserts.len());
         let _affected_credit = membership_credit(
             budget.clone(),
@@ -1675,6 +1692,10 @@ impl RelationalStore {
     }
 
     pub fn set_sync_source_lsns(&self, entries: impl IntoIterator<Item = (TableName, RowId, Lsn)>) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut source_lsns = self.sync_source_lsns.write();
         for (table, row_id, lsn) in entries {
             source_lsns.entry(table).or_default().insert(row_id, lsn);
@@ -1685,6 +1706,10 @@ impl RelationalStore {
         &self,
         entries: impl IntoIterator<Item = (TableName, RowId, SyncSourceKind)>,
     ) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut kinds = self.sync_source_kinds.write();
         for (table, row_id, kind) in entries {
             kinds.entry(table).or_default().insert(row_id, kind);
@@ -1714,6 +1739,10 @@ impl RelationalStore {
     }
 
     pub fn replace_sync_source_lsns(&self, entries: HashMap<(TableName, RowId), Lsn>) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut nested: HashMap<TableName, HashMap<RowId, Lsn>> = HashMap::new();
         for ((table, row_id), lsn) in entries {
             nested.entry(table).or_default().insert(row_id, lsn);
@@ -1722,6 +1751,10 @@ impl RelationalStore {
     }
 
     pub fn replace_sync_source_kinds(&self, entries: HashMap<(TableName, RowId), SyncSourceKind>) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut nested = HashMap::new();
         for ((table, row_id), kind) in entries {
             nested
@@ -1749,6 +1782,10 @@ impl RelationalStore {
         inserts: &[(TableName, VersionedRow)],
         skip_index_rows: &HashSet<(TableName, RowId)>,
     ) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         // Stage the owned row copies BEFORE acquiring any write guard. The
         // deep VersionedRow copy is the same retained data we keep either way;
         // doing it outside the lock keeps the writer's lock-hold window tight
@@ -1824,6 +1861,10 @@ impl RelationalStore {
         deletes: &[(TableName, RowId, TxId)],
         skip_index_rows: &HashSet<(TableName, RowId)>,
     ) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut indexes = self.indexes.write();
         let mut tables = self.tables.write();
         let row_positions = self.row_positions.read();
@@ -1876,17 +1917,27 @@ impl RelationalStore {
         deletes: &[(TableName, RowId, TxId)],
         inserts: &[(TableName, VersionedRow)],
     ) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let skip_index_rows = self.same_index_key_replacements(deletes, inserts);
         self.apply_deletes_ref_skipping_indexes(deletes, &skip_index_rows);
         self.apply_inserts_ref_skipping_indexes(inserts, &skip_index_rows);
     }
 
     pub fn create_table(&self, name: &str, meta: TableMeta) {
-        self.tables.write().entry(name.to_string()).or_default();
+        if !self.uses_disk_backed_committed_bodies() {
+            self.tables.write().entry(name.to_string()).or_default();
+        }
         self.table_meta.write().insert(name.to_string(), meta);
     }
 
     pub fn insert_loaded_row(&self, name: &str, row: VersionedRow) -> contextdb_core::Result<()> {
+        if self.uses_disk_backed_committed_bodies() {
+            return Ok(());
+        }
+
         // Row-load during Database::open: populate every index (user-declared
         // + auto) so the rebuild stays in lockstep. Rows arrive in row_id
         // ascending order, satisfying I18.
@@ -2344,7 +2395,14 @@ impl RelationalStore {
             .write()
             .entry(table.to_string())
             .or_default()
-            .insert(name.to_string(), IndexStorage::new(columns));
+            .insert(
+                name.to_string(),
+                if self.uses_disk_backed_committed_bodies() {
+                    IndexStorage::new_source_backed(columns, false, false)
+                } else {
+                    IndexStorage::new(columns)
+                },
+            );
     }
 
     pub fn create_index_storage_with_budget(
@@ -2354,8 +2412,13 @@ impl RelationalStore {
         columns: Vec<(String, SortDirection)>,
         budget: Arc<dyn ReadMemoryBudget>,
     ) {
-        let mut storage = IndexStorage::new(columns);
-        storage.current = MembershipImage::with_budget(budget);
+        let storage = if self.uses_disk_backed_committed_bodies() {
+            IndexStorage::new_source_backed(columns, false, false)
+        } else {
+            let mut storage = IndexStorage::new(columns);
+            storage.current = MembershipImage::with_budget(budget);
+            storage
+        };
         self.indexes
             .write()
             .entry(table.to_owned())
@@ -2407,8 +2470,12 @@ impl RelationalStore {
             }
             return;
         }
-        let mut storage = IndexStorage::new_automatic(columns);
-        if !exact_only {
+        let mut storage = if self.uses_disk_backed_committed_bodies() {
+            IndexStorage::new_source_backed(columns, exact_only, true)
+        } else {
+            IndexStorage::new_automatic(columns)
+        };
+        if !exact_only && !self.uses_disk_backed_committed_bodies() {
             if let Some(budget) = budget {
                 storage.current = MembershipImage::with_budget(budget);
             } else {
@@ -2443,6 +2510,10 @@ impl RelationalStore {
     }
 
     fn rebuild_index_inner(&self, table: &str, name: &str, preserve_current: bool) {
+        if self.uses_disk_backed_committed_bodies() {
+            return;
+        }
+
         let mut indexes = self.indexes.write();
         let Some(table_indexes) = indexes.get_mut(table) else {
             return;
@@ -2576,6 +2647,30 @@ impl RelationalStore {
         projection
     }
 
+    /// Schema preparation for durable stores never builds resident postings.
+    pub fn projected_source_index_storage(meta: &TableMeta) -> HashMap<String, IndexStorage> {
+        let mut indexes = HashMap::new();
+        for declaration in &meta.indexes {
+            let automatic = declaration.kind == IndexKind::Auto;
+            if automatic
+                && indexes.values().any(|storage: &IndexStorage| {
+                    storage.automatic && storage.columns == declaration.columns
+                })
+            {
+                continue;
+            }
+            indexes.insert(
+                declaration.name.clone(),
+                IndexStorage::new_source_backed(
+                    declaration.columns.clone(),
+                    automatic && declaration.columns.len() == 1,
+                    automatic,
+                ),
+            );
+        }
+        indexes
+    }
+
     fn position_maps_for_tables(tables: &HashMap<TableName, Vec<VersionedRow>>) -> RowPositionMaps {
         let capacity = tables.values().map(Vec::len).sum();
         let mut positions = HashMap::with_capacity(capacity);
@@ -2599,6 +2694,29 @@ impl RelationalStore {
         projections: Vec<TableProjection>,
         dropped_tables: impl IntoIterator<Item = String>,
     ) -> PreparedRelationalPublication {
+        if self.uses_disk_backed_committed_bodies() {
+            let mut table_meta = self.table_meta.read().clone();
+            for table in dropped_tables {
+                table_meta.remove(&table);
+            }
+            for projection in projections {
+                table_meta.insert(projection.table, projection.meta);
+            }
+            let indexes = table_meta
+                .iter()
+                .map(|(table, meta)| (table.clone(), Self::projected_source_index_storage(meta)))
+                .collect();
+            return PreparedRelationalPublication {
+                tables: HashMap::new(),
+                table_meta,
+                indexes,
+                row_positions: HashMap::new(),
+                row_version_positions: HashMap::new(),
+                sync_source_lsns: HashMap::new(),
+                sync_source_kinds: HashMap::new(),
+            };
+        }
+
         let mut tables = self.tables.read().clone();
         let mut table_meta = self.table_meta.read().clone();
         let mut source_lsns = self.sync_source_lsns.read().clone();
@@ -2680,11 +2798,36 @@ impl RelationalStore {
         *source_kinds = publication.sync_source_kinds;
     }
 
+    fn publish_source_projections(
+        &self,
+        projections: Vec<TableProjection>,
+        dropped: &HashSet<String>,
+    ) {
+        let mut all_indexes = self.indexes.write();
+        let mut table_meta = self.table_meta.write();
+        for table in dropped {
+            all_indexes.remove(table);
+            table_meta.remove(table);
+        }
+        for mut projection in projections {
+            for storage in projection.indexes.values_mut() {
+                storage.discard_resident_postings();
+            }
+            table_meta.insert(projection.table.clone(), projection.meta);
+            all_indexes.insert(projection.table, projection.indexes);
+        }
+    }
+
     /// Publish complete replacements for every affected table.  This method
     /// has no validation or allocation path: callers prepare the complete
     /// projections before Redb commits, so once durability succeeds this is
     /// only lock-ordered memory replacement.
     pub fn publish_table_projections(&self, projections: Vec<TableProjection>) {
+        if self.uses_disk_backed_committed_bodies() {
+            self.publish_source_projections(projections, &HashSet::new());
+            return;
+        }
+
         if projections.is_empty() {
             return;
         }
@@ -2729,6 +2872,11 @@ impl RelationalStore {
         projections: Vec<TableProjection>,
         dropped: &std::collections::HashSet<String>,
     ) {
+        if self.uses_disk_backed_committed_bodies() {
+            self.publish_source_projections(projections, dropped);
+            return;
+        }
+
         if projections.is_empty() && dropped.is_empty() {
             return;
         }
@@ -2803,6 +2951,21 @@ impl RelationalStore {
         rows: Vec<VersionedRow>,
         indexes: HashMap<String, IndexStorage>,
     ) -> bool {
+        if self.uses_disk_backed_committed_bodies() {
+            let mut all_indexes = self.indexes.write();
+            let mut table_meta = self.table_meta.write();
+            if !table_meta.contains_key(table) {
+                return false;
+            }
+            let mut indexes = indexes;
+            for storage in indexes.values_mut() {
+                storage.discard_resident_postings();
+            }
+            table_meta.insert(table.to_owned(), meta);
+            all_indexes.insert(table.to_owned(), indexes);
+            return true;
+        }
+
         // This is the same lock order as apply_inserts/apply_deletes. Holding
         // all of them through replacement keeps row lookup maps aligned with
         // the rows an index posting names.
@@ -3024,7 +3187,11 @@ impl RelationalStore {
     }
 
     pub fn table_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.tables.read().keys().cloned().collect();
+        let mut names: Vec<_> = if self.uses_disk_backed_committed_bodies() {
+            self.table_meta.read().keys().cloned().collect()
+        } else {
+            self.tables.read().keys().cloned().collect()
+        };
         names.sort();
         names
     }
@@ -3128,8 +3295,38 @@ impl RelationalStore {
                     },
                 ));
         }
-        for indexes in self.indexes.read().values() {
-            for index in indexes.values() {
+        let all_indexes = self.indexes.read();
+        if self.uses_disk_backed_committed_bodies() {
+            bytes.index_descriptors = hash_table_bytes::<TableName, HashMap<String, IndexStorage>>(
+                all_indexes.capacity(),
+            );
+        }
+        for (table, indexes) in all_indexes.iter() {
+            if self.uses_disk_backed_committed_bodies() {
+                bytes.index_descriptors = bytes
+                    .index_descriptors
+                    .saturating_add(table.capacity())
+                    .saturating_add(hash_table_bytes::<String, IndexStorage>(indexes.capacity()));
+            }
+            for (name, index) in indexes {
+                if index.source_backed {
+                    bytes.index_descriptors = bytes
+                        .index_descriptors
+                        .saturating_add(name.capacity())
+                        .saturating_add(
+                            index
+                                .columns
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<(String, SortDirection)>()),
+                        )
+                        .saturating_add(
+                            index
+                                .columns
+                                .iter()
+                                .map(|(name, _)| name.capacity())
+                                .sum::<usize>(),
+                        );
+                }
                 index.retained_structure_bytes(&mut bytes);
             }
         }

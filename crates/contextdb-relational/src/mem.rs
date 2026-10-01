@@ -175,6 +175,12 @@ impl BoundedOrderedRowCursor {
     where
         E: From<Error>,
     {
+        if store.uses_disk_backed_committed_bodies() {
+            return Err(E::from(Error::Other(
+                "durable index capture requires a captured source".into(),
+            )));
+        }
+
         let indexes = store.indexes.read();
         let name = self
             .index
@@ -684,6 +690,12 @@ impl BoundedExactIndexCursor {
     where
         E: From<Error>,
     {
+        if store.uses_disk_backed_committed_bodies() {
+            return Err(E::from(Error::Other(
+                "durable index capture requires a captured source".into(),
+            )));
+        }
+
         let indexes = store.indexes.read();
         let storage = indexes
             .get(table)
@@ -835,9 +847,171 @@ fn bounded_index_key_owned_bytes(key: &IndexKey) -> Result<usize> {
         .ok_or_else(|| Error::Other("bounded owned index key size overflow".to_string()))
 }
 
+fn push_admitted_source_row(
+    rows: &mut Vec<VersionedRow>,
+    row: &VersionedRow,
+    before_clone: &mut impl FnMut(usize) -> Result<()>,
+) -> Result<()> {
+    if rows.len() == rows.capacity() {
+        let capacity = rows
+            .capacity()
+            .checked_mul(2)
+            .map(|capacity| capacity.max(4))
+            .ok_or_else(|| Error::Other("relational scan capacity overflow".into()))?;
+        let bytes = capacity
+            .checked_sub(rows.capacity())
+            .and_then(|slots| slots.checked_mul(std::mem::size_of::<VersionedRow>()))
+            .ok_or_else(|| Error::Other("relational scan capacity size overflow".into()))?;
+        // Exact reservation avoids Vec::push's implicit, unadmitted growth.
+        // Existing capacity stays charged, including slots freed by retain.
+        before_clone(bytes)?;
+        rows.try_reserve_exact(capacity - rows.len())
+            .map_err(|_| Error::Other("relational scan capacity allocation failed".into()))?;
+    }
+    before_clone(row.estimated_bytes())?;
+    rows.push(row.clone());
+    Ok(())
+}
+
 impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     pub fn new(store: Arc<RelationalStore>, tx_mgr: Arc<TransactionManager<S>>) -> Self {
         Self { store, tx_mgr }
+    }
+
+    /// Complete operation output from a captured durable root. The caller
+    /// admits output capacity and every retained row before allocation/copy,
+    /// including the overlay. Output admission must outlive the returned
+    /// collection; on error the caller releases its operation reservations
+    /// after this method has dropped all partial output and source windows.
+    pub fn scan_with_source(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        snapshot: SnapshotId,
+        source: &dyn crate::source::RelationalReadSource,
+        mut before_clone: impl FnMut(usize) -> Result<()>,
+    ) -> Result<Vec<VersionedRow>> {
+        self.ensure_table_exists(table)?;
+        if snapshot.0 > source.snapshot().0 {
+            return Err(Error::Other(
+                "relational snapshot exceeds the captured source frontier".into(),
+            ));
+        }
+        let mut cursor = source.row_cursor(table, Bound::Unbounded, Bound::Unbounded, false)?;
+        let mut result = Vec::new();
+        while let Some(window) = cursor.next_window()? {
+            self.store.bump_scan_rows_touched(1);
+            let row = window.value();
+            if row.visible_at(snapshot) {
+                push_admitted_source_row(&mut result, row, &mut before_clone)?;
+            }
+        }
+        if let Some(tx) = tx {
+            self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
+                let scratch_entries = result
+                    .len()
+                    .saturating_add(ws.relational_deletes.len())
+                    .saturating_add(ws.relational_inserts.len());
+                let scratch_bytes = scratch_entries.saturating_mul(32);
+                before_clone(scratch_bytes)?;
+                let committed_ids: HashSet<_> = result.iter().map(|row| row.row_id).collect();
+                let deleted_ids: HashSet<_> = ws
+                    .relational_deletes
+                    .iter()
+                    .filter(|(t, _, _)| t == table)
+                    .map(|(_, row, _)| *row)
+                    .collect();
+                result.retain(|row| {
+                    !deleted_ids.contains(&row.row_id)
+                        && !row_matches_delete_predicates(
+                            &ws.relational_delete_predicates,
+                            table,
+                            row,
+                        )
+                });
+                let mut seen = HashSet::new();
+                let staged_start = result.len();
+                for (t, row) in ws.relational_inserts.iter().rev() {
+                    if t == table
+                        && seen.insert(row.row_id)
+                        && (!deleted_ids.contains(&row.row_id)
+                            || committed_ids.contains(&row.row_id))
+                    {
+                        push_admitted_source_row(&mut result, row, &mut before_clone)?;
+                    }
+                }
+                result[staged_start..].reverse();
+                Ok(())
+            })??;
+        }
+        Ok(result)
+    }
+
+    /// Pull one physical version using the full encoded continuation key in
+    /// the caller's root. No store lock, row directory or fresh root is used.
+    pub fn bounded_physical_row_next_from_source<E>(
+        &self,
+        source: &dyn crate::source::RelationalReadSource,
+        table: &str,
+        cursor: &mut BoundedPhysicalCursor,
+        mut before_touch: impl FnMut() -> std::result::Result<(), E>,
+        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E>
+    where
+        E: From<Error>,
+    {
+        if cursor.exhausted {
+            return Ok(None);
+        }
+        before_touch()?;
+        let lower = cursor
+            .source_key
+            .as_deref()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let mut source_cursor = source
+            .row_cursor(table, lower, Bound::Unbounded, false)
+            .map_err(E::from)?;
+        let Some(window) = source_cursor.next_window().map_err(E::from)? else {
+            cursor.source_exhaust();
+            cursor.source_key = None;
+            return Ok(None);
+        };
+        let bytes = window
+            .value()
+            .estimated_bytes()
+            .checked_add(window.position_key().len())
+            .ok_or_else(|| E::from(Error::Other("source row output size overflow".into())))?;
+        before_clone(bytes)?;
+        let row = window.value().clone();
+        cursor.source_advance(window.position_key().to_vec(), &row);
+        self.store.bump_scan_rows_touched(1);
+        Ok(Some(row))
+    }
+
+    /// Open a source continuation without a table-history census.
+    pub fn bounded_physical_cursor_from_source(
+        &self,
+        table: &str,
+    ) -> Result<BoundedPhysicalCursor> {
+        self.ensure_table_exists(table)?;
+        Ok(BoundedPhysicalCursor {
+            position: 0,
+            end: 0,
+            last_inspected: None,
+            last_emitted: None,
+            exhausted: false,
+            source_key: None,
+        })
+    }
+
+    fn ensure_memory_reads(&self) -> Result<()> {
+        if self.store.uses_disk_backed_committed_bodies() {
+            Err(Error::Other(
+                "durable relational reads require a captured source".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn ensure_table_exists(&self, table: &str) -> Result<()> {
@@ -901,6 +1075,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     /// Capturing this once gives a cursor a stable end position; later commits
     /// are outside its snapshot and do not extend its source.
     pub fn bounded_table_len(&self, table: &str) -> Result<usize> {
+        self.ensure_memory_reads()?;
+
         let tables = self.store.tables.read();
         tables
             .get(table)
@@ -938,6 +1114,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     where
         E: From<Error>,
     {
+        self.ensure_memory_reads().map_err(E::from)?;
+
         if cursor.exhausted {
             return Ok(None);
         }
@@ -1043,6 +1221,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     where
         E: From<Error>,
     {
+        self.ensure_memory_reads().map_err(E::from)?;
+
         if cursor.exhausted {
             return Ok(None);
         }
@@ -1173,6 +1353,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     where
         E: From<Error>,
     {
+        self.ensure_memory_reads().map_err(E::from)?;
+
         if cursor.exhausted {
             return Ok(None);
         }
@@ -1322,6 +1504,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     where
         E: From<Error>,
     {
+        self.ensure_memory_reads().map_err(E::from)?;
+
         if cursor.exhausted {
             return Ok(None);
         }
@@ -1626,6 +1810,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         table: &str,
         snapshot: SnapshotId,
     ) -> Result<Vec<VersionedRow>> {
+        self.ensure_memory_reads()?;
         let mut result: Vec<VersionedRow> = {
             let tables = self.store.tables.read();
             let rows = tables
@@ -1698,6 +1883,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         value: &Value,
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
+        self.ensure_memory_reads()?;
         self.ensure_table_exists(table)?;
 
         let (deleted_row_ids, delete_predicates) = match tx {

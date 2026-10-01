@@ -1,6 +1,7 @@
 pub mod mem;
 #[doc(hidden)]
 pub mod membership;
+pub mod source;
 pub mod store;
 
 pub use mem::MemRelationalExecutor;
