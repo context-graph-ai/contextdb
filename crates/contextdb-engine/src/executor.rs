@@ -6662,6 +6662,7 @@ fn exec_insert(
         if !vector_columns.is_empty() {
             validate_vector_columns(db, &p.table, &values)?;
         }
+        let checkpoint = db.write_set_checkpoint(txid)?;
         let row_bytes = db.admit_retained_row_bytes(
             &p.table,
             &values,
@@ -6670,7 +6671,6 @@ fn exec_insert(
             "row_insert",
             "Reduce row size or raise MEMORY_LIMIT before inserting more data.",
         )?;
-        let checkpoint = db.write_set_checkpoint(txid)?;
         let graph_edge = if route_inserts_to_graph {
             match (
                 values.get("source_id"),
@@ -6808,13 +6808,6 @@ fn exec_insert(
                                     return Err(err);
                                 }
                             }
-                        }
-                        if let Err(err) =
-                            db.delete_row_keeping_vectors(txid, &p.table, existing_row.row_id)
-                        {
-                            db.accountant().release(row_bytes);
-                            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-                            return Err(err);
                         }
                         let row_uuid = upsert_values.get("id").and_then(Value::as_uuid).copied();
                         let new_state = db
@@ -7405,7 +7398,13 @@ fn exec_update(
                 affected = affected.saturating_add(1);
                 continue;
             }
-            let checkpoint = db.write_set_checkpoint(txid)?;
+            let checkpoint = match db.write_set_checkpoint(txid) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    db.accountant().release(new_row_bytes);
+                    return Err(error);
+                }
+            };
             let before_counts = db.write_set_counts(txid)?;
             let new_row_id = match db
                 .replace_row_after_update_validation(txid, &p.table, row.row_id, values, snapshot)
@@ -7529,6 +7528,7 @@ fn exec_update(
         let assigned_vector_values = plan.assigned_vector_values;
         let assigned_vector_columns = plan.assigned_vector_columns;
         let conditional_predicates = plan.conditional_predicates;
+        let checkpoint = db.write_set_checkpoint(txid)?;
         let new_row_bytes = admit_table_row_bytes(
             db,
             &p.table,
@@ -7537,9 +7537,7 @@ fn exec_update(
             "row_replace",
             "Reduce row growth or raise MEMORY_LIMIT before updating this row.",
         )?;
-        let checkpoint = db.write_set_checkpoint(txid)?;
         let before_counts = db.write_set_counts(txid)?;
-        let mut vector_allocations = Vec::new();
 
         let vector_free_trigger_update = trigger_callback_bound
             && assigned_vector_columns.is_empty()
@@ -7567,20 +7565,16 @@ fn exec_update(
                     return Err(err);
                 }
             }
-            if let Err(err) = db.delete_row_keeping_vectors(txid, &p.table, row.row_id) {
-                db.accountant().release(new_row_bytes);
-                return Err(err);
-            }
-
-            let new_row_id =
-                match db.insert_row_replacing(txid, &p.table, values, row.row_id, false) {
-                    Ok(row_id) => row_id,
-                    Err(err) => {
-                        db.accountant().release(new_row_bytes);
-                        let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-                        return Err(err);
-                    }
-                };
+            let new_row_id = match db
+                .replace_row_after_update_validation(txid, &p.table, row.row_id, values, snapshot)
+            {
+                Ok(row_id) => row_id,
+                Err(err) => {
+                    db.accountant().release(new_row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            };
             for index in &vector_indexes {
                 if assigned_vector_columns.contains(&index.column) {
                     continue;
@@ -7596,20 +7590,16 @@ fn exec_update(
         db.record_staged_row_admission(txid, &p.table, new_row_id, new_row_bytes);
         for (column, vector) in assigned_vector_values {
             let index = contextdb_core::VectorIndexRef::new(&p.table, column);
-            let vector_bytes = db.vector_insert_accounted_bytes(&index, vector.len());
             if let Err(err) = db.insert_vector_strict(txid, index, new_row_id, vector) {
                 db.accountant().release(new_row_bytes);
-                release_accounted_bytes(db, &vector_allocations);
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(err);
             }
-            vector_allocations.push(vector_bytes);
         }
         if let Err(err) =
             db.propagate_state_change_if_needed(txid, &p.table, row_uuid, new_state.as_deref())
         {
             db.accountant().release(new_row_bytes);
-            release_accounted_bytes(db, &vector_allocations);
             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
             return Err(err);
         }
@@ -18883,12 +18873,6 @@ fn project_graph_frontier_rows(
             Ok(row)
         })
         .collect()
-}
-
-fn release_accounted_bytes(db: &Database, bytes: &[usize]) {
-    for bytes in bytes {
-        db.accountant().release(*bytes);
-    }
 }
 
 impl ReadExecutionTarget for BoundedCursorTarget {

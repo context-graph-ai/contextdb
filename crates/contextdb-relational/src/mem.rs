@@ -962,8 +962,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     .sum::<usize>(),
             )
         });
-        let _scratch = admission
-            .reserve(scratch_bytes.saturating_add(meta.estimated_bytes().saturating_mul(2)))?;
+        let _scratch = admission.reserve(scratch_bytes)?;
         let schema_charge = admission.reserve(
             contextdb_tx::ordered_staged::StagedSchema::bytes_for_meta(meta),
         )?;
@@ -993,7 +992,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             schema.clone(),
             |bytes| admission.reserve(bytes),
         )?;
-        ws.ordered_staged_rows.stage(
+        ws.ordered_staged_rows.stage_retiring_row(
             table,
             contextdb_tx::StagedPosition {
                 position,
@@ -1002,6 +1001,14 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             },
             &keys,
             &schema,
+            if ws.ordered_staged_rows.contains_row(table, row.row_id) {
+                ws.relational_inserts
+                    .iter()
+                    .filter(|(name, old)| name == table && old.row_id == row.row_id)
+                    .count()
+            } else {
+                0
+            },
             |bytes| admission.reserve(bytes),
         )?;
         ws.ordered_staged_rows

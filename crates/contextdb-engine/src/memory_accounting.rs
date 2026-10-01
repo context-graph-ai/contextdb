@@ -313,6 +313,37 @@ pub(crate) struct OwnedMemoryReservation {
     bytes: usize,
 }
 
+/// Admission transferred from a displaced ordinary write into mutation undo.
+#[derive(Debug)]
+pub(crate) struct TransferredRowReservation {
+    accountant: Arc<MemoryAccountant>,
+    bytes: AtomicUsize,
+}
+impl TransferredRowReservation {
+    pub(crate) fn adopt(&self, bytes: usize) {
+        self.bytes.store(bytes, Ordering::Relaxed);
+    }
+    pub(crate) fn from_admitted(accountant: Arc<MemoryAccountant>, bytes: usize) -> Self {
+        Self {
+            accountant,
+            bytes: AtomicUsize::new(bytes),
+        }
+    }
+}
+impl contextdb_tx::StagedPostingCharge for TransferredRowReservation {
+    fn retained_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+    fn transfer_back(&self) -> usize {
+        self.bytes.swap(0, Ordering::Relaxed)
+    }
+}
+impl Drop for TransferredRowReservation {
+    fn drop(&mut self) {
+        self.accountant.release(self.bytes.load(Ordering::Relaxed));
+    }
+}
+
 /// A stack-scoped database-accountant charge. This is used where an existing
 /// execution primitive can unwind from inside its source loop; the charge is
 /// then returned even though control never reaches the primitive's ordinary
@@ -361,6 +392,10 @@ impl contextdb_tx::StagedPostingCharge for OwnedMemoryReservation {
 }
 
 impl OwnedMemoryReservation {
+    pub(crate) fn transfer_to_staged(mut self) {
+        self.bytes = 0;
+    }
+
     pub(crate) fn new(accountant: Arc<MemoryAccountant>) -> Self {
         Self {
             accountant,

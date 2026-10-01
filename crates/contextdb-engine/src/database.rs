@@ -11849,6 +11849,30 @@ struct PendingCommitMetadata {
     vector_schema_epochs: HashMap<VectorIndexRef, u64>,
 }
 
+pub(crate) struct WriteSetCheckpoint<'a> {
+    database: &'a Database,
+    tx: TxId,
+    counts: [usize; 13],
+    requires_commit_lsn: bool,
+    propagation_in_progress: bool,
+    marker: [usize; 2],
+    metadata_counts: [usize; 5],
+    metadata_existed: bool,
+    vector_epochs: Vec<VectorIndexRef>,
+    _charge: crate::memory_accounting::OwnedMemoryReservation,
+    active: bool,
+}
+impl Drop for WriteSetCheckpoint<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self
+                .database
+                .tx_mgr
+                .with_write_set(self.tx, |ws| ws.ordered_staged_rows.settle_checkpoint());
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UpsertIntentDetails {
     pub insert_values: HashMap<ColName, Value>,
@@ -25664,6 +25688,21 @@ impl Database {
         if !trigger_callback_bound || !self.trigger.ready.load(Ordering::SeqCst) {
             self.ensure_trigger_table_ready(table, "insert_row")?;
         }
+        let checkpoint = self.write_set_checkpoint(tx)?;
+        let result = self.insert_row_within_operation(tx, table, values, trigger_callback_bound);
+        if result.is_err() {
+            let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        }
+        result
+    }
+
+    fn insert_row_within_operation(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+        trigger_callback_bound: bool,
+    ) -> Result<RowId> {
         // Statement-scoped bound: `Value::TxId(n)` must satisfy
         // `n <= max(committed_watermark, tx)` so writes inside an active
         // transaction can reference their own allocated TxId. The error,
@@ -25780,13 +25819,12 @@ impl Database {
             Vec::new()
         };
         self.blank_quantized_vector_values(table, &mut values);
-        let inserted = self.insert_relational_row_from_read(
+        let inserted = self.replace_row_after_update_validation(
             tx,
             table,
             old_row_id,
             values,
             self.snapshot_for_read(),
-            None,
         )?;
         self.write_row_vectors(tx, inserted, row_vectors)?;
         Ok(inserted)
@@ -25800,9 +25838,22 @@ impl Database {
         values: HashMap<ColName, Value>,
         snapshot: SnapshotId,
     ) -> Result<RowId> {
-        self.validate_primary_key_values_present(table, &values)?;
-        self.delete_relational_row_releasing_staged(tx, table, row_id)?;
-        self.insert_relational_row_from_read(tx, table, row_id, values, snapshot, None)
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.into()))?;
+        let committed_row_exists = self.committed_row_at(table, row_id, snapshot)?.is_some();
+        self.replace_row_after_update_validation_counted(
+            tx,
+            table,
+            row_id,
+            values,
+            UpdateReplacementContext {
+                meta: &meta,
+                committed_row_exists,
+                created_at: Wallclock::now(),
+            },
+        )
+        .map(|(row, _, _)| row)
     }
 
     /// A relational delete discards a same-transaction insert before commit.
@@ -26010,9 +26061,34 @@ impl Database {
                         })
                 })
                 .sum::<usize>();
-            ws.relational_inserts.retain(|(staged_table, staged_row)| {
-                !(staged_table == &table_name && staged_row.row_id == row_id)
-            });
+            let prior_admitted = ws.admitted_bytes_for_staged_row(table, row_id);
+            let deferred = if ws.ordered_staged_rows.checkpoint_active() {
+                let transferred = (ws.ordered_staged_rows.contains_row(table, row_id)
+                    && ws
+                        .relational_inserts
+                        .iter()
+                        .any(|(name, row)| name == table && row.row_id == row_id))
+                .then(|| {
+                    Arc::new(
+                        crate::memory_accounting::TransferredRowReservation::from_admitted(
+                            self.accountant.clone(),
+                            retired_charge,
+                        ),
+                    ) as Arc<dyn contextdb_tx::StagedPostingCharge>
+                });
+                ws.ordered_staged_rows.retain_displaced(
+                    &mut ws.relational_inserts,
+                    table,
+                    row_id,
+                    prior_admitted,
+                    transferred,
+                )
+            } else {
+                ws.relational_inserts.retain(|(staged_table, staged_row)| {
+                    !(staged_table == &table_name && staged_row.row_id == row_id)
+                });
+                false
+            };
             if retired_charge != 0 {
                 ws.forget_relational_insert_admitted_bytes(table, row_id);
             }
@@ -26029,7 +26105,10 @@ impl Database {
             ws.relational_inserts.push((table_name, row));
             let after = current_write_set_counts(ws);
             ws.rebind_ordered_staged_rows();
-            Ok::<_, Error>(((row_id, before, after), retired_charge))
+            Ok::<_, Error>((
+                (row_id, before, after),
+                if deferred { 0 } else { retired_charge },
+            ))
         })??;
         self.accountant.release(retired_charge);
         Ok(outcome)
@@ -34245,6 +34324,21 @@ impl Database {
         let _operation = self.open_operation_after_write_control_wait(tx, "upsert_row")?;
         self.ensure_trigger_table_ready(table, "upsert_row")?;
         self.complete_insert_access_values(table, &mut values)?;
+        let checkpoint = self.write_set_checkpoint(tx)?;
+        let result = self.upsert_row_within_operation(tx, table, conflict_col, values);
+        if result.is_err() {
+            let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        }
+        result
+    }
+
+    fn upsert_row_within_operation(
+        &self,
+        tx: TxId,
+        table: &str,
+        conflict_col: &str,
+        values: HashMap<ColName, Value>,
+    ) -> Result<UpsertResult> {
         let snapshot = self.snapshot_for_read();
         let existing_row = values
             .get(conflict_col)
@@ -34345,21 +34439,14 @@ impl Database {
             return Ok(UpsertResult::NoOp);
         }
         self.validate_commit_time_upsert_state_transition(table, existing, &values)?;
-        self.delete_relational_row_releasing_staged(tx, table, existing.row_id)?;
         // Placing the new vector is what retires the old one: the store
         // deletes the entry this row already had before it takes the new one,
         // so an updating upsert leaves one vector behind, not two.
         let row_vectors = self.row_vector_values(table, &values);
         let mut values = values;
         self.blank_quantized_vector_values(table, &mut values);
-        let replaced = self.insert_relational_row_from_read(
-            tx,
-            table,
-            existing.row_id,
-            values,
-            snapshot,
-            None,
-        )?;
+        let replaced =
+            self.replace_row_after_update_validation(tx, table, existing.row_id, values, snapshot)?;
         self.write_row_vectors(tx, replaced, row_vectors)?;
 
         if let (Some(uuid), Some(state), Some(_meta)) =
@@ -39611,22 +39698,15 @@ impl Database {
         table: &str,
         row_id: RowId,
         values: &HashMap<ColName, Value>,
-        staged_before: usize,
+        _staged_before: usize,
     ) -> Result<()> {
         let captured = self.row_vector_values(table, values);
         if captured.is_empty() {
             return Ok(());
         }
-        match self.write_row_vectors(tx, row_id, captured) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let _ = self.tx_mgr.with_write_set(tx, |ws| {
-                    ws.relational_inserts.truncate(staged_before);
-                    ws.forget_admitted_bytes_for_unstaged_rows();
-                });
-                Err(error)
-            }
-        }
+        // The caller's checkpoint owns complete compensation, including the
+        // immutable overlay; truncating only ordinary rows here loses owners.
+        self.write_row_vectors(tx, row_id, captured)
     }
 
     /// How many rows this transaction has staged, read before one more is.
@@ -39641,19 +39721,167 @@ impl Database {
         tx: TxId,
         row_id: RowId,
         captured: Vec<(VectorIndexRef, Vec<f32>)>,
-    ) -> Result<Vec<usize>> {
-        let mut charged = Vec::new();
-        for (index, vector) in captured {
-            let bytes = self.vector_insert_accounted_bytes(&index, vector.len());
-            if let Err(error) = self.insert_vector_strict(tx, index, row_id, vector) {
-                for taken in &charged {
-                    self.accountant.release(*taken);
-                }
-                return Err(error);
-            }
-            charged.push(bytes);
+    ) -> Result<()> {
+        if captured.is_empty() {
+            return Ok(());
         }
-        Ok(charged)
+        let _vector_schema =
+            self.vector_schema_read_many(captured.iter().map(|(index, _)| index.clone()));
+        // Placement validates and reserves the whole batch before publishing any
+        // vector write. A later column refusal cannot leave a staged prefix.
+        let control_bytes = captured.len().saturating_mul(
+            std::mem::size_of::<crate::memory_accounting::OwnedMemoryReservation>()
+                .saturating_add(std::mem::size_of::<bool>())
+                .saturating_add(
+                    std::mem::size_of::<crate::memory_accounting::TransferredRowReservation>()
+                        .saturating_add(2 * std::mem::size_of::<usize>()),
+                )
+                .saturating_add(std::mem::size_of::<(
+                    Option<contextdb_tx::ordered_staged::PreparedVectorUndo>,
+                    Arc<crate::memory_accounting::TransferredRowReservation>,
+                    usize,
+                )>()),
+        );
+        let _control = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            control_bytes,
+            "vector",
+            "placement_controls",
+            "Reduce vector columns or raise MEMORY_LIMIT.",
+        )?;
+        let mut reservations = Vec::with_capacity(captured.len());
+        for (index, vector) in &captured {
+            self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
+            self.vector_store.validate_vector(index, vector.len())?;
+            self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
+            let bytes = self.vector_insert_accounted_bytes(index, vector.len());
+            reservations.push(
+                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    self.accountant.clone(),
+                    bytes,
+                    "insert",
+                    &format!("vector_insert@{}.{}", index.table, index.column),
+                    "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
+                )?,
+            );
+        }
+        let existing_live = captured
+            .iter()
+            .map(|(index, _)| {
+                self.vector_store
+                    .has_live_entry_for_row(index, row_id, self.snapshot())
+            })
+            .collect::<Vec<_>>();
+        self.record_vector_schema_epochs(tx, captured.iter().map(|(index, _)| index.clone()))?;
+        self.tx_mgr.with_write_set(tx, |ws| {
+            let mut prepared_undo = Vec::with_capacity(captured.len());
+            for (index, _) in &captured {
+                let bytes = ws
+                    .vector_inserts
+                    .iter()
+                    .filter(|entry| entry.index == *index && entry.row_id == row_id)
+                    .map(|entry| {
+                        self.vector_insert_accounted_bytes(&entry.index, entry.vector.len())
+                    })
+                    .sum();
+                let admission = Arc::new(
+                    crate::memory_accounting::TransferredRowReservation::from_admitted(
+                        self.accountant.clone(),
+                        0,
+                    ),
+                );
+                // Ownership transfers only on publication, so a failed prepare
+                // must leave the original admission with its staged entries.
+                let undo = ws.ordered_staged_rows.prepare_vector_undo(
+                    index,
+                    row_id,
+                    &ws.vector_inserts,
+                    &ws.vector_moves,
+                    &ws.vector_deletes,
+                    admission.clone(),
+                    |bytes| {
+                        Ok(Arc::new(
+                            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                                self.accountant.clone(),
+                                bytes,
+                                "vector",
+                                "mutation_undo",
+                                "Reduce staged vectors or raise MEMORY_LIMIT.",
+                            )?,
+                        ))
+                    },
+                );
+                prepared_undo.push((undo?, admission, bytes));
+            }
+            let mut existing_live = existing_live.into_iter();
+            for ((index, vector), (undo, admission, bytes)) in
+                captured.into_iter().zip(prepared_undo.drain(..))
+            {
+                let existing_live = existing_live.next().expect("prepared vector identity");
+                if let Some(undo) = undo {
+                    admission.adopt(bytes);
+                    ws.ordered_staged_rows.publish_vector_undo(
+                        undo,
+                        &mut ws.vector_inserts,
+                        &mut ws.vector_moves,
+                        &mut ws.vector_deletes,
+                        true,
+                        self.vector_insert_accounted_bytes(&index, vector.len()),
+                    );
+                }
+                let mut position = 0;
+                while position < ws.vector_inserts.len() {
+                    if ws.vector_inserts[position].index == index
+                        && ws.vector_inserts[position].row_id == row_id
+                    {
+                        let prior = ws.vector_inserts.remove(position);
+                        self.accountant.release(
+                            self.vector_insert_accounted_bytes(&prior.index, prior.vector.len()),
+                        );
+                    } else {
+                        position += 1;
+                    }
+                }
+                let mut position = 0;
+                while position < ws.vector_moves.len() {
+                    if ws.vector_moves[position].0 == index && ws.vector_moves[position].2 == row_id
+                    {
+                        let (_, old_row, _, _) = ws.vector_moves.remove(position);
+                        if !ws
+                            .vector_deletes
+                            .iter()
+                            .any(|(pending, row, _)| *pending == index && *row == old_row)
+                        {
+                            ws.vector_deletes.push((index.clone(), old_row, tx));
+                        }
+                    } else {
+                        position += 1;
+                    }
+                }
+                if existing_live
+                    && !ws
+                        .vector_deletes
+                        .iter()
+                        .any(|(pending, row, _)| *pending == index && *row == row_id)
+                {
+                    ws.vector_deletes.push((index.clone(), row_id, tx));
+                }
+                ws.vector_inserts.push(VectorEntry {
+                    index,
+                    row_id,
+                    vector,
+                    created_tx: tx,
+                    deleted_tx: None,
+                    lsn: Lsn(0),
+                });
+            }
+            Ok::<_, Error>(())
+        })??;
+        // The existing write-set accounting owns these charges after install.
+        for reservation in reservations {
+            reservation.transfer_to_staged();
+        }
+        Ok(())
     }
 
     pub fn insert_vector(
@@ -39673,13 +39901,19 @@ impl Database {
         {
             return Err(self.direct_vector_dimension_error(&index, expected, vector.len()));
         }
-        self.insert_vector_strict(tx, index.clone(), row_id, vector)
+        let checkpoint = self.write_set_checkpoint(tx)?;
+        let result = self
+            .insert_vector_strict(tx, index.clone(), row_id, vector)
             .map_err(|err| match err {
                 Error::VectorIndexDimensionMismatch {
                     expected, actual, ..
                 } => self.direct_vector_dimension_error(&index, expected, actual),
                 other => other,
-            })
+            });
+        if result.is_err() {
+            let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        }
+        result
     }
 
     pub(crate) fn insert_vector_strict(
@@ -39689,101 +39923,75 @@ impl Database {
         row_id: RowId,
         vector: Vec<f32>,
     ) -> Result<()> {
-        let _vector_schema = self.vector_schema_read(&index);
-        self.record_vector_schema_epoch(tx, &index)?;
-        self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
-        self.vector_store.validate_vector(&index, vector.len())?;
-        self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
-        let bytes = self.vector_insert_accounted_bytes(&index, vector.len());
-        self.accountant.try_allocate_for(
-            bytes,
-            "insert",
-            &format!("vector_insert@{}.{}", index.table, index.column),
-            "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
-        )?;
-        let existing_live =
-            self.vector_store
-                .has_live_entry_for_row(&index, row_id, self.snapshot());
-        let entry = VectorEntry {
-            index: index.clone(),
-            row_id,
-            vector,
-            created_tx: tx,
-            deleted_tx: None,
-            lsn: Lsn(0),
-        };
-        let replaced_inserts = match self.tx_mgr.with_write_set(tx, |ws| {
-            let mut replaced_inserts = Vec::new();
-            let mut pos = 0;
-            while pos < ws.vector_inserts.len() {
-                if ws.vector_inserts[pos].index == index && ws.vector_inserts[pos].row_id == row_id
-                {
-                    replaced_inserts.push(ws.vector_inserts.remove(pos));
-                } else {
-                    pos += 1;
-                }
-            }
-
-            let mut moved_sources = Vec::new();
-            let mut pos = 0;
-            while pos < ws.vector_moves.len() {
-                let (move_index, old_row_id, new_row_id, _) = &ws.vector_moves[pos];
-                if *move_index == index && *new_row_id == row_id {
-                    moved_sources.push(*old_row_id);
-                    ws.vector_moves.remove(pos);
-                } else {
-                    pos += 1;
-                }
-            }
-            for old_row_id in moved_sources {
-                if !ws
-                    .vector_deletes
-                    .iter()
-                    .any(|(pending_index, pending_row_id, _)| {
-                        *pending_index == index && *pending_row_id == old_row_id
-                    })
-                {
-                    ws.vector_deletes.push((index.clone(), old_row_id, tx));
-                }
-            }
-
-            let already_deleted =
-                ws.vector_deletes
-                    .iter()
-                    .any(|(pending_index, pending_row_id, _)| {
-                        *pending_index == index && *pending_row_id == row_id
-                    });
-            if existing_live && !already_deleted {
-                ws.vector_deletes.push((index.clone(), row_id, tx));
-            }
-            ws.vector_inserts.push(entry);
-            replaced_inserts
-        }) {
-            Ok(replaced_inserts) => replaced_inserts,
-            Err(err) => {
-                self.accountant.release(bytes);
-                return Err(err);
-            }
-        };
-        for replaced in replaced_inserts {
-            self.accountant.release(
-                self.vector_insert_accounted_bytes(&replaced.index, replaced.vector.len()),
-            );
-        }
-        Ok(())
+        self.write_row_vectors(tx, row_id, vec![(index, vector)])
     }
 
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
         let _operation = self.open_operation_after_write_control_wait(tx, "delete_vector")?;
         let _vector_schema = self.vector_schema_read(&index);
-        self.record_vector_schema_epoch(tx, &index)?;
         self.ensure_trigger_table_ready(&index.table, "delete_vector")?;
         self.vector_store.index_layout(&index)?;
         self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
+        let checkpoint = self.write_set_checkpoint(tx)?;
+        let result = self.delete_vector_within_operation(tx, index, row_id);
+        if result.is_err() {
+            let _ = self.restore_write_set_checkpoint(tx, checkpoint);
+        }
+        result
+    }
+    fn delete_vector_within_operation(
+        &self,
+        tx: TxId,
+        index: VectorIndexRef,
+        row_id: RowId,
+    ) -> Result<()> {
+        self.record_vector_schema_epoch(tx, &index)?;
         let existing_live =
             self.vector_store
                 .has_live_entry_for_row(&index, row_id, self.snapshot());
         let canceled_inserts = self.tx_mgr.with_write_set(tx, |ws| {
+            let bytes = ws
+                .vector_inserts
+                .iter()
+                .filter(|entry| entry.index == index && entry.row_id == row_id)
+                .map(|entry| self.vector_insert_accounted_bytes(&entry.index, entry.vector.len()))
+                .sum();
+            let admission = Arc::new(
+                crate::memory_accounting::TransferredRowReservation::from_admitted(
+                    self.accountant.clone(),
+                    0,
+                ),
+            );
+            let undo = ws.ordered_staged_rows.prepare_vector_undo(
+                &index,
+                row_id,
+                &ws.vector_inserts,
+                &ws.vector_moves,
+                &ws.vector_deletes,
+                admission.clone(),
+                |bytes| {
+                    Ok(Arc::new(
+                        crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                            self.accountant.clone(),
+                            bytes,
+                            "vector",
+                            "mutation_undo",
+                            "Reduce staged vectors or raise MEMORY_LIMIT.",
+                        )?,
+                    ))
+                },
+            )?;
+            if let Some(undo) = undo {
+                admission.adopt(bytes);
+                ws.ordered_staged_rows.publish_vector_undo(
+                    undo,
+                    &mut ws.vector_inserts,
+                    &mut ws.vector_moves,
+                    &mut ws.vector_deletes,
+                    true,
+                    0,
+                );
+            }
             let mut canceled_inserts = Vec::new();
             let mut pos = 0;
             while pos < ws.vector_inserts.len() {
@@ -39831,8 +40039,8 @@ impl Database {
             if !pending_move_from_row && existing_live && !already_deleted {
                 ws.vector_deletes.push((index, row_id, tx));
             }
-            canceled_inserts
-        })?;
+            Ok::<_, Error>(canceled_inserts)
+        })??;
         for entry in canceled_inserts {
             self.accountant
                 .release(self.vector_insert_accounted_bytes(&entry.index, entry.vector.len()));
@@ -39890,10 +40098,38 @@ impl Database {
             )?;
             if old_key == new_key {
                 self.tx_mgr.with_write_set(tx, |ws| {
+                    let admission = Arc::new(
+                        crate::memory_accounting::TransferredRowReservation::from_admitted(
+                            self.accountant.clone(),
+                            0,
+                        ),
+                    );
+                    let undo = ws.ordered_staged_rows.prepare_vector_move_cancellation(
+                        &index,
+                        old_row_id,
+                        &ws.vector_moves,
+                        admission,
+                        |bytes| {
+                            Ok(Arc::new(
+                                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                                    self.accountant.clone(),
+                                    bytes,
+                                    "vector",
+                                    "mutation_undo",
+                                    "Reduce staged vectors or raise MEMORY_LIMIT.",
+                                )?,
+                            ))
+                        },
+                    )?;
                     ws.vector_moves.retain(|(i, from, to, _)| {
                         !(i == &index && *from == old_row_id && *to == new_row_id)
-                    })
-                })?;
+                    });
+                    if let Some(undo) = undo {
+                        ws.ordered_staged_rows
+                            .publish_vector_move_undo(undo, Vec::new());
+                    }
+                    Ok::<_, Error>(())
+                })??;
                 return Ok(());
             }
         }
@@ -39901,6 +40137,48 @@ impl Database {
             self.vector_store
                 .has_live_entry_for_row(&index, old_row_id, self.snapshot());
         let replaced_inserts = self.tx_mgr.with_write_set(tx, |ws| {
+            let moving_position = ws
+                .vector_inserts
+                .iter()
+                .rposition(|entry| entry.index == index && entry.row_id == old_row_id);
+            let bytes = ws
+                .vector_inserts
+                .iter()
+                .enumerate()
+                .filter(|(position, entry)| {
+                    entry.index == index
+                        && ((new_row_id != old_row_id && entry.row_id == new_row_id)
+                            || (entry.row_id == old_row_id && Some(*position) != moving_position))
+                })
+                .map(|(_, entry)| {
+                    self.vector_insert_accounted_bytes(&entry.index, entry.vector.len())
+                })
+                .sum();
+            let admission = Arc::new(
+                crate::memory_accounting::TransferredRowReservation::from_admitted(
+                    self.accountant.clone(),
+                    0,
+                ),
+            );
+            let undo = ws.ordered_staged_rows.prepare_vector_move_undo(
+                &index,
+                old_row_id,
+                new_row_id,
+                &ws.vector_inserts,
+                &ws.vector_moves,
+                admission.clone(),
+                |bytes| {
+                    Ok(Arc::new(
+                        crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                            self.accountant.clone(),
+                            bytes,
+                            "vector",
+                            "mutation_undo",
+                            "Reduce staged vectors or raise MEMORY_LIMIT.",
+                        )?,
+                    ))
+                },
+            )?;
             let old_row_deleted =
                 ws.vector_deletes
                     .iter()
@@ -39980,8 +40258,15 @@ impl Database {
                 });
             }
 
-            replaced_inserts
-        })?;
+            if let Some(undo) = undo {
+                admission.adopt(bytes);
+                ws.ordered_staged_rows
+                    .publish_vector_move_undo(undo, replaced_inserts);
+                Ok::<_, Error>(Vec::new())
+            } else {
+                Ok::<_, Error>(replaced_inserts)
+            }
+        })??;
         for replaced in replaced_inserts {
             self.accountant.release(
                 self.vector_insert_accounted_bytes(&replaced.index, replaced.vector.len()),
@@ -50331,20 +50616,79 @@ impl Database {
             })
     }
 
-    pub(crate) fn write_set_checkpoint(
-        &self,
-        tx: TxId,
-    ) -> Result<(usize, usize, usize, usize, usize, usize, usize)> {
-        self.tx_mgr.with_write_set(tx, |ws| {
-            (
-                ws.relational_inserts.len(),
-                ws.relational_deletes.len(),
-                ws.adj_inserts.len(),
-                ws.vector_inserts.len(),
-                ws.vector_deletes.len(),
-                ws.vector_moves.len(),
-                ws.config_writes.len(),
-            )
+    pub(crate) fn write_set_checkpoint(&self, tx: TxId) -> Result<WriteSetCheckpoint<'_>> {
+        let metadata = self.pending_commit_metadata.lock();
+        let prior = metadata.get(&tx);
+        let bytes = prior.map_or(0, |m| {
+            m.vector_schema_epochs
+                .keys()
+                .map(|index| {
+                    std::mem::size_of::<VectorIndexRef>()
+                        .saturating_add(index.table.len())
+                        .saturating_add(index.column.len())
+                })
+                .sum()
+        });
+        let charge = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            bytes,
+            "relational",
+            "mutation_checkpoint",
+            "Reduce staged metadata or raise MEMORY_LIMIT.",
+        )?;
+        let metadata_counts = prior.map_or([0; 5], |m| {
+            [
+                m.discard_selections.len(),
+                m.delivery_registrations.len(),
+                m.conditional_update_guards.len(),
+                m.sync_lineage_guards.len(),
+                m.upsert_intents.len(),
+            ]
+        });
+        let vector_epochs = prior.map_or_else(Vec::new, |m| {
+            let mut epochs = Vec::with_capacity(m.vector_schema_epochs.len());
+            for index in m.vector_schema_epochs.keys() {
+                epochs.push(index.clone());
+            }
+            epochs
+        });
+        let metadata_existed = prior.is_some();
+        drop(metadata);
+        let (counts, marker, requires_commit_lsn, propagation_in_progress) =
+            self.tx_mgr.with_write_set(tx, |ws| {
+                (
+                    [
+                        ws.relational_inserts.len(),
+                        ws.relational_deletes.len(),
+                        ws.adj_inserts.len(),
+                        ws.vector_inserts.len(),
+                        ws.vector_deletes.len(),
+                        ws.vector_moves.len(),
+                        ws.config_writes.len(),
+                        ws.adj_deletes.len(),
+                        ws.relational_delete_predicates.len(),
+                        ws.sync_source_provenance_marks.len(),
+                        ws.config_deletes.len(),
+                        ws.config_max_u64_keys.len(),
+                        usize::from(ws.requires_commit_lsn),
+                    ],
+                    ws.ordered_staged_rows.begin_checkpoint(),
+                    ws.requires_commit_lsn,
+                    ws.propagation_in_progress,
+                )
+            })?;
+        Ok(WriteSetCheckpoint {
+            database: self,
+            tx,
+            counts,
+            requires_commit_lsn,
+            propagation_in_progress,
+            marker,
+            metadata_counts,
+            metadata_existed,
+            vector_epochs,
+            _charge: charge,
+            active: true,
         })
     }
 
@@ -50444,18 +50788,63 @@ impl Database {
     pub(crate) fn restore_write_set_checkpoint(
         &self,
         tx: TxId,
-        checkpoint: (usize, usize, usize, usize, usize, usize, usize),
+        mut checkpoint: WriteSetCheckpoint<'_>,
     ) -> Result<()> {
         self.tx_mgr.with_write_set(tx, |ws| {
-            ws.relational_inserts.truncate(checkpoint.0);
-            ws.relational_deletes.truncate(checkpoint.1);
-            ws.adj_inserts.truncate(checkpoint.2);
-            ws.vector_inserts.truncate(checkpoint.3);
-            ws.vector_deletes.truncate(checkpoint.4);
-            ws.vector_moves.truncate(checkpoint.5);
-            ws.config_writes.truncate(checkpoint.6);
+            ws.ordered_staged_rows.restore_checkpoint(
+                checkpoint.marker,
+                &mut ws.relational_inserts,
+                &mut ws.relational_insert_admitted_bytes,
+            );
+            ws.ordered_staged_rows.restore_vector_checkpoint(
+                checkpoint.marker,
+                &mut ws.vector_inserts,
+                &mut ws.vector_moves,
+                &mut ws.vector_deletes,
+                |bytes| self.accountant.release(bytes),
+            );
+            ws.ordered_staged_rows.settle_checkpoint();
+            ws.relational_inserts.truncate(checkpoint.counts[0]);
+            ws.relational_deletes.truncate(checkpoint.counts[1]);
+            ws.adj_inserts.truncate(checkpoint.counts[2]);
+            ws.vector_inserts.truncate(checkpoint.counts[3]);
+            ws.vector_deletes.truncate(checkpoint.counts[4]);
+            ws.vector_moves.truncate(checkpoint.counts[5]);
+            ws.config_writes.truncate(checkpoint.counts[6]);
+            ws.adj_deletes.truncate(checkpoint.counts[7]);
+            ws.relational_delete_predicates
+                .truncate(checkpoint.counts[8]);
+            ws.sync_source_provenance_marks
+                .truncate(checkpoint.counts[9]);
+            ws.config_deletes.truncate(checkpoint.counts[10]);
+            ws.config_max_u64_keys.truncate(checkpoint.counts[11]);
+            ws.requires_commit_lsn = checkpoint.requires_commit_lsn;
+            ws.propagation_in_progress = checkpoint.propagation_in_progress;
             ws.forget_admitted_bytes_for_unstaged_rows();
-        })
+        })?;
+        checkpoint.active = false;
+        let mut metadata = self.pending_commit_metadata.lock();
+        if !checkpoint.metadata_existed {
+            metadata.remove(&tx);
+        } else if let Some(prior) = metadata.get_mut(&tx) {
+            prior
+                .discard_selections
+                .truncate(checkpoint.metadata_counts[0]);
+            prior
+                .delivery_registrations
+                .truncate(checkpoint.metadata_counts[1]);
+            prior
+                .conditional_update_guards
+                .truncate(checkpoint.metadata_counts[2]);
+            prior
+                .sync_lineage_guards
+                .truncate(checkpoint.metadata_counts[3]);
+            prior.upsert_intents.truncate(checkpoint.metadata_counts[4]);
+            prior
+                .vector_schema_epochs
+                .retain(|index, _| checkpoint.vector_epochs.contains(index));
+        }
+        Ok(())
     }
 
     sync_test_seam! {

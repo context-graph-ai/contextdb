@@ -13,6 +13,10 @@ pub trait StagedPostingCharge: Debug + Send + Sync {
     fn retained_bytes(&self) -> usize {
         0
     }
+    #[doc(hidden)]
+    fn transfer_back(&self) -> usize {
+        0
+    }
     fn reserve_copy(&self, _bytes: usize) -> Result<Arc<dyn StagedPostingCharge>> {
         Err(contextdb_core::Error::Other(
             "staged snapshot copying requires admission".into(),
@@ -133,11 +137,74 @@ struct IndexPostings {
 /// Retained postings contain identities/positions only, never row payloads.
 /// A write-set clone is operation output: its caller must admit these bytes
 /// along with the rows it copies, using `retained_bytes` before cloning.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct OrderedStagedRows {
     tables: BTreeMap<String, BTreeMap<String, IndexPostings>>,
     charges: BTreeMap<String, RowCharges>,
     statement_rows: BTreeMap<String, Arc<crate::StatementRows>>,
+    undo: Vec<StagedMutationUndo>,
+    checkpoint_depth: usize,
+    vector_undo: Vec<StagedVectorUndo>,
+    journal_charges: Vec<Arc<dyn StagedPostingCharge>>,
+    vector_prepared: usize,
+}
+impl Clone for OrderedStagedRows {
+    fn clone(&self) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            charges: self.charges.clone(),
+            statement_rows: self.statement_rows.clone(),
+            undo: Vec::new(),
+            checkpoint_depth: 0,
+            vector_undo: Vec::new(),
+            journal_charges: Vec::new(),
+            vector_prepared: 0,
+        }
+    }
+}
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PreparedVectorUndo {
+    index: contextdb_core::VectorIndexRef,
+    row_id: RowId,
+    inserts: Vec<(usize, contextdb_core::VectorEntry)>,
+    moves: Vec<(usize, (contextdb_core::VectorIndexRef, RowId, RowId, TxId))>,
+    deletes: Vec<(usize, (contextdb_core::VectorIndexRef, RowId, TxId))>,
+    installed_bytes: usize,
+    preserve_inserts: bool,
+    moving: Option<(RowId, Option<usize>)>,
+    replacement_positions: Vec<usize>,
+    admission: Arc<dyn StagedPostingCharge>,
+    _charge: Arc<dyn StagedPostingCharge>,
+}
+type StagedVectorUndo = PreparedVectorUndo;
+
+#[derive(Debug)]
+struct LegacyIndexUndo {
+    name: String,
+    domain: Option<IndexPostings>,
+    schema: Option<Arc<StagedSchema>>,
+    key: Option<(IndexKey, StagedPosition)>,
+    replace_domain: bool,
+}
+#[derive(Debug)]
+struct StagedMutationUndo {
+    table: String,
+    row_id: RowId,
+    legacy: Vec<LegacyIndexUndo>,
+    old_charge: Option<(usize, Arc<dyn StagedPostingCharge>)>,
+    statement: Option<crate::statement_rows::StatementRowUndo>,
+    table_existed: bool,
+    displaced: Vec<(usize, String, contextdb_core::VersionedRow)>,
+    prior_admitted: Option<usize>,
+    admission: Option<Arc<dyn StagedPostingCharge>>,
+    _charge: Arc<dyn StagedPostingCharge>,
+}
+
+#[doc(hidden)]
+pub struct PreparedStatementRemovals {
+    tables: Vec<(String, crate::statement_rows::PreparedStatementRemoval)>,
+    _charge: Option<Arc<dyn StagedPostingCharge>>,
 }
 
 pub struct OrderedStagedCursor<'a> {
@@ -189,7 +256,14 @@ impl OrderedStagedRows {
         mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
     ) -> Result<crate::statement_rows::PreparedStatementRow> {
         if let Some(snapshot) = self.statement_rows.get(table) {
-            return crate::StatementRows::prepare(snapshot, row, keys, schema, reserve);
+            return crate::StatementRows::prepare(
+                snapshot,
+                row,
+                keys,
+                schema,
+                reserve,
+                self.checkpoint_depth != 0,
+            );
         }
         let charge = reserve(
             std::mem::size_of::<crate::StatementRows>()
@@ -197,7 +271,14 @@ impl OrderedStagedRows {
                 .saturating_add(192),
         )?;
         let snapshot = Arc::new(crate::StatementRows::with_control(charge));
-        let mut prepared = crate::StatementRows::prepare(&snapshot, row, keys, schema, reserve)?;
+        let mut prepared = crate::StatementRows::prepare(
+            &snapshot,
+            row,
+            keys,
+            schema,
+            reserve,
+            self.checkpoint_depth != 0,
+        )?;
         prepared.new_table = Some(snapshot);
         Ok(prepared)
     }
@@ -209,12 +290,494 @@ impl OrderedStagedRows {
         if let Some(snapshot) = prepared.new_table.take() {
             self.statement_rows.insert(table.to_owned(), snapshot);
         }
-        crate::StatementRows::publish(
+        let undo = crate::StatementRows::publish(
             self.statement_rows
                 .get_mut(table)
                 .expect("prepared table owner"),
             prepared,
         );
+        if let Some(undo) = undo {
+            self.undo
+                .last_mut()
+                .expect("prepared staged undo")
+                .statement = Some(undo);
+        }
+    }
+    fn retain_journal_charge(&mut self, charge: Arc<dyn StagedPostingCharge>) -> Result<()> {
+        self.journal_charges.try_reserve_exact(1).map_err(|_| {
+            contextdb_core::Error::Other("journal ownership allocation failed".into())
+        })?;
+        self.journal_charges.push(charge);
+        Ok(())
+    }
+    #[doc(hidden)]
+    pub fn checkpoint_active(&self) -> bool {
+        self.checkpoint_depth != 0
+    }
+    #[doc(hidden)]
+    pub fn begin_checkpoint(&mut self) -> [usize; 2] {
+        self.checkpoint_depth += 1;
+        [self.undo.len(), self.vector_undo.len()]
+    }
+    #[doc(hidden)]
+    pub fn settle_checkpoint(&mut self) {
+        self.checkpoint_depth -= 1;
+        if self.checkpoint_depth == 0 {
+            // Release journal storage before its admitted control owners.
+            self.undo = Vec::new();
+            self.vector_undo = Vec::new();
+            self.journal_charges = Vec::new();
+            self.vector_prepared = 0;
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn prepare_vector_undo(
+        &mut self,
+        index: &contextdb_core::VectorIndexRef,
+        row_id: RowId,
+        inserts: &[contextdb_core::VectorEntry],
+        moves: &[(contextdb_core::VectorIndexRef, RowId, RowId, TxId)],
+        deletes: &[(contextdb_core::VectorIndexRef, RowId, TxId)],
+        admission: Arc<dyn StagedPostingCharge>,
+        mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    ) -> Result<Option<PreparedVectorUndo>> {
+        if self.checkpoint_depth == 0 {
+            return Ok(None);
+        }
+        let ni = inserts
+            .iter()
+            .filter(|entry| entry.index == *index && entry.row_id == row_id)
+            .count();
+        let nm = moves
+            .iter()
+            .filter(|(pending, _from, to, _)| pending == index && *to == row_id)
+            .count();
+        let nd = deletes
+            .iter()
+            .filter(|(pending, row, _)| pending == index && *row == row_id)
+            .count();
+        let bytes = std::mem::size_of::<PreparedVectorUndo>()
+            .saturating_add(index.table.len())
+            .saturating_add(index.column.len())
+            .saturating_add(
+                ni.saturating_mul(std::mem::size_of::<(usize, contextdb_core::VectorEntry)>()),
+            )
+            .saturating_add(nm.saturating_mul(std::mem::size_of::<(
+                usize,
+                (contextdb_core::VectorIndexRef, RowId, RowId, TxId),
+            )>()))
+            .saturating_add(nd.saturating_mul(std::mem::size_of::<(
+                usize,
+                (contextdb_core::VectorIndexRef, RowId, TxId),
+            )>()));
+        let bytes = bytes.saturating_add(
+            deletes
+                .iter()
+                .filter(|(pending, row, _)| pending == index && *row == row_id)
+                .map(|(pending, _, _)| pending.table.len().saturating_add(pending.column.len()))
+                .sum::<usize>(),
+        );
+        let charge =
+            reserve(bytes.saturating_add(std::mem::size_of::<Arc<dyn StagedPostingCharge>>()))?;
+        self.retain_journal_charge(charge.clone())?;
+        self.vector_prepared += 1;
+        self.vector_undo
+            .try_reserve_exact(self.vector_prepared.saturating_sub(self.vector_undo.len()))
+            .map_err(|_| {
+                contextdb_core::Error::Other("vector undo control allocation failed".into())
+            })?;
+        Ok(Some(PreparedVectorUndo {
+            index: index.clone(),
+            row_id,
+            inserts: Vec::with_capacity(ni),
+            moves: Vec::with_capacity(nm),
+            deletes: Vec::with_capacity(nd),
+            installed_bytes: 0,
+            preserve_inserts: false,
+            moving: None,
+            replacement_positions: Vec::new(),
+            admission,
+            _charge: charge,
+        }))
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn prepare_vector_move_undo(
+        &mut self,
+        index: &contextdb_core::VectorIndexRef,
+        from: RowId,
+        to: RowId,
+        inserts: &[contextdb_core::VectorEntry],
+        moves: &[(contextdb_core::VectorIndexRef, RowId, RowId, TxId)],
+        admission: Arc<dyn StagedPostingCharge>,
+        mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    ) -> Result<Option<PreparedVectorUndo>> {
+        if self.checkpoint_depth == 0 {
+            return Ok(None);
+        }
+        let moving_position = inserts
+            .iter()
+            .rposition(|entry| entry.index == *index && entry.row_id == from);
+        let n = inserts
+            .iter()
+            .enumerate()
+            .filter(|(position, entry)| {
+                entry.index == *index
+                    && ((to != from && entry.row_id == to)
+                        || (entry.row_id == from && Some(*position) != moving_position))
+            })
+            .count();
+        let nm = moves
+            .iter()
+            .filter(|(pending, source, destination, _)| {
+                pending == index && (*source == from || *destination == from || *destination == to)
+            })
+            .count();
+        let bytes =
+            std::mem::size_of::<PreparedVectorUndo>()
+                .saturating_add(index.table.len())
+                .saturating_add(index.column.len())
+                .saturating_add(
+                    n.saturating_mul(
+                        std::mem::size_of::<(usize, contextdb_core::VectorEntry)>()
+                            .saturating_add(std::mem::size_of::<usize>()),
+                    )
+                    .saturating_add(
+                        usize::from(moving_position.is_some()).saturating_mul(
+                            std::mem::size_of::<(usize, contextdb_core::VectorEntry)>(),
+                        ),
+                    ),
+                )
+                .saturating_add(
+                    moves
+                        .iter()
+                        .filter(|(pending, source, destination, _)| {
+                            pending == index
+                                && (*source == from || *destination == from || *destination == to)
+                        })
+                        .map(|(pending, _, _, _)| {
+                            std::mem::size_of::<(
+                                usize,
+                                (contextdb_core::VectorIndexRef, RowId, RowId, TxId),
+                            )>()
+                            .saturating_add(pending.table.len())
+                            .saturating_add(pending.column.len())
+                        })
+                        .sum::<usize>(),
+                );
+        let charge =
+            reserve(bytes.saturating_add(std::mem::size_of::<Arc<dyn StagedPostingCharge>>()))?;
+        self.retain_journal_charge(charge.clone())?;
+        self.vector_prepared += 1;
+        self.vector_undo
+            .try_reserve_exact(self.vector_prepared.saturating_sub(self.vector_undo.len()))
+            .map_err(|_| {
+                contextdb_core::Error::Other("vector move undo allocation failed".into())
+            })?;
+        let mut positions = Vec::with_capacity(n);
+        // The existing mover retires earlier source entries first, then destination entries.
+        for (position, entry) in inserts.iter().enumerate() {
+            if entry.index == *index && entry.row_id == from && Some(position) != moving_position {
+                positions.push(position);
+            }
+        }
+        for (position, entry) in inserts.iter().enumerate() {
+            if entry.index == *index
+                && to != from
+                && entry.row_id == to
+                && Some(position) != moving_position
+            {
+                positions.push(position);
+            }
+        }
+        let mut prior_moves = Vec::with_capacity(nm);
+        for (position, entry) in moves.iter().enumerate() {
+            if entry.0 == *index && (entry.1 == from || entry.2 == from || entry.2 == to) {
+                prior_moves.push((position, entry.clone()));
+            }
+        }
+        Ok(Some(PreparedVectorUndo {
+            index: index.clone(),
+            row_id: to,
+            inserts: Vec::with_capacity(n.saturating_add(usize::from(moving_position.is_some()))),
+            moves: prior_moves,
+            deletes: Vec::new(),
+            installed_bytes: 0,
+            preserve_inserts: false,
+            moving: Some((from, moving_position)),
+            replacement_positions: positions,
+            admission,
+            _charge: charge,
+        }))
+    }
+    #[doc(hidden)]
+    pub fn prepare_vector_move_cancellation(
+        &mut self,
+        index: &contextdb_core::VectorIndexRef,
+        row_id: RowId,
+        moves: &[(contextdb_core::VectorIndexRef, RowId, RowId, TxId)],
+        admission: Arc<dyn StagedPostingCharge>,
+        mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    ) -> Result<Option<PreparedVectorUndo>> {
+        if self.checkpoint_depth == 0 {
+            return Ok(None);
+        }
+        let selected = |entry: &(contextdb_core::VectorIndexRef, RowId, RowId, TxId)| {
+            entry.0 == *index && (entry.1 == row_id || entry.2 == row_id)
+        };
+        let count = moves.iter().filter(|entry| selected(entry)).count();
+        let bytes = std::mem::size_of::<PreparedVectorUndo>()
+            .saturating_add(std::mem::size_of::<Arc<dyn StagedPostingCharge>>())
+            .saturating_add(index.table.len())
+            .saturating_add(index.column.len())
+            .saturating_add(
+                moves
+                    .iter()
+                    .filter(|entry| selected(entry))
+                    .map(|entry| {
+                        std::mem::size_of::<(
+                            usize,
+                            (contextdb_core::VectorIndexRef, RowId, RowId, TxId),
+                        )>()
+                        .saturating_add(entry.0.table.len())
+                        .saturating_add(entry.0.column.len())
+                    })
+                    .sum::<usize>(),
+            );
+        let charge = reserve(bytes)?;
+        self.retain_journal_charge(charge.clone())?;
+        self.vector_prepared += 1;
+        self.vector_undo
+            .try_reserve_exact(self.vector_prepared.saturating_sub(self.vector_undo.len()))
+            .map_err(|_| {
+                contextdb_core::Error::Other("vector cancellation undo allocation failed".into())
+            })?;
+        let mut prior_moves = Vec::with_capacity(count);
+        for (position, entry) in moves.iter().enumerate() {
+            if selected(entry) {
+                prior_moves.push((position, entry.clone()));
+            }
+        }
+        Ok(Some(PreparedVectorUndo {
+            index: index.clone(),
+            row_id,
+            inserts: Vec::new(),
+            moves: prior_moves,
+            deletes: Vec::new(),
+            installed_bytes: 0,
+            preserve_inserts: true,
+            moving: Some((row_id, None)),
+            replacement_positions: Vec::new(),
+            admission,
+            _charge: charge,
+        }))
+    }
+    #[doc(hidden)]
+    pub fn publish_vector_move_undo(
+        &mut self,
+        mut prepared: PreparedVectorUndo,
+        replaced: Vec<contextdb_core::VectorEntry>,
+    ) {
+        for (position, entry) in prepared.replacement_positions.drain(..).zip(replaced) {
+            prepared.inserts.push((position, entry));
+        }
+        self.vector_undo.push(prepared);
+    }
+    #[doc(hidden)]
+    pub fn publish_vector_undo(
+        &mut self,
+        mut prepared: PreparedVectorUndo,
+        inserts: &mut Vec<contextdb_core::VectorEntry>,
+        moves: &mut Vec<(contextdb_core::VectorIndexRef, RowId, RowId, TxId)>,
+        deletes: &mut Vec<(contextdb_core::VectorIndexRef, RowId, TxId)>,
+        replace: bool,
+        installed_bytes: usize,
+    ) {
+        prepared.installed_bytes = installed_bytes;
+        let mut position = 0;
+        while position < inserts.len() {
+            if inserts[position].index == prepared.index
+                && inserts[position].row_id == prepared.row_id
+            {
+                prepared.inserts.push((position, inserts.remove(position)));
+            } else {
+                position += 1;
+            }
+        }
+        let mut position = 0;
+        while position < moves.len() {
+            if moves[position].0 == prepared.index && moves[position].2 == prepared.row_id {
+                prepared.moves.push((position, moves.remove(position)));
+            } else {
+                position += 1;
+            }
+        }
+        // Preserve existing deletes without removing them: unchanged identities
+        // are borrowed during preparation and cloned only under admitted control.
+        for (position, entry) in deletes.iter().enumerate() {
+            if entry.0 == prepared.index && entry.1 == prepared.row_id {
+                prepared.deletes.push((position, entry.clone()));
+            }
+        }
+        if replace {
+            for (_, (index, source, _, tx)) in &prepared.moves {
+                if !deletes
+                    .iter()
+                    .any(|(pending, row, _)| pending == index && row == source)
+                {
+                    deletes.push((index.clone(), *source, *tx));
+                }
+            }
+        }
+        self.vector_undo.push(prepared);
+    }
+    #[doc(hidden)]
+    pub fn restore_vector_checkpoint(
+        &mut self,
+        marker: [usize; 2],
+        inserts: &mut Vec<contextdb_core::VectorEntry>,
+        moves: &mut Vec<(contextdb_core::VectorIndexRef, RowId, RowId, TxId)>,
+        deletes: &mut Vec<(contextdb_core::VectorIndexRef, RowId, TxId)>,
+        mut release: impl FnMut(usize),
+    ) {
+        while self.vector_undo.len() > marker[1] {
+            let mut undo = self.vector_undo.pop().expect("vector undo");
+            release(undo.installed_bytes);
+            if let Some((from, Some(position))) = undo.moving
+                && let Some(current) = inserts
+                    .iter()
+                    .rposition(|entry| entry.index == undo.index && entry.row_id == undo.row_id)
+            {
+                let mut entry = inserts.remove(current);
+                entry.row_id = from;
+                undo.inserts.push((position, entry));
+            }
+            if !undo.preserve_inserts {
+                inserts.retain(|entry| entry.index != undo.index || entry.row_id != undo.row_id);
+            }
+            moves.retain(|(index, source, to, _)| {
+                *index != undo.index
+                    || (*to != undo.row_id
+                        && undo
+                            .moving
+                            .is_none_or(|(from, _)| *source != from && *to != from))
+            });
+            if undo.moving.is_none() && !undo.preserve_inserts {
+                deletes.retain(|(index, row, _)| *index != undo.index || *row != undo.row_id);
+            }
+            undo.admission.transfer_back();
+            if undo.moving.is_some() {
+                undo.inserts.sort_unstable_by_key(|(position, _)| *position);
+                for (position, entry) in undo.inserts {
+                    inserts.insert(position.min(inserts.len()), entry);
+                }
+            } else {
+                for (position, entry) in undo.inserts.into_iter().rev() {
+                    inserts.insert(position.min(inserts.len()), entry);
+                }
+            }
+            for (position, entry) in undo.moves.into_iter().rev() {
+                moves.insert(position.min(moves.len()), entry);
+            }
+            for (position, entry) in undo.deletes {
+                deletes.insert(position.min(deletes.len()), entry);
+            }
+        }
+    }
+    #[doc(hidden)]
+    pub fn retain_displaced(
+        &mut self,
+        rows: &mut Vec<(String, contextdb_core::VersionedRow)>,
+        table: &str,
+        row: RowId,
+        prior_admitted: Option<usize>,
+        admission: Option<Arc<dyn StagedPostingCharge>>,
+    ) -> bool {
+        if self.checkpoint_depth == 0 {
+            return false;
+        }
+        let undo = self
+            .undo
+            .last_mut()
+            .expect("replacement staging prepared undo");
+        assert!(undo.table == table && undo.row_id == row);
+        let mut position = 0;
+        while position < rows.len() {
+            if rows[position].0 == table && rows[position].1.row_id == row {
+                let (name, old) = rows.remove(position);
+                undo.displaced.push((position, name, old));
+            } else {
+                position += 1;
+            }
+        }
+        undo.prior_admitted = prior_admitted;
+        undo.admission = admission;
+        true
+    }
+    #[doc(hidden)]
+    pub fn restore_checkpoint(
+        &mut self,
+        marker: [usize; 2],
+        inserts: &mut Vec<(String, contextdb_core::VersionedRow)>,
+        admitted: &mut HashMap<String, HashMap<RowId, usize>>,
+    ) {
+        while self.undo.len() > marker[0] {
+            let undo = self.undo.pop().expect("mutation undo");
+            inserts.retain(|(table, row)| table != &undo.table || row.row_id != undo.row_id);
+            if let Some(rows) = admitted.get_mut(&undo.table) {
+                rows.remove(&undo.row_id);
+            }
+            if let Some(charge) = undo.admission {
+                charge.transfer_back();
+                if let Some(bytes) = undo.prior_admitted {
+                    admitted
+                        .entry(undo.table.clone())
+                        .or_default()
+                        .insert(undo.row_id, bytes);
+                }
+            }
+            for (position, table, row) in undo.displaced.into_iter().rev() {
+                inserts.insert(position.min(inserts.len()), (table, row));
+            }
+            self.remove(&undo.table, undo.row_id);
+            if let Some(old) = undo.old_charge {
+                self.charges
+                    .entry(undo.table.clone())
+                    .or_default()
+                    .insert(undo.row_id, old);
+            }
+            for prior in undo.legacy {
+                let indexes = self.tables.entry(undo.table.clone()).or_default();
+                if prior.replace_domain {
+                    indexes.remove(&prior.name);
+                    if let Some(domain) = prior.domain {
+                        indexes.insert(prior.name, domain);
+                    }
+                } else {
+                    let postings = indexes.entry(prior.name).or_default();
+                    postings.schema = prior.schema;
+                    if let Some((key, position)) = prior.key {
+                        postings.latest.insert(undo.row_id, key.clone());
+                        postings.ordered.insert((key, undo.row_id), position);
+                    }
+                }
+            }
+            if undo.table_existed {
+                if let Some(statement) = undo.statement {
+                    crate::StatementRows::restore(
+                        self.statement_rows
+                            .get_mut(&undo.table)
+                            .expect("staged statement owner"),
+                        undo.row_id,
+                        statement,
+                    );
+                }
+            } else {
+                self.statement_rows.remove(&undo.table);
+            }
+        }
+        self.discard_empty_maps();
     }
     pub fn remove_statement_row(&mut self, table: &str, row: RowId) -> Result<()> {
         if let Some(snapshot) = self.statement_rows.get_mut(table) {
@@ -227,31 +790,58 @@ impl OrderedStagedRows {
             .get(table)
             .is_some_and(|rows| rows.has_index_for(index, meta))
     }
-    /// Prepare all table copies before publishing any removal.
+    /// Prepare every table copy and collection owner before any publication.
     pub fn prepare_statement_removals(
         &self,
         selected: &std::collections::BTreeSet<(String, RowId)>,
-    ) -> Result<Vec<(String, crate::statement_rows::PreparedStatementRemoval)>> {
-        let mut prepared = Vec::new();
-        for (table, snapshot) in &self.statement_rows {
-            if selected
+    ) -> Result<PreparedStatementRemovals> {
+        let selected_table = |table: &String, snapshot: &Arc<crate::StatementRows>| {
+            selected
                 .iter()
                 .any(|(name, row)| name == table && snapshot.contains(row))
-            {
-                prepared.push((
+        };
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        let mut admission = None;
+        for (table, snapshot) in &self.statement_rows {
+            if selected_table(table, snapshot) {
+                count = count.saturating_add(1);
+                bytes = bytes
+                    .saturating_add(table.len())
+                    .saturating_add(std::mem::size_of::<(
+                        String,
+                        crate::statement_rows::PreparedStatementRemoval,
+                    )>());
+                admission.get_or_insert(snapshot);
+            }
+        }
+        let charge = admission
+            .map(|snapshot| snapshot.reserve_removal_control(bytes))
+            .transpose()?;
+        let mut tables = Vec::new();
+        tables.try_reserve_exact(count).map_err(|_| {
+            contextdb_core::Error::Other("statement removal control allocation failed".into())
+        })?;
+        for (table, snapshot) in &self.statement_rows {
+            if selected_table(table, snapshot) {
+                tables.push((
                     table.clone(),
                     crate::StatementRows::prepare_removal(snapshot)?,
                 ));
             }
         }
-        Ok(prepared)
+        Ok(PreparedStatementRemovals {
+            tables,
+            _charge: charge,
+        })
     }
     pub fn publish_statement_removals(
         &mut self,
-        prepared: Vec<(String, crate::statement_rows::PreparedStatementRemoval)>,
+        prepared: PreparedStatementRemovals,
         selected: &std::collections::BTreeSet<(String, RowId)>,
     ) {
-        for (table, replacement) in prepared {
+        let PreparedStatementRemovals { tables, _charge } = prepared;
+        for (table, replacement) in tables {
             crate::StatementRows::publish_removal(
                 self.statement_rows
                     .get_mut(&table)
@@ -275,6 +865,21 @@ impl OrderedStagedRows {
         position: StagedPosition,
         keys: &[(String, IndexKey)],
         schema: &Arc<StagedSchema>,
+        reserve: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    {
+        self.stage_retiring_row(table, position, keys, schema, 0, reserve)
+    }
+    #[doc(hidden)]
+    pub fn stage_retiring_row<F>(
+        &mut self,
+        table: &str,
+        position: StagedPosition,
+        keys: &[(String, IndexKey)],
+        schema: &Arc<StagedSchema>,
+        retired_count: usize,
         mut reserve: F,
     ) -> Result<()>
     where
@@ -290,6 +895,111 @@ impl OrderedStagedRows {
             },
         );
         let charge = reserve(bytes)?;
+        if self.checkpoint_depth != 0 {
+            let indexes = self.tables.get(table);
+            let count = indexes.map_or(0, BTreeMap::len).saturating_add(keys.len());
+            let undo_bytes = std::mem::size_of::<StagedMutationUndo>()
+                .saturating_add(table.len())
+                .saturating_add(count.saturating_mul(std::mem::size_of::<LegacyIndexUndo>()))
+                .saturating_add(retired_count.saturating_mul(std::mem::size_of::<(
+                    usize,
+                    String,
+                    contextdb_core::VersionedRow,
+                )>()))
+                .saturating_add(table.len())
+                .saturating_add(indexes.map_or(0, |indexes| {
+                    indexes
+                        .iter()
+                        .map(|(name, postings)| {
+                            name.len().saturating_add(
+                                postings
+                                    .latest
+                                    .get(&position.row_id)
+                                    .map_or(0, |key| staged_key_bytes(key).saturating_mul(2)),
+                            )
+                        })
+                        .sum::<usize>()
+                }))
+                .saturating_add(keys.iter().map(|(name, _)| name.len()).sum::<usize>());
+            let undo_charge = reserve(
+                undo_bytes
+                    .saturating_add(std::mem::size_of::<Arc<dyn StagedPostingCharge>>())
+                    .saturating_add(if retired_count == 0 {
+                        0
+                    } else {
+                        // The engine transfer owner holds an accountant Arc and byte counter, plus the Arc control header.
+                        4 * std::mem::size_of::<usize>()
+                    }),
+            )?;
+            self.retain_journal_charge(undo_charge.clone())?;
+            self.undo.try_reserve_exact(1).map_err(|_| {
+                contextdb_core::Error::Other("mutation undo allocation failed".into())
+            })?;
+            let mut legacy = Vec::with_capacity(count);
+            if let Some(indexes) = self.tables.get_mut(table) {
+                for (name, postings) in indexes {
+                    let incompatible =
+                        keys.iter()
+                            .find(|(index, _)| index == name)
+                            .is_some_and(|_| {
+                                postings
+                                    .schema
+                                    .as_ref()
+                                    .is_some_and(|old| !old.matches_index(schema, name))
+                            });
+                    let singleton = postings.ordered.len() == 1
+                        && postings.latest.contains_key(&position.row_id);
+                    if incompatible || singleton {
+                        legacy.push(LegacyIndexUndo {
+                            name: name.clone(),
+                            domain: Some(std::mem::take(postings)),
+                            schema: None,
+                            key: None,
+                            replace_domain: true,
+                        });
+                    } else {
+                        legacy.push(LegacyIndexUndo {
+                            name: name.clone(),
+                            domain: None,
+                            schema: postings.schema.clone(),
+                            key: postings.latest.get(&position.row_id).map(|key| {
+                                (
+                                    key.clone(),
+                                    postings.ordered[&(key.clone(), position.row_id)],
+                                )
+                            }),
+                            replace_domain: false,
+                        });
+                    }
+                }
+            }
+            for (name, _) in keys {
+                if !legacy.iter().any(|old| &old.name == name) {
+                    legacy.push(LegacyIndexUndo {
+                        name: name.clone(),
+                        domain: None,
+                        schema: None,
+                        key: None,
+                        replace_domain: true,
+                    });
+                }
+            }
+            self.undo.push(StagedMutationUndo {
+                table: table.to_owned(),
+                row_id: position.row_id,
+                legacy,
+                old_charge: self
+                    .charges
+                    .get_mut(table)
+                    .and_then(|rows| rows.remove(&position.row_id)),
+                statement: None,
+                table_existed: self.statement_rows.contains_key(table),
+                displaced: Vec::with_capacity(retired_count),
+                prior_admitted: None,
+                admission: None,
+                _charge: undo_charge,
+            });
+        }
         let indexes = self.tables.entry(table.to_owned()).or_default();
         for postings in indexes.values_mut() {
             if let Some(old_key) = postings.latest.remove(&position.row_id) {

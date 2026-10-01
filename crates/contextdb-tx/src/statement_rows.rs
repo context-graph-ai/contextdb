@@ -4,7 +4,7 @@ use contextdb_core::{IndexKey, Result, RowId, VersionedRow};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[derive(Debug)]
 struct RowOwner {
@@ -19,6 +19,18 @@ pub struct PreparedStatementRow {
     pub(crate) new_table: Option<Arc<StatementRows>>,
     owner: Arc<RowOwner>,
     copy_charge: Option<Arc<dyn StagedPostingCharge>>,
+    undo: Option<StatementRowUndo>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StatementRowUndo {
+    _charge: Arc<dyn StagedPostingCharge>,
+    prior_image: Weak<StatementRows>,
+    prior_row: Option<Arc<RowOwner>>,
+    prior_sequence: usize,
+    prior_copy_charge: Option<Arc<dyn StagedPostingCharge>>,
+    domains: Vec<(String, Option<StatementIndex>)>,
+    schemas: Vec<(String, Arc<crate::ordered_staged::StagedSchema>)>,
 }
 
 // Boundary probes sort before or after every full key sharing their logical
@@ -276,6 +288,7 @@ impl StatementRows {
         keys: &[(String, IndexKey)],
         schema: Arc<crate::ordered_staged::StagedSchema>,
         mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+        retain_undo: bool,
     ) -> Result<PreparedStatementRow> {
         let bytes = row.estimated_bytes().saturating_add(256).saturating_add(
             keys.iter()
@@ -292,7 +305,33 @@ impl StatementRows {
         } else {
             None
         };
+        let undo_charge = if retain_undo {
+            Some(reserve(snapshot.undo_control_bytes(row.row_id, keys))?)
+        } else {
+            None
+        };
+        let undo = undo_charge.map(|charge| StatementRowUndo {
+            _charge: charge,
+            prior_image: if copy_charge.is_some() {
+                Arc::downgrade(snapshot)
+            } else {
+                Weak::new()
+            },
+            prior_row: snapshot.rows.get(&row.row_id).cloned(),
+            prior_sequence: snapshot.next_sequence,
+            prior_copy_charge: snapshot.copy_charge.clone(),
+            domains: Vec::with_capacity(
+                keys.len().saturating_add(
+                    snapshot
+                        .rows
+                        .get(&row.row_id)
+                        .map_or(0, |owner| owner.keys.len()),
+                ),
+            ),
+            schemas: Vec::with_capacity(snapshot.indexes.len()),
+        });
         Ok(PreparedStatementRow {
+            undo,
             new_table: None,
             owner: Arc::new(RowOwner {
                 row: row.clone(),
@@ -305,7 +344,10 @@ impl StatementRows {
         })
     }
 
-    pub(crate) fn publish(snapshot: &mut Arc<Self>, prepared: PreparedStatementRow) {
+    pub(crate) fn publish(
+        snapshot: &mut Arc<Self>,
+        mut prepared: PreparedStatementRow,
+    ) -> Option<StatementRowUndo> {
         if let Some(charge) = prepared.copy_charge {
             let mut next = (**snapshot).clone();
             next.copy_charge = Some(charge);
@@ -315,6 +357,35 @@ impl StatementRows {
             .expect("statement mutation was prepared under the write-set mutex");
         let owner = prepared.owner;
         let row_id = owner.row.row_id;
+        if let Some(undo) = prepared.undo.as_mut() {
+            // Preserve incompatible comparator domains by moving their controls,
+            // rather than cloning all staged keys for an ordinary mutation.
+            for (name, index) in &rows.indexes {
+                undo.schemas.push((name.clone(), index.schema.clone()));
+            }
+            for (name, _) in &owner.keys {
+                let displace = rows.indexes.get(name).is_none_or(|index| {
+                    !index.schema.matches_index(&owner.schema, name)
+                        || (index.postings.len() == 1
+                            && index.postings.values().next() == Some(&row_id))
+                });
+                if displace {
+                    undo.domains.push((name.clone(), rows.indexes.remove(name)));
+                }
+            }
+            if let Some(prior) = &undo.prior_row {
+                for (name, _) in &prior.keys {
+                    if !undo.domains.iter().any(|(old_name, _)| old_name == name)
+                        && rows
+                            .indexes
+                            .get(name)
+                            .is_some_and(|index| index.postings.len() == 1)
+                    {
+                        undo.domains.push((name.clone(), rows.indexes.remove(name)));
+                    }
+                }
+            }
+        }
         rows.remove_private(row_id);
         rows.next_sequence = owner
             .sequence
@@ -339,6 +410,77 @@ impl StatementRows {
         }
         rows.sequence.insert(owner.sequence, row_id);
         rows.rows.insert(row_id, owner);
+        prepared.undo
+    }
+    pub(crate) fn restore(snapshot: &mut Arc<Self>, row_id: RowId, undo: StatementRowUndo) {
+        if let Some(prior) = undo.prior_image.upgrade() {
+            *snapshot = prior;
+            return;
+        }
+        // Only pre-mutation statement snapshots are published. Preparation made
+        // this replacement private; inverse installation needs no new admission.
+        let rows = Arc::get_mut(snapshot).expect("private mutation replacement");
+        rows.remove_private(row_id);
+        rows.next_sequence = undo.prior_sequence;
+        rows.copy_charge = undo.prior_copy_charge;
+        for (name, domain) in undo.domains {
+            rows.indexes.remove(&name);
+            if let Some(domain) = domain {
+                rows.indexes.insert(name, domain);
+            }
+        }
+        for (name, schema) in undo.schemas {
+            if let Some(index) = rows.indexes.get_mut(&name) {
+                index.schema = schema;
+            }
+        }
+        if let Some(owner) = undo.prior_row {
+            for (name, key) in &owner.keys {
+                if let Some(index) = rows.indexes.get_mut(name)
+                    && index.schema.matches_index(&owner.schema, name)
+                {
+                    index
+                        .postings
+                        .insert(StatementIndexKey::Row((key.clone(), row_id)), row_id);
+                }
+            }
+            rows.sequence.insert(owner.sequence, row_id);
+            rows.rows.insert(row_id, owner);
+        }
+    }
+    pub(crate) fn undo_control_bytes(&self, row_id: RowId, keys: &[(String, IndexKey)]) -> usize {
+        std::mem::size_of::<StatementRowUndo>()
+            .saturating_add(
+                self.indexes
+                    .keys()
+                    .map(|name| {
+                        name.len().saturating_add(std::mem::size_of::<(
+                            String,
+                            Arc<crate::ordered_staged::StagedSchema>,
+                        )>())
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                keys.iter()
+                    .map(|(name, key)| {
+                        name.len()
+                            .saturating_add(std::mem::size_of::<(String, Option<StatementIndex>)>())
+                            .saturating_add(crate::ordered_staged::staged_key_bytes(key))
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.rows.get(&row_id).map_or(0, |owner| {
+                owner
+                    .keys
+                    .iter()
+                    .map(|(name, key)| {
+                        name.len()
+                            .saturating_add(std::mem::size_of::<(String, Option<StatementIndex>)>())
+                            .saturating_add(crate::ordered_staged::staged_key_bytes(key))
+                    })
+                    .sum::<usize>()
+            }))
     }
     fn remove_private(&mut self, row: RowId) {
         if let Some(owner) = self.rows.remove(&row) {
@@ -354,6 +496,17 @@ impl StatementRows {
             }
         }
         self.indexes.retain(|_, index| !index.postings.is_empty());
+    }
+    pub(crate) fn reserve_removal_control(
+        &self,
+        bytes: usize,
+    ) -> Result<Arc<dyn StagedPostingCharge>> {
+        self.rows
+            .values()
+            .next()
+            .expect("a selected statement table has a row")
+            ._charge
+            .reserve_copy(bytes)
     }
     pub(crate) fn prepare_removal(snapshot: &Arc<Self>) -> Result<PreparedStatementRemoval> {
         let replacement = if Arc::strong_count(snapshot) > 1 {
