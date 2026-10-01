@@ -89,6 +89,8 @@ mod writer_recycle_baseline_cost;
 #[path = "engine_seams/writer_file_ownership_survives_recycle.rs"]
 mod writer_file_ownership_survives_recycle;
 
+#[path = "engine_seams/buffer_pool_share_evicts_and_recharges_under_the_writer_budget.rs"]
+mod buffer_pool_share_evicts_and_recharges_under_the_writer_budget;
 #[cfg(target_os = "linux")]
 #[path = "engine_seams/writer_reopen_and_doubling_keep_a_fixed_resident_envelope.rs"]
 mod writer_reopen_and_doubling_keep_a_fixed_resident_envelope;
