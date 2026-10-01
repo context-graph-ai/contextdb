@@ -182,6 +182,10 @@ impl PersistentCompositeStore {
             },
         )?;
         drop(erasure_stages);
+        #[cfg(feature = "in-process-test-seams")]
+        crate::writer_commit_test_seams::reached(
+            crate::writer_commit_test_seams::CommitBoundary::BeforeMemoryPublication,
+        );
         self.inner
             .apply_exact_with_log_entries(ws, log_entries, partition_mutations)
     }

@@ -11,6 +11,9 @@ mod custody_remainder;
 mod custody_store;
 #[cfg(test)]
 mod published_vector_install_tests;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod resident_history_test_seams;
 #[cfg(test)]
 mod vector_frontier_metadata_admission_tests;
 #[cfg(test)]
@@ -15605,6 +15608,8 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                     "saved vector graph length disagrees with its catalog".to_string(),
                 ));
             }
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_query_test_seams::note_saved_graph_load(graph_bytes.len());
             #[cfg(feature = "test-seams")]
             if contextdb_vector::test_seam::take_dormant_vector_decode_failure_for_test() {
                 return Err(Error::Other(
@@ -16325,6 +16330,14 @@ impl MaintenanceContext {
     }
 
     fn build_checkpoint(&self) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        resident_history_test_seams::note(|work| {
+            work.workspace_peak = work.workspace_peak.max(
+                self.vector
+                    .memory_ownership_snapshot_for_test()
+                    .temporary_workspace,
+            );
+        });
         // Maintenance derives its work from memory, which no longer matches
         // the durable image once a publication was interrupted.
         if self.publication_interrupted.load(Ordering::SeqCst) {
@@ -16849,6 +16862,10 @@ impl MaintenanceContext {
                             continue;
                         }
                         for row in rows {
+                            #[cfg(feature = "test-seams")]
+                            resident_history_test_seams::note(|work| {
+                                work.retention_keys_examined += 1
+                            });
                             if row.deleted_tx.is_some()
                                 || !candidates.contains(&RetentionRowKey::new(
                                     table,
@@ -17580,6 +17597,18 @@ impl MaintenanceContext {
                             raw_count,
                         )?
                     };
+                    #[cfg(feature = "test-seams")]
+                    resident_history_test_seams::note(|work| {
+                        for entry in &entries {
+                            if work.maintenance_source_keys
+                                < work.maintenance_source_identities.len()
+                            {
+                                work.maintenance_source_identities[work.maintenance_source_keys] =
+                                    Some((entry.row_id.0, entry.lsn.0));
+                            }
+                            work.maintenance_source_keys += 1;
+                        }
+                    });
                     entries.retain(|entry| entry.created_tx <= covered_tx);
                     for entry in &mut entries {
                         if entry.deleted_tx.is_some_and(|tx| tx > covered_tx) {
@@ -20404,6 +20433,10 @@ impl Database {
                 }
             }
             persistence.visit_relational_table(name, |mut row| {
+                #[cfg(feature = "in-process-test-seams")]
+                crate::writer_query_test_seams::note_history(
+                    crate::writer_query_test_seams::HistoryFamily::IndexRebuildInput,
+                );
                 if sanitize_loaded_row_for_meta(&mut row, &runtime_meta) {
                     sanitized_row_tables.insert(name.clone());
                 }
@@ -34546,6 +34579,8 @@ impl Database {
                     .cloned()
                     .collect::<Vec<_>>();
                 let overlap = ws.relational_inserts.iter().find_map(|(t, row)| {
+                    #[cfg(feature = "in-process-test-seams")]
+                    crate::writer_query_test_seams::note_constraint_staged_row();
                     if t != table {
                         return None;
                     }
@@ -34593,6 +34628,8 @@ impl Database {
                 .unwrap_or_default()
         };
         for entry in entries {
+            #[cfg(feature = "in-process-test-seams")]
+            crate::writer_query_test_seams::note_constraint_posting();
             if let Some(sid) = skip_row_id
                 && entry.row_id == sid
             {
@@ -44411,6 +44448,8 @@ impl Database {
             };
             captured
         };
+        #[cfg(feature = "in-process-test-seams")]
+        crate::writer_query_test_seams::note_read_snapshot(snapshot);
         Ok(Some((
             snapshot,
             publication_lsn,
@@ -51700,7 +51739,13 @@ impl Database {
 
     fn change_log_since_unlocked(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
         let log = self.change_log.read();
-        let start = log.partition_point(|e| e.lsn() <= since_lsn);
+        let start = log.partition_point(|e| {
+            #[cfg(feature = "test-seams")]
+            resident_history_test_seams::note(|work| work.log_keys_examined += 1);
+            e.lsn() <= since_lsn
+        });
+        #[cfg(feature = "test-seams")]
+        resident_history_test_seams::note(|work| work.log_keys_examined += log.len() - start);
         log[start..].to_vec()
     }
 
@@ -67215,6 +67260,8 @@ fn prune_expired_rows(
         }
         let mut table_has_future_dated = false;
         for row in rows {
+            #[cfg(feature = "test-seams")]
+            resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
             if row.deleted_tx.is_none()
                 && row.created_at.is_some_and(|stamp| stamp.0 > skew_horizon)
             {
@@ -67253,6 +67300,8 @@ fn prune_expired_rows(
         }
 
         for row in rows {
+            #[cfg(feature = "test-seams")]
+            resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
             let row_key = RetentionRowKey::new(table_name, row.row_id, row.created_tx);
             if !prune_candidates.contains(&row_key) {
                 continue;
@@ -67410,6 +67459,8 @@ fn prune_expired_rows(
             .saturating_add(meta.exact_probe_filter_bytes());
         if let Some(rows) = table_snapshot.get(table) {
             for row in rows {
+                #[cfg(feature = "test-seams")]
+                resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
                 if versions.contains(&(row.row_id, row.created_tx)) {
                     continue;
                 }
@@ -68272,6 +68323,8 @@ fn compact_currency_versions_inner(
         // one for a currency table (updates always advance the LSN).
         let mut keeper_lsn: HashMap<RowId, Lsn> = HashMap::new();
         for row in rows {
+            #[cfg(feature = "test-seams")]
+            resident_history_test_seams::note(|work| work.cleanup_versions_examined += 1);
             keeper_lsn
                 .entry(row.row_id)
                 .and_modify(|current| {
@@ -68282,6 +68335,8 @@ fn compact_currency_versions_inner(
                 .or_insert(row.lsn);
         }
         for row in rows {
+            #[cfg(feature = "test-seams")]
+            resident_history_test_seams::note(|work| work.cleanup_versions_examined += 1);
             if keeper_lsn.get(&row.row_id).copied() == Some(row.lsn) {
                 // A deleted row's final version is still its relational
                 // keeper (the delete stamps that version; the tombstone stays
@@ -68693,6 +68748,8 @@ fn retention_prune_candidates(
         // admitted before insertion, and the complete attempt publishes once.
         for page in rows.chunks(128) {
             for row in page {
+                #[cfg(feature = "test-seams")]
+                resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
                 if matches!(preparation, RetentionPreparation::Expiry) && row.deleted_tx.is_some() {
                     continue;
                 }
@@ -68736,6 +68793,8 @@ fn fk_protected_prune_candidates(
                 continue;
             }
             for parent_row in rows {
+                #[cfg(feature = "test-seams")]
+                resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
                 let parent_key =
                     RetentionRowKey::new(parent_table, parent_row.row_id, parent_row.created_tx);
                 if !prune_candidates.contains(&parent_key) || parent_row.deleted_tx.is_some() {
@@ -68847,6 +68906,8 @@ fn child_rows_contain_live_reference(
     }
     tables.get(child_table).is_some_and(|rows| {
         rows.iter().any(|row| {
+            #[cfg(feature = "test-seams")]
+            resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
             row.deleted_tx.is_none()
                 && child_columns
                     .iter()

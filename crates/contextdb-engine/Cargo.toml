@@ -15,7 +15,7 @@ categories.workspace = true
 
 [features]
 in-process-test-seams = []
-test-seams = ["in-process-test-seams", "redb/test-seams", "contextdb-vector/test-seams", "contextdb-core/test-seams", "contextdb-tx/test-seams"]
+test-seams = ["in-process-test-seams", "redb/test-seams", "redb/cache_metrics", "contextdb-vector/test-seams", "contextdb-core/test-seams", "contextdb-tx/test-seams", "contextdb-relational/test-seams"]
 # Build-only validation facility used by the installed release smoke. It keeps
 # the real Iroh path and exposes only two fixed crash checkpoints; it does not
 # enable the broader test seam.

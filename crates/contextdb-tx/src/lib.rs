@@ -1,4 +1,7 @@
 pub mod commit_directory;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod commit_wait_test_seams;
 pub mod manager;
 pub mod ordered_staged;
 pub mod write_set;

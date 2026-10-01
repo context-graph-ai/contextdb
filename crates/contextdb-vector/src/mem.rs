@@ -2957,6 +2957,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 if source.allowed_count == 0 {
                     continue;
                 }
+                #[cfg(feature = "test-seams")]
+                crate::auto_planning_test_seams::note_partition_cost();
                 let comparison_nanos = if source.state.streams_raw_bodies() {
                     AUTO_EXHAUSTIVE_COMPARISON_NANOS
                 } else {

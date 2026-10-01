@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "test-seams")]
+mod resident_history_test_seams;
+
 #[cfg(test)]
 thread_local! {
     static COMMIT_WAIT_ENTERED_FOR_TEST: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
@@ -763,6 +766,8 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
                         .expect("commit-wait observer remains available");
                 }
             });
+            #[cfg(feature = "test-seams")]
+            crate::commit_wait_test_seams::note_wait();
             let remaining = duration.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 return None;

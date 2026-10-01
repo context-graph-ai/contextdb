@@ -11354,6 +11354,8 @@ fn merge_staged_rows_in_index_order(
     mut staged: Vec<VersionedRow>,
     columns: &[(String, contextdb_core::SortDirection)],
 ) -> Vec<VersionedRow> {
+    #[cfg(feature = "in-process-test-seams")]
+    crate::writer_query_test_seams::note_staged_sort(staged.len());
     staged.sort_unstable_by(|left, right| compare_rows_by_index_columns(left, right, columns));
     let mut committed = committed.into_iter().peekable();
     let mut staged = staged.into_iter().peekable();
