@@ -63,6 +63,7 @@ impl RedbPersistence {
         mutations: &[content_identity::ContentIdentityMutation],
     ) -> Result<()> {
         let mut heads = write.open_table(TABLE).map_err(Self::storage_error)?;
+        let mut family_exists = std::collections::HashMap::new();
         for mutation in mutations {
             let Some(projection) = mutation.row_head else {
                 continue;
@@ -70,11 +71,15 @@ impl RedbPersistence {
             let (table, row) = route(&mutation.logical_key)?;
             let name = Self::rel_table_name(table);
             let relation: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
-            if write
-                .table_root_fingerprint(relation)
-                .map_err(Self::storage_error)?
-                .is_none()
-            {
+            let exists = match family_exists.get(table) {
+                Some(exists) => *exists,
+                None => {
+                    let exists = write.table_exists(relation).map_err(Self::storage_error)?;
+                    family_exists.insert(table, exists);
+                    exists
+                }
+            };
+            if !exists {
                 if projection.is_some() {
                     return Err(damage(
                         "row head publication names an absent physical family",

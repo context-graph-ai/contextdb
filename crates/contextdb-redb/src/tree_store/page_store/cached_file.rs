@@ -305,7 +305,7 @@ pub(super) struct PagedCachedFile {
     // cache budget while any such page is held.
     read_cache_bytes: Arc<AtomicUsize>,
     write_buffer_bytes: AtomicUsize,
-    max_cache_size: usize,
+    max_cache_size: AtomicUsize,
     // Rotates the starting stripe for read-cache eviction
     next_eviction_stripe: AtomicUsize,
     #[cfg(feature = "cache_metrics")]
@@ -338,7 +338,7 @@ impl PagedCachedFile {
             page_size,
             read_cache_bytes: Arc::new(AtomicUsize::new(0)),
             write_buffer_bytes: AtomicUsize::new(0),
-            max_cache_size,
+            max_cache_size: AtomicUsize::new(max_cache_size),
             next_eviction_stripe: AtomicUsize::new(0),
             #[cfg(feature = "cache_metrics")]
             reads_total: Default::default(),
@@ -386,6 +386,24 @@ impl PagedCachedFile {
                 used_bytes: read_bytes + write_bytes,
             }
         }
+    }
+
+    /// Settle the writer's share during its quiescent startup, before source
+    /// roots are published. Eviction releases cache ownership only: any page
+    /// held elsewhere keeps its original bytes and remains in the live count.
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize> {
+        if self.max_cache_size.load(Ordering::Acquire) != bytes {
+            self.flush_write_buffer()?;
+            let lock = self.write_buffer.lock().unwrap();
+            self.max_cache_size.store(bytes, Ordering::Release);
+            let retained = self.read_cache_bytes.load(Ordering::Acquire);
+            self.evict_from_read_cache(retained.saturating_sub(bytes), &lock);
+        }
+        Ok(bytes.max(
+            self.read_cache_bytes.load(Ordering::Acquire)
+                + self.write_buffer_bytes.load(Ordering::Acquire),
+        ))
     }
 
     pub(crate) fn close(&self) -> Result {
@@ -456,7 +474,7 @@ impl PagedCachedFile {
                 .read_cache_bytes
                 .fetch_add(buffer.len(), Ordering::AcqRel);
 
-            if cache_size + buffer.len() <= self.max_cache_size {
+            if cache_size + buffer.len() <= self.max_cache_size.load(Ordering::Acquire) {
                 let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
                 let mut lock = self.read_cache[cache_slot].write().unwrap();
                 // A race could replace an existing buffer; dropping it gives
@@ -556,16 +574,19 @@ impl PagedCachedFile {
         // stays counted until it is dropped.
         let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
         let cache_size = self.read_cache_bytes.load(Ordering::Acquire);
-        if cache_size + len + write_bytes > self.max_cache_size {
+        if cache_size + len + write_bytes > self.max_cache_size.load(Ordering::Acquire) {
             let lock = self.write_buffer.lock().unwrap();
-            self.evict_from_read_cache(cache_size + len + write_bytes - self.max_cache_size, &lock);
+            self.evict_from_read_cache(
+                cache_size + len + write_bytes - self.max_cache_size.load(Ordering::Acquire),
+                &lock,
+            );
         }
 
         // Admit the page to the cache only if its count still fits the
         // budget, so every page the cache's count covers stays inside it.
         let previous = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
         let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
-        if previous + len + write_bytes <= self.max_cache_size {
+        if previous + len + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
             let page = CachedPage::admitted(buffer, &self.read_cache_bytes);
             let mut write_lock = self.read_cache[cache_slot].write().unwrap();
             // A race could replace an existing buffer; dropping it gives back
@@ -692,7 +713,7 @@ impl PagedCachedFile {
         } else {
             let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
             let mut write_bytes = previous + len;
-            let half = self.max_cache_size / 2;
+            let half = self.max_cache_size.load(Ordering::Acquire) / 2;
 
             // Rule 1: write buffer NEVER exceeds 50%.  Flush excess to disk.
             if write_bytes > half {
@@ -724,8 +745,11 @@ impl PagedCachedFile {
             // exceeds the budget then read must be > 50%, so evict from the
             // read cache (fairness: we only take from read when read > 50%).
             let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
-            if write_bytes + read_bytes > self.max_cache_size {
-                self.evict_from_read_cache(write_bytes + read_bytes - self.max_cache_size, &lock);
+            if write_bytes + read_bytes > self.max_cache_size.load(Ordering::Acquire) {
+                self.evict_from_read_cache(
+                    write_bytes + read_bytes - self.max_cache_size.load(Ordering::Acquire),
+                    &lock,
+                );
             }
             let result = if let Some(data) = existing {
                 #[cfg(feature = "cache_metrics")]

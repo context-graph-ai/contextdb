@@ -631,6 +631,15 @@ impl ReadableDatabase for Database {
 }
 
 impl Database {
+    /// Settle a writer cache share before exposing its first reader root.
+    /// The caller must exclude concurrent database operations during startup.
+    /// The returned reserve covers the capacity and any still-held pages.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize, StorageError> {
+        self.mem.settle_startup_cache_budget(bytes)
+    }
+
     /// Upper bound on the allocator's resident heap owner. Paged file
     /// backends have a fixed envelope regardless of durable region count.
     pub fn allocator_resident_bytes(&self) -> usize {
@@ -1435,13 +1444,9 @@ impl Database {
     pub fn drain_deferred_frees(&self) -> Result<(), Error> {
         loop {
             let mut tx = self.begin_write()?;
-            if self
-                .transaction_tracker
-                .oldest_live_read_transaction()
-                .is_some()
-                || self.transaction_tracker.any_savepoint_exists()
+            if self.transaction_tracker.any_savepoint_exists()
                 || tx.list_persistent_savepoints()?.next().is_some()
-                || !tx.pending_free_pages()?
+                || !tx.eligible_pending_free_pages()?
             {
                 tx.abort()?;
                 return Ok(());

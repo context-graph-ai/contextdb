@@ -32,8 +32,8 @@ use std::{io, panic, thread};
 
 const MAX_PAGES_PER_COMPACTION: usize = 1_000_000;
 
-/// An in-process scheduling position. No storage pages or read transaction
-/// survive a compaction batch, so it is safe to discard this on restart.
+/// A bounded scheduling position. No storage pages or read transaction
+/// survive a compaction batch; callers may checkpoint its scalar state.
 #[doc(hidden)]
 #[derive(Clone, Debug, Default)]
 pub struct CompactionCursor {
@@ -47,6 +47,41 @@ pub struct CompactionCursor {
 impl CompactionCursor {
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn checkpoint(&self) -> (u8, Option<&str>, bool, &[usize], bool) {
+        (
+            self.phase,
+            self.table.as_deref(),
+            self.advance_table,
+            &self.position,
+            self.active,
+        )
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn restore_checkpoint(
+        phase: u8,
+        table: Option<String>,
+        advance_table: bool,
+        position: Vec<usize>,
+        active: bool,
+    ) -> Result<Self, StorageError> {
+        if phase > 3 {
+            return Err(StorageError::Corrupted(
+                "invalid compaction checkpoint phase".into(),
+            ));
+        }
+        Ok(Self {
+            phase,
+            table,
+            advance_table,
+            position,
+            active,
+        })
     }
 }
 
@@ -962,6 +997,29 @@ impl WriteTransaction {
         Ok(false)
     }
 
+    /// Inspect only the oldest entry in each free tree using the same fence
+    /// as durable_commit. A live reader protects newer entries, not every
+    /// deferred allocation in the file.
+    pub(crate) fn eligible_pending_free_pages(&self) -> Result<bool> {
+        let free_until = self
+            .transaction_tracker
+            .oldest_live_read_transaction()
+            .map_or(self.transaction_id, |id| id.next())
+            .raw_id();
+        let mut system_tables = self.system_tables.lock().unwrap();
+        for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
+            let table = system_tables.open_system_table(self, definition)?;
+            if table
+                .tree
+                .first()?
+                .is_some_and(|(key, _)| key.value().transaction_id < free_until)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[cfg(debug_assertions)]
     pub fn print_allocated_page_debug(&self) {
         let mut all_allocated: HashSet<PageNumber> =
@@ -1417,6 +1475,22 @@ impl WriteTransaction {
         definition: TableDefinition<K, V>,
     ) -> Result<Table<'txn, K, V>, TableError> {
         self.tables.lock().unwrap().open_table(self, definition)
+    }
+
+    /// Check a user family's directory entry without finalizing dirty payload pages.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn table_exists<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<bool, TableError> {
+        Ok(self
+            .tables
+            .lock()
+            .unwrap()
+            .table_tree
+            .get_table::<K, V>(definition.name(), TableType::Normal)?
+            .is_some())
     }
 
     /// Return the finalized root header of a user table after its open handles
@@ -2007,11 +2081,24 @@ impl WriteTransaction {
     /// fingerprints changed by page movement in this same transaction.
     #[doc(hidden)]
     pub fn compact_step_with_hook(
+        self,
+        cursor: &mut CompactionCursor,
+        maximum: usize,
+        admit: impl FnMut(usize) -> std::io::Result<()>,
+        on_batch: impl FnOnce(&Self) -> Result<(), StorageError>,
+    ) -> Result<CompactionProgress, crate::CompactionError> {
+        self.compact_step_with_cursor_hook(cursor, maximum, admit, |txn, _| on_batch(txn))
+    }
+
+    /// Checkpoint the successor cursor in the relocation transaction. The
+    /// caller sees the successor in memory only after that commit succeeds.
+    #[doc(hidden)]
+    pub fn compact_step_with_cursor_hook(
         mut self,
         cursor: &mut CompactionCursor,
         maximum: usize,
         mut admit: impl FnMut(usize) -> std::io::Result<()>,
-        on_batch: impl FnOnce(&Self) -> Result<(), StorageError>,
+        on_batch: impl FnOnce(&Self, &CompactionCursor) -> Result<(), StorageError>,
     ) -> Result<CompactionProgress, crate::CompactionError> {
         assert!(maximum > 0);
         if self.transaction_tracker.any_savepoint_exists() {
@@ -2023,7 +2110,7 @@ impl WriteTransaction {
         let mut next = cursor.clone();
         next.active = true;
         let progress = self.compact_page_batch(&mut next, maximum, &mut admit)?;
-        on_batch(&self)?;
+        on_batch(&self, &next)?;
         self.commit_compaction_frees()
             .map_err(|e| e.into_storage_error())?;
         *cursor = next;

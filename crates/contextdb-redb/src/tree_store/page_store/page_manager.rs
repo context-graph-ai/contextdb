@@ -385,6 +385,11 @@ impl TransactionalMemory {
         })
     }
 
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn settle_startup_cache_budget(&self, bytes: usize) -> Result<usize> {
+        self.storage.settle_startup_cache_budget(bytes)
+    }
+
     pub(crate) fn cache_stats(&self) -> CacheStats {
         self.storage.cache_stats()
     }

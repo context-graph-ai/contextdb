@@ -8675,6 +8675,22 @@ struct DurableLineageRecoveryBounds {
     max_row_id: RowId,
 }
 
+impl Database {
+    pub(crate) fn lineage_recovery_floors_for_write(
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<(RowId, Lsn)> {
+        if !key.starts_with(Self::DURABLE_LINEAGE_CONFIG_PREFIX)
+            && !key.starts_with(Self::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX)
+        {
+            return Ok((RowId(0), Lsn(0)));
+        }
+        let mut bounds = DurableLineageRecoveryBounds::default();
+        bounds.admit(key, bytes)?;
+        Ok((bounds.max_row_id, bounds.purge_frontier_max_lsn))
+    }
+}
+
 impl DurableLineageRecoveryBounds {
     fn admit(&mut self, key: &str, bytes: &[u8]) -> Result<()> {
         let record = RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes)?;
@@ -9334,6 +9350,7 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub published_root_charge: usize,
     pub captured_root_charge: usize,
     pub commit_source_reference_charge: usize,
+    pub storage_maintenance_control_charge: usize,
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -16833,7 +16850,8 @@ impl MaintenanceContext {
                 // The reserved-LSN callback holds the commit frontier. Borrow
                 // authoritative rows there; copy only admitted mutation identities.
                 let metas = self.relational.table_meta.read();
-                let frontier = MaintenanceFrontier::capture(&self.relational, &self.tx_mgr)?;
+                let frontier = MaintenanceFrontier::capture(&self.relational, &self.tx_mgr)?
+                    .retention_batch(&metas, "expiry", &mut workspace.borrow_mut())?;
                 let watermark = self.sync_watermark.load(Ordering::SeqCst);
                 let candidates = retention_prune_candidates(
                     &metas,
@@ -16845,6 +16863,8 @@ impl MaintenanceContext {
                 )?;
                 let protected = fk_protected_prune_candidates(&metas, &frontier, &candidates)?;
                 self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
+                    ws.config_writes
+                        .extend(frontier.retention_progress().iter().cloned());
                     let mut expired_nodes = HashSet::new();
                     for table in metas.keys() {
                         if metas
@@ -19856,6 +19876,13 @@ impl Database {
         if self.resource_owner
             && let Some(persistence) = &self.persistence
         {
+            // New owner requests must not capture this publication after its
+            // release. An accepted request may still need to capture it, so
+            // retain the root until that request drains. Suspended cursors and
+            // external readers keep their own independent shared roots.
+            if self.stop_owner_reads_without_waiting() {
+                self.tx_mgr.release_publication_handle();
+            }
             persistence.drain_deferred_frees_before_handoff()?;
         }
         Ok(())
@@ -20410,13 +20437,13 @@ impl Database {
         // memory limit has settled, so the accountant here is the one the
         // composite store and every other subsystem share.
         persistence.attach_memory_accountant(Arc::clone(&accountant));
-        // The page cache the store was opened with, charged now that the
-        // accountant is the one every subsystem will share -- so a limit the
-        // store carries itself bounds its cache like any other retention, and
-        // a limit that cannot hold it refuses the open with the typed error
-        // instead of opening a store whose own budget it does not fit.
-        let cache_bytes =
-            crate::persistence::redb_writer_cache_bytes_for_limit(accountant.usage().limit);
+        persistence.restore_storage_compaction()?;
+        // The persisted effective limit sizes the actual native cache before
+        // source roots are published. Charge that same reserve, including any
+        // page whose final holder has not released it during startup eviction.
+        let cache_bytes = persistence.settle_writer_cache_budget(
+            crate::persistence::redb_writer_cache_bytes_for_limit(accountant.usage().limit),
+        )?;
         //
         // Charged, not admitted: the cache exists the moment Redb is open, and
         // a limit is persisted with the store, so refusing the OPEN on it
@@ -20525,22 +20552,11 @@ impl Database {
             .map(|(lsn, _)| *lsn)
             .max()
             .unwrap_or(Lsn(0));
-        let mut lineage_bounds = DurableLineageRecoveryBounds::default();
-        for (key, bytes) in
-            persistence
-                .load_config_values_raw_with_prefix(Self::DURABLE_LINEAGE_CONFIG_PREFIX)?
-                .into_iter()
-                .chain(persistence.load_config_values_raw_with_prefix(
-                    Self::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX,
-                )?)
-        {
-            lineage_bounds.admit(&key, &bytes)?;
-        }
-        let max_row_id = open_bounds.max_row_id.max(lineage_bounds.max_row_id);
-        let max_lsn = open_bounds
-            .max_lsn
-            .max(ddl_max_lsn)
-            .max(lineage_bounds.purge_frontier_max_lsn);
+        // Applied lifecycle and purge writes maintain the non-derivable
+        // identity floors in their own transaction. Open reads those floors
+        // rather than rebuilding them from every retained lifecycle record.
+        let max_row_id = open_bounds.max_row_id;
+        let max_lsn = open_bounds.max_lsn.max(ddl_max_lsn);
         relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
 
         let (initial_table_index, initial_lsn_refcounts) =
@@ -20640,10 +20656,6 @@ impl Database {
             .store(persisted_maintenance_poll_interval_ms, Ordering::SeqCst);
         db.vector_serving_cache_bytes
             .store(persisted_vector_serving_cache_bytes, Ordering::SeqCst);
-
-        db.load_received_ddl_arrivals_from_persistence()?;
-        db.load_superseded_ddl_occurrences_from_persistence()?;
-        db.load_graph_arrivals_from_persistence()?;
 
         for meta in all_meta.values() {
             if !meta.dag_edge_types.is_empty() {
@@ -24684,7 +24696,7 @@ impl Database {
                         if let Some(delta) = in_memory_lineage_delta.borrow_mut().take() {
                             self.publish_in_memory_lineage_delta(delta);
                         }
-                        if !committed_graph_arrivals.borrow().is_empty() {
+                        if self.persistence.is_none() && !committed_graph_arrivals.borrow().is_empty() {
                             self.sync_graph_arrivals
                                 .write()
                                 .extend(committed_graph_arrivals.borrow_mut().drain(..));
@@ -26433,12 +26445,15 @@ impl Database {
     /// `(source,target,type)` is never mistaken for an echo.
     pub fn graph_change_arrived_by_sync(&self, edge: &EdgeChange) -> bool {
         let deleted = matches!(edge.properties.get("__deleted"), Some(Value::Bool(true)));
-        self.sync_graph_arrivals
-            .read()
-            .get(&(edge.source, edge.target, edge.edge_type.clone()))
-            .is_some_and(|marker| {
-                marker.pulled && marker.local_lsn == edge.lsn && marker.deleted == deleted
-            })
+        self.with_graph_arrival(
+            &(edge.source, edge.target, edge.edge_type.clone()),
+            |marker| {
+                Ok(marker.is_some_and(|marker| {
+                    marker.pulled && marker.local_lsn == edge.lsn && marker.deleted == deleted
+                }))
+            },
+        )
+        .unwrap_or(false)
     }
 
     /// Whether this exact vector-owner mutation arrived by sync. Vector
@@ -26857,24 +26872,34 @@ impl Database {
         state.push_outcomes.extend(delta.push_outcomes);
     }
 
-    fn load_graph_arrivals_from_persistence(&self) -> Result<()> {
-        let Some(persistence) = &self.persistence else {
-            return Ok(());
-        };
-        let mut arrivals = HashMap::new();
-        for (key, record) in persistence
-            .load_config_values_with_prefix::<DurableGraphArrival>(SYNC_GRAPH_ARRIVAL_PREFIX)?
-        {
-            if key != Self::graph_arrival_config_key(&record)? {
+    fn with_graph_arrival<T>(
+        &self,
+        identity: &GraphIdentity,
+        visit: impl FnOnce(Option<&DurableGraphArrival>) -> Result<T>,
+    ) -> Result<T> {
+        let (_, root) = self.capture_writer_statement()?;
+        if let Some(root) = root {
+            let key_record = DurableGraphArrival {
+                source: identity.0,
+                target: identity.1,
+                edge_type: identity.2.clone(),
+                local_lsn: Lsn(0),
+                deleted: false,
+                pulled: false,
+            };
+            let key = Self::graph_arrival_config_key(&key_record)?;
+            let record = root.config_point::<DurableGraphArrival>(&key)?;
+            if let Some(record) = &record
+                && Self::graph_arrival_key(&record.value) != *identity
+            {
                 return Err(Error::StoreCorrupted {
                     path: key,
-                    reason: "graph-arrival key disagrees with its canonical record".to_string(),
+                    reason: "graph-arrival key disagrees with its canonical record".into(),
                 });
             }
-            arrivals.insert(Self::graph_arrival_key(&record), record);
+            return visit(record.as_ref().map(|record| &record.value));
         }
-        *self.sync_graph_arrivals.write() = arrivals;
-        Ok(())
+        visit(self.sync_graph_arrivals.read().get(identity))
     }
 
     fn durable_lineage_config_key(
@@ -27000,34 +27025,97 @@ impl Database {
         )
     }
 
-    fn load_received_ddl_arrivals_from_persistence(&self) -> Result<()> {
-        let Some(persistence) = &self.persistence else {
-            return Ok(());
-        };
-        let mut arrivals = HashMap::new();
-        for (key, arrival) in persistence
-            .load_config_values_with_prefix::<DurableReceivedDdlArrival>(
+    fn has_received_ddl_arrivals(&self) -> Result<bool> {
+        let (_, root) = self.capture_writer_statement()?;
+        if let Some(root) = root {
+            RedbPersistence::config_prefix_exists_at_root(
+                &root,
                 Self::DURABLE_RECEIVED_DDL_ARRIVAL_CONFIG_PREFIX,
-            )?
-        {
-            let expected_key = Self::durable_received_ddl_arrival_key(
-                arrival.local_lsn,
-                arrival.persisted_ordinal,
-            );
-            if key != expected_key
-                || arrivals
-                    .insert((arrival.local_lsn, arrival.persisted_ordinal), arrival)
-                    .is_some()
+            )
+        } else {
+            Ok(!self.received_ddl_arrivals.read().is_empty())
+        }
+    }
+
+    fn visit_received_ddl_arrivals(
+        &self,
+        mut visit: impl FnMut((Lsn, u32), &DurableReceivedDdlArrival) -> Result<()>,
+    ) -> Result<()> {
+        let (_, root) = self.capture_writer_statement()?;
+        if let Some(root) = root {
+            let mut cursor =
+                root.config_cursor(Self::DURABLE_RECEIVED_DDL_ARRIVAL_CONFIG_PREFIX)?;
+            while let Some(window) = cursor.next(|_, bytes| {
+                RedbPersistence::decode_config_value_exact::<DurableReceivedDdlArrival>(bytes)
+            })? {
+                let record = &window.value;
+                let key = Self::durable_received_ddl_arrival_key(
+                    record.local_lsn,
+                    record.persisted_ordinal,
+                );
+                if window.position() != key.as_bytes() {
+                    return Err(Error::StoreCorrupted {
+                        path: key,
+                        reason: "received DDL arrival key does not bind one exact local occurrence"
+                            .into(),
+                    });
+                }
+                visit((record.local_lsn, record.persisted_ordinal), record)?;
+            }
+            return Ok(());
+        }
+        let arrivals = self.received_ddl_arrivals.read();
+        let mut records = arrivals.iter().collect::<Vec<_>>();
+        records.sort_unstable_by_key(|(key, _)| **key);
+        for (key, record) in records {
+            visit(*key, record)?;
+        }
+        Ok(())
+    }
+
+    fn with_received_ddl_arrival<T>(
+        &self,
+        occurrence: (Lsn, u32),
+        visit: impl FnOnce(Option<&DurableReceivedDdlArrival>) -> Result<T>,
+    ) -> Result<T> {
+        let (_, root) = self.capture_writer_statement()?;
+        if let Some(root) = root {
+            let key = Self::durable_received_ddl_arrival_key(occurrence.0, occurrence.1);
+            let record = root.config_point::<DurableReceivedDdlArrival>(&key)?;
+            if let Some(record) = &record
+                && (record.value.local_lsn, record.value.persisted_ordinal) != occurrence
             {
                 return Err(Error::StoreCorrupted {
                     path: key,
                     reason: "received DDL arrival key does not bind one exact local occurrence"
-                        .to_string(),
+                        .into(),
                 });
             }
+            return visit(record.as_ref().map(|record| &record.value));
         }
-        *self.received_ddl_arrivals.write() = arrivals;
-        Ok(())
+        visit(self.received_ddl_arrivals.read().get(&occurrence))
+    }
+
+    fn with_superseded_ddl_occurrence<T>(
+        &self,
+        occurrence: (Lsn, u32),
+        visit: impl FnOnce(Option<&DurableSupersededDdlOccurrence>) -> Result<T>,
+    ) -> Result<T> {
+        let (_, root) = self.capture_writer_statement()?;
+        if let Some(root) = root {
+            let key = Self::durable_superseded_ddl_occurrence_key(occurrence.0, occurrence.1);
+            let record = root.config_point::<DurableSupersededDdlOccurrence>(&key)?;
+            if let Some(record) = &record
+                && (record.value.local_lsn, record.value.persisted_ordinal) != occurrence
+            {
+                return Err(Error::StoreCorrupted {
+                    path: key,
+                    reason: "superseded DDL key does not bind one exact local occurrence".into(),
+                });
+            }
+            return visit(record.as_ref().map(|record| &record.value));
+        }
+        visit(self.superseded_ddl_occurrences.read().get(&occurrence))
     }
 
     const DURABLE_SUPERSEDED_DDL_CONFIG_PREFIX: &str = "sync_ddl_superseded.v1.";
@@ -27038,39 +27126,6 @@ impl Database {
             Self::DURABLE_SUPERSEDED_DDL_CONFIG_PREFIX,
             local_lsn.0
         )
-    }
-
-    fn load_superseded_ddl_occurrences_from_persistence(&self) -> Result<()> {
-        let Some(persistence) = &self.persistence else {
-            return Ok(());
-        };
-        let mut superseded = HashMap::new();
-        for (key, occurrence) in persistence
-            .load_config_values_with_prefix::<DurableSupersededDdlOccurrence>(
-                Self::DURABLE_SUPERSEDED_DDL_CONFIG_PREFIX,
-            )?
-        {
-            let expected_key = Self::durable_superseded_ddl_occurrence_key(
-                occurrence.local_lsn,
-                occurrence.persisted_ordinal,
-            );
-            if key != expected_key
-                || superseded
-                    .insert(
-                        (occurrence.local_lsn, occurrence.persisted_ordinal),
-                        occurrence,
-                    )
-                    .is_some()
-            {
-                return Err(Error::StoreCorrupted {
-                    path: key,
-                    reason: "superseded DDL key does not bind one exact local occurrence"
-                        .to_string(),
-                });
-            }
-        }
-        *self.superseded_ddl_occurrences.write() = superseded;
-        Ok(())
     }
 
     /// Decide which locally authored DDL occurrences an incoming authenticated
@@ -27088,8 +27143,6 @@ impl Database {
         local_ddl_log: &[(Lsn, DdlChange)],
         received_ddl: &[DdlChange],
     ) -> Result<Vec<((Lsn, u32), DurableSupersededDdlOccurrence)>> {
-        let arrivals = self.received_ddl_arrivals.read();
-        let already_superseded = self.superseded_ddl_occurrences.read();
         let mut candidates = Vec::<((Lsn, u32), DurableSupersededDdlOccurrence)>::new();
         for change in received_ddl {
             for (position, (lsn, local)) in local_ddl_log.iter().enumerate() {
@@ -27101,8 +27154,8 @@ impl Database {
                     .filter(|(prior, _)| prior == lsn)
                     .count() as u32;
                 let key = (*lsn, ordinal);
-                if arrivals.contains_key(&key)
-                    || already_superseded.contains_key(&key)
+                if self.with_received_ddl_arrival(key, |value| Ok(value.is_some()))?
+                    || self.with_superseded_ddl_occurrence(key, |value| Ok(value.is_some()))?
                     || candidates.iter().any(|(candidate, _)| *candidate == key)
                 {
                     continue;
@@ -27138,8 +27191,9 @@ impl Database {
                 .enumerate()
             {
                 let occurrence = (key.0, ordinal as u32);
-                if arrivals.contains_key(&occurrence)
-                    || already_superseded.contains_key(&occurrence)
+                if self.with_received_ddl_arrival(occurrence, |value| Ok(value.is_some()))?
+                    || self
+                        .with_superseded_ddl_occurrence(occurrence, |value| Ok(value.is_some()))?
                 {
                     continue;
                 }
@@ -30129,12 +30183,14 @@ impl Database {
         self.in_memory_ddl_generations
             .lock()
             .extend(stage.mirrors.ddl_generations);
-        self.received_ddl_arrivals
-            .write()
-            .extend(stage.mirrors.received_ddl_arrivals);
-        self.superseded_ddl_occurrences
-            .write()
-            .extend(stage.mirrors.superseded_ddl_occurrences);
+        if self.persistence.is_none() {
+            self.received_ddl_arrivals
+                .write()
+                .extend(stage.mirrors.received_ddl_arrivals);
+            self.superseded_ddl_occurrences
+                .write()
+                .extend(stage.mirrors.superseded_ddl_occurrences);
+        }
         {
             let mut sources = self.sync_tombstone_arrivals.write();
             sources.retain(|(table, _), _| !stage.affected_tables.contains(table));
@@ -43272,19 +43328,36 @@ impl Database {
             )
             .collect::<HashSet<_>>();
         let mut graph_arrival_memory_mirror = self.sync_graph_arrivals.read().clone();
-        let removed_graph_arrivals = graph_arrival_memory_mirror
-            .iter()
-            .filter(|((source, target, edge_type), marker)| {
-                selected_graph_occurrences.contains(&(
-                    *source,
-                    *target,
-                    edge_type.clone(),
-                    marker.local_lsn,
-                    marker.deleted,
-                ))
-            })
-            .map(|(identity, marker)| (identity.clone(), marker.clone()))
-            .collect::<Vec<_>>();
+        let removed_graph_arrivals = if self.persistence.is_some() {
+            let mut removed = Vec::new();
+            for (source, target, edge_type, lsn, deleted) in &selected_graph_occurrences {
+                let identity = (*source, *target, edge_type.clone());
+                self.with_graph_arrival(&identity, |marker| {
+                    if let Some(marker) = marker
+                        && marker.local_lsn == *lsn
+                        && marker.deleted == *deleted
+                    {
+                        removed.push((identity.clone(), marker.clone()));
+                    }
+                    Ok(())
+                })?;
+            }
+            removed
+        } else {
+            graph_arrival_memory_mirror
+                .iter()
+                .filter(|((source, target, edge_type), marker)| {
+                    selected_graph_occurrences.contains(&(
+                        *source,
+                        *target,
+                        edge_type.clone(),
+                        marker.local_lsn,
+                        marker.deleted,
+                    ))
+                })
+                .map(|(identity, marker)| (identity.clone(), marker.clone()))
+                .collect::<Vec<_>>()
+        };
         let graph_arrival_config_keys = removed_graph_arrivals
             .iter()
             .map(|(_, marker)| Self::graph_arrival_config_key(marker))
@@ -50941,7 +51014,12 @@ impl Database {
                     persistence.writer_snapshot_charge_for_test()
                 })
                 .saturating_sub(receipt.published_root_charge);
-            receipt.named_owner_total = receipt.commit_source_reference_charge
+            receipt.storage_maintenance_control_charge =
+                self.persistence.as_ref().map_or(0, |persistence| {
+                    persistence.storage_compaction_control_charge()
+                });
+            receipt.named_owner_total = receipt.storage_maintenance_control_charge
+                + receipt.commit_source_reference_charge
                 + receipt.published_root_charge
                 + receipt.captured_root_charge
                 + receipt.staged_index_postings
@@ -54106,7 +54184,7 @@ impl Database {
                 return Ok((changes, source));
             }
         }
-        if !changes.ddl.is_empty() && !self.received_ddl_arrivals.read().is_empty() {
+        if !changes.ddl.is_empty() && self.has_received_ddl_arrivals()? {
             let (ddl, ddl_lsn) = self.received_schema_as_authored(Lsn(0), &changes.ddl)?;
             changes.ddl = ddl;
             changes.ddl_lsn = ddl_lsn;
@@ -54272,7 +54350,7 @@ impl Database {
         let restates_received_schema = !complete_history
             && snapshot_schema_lsn > since_lsn
             && !snapshot_ddl.is_empty()
-            && !self.received_ddl_arrivals.read().is_empty();
+            && self.has_received_ddl_arrivals()?;
         let ddl_lsn = if complete_history {
             let (lsns, changes): (Vec<_>, Vec<_>) = history
                 .into_iter()
@@ -54335,13 +54413,7 @@ impl Database {
                 (key, ddl)
             })
             .collect::<HashMap<_, _>>();
-        let mut arrivals = self
-            .received_ddl_arrivals
-            .read()
-            .iter()
-            .map(|(key, arrival)| (*key, arrival.author.is_some()))
-            .collect::<Vec<_>>();
-        arrivals.sort_by_key(|(key, _)| *key);
+        let mut first_arrival = None;
         let received_subject = |key: &(Lsn, u32)| -> Result<String> {
             if let Some(ddl) = occurrences.get(key) {
                 return Ok(Self::declaration_subject(ddl));
@@ -54351,27 +54423,29 @@ impl Database {
                 .and_then(|sidecar| sidecar.table)
                 .unwrap_or_else(|| format!("received at local LSN {}", key.0.0)))
         };
-        for (key, has_author) in &arrivals {
+        self.visit_received_ddl_arrivals(|key, arrival| {
+            first_arrival = Some(first_arrival.map_or(key, |first: (Lsn, u32)| first.min(key)));
             if key.0 <= since_lsn {
-                continue;
+                return Ok(());
             }
-            if !occurrences.contains_key(key) {
+            if !occurrences.contains_key(&key) {
                 return Err(Error::ReceivedSchemaAuthorshipUnavailable {
-                    table: received_subject(key)?,
+                    table: received_subject(&key)?,
                     reason: "this node's durable schema history no longer holds the declaration \
                              it received"
                         .to_string(),
                 });
             }
-            if !has_author {
+            if arrival.author.is_none() {
                 return Err(Error::ReceivedSchemaAuthorshipUnavailable {
-                    table: received_subject(key)?,
+                    table: received_subject(&key)?,
                     reason: "this node no longer holds the author's signed identity for the \
                              declaration it received"
                         .to_string(),
                 });
             }
-        }
+            Ok(())
+        })?;
         let history_ddl = history
             .iter()
             .map(|(_, ddl)| ddl.clone())
@@ -54383,8 +54457,8 @@ impl Database {
             || historical.event_bus != snapshot.event_bus
             || historical.trigger != snapshot.trigger
         {
-            let table = match arrivals.first() {
-                Some((key, _)) => received_subject(key)?,
+            let table = match first_arrival {
+                Some(key) => received_subject(&key)?,
                 None => "unknown".to_string(),
             };
             return Err(Error::ReceivedSchemaAuthorshipUnavailable {
@@ -58420,41 +58494,42 @@ impl Database {
         source: &DdlProvenanceSource,
     ) -> Result<ReceivedDdlArrivalValidation> {
         if source.kind == DdlProvenanceKind::SyntheticSnapshot {
-            if self.received_ddl_arrivals.read().is_empty() {
+            if !self.has_received_ddl_arrivals()? {
                 return Ok(ReceivedDdlArrivalValidation::Marked(HashSet::new()));
             }
             return Err(Error::SyncError(
                 "synthetic snapshot cannot carry received DDL authorship".to_string(),
             ));
         }
-        let arrivals = self.received_ddl_arrivals.read().clone();
         let mut groups = HashMap::<Lsn, (bool, bool)>::new();
         let mut marked = HashSet::new();
         for entry in source.entries.iter() {
             let key = (entry.source_lsn, entry.ordinal);
-            let is_marked = if let Some(arrival) = arrivals.get(&key) {
-                let raw_ddl = self.raw_ddl_log_occurrence(entry.source_lsn, entry.ordinal)?;
-                let sidecar = self.ddl_provenance_sidecar_for_source_entry(source, entry)?;
-                let expected = Self::canonical_local_ddl_arrival_digest(
-                    &raw_ddl,
-                    entry.source_lsn,
-                    entry.ordinal,
-                    &sidecar,
-                )?;
-                if arrival.local_lsn != entry.source_lsn
-                    || arrival.persisted_ordinal != entry.ordinal
-                    || arrival.digest != expected
-                {
-                    return Err(Error::SyncError(
-                        "received DDL arrival digest does not bind its local schema occurrence"
-                            .to_string(),
-                    ));
-                }
-                marked.insert(key);
-                true
-            } else {
-                false
-            };
+            let is_marked = self.with_received_ddl_arrival(key, |arrival| {
+                Ok(if let Some(arrival) = arrival {
+                    let raw_ddl = self.raw_ddl_log_occurrence(entry.source_lsn, entry.ordinal)?;
+                    let sidecar = self.ddl_provenance_sidecar_for_source_entry(source, entry)?;
+                    let expected = Self::canonical_local_ddl_arrival_digest(
+                        &raw_ddl,
+                        entry.source_lsn,
+                        entry.ordinal,
+                        &sidecar,
+                    )?;
+                    if arrival.local_lsn != entry.source_lsn
+                        || arrival.persisted_ordinal != entry.ordinal
+                        || arrival.digest != expected
+                    {
+                        return Err(Error::SyncError(
+                            "received DDL arrival digest does not bind its local schema occurrence"
+                                .to_string(),
+                        ));
+                    }
+                    marked.insert(key);
+                    true
+                } else {
+                    false
+                })
+            })?;
             let group = groups.entry(entry.source_lsn).or_insert((false, true));
             group.0 |= is_marked;
             group.1 &= is_marked;
@@ -58486,37 +58561,35 @@ impl Database {
         if source.kind == DdlProvenanceKind::SyntheticSnapshot {
             return Ok(HashSet::new());
         }
-        let superseded = self.superseded_ddl_occurrences.read().clone();
-        if superseded.is_empty() {
-            return Ok(HashSet::new());
-        }
         let mut groups = HashMap::<Lsn, (bool, bool)>::new();
         let mut marked = HashSet::new();
         for entry in source.entries.iter() {
             let key = (entry.source_lsn, entry.ordinal);
-            let is_superseded = if let Some(occurrence) = superseded.get(&key) {
-                let raw_ddl = self.raw_ddl_log_occurrence(entry.source_lsn, entry.ordinal)?;
-                let sidecar = self.ddl_provenance_sidecar_for_source_entry(source, entry)?;
-                let expected = Self::canonical_local_ddl_arrival_digest(
-                    &raw_ddl,
-                    entry.source_lsn,
-                    entry.ordinal,
-                    &sidecar,
-                )?;
-                if occurrence.local_lsn != entry.source_lsn
-                    || occurrence.persisted_ordinal != entry.ordinal
-                    || occurrence.digest != expected
-                {
-                    return Err(Error::SyncError(
-                        "superseded DDL evidence does not bind its local schema occurrence"
-                            .to_string(),
-                    ));
-                }
-                marked.insert(key);
-                true
-            } else {
-                false
-            };
+            let is_superseded = self.with_superseded_ddl_occurrence(key, |occurrence| {
+                Ok(if let Some(occurrence) = occurrence {
+                    let raw_ddl = self.raw_ddl_log_occurrence(entry.source_lsn, entry.ordinal)?;
+                    let sidecar = self.ddl_provenance_sidecar_for_source_entry(source, entry)?;
+                    let expected = Self::canonical_local_ddl_arrival_digest(
+                        &raw_ddl,
+                        entry.source_lsn,
+                        entry.ordinal,
+                        &sidecar,
+                    )?;
+                    if occurrence.local_lsn != entry.source_lsn
+                        || occurrence.persisted_ordinal != entry.ordinal
+                        || occurrence.digest != expected
+                    {
+                        return Err(Error::SyncError(
+                            "superseded DDL evidence does not bind its local schema occurrence"
+                                .to_string(),
+                        ));
+                    }
+                    marked.insert(key);
+                    true
+                } else {
+                    false
+                })
+            })?;
             let group = groups.entry(entry.source_lsn).or_insert((false, true));
             group.0 |= is_superseded;
             group.1 &= is_superseded;
@@ -58641,7 +58714,7 @@ impl Database {
         // a snapshot is signable only as this node's own declarations, and
         // only while this node holds no received schema: signing one then
         // would re-author someone else's migration under this node's name.
-        if source.is_synthetic_snapshot() && !self.received_ddl_arrivals.read().is_empty() {
+        if source.is_synthetic_snapshot() && self.has_received_ddl_arrivals()? {
             return Err(Error::ReceivedSchemaAuthorshipUnavailable {
                 table: changes
                     .ddl
@@ -58656,15 +58729,14 @@ impl Database {
         let authors = if source.is_synthetic_snapshot() {
             vec![None; source_entries.len()]
         } else {
-            let arrivals = self.received_ddl_arrivals.read();
             source_entries
                 .iter()
                 .map(|entry| {
-                    arrivals
-                        .get(&(entry.source_lsn, entry.ordinal))
-                        .map(|arrival| arrival.author.clone())
+                    self.with_received_ddl_arrival((entry.source_lsn, entry.ordinal), |arrival| {
+                        Ok(arrival.map(|arrival| arrival.author.clone()))
+                    })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>>>()?
         };
         let mut provenance = Vec::with_capacity(changes.ddl.len());
         for (((ddl, lsn), entry), author) in changes
@@ -60520,15 +60592,15 @@ impl Database {
 
     // Use authenticated arrival provenance to distinguish this
     // node's own declaration from policy it merely adopted and relays.
-    fn locally_declared_custody_policy(&self, table: &str) -> bool {
-        let arrivals = self.received_ddl_arrivals.read();
+    fn locally_declared_custody_policy(&self, table: &str) -> Result<bool> {
         let mut ordinals = HashMap::<Lsn, u32>::new();
-        self.ddl_log.read().iter().any(|(lsn, change)| {
+        for (lsn, change) in self.ddl_log.read().iter() {
             let ordinal = ordinals.entry(*lsn).or_default();
-            let received = arrivals.contains_key(&(*lsn, *ordinal));
+            let received =
+                self.with_received_ddl_arrival((*lsn, *ordinal), |arrival| Ok(arrival.is_some()))?;
             *ordinal += 1;
             if received {
-                return false;
+                continue;
             }
             let (
                 name,
@@ -60561,10 +60633,10 @@ impl Database {
                     composite_foreign_keys,
                     composite_unique,
                 ),
-                _ => return false,
+                _ => continue,
             };
             if name != table {
-                return false;
+                continue;
             }
             let m = rough_sync_table_meta(
                 columns,
@@ -60573,14 +60645,18 @@ impl Database {
                 composite_foreign_keys,
                 composite_unique,
             );
-            m.sync_direction.is_some()
+            if m.sync_direction.is_some()
                 || m.conflict_policy.is_some()
                 || m.immutable
                 || m.default_ttl_seconds.is_some()
                 || m.history_policy.is_some()
                 || m.delivery_manifest_tables.is_some()
                 || m.edge_discard.is_some()
-        })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether this node's declared or bound policy refuses one arriving
@@ -60632,7 +60708,7 @@ impl Database {
         let installer_owned = crate::executor::ENGINE_OWNED_LEDGER_TABLES.contains(&name.as_str())
             || crate::executor::is_hub_refereed_sync_conflict_table(name);
         if !installer_owned
-            && self.locally_declared_custody_policy(name)
+            && self.locally_declared_custody_policy(name)?
             && let Some(local) = self.table_meta(name)
         {
             let local_policy = crate::custody::policy::from_meta(&local);
@@ -62337,6 +62413,14 @@ impl Database {
         edges: &BTreeSet<String>,
     ) -> Result<ScopedPolicyHolds> {
         let memory = Self::policy_hold_memory(Arc::clone(&self.accountant));
+        if let Some(persistence) = &self.persistence
+            && !persistence.config_prefix_exists(Self::POLICY_HOLD_PREFIX)?
+        {
+            return Ok(ScopedPolicyHolds {
+                entries: Vec::new(),
+                memory,
+            });
+        }
         let mut entries = if let Some(persistence) = &self.persistence {
             let mut scopes = BTreeSet::new();
             let tenants = [None, identity.map(|(tenant, _)| tenant)];
@@ -69206,7 +69290,12 @@ fn prune_expired_rows(
 
     // The caller owns the commit lock until publication. Keep a borrowed
     // frontier for FK probes and complete-lifetime checks, never a payload copy.
-    let frontier = MaintenanceFrontier::capture(relational_store, tx_mgr)?;
+    let frontier = MaintenanceFrontier::capture(relational_store, tx_mgr)?.retention_batch(
+        &metas,
+        "prune",
+        &mut workspace,
+    )?;
+    let retention_progress = frontier.retention_progress().to_vec();
     let durable_source = frontier.is_durable();
     // A stamp further ahead than the tolerance can never age out on this
     // holder's clock, so it would pin its row silently. Count it per table,
@@ -69222,8 +69311,11 @@ fn prune_expired_rows(
         if meta.default_ttl_seconds.is_none() {
             continue;
         }
+        if frontier.no_future_stamps(table_name, skew_horizon)? {
+            continue;
+        }
         let mut table_has_future_dated = false;
-        frontier.visit(table_name, |row| {
+        frontier.visit_all(table_name, |row| {
             #[cfg(feature = "test-seams")]
             resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
             if row.deleted_tx.is_none()
@@ -69341,7 +69433,7 @@ fn prune_expired_rows(
     // and had to leave adjacency behind because a registered reader could
     // still see it. A pass that prunes no row at all still has to revisit
     // that carry-over -- the reader it was waiting on may be gone.
-    if pruned_version_count == 0 && carried_edge_nodes.is_empty() {
+    if pruned_version_count == 0 && carried_edge_nodes.is_empty() && retention_progress.is_empty() {
         return Ok(PruningReport {
             pruned_rows: 0,
             blocked_count: blocked.len() as u64,
@@ -69599,8 +69691,12 @@ fn prune_expired_rows(
         })
         .collect();
     let (_pruned_change_log_entries, removed_lsn_counts) = {
-        let table_index = change_log_table_index.read();
-        count_pruned_change_log_entries(&table_index, &pruned_change_keys)
+        if let Some(root) = writer_read::durable_root(tx_mgr.capture_published_read().handle)? {
+            RedbPersistence::pruned_change_counts_at_root(&root, &pruned_change_keys)?
+        } else {
+            let table_index = change_log_table_index.read();
+            count_pruned_change_log_entries(&table_index, &pruned_change_keys)
+        }
     };
 
     let membership_deletes = orphaned_source_lsn_rows
@@ -69664,6 +69760,7 @@ fn prune_expired_rows(
             Some((&removed_vectors, &removed_edges, &deferred_edge_nodes)),
             &commit_index_candidates,
             &generation_cleanup,
+            &retention_progress,
         );
         if let Err(error) = persisted {
             watch.completed();
@@ -69921,6 +70018,14 @@ fn scoped_commit_index_candidates(
 ) -> Result<Vec<Lsn>> {
     if affected_lsns.is_empty() {
         return Ok(Vec::new());
+    }
+    if let Some(root) = writer_read::durable_root(tx_mgr.capture_published_read().handle)? {
+        return RedbPersistence::commit_candidates_at_root(
+            &root,
+            tx_mgr,
+            removed_lsn_counts,
+            affected_lsns,
+        );
     }
     let still_covered = |lsn: Lsn| -> bool {
         lsn_refcounts.get(&lsn).copied().unwrap_or(0)
@@ -70533,8 +70638,12 @@ fn compact_currency_versions_inner(
         })
         .collect();
     let (pruned_change_log_entries, removed_lsn_counts) = {
-        let table_index = change_log_table_index.read();
-        count_pruned_change_log_entries(&table_index, &pruned_change_keys)
+        if let Some(root) = writer_read::durable_root(tx_mgr.capture_published_read().handle)? {
+            RedbPersistence::pruned_change_counts_at_root(&root, &pruned_change_keys)?
+        } else {
+            let table_index = change_log_table_index.read();
+            count_pruned_change_log_entries(&table_index, &pruned_change_keys)
+        }
     };
 
     // Select commit-index removals from the pre-pass counts before deleting any
@@ -71055,9 +71164,15 @@ fn child_rows_contain_live_reference(
         return Ok(false);
     }
     let mut found = false;
-    frontier.visit(child_table, |row| {
+    let values = parent_columns
+        .iter()
+        .map(|column| parent.values.get(column).expect("non-null parent key"))
+        .collect::<Vec<_>>();
+    frontier.visit_references(child_table, child_columns, &values, |row| {
         #[cfg(feature = "test-seams")]
-        resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+        if !frontier.is_durable() {
+            resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+        }
         found = row.deleted_tx.is_none()
             && child_columns
                 .iter()
