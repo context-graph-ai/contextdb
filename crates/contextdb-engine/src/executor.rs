@@ -2575,31 +2575,10 @@ pub(crate) struct BoundedCursorExecutionState {
     pub(crate) publication: ReadPublicationScope,
     erased: std::sync::atomic::AtomicBool,
     active_cancellation: std::sync::Mutex<OwnerReadCancellation>,
-    cancellation_listener:
-        std::sync::Mutex<Option<contextdb_core::read_contract::CancellationListener>>,
     expiry_watch: std::sync::Mutex<Option<Arc<bounded::CursorExpiryWatch>>>,
 }
 
 impl BoundedCursorExecutionState {
-    fn watch_cancellation(self: &Arc<Self>, cancellation: &OwnerReadCancellation) {
-        let weak = Arc::downgrade(self);
-        let listener = cancellation.tell_on_cancel(move || {
-            if let Some(execution) = weak.upgrade() {
-                // Cancellation can originate inside an active source callback.
-                // The active fetch releases itself; a parked read releases here.
-                if let Ok(mut lifecycle) = execution.lifecycle.try_lock() {
-                    *lifecycle =
-                        BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
-                }
-                execution.wake_expiry();
-            }
-        });
-        *self
-            .cancellation_listener
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(listener);
-    }
-
     fn wake_expiry(&self) {
         let watch = self
             .expiry_watch
@@ -2620,10 +2599,6 @@ impl BoundedCursorExecutionState {
         if let Some(watch) = watch {
             watch.retire();
         }
-        self.cancellation_listener
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
     }
 
     pub(crate) fn release_for_erasure(&self) {

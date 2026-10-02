@@ -13516,11 +13516,9 @@ pub(super) fn open_cursor(
         lifecycle: Mutex::new(lifecycle),
         publication: publication.clone(),
         erased: std::sync::atomic::AtomicBool::new(false),
-        active_cancellation: Mutex::new(publication.budget.cancellation.clone()),
-        cancellation_listener: Mutex::new(None),
+        active_cancellation: Mutex::new(OwnerReadCancellation::new()),
         expiry_watch: Mutex::new(None),
     });
-    execution.watch_cancellation(&publication.budget.cancellation);
     db.register_writer_cursor(&execution)?;
     start_cursor_expiry_watch(&execution, db.bounded_read_accountant())?;
     Ok(BoundedCursorOpen {
@@ -13806,10 +13804,16 @@ pub(super) fn fetch_cursor(
         .active_cancellation
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = cancellation.clone();
-    cursor._state.watch_cancellation(&cancellation);
     struct DriveAfterFetch(Arc<BoundedCursorExecutionState>);
     impl Drop for DriveAfterFetch {
         fn drop(&mut self) {
+            // The token belongs to this request. A later cancellation must
+            // not affect the continuation parked between fetches.
+            *self
+                .0
+                .active_cancellation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = OwnerReadCancellation::new();
             self.0.wake_expiry();
         }
     }
@@ -13853,8 +13857,12 @@ pub(super) fn fetch_cursor(
         #[cfg(feature = "test-seams")]
         probe,
     ) {
-        state.finish_plugin_error(&error);
-        *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
+        if matches!(error, BoundedExecutionError::Cancelled) {
+            *lifecycle = BoundedCursorLifecycle::Open(state);
+        } else {
+            state.finish_plugin_error(&error);
+            *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
+        }
         return Err(error);
     }
     let rows = match rows {
@@ -13895,9 +13903,9 @@ pub(super) fn fetch_cursor(
             Ok(fetch)
         }
         Err(BoundedExecutionError::Cancelled) => {
-            state.finish_plugin_error(&BoundedExecutionError::Cancelled);
-            *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
-            cursor._state.wake_expiry();
+            // fetch_page restored every unpublished row to the replay. The
+            // same accounted continuation and captured root remain usable.
+            *lifecycle = BoundedCursorLifecycle::Open(state);
             Err(BoundedExecutionError::Cancelled)
         }
         Err(error) => {
