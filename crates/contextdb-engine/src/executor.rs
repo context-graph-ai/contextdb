@@ -7323,7 +7323,7 @@ fn exec_update(
                 };
                 let committed_row_exists = row.created_tx != txid
                     || db
-                        .committed_row_at(&p.table, row.row_id, db.snapshot())?
+                        .committed_row_at(&p.table, row.row_id, snapshot)?
                         .is_some();
                 let (new_row_id, before_counts, after_counts) = match db
                     .replace_row_after_update_validation_counted(

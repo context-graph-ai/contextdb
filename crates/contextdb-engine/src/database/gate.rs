@@ -1988,9 +1988,33 @@ impl Database {
         if !self.table_has_read_gate(table)? {
             return Ok(None);
         }
+        self.assert_table_read_allowed(table)?;
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let mut bitmap = RoaringTreemap::new();
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        if self.visit_writer_rows_phased::<Error>(table, |row| {
+            if let Some(row) = row
+                && row.visible_at(snapshot)
+                && self.read_allowed_for_row(table, &meta, row, snapshot)?
+            {
+                output.try_grow_for(
+                    64,
+                    "writer_source",
+                    "read_gate_candidates",
+                    "Raise MEMORY_LIMIT to retain these read candidates.",
+                )?;
+                bitmap.insert(row.row_id.0);
+            }
+            Ok(())
+        })? {
+            self.retain_writer_output(output);
+            return Ok(Some(bitmap));
+        }
         let rows = self.relational.scan(table, snapshot)?;
         let rows = self.filter_rows_for_read(table, rows, snapshot)?;
-        let mut bitmap = RoaringTreemap::new();
         for row in rows {
             bitmap.insert(row.row_id.0);
         }

@@ -38466,7 +38466,7 @@ impl Database {
         }
 
         let committed_row_exists = self
-            .committed_row_at(table, row_id, self.snapshot())?
+            .committed_row_at(table, row_id, self.snapshot_for_read())?
             .is_some();
         if committed_row_exists
             && !ws

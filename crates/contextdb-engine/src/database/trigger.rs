@@ -1758,15 +1758,17 @@ impl Database {
         if deleted_ids_by_table.is_empty() {
             return Ok(HashMap::new());
         }
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_for_read();
         let mut deleted_rows = HashMap::new();
         for (table, row_ids) in deleted_ids_by_table {
-            let rows = self
-                .relational
-                .scan(&table, snapshot)?
-                .into_iter()
-                .filter(|row| row_ids.contains(&row.row_id))
-                .collect::<Vec<_>>();
+            let mut row_ids = row_ids.into_iter().collect::<Vec<_>>();
+            row_ids.sort_unstable();
+            let mut rows = Vec::new();
+            for row_id in row_ids {
+                if let Some(row) = self.committed_row_at(&table, row_id, snapshot)? {
+                    rows.push(row);
+                }
+            }
             if !rows.is_empty() {
                 deleted_rows.insert(table, rows);
             }

@@ -574,8 +574,16 @@ impl Database {
                 return Ok(None);
             }
             let row = if posting.value().entry.visible_at(snapshot) {
-                visible_row(source, table, posting.value().entry.row_id, snapshot)
-                    .map_err(E::from)?
+                Some(
+                    visible_row(source, table, posting.value().entry.row_id, snapshot)
+                        .map_err(E::from)?
+                        .ok_or_else(|| {
+                            E::from(Error::StoreCorrupted {
+                                path: table.to_owned(),
+                                reason: "visible posting has no saved row version".into(),
+                            })
+                        })?,
+                )
             } else {
                 None
             };
@@ -662,8 +670,16 @@ impl Database {
                 continue;
             };
             let row = if posting.value().entry.visible_at(snapshot) {
-                visible_row(source, table, posting.value().entry.row_id, snapshot)
-                    .map_err(E::from)?
+                Some(
+                    visible_row(source, table, posting.value().entry.row_id, snapshot)
+                        .map_err(E::from)?
+                        .ok_or_else(|| {
+                            E::from(Error::StoreCorrupted {
+                                path: table.to_owned(),
+                                reason: "visible posting has no saved row version".into(),
+                            })
+                        })?,
+                )
             } else {
                 None
             };

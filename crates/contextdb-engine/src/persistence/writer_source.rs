@@ -896,9 +896,10 @@ impl WriterReadCursor {
         self.next_before(before, |key, value| {
             let row = RedbPersistence::decode_versioned_row(value, None)?;
             if RedbPersistence::rel_row_key(&row) != key {
-                return Err(Error::Other(
-                    "row cursor encountered a mismatched version key".into(),
-                ));
+                return Err(Error::StoreCorrupted {
+                    path: "relational row".into(),
+                    reason: "row cursor encountered a mismatched version key".into(),
+                });
             }
             Ok(row)
         })

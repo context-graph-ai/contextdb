@@ -220,6 +220,7 @@ impl RedbPersistence {
                 &[],
                 &mut self.proof_admission(),
             )?;
+            Self::write_writer_recovery_bounds_in_write(&write, None)?;
             write.commit().map_err(Self::storage_error)
         })
     }
