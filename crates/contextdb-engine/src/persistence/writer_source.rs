@@ -174,7 +174,7 @@ impl RedbPersistence {
                 )?;
                 let body_memory = OwnedMemoryReservation::try_new_for(
                     accountant.clone(),
-                    meta.estimated_bytes().saturating_add(64),
+                    meta.metadata_bytes().saturating_add(64),
                     "writer_source",
                     "captured_schema",
                     HINT,
@@ -243,7 +243,7 @@ impl RedbPersistence {
         for (name, meta) in installed {
             let body_memory = OwnedMemoryReservation::try_new_for(
                 accountant.clone(),
-                meta.estimated_bytes().saturating_add(64),
+                meta.metadata_bytes().saturating_add(64),
                 "writer_source",
                 "captured_schema",
                 HINT,

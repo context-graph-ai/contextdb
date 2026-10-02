@@ -13638,15 +13638,13 @@ pub struct PruningReport {
     pub pruned_rows: u64,
     pub blocked_count: u64,
     pub blocked: Vec<String>,
-    /// An ESTIMATE of the live bytes the pruned row versions — and the vectors
-    /// and edges that went with them — accounted for, on the same estimator
-    /// [`TableSizeEstimate`] uses. It tracks the SIZE of what left, so two
-    /// populations with the same row count and different payloads report
-    /// materially different reclaim, but it is an accounting figure and NOT
-    /// the number of bytes handed back to the filesystem: the estimator
-    /// deliberately over-counts large values, and freed pages are reused in
-    /// place unless a compaction runs. `file_bytes_before` / `file_bytes_after`
-    /// carry the physical truth.
+    /// An estimate of retained memory released by this cycle. A file-backed
+    /// writer counts retired row and log ownership; durable payloads that were
+    /// never resident do not contribute memory reclamation. Vector and edge
+    /// reclamation follow their retained owners. This is an accounting figure,
+    /// not the number of bytes returned to the filesystem: freed pages are
+    /// reused unless compaction runs. `file_bytes_before` / `file_bytes_after`
+    /// carry the physical sizes.
     pub reclaimed_bytes: u64,
     /// The database file's size before and after this cycle; `None` for an
     /// in-memory database, which has no file.
@@ -69333,6 +69331,7 @@ fn prune_expired_rows(
     // The caller owns the commit lock until publication. Keep a borrowed
     // frontier for FK probes and complete-lifetime checks, never a payload copy.
     let frontier = MaintenanceFrontier::capture(relational_store, tx_mgr)?;
+    let durable_source = frontier.is_durable();
     // A stamp further ahead than the tolerance can never age out on this
     // holder's clock, so it would pin its row silently. Count it per table,
     // every cycle, whether or not anything prunes.
@@ -69814,14 +69813,16 @@ fn prune_expired_rows(
     // Only now, with every persisted step behind us, does memory follow —
     // scoped to a suffix of `change_log` (see
     // `remove_pruned_change_log_entries`), never the whole Vec.
-    if let Some(min_affected_lsn) = affected_lsns.iter().min().copied() {
+    let released_log_bytes = if let Some(min_affected_lsn) = affected_lsns.iter().min().copied() {
         remove_pruned_change_log_entries(
             accountant,
             &mut change_log.write(),
             &pruned_change_keys,
             min_affected_lsn,
-        );
-    }
+        )
+    } else {
+        0
+    };
     remove_pruned_from_table_index(&mut change_log_table_index.write(), &pruned_change_keys);
     apply_removed_lsn_counts(&mut change_log_lsn_refcounts.write(), &removed_lsn_counts);
     // The REAL count: `tx_mgr`'s own in-memory removal, not the persisted
@@ -69926,9 +69927,13 @@ fn prune_expired_rows(
         pruned_rows: pruned_version_count,
         blocked_count: blocked.len() as u64,
         blocked,
-        reclaimed_bytes: released_row_bytes
-            .saturating_add(released_vector_bytes)
-            .saturating_add(released_edge_bytes) as u64,
+        reclaimed_bytes: (if durable_source {
+            accounted_row_bytes.saturating_add(released_log_bytes)
+        } else {
+            released_row_bytes
+        })
+        .saturating_add(released_vector_bytes)
+        .saturating_add(released_edge_bytes) as u64,
         future_dated_rows,
         future_dated_tables,
         pruned_commit_index_entries,
@@ -70292,7 +70297,7 @@ fn remove_pruned_change_log_entries(
     change_log: &mut Vec<ChangeLogEntry>,
     pruned_by_table: &HashMap<String, HashSet<(RowId, Lsn)>>,
     min_affected_lsn: Lsn,
-) {
+) -> usize {
     // The log is charged per entry when it is appended, so a pass that
     // shortens it gives back exactly the entries it removed.
     let mut released = 0usize;
@@ -70312,6 +70317,7 @@ fn remove_pruned_change_log_entries(
     }
     change_log.truncate(write);
     accountant.release(released);
+    released
 }
 
 /// Drop the pruned `(lsn, row_id)` coordinates from the affected tables'
@@ -70409,6 +70415,7 @@ fn compact_currency_versions_inner(
     snapshot_registry.removal_pass_test_pause.maybe_pause();
     let metas = relational_store.table_meta.read().clone();
     let frontier = MaintenanceFrontier::capture(relational_store, tx_mgr)?;
+    let durable_source = frontier.is_durable();
     let tables_in_snapshot = tables
         .iter()
         .filter(|table| metas.contains_key(**table))
@@ -70695,14 +70702,16 @@ fn compact_currency_versions_inner(
     // Publish memory only after the complete durable removal succeeds, under
     // the existing commit and snapshot-removal gates. The physical change-log
     // removal visits its affected suffix, not unrelated earlier entries.
-    if let Some(min_affected_lsn) = affected_lsns.iter().min().copied() {
+    let released_log_bytes = if let Some(min_affected_lsn) = affected_lsns.iter().min().copied() {
         remove_pruned_change_log_entries(
             accountant,
             &mut change_log.write(),
             &pruned_change_keys,
             min_affected_lsn,
-        );
-    }
+        )
+    } else {
+        0
+    };
     remove_pruned_from_table_index(&mut change_log_table_index.write(), &pruned_change_keys);
     apply_removed_lsn_counts(&mut change_log_lsn_refcounts.write(), &removed_lsn_counts);
     // The REAL count: `tx_mgr`'s own in-memory removal, not the persisted
@@ -70762,7 +70771,12 @@ fn compact_currency_versions_inner(
     let report = CurrencyCompactionReport {
         pruned_versions: pruned_version_count,
         pruned_change_log_entries,
-        reclaimed_bytes: released_row_bytes.saturating_add(released_vector_bytes) as u64,
+        reclaimed_bytes: (if durable_source {
+            accounted_row_bytes.saturating_add(released_log_bytes)
+        } else {
+            released_row_bytes
+        })
+        .saturating_add(released_vector_bytes) as u64,
         compacted_tables,
         redb_compacted: false,
         // No wholesale survivor rewrite. Selected change-log LSN groups are
