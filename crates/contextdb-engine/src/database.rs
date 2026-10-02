@@ -275,6 +275,7 @@ mod policy_hold_scoped_load_tests;
 #[cfg(test)]
 mod received_schema_stage_tests {
     use super::*;
+    include!("database/durable_test_observations.rs");
 
     fn create_table() -> DdlChange {
         DdlChange::CreateTable {
@@ -5869,7 +5870,7 @@ mod received_schema_stage_tests {
         db.in_memory_table_generations
             .lock()
             .insert("events".to_string(), 1);
-        let row_id = db.relational_store.tables.read()["events"]
+        let row_id = durable_observation::rows(&db, "events")
             .iter()
             .rev()
             .find(|row| row.values.get("id") == Some(&Value::Int64(2)))
@@ -5909,9 +5910,7 @@ mod received_schema_stage_tests {
         )
         .unwrap();
 
-        let (stage_lsn, logged_key) = db
-            .change_log
-            .read()
+        let (stage_lsn, logged_key) = durable_observation::changes(&db)
             .iter()
             .rev()
             .find_map(|entry| match entry {
@@ -5934,18 +5933,18 @@ mod received_schema_stage_tests {
                 .iter()
                 .any(|row| row.deleted && row.natural_key == target_key)
         );
+        assert!(durable_observation::table_index(&db, "events").contains(&(stage_lsn, row_id)));
         assert!(
-            db.__change_log_table_index_for_test("events")
-                .contains(&(stage_lsn, row_id))
+            durable_observation::root(&db)
+                .change_log_occurrences(stage_lsn)
+                .unwrap()
+                >= 1
         );
-        assert!(db.change_log_lsn_refcounts.read()[&stage_lsn] >= 1);
         db.close().unwrap();
         drop(db);
 
         let reopened = Database::open(&path).unwrap();
-        let reopened_key = reopened
-            .change_log
-            .read()
+        let reopened_key = durable_observation::changes(&reopened)
             .iter()
             .find_map(|entry| match entry {
                 ChangeLogEntry::RowDelete {
@@ -5968,11 +5967,14 @@ mod received_schema_stage_tests {
                 .any(|row| row.deleted && row.natural_key == target_key)
         );
         assert!(
-            reopened
-                .__change_log_table_index_for_test("events")
-                .contains(&(stage_lsn, row_id))
+            durable_observation::table_index(&reopened, "events").contains(&(stage_lsn, row_id))
         );
-        assert!(reopened.change_log_lsn_refcounts.read()[&stage_lsn] >= 1);
+        assert!(
+            durable_observation::root(&reopened)
+                .change_log_occurrences(stage_lsn)
+                .unwrap()
+                >= 1
+        );
     }
 
     #[test]
@@ -6601,6 +6603,7 @@ mod received_schema_stage_tests {
 #[cfg(test)]
 mod persisted_state_snapshot_tests {
     use super::*;
+    include!("database/durable_test_observations.rs");
 
     fn create_and_insert(db: &Database) -> RowId {
         let params = HashMap::new();
@@ -6691,14 +6694,14 @@ mod persisted_state_snapshot_tests {
 
         assert_ne!(old_row_id, fresh_row_id);
         assert!(
-            db.relational_store
-                .live_row_by_id("events", old_row_id)
-                .is_none()
+            durable_observation::rows(&db, "events")
+                .iter()
+                .all(|row| row.row_id != old_row_id || !row.visible_at(db.snapshot_for_read()))
         );
         assert!(
-            db.relational_store
-                .live_row_by_id("events", fresh_row_id)
-                .is_some()
+            durable_observation::rows(&db, "events")
+                .iter()
+                .any(|row| row.row_id == fresh_row_id && row.visible_at(db.snapshot_for_read()))
         );
         for rows in [
             db.full_state_snapshot()
