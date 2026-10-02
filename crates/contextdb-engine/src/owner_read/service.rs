@@ -4070,12 +4070,6 @@ async fn await_authoritative_response_send<T>(
         .tell_on_cancel(move || waiting_thread.unpark());
     std::future::poll_fn(|context| {
         loop {
-            // The carrier may have completed before this connection thread
-            // was scheduled again. A completed response ends the operation;
-            // a later clock advance cannot expire the idle session it leaves.
-            if let Poll::Ready(result) = std::future::Future::poll(send.as_mut(), context) {
-                return Poll::Ready(result);
-            }
             if budget.cancellation.is_cancelled() {
                 return Poll::Ready(Err(crate::local_transport::owner_disconnected()));
             }
@@ -4086,6 +4080,9 @@ async fn await_authoritative_response_send<T>(
             }
             if !expiry_completed {
                 expiry_completed = std::future::Future::poll(expiry.as_mut(), context).is_ready();
+            }
+            if let Poll::Ready(result) = std::future::Future::poll(send.as_mut(), context) {
+                return Poll::Ready(result);
             }
             if !expiry_completed {
                 return Poll::Pending;

@@ -291,6 +291,107 @@ impl Database {
         Ok(Some(rows))
     }
 
+    pub(super) fn writer_rank_join(
+        &self,
+        policy: &RankPolicy,
+        join_value: &Value,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VersionedRow>> {
+        use contextdb_relational::source::{
+            RelationalIndexRange, RelationalReadSource, visible_row,
+        };
+        use std::ops::Bound;
+        let root = self
+            .writer_read_root()?
+            .ok_or_else(|| Error::Other("rank join requires its captured root".into()))?;
+        let meta = root
+            .borrow_captured_table_meta(&policy.joined_table)
+            .ok_or_else(|| Error::TableNotFound(policy.joined_table.clone()))?;
+        let index = meta
+            .indexes
+            .iter()
+            .find(|index| index.name == policy.protected_index)
+            .ok_or_else(|| Error::IndexNotFound {
+                table: policy.joined_table.clone(),
+                index: policy.protected_index.clone(),
+            })?;
+        let Some((column, direction)) = index.columns.first() else {
+            return Err(Error::Other(
+                "rank policy protected index has no columns".into(),
+            ));
+        };
+        if column != &policy.joined_column {
+            return Err(Error::Other(
+                "rank policy protected index no longer leads with its join column".into(),
+            ));
+        }
+        let key = vec![match direction {
+            SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(join_value.clone())),
+            SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(join_value.clone())),
+        }];
+        let source =
+            crate::persistence::writer_adapters::WriterRelationalSource::new(root.clone())?;
+        let current = snapshot == source.snapshot();
+        let mut cursor = if index.columns.len() == 1 {
+            source.exact_index_cursor(&policy.joined_table, &index.name, current, &key)?
+        } else {
+            let lower = source.index_position_key(current, &key, RowId(0), TxId(0))?;
+            source.index_cursor(
+                &policy.joined_table,
+                &index.name,
+                RelationalIndexRange {
+                    current,
+                    lower: Bound::Included(lower.as_bytes()),
+                    upper: Bound::Unbounded,
+                    reverse: false,
+                },
+            )?
+        };
+        let mut best = None;
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        while let Some(posting) = cursor.next_window()? {
+            if !posting.value().key.starts_with(&key) {
+                break;
+            }
+            if !posting.value().entry.visible_at(snapshot) {
+                continue;
+            }
+            let Some(row) = visible_row(
+                &source,
+                &policy.joined_table,
+                posting.value().entry.row_id,
+                snapshot,
+            )?
+            else {
+                continue;
+            };
+            let row = row.value();
+            if row
+                .values
+                .get(&policy.joined_column)
+                .is_none_or(|value| !values_equal_for_rank_join(value, join_value))
+                || !self.row_read_allowed_for_change(&policy.joined_table, row, snapshot)
+                || best
+                    .as_ref()
+                    .is_some_and(|best: &VersionedRow| best.row_id >= row.row_id)
+            {
+                continue;
+            }
+            let mut next = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
+                row.estimated_bytes(),
+                "query",
+                "rank_join_output",
+                "Raise MEMORY_LIMIT to return this rank join row.",
+            )?;
+            best = Some(row.clone());
+            std::mem::swap(&mut output, &mut next);
+        }
+        self.retain_writer_output(output);
+        Ok(best)
+    }
+
     /// Commit preparation needs the actual committed frontier, independently
     /// of an outer statement's retained transaction base.
     pub(super) fn committed_row_exists_at_current_frontier(
@@ -447,9 +548,42 @@ impl Database {
 
 impl Database {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn writer_ordered_next<E: From<Error>>(
+    pub(super) fn writer_physical_next<E: From<Error>>(
         &self,
         source: &dyn contextdb_relational::source::RelationalReadSource,
+        table: &str,
+        cursor: &mut contextdb_relational::mem::BoundedPhysicalCursor,
+        mut touch: impl FnMut() -> std::result::Result<(), E>,
+        mut clone: impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<VersionedRow>, E> {
+        use std::ops::Bound;
+        if cursor.is_exhausted() {
+            return Ok(None);
+        }
+        let lower = cursor
+            .source_position()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let mut physical = source
+            .row_cursor(table, lower, Bound::Unbounded, false)
+            .map_err(E::from)?;
+        let Some(window) = next_window_with_work(&mut *physical, &mut touch)? else {
+            cursor.source_exhaust();
+            return Ok(None);
+        };
+        clone(
+            window
+                .value()
+                .estimated_bytes()
+                .saturating_add(window.position_key().len()),
+        )?;
+        let row = window.value().clone();
+        cursor.source_advance(window.position_key().to_vec(), &row);
+        Ok(Some(row))
+    }
+
+    pub(super) fn writer_ordered_next<E: From<Error>>(
+        &self,
+        source: &crate::persistence::writer_adapters::WriterRelationalSource,
         table: &str,
         snapshot: SnapshotId,
         cursor: &mut contextdb_relational::mem::BoundedOrderedRowCursor,
@@ -457,7 +591,9 @@ impl Database {
         mut touch: impl FnMut() -> std::result::Result<(), E>,
         mut clone: impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<VersionedRow>, E> {
-        use contextdb_relational::source::{RelationalIndexRange, visible_row};
+        use contextdb_relational::source::{
+            RelationalIndexRange, RelationalReadSource, visible_row,
+        };
         use std::ops::Bound;
         if cursor.is_exhausted() {
             return Ok(None);
@@ -574,8 +710,15 @@ impl Database {
                 return Ok(None);
             }
             let row = if posting.value().entry.visible_at(snapshot) {
-                let selected = visible_row(source, table, posting.value().entry.row_id, snapshot)
-                    .map_err(E::from)?;
+                let selected = if current {
+                    let (_, key) = source
+                        .row_head(table, posting.value().entry.row_id)
+                        .map_err(E::from)?;
+                    source.exact_row(table, &key).map_err(E::from)?
+                } else {
+                    visible_row(source, table, posting.value().entry.row_id, snapshot)
+                        .map_err(E::from)?
+                };
                 if selected.is_none() && snapshot == source.snapshot() {
                     return Err(E::from(Error::StoreCorrupted {
                         path: table.to_owned(),

@@ -7757,9 +7757,14 @@ fn publish_storage_compaction_batch(
                 Ok(progress)
             }
             Err(error) => {
-                // Page admission fails before the relocation transaction commits.
+                // Page admission and reader-presence refusal happen before
+                // the relocation transaction commits.
                 // Other storage errors may have crossed its durable boundary.
-                if matches!(error, Error::MemoryBudgetExceeded { .. }) {
+                if matches!(
+                    error,
+                    Error::MemoryBudgetExceeded { .. }
+                        | Error::ReaderCoordinationUnavailable { .. }
+                ) {
                     watch.completed();
                 }
                 Err(error)
@@ -28149,6 +28154,59 @@ impl Database {
                 Ok(())
             };
         prepare_metadata(true, &mut metadata_copy_charges)?;
+        let copied_vector_index = |index: &contextdb_core::VectorIndexRef| {
+            renamed_vector_sources.contains(index)
+                || affected_tables.contains(&index.table)
+                    && projected_tables.get(&index.table).is_some_and(|meta| {
+                        meta.columns.iter().any(|column| {
+                            column.name == index.column
+                                && matches!(column.column_type, ColumnType::Vector(_))
+                        })
+                    })
+        };
+        // Price the affected table/row image with the selected vector copy
+        // before allocating their bodies. Otherwise refusing that final vector
+        // copy has already allocated the relational image. The ordinary object
+        // charges below own the copy; this reservation checks their combined
+        // widest point before those objects exist.
+        if copy_vectors {
+            let mut image_bytes = self
+                .vector_store
+                .partitioned_copy_bytes_matching(copied_vector_index);
+            let metadata = self.relational_store.table_meta.read();
+            for table in affected_tables {
+                let Some(meta) = metadata.get(table) else {
+                    continue;
+                };
+                image_bytes = image_bytes
+                    .saturating_add(meta.estimated_bytes())
+                    .saturating_add(self.relational_store.table_index_structure_bytes(table).0);
+                if self.relational_store.uses_disk_backed_committed_bodies() {
+                    self.persistence
+                        .as_ref()
+                        .expect("disk-backed relational bodies require persistence")
+                        .visit_relational_table_with_admission(table, &self.accountant, |row| {
+                            if row.deleted_tx.is_none() {
+                                image_bytes = image_bytes.saturating_add(
+                                    retained_row_bytes_with_optional_meta(table, &row, Some(meta)),
+                                );
+                            }
+                            Ok(())
+                        })?;
+                } else if let Some(rows) = self.relational_store.tables.read().get(table) {
+                    for row in rows.iter().filter(|row| row.deleted_tx.is_none()) {
+                        image_bytes = image_bytes.saturating_add(
+                            retained_row_bytes_with_optional_meta(table, row, Some(meta)),
+                        );
+                    }
+                }
+            }
+            drop(StagedCopyCharge::admit(
+                &self.accountant,
+                image_bytes,
+                "stage_received_unit_vector_image",
+            )?);
+        }
         {
             let metadata = self.relational_store.table_meta.read();
             for table in affected_tables {
@@ -28363,16 +28421,6 @@ impl Database {
         // cloned, so vectors of unrelated tables are never touched. A column
         // the unit renames is copied under its old name: the replayed rename
         // carries those vectors to the new one.
-        let copied_vector_index = |index: &contextdb_core::VectorIndexRef| {
-            renamed_vector_sources.contains(index)
-                || affected_tables.contains(&index.table)
-                    && projected_tables.get(&index.table).is_some_and(|meta| {
-                        meta.columns.iter().any(|column| {
-                            column.name == index.column
-                                && matches!(column.column_type, ColumnType::Vector(_))
-                        })
-                    })
-        };
         // The copy's widest point -- the owned clone and the destination built
         // from it, both alive while `replace_loaded_partitioned_vectors` runs --
         // is admitted before either exists, and this guard owns that charge
@@ -41716,6 +41764,15 @@ impl Database {
             return Ok(None);
         }
 
+        if self.writer_read_root()?.is_some() {
+            return match tx {
+                Some(tx) => {
+                    self.joined_row_for_rank_policy_in_tx(tx, policy, &join_value, snapshot)
+                }
+                None => self.writer_rank_join(policy, &join_value, snapshot),
+            };
+        }
+
         let indexes = self.relational_store.indexes.read();
         let storage = indexes
             .get(&policy.joined_table)
@@ -46341,13 +46398,7 @@ impl Database {
         if let Some(root) = self.writer_read_root().map_err(E::from)? {
             let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)
                 .map_err(E::from)?;
-            return self.relational.bounded_physical_row_next_from_source(
-                &source,
-                table,
-                cursor,
-                before_touch,
-                before_clone,
-            );
+            return self.writer_physical_next(&source, table, cursor, before_touch, before_clone);
         }
         self.relational
             .bounded_physical_row_next(table, cursor, before_touch, before_clone)
@@ -50503,6 +50554,12 @@ impl Database {
         // failure to report after releasing the owner resources; handoff must
         // still publish the final committed root and stop later writes.
         if !already_closed {
+            // Writes and new statements have stopped. Accepted readers own
+            // their captured roots; the publisher must no longer pin pages
+            // that the final cleanup is entitled to reclaim.
+            if self.resource_owner {
+                self.tx_mgr.release_publication_handle();
+            }
             // A prior attempt has already crossed the handoff boundary; a
             // retry may only finish draining accepted owner reads. Retain a
             // failed drain across that wait and any deadline refusal.

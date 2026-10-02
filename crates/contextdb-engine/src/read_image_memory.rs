@@ -16,6 +16,7 @@ pub(crate) struct ImageMemory {
     subsystem: &'static str,
     operation: &'static str,
     hint: &'static str,
+    reader_budget: Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>,
     held: AtomicUsize,
     failure: parking_lot::Mutex<Option<Error>>,
 }
@@ -29,6 +30,7 @@ impl ImageMemory {
             subsystem: "direct_read",
             operation: "hydrate_owned_image",
             hint: "Raise MEMORY_LIMIT to admit the complete committed read image.",
+            reader_budget: None,
             held: AtomicUsize::new(0),
             failure: parking_lot::Mutex::new(None),
         })
@@ -56,19 +58,44 @@ impl ImageMemory {
             subsystem,
             operation,
             hint,
+            reader_budget: None,
+            held: AtomicUsize::new(0),
+            failure: parking_lot::Mutex::new(None),
+        })
+    }
+    /// A durable source window belongs to the requesting read when present.
+    /// Internal writer operations continue to own their scratch directly.
+    pub(crate) fn charging_source(accountant: Arc<MemoryAccountant>) -> Arc<Self> {
+        let reader_budget = SOURCE_BUDGET.with(|slot| slot.borrow().clone());
+        Arc::new(Self {
+            accountant,
+            subsystem: "writer_source",
+            operation: "cursor_window",
+            hint: "Raise MEMORY_LIMIT to admit this writer cursor window.",
+            reader_budget,
             held: AtomicUsize::new(0),
             failure: parking_lot::Mutex::new(None),
         })
     }
     pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
-        self.accountant
-            .try_allocate_for(bytes, self.subsystem, self.operation, self.hint)?;
+        match &self.reader_budget {
+            Some(budget) => budget.try_reserve(bytes, self.subsystem, self.operation, self.hint)?,
+            None => self.accountant.try_allocate_for(
+                bytes,
+                self.subsystem,
+                self.operation,
+                self.hint,
+            )?,
+        }
         self.held.fetch_add(bytes, Ordering::SeqCst);
         Ok(())
     }
     pub(crate) fn release(&self, bytes: usize) {
         self.held.fetch_sub(bytes, Ordering::SeqCst);
-        self.accountant.release(bytes);
+        match &self.reader_budget {
+            Some(budget) => budget.release(bytes),
+            None => self.accountant.release(bytes),
+        }
     }
     pub(crate) fn held(&self) -> usize {
         self.held.load(Ordering::SeqCst)
@@ -92,7 +119,7 @@ impl ImageMemory {
 }
 impl Drop for ImageMemory {
     fn drop(&mut self) {
-        self.accountant.release(self.held.load(Ordering::SeqCst));
+        self.release(self.held.load(Ordering::SeqCst));
     }
 }
 /// The memory an answer holds against its reader's limit for as long as the
@@ -125,6 +152,24 @@ impl PartialEq for AnswerCharge {
     fn eq(&self, _: &Self) -> bool {
         true
     }
+}
+
+thread_local! {
+    static SOURCE_BUDGET: RefCell<Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn with_source_budget<T>(
+    budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SOURCE_BUDGET.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(SOURCE_BUDGET.with(|slot| slot.replace(Some(budget))));
+    operation()
 }
 
 thread_local! { static ACTIVE: RefCell<Vec<Arc<ImageMemory>>> = const { RefCell::new(Vec::new()) }; }
