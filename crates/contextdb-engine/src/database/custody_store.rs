@@ -270,13 +270,13 @@ impl Database {
     // A replacement or deletion ends ownership of the
     // previous committed manifest. Preserve its signed history and terminals;
     // current rows require a registration from their own writing transaction.
-    fn retire_changed_custody_roots(&self, ws: &mut WriteSet) -> Result<()> {
+    fn retire_changed_custody_roots(&self, ws: &mut WriteSet, snapshot: SnapshotId) -> Result<()> {
         use crate::custody::{canonical::hex, records::RowRef};
         if ws.relational_deletes.is_empty() {
             return Ok(());
         }
         let mut selectors = BTreeSet::new();
-        for (table, rows) in self.deleted_row_snapshots_by_table(ws)? {
+        for (table, rows) in self.deleted_row_snapshots_by_table(ws, snapshot)? {
             let Some(meta) = self.table_meta(&table) else {
                 continue;
             };
@@ -325,7 +325,11 @@ impl Database {
     }
 
     pub(super) fn prepare_custody_commit(&self, ws: &mut WriteSet) -> Result<Option<CustodyDelta>> {
-        self.retire_changed_custody_roots(ws)?;
+        self.retire_changed_custody_roots(
+            ws,
+            self.scoped_writer_root()
+                .map_or_else(|| self.snapshot_for_read(), |root| root.snapshot),
+        )?;
         if !ws.config_writes.iter().any(|(key, _)| owned_key(key))
             && !ws.config_deletes.iter().any(|key| owned_key(key))
         {

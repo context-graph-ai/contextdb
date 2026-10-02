@@ -2632,7 +2632,7 @@ enum BoundedCursorLifecycle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BoundedCursorTerminalReason {
     Refused,
-    Expired,
+    Expired(contextdb_core::read_contract::CursorExpiryKind),
     ExplicitClose,
     Erased,
 }

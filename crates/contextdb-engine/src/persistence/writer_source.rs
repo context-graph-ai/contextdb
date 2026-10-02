@@ -801,6 +801,19 @@ impl WriterReadCursor {
                     Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
                     Err(e) => return Err(RedbPersistence::storage_error(e)),
                 };
+                if self.table.starts_with("rel_")
+                    && self.after.is_none()
+                    && matches!(self.lower, Bound::Unbounded)
+                    && matches!(self.upper, Bound::Unbounded)
+                    && let Some(logical) = self.logical_table.as_deref()
+                {
+                    memory.reserve(logical.len().saturating_add(32))?;
+                    RedbPersistence::verify_writer_relational_count_in_read(
+                        &self.root.read,
+                        logical,
+                        table.len().map_err(RedbPersistence::storage_error)?,
+                    )?;
+                }
                 let mut range = table
                     .range::<&[u8]>((lower, upper))
                     .map_err(RedbPersistence::storage_error)?;

@@ -13562,7 +13562,16 @@ impl CursorExpiryWatch {
         };
         if let Err(error) = state.check_expiry() {
             state.finish_plugin_error(&error);
-            *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Expired);
+            let reason = match &error {
+                BoundedExecutionError::Refused(failure) => match failure.detail() {
+                    ReadFailureDetail::CursorExpired { expiry } => {
+                        BoundedCursorTerminalReason::Expired(*expiry)
+                    }
+                    _ => BoundedCursorTerminalReason::Refused,
+                },
+                _ => BoundedCursorTerminalReason::Refused,
+            };
+            *lifecycle = BoundedCursorLifecycle::Released(reason);
             drop(lifecycle);
             execution.retire_expiry();
             return;
@@ -13832,6 +13841,12 @@ pub(super) fn fetch_cursor(
         BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::ExplicitClose),
     );
     let mut state = match current {
+        BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Expired(expiry)) => {
+            *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
+            return Err(BoundedExecutionError::Refused(ReadFailure::cursor_expired(
+                expiry,
+            )));
+        }
         BoundedCursorLifecycle::Released(reason) => {
             *lifecycle = BoundedCursorLifecycle::Released(reason);
             return Err(cursor_not_found());
@@ -13849,7 +13864,7 @@ pub(super) fn fetch_cursor(
     };
     if let Err(error) = state.check_expiry() {
         state.finish_plugin_error(&error);
-        *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Expired);
+        *lifecycle = BoundedCursorLifecycle::Released(BoundedCursorTerminalReason::Refused);
         return Err(error);
     }
     if let Err(error) = state.context.begin_fetch(

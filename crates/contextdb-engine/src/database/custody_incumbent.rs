@@ -11,7 +11,7 @@ impl Database {
         let Some(meta) = self.table_meta(&root.table) else {
             return Ok(None);
         };
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_for_read();
         let Some(row) =
             self.visible_row_by_natural_key(&root.table, &root.key, snapshot, &HashSet::new())?
         else {
@@ -42,10 +42,7 @@ impl Database {
             if self.table_meta(table).is_none() {
                 continue;
             }
-            for row in self
-                .relational
-                .scan_filter_with_tx(None, table, snapshot, &|_| true)?
-            {
+            for row in self.relational_scan_filter_with_tx(None, table, snapshot, &|_| true)? {
                 let (key, values) = self
                     .row_change_values_from_row(table, &row)?
                     .ok_or_else(invalid)?;

@@ -91,6 +91,83 @@ impl RedbPersistence {
         table
             .insert(BOUNDS_KEY, encoded.as_slice())
             .map_err(Self::storage_error)?;
+        drop(table);
+        Self::write_writer_relational_counts_in_write(write)
+    }
+
+    // A full row cursor has no selected posting to attest a missing body.
+    // Its transaction-coupled cardinality certifies the physical family, even
+    // when a corrupt deletion leaves the iterator empty. No identities or
+    // row payloads are read to maintain or check this metadata.
+    fn write_writer_relational_counts_in_write(write: &redb::WriteTransaction) -> Result<()> {
+        let metadata = write.open_table(META_TABLE).map_err(Self::storage_error)?;
+        let mut counts = write
+            .open_table(WRITER_RECOVERY_TABLE)
+            .map_err(Self::storage_error)?;
+        for entry in metadata
+            .range("table:".."table;")
+            .map_err(Self::storage_error)?
+        {
+            let (name, _) = entry.map_err(Self::storage_error)?;
+            let name =
+                name.value()
+                    .strip_prefix("table:")
+                    .ok_or_else(|| Error::StoreCorrupted {
+                        path: "meta".into(),
+                        reason: "invalid table declaration key".into(),
+                    })?;
+            let physical = Self::rel_table_name(name);
+            let count = match write.open_table(TableDefinition::<&[u8], &[u8]>::new(&physical)) {
+                Ok(rows) => rows.len().map_err(Self::storage_error)?,
+                Err(redb::TableError::TableDoesNotExist(_)) => 0,
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let key = format!("row_versions:{name}");
+            let value = count.to_be_bytes();
+            if counts
+                .get(key.as_str())
+                .map_err(Self::storage_error)?
+                .is_some_and(|existing| existing.value() == value)
+            {
+                continue;
+            }
+            counts
+                .insert(key.as_str(), value.as_slice())
+                .map_err(Self::storage_error)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_writer_relational_count_in_read(
+        read: &redb::ReadTransaction,
+        table: &str,
+        actual: u64,
+    ) -> Result<()> {
+        let counts = read
+            .open_table(WRITER_RECOVERY_TABLE)
+            .map_err(Self::storage_error)?;
+        let key = format!("row_versions:{table}");
+        let value = counts
+            .get(key.as_str())
+            .map_err(Self::storage_error)?
+            .ok_or_else(|| Error::StoreCorrupted {
+                path: table.to_owned(),
+                reason: "missing saved row cardinality".into(),
+            })?;
+        let expected = value
+            .value()
+            .try_into()
+            .map(u64::from_be_bytes)
+            .map_err(|_| Error::StoreCorrupted {
+                path: table.to_owned(),
+                reason: "invalid saved row cardinality".into(),
+            })?;
+        if expected != actual {
+            return Err(Error::StoreCorrupted {
+                path: table.to_owned(),
+                reason: "row family cardinality differs from its committed record".into(),
+            });
+        }
         Ok(())
     }
 

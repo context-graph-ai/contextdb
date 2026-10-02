@@ -35313,8 +35313,8 @@ impl Database {
         stage_timer.record(stats_guard.stats_mut(), 0);
         self.validate_vector_schema_epochs(ws, &metadata.vector_schema_epochs)?;
         self.validate_vector_write_set_schema(ws)?;
-        self.discard_deletes_of_rows_that_are_already_gone(ws)?;
-        let mut deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws)?;
+        self.discard_deletes_of_rows_that_are_already_gone(ws, snapshot)?;
+        let mut deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws, snapshot)?;
         self.validate_unique_constraints_in_write_set(
             ws,
             snapshot,
@@ -35654,11 +35654,15 @@ impl Database {
     /// raise an outbound deletion obligation for a row this node did not
     /// delete. A row this same transaction is inserting is not gone -- it has
     /// simply not been committed yet -- so its delete stays.
-    fn discard_deletes_of_rows_that_are_already_gone(&self, ws: &mut WriteSet) -> Result<()> {
+    fn discard_deletes_of_rows_that_are_already_gone(
+        &self,
+        ws: &mut WriteSet,
+        snapshot: SnapshotId,
+    ) -> Result<()> {
         if ws.relational_deletes.is_empty() {
             return Ok(());
         }
-        let live = self.deleted_row_snapshots_by_table(ws)?;
+        let live = self.deleted_row_snapshots_by_table(ws, snapshot)?;
         let staged = ws
             .relational_inserts
             .iter()
@@ -35712,6 +35716,7 @@ impl Database {
     fn deleted_row_snapshots_by_table(
         &self,
         ws: &WriteSet,
+        snapshot: SnapshotId,
     ) -> Result<HashMap<String, HashMap<RowId, VersionedRow>>> {
         if ws.relational_deletes.is_empty() {
             return Ok(HashMap::new());
@@ -35725,7 +35730,6 @@ impl Database {
         }
         if self.persistence.is_some() {
             let mut rows = HashMap::<String, HashMap<RowId, VersionedRow>>::new();
-            let snapshot = self.snapshot();
             let mut output =
                 crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
             for (table, row_id) in keys {
@@ -36898,7 +36902,7 @@ impl Database {
             )? {
                 staged_lookup.apply_delta(&staged_tuple_columns, &rewrite.lookup_delta);
                 deleted_by_table = Self::deleted_row_ids_by_table(ws);
-                *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws)?;
+                *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws, snapshot)?;
                 index =
                     Self::relational_insert_index_by_row(ws, &rewrite.table, rewrite.row_id, index)
                         .unwrap_or_else(|| index.min(ws.relational_inserts.len()));
@@ -36994,7 +36998,8 @@ impl Database {
                     {
                         staged_lookup.apply_delta(&staged_tuple_columns, &rewrite.lookup_delta);
                         deleted_by_table = Self::deleted_row_ids_by_table(ws);
-                        *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws)?;
+                        *deleted_rows_by_table =
+                            self.deleted_row_snapshots_by_table(ws, snapshot)?;
                         index = Self::relational_insert_index_by_row(
                             ws,
                             &rewrite.table,
@@ -37107,7 +37112,8 @@ impl Database {
                     {
                         staged_lookup.apply_delta(&staged_tuple_columns, &rewrite.lookup_delta);
                         deleted_by_table = Self::deleted_row_ids_by_table(ws);
-                        *deleted_rows_by_table = self.deleted_row_snapshots_by_table(ws)?;
+                        *deleted_rows_by_table =
+                            self.deleted_row_snapshots_by_table(ws, snapshot)?;
                         index = Self::relational_insert_index_by_row(
                             ws,
                             &rewrite.table,

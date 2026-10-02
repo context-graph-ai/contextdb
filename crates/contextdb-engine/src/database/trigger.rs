@@ -1175,26 +1175,31 @@ impl Database {
     ) -> Result<CommitValidationOutcome> {
         let conditional_update_guards = self.take_conditional_update_guards_for_tx(tx);
         let upsert_intents = self.pending_upsert_intents_for_tx(tx);
-        self.tx_mgr.with_write_set_detached(tx, |ws| {
-            ws.canonicalize_final_state();
-            if ws.is_empty() {
-                return Ok(CommitValidationOutcome::default());
-            }
-            self.rewrite_txid_placeholders(tx, ws)?;
-            let snapshot = self.snapshot();
-            let validation = self.revalidate_conditional_updates(
-                ws,
-                snapshot,
-                &conditional_update_guards,
-                None,
-            )?;
-            self.rewrite_commit_time_upserts_for_write_set(ws, snapshot, &upsert_intents)?;
-            ws.canonicalize_final_state();
-            Ok(CommitValidationOutcome {
-                conditional_noop_count: validation.conditional_noop_count,
-                conditional_conflict_count: validation.conditional_conflict_count,
-            })
-        })?
+        let published = self.tx_mgr.capture_published_read();
+        let snapshot = published.snapshot;
+        let _writer_read =
+            self.enter_writer_read(super::writer_read::durable_root(published.handle)?);
+        self.with_snapshot_override(snapshot, || {
+            self.tx_mgr.with_write_set_detached(tx, |ws| {
+                ws.canonicalize_final_state();
+                if ws.is_empty() {
+                    return Ok(CommitValidationOutcome::default());
+                }
+                self.rewrite_txid_placeholders(tx, ws)?;
+                let validation = self.revalidate_conditional_updates(
+                    ws,
+                    snapshot,
+                    &conditional_update_guards,
+                    None,
+                )?;
+                self.rewrite_commit_time_upserts_for_write_set(ws, snapshot, &upsert_intents)?;
+                ws.canonicalize_final_state();
+                Ok(CommitValidationOutcome {
+                    conditional_noop_count: validation.conditional_noop_count,
+                    conditional_conflict_count: validation.conditional_conflict_count,
+                })
+            })?
+        })
     }
 
     pub(super) fn prepare_active_sync_trigger_write_set_for_dispatch(
