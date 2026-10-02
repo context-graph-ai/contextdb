@@ -1339,6 +1339,11 @@ impl CompositeStore {
                     },
                 ));
         }
+        // File-backed history is already installed atomically in durable
+        // selectors. Keep no second decoded log or lookup directory.
+        if self.relational.uses_disk_backed_committed_bodies() {
+            return Ok(());
+        }
         // What the log and its two side indexes now hold, plus the one
         // commit-index entry the transaction manager inserts for this commit
         // the moment this apply returns. Both exist once the commit is

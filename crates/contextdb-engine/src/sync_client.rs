@@ -1351,7 +1351,7 @@ impl SyncClient {
         let since = self.push_watermark.load(Ordering::SeqCst);
         let (changes, _, ddl_provenance_source) =
             self.db.checked_changes_since_with_arrivals(since)?;
-        let history = self.db.sync_direction_history();
+        let history = self.db.try_sync_direction_history()?;
         let changes = changes
             .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
         let reupload_epoch = self.destination_reupload_epoch()?;
@@ -1371,9 +1371,9 @@ impl SyncClient {
             &self.db,
             match reupload_epoch {
                 Some((through, _)) => {
-                    drop_rows_that_arrived_by_sync_after(&self.db, changes, Some(through))
+                    checked_drop_rows_that_arrived_by_sync_after(&self.db, changes, Some(through))?
                 }
-                None => drop_rows_that_arrived_by_sync(&self.db, changes),
+                None => checked_drop_rows_that_arrived_by_sync_after(&self.db, changes, None)?,
             },
         )
     }
@@ -2357,7 +2357,7 @@ impl SyncClient {
         refuse_keyless_tables_with_no_identity_fallback(&self.db, &HashMap::new())?;
         let (changeset, _, ddl_provenance_source) =
             self.db.checked_changes_since_with_arrivals(since)?;
-        let history = self.db.sync_direction_history();
+        let history = self.db.try_sync_direction_history()?;
         let changeset = changeset
             .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
         let changeset = self.db.filter_outbound_received_ddl(
@@ -2374,9 +2374,9 @@ impl SyncClient {
         };
         let changeset = match destination_reupload_epoch {
             Some((through, _)) => {
-                drop_rows_that_arrived_by_sync_after(&self.db, changeset, Some(through))
+                checked_drop_rows_that_arrived_by_sync_after(&self.db, changeset, Some(through))?
             }
-            None => drop_rows_that_arrived_by_sync(&self.db, changeset),
+            None => checked_drop_rows_that_arrived_by_sync_after(&self.db, changeset, None)?,
         };
         let mut recoverable_tables = HashSet::new();
         let mut remaining_capabilities = BTreeMap::new();
@@ -2386,7 +2386,7 @@ impl SyncClient {
                     &self.db,
                     table,
                     capabilities,
-                );
+                )?;
                 if unsupported.is_empty() {
                     recoverable_tables.insert(table.clone());
                 } else {
@@ -2430,7 +2430,7 @@ impl SyncClient {
                     &self.db,
                     &changeset,
                     capabilities,
-                )
+                )?
             {
                 state.capabilities.remove(&table);
                 if !capabilities.is_empty() {
@@ -3687,7 +3687,7 @@ impl SyncClient {
             let applied_page = self
                 .db
                 .with_authoritative_hub_received_apply(&authenticated_hub, |db| {
-            let mut directions = db.latest_declared_table_directions();
+            let mut directions = db.latest_declared_table_directions()?;
             let mut table_generations = HashMap::new();
             let mut prepared_dependency_units = Vec::new();
             let mut policy_projection = contextdb_engine::database::PullPolicyProjection::default();
@@ -4274,19 +4274,31 @@ pub(crate) fn refuse_keyless_tables_with_no_identity_fallback(
 /// always propagates. Vectors follow their owning row's exact `(table, local
 /// commit LSN)` group: a pulled vector must not echo, but a locally edited,
 /// deleted, AcceptedLocal, or Pending owner remains outbound work.
+#[cfg(test)]
 pub(crate) fn drop_rows_that_arrived_by_sync(db: &Database, changes: ChangeSet) -> ChangeSet {
-    drop_rows_that_arrived_by_sync_after(db, changes, None)
+    checked_drop_rows_that_arrived_by_sync_after(db, changes, None)
+        .expect("fixture vector provenance history")
+}
+
+#[cfg(test)]
+fn drop_rows_that_arrived_by_sync_after(
+    db: &Database,
+    changes: ChangeSet,
+    reupload_through: Option<Lsn>,
+) -> ChangeSet {
+    checked_drop_rows_that_arrived_by_sync_after(db, changes, reupload_through)
+        .expect("fixture vector provenance history")
 }
 
 /// During an explicit destination move, retain only inherited mutations the
 /// edge already held when it made the move. A pull from the new hub can land
 /// before the rebuild push; those later arrivals remain ordinary self-echoes
 /// and must not ride the one-time re-upload.
-fn drop_rows_that_arrived_by_sync_after(
+fn checked_drop_rows_that_arrived_by_sync_after(
     db: &Database,
     changes: ChangeSet,
     reupload_through: Option<Lsn>,
-) -> ChangeSet {
+) -> Result<ChangeSet, Error> {
     let mut changes = changes;
     // A changeset can include the older local insert that preceded a pulled
     // tombstone. Suppressing only the tombstone would re-offer that stale
@@ -4307,10 +4319,15 @@ fn drop_rows_that_arrived_by_sync_after(
             && (!db.row_change_arrived_by_sync(row)
                 || reupload_through.is_some_and(|through| row.lsn <= through))
     });
-    changes.vectors.retain(|vector| {
-        !db.vector_change_arrived_by_sync(vector)
+    let mut vectors = Vec::with_capacity(changes.vectors.len());
+    for vector in std::mem::take(&mut changes.vectors) {
+        if !db.checked_vector_change_arrived_by_sync(&vector)?
             || reupload_through.is_some_and(|through| vector.lsn <= through)
-    });
+        {
+            vectors.push(vector);
+        }
+    }
+    changes.vectors = vectors;
     // Graph sync carries final edge state, not an operation log. Keep only the
     // newest insert/delete for one identity before applying the bounded
     // current-arrival marker. A suppressed pulled insert or delete therefore
@@ -4350,7 +4367,7 @@ fn drop_rows_that_arrived_by_sync_after(
             .then_some(edge)
         })
         .collect();
-    changes
+    Ok(changes)
 }
 
 /// Every table this database declares as `SYNC PUSH ONLY`. Read from the

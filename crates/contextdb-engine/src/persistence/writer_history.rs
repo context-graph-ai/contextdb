@@ -136,3 +136,52 @@ impl RedbPersistence {
         Ok(())
     }
 }
+
+impl super::writer_source::WriterSnapshot {
+    pub(crate) fn ddl_history_cursor(
+        self: &Arc<Self>,
+        since: Lsn,
+    ) -> Result<super::writer_source::WriterReadCursor> {
+        // Encode bounds on the stack; cursor admission precedes their copies.
+        let encode = |mut value: u64| {
+            let mut key = [b'0'; 20];
+            for digit in key.iter_mut().rev() {
+                *digit += (value % 10) as u8;
+                value /= 10;
+            }
+            key
+        };
+        let lower = encode(since.0.saturating_add(1));
+        let mut upper = [b';'; 21];
+        upper[..20].copy_from_slice(&encode(self.lsn.0));
+        self.cursor(
+            "ddl_log",
+            super::writer_source::WriterCursorFamily::Text,
+            std::ops::Bound::Included(&lower),
+            std::ops::Bound::Included(&upper),
+            false,
+        )
+    }
+}
+impl super::writer_source::WriterReadCursor {
+    pub(crate) fn next_ddl_history(
+        &mut self,
+    ) -> Result<Option<super::writer_source::WriterWindow<(Lsn, DdlChange)>>> {
+        self.next(|key, value| {
+            let key = std::str::from_utf8(key)
+                .map_err(|_| Error::Other("invalid declaration log key".into()))?;
+            let lsn = key
+                .split_once(':')
+                .map_or(key, |(lsn, _)| lsn)
+                .parse::<u64>()
+                .map_err(|_| Error::Other("invalid declaration log frontier".into()))?;
+            let (change, consumed) = crate::read_image_memory::decode(value)?;
+            if consumed != value.len() {
+                return Err(Error::Other(
+                    "declaration history record has trailing bytes".into(),
+                ));
+            }
+            Ok((Lsn(lsn), change))
+        })
+    }
+}

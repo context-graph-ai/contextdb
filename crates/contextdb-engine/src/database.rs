@@ -20500,7 +20500,7 @@ impl Database {
         let hnsw = Arc::new(OnceLock::new());
         let vector = Arc::new(VectorStore::new(hnsw.clone()));
         register_vector_layouts(&vector, &all_meta)?;
-        let loaded_ddl_log = persistence.load_ddl_log()?;
+        let loaded_ddl_log = Vec::new();
         register_dormant_raw_vector_partitions(&vector, &persistence, &accountant)?;
         // The loaders registered here and the handle built below share ONE cell,
         // so a partition faulted in after `SET VECTOR_SERVING_CACHE` sizes from
@@ -20517,20 +20517,13 @@ impl Database {
             DeclaredServingCache::Live(vector_serving_cache_cell.clone()),
         )?;
 
-        let loaded_change_log = persistence.load_change_log()?;
+        let loaded_change_log = Vec::new();
         // Recovery uses durable end keys and maintained identity floors. It
         // must not depend on the resident projections or enumerate retained
         // versions to decide which identities a new writer may allocate.
         let open_bounds = persistence.writer_open_bounds(all_meta.keys().map(String::as_str))?;
         let max_tx = open_bounds.max_tx;
-        // Some schema-only persistence doors still store their frontier in
-        // the DDL log. Preserve that floor until those doors atomically
-        // maintain the recovery record too.
-        let ddl_max_lsn = loaded_ddl_log
-            .iter()
-            .map(|(lsn, _)| *lsn)
-            .max()
-            .unwrap_or(Lsn(0));
+        // Schema-only publication maintains the same durable recovery floors.
         let mut lineage_bounds = DurableLineageRecoveryBounds::default();
         for (key, bytes) in
             persistence
@@ -20545,7 +20538,6 @@ impl Database {
         let max_row_id = open_bounds.max_row_id.max(lineage_bounds.max_row_id);
         let max_lsn = open_bounds
             .max_lsn
-            .max(ddl_max_lsn)
             .max(lineage_bounds.purge_frontier_max_lsn);
         relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
 
@@ -24147,7 +24139,9 @@ impl Database {
         self.in_memory_ddl_generations
             .lock()
             .extend(stage.ddl_generations);
-        self.ddl_log.write().extend(stage.ddl_log);
+        if self.persistence.is_none() {
+            self.ddl_log.write().extend(stage.ddl_log);
+        }
         stage.memory_swap.commit_after_swap();
         self.clear_statement_cache();
         self.reconcile_maintenance_thread();
@@ -26453,9 +26447,25 @@ impl Database {
     /// Delete provenance is intentionally session-local, matching the current
     /// tombstone retention boundary.
     pub fn vector_change_arrived_by_sync(&self, vector: &VectorChange) -> bool {
+        // The public answer is a yes/no; a durable history refusal cannot be
+        // carried by it. Outbound sync uses the checked form below, which
+        // returns that refusal to the push or pull that asked.
+        self.checked_vector_change_arrived_by_sync(vector)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "vector deletion provenance lookup failed");
+                false
+            })
+    }
+
+    /// Checked form of [`Self::vector_change_arrived_by_sync`]: a durable
+    /// history read failure is returned, never read as "not synced".
+    pub(crate) fn checked_vector_change_arrived_by_sync(
+        &self,
+        vector: &VectorChange,
+    ) -> Result<bool> {
         let _operation = self.assert_open_operation();
         if !vector.vector.is_empty() {
-            return self
+            return Ok(self
                 .row_visible_at_snapshot(
                     &vector.index.table,
                     vector.row_id,
@@ -26472,33 +26482,36 @@ impl Database {
                             .and_then(|(_, kind)| kind),
                             Some(contextdb_relational::store::SyncSourceKind::Pulled)
                         )
-                });
+                }));
         }
-        self.change_log.read().iter().any(|entry| {
-            let ChangeLogEntry::RowDelete {
-                table,
-                row_id,
-                natural_key,
-                lsn,
-            } = entry
-            else {
-                return false;
-            };
-            table == &vector.index.table
-                && *row_id == vector.row_id
-                && *lsn == vector.lsn
-                && self
-                    .sync_tombstone_arrivals
-                    .read()
-                    .get(&Self::sync_tombstone_key(table, natural_key))
-                    .is_some_and(|marker| {
-                        matches!(
-                            marker.kind,
-                            contextdb_relational::store::SyncSourceKind::Pulled
-                        ) && marker.delete_lsn == *lsn
-                            && marker.row_id == Some(*row_id)
-                    })
-        })
+        Ok(self
+            .find_history_change(vector.lsn, vector.lsn, |entry| {
+                let ChangeLogEntry::RowDelete {
+                    table,
+                    row_id,
+                    natural_key,
+                    lsn,
+                } = entry
+                else {
+                    return None;
+                };
+                (table == &vector.index.table
+                    && *row_id == vector.row_id
+                    && *lsn == vector.lsn
+                    && self
+                        .sync_tombstone_arrivals
+                        .read()
+                        .get(&Self::sync_tombstone_key(table, natural_key))
+                        .is_some_and(|marker| {
+                            matches!(
+                                marker.kind,
+                                contextdb_relational::store::SyncSourceKind::Pulled
+                            ) && marker.delete_lsn == *lsn
+                                && marker.row_id == Some(*row_id)
+                        }))
+                .then_some(())
+            })?
+            .is_some())
     }
 
     fn sync_tombstone_key(table: &str, natural_key: &NaturalKey) -> (String, String) {
@@ -28847,7 +28860,11 @@ impl Database {
             &changes.ddl,
         )?;
         side_semantic.catalog_charge = Some(projected_charge);
-        let local_ddl_log_before_extension = self.ddl_log.read();
+        let local_ddl_log_before_extension = if self.persistence.is_some() {
+            self.durable_ddl_entries_since(Lsn(0))?
+        } else {
+            self.ddl_log.read().clone()
+        };
         // Schema this node authored before the vector arrived, which the
         // vector itself restates, stops being outbound work. The comparison
         // uses the log as it stood before the received occurrences were
@@ -31292,7 +31309,9 @@ impl Database {
                 .lock()
                 .insert((lsn, 0), (Some(name.to_string()), Some(generation)));
         }
-        self.ddl_log.write().push((lsn, change));
+        if self.persistence.is_none() {
+            self.ddl_log.write().push((lsn, change));
+        }
         Ok(())
     }
 
@@ -32313,9 +32332,9 @@ impl Database {
     pub(crate) fn authored_schema_capabilities(
         &self,
         table: &str,
-    ) -> BTreeSet<crate::sync_types::SchemaSyncCapability> {
+    ) -> Result<BTreeSet<crate::sync_types::SchemaSyncCapability>> {
         let mut capabilities = BTreeSet::new();
-        for (_, ddl) in self.ddl_log.read().iter() {
+        for (_, ddl) in self.checked_ddl_entries_since(Lsn(0))?.iter() {
             if let DdlChange::CreateTable {
                 name,
                 columns,
@@ -32350,7 +32369,7 @@ impl Database {
                 }
             }
         }
-        capabilities
+        Ok(capabilities)
     }
 
     fn changeset_is_wholly_empty(changes: &ChangeSet) -> bool {
@@ -33088,8 +33107,8 @@ impl Database {
             .remove(&Self::sync_tombstone_key(table, natural_key));
     }
 
-    fn row_id_for_delete_change(&self, row: &RowChange) -> Option<RowId> {
-        self.change_log.read().iter().rev().find_map(|entry| {
+    fn row_id_for_delete_change(&self, row: &RowChange) -> Result<Option<RowId>> {
+        self.find_history_change(row.lsn, row.lsn, |entry| {
             let ChangeLogEntry::RowDelete {
                 table,
                 row_id,
@@ -33102,6 +33121,31 @@ impl Database {
             (table == &row.table && natural_key == &row.natural_key && *lsn == row.lsn)
                 .then_some(*row_id)
         })
+    }
+
+    fn find_history_change<T>(
+        &self,
+        first: Lsn,
+        last: Lsn,
+        mut select: impl FnMut(&ChangeLogEntry) -> Option<T>,
+    ) -> Result<Option<T>> {
+        let (_, root) = self.capture_writer_statement()?;
+        if let Some(root) = root {
+            let mut cursor = root.change_log_cursor(first, last.min(root.lsn))?;
+            while let Some(window) = cursor.next_change()? {
+                if let Some(value) = select(&window.value) {
+                    return Ok(Some(value));
+                }
+            }
+            return Ok(None);
+        }
+        Ok(self
+            .change_log
+            .read()
+            .iter()
+            .rev()
+            .filter(|entry| entry.lsn() >= first && entry.lsn() <= last)
+            .find_map(select))
     }
 
     /// A hub restored before an acknowledged local delete can replay its old
@@ -33174,7 +33218,7 @@ impl Database {
             let mut tombstones = Vec::new();
             for row in rows {
                 if row.deleted {
-                    let row_id = self.row_id_for_delete_change(row);
+                    let row_id = self.row_id_for_delete_change(row)?;
                     let current = self
                         .visible_row_by_natural_key(
                             &row.table,
@@ -33362,7 +33406,7 @@ impl Database {
                 let current = self.visible_row_by_natural_key(&row.table, &row.natural_key, snapshot, &no_deleted)?;
                 let row_id = match current {
                     Some(current) if !row.deleted && current.lsn == row.lsn => Some(current.row_id),
-                    None if row.deleted => self.row_id_for_delete_change(row),
+                    None if row.deleted => self.row_id_for_delete_change(row)?,
                     _ => None,
                 };
                 if let Some(row_id) = row_id {
@@ -33402,7 +33446,7 @@ impl Database {
                     }
                     if current.is_none() {
                         tombstones.push((Self::sync_tombstone_key(&row.table, &row.natural_key), SyncTombstoneArrival {
-                            arrival: hub_lsn, delete_lsn: row.lsn, row_id: self.row_id_for_delete_change(row),
+                            arrival: hub_lsn, delete_lsn: row.lsn, row_id: self.row_id_for_delete_change(row)?,
                             kind: contextdb_relational::store::SyncSourceKind::AcceptedLocal,
                             accepted_local_order_invalidated: false,
                         }));
@@ -35277,13 +35321,9 @@ impl Database {
             .unwrap_or_default()
     }
 
-    /// What the durable writer's own in-memory retention is charged right
-    /// now: the change log with its two side indexes, and the transaction
-    /// manager's commit index.
-    ///
-    /// Both grow with the import and are trimmed only by a maintenance cycle
-    /// the caller drives, so both are charged; this is the figure a close
-    /// hands back, because the store stops holding them when it goes away.
+    /// Retained writer owners released at close. File-backed history and
+    /// commit directories live in native tables; memory stores retain their
+    /// log and directory entries. The shared page cache remains charged.
     fn durable_writer_retained_bytes(&self) -> usize {
         // A committed read image is not a writer. It never appends a
         // change-log entry and never adds a commit-index entry, and the image
@@ -52294,7 +52334,9 @@ impl Database {
         } else {
             self.record_ddl_generation_sidecars(lsn, std::slice::from_ref(&change))?;
         }
-        self.ddl_log.write().push((lsn, change));
+        if self.persistence.is_none() {
+            self.ddl_log.write().push((lsn, change));
+        }
         Ok(())
     }
 
@@ -53639,7 +53681,14 @@ impl Database {
         if !self.access_is_admin() {
             return Vec::new();
         }
+        // The public history read returns a list; a durable read refusal is
+        // logged here and reads as no history. Internal callers use the
+        // checked door and return the refusal.
         self.with_commit_lock(|| self.ddl_log_since_unlocked(since_lsn))
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "declaration history read failed");
+                Vec::new()
+            })
     }
 
     /// The latest durable declaration for each locally known table name.
@@ -53648,10 +53697,12 @@ impl Database {
     /// must not compare those LSNs with this database's history. A DROP leaves
     /// the last declaration intact here: the local policy still decides
     /// whether remote work for that former generation may be applied.
-    pub(crate) fn latest_declared_table_directions(&self) -> HashMap<String, SyncDirection> {
+    pub(crate) fn latest_declared_table_directions(
+        &self,
+    ) -> Result<HashMap<String, SyncDirection>> {
         let _operation = self.assert_open_operation();
         let mut directions = HashMap::new();
-        let ddl_log = self.ddl_log.read();
+        let ddl_log = self.checked_ddl_entries_since(Lsn(0))?;
         let mut ddl_entries = ddl_log.iter().collect::<Vec<_>>();
         ddl_entries.sort_by_key(|(lsn, _)| *lsn);
         for (_, change) in ddl_entries {
@@ -53683,16 +53734,16 @@ impl Database {
                 _ => {}
             }
         }
-        directions
+        Ok(directions)
     }
 
     /// Reconstructs the durable declaration that governed every table
     /// generation. Live metadata is deliberately not consulted: a DROP removes
     /// it, while outbound history still needs the dropped generation's policy.
-    pub(crate) fn sync_direction_history(&self) -> SyncDirectionHistory {
+    pub(crate) fn try_sync_direction_history(&self) -> Result<SyncDirectionHistory> {
         let _operation = self.assert_open_operation();
         let mut history = SyncDirectionHistory::default();
-        let ddl_log = self.ddl_log.read();
+        let ddl_log = self.checked_ddl_entries_since(Lsn(0))?;
         let mut ddl_entries = ddl_log.iter().collect::<Vec<_>>();
         ddl_entries.sort_by_key(|(lsn, _)| *lsn);
         for (lsn, change) in ddl_entries {
@@ -53720,17 +53771,56 @@ impl Database {
                 _ => {}
             }
         }
-        history
+        Ok(history)
     }
 
-    fn ddl_log_since_unlocked(&self, since_lsn: Lsn) -> Vec<DdlChange> {
-        self.ddl_log_entries_since_unlocked(since_lsn)
+    #[cfg(test)]
+    pub(crate) fn sync_direction_history(&self) -> SyncDirectionHistory {
+        self.try_sync_direction_history()
+            .expect("fixture declaration history")
+    }
+
+    fn checked_ddl_entries_since(&self, since: Lsn) -> Result<Vec<(Lsn, DdlChange)>> {
+        self.ddl_log_entries_since_unlocked(since)
+    }
+
+    fn durable_ddl_entries_since(&self, since: Lsn) -> Result<Vec<(Lsn, DdlChange)>> {
+        let (_, root) = self.capture_writer_statement()?;
+        let root = root.ok_or_else(|| {
+            Error::Other("durable declaration history requires a captured writer source".into())
+        })?;
+        if since >= root.lsn {
+            return Ok(Vec::new());
+        }
+        let mut cursor = root.ddl_history_cursor(since)?;
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let mut entries = Vec::new();
+        while let Some(window) = cursor.next_ddl_history()? {
+            output.try_grow_for(
+                answer_list_entry_bytes::<(Lsn, DdlChange)>(window.value.1.estimated_bytes()),
+                "writer_source",
+                "declaration_history_output",
+                "Raise MEMORY_LIMIT to return declaration history.",
+            )?;
+            entries.push(window.value);
+        }
+        self.retain_writer_output(output);
+        Ok(entries)
+    }
+
+    fn ddl_log_since_unlocked(&self, since_lsn: Lsn) -> Result<Vec<DdlChange>> {
+        Ok(self
+            .ddl_log_entries_since_unlocked(since_lsn)?
             .into_iter()
             .map(|(_, change)| change)
-            .collect()
+            .collect())
     }
 
-    fn ddl_log_entries_since_unlocked(&self, since_lsn: Lsn) -> Vec<(Lsn, DdlChange)> {
+    fn ddl_log_entries_since_unlocked(&self, since_lsn: Lsn) -> Result<Vec<(Lsn, DdlChange)>> {
+        if self.persistence.is_some() {
+            return self.durable_ddl_entries_since(since_lsn);
+        }
         let ddl = self.ddl_log.read();
         let mut entries = ddl
             .iter()
@@ -53738,7 +53828,7 @@ impl Database {
             .cloned()
             .collect::<Vec<_>>();
         entries.sort_by_key(|(lsn, _)| *lsn);
-        entries
+        Ok(entries)
     }
 
     /// Read one immutable persisted-log occurrence. Received-arrival digests
@@ -53746,6 +53836,23 @@ impl Database {
     /// When the in-memory log no longer covers it (a persisted-state
     /// extraction), the durable log answers.
     fn raw_ddl_log_occurrence(&self, lsn: Lsn, ordinal: u32) -> Result<DdlChange> {
+        if let (_, Some(root)) = self.capture_writer_statement()? {
+            let mut cursor = root.ddl_history_cursor(Lsn(lsn.0.saturating_sub(1)))?;
+            let mut seen = 0u32;
+            while let Some(window) = cursor.next_ddl_history()? {
+                if window.value.0 != lsn {
+                    break;
+                }
+                if seen == ordinal {
+                    return Ok(window.value.1);
+                }
+                seen += 1;
+            }
+            return Err(Error::SyncError(format!(
+                "received DDL arrival lacks raw persisted occurrence at local LSN {} ordinal {}",
+                lsn.0, ordinal
+            )));
+        }
         let occurrence = |log: &[(Lsn, DdlChange)]| {
             log.iter()
                 .filter(|(entry_lsn, _)| *entry_lsn == lsn)
@@ -54097,7 +54204,7 @@ impl Database {
             drop(ddl_log);
             (projection.admit)(copied)?;
         }
-        let history = self.ddl_log_entries_since_unlocked(Lsn(0));
+        let history = self.ddl_log_entries_since_unlocked(Lsn(0))?;
         if !history.is_empty() {
             let (history_lsn, history_ddl): (Vec<_>, Vec<_>) = history.into_iter().unzip();
             let historical =
@@ -54271,7 +54378,7 @@ impl Database {
             .min()
             .unwrap_or(snapshot_ceiling);
         let snapshot_ddl = self.full_state_snapshot_ddl();
-        let history = self.ddl_log_entries_since_unlocked(Lsn(0));
+        let history = self.ddl_log_entries_since_unlocked(Lsn(0))?;
         let complete_history = if history.is_empty() {
             false
         } else {
@@ -57062,26 +57169,37 @@ impl Database {
             return self.persisted_state_since_with_ddl_provenance(since_lsn);
         }
 
+        #[cfg(feature = "test-seams")]
+        if since_lsn.0 < self.forced_change_log_gap_through.load(Ordering::SeqCst) {
+            return self.persisted_state_projected(since_lsn, projection);
+        }
+
         // Check if the ephemeral logs can serve the requested watermark.
         // After restart, both logs are empty but stores may have data — fall back to snapshot.
-        let (change_first_lsn, change_log_empty, ddl_first_lsn, ddl_log_empty) = self
-            .with_commit_lock(|| {
-                let log = self.change_log.read();
-                let change_first_lsn = log.first().map(|e| e.lsn());
-                let change_log_empty = log.is_empty();
-                drop(log);
-
-                let ddl = self.ddl_log.read();
-                let ddl_first_lsn = ddl.first().map(|(lsn, _)| *lsn);
-                let ddl_log_empty = ddl.is_empty();
-
+        let (change_first_lsn, change_log_empty, ddl_first_lsn, ddl_log_empty) =
+            if let (_, Some(root)) = self.capture_writer_statement()? {
+                let mut changes = root.change_log_cursor(Lsn(0), root.lsn)?;
+                let first_change = changes.next_change()?.map(|window| window.value.lsn());
+                let mut ddl = root.ddl_history_cursor(Lsn(0))?;
+                let first_ddl = ddl.next_ddl_history()?.map(|window| window.value.0);
                 (
-                    change_first_lsn,
-                    change_log_empty,
-                    ddl_first_lsn,
-                    ddl_log_empty,
+                    first_change,
+                    first_change.is_none(),
+                    first_ddl,
+                    first_ddl.is_none(),
                 )
-            });
+            } else {
+                self.with_commit_lock(|| {
+                    let log = self.change_log.read();
+                    let ddl = self.ddl_log.read();
+                    (
+                        log.first().map(ChangeLogEntry::lsn),
+                        log.is_empty(),
+                        ddl.first().map(|(lsn, _)| *lsn),
+                        ddl.is_empty(),
+                    )
+                })
+            };
 
         let has_table_data = !self
             .relational_store
@@ -57137,7 +57255,7 @@ impl Database {
                 (projection.admit)(ddl_bytes.saturating_add(change_bytes))?;
             }
             let ddl = if projection.ddl {
-                self.ddl_log_entries_since_unlocked(since_lsn)
+                self.ddl_log_entries_since_unlocked(since_lsn)?
             } else {
                 Vec::new()
             };
@@ -57732,7 +57850,7 @@ impl Database {
         let snapshot = self.snapshot();
         let confirmed_snapshot = self.snapshot_at(confirmed_frontier);
         let no_deleted = HashSet::new();
-        let history = self.sync_direction_history();
+        let history = self.try_sync_direction_history()?;
         let roots = changes
             .rows
             .iter()
@@ -58401,8 +58519,8 @@ impl Database {
     /// log when this database has persistence. A forced log gap must not turn
     /// old received schema into unprovable synthetic output after a move.
     pub(crate) fn durable_ddl_history_for_provenance(&self) -> Result<Vec<(Lsn, DdlChange)>> {
-        if let Some(persistence) = &self.persistence {
-            persistence.load_ddl_log()
+        if self.persistence.is_some() {
+            self.durable_ddl_entries_since(Lsn(0))
         } else {
             Ok(self.ddl_log.read().clone())
         }
@@ -60540,13 +60658,18 @@ impl Database {
 
     // Use authenticated arrival provenance to distinguish this
     // node's own declaration from policy it merely adopted and relays.
-    fn locally_declared_custody_policy(&self, table: &str) -> bool {
+    fn locally_declared_custody_policy(&self, table: &str) -> Result<bool> {
+        let history = self.checked_ddl_entries_since(Lsn(0))?;
         let arrivals = self.received_ddl_arrivals.read();
-        let mut ordinals = HashMap::<Lsn, u32>::new();
-        self.ddl_log.read().iter().any(|(lsn, change)| {
-            let ordinal = ordinals.entry(*lsn).or_default();
-            let received = arrivals.contains_key(&(*lsn, *ordinal));
-            *ordinal += 1;
+        let mut previous_lsn = None;
+        let mut next_ordinal = 0u32;
+        Ok(history.iter().any(|(lsn, change)| {
+            if previous_lsn != Some(*lsn) {
+                previous_lsn = Some(*lsn);
+                next_ordinal = 0;
+            }
+            let received = arrivals.contains_key(&(*lsn, next_ordinal));
+            next_ordinal += 1;
             if received {
                 return false;
             }
@@ -60600,7 +60723,7 @@ impl Database {
                 || m.history_policy.is_some()
                 || m.delivery_manifest_tables.is_some()
                 || m.edge_discard.is_some()
-        })
+        }))
     }
 
     /// Whether this node's declared or bound policy refuses one arriving
@@ -60652,7 +60775,7 @@ impl Database {
         let installer_owned = crate::executor::ENGINE_OWNED_LEDGER_TABLES.contains(&name.as_str())
             || crate::executor::is_hub_refereed_sync_conflict_table(name);
         if !installer_owned
-            && self.locally_declared_custody_policy(name)
+            && self.locally_declared_custody_policy(name)?
             && let Some(local) = self.table_meta(name)
         {
             let local_policy = crate::custody::policy::from_meta(&local);
@@ -69620,7 +69743,7 @@ fn prune_expired_rows(
         .collect();
     let (_pruned_change_log_entries, removed_lsn_counts) = {
         let table_index = change_log_table_index.read();
-        count_pruned_change_log_entries(&table_index, &pruned_change_keys)
+        count_pruned_change_log_entries_at_root(tx_mgr, &table_index, &pruned_change_keys)?
     };
 
     let membership_deletes = orphaned_source_lsn_rows
@@ -69942,6 +70065,39 @@ fn scoped_commit_index_candidates(
     if affected_lsns.is_empty() {
         return Ok(Vec::new());
     }
+    if let Some(root) = writer_read::durable_root(tx_mgr.capture_published_read().handle)? {
+        let mut cursor = root.change_log_cursor(Lsn(0), root.lsn)?;
+        let mut floor_after = None;
+        let mut previous_lsn = None;
+        while let Some(window) = cursor.next_change()? {
+            let lsn = window.value.lsn();
+            if previous_lsn == Some(lsn) {
+                continue;
+            }
+            previous_lsn = Some(lsn);
+            if root.change_log_occurrences(lsn)?
+                > removed_lsn_counts.get(&lsn).copied().unwrap_or(0)
+            {
+                floor_after = Some(lsn);
+                break;
+            }
+        }
+        let anchor = tx_mgr
+            .try_commit_index_floor(
+                floor_after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+            )?
+            .map(|(lsn, _)| lsn);
+        let mut candidates = Vec::new();
+        for lsn in affected_lsns {
+            if Some(*lsn) != anchor
+                && root.change_log_occurrences(*lsn)?
+                    <= removed_lsn_counts.get(lsn).copied().unwrap_or(0)
+            {
+                candidates.push(*lsn);
+            }
+        }
+        return Ok(candidates);
+    }
     let still_covered = |lsn: Lsn| -> bool {
         lsn_refcounts.get(&lsn).copied().unwrap_or(0)
             > removed_lsn_counts.get(&lsn).copied().unwrap_or(0)
@@ -70140,6 +70296,35 @@ impl ChangeLogAuxIndexFixtureForTest {
 /// this. Also returns the per-LSN breakdown (`removed_lsn_counts`), which
 /// `scoped_commit_index_removal` needs to know which LSNs the change log
 /// still covers after this pass.
+fn count_pruned_change_log_entries_at_root(
+    tx_mgr: &TransactionManager<DynStore>,
+    resident: &ChangeLogTableIndex,
+    pruned: &HashMap<String, HashSet<(RowId, Lsn)>>,
+) -> Result<(u64, HashMap<Lsn, u64>)> {
+    let Some(root) = writer_read::durable_root(tx_mgr.capture_published_read().handle)? else {
+        return Ok(count_pruned_change_log_entries(resident, pruned));
+    };
+    let mut total = 0u64;
+    let mut removed = HashMap::new();
+    for (table, keys) in pruned {
+        for (row, lsn) in keys {
+            let mut cursor = root.table_change_cursor(table, *lsn, *lsn)?;
+            while let Some(window) = cursor.next_table_change()? {
+                let matching = match window.value {
+                    ChangeLogEntry::RowInsert { row_id, .. }
+                    | ChangeLogEntry::RowDelete { row_id, .. } => row_id == *row,
+                    _ => false,
+                };
+                if matching {
+                    total += 1;
+                    *removed.entry(*lsn).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    Ok((total, removed))
+}
+
 fn count_pruned_change_log_entries(
     change_log_table_index: &ChangeLogTableIndex,
     pruned_by_table: &HashMap<String, HashSet<(RowId, Lsn)>>,
@@ -70554,7 +70739,7 @@ fn compact_currency_versions_inner(
         .collect();
     let (pruned_change_log_entries, removed_lsn_counts) = {
         let table_index = change_log_table_index.read();
-        count_pruned_change_log_entries(&table_index, &pruned_change_keys)
+        count_pruned_change_log_entries_at_root(tx_mgr, &table_index, &pruned_change_keys)?
     };
 
     // Select commit-index removals from the pre-pass counts before deleting any
