@@ -50210,14 +50210,18 @@ impl Database {
                 artifact.append_change_log_entries_batch(&batch)?;
             }
 
-            let ddl_entries: Vec<(Lsn, DdlChange)> = self
-                .ddl_log
-                .read()
-                .iter()
-                .filter(|(lsn, _)| *lsn <= snapshot_lsn)
-                .cloned()
-                .collect();
-            artifact.append_ddl_log_entries(&ddl_entries)?;
+            if let Some(root) = &writer_root {
+                root.copy_ddl_into(artifact, snapshot_lsn)?;
+            } else {
+                let ddl_entries: Vec<(Lsn, DdlChange)> = self
+                    .ddl_log
+                    .read()
+                    .iter()
+                    .filter(|(lsn, _)| *lsn <= snapshot_lsn)
+                    .cloned()
+                    .collect();
+                artifact.append_ddl_log_entries(&ddl_entries)?;
+            }
 
             if let Some(root) = &writer_root {
                 let mut cursor = root.commit_cursor(Lsn(0), snapshot_lsn, false)?;

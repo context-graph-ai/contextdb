@@ -17,6 +17,7 @@ mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
 pub(crate) mod writer_cleanup_progress;
 mod writer_commit_directory;
+mod writer_export;
 mod writer_file;
 mod writer_history;
 mod writer_recovery;
