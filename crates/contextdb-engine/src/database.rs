@@ -30191,7 +30191,7 @@ impl Database {
         }
         let mut deleted_rows = HashMap::<String, HashMap<RowId, VersionedRow>>::new();
         for (table, row_id, _) in &operational.relational_deletes {
-            if let Some(row) = self.relational_store.live_row_by_id(table, *row_id) {
+            if let Some(row) = self.committed_row_at(table, *row_id, self.snapshot_for_read())? {
                 deleted_rows
                     .entry(table.clone())
                     .or_default()
@@ -31750,11 +31750,12 @@ impl Database {
             // the stable authenticated identity, and retries reuse that bound
             // sidecar. Sampling a live row/current LSN here races compaction
             // and turns a retry into a different creator tuple.
-            let live_row = self
-                .row_id_for_natural_key_full(&row.table, &row.natural_key, self.snapshot_for_read())
-                .and_then(|row_id| {
-                    self.row_visible_at_snapshot(&row.table, row_id, self.snapshot_for_read())
-                });
+            let live_row = self.visible_row_by_natural_key(
+                &row.table,
+                &row.natural_key,
+                self.snapshot_for_read(),
+                &HashSet::new(),
+            )?;
             let generation = self.durable_lineage_table_generation(&row.table)?;
             let sidecar_key =
                 Self::durable_row_lineage_config_key(&row.table, &row.natural_key, generation);
@@ -49938,11 +49939,17 @@ impl Database {
         // landing mid-copy carry visibility TxIds above the watermark and LSN
         // stamps above the snapshot LSN, so the filters below exclude them
         // entirely — a commit is in the artifact entirely or not at all.
-        let (watermark, snapshot_lsn, commit_index, blob_snapshot, checkpoint_source) = self
-            .with_commit_lock(|| -> Result<_> {
+        let (watermark, snapshot_lsn, commit_index, blob_snapshot, checkpoint_source, writer_root) =
+            self.with_commit_lock(|| -> Result<_> {
                 let watermark = self.tx_mgr.current_tx_max();
                 let snapshot_lsn = self.tx_mgr.current_lsn();
-                let commit_index = self.tx_mgr.try_commit_index_prefix(snapshot_lsn)?;
+                let writer_root =
+                    writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?;
+                let commit_index = if writer_root.is_none() {
+                    self.tx_mgr.try_commit_index_prefix(snapshot_lsn)?
+                } else {
+                    BTreeMap::new()
+                };
                 let blob_snapshot = self.blob_repository.begin_export_snapshot()?;
                 let checkpoint_source = self
                     .persistence
@@ -49955,12 +49962,19 @@ impl Database {
                     commit_index,
                     blob_snapshot,
                     checkpoint_source,
+                    writer_root,
                 ))
             })?;
         #[cfg(feature = "test-seams")]
         self.export_after_capture_pause.maybe_pause();
 
-        let table_meta = self.relational_store.table_meta.read().clone();
+        let table_meta = match &writer_root {
+            Some(root) => root
+                .captured_table_metadata()
+                .map(|(name, meta)| (name.to_owned(), meta.clone()))
+                .collect(),
+            None => self.relational_store.table_meta.read().clone(),
+        };
         for (name, meta) in &table_meta {
             artifact.flush_table_meta(name, meta)?;
         }
@@ -49974,6 +49988,58 @@ impl Database {
         for name in table_names {
             let name = name.as_str();
             let meta = table_meta.get(name);
+            if let (Some(root), Some(source), Some(meta)) = (&writer_root, &checkpoint_source, meta)
+            {
+                use std::ops::Bound;
+                let mut cursor = root.cursor(
+                    &RedbPersistence::rel_table_name(name),
+                    crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                    false,
+                )?;
+                while let Some(window) = cursor.next_row()? {
+                    let _row_copy = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                        self.accountant.clone(),
+                        window.value.estimated_bytes(),
+                        "storage",
+                        "export_row",
+                        "Raise MEMORY_LIMIT to export this row.",
+                    )?;
+                    let Some(mut row) = export_row_at_snapshot(&window.value, watermark) else {
+                        continue;
+                    };
+                    let (_, admission) = source.load_export_row_values(
+                        name,
+                        meta,
+                        std::slice::from_mut(&mut row),
+                    )?;
+                    source.overlay_export_row_f32_projections(
+                        name,
+                        meta,
+                        std::slice::from_mut(&mut row),
+                    )?;
+                    artifact.append_table_rows_batch(
+                        name,
+                        Some(meta),
+                        std::slice::from_ref(&row),
+                    )?;
+                    if row.deleted_tx.is_none() {
+                        row_count += 1;
+                        if let Some((lsn, kind)) = root.sync_source(name, row.row_id)? {
+                            artifact.append_sync_source_provenance_batch(&[(
+                                name.to_owned(),
+                                row.row_id,
+                                lsn,
+                                kind,
+                            )])?;
+                        }
+                    }
+                    drop(admission);
+                }
+                artifact.rebuild_relational_indexes_for_current_table(name, meta)?;
+                continue;
+            }
             let mut offset = 0usize;
             loop {
                 let (mut batch, source_provenance) = {
@@ -50077,13 +50143,42 @@ impl Database {
         // Edges: the forward adjacency is the canonical copy; the writer
         // derives the reverse table from the same entries.
         let mut edge_count = 0u64;
-        let nodes: Vec<NodeId> = self
-            .graph_store
-            .forward_adj
-            .read()
-            .keys()
-            .copied()
-            .collect();
+        if let Some(root) = &writer_root {
+            use std::ops::Bound;
+            let mut cursor = root.cursor(
+                "graph_fwd",
+                crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                false,
+            )?;
+            while let Some(window) = cursor.next_edge()? {
+                let _edge_copy = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    self.accountant.clone(),
+                    window.value.estimated_bytes(),
+                    "storage",
+                    "export_edge",
+                    "Raise MEMORY_LIMIT to export this edge.",
+                )?;
+                let Some(edge) = export_edge_at_snapshot(&window.value, watermark) else {
+                    continue;
+                };
+                if edge.deleted_tx.is_none() {
+                    edge_count += 1;
+                }
+                artifact.append_graph_edges_batch(std::slice::from_ref(&edge))?;
+            }
+        }
+        let nodes: Vec<NodeId> = if writer_root.is_some() {
+            Vec::new()
+        } else {
+            self.graph_store
+                .forward_adj
+                .read()
+                .keys()
+                .copied()
+                .collect()
+        };
         for chunk in nodes.chunks(EXPORT_NODE_BATCH_SIZE) {
             let batch = {
                 let forward = self.graph_store.forward_adj.read();
@@ -50118,35 +50213,59 @@ impl Database {
             let Some(entry) = export_vector_at_snapshot(&partitioned.entry, watermark) else {
                 continue;
             };
-            let owner = self
-                .relational_store
-                .tables
-                .read()
-                .get(&entry.index.table)
-                .and_then(|rows| {
-                    rows.iter()
-                        .find(|row| {
-                            row.row_id == entry.row_id
-                                && row.created_tx == entry.created_tx
-                                && row.lsn == entry.lsn
-                        })
-                        .or_else(|| {
-                            entry.deleted_tx.is_none().then(|| {
-                                rows.iter()
-                                    .filter(|row| {
-                                        row.row_id == entry.row_id && row.deleted_tx.is_none()
-                                    })
-                                    .max_by_key(|row| (row.lsn, row.created_tx))
-                            })?
-                        })
-                        .cloned()
-                })
-                .ok_or_else(|| {
-                    Error::Other(format!(
-                        "exported vector {} row {} has no owning relational version",
-                        entry.index, entry.row_id.0
-                    ))
-                })?;
+            let owner = if let Some(root) = &writer_root {
+                let mut cursor = root.row_cursor(&entry.index.table, entry.row_id)?;
+                let mut owner = None;
+                while let Some(window) = cursor.next_row()? {
+                    let row = &window.value;
+                    if row.created_tx == entry.created_tx && row.lsn == entry.lsn {
+                        owner = Some((row.created_tx, row.lsn));
+                        break;
+                    }
+                }
+                if owner.is_none() && entry.deleted_tx.is_none() {
+                    let source = crate::persistence::writer_adapters::WriterRelationalSource::new(
+                        root.clone(),
+                    )?;
+                    owner = contextdb_relational::source::visible_row(
+                        &source,
+                        &entry.index.table,
+                        entry.row_id,
+                        SnapshotId::from_tx(watermark),
+                    )?
+                    .map(|window| (window.value().created_tx, window.value().lsn));
+                }
+                owner
+            } else {
+                self.relational_store
+                    .tables
+                    .read()
+                    .get(&entry.index.table)
+                    .and_then(|rows| {
+                        rows.iter()
+                            .find(|row| {
+                                row.row_id == entry.row_id
+                                    && row.created_tx == entry.created_tx
+                                    && row.lsn == entry.lsn
+                            })
+                            .or_else(|| {
+                                entry.deleted_tx.is_none().then(|| {
+                                    rows.iter()
+                                        .filter(|row| {
+                                            row.row_id == entry.row_id && row.deleted_tx.is_none()
+                                        })
+                                        .max_by_key(|row| (row.lsn, row.created_tx))
+                                })?
+                            })
+                            .map(|row| (row.created_tx, row.lsn))
+                    })
+            }
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "exported vector {} row {} has no owning relational version",
+                    entry.index, entry.row_id.0
+                ))
+            })?;
             if entry.deleted_tx.is_none() {
                 vector_count += 1;
             }
@@ -50154,11 +50273,11 @@ impl Database {
                 index: entry.index.clone(),
                 partition_key: partitioned.partition_key,
                 row_id: entry.row_id,
-                row_created_tx: owner.created_tx,
-                row_lsn: owner.lsn,
+                row_created_tx: owner.0,
+                row_lsn: owner.1,
                 vector_created_tx: entry.created_tx,
                 vector_lsn: entry.lsn,
-                visible_from: TxId(owner.created_tx.0.max(entry.created_tx.0)),
+                visible_from: TxId(owner.0.0.max(entry.created_tx.0)),
                 deleted_tx: entry.deleted_tx,
             });
             vector_batch.push(entry);
@@ -50176,7 +50295,22 @@ impl Database {
         // indices tracked across batches so multi-entry commits never collide.
         let mut offset = 0usize;
         let mut lsn_run: Option<(Lsn, usize)> = None;
+        if let Some(root) = &writer_root {
+            let mut cursor = root.change_log_cursor(Lsn(0), snapshot_lsn)?;
+            while let Some(window) = cursor.next_change()? {
+                let ordinal = usize::try_from(u64::from_be_bytes(
+                    window.position()[8..16]
+                        .try_into()
+                        .expect("numeric occurrence key"),
+                ))
+                .map_err(|_| Error::Other("export change ordinal exceeds usize".into()))?;
+                artifact.append_change_log_entries_batch(&[(ordinal, window.value.clone())])?;
+            }
+        }
         loop {
+            if writer_root.is_some() {
+                break;
+            }
             let batch: Vec<(usize, ChangeLogEntry)> = {
                 let log = self.change_log.read();
                 if offset >= log.len() {
@@ -50211,7 +50345,20 @@ impl Database {
             .collect();
         artifact.append_ddl_log_entries(&ddl_entries)?;
 
-        artifact.flush_commit_index_entries(&commit_index)?;
+        if let Some(root) = &writer_root {
+            let mut cursor = root.commit_cursor(Lsn(0), snapshot_lsn, false)?;
+            let mut batch = BTreeMap::new();
+            while let Some((lsn, tx)) = cursor.next()? {
+                batch.insert(lsn, tx);
+                if batch.len() == EXPORT_BATCH_SIZE {
+                    artifact.flush_commit_index_entries(&batch)?;
+                    batch.clear();
+                }
+            }
+            artifact.flush_commit_index_entries(&batch)?;
+        } else {
+            artifact.flush_commit_index_entries(&commit_index)?;
+        }
 
         // The owning Redb read transaction was captured with the relational
         // snapshot tuple. Copy only its canonical manifest-owned blob roles;
@@ -67044,14 +67191,16 @@ impl Database {
         key_value: &Value,
         snapshot: SnapshotId,
     ) -> Option<RowId> {
-        self.relational_store
-            .tables
-            .read()
-            .get(table)?
-            .iter()
-            .rev()
-            .find(|row| row.visible_at(snapshot) && row.values.get(key_col) == Some(key_value))
-            .map(|row| row.row_id)
+        self.required_indexed_visible_row_by_column(
+            table,
+            key_col,
+            key_value,
+            snapshot,
+            &HashSet::new(),
+        )
+        .ok()
+        .flatten()
+        .map(|row| row.row_id)
     }
 
     /// The visible row carrying a whole sync identity, matched on every key
@@ -67082,13 +67231,9 @@ impl Database {
         natural_key: &NaturalKey,
         snapshot: SnapshotId,
     ) -> Option<RowId> {
-        self.relational_store
-            .tables
-            .read()
-            .get(table)?
-            .iter()
-            .rev()
-            .find(|row| row.visible_at(snapshot) && natural_key.matches_values(&row.values))
+        self.visible_row_by_natural_key(table, natural_key, snapshot, &HashSet::new())
+            .ok()
+            .flatten()
             .map(|row| row.row_id)
     }
 

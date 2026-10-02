@@ -423,6 +423,10 @@ pub(crate) struct WriterWindow<T> {
 }
 
 impl<T> WriterWindow<T> {
+    pub(crate) fn position(&self) -> &[u8] {
+        &self.position
+    }
+
     pub(super) fn map<U>(self, f: impl FnOnce(T) -> U) -> WriterWindow<U> {
         WriterWindow {
             value: f(self.value),

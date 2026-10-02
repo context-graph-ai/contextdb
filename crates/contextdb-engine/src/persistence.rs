@@ -32139,7 +32139,7 @@ impl RedbPersistence {
         })
     }
 
-    fn rel_table_name(name: &str) -> String {
+    pub(crate) fn rel_table_name(name: &str) -> String {
         format!("rel_{name}")
     }
 
