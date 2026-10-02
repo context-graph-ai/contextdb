@@ -254,9 +254,9 @@ pub(crate) struct TransactionVectorOverlay {
     /// Identities the transaction staged a vector for, so the committed entry
     /// is passed over and the staged one published in its place.
     pub(crate) staged_identities: std::collections::HashSet<RowId>,
-    /// Where this index's staged vectors sit in the write set, newest version
-    /// per row, in the order the transaction staged them.
-    pub(crate) staged_positions: Vec<usize>,
+    /// Immutable staged identity/payload owners, newest version per row,
+    /// in the order the transaction staged them.
+    pub(crate) staged_vectors: Vec<Arc<contextdb_tx::ordered_staged::StagedVectorCapability>>,
     /// How many transaction-delta entries can remove, move, or add to the
     /// source answer. A source that stops at the statement's LIMIT would
     /// truncate before the overlay has had its say, so this many extra
@@ -270,7 +270,7 @@ impl TransactionVectorOverlay {
     /// Nothing staged, nothing withdrawn, nothing moved: the search is the
     /// search it would have been with no transaction open.
     pub(crate) fn is_empty(&self) -> bool {
-        self.removed.is_empty() && self.moved.is_empty() && self.staged_positions.is_empty()
+        self.removed.is_empty() && self.moved.is_empty() && self.staged_vectors.is_empty()
     }
 
     /// Kept only when it actually changes the search, so every later read of
@@ -462,16 +462,16 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     }
 
     /// One vector the transaction has staged, cloned under the caller's
-    /// charge, exactly as a committed entry is. `position` is an entry of
-    /// [`TransactionVectorOverlay::staged_positions`].
+    /// charge, exactly as a committed entry is. The immutable capability comes
+    /// from [`TransactionVectorOverlay::staged_vectors`].
     fn transaction_staged_vector(
         &self,
         tx: TxId,
-        position: usize,
+        capability: &contextdb_tx::ordered_staged::StagedVectorCapability,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<(RowId, Vec<f32>)>, BoundedExecutionError> {
-        let _ = (tx, position, before_touch, before_clone);
+        let _ = (tx, capability, before_touch, before_clone);
         Ok(None)
     }
 
@@ -526,12 +526,14 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 
     fn bounded_read_snapshot_registration(
         &self,
+        needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<BoundedReadSnapshotPin>>;
 
     fn bounded_cursor_snapshot_registration(
         &self,
+        needs_vector_graph: bool,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
@@ -1366,11 +1368,11 @@ impl ReadExecutionTarget for Database {
     fn transaction_staged_vector(
         &self,
         tx: TxId,
-        position: usize,
+        capability: &contextdb_tx::ordered_staged::StagedVectorCapability,
         before_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_clone: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
     ) -> std::result::Result<Option<(RowId, Vec<f32>)>, BoundedExecutionError> {
-        Database::transaction_staged_vector(self, tx, position, before_touch, before_clone)
+        Database::transaction_staged_vector(self, tx, capability, before_touch, before_clone)
     }
 
     #[cfg(feature = "test-seams")]
@@ -1429,21 +1431,33 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_read_snapshot_registration(
         &self,
+        needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<BoundedReadSnapshotPin>> {
-        Database::bounded_read_snapshot_registration_with_root(self, budget, withdrawn)
+        Database::bounded_read_snapshot_registration_with_root(
+            self,
+            needs_vector_graph,
+            budget,
+            withdrawn,
+        )
     }
 
     fn bounded_cursor_snapshot_registration(
         &self,
+        needs_vector_graph: bool,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<BoundedCursorSnapshotPin>> {
         Database::bounded_cursor_snapshot_registration_with_root(
-            self, clock, idle_ms, budget, withdrawn,
+            self,
+            needs_vector_graph,
+            clock,
+            idle_ms,
+            budget,
+            withdrawn,
         )
     }
 
@@ -19027,22 +19041,29 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_read_snapshot_registration(
         &self,
+        needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<BoundedReadSnapshotPin>> {
         self.store
-            .bounded_read_snapshot_registration(budget, withdrawn)
+            .bounded_read_snapshot_registration(needs_vector_graph, budget, withdrawn)
     }
 
     fn bounded_cursor_snapshot_registration(
         &self,
+        needs_vector_graph: bool,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<BoundedCursorSnapshotPin>> {
-        self.store
-            .bounded_cursor_snapshot_registration(clock, idle_ms, budget, withdrawn)
+        self.store.bounded_cursor_snapshot_registration(
+            needs_vector_graph,
+            clock,
+            idle_ms,
+            budget,
+            withdrawn,
+        )
     }
 
     fn assert_table_read_allowed(&self, table: &str) -> Result<()> {

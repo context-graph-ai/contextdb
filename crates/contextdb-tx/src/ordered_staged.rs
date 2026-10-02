@@ -117,6 +117,51 @@ pub fn staged_key_bytes(key: &IndexKey) -> usize {
     )
 }
 
+/// An immutable vector selected at the mutation boundary. Statement capture
+/// shares this capability; it never retains a mutable ordinary-write position.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StagedVectorCapability {
+    row_id: RowId,
+    column: String,
+    payload: StagedVectorPayload,
+    _charge: Arc<dyn StagedPostingCharge>,
+}
+#[derive(Debug)]
+enum StagedVectorPayload {
+    Scalar(Arc<crate::statement_rows::RowOwner>),
+    Owned(Arc<AdmittedVectorPayload>),
+}
+#[derive(Debug)]
+struct AdmittedVectorPayload {
+    values: Vec<f32>,
+    _charge: Arc<dyn StagedPostingCharge>,
+}
+impl StagedVectorCapability {
+    pub fn row_id(&self) -> RowId {
+        self.row_id
+    }
+    pub fn vector(&self) -> &[f32] {
+        match &self.payload {
+            StagedVectorPayload::Scalar(owner) => match owner.row.values.get(&self.column) {
+                Some(Value::Vector(values)) => values,
+                _ => unreachable!("immutable scalar vector owner"),
+            },
+            StagedVectorPayload::Owned(owner) => &owner.values,
+        }
+    }
+}
+#[derive(Debug, Clone)]
+struct StagedVectorIndex {
+    rows: BTreeMap<RowId, Arc<StagedVectorCapability>>,
+    _charge: Arc<dyn StagedPostingCharge>,
+}
+#[doc(hidden)]
+pub struct PreparedStagedVector {
+    capability: Arc<StagedVectorCapability>,
+    new_index: Option<StagedVectorIndex>,
+}
+
 pub type OrderedStagedBounds<'a> = (Bound<&'a (IndexKey, RowId)>, Bound<&'a (IndexKey, RowId)>);
 type RowCharges = BTreeMap<RowId, (usize, Arc<dyn StagedPostingCharge>)>;
 
@@ -147,6 +192,7 @@ pub struct OrderedStagedRows {
     vector_undo: Vec<StagedVectorUndo>,
     journal_charges: Vec<Arc<dyn StagedPostingCharge>>,
     vector_prepared: usize,
+    vectors: BTreeMap<String, BTreeMap<String, StagedVectorIndex>>,
 }
 impl Clone for OrderedStagedRows {
     fn clone(&self) -> Self {
@@ -159,6 +205,7 @@ impl Clone for OrderedStagedRows {
             vector_undo: Vec::new(),
             journal_charges: Vec::new(),
             vector_prepared: 0,
+            vectors: self.vectors.clone(),
         }
     }
 }
@@ -170,6 +217,9 @@ pub struct PreparedVectorUndo {
     inserts: Vec<(usize, contextdb_core::VectorEntry)>,
     moves: Vec<(usize, (contextdb_core::VectorIndexRef, RowId, RowId, TxId))>,
     deletes: Vec<(usize, (contextdb_core::VectorIndexRef, RowId, TxId))>,
+    vector_index_existed: bool,
+    old_vector: Option<Arc<StagedVectorCapability>>,
+    old_source_vector: Option<Arc<StagedVectorCapability>>,
     installed_bytes: usize,
     preserve_inserts: bool,
     moving: Option<(RowId, Option<usize>)>,
@@ -394,6 +444,12 @@ impl OrderedStagedRows {
             inserts: Vec::with_capacity(ni),
             moves: Vec::with_capacity(nm),
             deletes: Vec::with_capacity(nd),
+            vector_index_existed: self
+                .vectors
+                .get(&index.table)
+                .is_some_and(|columns| columns.contains_key(&index.column)),
+            old_vector: self.vector_capability(index, row_id),
+            old_source_vector: None,
             installed_bytes: 0,
             preserve_inserts: false,
             moving: None,
@@ -504,6 +560,12 @@ impl OrderedStagedRows {
             inserts: Vec::with_capacity(n.saturating_add(usize::from(moving_position.is_some()))),
             moves: prior_moves,
             deletes: Vec::new(),
+            vector_index_existed: self
+                .vectors
+                .get(&index.table)
+                .is_some_and(|columns| columns.contains_key(&index.column)),
+            old_vector: self.vector_capability(index, to),
+            old_source_vector: self.vector_capability(index, from),
             installed_bytes: 0,
             preserve_inserts: false,
             moving: Some((from, moving_position)),
@@ -566,6 +628,12 @@ impl OrderedStagedRows {
             inserts: Vec::new(),
             moves: prior_moves,
             deletes: Vec::new(),
+            vector_index_existed: self
+                .vectors
+                .get(&index.table)
+                .is_some_and(|columns| columns.contains_key(&index.column)),
+            old_vector: self.vector_capability(index, row_id),
+            old_source_vector: None,
             installed_bytes: 0,
             preserve_inserts: true,
             moving: Some((row_id, None)),
@@ -645,6 +713,16 @@ impl OrderedStagedRows {
         while self.vector_undo.len() > marker[1] {
             let mut undo = self.vector_undo.pop().expect("vector undo");
             release(undo.installed_bytes);
+            self.remove_vector_capability(&undo.index, undo.row_id);
+            if let Some((from, _)) = undo.moving {
+                self.remove_vector_capability(&undo.index, from);
+                if let Some(prior) = undo.old_source_vector.take() {
+                    self.restore_vector_capability(&undo.index, prior);
+                }
+            }
+            if let Some(prior) = undo.old_vector.take() {
+                self.restore_vector_capability(&undo.index, prior);
+            }
             if let Some((from, Some(position))) = undo.moving
                 && let Some(current) = inserts
                     .iter()
@@ -666,6 +744,23 @@ impl OrderedStagedRows {
             });
             if undo.moving.is_none() && !undo.preserve_inserts {
                 deletes.retain(|(index, row, _)| *index != undo.index || *row != undo.row_id);
+            }
+            if !undo.vector_index_existed
+                && let Some(columns) = self.vectors.get_mut(&undo.index.table)
+            {
+                let empty = columns
+                    .get(&undo.index.column)
+                    .is_some_and(|owners| owners.rows.is_empty());
+                let removed_index = empty.then(|| columns.remove(&undo.index.column));
+                let removed_table = columns
+                    .is_empty()
+                    .then(|| self.vectors.remove(&undo.index.table));
+                if self.vectors.is_empty() {
+                    self.vectors = BTreeMap::new();
+                }
+                // Keep admission until both outer/column empty leaves retire.
+                drop(removed_table);
+                drop(removed_index);
             }
             undo.admission.transfer_back();
             if undo.moving.is_some() {
@@ -1154,6 +1249,210 @@ impl OrderedStagedRows {
         })
     }
 
+    /// Controls for a per-index root remain owned until the transaction ends;
+    /// payload controls retire independently as rows are changed or withdrawn.
+    #[doc(hidden)]
+    pub fn vector_capability(
+        &self,
+        index: &contextdb_core::VectorIndexRef,
+        row: RowId,
+    ) -> Option<Arc<StagedVectorCapability>> {
+        self.vectors
+            .get(&index.table)?
+            .get(&index.column)?
+            .rows
+            .get(&row)
+            .cloned()
+    }
+    #[doc(hidden)]
+    pub fn prepare_vector_capability(
+        &self,
+        index: &contextdb_core::VectorIndexRef,
+        row: RowId,
+        values: &[f32],
+        mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    ) -> Result<PreparedStagedVector> {
+        let scalar = self
+            .statement_rows
+            .get(&index.table)
+            .and_then(|rows| rows.owner(row))
+            .filter(|owner| {
+                matches!(owner.row.values.get(&index.column),
+                Some(Value::Vector(have)) if have.as_slice() == values)
+            });
+        let payload = match scalar {
+            Some(owner) => StagedVectorPayload::Scalar(owner),
+            None => {
+                let charge = reserve(
+                    std::mem::size_of::<AdmittedVectorPayload>()
+                        .saturating_add(2 * std::mem::size_of::<usize>())
+                        .saturating_add(values.len().saturating_mul(std::mem::size_of::<f32>())),
+                )?;
+                StagedVectorPayload::Owned(Arc::new(AdmittedVectorPayload {
+                    values: values.to_vec(),
+                    _charge: charge,
+                }))
+            }
+        };
+        self.prepare_vector_capability_with_payload(index, row, payload, &mut reserve)
+    }
+    #[doc(hidden)]
+    pub fn prepare_moved_vector_capability(
+        &self,
+        index: &contextdb_core::VectorIndexRef,
+        from: RowId,
+        to: RowId,
+        mut reserve: impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    ) -> Result<Option<PreparedStagedVector>> {
+        let Some(prior) = self.vector_capability(index, from) else {
+            return Ok(None);
+        };
+        let payload = match &prior.payload {
+            StagedVectorPayload::Scalar(owner) => StagedVectorPayload::Scalar(owner.clone()),
+            StagedVectorPayload::Owned(owner) => StagedVectorPayload::Owned(owner.clone()),
+        };
+        self.prepare_vector_capability_with_payload(index, to, payload, &mut reserve)
+            .map(Some)
+    }
+    fn prepare_vector_capability_with_payload(
+        &self,
+        index: &contextdb_core::VectorIndexRef,
+        row: RowId,
+        payload: StagedVectorPayload,
+        reserve: &mut impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
+    ) -> Result<PreparedStagedVector> {
+        // The shared staged-posting B-tree envelope plus actual capability and
+        // owned column name; temporary preparation is admitted by the caller.
+        let charge = reserve(
+            std::mem::size_of::<StagedVectorCapability>()
+                .saturating_add(2 * std::mem::size_of::<usize>())
+                .saturating_add(256)
+                .saturating_add(index.column.len()),
+        )?;
+        let new_index = if self
+            .vectors
+            .get(&index.table)
+            .is_some_and(|columns| columns.contains_key(&index.column))
+        {
+            None
+        } else {
+            let charge =
+                reserve(
+                    std::mem::size_of::<StagedVectorIndex>()
+                        .saturating_add(
+                            128usize.saturating_add(
+                                11usize.saturating_mul(
+                                    std::mem::size_of::<String>()
+                                        .saturating_add(std::mem::size_of::<StagedVectorIndex>()),
+                                ),
+                            ),
+                        )
+                        .saturating_add(if self.vectors.contains_key(&index.table) {
+                            0
+                        } else {
+                            128usize
+                                .saturating_add(11usize.saturating_mul(
+                                    std::mem::size_of::<String>().saturating_add(
+                                        std::mem::size_of::<BTreeMap<String, StagedVectorIndex>>(),
+                                    ),
+                                ))
+                                .saturating_add(index.table.len())
+                        })
+                        .saturating_add(index.column.len()),
+                )?;
+            Some(StagedVectorIndex {
+                rows: BTreeMap::new(),
+                _charge: charge,
+            })
+        };
+        Ok(PreparedStagedVector {
+            capability: Arc::new(StagedVectorCapability {
+                row_id: row,
+                column: index.column.clone(),
+                payload,
+                _charge: charge,
+            }),
+            new_index,
+        })
+    }
+    #[doc(hidden)]
+    pub fn publish_vector_capability(
+        &mut self,
+        index: &contextdb_core::VectorIndexRef,
+        prepared: PreparedStagedVector,
+    ) {
+        if let Some(new) = prepared.new_index {
+            if !self.vectors.contains_key(&index.table) {
+                self.vectors.insert(index.table.clone(), BTreeMap::new());
+            }
+            self.vectors
+                .get_mut(&index.table)
+                .expect("prepared vector table")
+                .entry(index.column.clone())
+                .or_insert(new);
+        }
+        self.vectors
+            .get_mut(&index.table)
+            .and_then(|columns| columns.get_mut(&index.column))
+            .expect("prepared vector index")
+            .rows
+            .insert(prepared.capability.row_id, prepared.capability);
+    }
+    #[doc(hidden)]
+    pub fn remove_vector_capability(&mut self, index: &contextdb_core::VectorIndexRef, row: RowId) {
+        if let Some(owners) = self
+            .vectors
+            .get_mut(&index.table)
+            .and_then(|columns| columns.get_mut(&index.column))
+        {
+            let removed = owners.rows.remove(&row);
+            if owners.rows.is_empty() {
+                // std BTreeMap may keep its empty leaf; retire it before the
+                // final per-row control admission is released.
+                owners.rows = BTreeMap::new();
+            }
+            drop(removed);
+        }
+    }
+    fn restore_vector_capability(
+        &mut self,
+        index: &contextdb_core::VectorIndexRef,
+        capability: Arc<StagedVectorCapability>,
+    ) {
+        self.vectors
+            .get_mut(&index.table)
+            .and_then(|columns| columns.get_mut(&index.column))
+            .expect("retained vector index controls")
+            .rows
+            .insert(capability.row_id, capability);
+    }
+    #[doc(hidden)]
+    pub fn vector_capability_retained_bytes(&self) -> usize {
+        self.vectors
+            .values()
+            .flat_map(|columns| columns.values())
+            .map(|owners| {
+                owners._charge.retained_bytes().saturating_add(
+                    owners
+                        .rows
+                        .values()
+                        .map(|owner| {
+                            owner
+                                ._charge
+                                .retained_bytes()
+                                .saturating_add(match &owner.payload {
+                                    StagedVectorPayload::Scalar(_) => 0,
+                                    StagedVectorPayload::Owned(payload) => {
+                                        payload._charge.retained_bytes()
+                                    }
+                                })
+                        })
+                        .sum::<usize>(),
+                )
+            })
+            .sum()
+    }
+
     pub fn contains_row(&self, table: &str, row: RowId) -> bool {
         self.charges
             .get(table)
@@ -1161,16 +1460,18 @@ impl OrderedStagedRows {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.charges
-            .values()
-            .flat_map(|rows| rows.values())
-            .fold(0usize, |bytes, (charge, _)| bytes.saturating_add(*charge))
-            .saturating_add(
-                self.statement_rows
-                    .values()
-                    .map(|rows| rows.retained_bytes())
-                    .sum::<usize>(),
-            )
+        self.vector_capability_retained_bytes().saturating_add(
+            self.charges
+                .values()
+                .flat_map(|rows| rows.values())
+                .fold(0usize, |bytes, (charge, _)| bytes.saturating_add(*charge))
+                .saturating_add(
+                    self.statement_rows
+                        .values()
+                        .map(|rows| rows.retained_bytes())
+                        .sum::<usize>(),
+                ),
+        )
     }
 
     /// Canonicalization only changes positions/visibility identity, never keys.

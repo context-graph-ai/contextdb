@@ -207,6 +207,12 @@ impl Database {
                 }
             });
             ws.forget_admitted_bytes_for_unstaged_rows();
+            for entry in &ws.vector_inserts {
+                if selected_rows.contains(&(entry.index.table.clone(), entry.row_id)) {
+                    ws.ordered_staged_rows
+                        .remove_vector_capability(&entry.index, entry.row_id);
+                }
+            }
             ws.vector_inserts.retain(|entry| {
                 if selected_rows.contains(&(entry.index.table.clone(), entry.row_id)) {
                     removed.vector_inserts.push(entry.clone());

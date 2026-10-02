@@ -9262,6 +9262,9 @@ pub struct WriterMemoryOwnershipReceiptForTest {
     pub staged_row_versions: usize,
     pub staged_row_admissions: usize,
     pub staged_vector_admissions: usize,
+    /// Actual new capability/index controls and native immutable payload copies.
+    /// Included in staged_index_postings, rather than added a second time.
+    pub staged_vector_owner_controls: usize,
     pub staged_index_postings: usize,
     pub table_metadata: usize,
     pub graph_entries: usize,
@@ -38769,11 +38772,22 @@ impl Database {
                 // Before the relational body goes, so a failure leaves the row and
                 // its vectors together rather than a row with no embeddings.
                 for index in self.vector_indexes_of_table(table) {
-                    if self.vector_store.has_live_entry_for_row(
-                        &index,
-                        row_id,
-                        self.snapshot_for_read(),
-                    ) {
+                    let staged = self.tx_mgr.with_write_set(tx, |ws| {
+                        ws.vector_inserts
+                            .iter()
+                            .any(|entry| entry.index == index && entry.row_id == row_id)
+                            || ws
+                                .vector_moves
+                                .iter()
+                                .any(|(have, _, to, _)| *have == index && *to == row_id)
+                    })?;
+                    if staged
+                        || self.vector_store.has_live_entry_for_row(
+                            &index,
+                            row_id,
+                            self.snapshot_for_read(),
+                        )
+                    {
                         self.delete_vector(tx, index, row_id)?;
                     }
                 }
@@ -39919,6 +39933,9 @@ impl Database {
                     std::mem::size_of::<crate::memory_accounting::TransferredRowReservation>()
                         .saturating_add(2 * std::mem::size_of::<usize>()),
                 )
+                .saturating_add(std::mem::size_of::<
+                    contextdb_tx::ordered_staged::PreparedStagedVector,
+                >())
                 .saturating_add(std::mem::size_of::<(
                     Option<contextdb_tx::ordered_staged::PreparedVectorUndo>,
                     Arc<crate::memory_accounting::TransferredRowReservation>,
@@ -39958,7 +39975,24 @@ impl Database {
         self.record_vector_schema_epochs(tx, captured.iter().map(|(index, _)| index.clone()))?;
         self.tx_mgr.with_write_set(tx, |ws| {
             let mut prepared_undo = Vec::with_capacity(captured.len());
-            for (index, _) in &captured {
+            let mut prepared_vectors = Vec::with_capacity(captured.len());
+            for (index, vector) in &captured {
+                prepared_vectors.push(ws.ordered_staged_rows.prepare_vector_capability(
+                    index,
+                    row_id,
+                    vector,
+                    |bytes| {
+                        Ok(Arc::new(
+                            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                                self.accountant.clone(),
+                                bytes,
+                                "vector",
+                                "staged_immutable_owner",
+                                "Reduce staged vectors or raise MEMORY_LIMIT.",
+                            )?,
+                        ))
+                    },
+                )?);
                 let bytes = ws
                     .vector_inserts
                     .iter()
@@ -39997,8 +40031,10 @@ impl Database {
                 prepared_undo.push((undo?, admission, bytes));
             }
             let mut existing_live = existing_live.into_iter();
-            for ((index, vector), (undo, admission, bytes)) in
-                captured.into_iter().zip(prepared_undo.drain(..))
+            for (((index, vector), (undo, admission, bytes)), prepared_vector) in captured
+                .into_iter()
+                .zip(prepared_undo.drain(..))
+                .zip(prepared_vectors)
             {
                 let existing_live = existing_live.next().expect("prepared vector identity");
                 if let Some(undo) = undo {
@@ -40049,6 +40085,8 @@ impl Database {
                 {
                     ws.vector_deletes.push((index.clone(), row_id, tx));
                 }
+                ws.ordered_staged_rows
+                    .publish_vector_capability(&index, prepared_vector);
                 ws.vector_inserts.push(VectorEntry {
                     index,
                     row_id,
@@ -40175,6 +40213,8 @@ impl Database {
                     0,
                 );
             }
+            ws.ordered_staged_rows
+                .remove_vector_capability(&index, row_id);
             let mut canceled_inserts = Vec::new();
             let mut pos = 0;
             while pos < ws.vector_inserts.len() {
@@ -40359,6 +40399,22 @@ impl Database {
                     ))
                 },
             )?;
+            let prepared_vector = ws.ordered_staged_rows.prepare_moved_vector_capability(
+                &index,
+                old_row_id,
+                new_row_id,
+                |bytes| {
+                    Ok(Arc::new(
+                        crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                            self.accountant.clone(),
+                            bytes,
+                            "vector",
+                            "staged_immutable_owner",
+                            "Reduce staged vectors or raise MEMORY_LIMIT.",
+                        )?,
+                    ))
+                },
+            )?;
             let old_row_deleted =
                 ws.vector_deletes
                     .iter()
@@ -40438,6 +40494,16 @@ impl Database {
                 });
             }
 
+            if moved_any {
+                ws.ordered_staged_rows
+                    .remove_vector_capability(&index, old_row_id);
+                ws.ordered_staged_rows
+                    .remove_vector_capability(&index, new_row_id);
+                if let Some(prepared) = prepared_vector {
+                    ws.ordered_staged_rows
+                        .publish_vector_capability(&index, prepared);
+                }
+            }
             if let Some(undo) = undo {
                 admission.adopt(bytes);
                 ws.ordered_staged_rows
@@ -45105,7 +45171,7 @@ impl Database {
     /// The same five facts the established door merges by hand
     /// (`query_vector_strict_with_write_set_exact`), read once and carried as
     /// decisions rather than as a copy of the index: what this transaction
-    /// took out, what it re-filed elsewhere, and where its own vectors sit.
+    /// took out, what it re-filed elsewhere, and the immutable vectors it owns.
     pub(crate) fn transaction_vector_overlay(
         &self,
         tx: TxId,
@@ -45145,11 +45211,13 @@ impl Database {
                     .filter(|entry| entry.index == *index && entry.deleted_tx.is_none())
                     .count();
                 // Explicit requested capacities bound every hash allocation and the
-                // positions buffer before construction under the write-set lock.
+                // capability buffer before construction under the write-set lock.
                 let bytes = held::map::<RowId, ()>(removed_capacity)
                     .saturating_add(held::map::<RowId, RowId>(moved_capacity))
                     .saturating_add(held::map::<RowId, ()>(staged_capacity))
-                    .saturating_add(staged_capacity.saturating_mul(std::mem::size_of::<usize>()))
+                    .saturating_add(staged_capacity.saturating_mul(std::mem::size_of::<
+                        Arc<contextdb_tx::ordered_staged::StagedVectorCapability>,
+                    >()))
                     .saturating_add(if staged_capacity == 0 {
                         0
                     } else {
@@ -45185,25 +45253,31 @@ impl Database {
                     }
                 }
                 let mut staged_identities = HashSet::with_capacity(staged_capacity);
-                let mut staged_positions = Vec::with_capacity(staged_capacity);
-                for (position, entry) in ws.vector_inserts.iter().enumerate().rev() {
+                let mut staged_vectors = Vec::with_capacity(staged_capacity);
+                for entry in ws.vector_inserts.iter().rev() {
                     if entry.index == *index
                         && entry.deleted_tx.is_none()
                         && staged_identities.insert(entry.row_id)
                     {
-                        staged_positions.push(position);
+                        let capability = ws
+                            .ordered_staged_rows
+                            .vector_capability(index, entry.row_id)
+                            .ok_or_else(|| {
+                                Error::Other("staged vector has no admitted immutable owner".into())
+                            })?;
+                        staged_vectors.push(capability);
                     }
                 }
-                staged_positions.reverse();
+                staged_vectors.reverse();
                 let searchable_entry_count = removed
                     .len()
                     .saturating_add(moved.len())
-                    .saturating_add(staged_positions.len());
+                    .saturating_add(staged_vectors.len());
                 Ok(crate::executor::TransactionVectorOverlay {
                     removed,
                     moved,
                     staged_identities,
-                    staged_positions,
+                    staged_vectors,
                     searchable_entry_count,
                     _memory: Some(memory),
                 })
@@ -45219,8 +45293,8 @@ impl Database {
     /// committed entry of the same width costs.
     pub(crate) fn transaction_staged_vector(
         &self,
-        tx: TxId,
-        position: usize,
+        _tx: TxId,
+        capability: &contextdb_tx::ordered_staged::StagedVectorCapability,
         before_touch: &mut dyn FnMut() -> std::result::Result<
             (),
             crate::executor::BoundedExecutionError,
@@ -45233,35 +45307,16 @@ impl Database {
         >,
     ) -> std::result::Result<Option<(RowId, Vec<f32>)>, crate::executor::BoundedExecutionError>
     {
-        // Measured before it is copied, so the charge precedes the allocation
-        // it pays for.
-        let measured = self
-            .tx_mgr
-            .with_write_set(tx, |ws| {
-                ws.vector_inserts.get(position).map(|entry| {
-                    (
-                        entry.row_id,
-                        entry
-                            .vector
-                            .len()
-                            .saturating_mul(std::mem::size_of::<f32>())
-                            .saturating_add(std::mem::size_of::<Vec<f32>>()),
-                    )
-                })
-            })
-            .map_err(crate::executor::BoundedExecutionError::from)?;
-        let Some((row_id, bytes)) = measured else {
-            return Ok(None);
-        };
+        // The capability retains both identity and payload through admission.
+        // Later mutations never require another lookup in the WriteSet.
+        let values = capability.vector();
+        let bytes = values
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_add(std::mem::size_of::<Vec<f32>>());
         before_touch()?;
         before_clone(bytes)?;
-        self.tx_mgr
-            .with_write_set(tx, |ws| {
-                ws.vector_inserts
-                    .get(position)
-                    .map(|entry| (row_id, entry.vector.clone()))
-            })
-            .map_err(crate::executor::BoundedExecutionError::from)
+        Ok(Some((capability.row_id(), values.to_vec())))
     }
 
     #[cfg(test)]
@@ -45271,7 +45326,7 @@ impl Database {
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<(SnapshotId, Lsn, Box<dyn Send + Sync>)>> {
         Ok(self
-            .bounded_read_snapshot_registration_with_root(budget, withdrawn)?
+            .bounded_read_snapshot_registration_with_root(false, budget, withdrawn)?
             .map(|(snapshot, lsn, registration, root)| {
                 (
                     snapshot,
@@ -45297,7 +45352,9 @@ impl Database {
         )>,
     > {
         Ok(self
-            .bounded_cursor_snapshot_registration_with_root(clock, idle_ms, budget, withdrawn)?
+            .bounded_cursor_snapshot_registration_with_root(
+                false, clock, idle_ms, budget, withdrawn,
+            )?
             .map(|(snapshot, lsn, window, storage, registration, root)| {
                 (
                     snapshot,
@@ -45309,13 +45366,65 @@ impl Database {
             }))
     }
 
+    fn bounded_vector_graph_snapshot_registration(
+        &self,
+        idle_window: Option<Arc<CursorIdleWindow>>,
+        budget: &ReadRegistrationBudget,
+        withdrawn: &OwnerReadCancellation,
+    ) -> Result<Option<crate::executor::BoundedReadSnapshotPin>> {
+        let remaining = budget.remaining()?;
+        let Some(captured) = self.tx_mgr.try_with_commit_lock_cancellable_for(
+            remaining,
+            withdrawn,
+            || budget.remaining().is_err(),
+            || {
+                let (snapshot, root) =
+                    self.capture_writer_transaction_statement(self.active_read_transaction())?;
+                let lsn = root
+                    .as_ref()
+                    .map_or_else(|| self.current_lsn(), |root| root.lsn);
+                Ok(self
+                    .snapshot_registry
+                    .register_withdrawable_at_commit_boundary(
+                        snapshot,
+                        idle_window,
+                        budget,
+                        withdrawn,
+                    )?
+                    .map(|registration| (snapshot, lsn, registration, root)))
+            },
+        ) else {
+            return if withdrawn.is_cancelled() {
+                Ok(None)
+            } else {
+                Err(budget.elapsed_timeout())
+            };
+        };
+        // The admitted stack guard already protects the selected graph. Box
+        // its carrier only after the publication/registry locks are released.
+        captured.map(|captured| {
+            captured.map(|(snapshot, lsn, registration, root)| {
+                (
+                    snapshot,
+                    lsn,
+                    Box::new(registration) as Box<dyn Send + Sync>,
+                    root,
+                )
+            })
+        })
+    }
+
     pub(crate) fn bounded_read_snapshot_registration_with_root(
         &self,
+        needs_vector_graph: bool,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
     ) -> Result<Option<crate::executor::BoundedReadSnapshotPin>> {
         if withdrawn.is_cancelled() {
             return Ok(None);
+        }
+        if needs_vector_graph {
+            return self.bounded_vector_graph_snapshot_registration(None, budget, withdrawn);
         }
         if self.persistence.is_some() {
             budget.remaining()?;
@@ -45454,6 +45563,7 @@ impl Database {
     /// meaning as on the read above: the caller withdrew during admission.
     pub(crate) fn bounded_cursor_snapshot_registration_with_root(
         &self,
+        needs_vector_graph: bool,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
         budget: &ReadRegistrationBudget,
@@ -45461,6 +45571,34 @@ impl Database {
     ) -> Result<Option<crate::executor::BoundedCursorSnapshotPin>> {
         if withdrawn.is_cancelled() {
             return Ok(None);
+        }
+        if needs_vector_graph {
+            // Window allocation precedes the admission/publication locks. The
+            // admitted registration protects graph continuity while a storage
+            // pin is acquired afterward, without I/O under either lock.
+            let window = Arc::new(CursorIdleWindow::new(
+                Arc::clone(&clock),
+                idle_ms,
+                clock.now_ms(),
+            ));
+            let Some((snapshot, lsn, registration, root)) = self
+                .bounded_vector_graph_snapshot_registration(
+                    Some(window.clone()),
+                    budget,
+                    withdrawn,
+                )?
+            else {
+                return Ok(None);
+            };
+            let storage = if let Some(root) = &root {
+                let Some(storage) = self.writer_cursor_storage_pin(root, budget, withdrawn)? else {
+                    return Ok(None);
+                };
+                Some(storage)
+            } else {
+                None
+            };
+            return Ok(Some((snapshot, lsn, window, storage, registration, root)));
         }
         if self.persistence.is_some() {
             budget.remaining()?;
@@ -46195,8 +46333,8 @@ impl Database {
     ///
     /// The staged vector is MEASURED before it is copied, so the charge
     /// precedes the allocation it pays for -- the same order a committed row is
-    /// charged in, and the reason this asks the write set twice rather than
-    /// cloning it once.
+    /// charged in. Immutable ownership retains the measured body through the
+    /// admission callback, so a later mutation cannot change the selected value.
     pub(crate) fn staged_row_vector_for_source<E>(
         &self,
         tx: TxId,
@@ -46208,44 +46346,63 @@ impl Database {
     where
         E: From<Error>,
     {
-        let measured =
-            self.tx_mgr
-                .with_write_set(tx, |ws| {
-                    if let Some(entry) = ws.vector_inserts.iter().rev().find(|entry| {
-                        entry.index == *index
-                            && entry.row_id == row_id
-                            && entry.deleted_tx.is_none()
-                    }) {
-                        return Some(entry.vector.len() * std::mem::size_of::<f32>());
-                    }
-                    if ws
-                        .vector_deletes
-                        .iter()
-                        .rev()
-                        .any(|(deleted_index, deleted_row_id, _)| {
-                            deleted_index == index && *deleted_row_id == row_id
-                        })
-                    {
-                        return Some(0);
-                    }
-                    if ws.vector_moves.iter().rev().any(
-                        |(moved_index, from_row_id, to_row_id, _)| {
-                            moved_index == index && (*from_row_id == row_id || *to_row_id == row_id)
-                        },
-                    ) {
-                        return Some(0);
-                    }
-                    None
-                })
-                .map_err(E::from)?;
-        let Some(bytes) = measured else {
+        enum Captured {
+            Vector(Arc<contextdb_tx::ordered_staged::StagedVectorCapability>),
+            Deleted,
+            Moved { from: RowId, to: RowId },
+        }
+        let captured = self
+            .tx_mgr
+            .with_write_set(tx, |ws| {
+                if let Some(owner) = ws.ordered_staged_rows.vector_capability(index, row_id) {
+                    return Some(Captured::Vector(owner));
+                }
+                if ws
+                    .vector_deletes
+                    .iter()
+                    .rev()
+                    .any(|(have, row, _)| have == index && *row == row_id)
+                {
+                    return Some(Captured::Deleted);
+                }
+                ws.vector_moves
+                    .iter()
+                    .rev()
+                    .find(|(have, from, to, _)| have == index && (*from == row_id || *to == row_id))
+                    .map(|(_, from, to, _)| Captured::Moved {
+                        from: *from,
+                        to: *to,
+                    })
+            })
+            .map_err(E::from)?;
+        let Some(captured) = captured else {
             return Ok(None);
         };
-        before_copy(bytes)?;
-        let entry = self
-            .vector_entry_for_row_in_tx(Some(tx), index, row_id, snapshot)
-            .map_err(E::from)?;
-        Ok(Some(entry.map(|entry| entry.vector)))
+        match captured {
+            Captured::Vector(owner) => {
+                before_copy(
+                    owner
+                        .vector()
+                        .len()
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                )?;
+                Ok(Some(Some(owner.vector().to_vec())))
+            }
+            Captured::Deleted => Ok(Some(None)),
+            Captured::Moved { from, to } => {
+                if from == row_id && from != to {
+                    return Ok(Some(None));
+                }
+                // The stable placement was captured once. Loading its committed
+                // source never consults a later transaction mutation.
+                before_copy(0)?;
+                let entry = self
+                    .vector_store
+                    .load_live_entry_for_row(index, from, snapshot)
+                    .map_err(E::from)?;
+                Ok(Some(entry.map(|entry| entry.vector)))
+            }
+        }
     }
 
     /// Resolve one ROW_VECTOR source through the relational row and vector
@@ -50074,6 +50231,8 @@ impl Database {
                 receipt.active_transactions = active.len();
                 for ws in active.values() {
                     receipt.staged_row_versions += ws.relational_inserts.len();
+                    receipt.staged_vector_owner_controls +=
+                        ws.ordered_staged_rows.vector_capability_retained_bytes();
                     receipt.staged_index_postings += ws.ordered_staged_rows.retained_bytes();
                     for (table, row) in &ws.relational_inserts {
                         receipt.staged_row_admissions += ws
