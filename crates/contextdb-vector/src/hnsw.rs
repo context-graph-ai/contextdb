@@ -3039,6 +3039,13 @@ pub fn with_hnsw_build_observer<R>(
     action()
 }
 
+/// An engine-driven paged construction is a fresh graph build too.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn observe_paged_hnsw_build() {
+    observe_hnsw_build();
+}
+
 #[cfg(feature = "test-seams")]
 fn observe_hnsw_build() {
     let observer = HNSW_BUILD_OBSERVER.with(|slot| slot.borrow().clone());

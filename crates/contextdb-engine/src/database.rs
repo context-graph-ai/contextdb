@@ -23,6 +23,7 @@ mod vector_generation_decode_owner_tests;
 #[cfg(test)]
 mod vector_journal_cleanup_cancellation_tests;
 mod vector_maintenance_inventory;
+mod vector_paged_build;
 #[cfg(test)]
 mod vector_public_cycle_admission_tests;
 #[cfg(test)]
@@ -13657,6 +13658,11 @@ pub struct TableSizeEstimate {
 #[derive(Default)]
 struct SnapshotFloorRegistry {
     next_token: AtomicU64,
+    /// Construction floors of unpublished paged vector builds: one registered
+    /// snapshot per pending partition, restored from the durable build record
+    /// before any cleanup and released when the build publishes or is
+    /// abandoned. Removal passes defer to them like any reader-held pin.
+    construction_floors: Mutex<HashMap<VectorPartitionRef, u64>>,
     /// The registered set AND the in-flight removal pass marker, under ONE
     /// lock -- a registration and a pass's registered-set/watermark sample
     /// can never interleave un-observed. (A previous design guarded these
@@ -13829,6 +13835,52 @@ impl SnapshotFloorRegistry {
     /// this returned.
     fn no_snapshots_currently_registered(&self) -> bool {
         self.state.lock().active.is_empty()
+    }
+
+    /// Racy peek like the one above, ignoring construction floors (see
+    /// `begin_vector_removal_pass`).
+    fn no_snapshots_besides_construction_floors(&self) -> bool {
+        let floors = self.construction_floors.lock();
+        self.state
+            .lock()
+            .active
+            .keys()
+            .all(|token| floors.values().any(|floor| floor == token))
+    }
+
+    /// Hold `snapshot` for `partition`'s unpublished paged build. Called at
+    /// open before cleanup can run and at build start under the commit gate,
+    /// where no removal pass can be sampling concurrently.
+    fn hold_construction_floor(&self, partition: &VectorPartitionRef, snapshot: SnapshotId) {
+        let mut floors = self.construction_floors.lock();
+        let mut state = self.state.lock();
+        if let Some(token) = floors.get(partition) {
+            if state
+                .active
+                .get(token)
+                .is_some_and(|registered| registered.snapshot == snapshot)
+            {
+                return;
+            }
+            state.active.remove(token);
+        }
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst);
+        state.active.insert(
+            token,
+            RegisteredSnapshot {
+                snapshot,
+                class: SnapshotRegistrationClass::ReaderHeld,
+                idle_window: None,
+            },
+        );
+        floors.insert(partition.clone(), token);
+    }
+
+    fn release_construction_floor(&self, partition: &VectorPartitionRef) {
+        let Some(token) = self.construction_floors.lock().remove(partition) else {
+            return;
+        };
+        self.state.lock().active.remove(&token);
     }
 
     fn register(self: &Arc<Self>, snapshot: SnapshotId) -> SnapshotRegistration {
@@ -14092,6 +14144,32 @@ impl SnapshotFloorRegistry {
         maybe_pause_vector_repair_snapshot_sample_transition_for_test();
         drop(sampled_snapshots);
         Ok((guard, retained_bytes))
+    }
+
+    /// Removal pass for vector partition retirement and retired graph
+    /// reclamation. A construction floor protects only its own partition's
+    /// source rows, never a partition state or a retired graph generation, so
+    /// those registrations are left out of this sample; relational version
+    /// cleanup keeps honoring them through the ordinary passes.
+    fn begin_vector_removal_pass(self: &Arc<Self>, watermark: TxId) -> ActiveRemovalPassGuard {
+        let floors = self.construction_floors.lock();
+        let mut state = self.state.lock();
+        let mut registered_snapshots: Vec<SnapshotId> = state
+            .active
+            .iter()
+            .filter(|(token, registered)| {
+                !floors.values().any(|floor| floor == *token) && registered.holder_still_entitled()
+            })
+            .map(|(_, registered)| registered.snapshot)
+            .collect();
+        drop(floors);
+        registered_snapshots.sort_unstable();
+        state.active_pass = Some(ActiveRemovalPass { watermark });
+        drop(state);
+        ActiveRemovalPassGuard {
+            registry: self.clone(),
+            registered_snapshots: registered_snapshots.into(),
+        }
     }
 
     fn begin_removal_pass_inner(
@@ -15147,18 +15225,48 @@ impl DurableVectorGenerationLoader {
             self.descriptor.generation_id,
             base.as_ref(),
             |saved| {
+                let paged = self.is_base
+                    && saved.graph_format_version
+                        == crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
                 if saved.covered_tx != self.descriptor.covered_tx
                     || saved.covered_lsn != self.descriptor.covered_lsn
                     || saved.bytes.len() as u64 != self.descriptor.durable_bytes
                     || saved.dimension as usize != self.dimension
                     || saved.quantization != self.quantization
                     || saved.algorithm_version != VECTOR_GRAPH_ALGORITHM_VERSION
-                    || saved.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION
+                    || (saved.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION && !paged)
                 {
                     return Err(Error::Other(
                         "saved vector graph disagrees with its catalog or column declaration"
                             .to_string(),
                     ));
+                }
+                if paged {
+                    // A paged generation is served from the image's pinned
+                    // pages; only its small control handle stays resident.
+                    let resident = vector_paged_build::PAGED_GENERATION_RESIDENT_BYTES as usize;
+                    self.accountant.try_allocate_for(
+                        resident,
+                        "vector_index",
+                        "load_retained_vector_generation",
+                        "Evict another vector partition or raise MEMORY_LIMIT before loading this maintained route.",
+                    )?;
+                    owned = resident;
+                    Self::load_checkpoint(request)?;
+                    let graph = self.paged_generation_graph(saved.bytes)?;
+                    contextdb_core::find_attribution::note_saved_graph_load(
+                        contextdb_core::find_attribution::LoadCharge {
+                            saved_bytes: saved.bytes.len(),
+                            priced_bytes: generation.reclaim_bytes,
+                            minimum_bytes: resident,
+                            admitted_bytes: resident,
+                            held_bytes: resident,
+                            cache_bytes: 0,
+                            minimum_cache_bytes: 0,
+                            maximum_cache_bytes: 0,
+                        },
+                    );
+                    return Ok((graph, resident));
                 }
                 // The serving cache's ceiling follows the declaration and the
                 // data, not a constant: a size this reader was given, else a
@@ -15450,6 +15558,60 @@ impl DurableVectorGenerationLoader {
     }
 }
 
+impl DurableVectorGenerationLoader {
+    /// Serve a published paged base from its native pages through readers of
+    /// the writer's published root. Nothing population-sized is decoded.
+    fn paged_generation_graph(&self, meta_bytes: &[u8]) -> Result<HnswIndex> {
+        use crate::persistence::vector_paged::{NativePagedGraphSource, PagedGenerationMeta};
+        let capture = match &self.source {
+            DurableVectorGenerationSource::Writable(persistence) => {
+                persistence.paged_root_capture()?
+            }
+            DurableVectorGenerationSource::CommittedImage(source) => source.paged_root_capture(),
+        };
+        let meta = PagedGenerationMeta::decode(meta_bytes)?;
+        let progress = meta.progress()?;
+        if progress.generation_id != self.descriptor.generation_id
+            || progress.frontier_tx != self.descriptor.covered_tx
+            || progress.frontier_lsn != self.descriptor.covered_lsn
+            || progress.phase != contextdb_vector::hnsw::paged_builder::PagedVectorPhase::Complete
+            || meta.declaration.dimension as usize != self.dimension
+            || meta.declaration.quantization != self.quantization
+        {
+            return Err(Error::StoreCorrupted {
+                path: "vector_paged_generation_pages".into(),
+                reason: "paged generation metadata disagrees with its catalog".into(),
+            });
+        }
+        let mut policy = self.layout.resolve_policy(progress.graph.points, 1);
+        policy.hnsw_m = meta.declaration.hnsw_m as usize;
+        policy.hnsw_ef_construction = meta.declaration.hnsw_ef_construction as usize;
+        policy.hnsw_ef_search = meta.declaration.hnsw_ef_search as usize;
+        let plan = vector_paged_build::paged_batch_plan(&meta.declaration)?;
+        let source = Arc::new(NativePagedGraphSource {
+            capture,
+            storage_id: meta.storage_id,
+            declaration: meta.declaration.clone(),
+            frontier: progress.frontier_tx,
+            points: progress.graph.points,
+            node_limit: plan.max_node_bytes,
+            checkpoint: Arc::new(|| Ok(())),
+        });
+        let tail = contextdb_vector::hnsw::paged_builder::PagedVectorTail::new(
+            self.partition.clone(),
+            progress,
+            policy,
+            self.dimension,
+            self.quantization,
+            Arc::new(vector_paged_build::SealedPagedGeneration),
+            source,
+            self.accountant.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )?;
+        Ok(HnswIndex::from_paged_tail(tail))
+    }
+}
+
 impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
     fn load(
         &self,
@@ -15548,25 +15710,27 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
 
         let loaded = (|| -> Result<_> {
             Self::load_checkpoint(request)?;
-            let graph_bytes = if self.is_base {
+            let (graph_bytes, paged) = if self.is_base {
                 let record = self.source.load_base(
                     &self.partition.index,
                     &self.partition.partition_key,
                     self.descriptor.generation_id,
                 )?;
+                let paged = record.graph_format_version
+                    == crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
                 if record.highest_included_tx != self.descriptor.covered_tx
                     || record.highest_included_lsn != self.descriptor.covered_lsn
                     || record.dimension as usize != self.dimension
                     || record.quantization != self.quantization
                     || record.algorithm_version != VECTOR_GRAPH_ALGORITHM_VERSION
-                    || record.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION
+                    || (record.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION && !paged)
                 {
                     return Err(Error::Other(
                         "saved vector base disagrees with its catalog or column declaration"
                             .to_string(),
                     ));
                 }
-                record.graph.bytes
+                (record.graph.bytes, paged)
             } else {
                 let record = self.source.load_change(
                     &self.partition.index,
@@ -15586,7 +15750,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                             .to_string(),
                     ));
                 }
-                record.graph.bytes
+                (record.graph.bytes, false)
             };
             Self::load_checkpoint(request)?;
             if graph_bytes.len() != graph_workspace {
@@ -15603,12 +15767,16 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                 ));
             }
             Self::load_checkpoint(request)?;
-            let current_resident = HnswIndex::durable_resident_bound(
-                &graph_bytes,
-                self.dimension,
-                self.quantization,
-                generation.identity.hnsw_m as usize,
-            )?;
+            let current_resident = if paged {
+                resident_bytes
+            } else {
+                HnswIndex::durable_resident_bound(
+                    &graph_bytes,
+                    self.dimension,
+                    self.quantization,
+                    generation.identity.hnsw_m as usize,
+                )?
+            };
             // The codec moves point values into the serving graph and consumes
             // adjacency as it installs edges. Its encoded payload coexists with
             // one graph, not a second graph with full neighbour capacity.
@@ -15629,13 +15797,17 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                 total_reservation = total_reservation.saturating_add(additional);
             }
             resident_bytes = current_resident;
-            let graph = HnswIndex::decode_durable_generation(
-                &graph_bytes,
-                self.dimension,
-                self.quantization,
-            )?;
+            let graph = if paged {
+                self.paged_generation_graph(&graph_bytes)?
+            } else {
+                HnswIndex::decode_durable_generation(
+                    &graph_bytes,
+                    self.dimension,
+                    self.quantization,
+                )?
+            };
             Self::load_checkpoint(request)?;
-            if graph.estimated_resident_bytes() != resident_bytes {
+            if !paged && graph.estimated_resident_bytes() != resident_bytes {
                 return Err(Error::Other(
                     "saved vector graph residency disagrees with its catalog".to_string(),
                 ));
@@ -17221,7 +17393,9 @@ impl MaintenanceContext {
         self.vector.has_snapshot_free_retirement_candidate()
             || self.vector.has_retired_graph_generations()
             || (self.persistence.is_some()
-                && self.snapshot_registry.no_snapshots_currently_registered())
+                && self
+                    .snapshot_registry
+                    .no_snapshots_besides_construction_floors())
     }
 
     fn retire_snapshot_free_vector_partitions(&self) -> Result<MaintenanceMetadataFailures> {
@@ -17234,7 +17408,7 @@ impl MaintenanceContext {
                 .fetch_add(1, Ordering::SeqCst);
             let active_removal_pass = self
                 .snapshot_registry
-                .begin_removal_pass(self.tx_mgr.current_tx_max());
+                .begin_vector_removal_pass(self.tx_mgr.current_tx_max());
             let registered = active_removal_pass.registered_snapshots();
             // This is a fresh authenticated sample inside the removal boundary,
             // before any catalog-driven removal or resident retirement.
@@ -17268,7 +17442,7 @@ impl MaintenanceContext {
         self.tx_mgr.with_commit_lock(|| {
             let active_removal_pass = self
                 .snapshot_registry
-                .begin_removal_pass(self.tx_mgr.current_tx_max());
+                .begin_vector_removal_pass(self.tx_mgr.current_tx_max());
             let mut inventory = self.maintenance_closing_inventory_locked()?;
             if !inventory.complete {
                 return Ok(inventory.failures);
@@ -17301,6 +17475,15 @@ impl MaintenanceContext {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(VectorPartitionPublicationOutcome::default());
         };
+        // Base generations are built by finite restartable paged batches;
+        // only sealed changes over a published base and route repair remain
+        // on the resident path below.
+        if let Some(outcome) = self.advance_paged_vector_build(partition)? {
+            return Ok(outcome);
+        }
+        // The durable floor of a whole build lives exactly as long as this
+        // call; only a crash leaves it for the next open to restore.
+        let _whole_build_floor = vector_paged_build::WholeBuildFloor::new(self, partition);
         loop {
             let layout = self.vector.index_layout(&partition.index)?;
             let live_vectors = self
@@ -17387,6 +17570,11 @@ impl MaintenanceContext {
                     let covered_lsn = self.tx_mgr.current_lsn();
                     let snapshot = SnapshotId(covered_tx.0);
                     let pin = self.snapshot_registry.register(snapshot);
+                    // A crash during this whole build must leave its frontier
+                    // protected at reopen, before any cleanup runs.
+                    persistence.record_construction_floor(partition, covered_tx)?;
+                    self.snapshot_registry
+                        .hold_construction_floor(partition, snapshot);
                     let (raw_count, mut graph_count) = if partition_state_present {
                         self.vector.partition_generation_entry_counts(
                             &partition.index,
@@ -18247,6 +18435,10 @@ impl MaintenanceContext {
         // replacement. Pending route/journal work still forbids retiring the
         // route itself; the snapshot guard independently protects old graphs.
         let mut cycle_failures = self.reclaim_snapshot_free_vector_graphs()?;
+        match self.reclaim_paged_vector_storage() {
+            Ok(()) | Err(Error::MemoryBudgetExceeded { .. }) => {}
+            Err(error) => return Err(error),
+        }
         // Idempotent T2 retry never clears or rebuilds a healthy route. Newer
         // journal suffix records remain outside each catalog's covered LSN. A
         // local retry refusal is retained in the report while the rest of the
@@ -18270,69 +18462,76 @@ impl MaintenanceContext {
             .as_ref()
             .map(|sample| sample.candidates.as_slice())
             .unwrap_or(&[]);
-        let mut vector = if !pending_vector_partitions.is_empty() {
-            // File-backed construction publishes through the durable catalog
-            // first. Building a separate process-only graph here let the
-            // writer call the route ready while a reader of the same
-            // committed store still saw `initial_build`.
-            let mut built_partitions = 0usize;
-            let mut built_indexes = HashSet::new();
-            let mut first_failure_details = cleanup_retry_failure.or(cycle_failures.first);
-            for candidate in pending_vector_partitions {
-                let partition = &candidate.partition;
-                if cleanup_retry_failed_partitions.contains(partition) {
-                    continue;
-                }
-                let outcome = match self.persist_built_vector_partition(partition) {
-                    Ok(outcome) => outcome,
-                    Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
-                        return Err(error);
-                    }
-                    Err(error) => {
-                        self.vector
-                            .record_partition_maintenance_error(partition, &error)?;
-                        first_failure_details.get_or_insert_with(|| {
-                            VectorMaintenanceFailureDetails::from_error(&error)
-                        });
+        // An unpublished paged build keeps advancing even when this cycle's
+        // sampled inventory does not select its route.
+        let unselected_paged_builds = self.unselected_paged_builds(pending_vector_partitions)?;
+        let mut vector =
+            if !pending_vector_partitions.is_empty() || !unselected_paged_builds.is_empty() {
+                // File-backed construction publishes through the durable catalog
+                // first. Building a separate process-only graph here let the
+                // writer call the route ready while a reader of the same
+                // committed store still saw `initial_build`.
+                let mut built_partitions = 0usize;
+                let mut built_indexes = HashSet::new();
+                let mut first_failure_details = cleanup_retry_failure.or(cycle_failures.first);
+                for partition in pending_vector_partitions
+                    .iter()
+                    .map(|candidate| &candidate.partition)
+                    .chain(unselected_paged_builds.iter())
+                {
+                    if cleanup_retry_failed_partitions.contains(partition) {
                         continue;
                     }
-                };
-                if let Some(failure) = outcome.cleanup_failure {
-                    first_failure_details.get_or_insert(failure);
+                    let outcome = match self.persist_built_vector_partition(partition) {
+                        Ok(outcome) => outcome,
+                        Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            self.vector
+                                .record_partition_maintenance_error(partition, &error)?;
+                            first_failure_details.get_or_insert_with(|| {
+                                VectorMaintenanceFailureDetails::from_error(&error)
+                            });
+                            continue;
+                        }
+                    };
+                    if let Some(failure) = outcome.cleanup_failure {
+                        first_failure_details.get_or_insert(failure);
+                    }
+                    // A repair can make its replacement catalog durable while the
+                    // worker is being stopped. Keep that publication authoritative,
+                    // but observe the stop before counting success or beginning any
+                    // later reclamation, retirement, compaction, or cycle stamping.
+                    self.build_checkpoint()?;
+                    if !outcome.published {
+                        continue;
+                    }
+                    built_partitions = built_partitions.saturating_add(1);
+                    built_indexes.insert(partition.index.clone());
+                    first_failure_details =
+                        first_failure_details.or(self.reclaim_snapshot_free_vector_graphs()?.first);
                 }
-                // A repair can make its replacement catalog durable while the
-                // worker is being stopped. Keep that publication authoritative,
-                // but observe the stop before counting success or beginning any
-                // later reclamation, retirement, compaction, or cycle stamping.
-                self.build_checkpoint()?;
-                if !outcome.published {
-                    continue;
-                }
-                built_partitions = built_partitions.saturating_add(1);
-                built_indexes.insert(partition.index.clone());
-                first_failure_details =
-                    first_failure_details.or(self.reclaim_snapshot_free_vector_graphs()?.first);
-            }
-            let mut report = self.vector.hnsw_maintenance_status();
-            report.built_partitions = built_partitions;
-            report.built_indexes = built_indexes.len();
-            report.first_failure = first_failure_details.map(|details| details.failure);
-            report.first_failure_details = first_failure_details;
-            report
-        } else if self.persistence.is_some() {
-            let mut report = self.vector.hnsw_maintenance_status();
-            let first_failure_details = cleanup_retry_failure
-                .or(cycle_failures.first)
-                .or(report.first_failure_details);
-            report.first_failure = first_failure_details.map(|details| details.failure);
-            report.first_failure_details = first_failure_details;
-            report
-        } else {
-            self.vector
-                .run_hnsw_maintenance_cycle_with(self.accountant.clone(), &mut || {
-                    self.build_checkpoint()
-                })?
-        };
+                let mut report = self.vector.hnsw_maintenance_status();
+                report.built_partitions = built_partitions;
+                report.built_indexes = built_indexes.len();
+                report.first_failure = first_failure_details.map(|details| details.failure);
+                report.first_failure_details = first_failure_details;
+                report
+            } else if self.persistence.is_some() {
+                let mut report = self.vector.hnsw_maintenance_status();
+                let first_failure_details = cleanup_retry_failure
+                    .or(cycle_failures.first)
+                    .or(report.first_failure_details);
+                report.first_failure = first_failure_details.map(|details| details.failure);
+                report.first_failure_details = first_failure_details;
+                report
+            } else {
+                self.vector
+                    .run_hnsw_maintenance_cycle_with(self.accountant.clone(), &mut || {
+                        self.build_checkpoint()
+                    })?
+            };
         // A replacement first publishes the prior graph as a retired snapshot
         // chain. Reclaim only after publication, under the registry's removal
         // guard, so active readers keep that route and unselected generations
@@ -20656,6 +20855,9 @@ impl Database {
         db.rebuild_rank_formula_cache_from_meta(&all_meta)?;
 
         db.account_loaded_state()?;
+        // Unpublished paged builds restore their construction floors before
+        // any maintenance or cleanup can run against this handle.
+        db.restore_paged_vector_builds()?;
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         db.load_cron_state_from_persistence()?;
         db.load_event_bus_state_from_persistence()?;

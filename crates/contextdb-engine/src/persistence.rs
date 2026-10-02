@@ -12,6 +12,7 @@ mod reader_presence;
 mod resident_history_test_seams;
 mod transaction_repair;
 mod vector_membership_pages;
+pub(crate) mod vector_paged;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
@@ -16835,6 +16836,11 @@ pub struct RedbPersistence {
     /// no opener reads past it. Never set back to `false` — one unsupported table
     /// is enough to mark the whole root.
     used_legacy_table_meta_layout: AtomicBool,
+    /// Catalog/base records staged for the publishing batch of a paged
+    /// vector build, keyed by its partition route. Taken by that batch.
+    paged_publications: parking_lot::Mutex<HashMap<Vec<u8>, vector_paged::PagedPublication>>,
+    /// Captures the writer's published root for paged generation readers.
+    paged_root_capture: std::sync::OnceLock<vector_paged::PagedRootCapture>,
 }
 pub(crate) struct RawSyncApplyStateDigest {
     pub(crate) digest: String,
@@ -17126,7 +17132,10 @@ fn borrow_vector_partition_change<'a>(
         || record.dimension != base.dimension
         || record.quantization != base.quantization
         || record.algorithm_version != base.algorithm_version
-        || record.graph_format_version != base.graph_format_version
+        || !vector_paged::change_format_compatible(
+            record.graph_format_version,
+            base.graph_format_version,
+        )
         || record.covered_through_tx.0 < base.highest_included_tx.0
         || record.covered_through_lsn.0 < base.highest_included_lsn.0
         || record.fresh_tail_from_tx.0 < record.covered_through_tx.0
@@ -17511,6 +17520,18 @@ impl ReadOnlyVectorGenerationSource {
         self.source.with_read(read)
     }
 
+    /// Paged generation readers of a committed image read its pinned root.
+    pub(crate) fn paged_root_capture(&self) -> vector_paged::PagedRootCapture {
+        let source = Arc::clone(&self.source);
+        Arc::new(move || {
+            let read = Arc::new(source.begin_read()?);
+            Ok((
+                read,
+                Arc::clone(&source) as Arc<dyn std::any::Any + Send + Sync>,
+            ))
+        })
+    }
+
     pub(crate) fn generation_record_bytes(
         &self,
         index: &VectorIndexRef,
@@ -17730,7 +17751,10 @@ impl ReadOnlyVectorGenerationSource {
                 || record.dimension != base.dimension
                 || record.quantization != base.quantization
                 || record.algorithm_version != base.algorithm_version
-                || record.graph_format_version != base.graph_format_version
+                || !vector_paged::change_format_compatible(
+                    record.graph_format_version,
+                    base.graph_format_version,
+                )
                 || record.covered_through_tx.0 < base.covered_tx.0
                 || record.covered_through_lsn.0 < base.covered_lsn.0
                 || record.fresh_tail_from_tx.0 < record.covered_through_tx.0
@@ -19178,6 +19202,8 @@ impl RedbPersistence {
             writer_schema: parking_lot::Mutex::new(None),
             cache_charge_bytes: std::sync::OnceLock::new(),
             used_legacy_table_meta_layout: AtomicBool::new(false),
+            paged_publications: Default::default(),
+            paged_root_capture: std::sync::OnceLock::new(),
         })
     }
 
@@ -19243,6 +19269,8 @@ impl RedbPersistence {
                         writer_schema: parking_lot::Mutex::new(None),
                         cache_charge_bytes: std::sync::OnceLock::new(),
                         used_legacy_table_meta_layout: AtomicBool::new(false),
+                        paged_publications: Default::default(),
+                        paged_root_capture: std::sync::OnceLock::new(),
                     })
                 }
                 Err(err) => {
@@ -19420,6 +19448,8 @@ impl RedbPersistence {
                     writer_schema: parking_lot::Mutex::new(None),
                     cache_charge_bytes: std::sync::OnceLock::new(),
                     used_legacy_table_meta_layout: AtomicBool::new(false),
+                    paged_publications: Default::default(),
+                    paged_root_capture: std::sync::OnceLock::new(),
                 };
                 persistence.recover_authoritative_purge_publication()?;
                 persistence.truncate_uncommitted_commit_index_tail()?;
@@ -26709,6 +26739,16 @@ impl RedbPersistence {
                         {
                             continue;
                         }
+                        // A retired paged base's pages are reclaimed in finite
+                        // cleanup transactions; queue them with this removal.
+                        if record.graph_format_version
+                            == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION
+                        {
+                            Self::queue_paged_generation_cleanup_in_write(
+                                write,
+                                &record.graph.bytes,
+                            )?;
+                        }
                     }
                     VectorPartitionRecordKind::ChangeGeneration => {
                         let record: VectorPartitionChangeGenerationRecord =
@@ -33751,7 +33791,10 @@ impl RedbPersistence {
             || change.dimension != base.dimension
             || change.quantization != base.quantization
             || change.algorithm_version != base.algorithm_version
-            || change.graph_format_version != base.graph_format_version
+            || !vector_paged::change_format_compatible(
+                change.graph_format_version,
+                base.graph_format_version,
+            )
             || change.covered_through_tx.0 < base.highest_included_tx.0
             || change.covered_through_lsn.0 < base.highest_included_lsn.0
             || change.fresh_tail_from_tx.0 < change.covered_through_tx.0

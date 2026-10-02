@@ -8872,6 +8872,87 @@ impl VectorStore {
         Ok(true)
     }
 
+    /// Advance one engine-selected partition by one batch under a plan the
+    /// engine derives from its current writer budget. The registered plan is
+    /// replaced first, so a later limit change never runs a stale workspace.
+    #[doc(hidden)]
+    pub fn step_partition_paged_build_with_plan(
+        &self,
+        partition: &VectorPartitionRef,
+        plan: PagedVectorBatchPlan,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
+        else {
+            return Ok(false);
+        };
+        if state.paged_builder.lock().in_flight {
+            return Ok(false);
+        }
+        let Some(mut operation) = PagedBuildOperation::take(state, false)? else {
+            return Ok(false);
+        };
+        let (builder, registered) = operation.work();
+        *registered = plan;
+        builder.step(plan, checkpoint)?;
+        Ok(true)
+    }
+
+    /// `publish_partition_paged_build` under a plan derived at publication.
+    #[doc(hidden)]
+    pub fn publish_partition_paged_build_with_plan(
+        &self,
+        partition: &VectorPartitionRef,
+        through_lsn: Lsn,
+        plan: PagedVectorBatchPlan,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<PagedVectorProgress> {
+        let state = self.partition_state(&partition.index, &partition.partition_key)?;
+        let mut operation = PagedBuildOperation::take(state, false)?
+            .ok_or_else(|| Error::Other("paged vector builder is not registered".into()))?;
+        let (builder, registered) = operation.work();
+        *registered = plan;
+        builder.publish(through_lsn, plan, checkpoint)?;
+        let progress = builder.progress().clone();
+        operation.finished = true;
+        Ok(progress)
+    }
+
+    /// Report an engine-driven paged build's durable or in-flight inserted
+    /// point count as this partition's maintenance progress. An armed test
+    /// pause observes the same count the ordinary resident build reports.
+    #[doc(hidden)]
+    pub fn report_partition_paged_build_progress(
+        &self,
+        partition: &VectorPartitionRef,
+        phase: &'static str,
+        reason: &'static str,
+        vectors_total: usize,
+        vectors_done: usize,
+        checkpoint_tx: TxId,
+    ) {
+        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
+        else {
+            return;
+        };
+        *state.maintenance_progress.write() = Some(VectorMaintenanceProgress {
+            state: phase,
+            reason,
+            vectors_total,
+            vectors_done: vectors_done.min(vectors_total),
+            checkpoint_tx,
+        });
+        state.set_maintenance_vectors_done(vectors_done);
+    }
+
+    /// Clear the reported progress of a published or abandoned paged build.
+    #[doc(hidden)]
+    pub fn clear_partition_paged_build_progress(&self, partition: &VectorPartitionRef) {
+        if let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key) {
+            *state.maintenance_progress.write() = None;
+        }
+    }
+
     /// Complete storage publication under the engine's commit gate, then
     /// release the pending-build slot. Serving roots are installed through
     /// install_loaded_sealed_generation / publish_replacement_base_generation;

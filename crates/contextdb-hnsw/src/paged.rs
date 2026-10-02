@@ -211,6 +211,65 @@ impl PagedGraphWorkspace {
                     .checked_add(32)?,
             )
     }
+    /// Allocation bound of a workspace whose provider spills the search
+    /// visited set and the search priority queue to transaction pages (every
+    /// `visit_search_scratch`/`push_search_candidate` answers `Some`/`true`).
+    /// Only the result, selection, pruning and extension containers remain.
+    pub fn spilled_allocation_bound(capacity: usize) -> Option<usize> {
+        capacity
+            .checked_mul(4 * std::mem::size_of::<PagedEdge>() + std::mem::size_of::<PointId>())?
+            .checked_add(32)
+    }
+    /// Exact allocation of `new(capacity)`: every container is allocated at
+    /// its admitted capacity once and refuses growth beyond it.
+    pub fn exact_allocation_bound(capacity: usize) -> Option<usize> {
+        let buckets = capacity
+            .checked_mul(8)?
+            .checked_div(7)?
+            .checked_add(1)?
+            .checked_next_power_of_two()?
+            .max(4);
+        Self::spilled_allocation_bound(capacity)?.checked_add(
+            buckets
+                .checked_mul(std::mem::size_of::<PointId>() + 1)?
+                .checked_add(32)?,
+        )
+    }
+    /// Workspace for a spilling provider: the search visited set is never
+    /// allocated. Every container still refuses growth at `capacity`.
+    pub fn new_spilled(capacity: usize) -> Self {
+        Self {
+            capacity,
+            visited: HashSet::new(),
+            candidates: BinaryHeap::with_capacity(capacity),
+            results: BinaryHeap::with_capacity(capacity),
+            selected: Vec::with_capacity(capacity),
+            discarded: BinaryHeap::with_capacity(capacity),
+            extension: Vec::with_capacity(capacity),
+        }
+    }
+    /// A workspace whose containers start empty and grow on demand, each in
+    /// steps capped at `capacity`, so actual allocation follows one insertion's
+    /// real use and never exceeds `exact_allocation_bound(capacity)`.
+    pub fn new_lazy(capacity: usize) -> Self {
+        Self {
+            capacity,
+            visited: HashSet::new(),
+            candidates: BinaryHeap::new(),
+            results: BinaryHeap::new(),
+            selected: Vec::new(),
+            discarded: BinaryHeap::new(),
+            extension: Vec::new(),
+        }
+    }
+    fn growth(len: usize, capacity: usize) -> usize {
+        len.max(8).min(capacity.saturating_sub(len)).max(1)
+    }
+    fn grow_vec<T>(vec: &mut Vec<T>, capacity: usize) {
+        if vec.len() == vec.capacity() {
+            vec.reserve_exact(Self::growth(vec.len(), capacity));
+        }
+    }
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -234,6 +293,9 @@ impl PagedGraphWorkspace {
     ) -> Result<(), PagedGraphError<E>> {
         if heap.len() >= capacity {
             return Err(PagedGraphError::ScratchExhausted);
+        }
+        if heap.len() == heap.capacity() {
+            heap.reserve_exact(Self::growth(heap.len(), capacity));
         }
         heap.push(point);
         Ok(())
@@ -429,6 +491,7 @@ fn select<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
     workspace.extension.clear();
     if workspace.candidates.len() <= cap && !extend {
         while let Some(edge) = workspace.candidates.pop() {
+            PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
             workspace.selected.push(edge.reversed());
         }
         return Ok(());
@@ -448,6 +511,7 @@ fn select<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
                 if workspace.extension.len() >= workspace.capacity {
                     return Err(PagedGraphError::ScratchExhausted);
                 }
+                PagedGraphWorkspace::grow_vec(&mut workspace.extension, workspace.capacity);
                 workspace.extension.push(edge.point_id);
             }
         }
@@ -485,6 +549,7 @@ fn select<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
             if workspace.selected.len() >= workspace.capacity {
                 return Err(PagedGraphError::ScratchExhausted);
             }
+            PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
             workspace.selected.push(candidate.reversed());
         } else if policy.keep_pruned {
             PagedGraphWorkspace::push(workspace.capacity, &mut workspace.discarded, candidate)?;
@@ -498,6 +563,7 @@ fn select<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
             if workspace.selected.len() >= workspace.capacity {
                 return Err(PagedGraphError::ScratchExhausted);
             }
+            PagedGraphWorkspace::grow_vec(&mut workspace.selected, workspace.capacity);
             workspace.selected.push(candidate.reversed());
         }
     }

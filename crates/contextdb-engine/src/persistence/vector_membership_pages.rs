@@ -369,3 +369,48 @@ pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
     }
     Ok(())
 }
+
+/// Authenticated decode of one ordered source companion for the paged builder.
+pub(super) fn decode_source_member(
+    key: &[u8],
+    encoded: &[u8],
+) -> Result<VectorPartitionMembershipRecord> {
+    decode_member(key, encoded)
+}
+
+/// The route named by a partition prefix (`vector_partition_prefix`).
+pub(super) fn partition_from_prefix(mut key: &[u8]) -> Result<VectorPartitionRef> {
+    let table = std::str::from_utf8(component(&mut key)?)
+        .map_err(|_| corruption("membership table name is not UTF-8"))?;
+    let column = std::str::from_utf8(component(&mut key)?)
+        .map_err(|_| corruption("membership column name is not UTF-8"))?;
+    let partition = VectorPartitionKey::from_canonical_bytes(component(&mut key)?)
+        .map_err(|_| corruption("membership partition key is invalid"))?;
+    if !key.is_empty() {
+        return Err(corruption("partition route key has trailing bytes"));
+    }
+    Ok(VectorPartitionRef::new(
+        VectorIndexRef::new(table, column),
+        partition,
+    ))
+}
+
+/// Live membership count of one partition from its maintained summary.
+pub(super) fn partition_live_entries(
+    read: &redb::ReadTransaction,
+    partition: &VectorPartitionRef,
+) -> Result<usize> {
+    let summaries = match read.open_table(SUMMARY) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(error) => return Err(RedbPersistence::storage_error(error)),
+    };
+    let key = RedbPersistence::vector_partition_prefix(&partition.index, &partition.partition_key);
+    let summary = summaries
+        .get(key.as_slice())
+        .map_err(RedbPersistence::storage_error)?
+        .map(|value| decode_summary(&key, value.value()))
+        .transpose()?
+        .unwrap_or_default();
+    usize::try_from(summary.live_entries).map_err(|_| corruption("membership live count overflow"))
+}
