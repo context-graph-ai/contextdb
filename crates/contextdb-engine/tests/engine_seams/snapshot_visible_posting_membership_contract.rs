@@ -567,6 +567,57 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         expected,
         "the committed vector remains searchable after reopen"
     );
+
+    // An indexed-table write must not disguise a source refusal while a
+    // separate row's conditions are revalidated at commit.
+    db.execute(
+        "CREATE TABLE guarded_row (id INTEGER, active BOOLEAN)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO guarded_row VALUES (7, TRUE)", &HashMap::new())
+        .unwrap();
+    let guarded_snapshot = db.snapshot();
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE refused_members SET active = FALSE WHERE id = 1",
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert!(
+        db.guard_row_conditions_in_tx(
+            tx,
+            "guarded_row",
+            "id",
+            &Value::Int64(7),
+            &[("active".to_owned(), Value::Bool(true))],
+        )
+        .unwrap()
+    );
+    db.accountant()
+        .set_budget(Some(db.accountant().usage().used))
+        .unwrap();
+    let mixed_result = db.commit(tx);
+    assert!(
+        matches!(mixed_result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes: 24, available_bytes: 0, budget_limit_bytes: 78773, .. }) if subsystem == "writer_source" && operation == "store_adapter"),
+        "conditional-row admission keeps its source attribution beside an indexed write: {mixed_result:?}"
+    );
+    db.accountant().set_budget(None).unwrap();
+    let _ = db.rollback(tx);
+    assert_eq!(db.snapshot(), guarded_snapshot);
+    assert_eq!(db.execute(sql, &HashMap::new()).unwrap().rows, expected);
+    db.close().unwrap();
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.snapshot(), guarded_snapshot);
+    assert_eq!(db.execute(sql, &HashMap::new()).unwrap().rows, expected);
+    assert_eq!(
+        db.execute("SELECT id, active FROM guarded_row", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(7), Value::Bool(true)]]
+    );
 }
 
 #[test]
