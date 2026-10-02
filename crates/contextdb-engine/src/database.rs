@@ -49770,32 +49770,49 @@ impl Database {
         // landing mid-copy carry visibility TxIds above the watermark and LSN
         // stamps above the snapshot LSN, so the filters below exclude them
         // entirely — a commit is in the artifact entirely or not at all.
-        let (watermark, snapshot_lsn, commit_index, blob_snapshot, checkpoint_source, writer_root) =
-            self.with_commit_lock(|| -> Result<_> {
-                let watermark = self.tx_mgr.current_tx_max();
-                let snapshot_lsn = self.tx_mgr.current_lsn();
-                let writer_root =
-                    writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?;
-                let commit_index = if writer_root.is_none() {
-                    self.tx_mgr.try_commit_index_prefix(snapshot_lsn)?
-                } else {
-                    BTreeMap::new()
-                };
-                let blob_snapshot = self.blob_repository.begin_export_snapshot()?;
-                let checkpoint_source = self
-                    .persistence
-                    .as_ref()
-                    .map(|persistence| persistence.checkpoint_read_source())
-                    .transpose()?;
-                Ok((
-                    watermark,
-                    snapshot_lsn,
-                    commit_index,
-                    blob_snapshot,
-                    checkpoint_source,
-                    writer_root,
-                ))
-            })?;
+        let (
+            watermark,
+            snapshot_lsn,
+            commit_index,
+            blob_snapshot,
+            checkpoint_source,
+            writer_root,
+            recovery_floors,
+        ) = self.with_commit_lock(|| -> Result<_> {
+            let watermark = self.tx_mgr.current_tx_max();
+            let snapshot_lsn = self.tx_mgr.current_lsn();
+            let writer_root =
+                writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?;
+            let recovery_floors = match &writer_root {
+                Some(root) => RedbPersistence::writer_recovery_floors_in_read(root)?,
+                None => crate::persistence::WriterRecoveryBounds {
+                    identity_tx_floor: watermark.0,
+                    source_lsn_floor: snapshot_lsn.0,
+                    external_row_id_floor: self.relational_store.next_row_id().0.saturating_sub(1),
+                    commit_count: 0,
+                },
+            };
+            let commit_index = if writer_root.is_none() {
+                self.tx_mgr.try_commit_index_prefix(snapshot_lsn)?
+            } else {
+                BTreeMap::new()
+            };
+            let blob_snapshot = self.blob_repository.begin_export_snapshot()?;
+            let checkpoint_source = self
+                .persistence
+                .as_ref()
+                .map(|persistence| persistence.checkpoint_read_source())
+                .transpose()?;
+            Ok((
+                watermark,
+                snapshot_lsn,
+                commit_index,
+                blob_snapshot,
+                checkpoint_source,
+                writer_root,
+                recovery_floors,
+            ))
+        })?;
         #[cfg(feature = "test-seams")]
         self.export_after_capture_pause.maybe_pause();
 
@@ -50266,6 +50283,7 @@ impl Database {
                 }
             }
 
+            artifact.flush_writer_recovery_floors(recovery_floors)?;
             Ok(ExportReport {
                 snapshot_lsn,
                 rows: row_count,

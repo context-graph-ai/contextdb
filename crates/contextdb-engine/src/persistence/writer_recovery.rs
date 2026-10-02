@@ -26,6 +26,70 @@ pub(crate) struct WriterOpenBounds {
 }
 
 impl RedbPersistence {
+    pub(crate) fn writer_recovery_floors_in_read(
+        snapshot: &WriterSnapshot,
+    ) -> Result<WriterRecoveryBounds> {
+        let read = snapshot.owner_read();
+        let table = read
+            .open_table(WRITER_RECOVERY_TABLE)
+            .map_err(Self::storage_error)?;
+        let value = table
+            .get(BOUNDS_KEY)
+            .map_err(Self::storage_error)?
+            .ok_or_else(|| Error::StoreCorrupted {
+                path: "writer_recovery".into(),
+                reason: "missing writer recovery bounds".into(),
+            })?;
+        Self::decode_exact(value.value())
+    }
+
+    /// A checkpoint carries non-derivable identity floors even if no retained
+    /// row or commit key witnesses them. Destination counts and physical roots
+    /// remain those of its own completed copy.
+    pub(crate) fn flush_writer_recovery_floors(&self, source: WriterRecoveryBounds) -> Result<()> {
+        let _scratch = self
+            .proof_accountant
+            .get()
+            .map(|accountant| {
+                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    accountant.clone(),
+                    512,
+                    "storage",
+                    "export_writer_floors",
+                    "Raise MEMORY_LIMIT to export writer identity floors.",
+                )
+            })
+            .transpose()?;
+        self.with_db(|db| {
+            let write = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut table = write
+                    .open_table(WRITER_RECOVERY_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut target: WriterRecoveryBounds = table
+                    .get(BOUNDS_KEY)
+                    .map_err(Self::storage_error)?
+                    .map(|value| Self::decode_exact(value.value()))
+                    .transpose()?
+                    .ok_or_else(|| Error::StoreCorrupted {
+                        path: "writer_recovery".into(),
+                        reason: "missing destination writer recovery bounds".into(),
+                    })?;
+                target.identity_tx_floor = target.identity_tx_floor.max(source.identity_tx_floor);
+                target.source_lsn_floor = target.source_lsn_floor.max(source.source_lsn_floor);
+                target.external_row_id_floor = target
+                    .external_row_id_floor
+                    .max(source.external_row_id_floor);
+                let encoded = Self::encode(&target)?;
+                table
+                    .insert(BOUNDS_KEY, encoded.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            Self::write_commit_directory_root_in_write(&write)?;
+            write.commit().map_err(Self::storage_error)
+        })
+    }
+
     /// Called in the same transaction as every persistence commit, including
     /// store creation and early schema flushes. `len` reads the tree's stored
     /// cardinality, not its entries. History is never enumerated here.
