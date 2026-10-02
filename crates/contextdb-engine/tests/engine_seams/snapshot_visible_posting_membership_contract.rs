@@ -533,8 +533,8 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         .unwrap();
     let result = db.commit(tx);
     assert!(
-        matches!(result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. }) if subsystem == "relational_index" && operation == "membership"),
-        "membership must be admitted before durability: {result:?}"
+        matches!(result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes: 24, available_bytes: 0, budget_limit_bytes: 79664, .. }) if subsystem == "writer_source" && operation == "store_adapter"),
+        "source admission must refuse before publishing any changed state: {result:?}"
     );
     db.accountant().set_budget(None).unwrap();
     let _ = db.rollback(tx);
@@ -545,7 +545,28 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
     db.close().unwrap();
     drop(db);
     let db = Database::open(&path).unwrap();
+    assert_eq!(db.snapshot(), snapshot);
     assert_eq!(db.execute(sql, &HashMap::new()).unwrap().rows, expected);
+    assert!(
+        db.execute(
+            "SELECT id FROM refused_members WHERE active = FALSE",
+            &HashMap::new()
+        )
+        .unwrap()
+        .rows
+        .is_empty(),
+        "the refused index key must remain absent after reopen"
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id, embedding FROM refused_members ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 1",
+            &params([("query", Value::Vector(vec![1.0, 0.0]))]),
+        )
+        .unwrap()
+        .rows,
+        expected,
+        "the committed vector remains searchable after reopen"
+    );
 }
 
 #[test]
