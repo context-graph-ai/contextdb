@@ -802,6 +802,9 @@ pub struct BoundedBruteForceCursor {
     stream_when_refused: bool,
     /// The current partition is being compared one stored body at a time.
     streaming_source: bool,
+    membership_cursor: Option<Box<dyn crate::store::RawVectorMembershipCursor>>,
+    membership_reserved_bytes: usize,
+    pending_membership: Option<crate::store::RawVectorDirectoryEntry>,
 }
 
 /// A store-owned entry source pinned when the cursor is opened. Exact stepping
@@ -1782,7 +1785,7 @@ where
 
 fn retain_snapshot_source<E>(
     sources: &mut Vec<BoundedSnapshotVectorSource>,
-    key: VectorPartitionKey,
+    key: &VectorPartitionKey,
     state: Arc<crate::store::IndexState>,
     retained_bytes: &mut usize,
     before_work: &mut impl FnMut() -> std::result::Result<(), E>,
@@ -1792,7 +1795,7 @@ fn retain_snapshot_source<E>(
 where
     E: From<Error>,
 {
-    let position = match sources.binary_search_by(|source| source.partition_key.cmp(&key)) {
+    let position = match sources.binary_search_by(|source| source.partition_key.cmp(key)) {
         Ok(_) => return Ok(()),
         Err(position) => position,
     };
@@ -1823,7 +1826,7 @@ where
     sources.insert(
         position,
         BoundedSnapshotVectorSource {
-            partition_key: key,
+            partition_key: key.clone(),
             state,
             candidate_ids: None,
             point_load: false,
@@ -1967,7 +1970,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 before_source_entry()?;
                 retain_snapshot_source(
                     &mut selected,
-                    key.clone(),
+                    key,
                     state.clone(),
                     &mut retained_bytes,
                     before_source_entry,
@@ -2008,7 +2011,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 };
                 if let Err(error) = retain_snapshot_source(
                     &mut selected,
-                    prefix.clone(),
+                    prefix,
                     state,
                     &mut retained_bytes,
                     before_source_entry,
@@ -2044,7 +2047,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 {
                     retain_snapshot_source(
                         &mut selected,
-                        key.clone(),
+                        key,
                         state.clone(),
                         &mut retained_bytes,
                         before_source_entry,
@@ -2183,7 +2186,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                     Err(_) => {
                                         retain_snapshot_source(
                                             &mut sources,
-                                            key.clone(),
+                                            key,
                                             state.clone(),
                                             &mut retained_bytes,
                                             before_checkpoint,
@@ -2469,6 +2472,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             body_reads: crate::store::RawVectorBodyReads::default(),
             stream_when_refused: false,
             streaming_source: false,
+            membership_cursor: None,
+            membership_reserved_bytes: 0,
+            pending_membership: None,
         })
     }
 
@@ -2611,19 +2617,72 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 )));
             };
             before_source_entry()?;
-            match source.state.ensure_raw_vectors_loaded() {
-                Ok(()) => {
-                    cursor.streaming_source = false;
-                    cursor.state_end = Some(source.state.entry_count());
+            if let Some(memberships) = source.state.durable_membership_source() {
+                let mut interrupted = None;
+                let mut reserved = 0usize;
+                let opened = memberships.open(&mut |request| {
+                    if interrupted.is_some() {
+                        return false;
+                    }
+                    let result = match request {
+                        crate::store::DormantVectorLoadRequest::Reserve(bytes) => {
+                            match reserved.checked_add(bytes) {
+                                Some(total) => before_retain(bytes).map(|()| reserved = total),
+                                None => Err(E::from(Error::Other(
+                                    "membership cursor reservation overflow".to_string(),
+                                ))),
+                            }
+                        }
+                        _ => before_source_entry(),
+                    };
+                    if let Err(error) = result {
+                        interrupted = Some(error);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if let Some(error) = interrupted {
+                    drop(opened);
+                    release_retained(reserved);
+                    return Err(error);
                 }
-                Err(Error::MemoryBudgetExceeded { .. })
-                    if cursor.stream_when_refused && source.state.streams_raw_bodies() =>
-                {
-                    // The directory's end is found by reading past it.
-                    cursor.streaming_source = true;
-                    cursor.state_end = Some(usize::MAX);
+                let opened = match opened {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        release_retained(reserved);
+                        return Err(E::from(error));
+                    }
+                };
+                cursor.retained_bytes = match cursor.retained_bytes.checked_add(reserved) {
+                    Some(bytes) => bytes,
+                    None => {
+                        drop(opened);
+                        release_retained(reserved);
+                        return Err(E::from(Error::Other(
+                            "membership cursor retained bytes overflow".to_string(),
+                        )));
+                    }
+                };
+                cursor.membership_reserved_bytes = reserved;
+                cursor.membership_cursor = Some(opened);
+                cursor.streaming_source = true;
+                cursor.state_end = Some(usize::MAX);
+            } else {
+                match source.state.ensure_raw_vectors_loaded() {
+                    Ok(()) => {
+                        cursor.streaming_source = false;
+                        cursor.state_end = Some(source.state.entry_count());
+                    }
+                    Err(Error::MemoryBudgetExceeded { .. })
+                        if cursor.stream_when_refused && source.state.streams_raw_bodies() =>
+                    {
+                        // The directory's end is found by reading past it.
+                        cursor.streaming_source = true;
+                        cursor.state_end = Some(usize::MAX);
+                    }
+                    Err(error) => return Err(E::from(error)),
                 }
-                Err(error) => return Err(E::from(error)),
             }
         }
         if cursor.position >= cursor.state_end.unwrap_or_default() {
@@ -2652,10 +2711,40 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             })?;
         before_source_entry()?;
         if cursor.streaming_source {
-            let Some(visible) = source
-                .state
-                .visible_directory_row_at(position, cursor.snapshot)
-            else {
+            let visible = if let Some(memberships) = cursor.membership_cursor.as_mut() {
+                let mut interrupted = None;
+                let next = if let Some(entry) = cursor.pending_membership.as_ref() {
+                    Ok(Some(entry.clone()))
+                } else {
+                    memberships.next(&mut |request| {
+                    let result = match request {
+                        crate::store::DormantVectorLoadRequest::Reserve(_) => Err(E::from(Error::Other(
+                            "membership cursor must admit its bounded window before opening".to_string(),
+                        ))),
+                        _ => before_source_entry(),
+                    };
+                    if let Err(error) = result { interrupted = Some(error); false } else { true }
+                })
+                };
+                if let Some(error) = interrupted {
+                    return Err(error);
+                }
+                cursor.pending_membership = next.map_err(E::from)?;
+                cursor.pending_membership.as_ref().map(|entry| {
+                    (entry.created_tx.0 <= cursor.snapshot.0
+                        && entry.deleted_tx.is_none_or(|tx| tx.0 > cursor.snapshot.0))
+                    .then_some(entry.row_id)
+                })
+            } else {
+                source
+                    .state
+                    .visible_directory_row_at(position, cursor.snapshot)
+            };
+            let Some(visible) = visible else {
+                cursor.membership_cursor.take();
+                let reserved = std::mem::take(&mut cursor.membership_reserved_bytes);
+                cursor.retained_bytes -= reserved;
+                release_retained(reserved);
                 cursor.source_position =
                     cursor.source_position.checked_add(1).ok_or_else(|| {
                         E::from(Error::Other(
@@ -2687,6 +2776,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     .map(|score| (row_id, score)),
                 None => None,
             };
+            cursor.pending_membership.take();
             cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
                 E::from(Error::Other(
                     "bounded vector candidate position overflow".to_string(),
@@ -2751,9 +2841,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             &mut release_retained,
         )?;
         let result = sources.iter().try_for_each(|source| {
-            source
-                .state
-                .bounded_visit_visible_ids(snapshot, &mut before_entry, &mut visit)
+            source.state.bounded_visit_visible_ids_charged(
+                snapshot,
+                &mut before_entry,
+                &mut before_retain,
+                &mut release_retained,
+                &mut visit,
+            )
         });
         drop(sources);
         release_retained(bytes);
@@ -3181,6 +3275,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 // graph (quarantined, an incomplete chain, nothing maintained,
                 // or a chain whose layers hold no point) is refused under
                 // INDEXED and compared row by row under AUTO.
+                // The selected chain has at most base, change and tail. Charge
+                // its finite owner vector before capturing any paged root.
+                let admitted_layer_bytes = 3usize.saturating_mul(std::mem::size_of::<
+                    crate::store::SnapshotCompatibleLayer<'_>,
+                >());
+                before_retain(admitted_layer_bytes)?;
                 let (availability, owned_layers) = state.snapshot_compatible_owned_layers(snapshot);
                 if availability == VectorGraphLayerAvailability::Ready && !owned_layers.is_empty() {
                     self.store.mark_sealed_graph_used(state);
@@ -3189,7 +3289,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             crate::store::SnapshotCompatibleLayer<'_>,
                         >()),
                     );
-                    before_retain(charged_bytes)?;
+                    let layer_bytes =
+                        owned_layers.capacity().saturating_mul(std::mem::size_of::<
+                            crate::store::SnapshotCompatibleLayer<'_>,
+                        >());
+                    if let Err(error) = before_retain(std::mem::size_of::<UnionPartition<'_>>()) {
+                        drop(owned_layers);
+                        release_retained(admitted_layer_bytes);
+                        return Err(error);
+                    }
+                    release_retained(admitted_layer_bytes.saturating_sub(layer_bytes));
                     union_partitions.push(UnionPartition {
                         source_position: partition_position - 1,
                         candidates,
@@ -3206,6 +3315,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     continue;
                 }
                 drop(owned_layers);
+                release_retained(admitted_layer_bytes);
                 let graph_ready = availability == VectorGraphLayerAvailability::Ready;
                 if mode == VectorSearchMode::Indexed {
                     return Ok(if graph_ready {
@@ -3739,7 +3849,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     partition: position,
                     allowed_count: partition.allowed_count,
                     live_count: partition.live_count,
-                    seed_rows: partition.candidates,
+                    seed_rows: partition
+                        .candidates
+                        .map(crate::hnsw::union::UnionSeedRows::Slice),
                 });
                 layer_owner.push((position, layer_position));
             }
@@ -4294,7 +4406,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let mut selected = BTreeMap::<VectorPartitionKey, Arc<crate::store::IndexState>>::new();
         for raw_row_id in candidates.iter() {
             let row_id = RowId(raw_row_id);
-            let Some(partition_key) = self.store.current_partition_for_row(index, row_id) else {
+            let Some(partition_key) = self.store.try_current_partition_for_row(index, row_id)?
+            else {
                 return self.all_partition_sources(index);
             };
             let Some(state) = self.store.try_partition_state(index, &partition_key) else {
@@ -4304,7 +4417,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 // the row-level authorization/filter boundary.
                 return self.all_partition_sources(index);
             };
-            if !state.directory_has_visible_row(row_id, snapshot) {
+            if !state.try_directory_has_visible_row(row_id, snapshot)? {
                 return self.all_partition_sources(index);
             }
             selected.entry(partition_key).or_insert(state);
@@ -4346,7 +4459,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         // contributes to this admission.
         let capacity = k.min(Self::aggregate_authorized_source_count(
             sources, candidates, snapshot,
-        ));
+        )?);
         scored.reserve(capacity)?;
         // Evaluate every eligible vector, retaining only the requested best
         // scores. Ranking callers request their complete candidate set here.
@@ -4365,7 +4478,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             for id in candidates.iter() {
                 let row_id = RowId(id);
                 for source in sources.iter() {
-                    if !source.state.directory_has_visible_row(row_id, snapshot) {
+                    if !source
+                        .state
+                        .try_directory_has_visible_row(row_id, snapshot)?
+                    {
                         continue;
                     }
                     if let Some(score) = source.state.score_visible_candidate(
@@ -4383,6 +4499,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return Ok(scored);
         }
         for source in sources {
+            if source.state.durable_membership_source().is_some() {
+                self.stream_source_bodies(index, source, query, snapshot, &mut consider)?;
+                continue;
+            }
             match source.state.ensure_raw_vectors_loaded() {
                 Ok(()) => {}
                 Err(Error::MemoryBudgetExceeded { .. })
@@ -4438,6 +4558,37 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         };
         let mut release_retained = |bytes: usize| accountant.release(bytes);
         let mut bodies = crate::store::RawVectorBodyReads::default();
+        if source.state.durable_membership_source().is_some() {
+            return source.state.bounded_visit_visible_ids_charged(
+                snapshot,
+                || Ok::<(), Error>(()),
+                |bytes| {
+                    accountant.try_allocate_for(
+                        bytes,
+                        "vector_search",
+                        "membership_window",
+                        "Reduce the query scope, or raise MEMORY_LIMIT.",
+                    )
+                },
+                |bytes| accountant.release(bytes),
+                |row_id| {
+                    if let Some(score) = source.state.bounded_score_stored_body(
+                        index,
+                        row_id,
+                        snapshot,
+                        query,
+                        &mut bodies,
+                        &mut || Ok::<(), Error>(()),
+                        &mut || Ok(()),
+                        &mut before_retain,
+                        &mut release_retained,
+                    )? {
+                        consider((row_id, score))?;
+                    }
+                    Ok(())
+                },
+            );
+        }
         let mut position = 0usize;
         while let Some(visible) = source.state.visible_directory_row_at(position, snapshot) {
             position = position
@@ -4463,7 +4614,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Ok(())
     }
 
-    fn aggregate_authorized_source_count(
+    fn aggregate_resident_authorized_source_count(
         sources: &[BoundedSnapshotVectorSource],
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
@@ -4487,6 +4638,37 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
+    fn aggregate_authorized_source_count(
+        sources: &[BoundedSnapshotVectorSource],
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+    ) -> Result<usize> {
+        if let Some(candidates) = candidates {
+            let mut count = 0usize;
+            for id in candidates.iter() {
+                for source in sources {
+                    if source
+                        .state
+                        .try_directory_has_visible_row(RowId(id), snapshot)?
+                    {
+                        count += 1;
+                        break;
+                    }
+                }
+            }
+            return Ok(count);
+        }
+        sources.iter().try_fold(0usize, |count, source| {
+            count
+                .checked_add(
+                    source
+                        .state
+                        .try_directory_visible_entry_count(snapshot, None)?,
+                )
+                .ok_or_else(|| Error::Other("vector authorized count overflow".into()))
+        })
+    }
+
     /// Passive aggregate used by EXPLAIN's policy disclosure. It reads only
     /// the already-resident raw directories and honors the same authorization
     /// bitmap and selected partition prefixes as execution; it never loads a
@@ -4499,9 +4681,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     ) -> Result<usize> {
         self.store.with_bulk_read(|| {
             let sources = self.selected_partition_sources(index, candidates, snapshot)?;
-            Ok(Self::aggregate_authorized_source_count(
-                &sources, candidates, snapshot,
-            ))
+            Self::aggregate_authorized_source_count(&sources, candidates, snapshot)
         })
     }
 
@@ -4562,9 +4742,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             breadth = breadth.max(
                 layout
                     .resolve_policy(
-                        source
-                            .state
-                            .directory_visible_entry_count(groups.snapshot, None),
+                        source.state.bounded_directory_visible_entry_count(
+                            groups.snapshot,
+                            None,
+                            &mut before_source,
+                        )?,
                         limit,
                     )
                     .hnsw_ef_search,
@@ -4657,16 +4839,19 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 )?;
                 let partition_routes = sources
                     .iter()
-                    .filter(|source| {
-                        source
+                    .map(|source| {
+                        Ok((source
                             .state
-                            .directory_visible_entry_count(snapshot, candidates)
-                            != 0
+                            .try_directory_visible_entry_count(snapshot, candidates)?
+                            != 0)
+                            .then_some(VectorPartitionSearchTrace {
+                                route: VectorPartitionSearchRoute::Exact,
+                                reason,
+                            }))
                     })
-                    .map(|_| VectorPartitionSearchTrace {
-                        route: VectorPartitionSearchRoute::Exact,
-                        reason,
-                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
                     .collect();
                 let trace = VectorSearchDebugTrace::brute_force(
                     &index,
@@ -4697,7 +4882,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
             if mode == contextdb_core::VectorSearchMode::Auto {
                 let authorized_count =
-                    Self::aggregate_authorized_source_count(&sources, candidates, snapshot);
+                    Self::aggregate_authorized_source_count(&sources, candidates, snapshot)?;
                 if authorized_count < layout.effective_auto_index_at() {
                     return exact(
                         if matches!(layout.quantization, VectorQuantization::F32) {
@@ -4927,7 +5112,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 return false;
             };
             let aggregate_count =
-                Self::aggregate_authorized_source_count(&sources, candidates, snapshot);
+                Self::aggregate_resident_authorized_source_count(&sources, candidates, snapshot);
             if aggregate_count == 0 {
                 return false;
             }
@@ -4940,6 +5125,32 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         != 0
                 })
                 .all(|source| source.state.has_complete_hnsw_route())
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn try_hnsw_eligible_without_build(
+        &self,
+        index: &VectorIndexRef,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        self.store.with_bulk_read(|| {
+            let sources = self.selected_partition_sources(index, candidates, snapshot)?;
+            if Self::aggregate_authorized_source_count(&sources, candidates, snapshot)? == 0 {
+                return Ok(false);
+            }
+            for source in &sources {
+                if source
+                    .state
+                    .try_directory_visible_entry_count(snapshot, candidates)?
+                    != 0
+                    && !source.state.has_complete_hnsw_route()
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         })
     }
 
@@ -4961,7 +5172,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             for source in sources {
                 if source
                     .state
-                    .directory_visible_entry_count(snapshot, candidates)
+                    .try_directory_visible_entry_count(snapshot, candidates)?
                     == 0
                 {
                     continue;
@@ -5009,6 +5220,42 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 tail |= sealed_base && status.fresh_tail_entries != 0;
             }
             Ok((base, change, tail))
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn try_hnsw_search_covers_all_without_build(
+        &self,
+        index: &VectorIndexRef,
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        self.store.with_bulk_read(|| {
+            let layout = self.store.index_layout(index)?;
+            let sources = self.selected_partition_sources(index, candidates, snapshot)?;
+            let mut nonempty = false;
+            for source in sources {
+                let allowed = source
+                    .state
+                    .try_directory_visible_entry_count(snapshot, candidates)?;
+                if allowed == 0 {
+                    continue;
+                }
+                nonempty = true;
+                let count = source
+                    .state
+                    .try_directory_visible_entry_count(snapshot, None)?;
+                let ef = layout
+                    .resolve_policy(count, search_policy_limit(k))
+                    .hnsw_ef_search;
+                if !source.state.has_complete_hnsw_route()
+                    || crate::hnsw::hnsw_search_candidate_cap_for_ef(ef, k) < allowed
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(nonempty)
         })
     }
 

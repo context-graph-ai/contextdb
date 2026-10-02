@@ -41,7 +41,9 @@ pub struct NoData;
 /// maximum number of layers
 pub(crate) const NB_LAYER_MAX: u8 = 16; // so max layer is 15!!
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 /// The 2-uple represent layer as u8  and rank in layer as a i32 as stored in our structure
 pub struct PointId(pub u8, pub i32);
 

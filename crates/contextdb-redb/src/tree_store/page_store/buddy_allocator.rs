@@ -1,3 +1,4 @@
+use super::allocator_pager::{AllocatorPager, bitmap_array_base};
 use crate::tree_store::PageNumber;
 use crate::tree_store::page_store::bitmap::BtreeBitmap;
 use crate::tree_store::page_store::page_manager::MAX_MAX_PAGE_ORDER;
@@ -5,6 +6,7 @@ use std::cmp::min;
 #[cfg(test)]
 use std::collections::HashSet;
 use std::mem::size_of;
+use std::sync::Arc;
 
 const MAX_ORDER_OFFSET: usize = 0;
 const PADDING: usize = 3;
@@ -34,7 +36,55 @@ pub(crate) struct BuddyAllocator {
 }
 
 impl BuddyAllocator {
-    #[cfg(feature = "test-seams")]
+    fn poisoned(&self) -> bool {
+        self.free.first().is_some_and(BtreeBitmap::poisoned)
+    }
+    pub(crate) fn materialize_paged_words(&mut self) {
+        for bitmap in &mut self.free {
+            bitmap.materialize_paged_words();
+        }
+    }
+    pub(crate) fn new_paged(
+        num_pages: u32,
+        max_page_capacity: u32,
+        region: u32,
+        pager: &Arc<AllocatorPager>,
+        initialize_free: bool,
+    ) -> Self {
+        let max_order = calculate_usable_order(max_page_capacity);
+        let mut capacity_for_order = max_page_capacity;
+        let mut pages_for_order = num_pages;
+        let mut free = Vec::with_capacity(max_order as usize + 1);
+        for order in 0..=max_order {
+            free.push(BtreeBitmap::new_padded_paged(
+                pages_for_order,
+                pages_for_order,
+                capacity_for_order,
+                bitmap_array_base(Some(region), order),
+                pager,
+                false,
+            ));
+            pages_for_order = next_higher_order(pages_for_order);
+            capacity_for_order = next_higher_order(capacity_for_order);
+        }
+        if initialize_free {
+            let mut accounted_pages = 0;
+            for order in (0..=max_order).rev() {
+                let order_size = 2u32.pow(order.into());
+                while accounted_pages + order_size <= num_pages {
+                    let page = accounted_pages / order_size;
+                    free[order as usize].clear(page);
+                    accounted_pages += order_size;
+                }
+            }
+            assert_eq!(accounted_pages, num_pages);
+        }
+        Self {
+            free,
+            len: num_pages,
+            max_order,
+        }
+    }
     pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
         self.free.capacity() * size_of::<BtreeBitmap>()
             + self
@@ -98,29 +148,41 @@ impl BuddyAllocator {
     // num_pages: u32
     // free_ends: array of u32, with ending offset for BtreeBitmap structure for the given order
     // ... BtreeBitmap structures
+    #[cfg(test)]
     pub(crate) fn to_vec(&self) -> Vec<u8> {
-        let serialized: Vec<Vec<u8>> = self.free.iter().map(BtreeBitmap::to_vec).collect();
+        let mut result = vec![0; self.encoded_len()];
+        self.encode_into(&mut result);
+        result
+    }
 
+    pub(crate) fn encoded_len(&self) -> usize {
         let header_bytes = 1 + 3 + size_of::<u32>();
         let offsets_bytes = (self.max_order as usize + 1) * size_of::<u32>();
-        let data_bytes: usize = serialized.iter().map(Vec::len).sum();
+        header_bytes
+            + offsets_bytes
+            + self
+                .free
+                .iter()
+                .map(BtreeBitmap::encoded_len)
+                .sum::<usize>()
+    }
 
-        let mut result = Vec::with_capacity(header_bytes + offsets_bytes + data_bytes);
-        result.push(self.max_order);
-        result.extend([0u8; 3]);
-        result.extend(self.len.to_le_bytes());
+    pub(crate) fn encode_into(&self, out: &mut [u8]) {
+        assert!(out.len() >= self.encoded_len());
+        let header_bytes = 1 + 3 + size_of::<u32>();
+        let offsets_bytes = self.free.len() * size_of::<u32>();
+        out[0] = self.max_order;
+        out[1..4].fill(0);
+        out[4..8].copy_from_slice(&self.len.to_le_bytes());
 
         let mut data_offset = header_bytes + offsets_bytes;
-        for bitmap in &serialized {
-            data_offset += bitmap.len();
-            let offset_u32: u32 = data_offset.try_into().unwrap();
-            result.extend(offset_u32.to_le_bytes());
+        for (order, bitmap) in self.free.iter().enumerate() {
+            let end = data_offset + bitmap.encoded_len();
+            let field = header_bytes + order * size_of::<u32>();
+            out[field..field + 4].copy_from_slice(&u32::try_from(end).unwrap().to_le_bytes());
+            bitmap.encode_into(&mut out[data_offset..end]);
+            data_offset = end;
         }
-        for bitmap in &serialized {
-            result.extend_from_slice(bitmap);
-        }
-
-        result
     }
 
     pub(crate) fn from_bytes(data: &[u8]) -> Self {
@@ -186,6 +248,12 @@ impl BuddyAllocator {
         None
     }
 
+    #[cfg(debug_assertions)]
+    pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
+        self.find_free_order(page.page_index << page.page_order)
+            .is_none()
+    }
+
     pub(crate) fn trailing_free_pages(&self) -> u32 {
         let mut free_pages = 0;
         let mut next_page = self.len() - 1;
@@ -228,6 +296,9 @@ impl BuddyAllocator {
     }
 
     pub(crate) fn resize(&mut self, new_size: u32) {
+        if self.poisoned() {
+            return;
+        }
         self.debug_check_consistency();
         if new_size > self.len() {
             let mut processed_pages = self.len();
@@ -297,6 +368,9 @@ impl BuddyAllocator {
 
     #[allow(unused_variables)]
     fn debug_check_consistency(&self) {
+        if self.poisoned() {
+            return;
+        }
         // Don't enable when fuzzing, because this is kind of expensive
         #[cfg(all(debug_assertions, not(fuzzing)))]
         {
@@ -339,6 +413,9 @@ impl BuddyAllocator {
     // Allocates a page of the given order at the lowest index possible. Will split a higher order page,
     // to get one of lower index
     pub(crate) fn alloc_lowest(&mut self, order: u8) -> Option<u32> {
+        if self.poisoned() {
+            return None;
+        }
         // Lowest index at the requested order
         let mut best_index_at_order = self.alloc_inner(order)?;
         // Best (index, order) found
@@ -370,6 +447,9 @@ impl BuddyAllocator {
             allocator.clear(free2);
             best = (free1, best_order - 1);
         }
+        if self.poisoned() {
+            return None;
+        }
         assert_eq!(best.0, best_index_at_order);
 
         Some(best.0)
@@ -380,6 +460,9 @@ impl BuddyAllocator {
     }
 
     pub(crate) fn alloc_inner(&mut self, order: u8) -> Option<u32> {
+        if self.poisoned() {
+            return None;
+        }
         if order > self.max_order {
             return None;
         }
@@ -407,8 +490,14 @@ impl BuddyAllocator {
     }
 
     pub(crate) fn record_alloc_inner(&mut self, page_number: u32, order: u8) {
-        let allocator = self.get_order_free_mut(order);
-        if allocator.get(page_number) {
+        if self.poisoned() {
+            return;
+        }
+        let allocated = self.get_order_free_mut(order).get(page_number);
+        if self.poisoned() {
+            return;
+        }
+        if allocated {
             // Need to split parent page
             let upper_page = next_higher_order(page_number);
             self.record_alloc_inner(upper_page, order + 1);
@@ -422,7 +511,7 @@ impl BuddyAllocator {
                 allocator.clear(free1);
             }
         } else {
-            allocator.set(page_number);
+            self.get_order_free_mut(order).set(page_number);
         }
     }
 
@@ -435,6 +524,9 @@ impl BuddyAllocator {
     }
 
     pub(crate) fn free_inner(&mut self, page_number: u32, order: u8) {
+        if self.poisoned() {
+            return;
+        }
         if order == self.max_order {
             let allocator = self.get_order_free_mut(order);
             allocator.clear(page_number);

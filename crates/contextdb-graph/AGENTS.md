@@ -22,6 +22,12 @@ and edge-type filtering, prepared DAG declaration publication
 (`PreparedDagEdgeTypes`), and the parked-traversal continuation that survives
 adjacency reclaim.
 
+`src/source.rs` owns storage-neutral adjacency reads (`GraphReadSource`, `GraphSnapshot`,
+`GraphCursor`, `GraphEdgeWindow`, `GraphQuery`, `GraphOverlay`): the engine supplies a pinned
+durable root, each edge window keeps its admission owner until dropped, and a historical logical
+snapshot filters that one physical root by retained MVCC intervals instead of loading newer edges.
+`MemGraphExecutor` reads through this seam, with uncommitted edges layered on as an overlay.
+
 Must not own: durability (the engine's `persistence.rs` writes redb; this crate
 is memory only), the commit gate (the engine sequences prepare → durable commit
 → publish), SQL grammar or planning, or row storage.
@@ -50,12 +56,14 @@ is memory only), the commit gate (the engine sequences prepare → durable commi
 | A million-entry traversal queue is released on a small stack | `tests/long_traversal_queue_drops_iteratively.rs::a_traversal_queue_holding_a_million_entries_is_released_on_a_small_stack` |
 | A `DAG`-declared edge type refuses a cycle insert, including a self-loop | `crates/contextdb-engine/tests/sql_surface/sql_surface_other.rs::dag_01_cycle_rejected_via_insert_sql`, `::dag_02_self_loop_rejected_via_insert_sql` |
 | A received ordinary edge-table drop removes its links, including after restart | `crates/contextdb-engine/tests/sync/a_received_drop_of_an_edge_table_takes_its_links.rs::a_received_drop_of_an_ordinary_edge_table_removes_its_links_now_and_after_a_restart`, `::an_authenticated_received_drop_of_an_ordinary_edge_table_removes_its_links` |
+| A graph delete seeks only its own edge identity and decodes no unrelated edges | `crates/contextdb-engine/tests/engine_seams/graph_delete_seeks_only_its_edge_identity.rs` → `graph_delete_seeks_only_its_edge_identity` |
 
 ## Where a change lives
 
 | Change | Where it lands |
 |---|---|
 | Adjacency layout, whole-schema or affected-edge publication | `src/store.rs` |
+| Reading adjacency from a pinned durable root, edge windows and the staged overlay | `src/source.rs`, consumed by `src/mem.rs` and `src/store.rs`; the engine implements the source. |
 | BFS, visited ceiling, DAG cycle check and prepared declaration publication, direction/type filters | `src/mem.rs`; export public types from `src/lib.rs` |
 | `GRAPH_TABLE` grammar | Parser crate |
 | Plan shape for `GraphBfs` | Planner crate |

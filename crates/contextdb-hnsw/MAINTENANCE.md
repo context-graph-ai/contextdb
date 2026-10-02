@@ -8,12 +8,12 @@ license files are unchanged.
 The maintained distribution is published as **`contextdb-hnsw`**. Its library remains named
 `hnsw_rs`, so upstream-style callers keep their compile-time identity; `contextdb-vector` depends on
 it, so it is published before `contextdb-vector`. The package identity, description, repository,
-library alias, and the absence of upstream examples, tests, and benchmarks are ContextDB packaging
+library alias, and the direct rand_chacha dependency for resumable seeded state, and the absence of upstream examples, tests, and benchmarks are ContextDB packaging
 metadata outside the source-only upstream diff below.
 
 ## Why the fork exists
 
-ContextDB needs five things upstream does not provide:
+ContextDB needs six things upstream does not provide:
 
 - **Deterministic builds.** Rebuilding a graph from the same points must produce the same topology,
   which needs a caller-provided seed for the level-assignment RNG.
@@ -31,14 +31,17 @@ ContextDB needs five things upstream does not provide:
 - **Source-driven saved-graph search.** An immutable graph reader needs one neighbour's identity
   without copying an adjacency list, so resident and paged F32 graphs use the same bounded walk.
 
+- **Provider-backed construction.** A durable graph must resume seeded insertion from a compact RNG position, load one point at a time, use finite admitted scratch, and stream the existing owned point/graph layout. The provider owns transactions and errors; the fork owns descent, diversity selection, reciprocal pruning and deterministic ties.
+
 [upstream-0.3.4.patch](upstream-0.3.4.patch) is the complete source-only delta against that exact
 package:
 
 | Changed source | Reason |
 |---|---|
-| `src/hnsw.rs` | Seeded `new_with_seed` constructors on `LayerGenerator`, `PointIndexation`, and `Hnsw`; empty-graph point iteration; `with_point_data`, `neighbour_identity`, and read-only getters; the owned read-only `LoadedHnsw`; `search_with_bounded_control` and `search_allowed_with_bounded_control` with `HnswAllowedSearchLimits` and their typed status/result/error types, where the bounded search scores its entry point once during descent and carries that distance into its level-zero walk; `insert_slice_with_point_id` returning the physical point identity. |
-| `src/hnswio.rs` | `encode_owned_graph`, `encode_owned_graph_into`, and `decode_owned_graph` for the owned graph representation, which validates every edge and returns an error for malformed bytes; `load_hnsw_owned` and `load_hnsw_owned_with_dist`; loaded points own shared handles to their memory mapping. |
-| `src/lib.rs` | Allow four upstream clippy lints so the workspace's strict lint gate passes on unchanged upstream code. |
+| `src/paged.rs` | Provider-backed sequential construction/search with finite scratch, optional transaction-local visited/priority-queue spill, constant-size degree counters, fallible point access, allowed-result refill through excluded nodes, shared statement visit/distance hooks, and resumable ChaCha12 state matching rand 0.9 StdRng; parity and refusal tests. |
+| `src/hnsw.rs` | Seeded `new_with_seed` constructors on `LayerGenerator`, `PointIndexation`, and `Hnsw`; empty-graph point iteration; `with_point_data`, `neighbour_identity`, and read-only getters; the owned read-only `LoadedHnsw`; `search_with_bounded_control` and `search_allowed_with_bounded_control` with `HnswAllowedSearchLimits` and their typed status/result/error types, where the bounded search scores its entry point once during descent and carries that distance into its level-zero walk; `insert_slice_with_point_id` returning the physical point identity; serializable physical PointId for provider checkpoints. |
+| `src/hnswio.rs` | `encode_owned_graph`, `encode_owned_graph_into`, and `decode_owned_graph` for the owned graph representation, which validates every edge and returns an error for malformed bytes; `load_hnsw_owned` and `load_hnsw_owned_with_dist`; loaded points own shared handles to their memory mapping; `encode_paged_graph_into`, `encode_paged_point_into` and `decode_paged_point` stream the unchanged owned layout through provider point reads. |
+| `src/lib.rs` | Export the provider module; allow four upstream clippy lints so the workspace's strict lint gate passes on unchanged upstream code. |
 | `src/api.rs`, `src/datamap.rs`, `src/filter.rs`, `src/flatten.rs`, `src/libext.rs` | Trailing whitespace removed from doc comments; no code change. |
 
 To reproduce the patch, obtain and verify the exact package above, unpack it outside the repository,
@@ -81,6 +84,7 @@ once an upstream release carries it:
 3. An owned, validated graph encoding with a read-only loaded graph.
 4. Allowed-set search with hard visit/distance limits and typed incomplete results.
 5. Read-only access to one neighbour identity for a shared saved-graph walk.
+6. Storage-neutral fallible point provider for canonical construction/search, finite insertion scratch, checkpointable seeded RNG, and streaming owned encoding; replace it when upstream supports this access seam.
 
-The fork can be retired only when upstream carries all five; until then, deleting it breaks vector
+The fork can be retired only when upstream carries all six; until then, deleting it breaks vector
 search. None of these proposals has been submitted upstream.

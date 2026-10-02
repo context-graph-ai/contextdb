@@ -1756,6 +1756,170 @@ impl<T: Serialize + DeserializeOwned + Clone + Sized + Send + Sync, D: Distance<
 
 //===============================================================================================================
 
+/// Stream a provider-backed graph using the existing owned graph layout. The
+/// provider admits and authenticates one point at a time; no topology or
+/// generation-sized encoded buffer is retained by this encoder.
+pub fn encode_paged_graph_into<T, S, W>(
+    storage: &mut S,
+    state: &crate::paged::PagedGraphState,
+    policy: crate::paged::PagedGraphPolicy,
+    dimension: usize,
+    mut output: W,
+) -> std::result::Result<(), crate::paged::PagedGraphError<S::Error>>
+where
+    T: Serialize,
+    S: crate::paged::PagedPointStorage<T>,
+    W: std::io::Write,
+{
+    use crate::paged::PagedGraphError;
+    if !policy.validate() {
+        return Err(PagedGraphError::InvalidPolicy);
+    }
+    let codec = bincode::DefaultOptions::new().with_fixint_encoding();
+    // Encoding failures are separate from provider errors; the storage
+    // transaction owns the output and must roll it back after either one.
+    let write = |result: bincode::Result<()>| result.map_err(|_| PagedGraphError::Encoding);
+    write(codec.serialize_into(
+        &mut output,
+        &(
+            CONTEXTDB_OWNED_GRAPH_FORMAT_VERSION,
+            policy.m,
+            policy.ef_construction,
+            policy.extend_candidates,
+            policy.keep_pruned,
+            policy.max_layer,
+            dimension,
+            1. / (policy.m as f64).ln(),
+        ),
+    ))?;
+    write(codec.serialize_into(&mut output, &(policy.max_layer as u64)))?;
+    for layer in 0..policy.max_layer {
+        write(codec.serialize_into(&mut output, &(state.layer_counts[layer] as u64)))?;
+        for rank in 0..state.layer_counts[layer] {
+            storage.checkpoint().map_err(PagedGraphError::Storage)?;
+            let id = PointId(
+                layer as u8,
+                i32::try_from(rank).map_err(|_| PagedGraphError::InvalidState)?,
+            );
+            let point = storage.load_point(id).map_err(PagedGraphError::Storage)?;
+            if point.id != id {
+                return Err(PagedGraphError::InvalidPoint);
+            }
+            write(codec.serialize_into(
+                &mut output,
+                &(
+                    point.origin_id,
+                    OwnedPointId {
+                        layer: id.0,
+                        rank: id.1,
+                    },
+                    point.values.as_slice(),
+                ),
+            ))?;
+            write(codec.serialize_into(&mut output, &(point.neighbours.len() as u64)))?;
+            for neighbours in &point.neighbours {
+                write(codec.serialize_into(&mut output, &(neighbours.len() as u64)))?;
+                for neighbour in neighbours {
+                    write(codec.serialize_into(
+                        &mut output,
+                        &OwnedNeighbour {
+                            origin_id: neighbour.origin_id,
+                            point_id: OwnedPointId {
+                                layer: neighbour.point_id.0,
+                                rank: neighbour.point_id.1,
+                            },
+                            distance: neighbour.distance,
+                        },
+                    ))?;
+                }
+            }
+        }
+    }
+    let entry = state.entry_point.map(|id| OwnedPointId {
+        layer: id.0,
+        rank: id.1,
+    });
+    write(codec.serialize_into(&mut output, &entry))?;
+    std::result::Result::Ok(())
+}
+
+/// Encode an independently stored point in the existing sealed graph point
+/// layout. The page owner adds its identity envelope and checksum.
+pub fn encode_paged_point_into<T: Serialize, W: std::io::Write>(
+    point: &crate::paged::PagedPoint<T>,
+    mut output: W,
+) -> Result<()> {
+    let codec = bincode::DefaultOptions::new().with_fixint_encoding();
+    codec.serialize_into(
+        &mut output,
+        &(
+            point.origin_id,
+            OwnedPointId {
+                layer: point.id.0,
+                rank: point.id.1,
+            },
+            point.values.as_slice(),
+        ),
+    )?;
+    codec.serialize_into(&mut output, &(point.neighbours.len() as u64))?;
+    for layer in &point.neighbours {
+        codec.serialize_into(&mut output, &(layer.len() as u64))?;
+        for edge in layer {
+            codec.serialize_into(
+                &mut output,
+                &OwnedNeighbour {
+                    origin_id: edge.origin_id,
+                    point_id: OwnedPointId {
+                        layer: edge.point_id.0,
+                        rank: edge.point_id.1,
+                    },
+                    distance: edge.distance,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Decode one sealed-layout point after its page envelope was authenticated.
+/// The byte limit is the caller's admitted finite decode window.
+pub fn decode_paged_point<T: DeserializeOwned>(
+    bytes: &[u8],
+    byte_limit: usize,
+) -> Result<crate::paged::PagedPoint<T>> {
+    if bytes.len() > byte_limit {
+        return Err(anyhow!("HNSW point exceeds its admitted decode window"));
+    }
+    let point: OwnedGraphPoint<T> = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(byte_limit as u64)
+        .reject_trailing_bytes()
+        .deserialize(bytes)?;
+    if point.point_id.layer >= 16 || point.point_id.rank < 0 || point.neighbours.len() > 16 {
+        return Err(anyhow!("invalid HNSW point identity or layer count"));
+    }
+    let neighbours = point
+        .neighbours
+        .into_iter()
+        .map(|layer| {
+            layer
+                .into_iter()
+                .map(|edge| crate::paged::PagedEdge {
+                    point_id: PointId(edge.point_id.layer, edge.point_id.rank),
+                    origin_id: edge.origin_id,
+                    distance: edge.distance,
+                })
+                .collect()
+        })
+        .collect();
+    Ok(crate::paged::PagedPoint {
+        id: PointId(point.point_id.layer, point.point_id.rank),
+        origin_id: point.origin_id,
+        values: point.values,
+        neighbours,
+    })
+}
+
 #[cfg(test)]
 
 mod tests {

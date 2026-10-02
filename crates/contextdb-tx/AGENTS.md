@@ -20,6 +20,14 @@ and `CommitFailure`. Owns (`src/write_set.rs`) `WriteSet`,
 `WriteSetApplicator`, `RelationalDeletePredicate`, and
 `row_matches_delete_predicates`, including recorded admission bytes for staged rows.
 
+Owns (`src/commit_directory.rs`) the storage-neutral commit history seam (`CommitDirectory`,
+`CommitDirectoryCursor`): a file-backed writer supplies a durable, root-pinned cursor and only the
+in-memory backend keeps a tree, so counts and endpoint probes never enumerate history. Owns
+(`src/ordered_staged.rs`) `OrderedStagedRows`, the incrementally ordered index view of a
+transaction's staged rows, so newest-first reads merge staged order without sorting. The manager
+also publishes a shared read root at each durable publication boundary
+(`capture_published_read`), which statement reads retain until they finish.
+
 Must not own: what a write set means in storage (the applicator in the engine
 and store crates applies it), SQL, durability, or conflict policy. Never add a
 second transaction manager beside this one.
@@ -50,6 +58,9 @@ second transaction manager beside this one.
 | After-apply publication precedes commit visibility | `tests/tx_safety_tests.rs::tx_09_after_apply_publication_precedes_commit_visibility` |
 | Staged rows settle their recorded admission across an index-set change | `crates/contextdb-engine/tests/declared_memory_limit_bounds_a_writer.rs::a_transaction_open_across_an_index_set_change_settles_the_rows_it_staged` |
 | Writable recovery truncates only uncommitted commit-index entries | `crates/contextdb-engine/tests/engine_seams/recover_uncommitted_commit_index_tail.rs::writable_recovery_truncates_only_commit_index_entries_past_the_committed_lsn` |
+| Writable open reads no history and a reader's captured root survives later commits, eviction and cleanup | `crates/contextdb-engine/tests/engine_seams/writable_open_never_touches_history_families.rs` → `writable_open_never_touches_history_families`; `crates/contextdb-engine/tests/engine_seams/writer_reader_root_survives_commit_eviction_and_cleanup.rs` → `writer_reader_root_survives_commit_eviction_and_cleanup` |
+| Commit and sync cursors reload from durable history without a full directory | `crates/contextdb-engine/tests/engine_seams/history_sync_and_commit_cursors_reload_without_full_directories.rs` → `history_sync_and_commit_cursors_reload_without_full_directories` |
+| Newest-event lookup merges staged order without a sort | `crates/contextdb-engine/tests/bounded/newest_event_merges_staged_order_without_sort.rs` → `newest_event_merges_staged_order_without_sort` |
 | Bounded reads copy one complete published snapshot and LSN while a writer applies; cancellation and an advanced request clock wake a parked reader | `crates/contextdb-engine/tests/engine_seams/snapshot_visible_posting_membership_contract.rs::new_membership_root_cannot_expose_half_applied_row_vector_commit`, `src/manager.rs::commit_wait_tests::cancellation_wakes_a_commit_wait_before_the_writer_releases`, `src/manager.rs::commit_wait_tests::manual_deadline_advance_wakes_commit_wait_without_writer_release` |
 
 ## Where a change lives
@@ -58,6 +69,7 @@ second transaction manager beside this one.
 |---|---|
 | Commit, rollback, snapshot, LSN, `TxId`, active write sets or commit-lock access | `src/manager.rs` |
 | Write-set fields, emptiness, canonicalization or staged-row admission records | `src/write_set.rs` |
+| Commit-history storage seam; staged-row index order | `src/commit_directory.rs`; `src/ordered_staged.rs`. The durable implementation is the engine's `persistence/writer_commit_directory.rs`. |
 | How a write set is applied to rows, edges, or vectors | The store crate that implements `WriteSetApplicator`, sequenced by the engine |
 | A new identifier newtype | Core crate `types.rs` — not here |
 

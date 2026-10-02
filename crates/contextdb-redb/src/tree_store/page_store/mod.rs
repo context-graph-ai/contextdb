@@ -1,3 +1,4 @@
+mod allocator_pager;
 mod backends;
 mod base;
 mod bitmap;

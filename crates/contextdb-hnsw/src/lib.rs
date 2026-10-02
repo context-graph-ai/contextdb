@@ -18,6 +18,7 @@ pub mod flatten;
 pub mod hnsw;
 pub mod hnswio;
 pub mod libext;
+pub mod paged;
 pub mod prelude;
 
 // we impose our version of anndists

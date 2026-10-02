@@ -295,7 +295,75 @@
  
  #[allow(clippy::len_without_is_empty)]
  /// Implements persistent storage for a database.
-@@ -305,6 +308,14 @@
+@@ -49,6 +52,12 @@
+     /// Writes the specified array to the storage.
+     fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
+ 
++    /// Create non-durable allocator scratch storage beside this backend's file.
++    /// Backends without a file may retain the in-memory allocator instead.
++    fn scratch_backend(&self) -> std::result::Result<Option<Box<dyn ScratchBackend>>, io::Error> {
++        Ok(None)
++    }
++
+     /// Release any resources held by the backend
+     ///
+     /// Note: redb will not access the backend after calling this method and will call it exactly
+@@ -56,6 +65,54 @@
+     fn close(&self) -> std::result::Result<(), io::Error> {
+         Ok(())
+     }
++}
++
++/// Seekable, non-durable backing for allocator working state. Its contents are
++/// discarded when the database closes or reopens; committed system tables stay
++/// the durable authority.
++#[allow(clippy::len_without_is_empty)]
++pub trait ScratchBackend: Debug + Send + Sync {
++    fn len(&self) -> io::Result<u64>;
++    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()>;
++    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()>;
++    fn set_len(&self, len: u64) -> io::Result<()>;
++}
++
++/// Create an allocator scratch file in the database file's directory.
++/// The directory entry is removed immediately. An open handle keeps the
++/// scratch usable, and process death cannot leave a named orphan behind.
++pub fn scratch_backend_in_directory(directory: &Path) -> io::Result<Box<dyn ScratchBackend>> {
++    use std::io::{Read, Seek, SeekFrom, Write};
++    use std::sync::Mutex;
++
++    #[derive(Debug)]
++    struct TemporaryScratch(Mutex<std::fs::File>);
++
++    impl ScratchBackend for TemporaryScratch {
++        fn len(&self) -> io::Result<u64> {
++            Ok(self.0.lock().unwrap().metadata()?.len())
++        }
++
++        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
++            let mut file = self.0.lock().unwrap();
++            file.seek(SeekFrom::Start(offset))?;
++            file.read_exact(out)
++        }
++
++        fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
++            let mut file = self.0.lock().unwrap();
++            file.seek(SeekFrom::Start(offset))?;
++            file.write_all(data)
++        }
++
++        fn set_len(&self, len: u64) -> io::Result<()> {
++            self.0.lock().unwrap().set_len(len)
++        }
++    }
++
++    Ok(Box::new(TemporaryScratch(Mutex::new(
++        tempfile::tempfile_in(directory)?,
++    ))))
+ }
+ 
+ pub trait TableHandle: Sealed {
+@@ -305,6 +362,14 @@
          Self {
              transaction_tracker: None,
              transaction_id: None,
@@ -310,7 +378,7 @@
              write_transaction: false,
          }
      }
-@@ -424,11 +435,53 @@
+@@ -424,11 +489,53 @@
          Builder::new().open_read_only(path)
      }
  
@@ -364,7 +432,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -441,21 +494,24 @@
+@@ -441,21 +548,24 @@
              region_size,
              cache_size,
              true,
@@ -402,7 +470,7 @@
          let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
          let db = Self {
              mem,
-@@ -502,6 +558,9 @@
+@@ -502,6 +612,9 @@
  pub struct Database {
      mem: Arc<TransactionalMemory>,
      transaction_tracker: Arc<TransactionTracker>,
@@ -412,7 +480,44 @@
  }
  
  impl ReadableDatabase for Database {
-@@ -619,6 +678,7 @@
+@@ -518,6 +631,17 @@
+ }
+ 
+ impl Database {
++    /// Upper bound on the allocator's resident heap owner. Paged file
++    /// backends have a fixed envelope regardless of durable region count.
++    pub fn allocator_resident_bytes(&self) -> usize {
++        self.mem.allocator_resident_bytes()
++    }
++
++    /// Return `(loaded_regions, total_regions)` for allocator state.
++    pub fn allocator_region_counts(&self) -> (usize, usize) {
++        self.mem.allocator_region_counts()
++    }
++
+     /// Opens the specified file as a redb database.
+     /// * if the file does not exist, or is an empty file, a new database will be initialized in it
+     /// * if the file is a valid redb database, it will be opened
+@@ -571,9 +695,17 @@
+     /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
+     /// alive when this method is called.
+     pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
+-        let allocator_hash = self.mem.allocator_hash();
++        if Arc::strong_count(&self.mem) != 1 {
++            return Err(DatabaseError::TransactionInProgress);
++        }
++        // The lazy allocator source holds a weak reference to this memory.
++        // Materialize it before Arc::get_mut, which requires no weak owners.
++        self.mem.materialize_allocator_source()?;
+         let mem = Arc::get_mut(&mut self.mem).ok_or(DatabaseError::TransactionInProgress)?;
+         let mut was_clean = mem.clear_cache_and_reload()?;
++        // The committed header may be smaller than a free tail left by an
++        // aborted write. Compare allocator states at committed geometry.
++        let allocator_hash = self.mem.allocator_hash();
+ 
+         let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
+ 
+@@ -619,6 +751,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -420,7 +525,7 @@
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +689,7 @@
+@@ -629,6 +762,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -428,7 +533,7 @@
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +704,7 @@
+@@ -643,6 +777,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -436,7 +541,7 @@
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +714,7 @@
+@@ -652,6 +787,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -444,7 +549,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +723,7 @@
+@@ -660,6 +796,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -452,7 +557,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -676,6 +740,209 @@
+@@ -676,6 +813,209 @@
          }
  
          Ok(compacted)
@@ -662,7 +767,7 @@
      }
  
      #[cfg_attr(not(debug_assertions), expect(dead_code))]
-@@ -891,6 +1158,7 @@
+@@ -891,6 +1231,7 @@
          Ok([data_root, system_root])
      }
  
@@ -670,7 +775,7 @@
      fn new(
          file: Box<dyn StorageBackend>,
          allow_initialize: bool,
-@@ -898,6 +1166,8 @@
+@@ -898,6 +1239,8 @@
          region_size: Option<u64>,
          cache_size: usize,
          repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
@@ -679,15 +784,29 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -909,6 +1179,7 @@
-             page_size,
+@@ -910,6 +1253,7 @@
              region_size,
              cache_size,
-+            false,
              false,
++            false,
          )?;
          let mut mem = Arc::new(mem);
-@@ -944,8 +1215,20 @@
+         // If the last transaction used 2-phase commit and updated the allocator state table, then
+@@ -919,7 +1263,12 @@
+             info!("Found valid allocator state, full repair not needed");
+             mem.load_allocator_state(&tree)?;
+             #[cfg(debug_assertions)]
+-            Self::mark_allocated_page_for_debug(&mut mem)?;
++            // Unit tests exercise the legacy exact-extent debug inventory.
++            // Normal file-backed writers keep that inventory empty so it
++            // cannot grow with the durable page count.
++            if cfg!(test) || !mem.uses_paged_allocator() {
++                Self::mark_allocated_page_for_debug(&mut mem)?;
++            }
+         } else {
+             #[cfg(feature = "logging")]
+             warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
+@@ -944,8 +1293,20 @@
  
          let db = Database {
              mem,
@@ -709,7 +828,7 @@
  
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-@@ -1035,12 +1318,21 @@
+@@ -1035,12 +1396,21 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -731,7 +850,7 @@
          WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
              .map_err(|e| e.into())
      }
-@@ -1056,16 +1348,78 @@
+@@ -1056,16 +1426,78 @@
  
          Ok(())
      }
@@ -812,7 +931,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +1460,7 @@
+@@ -1106,6 +1538,7 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -820,7 +939,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +1480,7 @@
+@@ -1125,6 +1558,7 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -828,7 +947,7 @@
          }
      }
  
-@@ -1157,13 +1513,27 @@
+@@ -1157,13 +1591,27 @@
          self
      }
  
@@ -857,7 +976,22 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1189,6 +1559,8 @@
+@@ -1175,6 +1623,7 @@
+     /// * if the file is a valid redb database, it will be opened
+     /// * otherwise this function will return an error
+     pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
++        let path = path.as_ref();
+         let file = OpenOptions::new()
+             .read(true)
+             .write(true)
+@@ -1183,26 +1632,71 @@
+             .open(path)?;
+ 
+         Database::new(
+-            Box::new(FileBackend::new(file)?),
++            Box::new(FileBackend::new_with_path(file, path)?),
+             true,
+             self.page_size,
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -866,7 +1000,16 @@
          )
      }
  
-@@ -1203,6 +1575,48 @@
+     /// Opens an existing redb database.
+     pub fn open(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
++        let path = path.as_ref();
+         let file = OpenOptions::new().read(true).write(true).open(path)?;
+ 
+         Database::new(
+-            Box::new(FileBackend::new(file)?),
++            Box::new(FileBackend::new_with_path(file, path)?),
+             false,
+             self.page_size,
              None,
              self.cache_size,
              &self.repair_callback,
@@ -915,7 +1058,7 @@
          )
      }
  
-@@ -1222,6 +1636,36 @@
+@@ -1222,6 +1716,36 @@
              self.page_size,
              None,
              self.cache_size,
@@ -952,7 +1095,7 @@
          )
      }
  
-@@ -1236,6 +1680,29 @@
+@@ -1236,6 +1760,29 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -982,7 +1125,7 @@
          )
      }
  
-@@ -1251,6 +1718,8 @@
+@@ -1251,6 +1798,8 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -991,7 +1134,7 @@
          )
      }
  }
-@@ -1260,18 +1729,215 @@
+@@ -1260,18 +1809,215 @@
          f.debug_struct("Database").finish()
      }
  }
@@ -1211,6 +1354,17 @@
      struct FailingBackend {
 --- a/src/lib.rs
 +++ b/src/lib.rs
+@@ -64,8 +64,8 @@
+ 
+ pub use db::{
+     Builder, CacheStats, Database, MultimapTableDefinition, MultimapTableHandle, ReadOnlyDatabase,
+-    ReadableDatabase, RepairSession, StorageBackend, TableDefinition, TableHandle,
+-    UntypedMultimapTableHandle, UntypedTableHandle,
++    ReadableDatabase, RepairSession, ScratchBackend, StorageBackend, TableDefinition, TableHandle,
++    UntypedMultimapTableHandle, UntypedTableHandle, scratch_backend_in_directory,
+ };
+ pub use error::{
+     CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
 @@ -79,19 +79,40 @@
      ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
      Table, TableStats,
@@ -2205,7 +2359,7 @@
 +            crate::commit_work::observe_commit_span_count();
 +            crate::commit_work::observe_commit_span(
 +                crate::commit_work::CommitSpan::FlushAndClose,
-+                span_started.elapsed().as_nanos() as u64,
++                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
 +            );
 +            span_started = std::time::Instant::now();
 +        }
@@ -2225,7 +2379,7 @@
 +        #[cfg(feature = "test-seams")]
 +        crate::commit_work::observe_commit_span(
 +            crate::commit_work::CommitSpan::StorePageLists,
-+            span_started.elapsed().as_nanos() as u64,
++            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
 +        );
  
          #[cfg(feature = "logging")]
@@ -2240,7 +2394,7 @@
  
          self.savepoint_state
              .lock()
-@@ -1627,11 +1760,21 @@
+@@ -1627,18 +1760,36 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -2255,14 +2409,32 @@
 +        {
 +            crate::commit_work::observe_commit_span(
 +                crate::commit_work::CommitSpan::ProcessFreedPages,
-+                span_started.elapsed().as_nanos() as u64,
++                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
 +            );
 +            span_started = std::time::Instant::now();
 +        }
  
          let mut system_tables = self.system_tables.lock().unwrap();
          let system_freed_pages = system_tables.system_freed_pages();
-@@ -1680,6 +1823,14 @@
+         let system_tree = system_tables.table_tree.flush_table_root_updates()?;
+-        system_tree
+-            .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
+-            .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
++        let retire_saved_allocator = if self.quick_repair {
++            self.mem.materialize_allocator_source()?;
++            true
++        } else {
++            self.mem.materialize_small_allocator_source()?
++        };
++        if retire_saved_allocator {
++            system_tree
++                .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
++                .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?;
++        }
+ 
+         if self.quick_repair {
+             system_tree.create_table_and_flush_table_root(
+@@ -1680,6 +1831,14 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
@@ -2270,26 +2442,36 @@
 +        {
 +            crate::commit_work::observe_commit_span(
 +                crate::commit_work::CommitSpan::SystemTree,
-+                span_started.elapsed().as_nanos() as u64,
++                u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
 +            );
 +            span_started = std::time::Instant::now();
 +        }
  
          self.mem.commit(
              user_root,
-@@ -1688,6 +1839,11 @@
+@@ -1688,6 +1847,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
 +        #[cfg(feature = "test-seams")]
 +        crate::commit_work::observe_commit_span(
 +            crate::commit_work::CommitSpan::StorageCommit,
-+            span_started.elapsed().as_nanos() as u64,
++            u64::try_from(span_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
 +        );
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1823,46 +1979,311 @@
+@@ -1766,6 +1930,9 @@
+     // Relocate pages to lower number regions/pages
+     // Returns true if a page(s) was moved
+     pub(crate) fn compact_pages(&mut self) -> Result<bool> {
++        // Relocation can replace the allocator-state tree's source pages. Copy
++        // its lazy bitmap words to scratch before those pages become reusable.
++        self.mem.materialize_allocator_source()?;
+         let mut progress = false;
+ 
+         // Find the 1M highest pages
+@@ -1823,46 +1990,331 @@
          Ok(progress)
      }
  
@@ -2347,6 +2529,13 @@
 +        maximum: usize,
 +        admit: &mut impl FnMut(usize) -> std::io::Result<()>,
 +    ) -> Result<CompactionProgress> {
++        // The saved allocator tree is a live lazy bitmap source. Keep that
++        // one root reachable instead of copying all its words under the writer
++        // lock before a finite batch's admission. Relocating the system master
++        // tree preserves this table's child root. Quick repair and explicit
++        // whole-file compaction detach the source before replacing its pages.
++        let protected_table = (cursor.phase >= 2 && self.mem.has_saved_allocator_source())
++            .then_some(ALLOCATOR_STATE_TABLE_NAME);
 +        let mut tables = self.tables.lock().unwrap();
 +        let mut system_tables = self.system_tables.lock().unwrap();
 +        let tree = if cursor.phase < 2 {
@@ -2354,7 +2543,8 @@
 +        } else {
 +            &mut system_tables.table_tree
 +        };
-+        let (target, pages, examined) = tree.compaction_page_batch(cursor, maximum)?;
++        let (target, pages, examined) =
++            tree.compaction_page_batch(cursor, maximum, protected_table)?;
 +        let mut relocation_map = HashMap::new();
 +        let pages = pages
 +            .into_iter()
@@ -2364,8 +2554,13 @@
 +            if relocation_map.contains_key(&path.page_number()) {
 +                continue;
 +            }
++            let bytes = self
++                .mem
++                .get_page_size()
++                .checked_shl(u32::from(path.page_number().page_order))
++                .ok_or_else(|| StorageError::Corrupted("relocation extent size overflow".into()))?;
++            admit(bytes.saturating_add(128))?;
 +            let old = self.mem.get_page(path.page_number(), PageHint::None)?;
-+            admit(old.memory().len().saturating_add(128))?;
 +            let mut new = self.mem.allocate_lowest(old.memory().len())?;
 +            let number = new.get_page_number();
 +            new.memory_mut()[0] = old.memory()[0];
@@ -2379,8 +2574,15 @@
 +                if relocation_map.contains_key(parent) {
 +                    continue;
 +                }
++                let bytes = self
++                    .mem
++                    .get_page_size()
++                    .checked_shl(u32::from(parent.page_order))
++                    .ok_or_else(|| {
++                        StorageError::Corrupted("relocation extent size overflow".into())
++                    })?;
++                admit(bytes.saturating_add(128))?;
 +                let old = self.mem.get_page(*parent, PageHint::None)?;
-+                admit(old.memory().len().saturating_add(128))?;
 +                let mut new = self.mem.allocate_lowest(old.memory().len())?;
 +                new.memory_mut()[0] = old.memory()[0];
 +                relocation_map.insert(*parent, new.get_page_number());
@@ -2631,7 +2833,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +2458,18 @@
+@@ -2037,6 +2489,18 @@
          })
      }
  
@@ -2650,7 +2852,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,6 +2540,82 @@
+@@ -2107,6 +2571,82 @@
      tree: TableTree,
  }
  
@@ -2733,7 +2935,7 @@
  impl ReadTransaction {
      pub(crate) fn new(
          mem: Arc<TransactionalMemory>,
-@@ -2121,6 +2630,45 @@
+@@ -2121,6 +2661,45 @@
          })
      }
  
@@ -2779,7 +2981,7 @@
      /// Open the given table
      pub fn open_table<K: Key + 'static, V: Value + 'static>(
          &self,
-@@ -2135,12 +2683,54 @@
+@@ -2135,12 +2714,54 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -2835,7 +3037,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +2751,7 @@
+@@ -2161,7 +2782,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -2844,7 +3046,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +2779,7 @@
+@@ -2189,7 +2810,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -2853,7 +3055,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +2807,7 @@
+@@ -2217,7 +2838,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -2862,7 +3064,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +2853,15 @@
+@@ -2263,7 +2884,15 @@
  
  #[cfg(test)]
  mod test {
@@ -2879,7 +3081,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +2882,840 @@
+@@ -2284,4 +2913,840 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -5800,10 +6002,41 @@
              }
          }
  
-@@ -762,6 +893,22 @@
-         }
+@@ -711,6 +842,28 @@
      }
+ }
  
++impl<K: Key + 'static> BtreeMut<'_, K, &'static [u8]> {
++    /// Reserve an allocator-table value without building a value-sized heap buffer.
++    /// A length-only source zero-fills the allocated B-tree destination. The
++    /// returned guard borrows that destination; no source buffer or mapping exists.
++    pub(crate) fn insert_zeroed_reserve(
++        &mut self,
++        key: &K::SelfType<'_>,
++        value_length: usize,
++    ) -> Result<AccessGuardMutInPlace<'_, &'static [u8]>> {
++        let mut freed_pages = self.freed_pages.lock().unwrap();
++        let mut operation: MutateHelper<'_, '_, K, &'static [u8]> = MutateHelper::new(
++            &mut self.root,
++            self.mem.clone(),
++            freed_pages.as_mut(),
++            self.allocated_pages.clone(),
++        );
++        let (_, guard) =
++            operation.insert_value(key, super::btree_base::LeafValue::Zeroes(value_length))?;
++        Ok(guard)
++    }
++}
++
+ pub(crate) struct RawBtree {
+     mem: Arc<TransactionalMemory>,
+     root: Option<BtreeHeader>,
+@@ -760,6 +913,22 @@
+         } else {
+             Ok(true)
+         }
++    }
++
 +    /// Authenticate only the saved root page during external admission.
 +    /// Its descendants remain protected by the transaction floor and are
 +    /// checked when the retained reader actually visits them.
@@ -5818,12 +6051,10 @@
 +            _ => return Ok(false),
 +        };
 +        Ok(computed.is_ok_and(|computed| computed == header.checksum))
-+    }
-+
+     }
+ 
      fn verify_checksum_helper(
-         &self,
-         page_number: PageNumber,
-@@ -804,12 +951,12 @@
+@@ -804,12 +973,12 @@
  }
  
  pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
@@ -5838,7 +6069,7 @@
      _key_type: PhantomData<K>,
      _value_type: PhantomData<V>,
  }
-@@ -822,7 +969,16 @@
+@@ -822,7 +991,16 @@
          mem: Arc<TransactionalMemory>,
      ) -> Result<Self> {
          let cached_root = if let Some(header) = root {
@@ -5856,7 +6087,7 @@
          } else {
              None
          };
-@@ -837,6 +993,24 @@
+@@ -837,6 +1015,24 @@
          })
      }
  
@@ -5881,7 +6112,7 @@
      pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
          &self.transaction_guard
      }
-@@ -858,6 +1032,17 @@
+@@ -858,6 +1054,17 @@
              self.hint,
          )
          .verify_checksum()
@@ -5899,7 +6130,7 @@
      }
  
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-@@ -877,6 +1062,10 @@
+@@ -877,6 +1084,10 @@
      pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
          if let Some(ref root_page) = self.cached_root {
              self.get_helper(root_page, K::as_bytes(key).as_ref())
@@ -5910,7 +6141,7 @@
          } else {
              Ok(None)
          }
-@@ -898,8 +1087,10 @@
+@@ -898,8 +1109,10 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(page, K::fixed_width());
@@ -5922,7 +6153,7 @@
                  self.get_helper(&child_page, query)
              }
              _ => unreachable!(),
-@@ -911,6 +1102,10 @@
+@@ -911,6 +1124,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.first_helper(root.clone())
@@ -5933,7 +6164,7 @@
          } else {
              Ok(None)
          }
-@@ -932,7 +1127,10 @@
+@@ -932,7 +1149,10 @@
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
                  let child_page = accessor.child_page(0).unwrap();
@@ -5945,7 +6176,7 @@
              }
              _ => unreachable!(),
          }
-@@ -943,6 +1141,10 @@
+@@ -943,6 +1163,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.last_helper(root.clone())
@@ -5956,7 +6187,7 @@
          } else {
              Ok(None)
          }
-@@ -964,8 +1166,12 @@
+@@ -964,8 +1188,12 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
@@ -5971,7 +6202,7 @@
              }
              _ => unreachable!(),
          }
-@@ -975,12 +1181,35 @@
+@@ -975,12 +1203,35 @@
          &self,
          range: &'_ T,
      ) -> Result<BtreeRangeIter<K, V>> {
@@ -6037,6 +6268,15 @@
          Self {
              page: EitherPage::ArcMemory(page),
              offset: range.start,
+@@ -306,7 +308,7 @@
+             self.entry_index,
+             self.key_width,
+             V::fixed_width(),
+-            value_bytes.as_ref(),
++            value_bytes.as_ref().len(),
+         ) {
+             let mut mutator =
+                 LeafMutator::new(self.page.memory_mut(), self.key_width, V::fixed_width());
 @@ -358,6 +360,12 @@
          self.len = new_end - new_start;
  
@@ -6050,6 +6290,168 @@
      }
  }
  
+@@ -618,8 +626,32 @@
+     }
+ }
+ 
++/// A borrowed serialized value or a length-only reservation. Zero reservations
++/// own no payload; bytes are initialized only in the allocated destination.
++#[derive(Clone, Copy)]
++pub(super) enum LeafValue<'a> {
++    Bytes(&'a [u8]),
++    Zeroes(usize),
++}
++
++impl LeafValue<'_> {
++    pub(super) fn len(self) -> usize {
++        match self {
++            Self::Bytes(bytes) => bytes.len(),
++            Self::Zeroes(len) => len,
++        }
++    }
++
++    fn write(self, destination: &mut [u8]) {
++        match self {
++            Self::Bytes(bytes) => destination.copy_from_slice(bytes),
++            Self::Zeroes(_) => destination.fill(0),
++        }
++    }
++}
++
+ pub(super) struct LeafBuilder<'a, 'b> {
+-    pairs: Vec<(&'a [u8], &'a [u8])>,
++    pairs: Vec<(&'a [u8], LeafValue<'a>)>,
+     fixed_key_size: Option<usize>,
+     fixed_value_size: Option<usize>,
+     total_key_bytes: usize,
+@@ -657,6 +689,10 @@
+     }
+ 
+     pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
++        self.push_value(key, LeafValue::Bytes(value));
++    }
++
++    pub(super) fn push_value(&mut self, key: &'a [u8], value: LeafValue<'a>) {
+         self.total_key_bytes += key.len();
+         self.total_value_bytes += value.len();
+         self.pairs.push((key, value));
+@@ -712,7 +748,7 @@
+             first_split_key_bytes,
+         );
+         for (key, value) in self.pairs.iter().take(division) {
+-            builder.append(key, value);
++            builder.append_value(key, *value);
+         }
+         drop(builder);
+ 
+@@ -731,7 +767,7 @@
+             self.total_key_bytes - first_split_key_bytes,
+         );
+         for (key, value) in &self.pairs[division..] {
+-            builder.append(key, value);
++            builder.append_value(key, *value);
+         }
+         drop(builder);
+ 
+@@ -753,7 +789,7 @@
+             self.total_key_bytes,
+         );
+         for (key, value) in self.pairs {
+-            builder.append(key, value);
++            builder.append_value(key, value);
+         }
+         drop(builder);
+         Ok(page)
+@@ -877,6 +913,10 @@
+     }
+ 
+     pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
++        self.append_value(key, LeafValue::Bytes(value));
++    }
++
++    fn append_value(&mut self, key: &[u8], value: LeafValue<'_>) {
+         if let Some(key_width) = self.fixed_key_size {
+             assert_eq!(key_width, key.len());
+         }
+@@ -915,7 +955,7 @@
+                     .to_le_bytes(),
+             );
+         }
+-        self.page[value_offset..(value_offset + value.len())].copy_from_slice(value);
++        value.write(&mut self.page[value_offset..(value_offset + value.len())]);
+         self.pairs_written += 1;
+     }
+ }
+@@ -959,7 +999,7 @@
+         position: usize,
+         fixed_key_size: Option<usize>,
+         fixed_value_size: Option<usize>,
+-        new_value: &[u8],
++        new_value_length: usize,
+     ) -> bool {
+         let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
+         let remaining = page.memory().len() - accessor.total_length();
+@@ -967,7 +1007,7 @@
+             .value_range(position)
+             .map(|(s, e)| e - s)
+             .unwrap_or_default();
+-        let required_delta = isize::try_from(new_value.len()).unwrap()
++        let required_delta = isize::try_from(new_value_length).unwrap()
+             - isize::try_from(existing_value_len).unwrap();
+         required_delta <= isize::try_from(remaining).unwrap()
+     }
+@@ -978,7 +1018,7 @@
+         fixed_key_size: Option<usize>,
+         fixed_value_size: Option<usize>,
+         new_key: &[u8],
+-        new_value: &[u8],
++        new_value_length: usize,
+     ) -> bool {
+         let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
+         // If this is a large page, only allow in-place appending to avoid write amplification
+@@ -989,7 +1029,7 @@
+             return false;
+         }
+         let remaining = page.memory().len() - accessor.total_length();
+-        let mut required_delta = new_key.len() + new_value.len();
++        let mut required_delta = new_key.len() + new_value_length;
+         if fixed_key_size.is_none() {
+             required_delta += size_of::<u32>();
+         }
+@@ -1001,6 +1041,10 @@
+ 
+     // Replace the value at index `i` with `value`, leaving the key unchanged.
+     pub(crate) fn replace(&mut self, i: usize, value: &[u8]) {
++        self.replace_value(i, LeafValue::Bytes(value));
++    }
++
++    pub(super) fn replace_value(&mut self, i: usize, value: LeafValue<'_>) {
+         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
+         let num_pairs = accessor.num_pairs();
+         let last_value_end = accessor.value_end(num_pairs - 1).unwrap();
+@@ -1031,11 +1075,11 @@
+ 
+         // Write the new value
+         dest -= value.len();
+-        self.page[dest..(dest + value.len())].copy_from_slice(value);
++        value.write(&mut self.page[dest..(dest + value.len())]);
+     }
+ 
+     // Insert the given key, value pair at index i and shift all following pairs to the right
+-    pub(crate) fn insert(&mut self, i: usize, key: &[u8], value: &[u8]) {
++    pub(super) fn insert_value(&mut self, i: usize, key: &[u8], value: LeafValue<'_>) {
+         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
+         let required_delta = {
+             let mut delta = key.len() + value.len();
+@@ -1093,7 +1137,7 @@
+         // Insert the value
+         let inserted_value_end: u32 = dest.try_into().unwrap();
+         dest -= value.len();
+-        self.page[dest..(dest + value.len())].copy_from_slice(value);
++        value.write(&mut self.page[dest..(dest + value.len())]);
+ 
+         // Right shift the trailing key data & preceding value data
+         let start = shift_key_start;
 --- a/src/tree_store/btree_iters.rs
 +++ b/src/tree_store/btree_iters.rs
 @@ -1,10 +1,12 @@
@@ -6306,7 +6708,12 @@
                      page,
 --- a/src/tree_store/btree_mutator.rs
 +++ b/src/tree_store/btree_mutator.rs
-@@ -5,7 +5,7 @@
+@@ -1,11 +1,11 @@
+ use crate::tree_store::btree_base::{
+     BRANCH, BranchAccessor, BranchBuilder, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor,
+-    LeafBuilder, LeafMutator,
++    LeafBuilder, LeafMutator, LeafValue,
+ };
  use crate::tree_store::btree_mutator::DeletionResult::{
      DeletedBranch, DeletedLeaf, PartialBranch, PartialLeaf, Subtree,
  };
@@ -6324,7 +6731,7 @@
          deleted_pair: usize,
      },
      // A branch page subtree with fewer children than desired.
-@@ -39,13 +39,53 @@
+@@ -39,16 +39,58 @@
      DeletedBranch(PageNumber, Checksum),
  }
  
@@ -6378,8 +6785,14 @@
 +    additional_sibling: Option<(InsertionKey, PageNumber, Checksum)>,
      // The inserted value for .insert_reserve() to use
      inserted_value: AccessGuardMutInPlace<'a, V>,
-     // The previous value, if any
-@@ -63,7 +103,7 @@
+-    // The previous value, if any
++    // Whether the key existed, including reservations that discard old bytes.
++    replaced: bool,
++    // The previous value, if requested by an ordinary insertion.
+     old_value: Option<AccessGuard<'a, V>>,
+ }
+ 
+@@ -63,7 +105,7 @@
      _lifetime: PhantomData<&'a ()>,
  }
  
@@ -6388,7 +6801,7 @@
      pub(crate) fn new(
          root: &'b mut Option<BtreeHeader>,
          mem: Arc<TransactionalMemory>,
-@@ -107,9 +147,13 @@
+@@ -107,9 +149,13 @@
              let mut allocated = self.allocated.lock().unwrap();
              if !self.mem.free_if_uncommitted(page_number, &mut allocated) {
                  self.freed.push(page_number);
@@ -6402,16 +6815,71 @@
          }
      }
  
-@@ -191,7 +235,7 @@
+@@ -184,24 +230,25 @@
+         key: &K::SelfType<'_>,
+         value: &V::SelfType<'_>,
+     ) -> Result<(Option<AccessGuard<'a, V>>, AccessGuardMutInPlace<'a, V>)> {
++        let value_bytes = V::as_bytes(value);
++        self.insert_value(key, LeafValue::Bytes(value_bytes.as_ref()))
++    }
++
++    #[allow(clippy::type_complexity)]
++    pub(super) fn insert_value(
++        &mut self,
++        key: &K::SelfType<'_>,
++        value: LeafValue<'_>,
++    ) -> Result<(Option<AccessGuard<'a, V>>, AccessGuardMutInPlace<'a, V>)> {
+         let (new_root, old_value, guard) = if let Some(BtreeHeader {
+             root: p,
+             checksum,
+             length,
          }) = *self.root
          {
-             let result = self.insert_helper(
+-            let result = self.insert_helper(
 -                self.mem.get_page(p, PageHint::None)?,
-+                p,
-                 checksum,
-                 K::as_bytes(key).as_ref(),
-                 V::as_bytes(value).as_ref(),
-@@ -243,11 +287,77 @@
+-                checksum,
+-                K::as_bytes(key).as_ref(),
+-                V::as_bytes(value).as_ref(),
+-            )?;
+-
+-            let new_length = if result.old_value.is_some() {
+-                length
+-            } else {
+-                length + 1
+-            };
++            let result = self.insert_helper(p, checksum, K::as_bytes(key).as_ref(), value)?;
++
++            let new_length = if result.replaced { length } else { length + 1 };
+ 
+             let new_root = if let Some((key, page2, page2_checksum)) = result.additional_sibling {
+                 let mut builder =
+@@ -217,9 +264,7 @@
+             (new_root, result.old_value, result.inserted_value)
+         } else {
+             let key_bytes = K::as_bytes(key);
+-            let value_bytes = V::as_bytes(value);
+             let key_bytes = key_bytes.as_ref();
+-            let value_bytes = value_bytes.as_ref();
+             let mut builder = LeafBuilder::new(
+                 &self.mem,
+                 &self.allocated,
+@@ -227,13 +272,13 @@
+                 K::fixed_width(),
+                 V::fixed_width(),
+             );
+-            builder.push(key_bytes, value_bytes);
++            builder.push_value(key_bytes, value);
+             let page = builder.build()?;
+ 
+             let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+             let offset = accessor.offset_of_first_value();
+             let page_num = page.get_page_number();
+-            let guard = AccessGuardMutInPlace::new(page, offset, value_bytes.len());
++            let guard = AccessGuardMutInPlace::new(page, offset, value.len());
+ 
+             (BtreeHeader::new(page_num, DEFERRED, 1), None, guard)
+         };
+@@ -243,11 +288,78 @@
  
      fn insert_helper(
          &mut self,
@@ -6419,7 +6887,8 @@
 +        page_number: PageNumber,
          page_checksum: Checksum,
          key: &[u8],
-         value: &[u8],
+-        value: &[u8],
++        value: LeafValue<'_>,
      ) -> Result<InsertionResult<'a, V>> {
 +        // Preserve the existing singleton split without faulting its unrelated
 +        // value. Restrict this ordering shortcut to the built-in byte key.
@@ -6465,7 +6934,7 @@
 +                    K::fixed_width(),
 +                    V::fixed_width(),
 +                );
-+                builder.push(key, value);
++                builder.push_value(key, value);
 +                let new_page = builder.build()?;
 +                let new_root = new_page.get_page_number();
 +                let offset =
@@ -6482,6 +6951,7 @@
 +                    root_checksum,
 +                    additional_sibling: Some((separator, sibling, sibling_checksum)),
 +                    inserted_value: AccessGuardMutInPlace::new(new_page, offset, value.len()),
++                    replaced: false,
 +                    old_value: None,
 +                });
 +            }
@@ -6490,7 +6960,16 @@
          let node_mem = page.memory();
          Ok(match node_mem[0] {
              LEAF => {
-@@ -277,7 +387,7 @@
+@@ -265,7 +377,7 @@
+                         K::fixed_width(),
+                         V::fixed_width(),
+                     );
+-                    builder.push(key, value);
++                    builder.push_value(key, value);
+                     let new_page = builder.build()?;
+                     let new_page_number = new_page.get_page_number();
+                     let new_page_accessor =
+@@ -277,11 +389,12 @@
                              new_root: new_page_number,
                              root_checksum: DEFERRED,
                              additional_sibling: Some((
@@ -6499,16 +6978,100 @@
                                  page.get_page_number(),
                                  page_checksum,
                              )),
-@@ -289,7 +399,7 @@
+                             inserted_value: guard,
++                            replaced: false,
+                             old_value: None,
+                         })
+                     } else {
+@@ -289,8 +402,9 @@
                          Ok(InsertionResult {
                              new_root: page.get_page_number(),
                              root_checksum: page_checksum,
 -                            additional_sibling: Some((split_key, new_page_number, DEFERRED)),
 +                            additional_sibling: Some((split_key.into(), new_page_number, DEFERRED)),
                              inserted_value: guard,
++                            replaced: false,
                              old_value: None,
                          })
-@@ -383,6 +493,8 @@
+                     };
+@@ -304,7 +418,7 @@
+                             position,
+                             K::fixed_width(),
+                             V::fixed_width(),
+-                            value,
++                            value.len(),
+                         )
+                     } else {
+                         LeafMutator::sufficient_insert_inplace_space(
+@@ -313,7 +427,7 @@
+                             K::fixed_width(),
+                             V::fixed_width(),
+                             key,
+-                            value,
++                            value.len(),
+                         )
+                     }
+                 };
+@@ -322,10 +436,12 @@
+                     && has_inplace_space()
+                 {
+                     let page_number = page.get_page_number();
+-                    let existing_value = if found {
++                    let existing_value = if found && matches!(value, LeafValue::Bytes(_)) {
+                         let copied_value = accessor.entry(position).unwrap().value().to_vec();
+                         Some(AccessGuard::with_owned_value(copied_value))
+                     } else {
++                        // Reservations discard old bytes, avoiding a second
++                        // value-sized owner during in-place replacement.
+                         None
+                     };
+                     drop(page);
+@@ -333,9 +449,9 @@
+                     let mut mutator =
+                         LeafMutator::new(page_mut.memory_mut(), K::fixed_width(), V::fixed_width());
+                     if found {
+-                        mutator.replace(position, value);
++                        mutator.replace_value(position, value);
+                     } else {
+-                        mutator.insert(position, key, value);
++                        mutator.insert_value(position, key, value);
+                     }
+                     let new_page_accessor =
+                         LeafAccessor::new(page_mut.memory(), K::fixed_width(), V::fixed_width());
+@@ -346,6 +462,7 @@
+                         root_checksum: DEFERRED,
+                         additional_sibling: None,
+                         inserted_value: guard,
++                        replaced: found,
+                         old_value: existing_value,
+                     });
+                 }
+@@ -359,7 +476,7 @@
+                 );
+                 for i in 0..accessor.num_pairs() {
+                     if i == position {
+-                        builder.push(key, value);
++                        builder.push_value(key, value);
+                     }
+                     if !found || i != position {
+                         let entry = accessor.entry(i).unwrap();
+@@ -367,13 +484,13 @@
+                     }
+                 }
+                 if accessor.num_pairs() == position {
+-                    builder.push(key, value);
++                    builder.push_value(key, value);
+                 }
+                 if !builder.should_split() {
+                     let new_page = builder.build()?;
+ 
+                     let page_number = page.get_page_number();
+-                    let existing_value = if found {
++                    let existing_value = if found && matches!(value, LeafValue::Bytes(_)) {
+                         let (start, end) = accessor.value_range(position).unwrap();
+                         if self.modify_uncommitted && self.mem.uncommitted(page_number) {
+                             let arc = page.to_arc();
+@@ -383,6 +500,8 @@
                              Some(AccessGuard::with_arc_page(arc, start..end))
                          } else {
                              self.freed.push(page_number);
@@ -6517,7 +7080,23 @@
                              Some(AccessGuard::with_page(page, start..end))
                          }
                      } else {
-@@ -418,6 +530,8 @@
+@@ -402,13 +521,14 @@
+                         root_checksum: DEFERRED,
+                         additional_sibling: None,
+                         inserted_value: guard,
++                        replaced: found,
+                         old_value: existing_value,
+                     }
+                 } else {
+                     let (new_page1, split_key, new_page2) = builder.build_split()?;
+                     let split_key = split_key.to_vec();
+                     let page_number = page.get_page_number();
+-                    let existing_value = if found {
++                    let existing_value = if found && matches!(value, LeafValue::Bytes(_)) {
+                         let (start, end) = accessor.value_range(position).unwrap();
+                         if self.modify_uncommitted && self.mem.uncommitted(page_number) {
+                             let arc = page.to_arc();
+@@ -418,6 +538,8 @@
                              Some(AccessGuard::with_arc_page(arc, start..end))
                          } else {
                              self.freed.push(page_number);
@@ -6526,16 +7105,18 @@
                              Some(AccessGuard::with_page(page, start..end))
                          }
                      } else {
-@@ -452,7 +566,7 @@
+@@ -452,8 +574,9 @@
                      InsertionResult {
                          new_root: new_page_number,
                          root_checksum: DEFERRED,
 -                        additional_sibling: Some((split_key, new_page_number2, DEFERRED)),
 +                        additional_sibling: Some((split_key.into(), new_page_number2, DEFERRED)),
                          inserted_value: guard,
++                        replaced: found,
                          old_value: existing_value,
                      }
-@@ -462,12 +576,7 @@
+                 }
+@@ -462,12 +585,7 @@
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
                  let (child_index, child_page) = accessor.child_for_key::<K>(key);
                  let child_checksum = accessor.child_checksum(child_index).unwrap();
@@ -6549,7 +7130,23 @@
  
                  // Skip-path: if child page number and checksum haven't changed,
                  // no branch update is needed. This avoids redundant get_page_mut +
-@@ -553,11 +662,18 @@
+@@ -482,6 +600,7 @@
+                         root_checksum: page_checksum,
+                         additional_sibling: None,
+                         inserted_value: sub_result.inserted_value,
++                        replaced: sub_result.replaced,
+                         old_value: sub_result.old_value,
+                     });
+                 }
+@@ -504,6 +623,7 @@
+                         root_checksum: DEFERRED,
+                         additional_sibling: None,
+                         inserted_value: sub_result.inserted_value,
++                        replaced: sub_result.replaced,
+                         old_value: sub_result.old_value,
+                     });
+                 }
+@@ -553,15 +673,23 @@
  
                  let result = if builder.should_split() {
                      let (new_page1, split_key, new_page2) = builder.build_split()?;
@@ -6569,7 +7166,20 @@
                              new_page2.get_page_number(),
                              DEFERRED,
                          )),
-@@ -712,6 +828,8 @@
+                         inserted_value: sub_result.inserted_value,
++                        replaced: sub_result.replaced,
+                         old_value: sub_result.old_value,
+                     }
+                 } else {
+@@ -571,6 +699,7 @@
+                         root_checksum: DEFERRED,
+                         additional_sibling: None,
+                         inserted_value: sub_result.inserted_value,
++                        replaced: sub_result.replaced,
+                         old_value: sub_result.old_value,
+                     }
+                 };
+@@ -712,6 +841,8 @@
              // Won't be freed until the end of the transaction, so returning the page
              // in the AccessGuard below is still safe
              self.freed.push(page.get_page_number());
@@ -6578,7 +7188,7 @@
              Some(AccessGuard::with_page(page, start..end))
          };
          Ok((result, guard))
-@@ -831,14 +949,30 @@
+@@ -831,14 +962,30 @@
  
                  let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
                  debug_assert!(merge_with < accessor.count_children());
@@ -6617,7 +7227,7 @@
                  // Don't try to merge or rebalance, if the sibling contains a single large value
                  if single_large_value {
                      let mut child_builder = LeafBuilder::new(
-@@ -863,6 +997,9 @@
+@@ -863,6 +1010,9 @@
                      return Ok((result, found));
                  }
  
@@ -6637,6 +7247,324 @@
  mod btree;
  mod btree_base;
  mod btree_iters;
+--- /dev/null
++++ b/src/tree_store/page_store/allocator_pager.rs
+@@ -0,0 +1,315 @@
++//! Fixed-window, non-durable backing for allocator bitmap words.
++//!
++//! The resident payload is `WINDOWS * WINDOW_BYTES` plus one fixed control
++//! allocation; neither term depends on the file's region count. A window is
++//! written to scratch before reuse. The caller supplies committed or virtual
++//! base words when a scratch record is absent.
++
++use crate::{ScratchBackend, StorageError};
++use std::io;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex};
++
++pub(super) const WINDOW_BYTES: usize = 4096;
++pub(super) const WINDOWS: usize = 32;
++const RECORD_BYTES: u64 = (WINDOW_BYTES + 8) as u64;
++const PAGES_PER_ARRAY: u64 = 32;
++const HEIGHTS_PER_BITMAP: u64 = 4;
++const ORDERS_PER_ENTITY: u64 = 21;
++
++pub(super) fn bitmap_array_base(region: Option<u32>, order: u8) -> u64 {
++    let entity = region.map_or(0, |region| u64::from(region) + 1);
++    (entity * ORDERS_PER_ENTITY + u64::from(order)) * HEIGHTS_PER_BITMAP
++}
++
++type BaseLoader = dyn Fn(u64, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
++
++struct Window {
++    identity: u64,
++    bytes: [u8; WINDOW_BYTES],
++    dirty: bool,
++}
++
++impl Window {
++    fn empty() -> Self {
++        Self {
++            identity: 0,
++            bytes: [0; WINDOW_BYTES],
++            dirty: false,
++        }
++    }
++}
++
++struct Inner {
++    scratch: Box<dyn ScratchBackend>,
++    windows: Box<[Window]>,
++    next_victim: usize,
++    source: Option<Box<BaseLoader>>,
++}
++
++/// A scratch I/O fault is sticky: callers must refuse publication and skip
++/// clean-header writes after this bit becomes set.
++pub(super) struct AllocatorPager {
++    inner: Mutex<Inner>,
++    poisoned: AtomicBool,
++    first_failure: Mutex<Option<(io::ErrorKind, String)>>,
++}
++
++impl AllocatorPager {
++    pub(super) fn flush_and_detach_source(
++        &self,
++        virtual_source: Box<BaseLoader>,
++    ) -> io::Result<()> {
++        let mut inner = self.inner.lock().unwrap();
++        let Inner {
++            scratch,
++            windows,
++            source,
++            ..
++        } = &mut *inner;
++        for window in windows.iter_mut() {
++            if window.dirty {
++                let offset = (window.identity - 1)
++                    .checked_mul(RECORD_BYTES)
++                    .ok_or_else(|| {
++                        io::Error::new(io::ErrorKind::InvalidInput, "scratch offset overflow")
++                    })?;
++                scratch
++                    .write(offset, &window.identity.to_le_bytes())
++                    .inspect_err(|error| self.poison(error))?;
++                scratch
++                    .write(offset + 8, &window.bytes)
++                    .inspect_err(|error| self.poison(error))?;
++                window.dirty = false;
++            }
++        }
++        // The durable tree may be reclaimed after this point. Keep the virtual
++        // initializer for regions created later, while retaining spill records.
++        *source = Some(virtual_source);
++        Ok(())
++    }
++    pub(super) fn new(scratch: Box<dyn ScratchBackend>) -> Arc<Self> {
++        let mut windows = Vec::with_capacity(WINDOWS);
++        windows.resize_with(WINDOWS, Window::empty);
++        Arc::new(Self {
++            inner: Mutex::new(Inner {
++                scratch,
++                windows: windows.into_boxed_slice(),
++                next_victim: 0,
++                source: None,
++            }),
++            poisoned: AtomicBool::new(false),
++            first_failure: Mutex::new(None),
++        })
++    }
++
++    pub(super) fn resident_bytes() -> usize {
++        WINDOWS * std::mem::size_of::<Window>() + std::mem::size_of::<Self>()
++    }
++
++    pub(super) fn is_poisoned(&self) -> bool {
++        self.poisoned.load(Ordering::Acquire)
++    }
++
++    pub(super) fn storage_failure(&self) -> Option<StorageError> {
++        if !self.is_poisoned() {
++            return None;
++        }
++        Some(
++            self.io_failure()
++                .map_or(StorageError::PreviousIo, StorageError::Io),
++        )
++    }
++
++    pub(super) fn io_failure(&self) -> Option<io::Error> {
++        self.first_failure
++            .lock()
++            .unwrap()
++            .as_ref()
++            .map(|(kind, message)| io::Error::new(*kind, message.clone()))
++    }
++
++    pub(super) fn set_source(&self, source: Option<Box<BaseLoader>>) -> io::Result<()> {
++        let mut inner = self.inner.lock().unwrap();
++        inner
++            .scratch
++            .set_len(0)
++            .inspect_err(|error| self.poison(error))?;
++        inner.windows.iter_mut().for_each(|window| {
++            window.identity = 0;
++            window.dirty = false;
++        });
++        inner.source = source;
++        Ok(())
++    }
++
++    pub(super) fn truncate_regions(&self, retained: u32) -> io::Result<()> {
++        let mut inner = self.inner.lock().unwrap();
++        let first_removed_array =
++            (u64::from(retained) + 1) * ORDERS_PER_ENTITY * HEIGHTS_PER_BITMAP;
++        let first_removed_key = first_removed_array * PAGES_PER_ARRAY + 1;
++        for window in &mut inner.windows {
++            if window.identity >= first_removed_key {
++                window.identity = 0;
++                window.dirty = false;
++            }
++        }
++        let limit = (first_removed_key - 1) * RECORD_BYTES;
++        if inner
++            .scratch
++            .len()
++            .inspect_err(|error| self.poison(error))?
++            > limit
++        {
++            inner
++                .scratch
++                .set_len(limit)
++                .inspect_err(|error| self.poison(error))?;
++        }
++        Ok(())
++    }
++
++    pub(super) fn read_word(&self, array: u64, word: usize, len: u32, optimistic: bool) -> u64 {
++        self.try_read_word(array, word, len, optimistic)
++            .unwrap_or_else(|error| {
++                self.poison(&error);
++                u64::MAX
++            })
++    }
++
++    pub(super) fn write_word(
++        &self,
++        array: u64,
++        word: usize,
++        len: u32,
++        optimistic: bool,
++        value: u64,
++    ) {
++        if let Err(error) = self.try_write_word(array, word, len, optimistic, value) {
++            self.poison(&error);
++        }
++    }
++
++    fn try_read_word(
++        &self,
++        array: u64,
++        word: usize,
++        len: u32,
++        optimistic: bool,
++    ) -> io::Result<u64> {
++        let mut inner = self.inner.lock().unwrap();
++        let slot = Self::find_window(&mut inner, array, word, len, optimistic)?;
++        let start = word % (WINDOW_BYTES / 8) * 8;
++        Ok(u64::from_le_bytes(
++            inner.windows[slot].bytes[start..start + 8]
++                .try_into()
++                .unwrap(),
++        ))
++    }
++
++    fn try_write_word(
++        &self,
++        array: u64,
++        word: usize,
++        len: u32,
++        optimistic: bool,
++        value: u64,
++    ) -> io::Result<()> {
++        let mut inner = self.inner.lock().unwrap();
++        let slot = Self::find_window(&mut inner, array, word, len, optimistic)?;
++        let start = word % (WINDOW_BYTES / 8) * 8;
++        inner.windows[slot].bytes[start..start + 8].copy_from_slice(&value.to_le_bytes());
++        inner.windows[slot].dirty = true;
++        Ok(())
++    }
++
++    fn find_window(
++        inner: &mut Inner,
++        array: u64,
++        word: usize,
++        len: u32,
++        optimistic: bool,
++    ) -> io::Result<usize> {
++        let page: u32 = (word / (WINDOW_BYTES / 8)).try_into().map_err(|_| {
++            io::Error::new(io::ErrorKind::InvalidInput, "allocator word index overflow")
++        })?;
++        if u64::from(page) >= PAGES_PER_ARRAY {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "allocator bitmap exceeds fixed scratch stride",
++            ));
++        }
++        let identity = array
++            .checked_mul(PAGES_PER_ARRAY)
++            .and_then(|base| base.checked_add(u64::from(page)))
++            .and_then(|key| key.checked_add(1))
++            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "allocator key overflow"))?;
++        if let Some(index) = inner
++            .windows
++            .iter()
++            .position(|window| window.identity == identity)
++        {
++            return Ok(index);
++        }
++
++        let victim = inner.next_victim;
++        inner.next_victim = (victim + 1) % WINDOWS;
++        let prior = &mut inner.windows[victim];
++        if prior.dirty {
++            let offset = (prior.identity - 1)
++                .checked_mul(RECORD_BYTES)
++                .ok_or_else(|| {
++                    io::Error::new(io::ErrorKind::InvalidInput, "scratch offset overflow")
++                })?;
++            inner.scratch.write(offset, &prior.identity.to_le_bytes())?;
++            inner.scratch.write(offset + 8, &prior.bytes)?;
++            prior.dirty = false;
++        }
++
++        let offset = (identity - 1).checked_mul(RECORD_BYTES).ok_or_else(|| {
++            io::Error::new(io::ErrorKind::InvalidInput, "scratch offset overflow")
++        })?;
++        let stored = if inner.scratch.len()? >= offset + RECORD_BYTES {
++            let mut saved_identity = [0u8; 8];
++            inner.scratch.read(offset, &mut saved_identity)?;
++            u64::from_le_bytes(saved_identity) == identity
++        } else {
++            false
++        };
++        if stored {
++            inner.scratch.read(offset + 8, &mut prior.bytes)?;
++        } else {
++            let loaded = if let Some(source) = &inner.source {
++                source(array, page, &mut prior.bytes)?
++            } else {
++                false
++            };
++            if !loaded {
++                prior.bytes.fill(0xFF);
++                if optimistic {
++                    for (index, chunk) in prior.bytes.chunks_exact_mut(8).enumerate() {
++                        let first =
++                            (usize::try_from(page).unwrap() * WINDOW_BYTES / 8 + index) * 64;
++                        let free_bits = (len as usize).saturating_sub(first).min(64);
++                        let word = if free_bits == 64 {
++                            0
++                        } else {
++                            u64::MAX << free_bits
++                        };
++                        chunk.copy_from_slice(&word.to_le_bytes());
++                    }
++                }
++            }
++        }
++        prior.identity = identity;
++        Ok(victim)
++    }
++
++    fn poison(&self, error: &io::Error) {
++        let mut first = self.first_failure.lock().unwrap();
++        if first.is_none() {
++            *first = Some((error.kind(), error.to_string()));
++        }
++        self.poisoned.store(true, Ordering::Release);
++    }
++}
 --- a/src/tree_store/page_store/base.rs
 +++ b/src/tree_store/page_store/base.rs
 @@ -1,4 +1,4 @@
@@ -6707,11 +7635,27 @@
  pub(crate) enum PageTrackerPolicy {
 --- a/src/tree_store/page_store/bitmap.rs
 +++ b/src/tree_store/page_store/bitmap.rs
-@@ -16,6 +16,16 @@
+@@ -1,5 +1,7 @@
+-use crate::tree_store::page_store::xxh3_checksum;
++use super::allocator_pager::AllocatorPager;
++use crate::tree_store::page_store::hash128_with_seed;
+ use std::mem::size_of;
++use std::sync::Arc;
+ 
+ const HEIGHT_OFFSET: usize = 0;
+ const END_OFFSETS: usize = HEIGHT_OFFSET + size_of::<u32>();
+@@ -16,6 +18,23 @@
  // layer data: u64s
  // ...consecutive layers. Except for the last level, all sub-trees of the root must be complete
  impl BtreeBitmap {
-+    #[cfg(feature = "test-seams")]
++    pub(crate) fn poisoned(&self) -> bool {
++        self.heights.iter().any(U64GroupedBitmap::poisoned)
++    }
++    pub(crate) fn materialize_paged_words(&mut self) {
++        for height in &mut self.heights {
++            height.materialize_paged_words();
++        }
++    }
 +    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
 +        self.heights.capacity() * size_of::<U64GroupedBitmap>()
 +            + self
@@ -6724,13 +7668,458 @@
      pub(crate) fn count_unset(&self) -> u32 {
          self.get_level(self.get_height() - 1).count_unset()
      }
+@@ -39,10 +58,7 @@
+             while height < self.get_height() - 1 {
+                 height += 1;
+                 entry *= 64;
+-                entry = self
+-                    .get_level(height)
+-                    .first_unset(entry, entry + 64)
+-                    .unwrap();
++                entry = self.get_level(height).first_unset(entry, entry + 64)?;
+             }
+ 
+             Some(entry)
+@@ -68,26 +84,27 @@
+         result
+     }
+ 
+-    pub(crate) fn to_vec(&self) -> Vec<u8> {
+-        let mut result = vec![];
+-        let height: u32 = self.heights.len().try_into().unwrap();
+-        result.extend(height.to_le_bytes());
+-
+-        let vecs: Vec<Vec<u8>> = self.heights.iter().map(|x| x.to_vec()).collect();
+-        let mut data_offset = END_OFFSETS + self.heights.len() * size_of::<u32>();
+-        let end_metadata = data_offset;
+-        for serialized in &vecs {
+-            data_offset += serialized.len();
+-            let offset_u32: u32 = data_offset.try_into().unwrap();
+-            result.extend(offset_u32.to_le_bytes());
+-        }
+-
+-        assert_eq!(end_metadata, result.len());
+-        for serialized in &vecs {
+-            result.extend(serialized);
+-        }
+-
+-        result
++    pub(crate) fn encoded_len(&self) -> usize {
++        END_OFFSETS
++            + self.heights.len() * size_of::<u32>()
++            + self
++                .heights
++                .iter()
++                .map(U64GroupedBitmap::encoded_len)
++                .sum::<usize>()
++    }
++
++    pub(crate) fn encode_into(&self, out: &mut [u8]) {
++        assert!(out.len() >= self.encoded_len());
++        out[..4].copy_from_slice(&u32::try_from(self.heights.len()).unwrap().to_le_bytes());
++        let mut offset = END_OFFSETS + self.heights.len() * size_of::<u32>();
++        for (height, bitmap) in self.heights.iter().enumerate() {
++            let end = offset + bitmap.encoded_len();
++            let field = END_OFFSETS + height * size_of::<u32>();
++            out[field..field + 4].copy_from_slice(&u32::try_from(end).unwrap().to_le_bytes());
++            bitmap.encode_into(&mut out[offset..end]);
++            offset = end;
++        }
+     }
+ 
+     pub(crate) fn from_bytes(data: &[u8]) -> Self {
+@@ -152,6 +169,41 @@
+         result
+     }
+ 
++    pub(crate) fn new_padded_paged(
++        mut num_pages: u32,
++        _capacity: u32,
++        max_capacity: u32,
++        array_base: u64,
++        pager: &Arc<AllocatorPager>,
++        optimistic: bool,
++    ) -> Self {
++        let mut dimensions = Vec::with_capacity(Self::height_for_capacity(max_capacity));
++        let mut capacity = max_capacity;
++        loop {
++            dimensions.push((num_pages, capacity));
++            if capacity <= 64 {
++                break;
++            }
++            capacity = capacity.div_ceil(64);
++            num_pages = num_pages.div_ceil(64);
++        }
++        dimensions.reverse();
++        let heights = dimensions
++            .into_iter()
++            .enumerate()
++            .map(|(height, (len, capacity))| {
++                U64GroupedBitmap::new_paged(
++                    len,
++                    capacity,
++                    array_base + height as u64,
++                    pager,
++                    optimistic,
++                )
++            })
++            .collect();
++        Self { heights }
++    }
++
+     fn height_for_capacity(mut capacity: u32) -> usize {
+         let mut height = 1;
+         while capacity > 64 {
+@@ -171,18 +223,36 @@
+ 
+     // Returns the first unset id, and sets it
+     pub(crate) fn alloc(&mut self) -> Option<u32> {
++        if self.poisoned() {
++            return None;
++        }
+         let entry = self.find_first_unset()?;
++        if self.poisoned() {
++            return None;
++        }
+         self.set(entry);
+-        Some(entry)
++        (!self.poisoned()).then_some(entry)
+     }
+ 
+     pub(crate) fn set(&mut self, i: u32) {
++        if self.poisoned() {
++            return;
++        }
+         let full = self.get_level_mut(self.get_height() - 1).set(i);
++        if self.poisoned() {
++            return;
++        }
+         self.update_to_root(i, full);
+     }
+ 
+     pub(crate) fn clear(&mut self, i: u32) {
++        if self.poisoned() {
++            return;
++        }
+         self.get_level_mut(self.get_height() - 1).clear(i);
++        if self.poisoned() {
++            return;
++        }
+         self.update_to_root(i, false);
+     }
+ 
+@@ -221,9 +291,30 @@
+ pub(crate) struct U64GroupedBitmap {
+     len: u32,
+     data: Vec<u64>,
++    paged: Option<PagedWords>,
+ }
+ 
++struct PagedWords {
++    array: u64,
++    capacity_words: usize,
++    pager: Arc<AllocatorPager>,
++    optimistic: bool,
++}
++
+ impl U64GroupedBitmap {
++    fn poisoned(&self) -> bool {
++        self.paged
++            .as_ref()
++            .is_some_and(|paged| paged.pager.is_poisoned())
++    }
++    fn materialize_paged_words(&mut self) {
++        if self.paged.is_some() {
++            for index in 0..self.word_count() {
++                let value = self.word(index);
++                self.set_word(index, value);
++            }
++        }
++    }
+     fn required_words(elements: u32) -> usize {
+         let words = elements.div_ceil(64);
+         words as usize
+@@ -231,40 +322,117 @@
+ 
+     pub fn new_full(len: u32, capacity: u32) -> Self {
+         let data = vec![u64::MAX; Self::required_words(capacity)];
+-        Self { len, data }
++        Self {
++            len,
++            data,
++            paged: None,
++        }
++    }
++
++    fn new_paged(
++        len: u32,
++        capacity: u32,
++        array: u64,
++        pager: &Arc<AllocatorPager>,
++        optimistic: bool,
++    ) -> Self {
++        Self {
++            len,
++            data: Vec::new(),
++            paged: Some(PagedWords {
++                array,
++                capacity_words: Self::required_words(capacity),
++                pager: Arc::clone(pager),
++                optimistic,
++            }),
++        }
++    }
++
++    fn word(&self, index: usize) -> u64 {
++        // A saved region can have been larger than the currently published
++        // geometry after shrink. Its old tail bits are outside this bitmap and
++        // must never advertise a page to the allocator.
++        let first_bit = index * 64;
++        if first_bit >= self.len as usize {
++            return u64::MAX;
++        }
++        let value = if let Some(paged) = &self.paged {
++            assert!(index < paged.capacity_words);
++            paged
++                .pager
++                .read_word(paged.array, index, self.len, paged.optimistic)
++        } else {
++            self.data[index]
++        };
++        let valid = (self.len as usize - first_bit).min(64);
++        if valid == 64 {
++            value
++        } else {
++            value | (u64::MAX << valid)
++        }
++    }
++
++    fn set_word(&mut self, index: usize, value: u64) {
++        if let Some(paged) = &self.paged {
++            assert!(index < paged.capacity_words);
++            paged
++                .pager
++                .write_word(paged.array, index, self.len, paged.optimistic, value);
++        } else {
++            self.data[index] = value;
++        }
++    }
++
++    fn word_count(&self) -> usize {
++        Self::required_words(self.len)
+     }
+ 
+     pub fn xxh3_hash(&self) -> u128 {
+         if self.len == 0 {
+             return 0;
+         }
+-        let mut bytes = vec![];
+-        bytes.extend(self.len.to_le_bytes());
+-        // Hash all the whole words
+-        for x in &self.data[0..Self::required_words(self.len) - 1] {
+-            bytes.extend(x.to_le_bytes());
++        let mut buffer = [0u8; 4096];
++        buffer[..4].copy_from_slice(&self.len.to_le_bytes());
++        let mut used = 4;
++        let mut state = 0u128;
++        // This hash is an in-process mutation guard, not a durable checksum.
++        // Fold fixed windows so large bitmaps never allocate a full copy.
++        let mut add_word = |word: u64| {
++            if used + 8 > buffer.len() {
++                let seed = u64::from_le_bytes(state.to_le_bytes()[..8].try_into().unwrap());
++                state = hash128_with_seed(&buffer[..used], seed) ^ state.rotate_left(17);
++                used = 0;
++            }
++            buffer[used..used + 8].copy_from_slice(&word.to_le_bytes());
++            used += 8;
++        };
++        for index in 0..Self::required_words(self.len) - 1 {
++            add_word(self.word(index));
+         }
+         let (index, bit) = Self::data_index_of(self.len - 1);
+         // Select the bit and all lower ones
+         let mask = ((1 << bit) - 1) | (1 << bit);
+-        let group = self.data[index];
++        let group = self.word(index);
+         let group = group & mask;
+-        bytes.extend(group.to_le_bytes());
+-
+-        xxh3_checksum(&bytes)
++        add_word(group);
++        let seed = u64::from_le_bytes(state.to_le_bytes()[..8].try_into().unwrap());
++        hash128_with_seed(&buffer[..used], seed) ^ state.rotate_left(17)
+     }
+ 
+     // Format:
+     // 4 bytes: number of elements
+     // n bytes: serialized groups
+-    pub fn to_vec(&self) -> Vec<u8> {
+-        let words = Self::required_words(self.len);
+-        let mut result = Vec::with_capacity(size_of::<u32>() + words * size_of::<u64>());
+-        result.extend_from_slice(&self.len.to_le_bytes());
+-        for x in &self.data[..words] {
+-            result.extend_from_slice(&x.to_le_bytes());
+-        }
+-        result
++    fn encoded_len(&self) -> usize {
++        size_of::<u32>() + Self::required_words(self.len) * size_of::<u64>()
++    }
++
++    fn encode_into(&self, out: &mut [u8]) {
++        assert!(out.len() >= self.encoded_len());
++        out[..4].copy_from_slice(&self.len.to_le_bytes());
++        for index in 0..Self::required_words(self.len) {
++            let start = 4 + index * 8;
++            out[start..start + 8].copy_from_slice(&self.word(index).to_le_bytes());
++        }
+     }
+ 
+     pub fn from_bytes(serialized: &[u8]) -> Self {
+@@ -282,7 +450,11 @@
+             data.push(value);
+         }
+ 
+-        Self { len, data }
++        Self {
++            len,
++            data,
++            paged: None,
++        }
+     }
+ 
+     fn data_index_of(bit: u32) -> (usize, usize) {
+@@ -294,11 +466,13 @@
+     }
+ 
+     fn count_unset(&self) -> u32 {
+-        self.data.iter().map(|x| x.count_zeros()).sum()
++        (0..self.word_count())
++            .map(|i| self.word(i).count_zeros())
++            .sum()
+     }
+ 
+     fn any_unset(&self) -> bool {
+-        self.data.iter().any(|x| x.count_zeros() > 0)
++        (0..self.word_count()).any(|i| self.word(i).count_zeros() > 0)
+     }
+ 
+     fn first_unset(&self, start_bit: u32, end_bit: u32) -> Option<u32> {
+@@ -309,7 +483,7 @@
+ 
+         let (index, bit) = Self::data_index_of(start_bit);
+         let mask = (1 << bit) - 1;
+-        let group = self.data[index];
++        let group = self.word(index);
+         let group = group | mask;
+         match group.trailing_ones() {
+             64 => None,
+@@ -322,7 +496,7 @@
+     }
+ 
+     pub fn resize(&mut self, new_len: u32, full: bool) {
+-        if self.data.len() < Self::required_words(new_len) {
++        if self.paged.is_none() && self.data.len() < Self::required_words(new_len) {
+             let default_value = if full { u64::MAX } else { 0 };
+             self.data
+                 .resize(Self::required_words(new_len), default_value);
+@@ -344,7 +518,7 @@
+     pub fn get(&self, bit: u32) -> bool {
+         assert!(bit < self.len);
+         let (index, bit_index) = Self::data_index_of(bit);
+-        let group = self.data[index];
++        let group = self.word(index);
+         group & U64GroupedBitmap::select_mask(bit_index) != 0
+     }
+ 
+@@ -352,9 +526,9 @@
+     pub fn set(&mut self, bit: u32) -> bool {
+         assert!(bit < self.len);
+         let (index, bit_index) = Self::data_index_of(bit);
+-        let mut group = self.data[index];
++        let mut group = self.word(index);
+         group |= Self::select_mask(bit_index);
+-        self.data[index] = group;
++        self.set_word(index, group);
+ 
+         group == u64::MAX
+     }
+@@ -362,7 +536,7 @@
+     pub fn clear(&mut self, bit: u32) {
+         assert!(bit < self.len, "{bit} must be less than {}", self.len);
+         let (index, bit_index) = Self::data_index_of(bit);
+-        self.data[index] &= !Self::select_mask(bit_index);
++        self.set_word(index, self.word(index) & !Self::select_mask(bit_index));
+     }
+ }
+ 
 --- a/src/tree_store/page_store/buddy_allocator.rs
 +++ b/src/tree_store/page_store/buddy_allocator.rs
-@@ -34,6 +34,16 @@
+@@ -1,3 +1,4 @@
++use super::allocator_pager::{AllocatorPager, bitmap_array_base};
+ use crate::tree_store::PageNumber;
+ use crate::tree_store::page_store::bitmap::BtreeBitmap;
+ use crate::tree_store::page_store::page_manager::MAX_MAX_PAGE_ORDER;
+@@ -5,6 +6,7 @@
+ #[cfg(test)]
+ use std::collections::HashSet;
+ use std::mem::size_of;
++use std::sync::Arc;
+ 
+ const MAX_ORDER_OFFSET: usize = 0;
+ const PADDING: usize = 3;
+@@ -34,6 +36,64 @@
  }
  
  impl BuddyAllocator {
-+    #[cfg(feature = "test-seams")]
++    fn poisoned(&self) -> bool {
++        self.free.first().is_some_and(BtreeBitmap::poisoned)
++    }
++    pub(crate) fn materialize_paged_words(&mut self) {
++        for bitmap in &mut self.free {
++            bitmap.materialize_paged_words();
++        }
++    }
++    pub(crate) fn new_paged(
++        num_pages: u32,
++        max_page_capacity: u32,
++        region: u32,
++        pager: &Arc<AllocatorPager>,
++        initialize_free: bool,
++    ) -> Self {
++        let max_order = calculate_usable_order(max_page_capacity);
++        let mut capacity_for_order = max_page_capacity;
++        let mut pages_for_order = num_pages;
++        let mut free = Vec::with_capacity(max_order as usize + 1);
++        for order in 0..=max_order {
++            free.push(BtreeBitmap::new_padded_paged(
++                pages_for_order,
++                pages_for_order,
++                capacity_for_order,
++                bitmap_array_base(Some(region), order),
++                pager,
++                false,
++            ));
++            pages_for_order = next_higher_order(pages_for_order);
++            capacity_for_order = next_higher_order(capacity_for_order);
++        }
++        if initialize_free {
++            let mut accounted_pages = 0;
++            for order in (0..=max_order).rev() {
++                let order_size = 2u32.pow(order.into());
++                while accounted_pages + order_size <= num_pages {
++                    let page = accounted_pages / order_size;
++                    free[order as usize].clear(page);
++                    accounted_pages += order_size;
++                }
++            }
++            assert_eq!(accounted_pages, num_pages);
++        }
++        Self {
++            free,
++            len: num_pages,
++            max_order,
++        }
++    }
 +    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
 +        self.free.capacity() * size_of::<BtreeBitmap>()
 +            + self
@@ -6743,6 +8132,165 @@
      pub(crate) fn new(num_pages: u32, max_page_capacity: u32) -> Self {
          let max_order = calculate_usable_order(max_page_capacity);
  
+@@ -88,29 +148,41 @@
+     // num_pages: u32
+     // free_ends: array of u32, with ending offset for BtreeBitmap structure for the given order
+     // ... BtreeBitmap structures
++    #[cfg(test)]
+     pub(crate) fn to_vec(&self) -> Vec<u8> {
+-        let serialized: Vec<Vec<u8>> = self.free.iter().map(BtreeBitmap::to_vec).collect();
+-
++        let mut result = vec![0; self.encoded_len()];
++        self.encode_into(&mut result);
++        result
++    }
++
++    pub(crate) fn encoded_len(&self) -> usize {
+         let header_bytes = 1 + 3 + size_of::<u32>();
+         let offsets_bytes = (self.max_order as usize + 1) * size_of::<u32>();
+-        let data_bytes: usize = serialized.iter().map(Vec::len).sum();
+-
+-        let mut result = Vec::with_capacity(header_bytes + offsets_bytes + data_bytes);
+-        result.push(self.max_order);
+-        result.extend([0u8; 3]);
+-        result.extend(self.len.to_le_bytes());
++        header_bytes
++            + offsets_bytes
++            + self
++                .free
++                .iter()
++                .map(BtreeBitmap::encoded_len)
++                .sum::<usize>()
++    }
++
++    pub(crate) fn encode_into(&self, out: &mut [u8]) {
++        assert!(out.len() >= self.encoded_len());
++        let header_bytes = 1 + 3 + size_of::<u32>();
++        let offsets_bytes = self.free.len() * size_of::<u32>();
++        out[0] = self.max_order;
++        out[1..4].fill(0);
++        out[4..8].copy_from_slice(&self.len.to_le_bytes());
+ 
+         let mut data_offset = header_bytes + offsets_bytes;
+-        for bitmap in &serialized {
+-            data_offset += bitmap.len();
+-            let offset_u32: u32 = data_offset.try_into().unwrap();
+-            result.extend(offset_u32.to_le_bytes());
+-        }
+-        for bitmap in &serialized {
+-            result.extend_from_slice(bitmap);
+-        }
+-
+-        result
++        for (order, bitmap) in self.free.iter().enumerate() {
++            let end = data_offset + bitmap.encoded_len();
++            let field = header_bytes + order * size_of::<u32>();
++            out[field..field + 4].copy_from_slice(&u32::try_from(end).unwrap().to_le_bytes());
++            bitmap.encode_into(&mut out[data_offset..end]);
++            data_offset = end;
++        }
+     }
+ 
+     pub(crate) fn from_bytes(data: &[u8]) -> Self {
+@@ -174,6 +246,12 @@
+             page = next_higher_order(page);
+         }
+         None
++    }
++
++    #[cfg(debug_assertions)]
++    pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
++        self.find_free_order(page.page_index << page.page_order)
++            .is_none()
+     }
+ 
+     pub(crate) fn trailing_free_pages(&self) -> u32 {
+@@ -218,6 +296,9 @@
+     }
+ 
+     pub(crate) fn resize(&mut self, new_size: u32) {
++        if self.poisoned() {
++            return;
++        }
+         self.debug_check_consistency();
+         if new_size > self.len() {
+             let mut processed_pages = self.len();
+@@ -287,6 +368,9 @@
+ 
+     #[allow(unused_variables)]
+     fn debug_check_consistency(&self) {
++        if self.poisoned() {
++            return;
++        }
+         // Don't enable when fuzzing, because this is kind of expensive
+         #[cfg(all(debug_assertions, not(fuzzing)))]
+         {
+@@ -329,6 +413,9 @@
+     // Allocates a page of the given order at the lowest index possible. Will split a higher order page,
+     // to get one of lower index
+     pub(crate) fn alloc_lowest(&mut self, order: u8) -> Option<u32> {
++        if self.poisoned() {
++            return None;
++        }
+         // Lowest index at the requested order
+         let mut best_index_at_order = self.alloc_inner(order)?;
+         // Best (index, order) found
+@@ -360,6 +447,9 @@
+             allocator.clear(free2);
+             best = (free1, best_order - 1);
+         }
++        if self.poisoned() {
++            return None;
++        }
+         assert_eq!(best.0, best_index_at_order);
+ 
+         Some(best.0)
+@@ -370,6 +460,9 @@
+     }
+ 
+     pub(crate) fn alloc_inner(&mut self, order: u8) -> Option<u32> {
++        if self.poisoned() {
++            return None;
++        }
+         if order > self.max_order {
+             return None;
+         }
+@@ -397,8 +490,14 @@
+     }
+ 
+     pub(crate) fn record_alloc_inner(&mut self, page_number: u32, order: u8) {
+-        let allocator = self.get_order_free_mut(order);
+-        if allocator.get(page_number) {
++        if self.poisoned() {
++            return;
++        }
++        let allocated = self.get_order_free_mut(order).get(page_number);
++        if self.poisoned() {
++            return;
++        }
++        if allocated {
+             // Need to split parent page
+             let upper_page = next_higher_order(page_number);
+             self.record_alloc_inner(upper_page, order + 1);
+@@ -412,7 +511,7 @@
+                 allocator.clear(free1);
+             }
+         } else {
+-            allocator.set(page_number);
++            self.get_order_free_mut(order).set(page_number);
+         }
+     }
+ 
+@@ -425,6 +524,9 @@
+     }
+ 
+     pub(crate) fn free_inner(&mut self, page_number: u32, order: u8) {
++        if self.poisoned() {
++            return;
++        }
+         if order == self.max_order {
+             let allocator = self.get_order_free_mut(order);
+             allocator.clear(page_number);
 --- a/src/tree_store/page_store/cached_file.rs
 +++ b/src/tree_store/page_store/cached_file.rs
 @@ -15,6 +15,79 @@
@@ -7178,6 +8726,217 @@
  
      #[test]
      fn cache_leak() {
+--- a/src/tree_store/page_store/file_backend/fallback.rs
++++ b/src/tree_store/page_store/file_backend/fallback.rs
+@@ -1,13 +1,15 @@
+-use crate::{DatabaseError, Result, StorageBackend};
++use crate::{DatabaseError, Result, ScratchBackend, StorageBackend, scratch_backend_in_directory};
+ use std::fs::File;
+ use std::io;
+ use std::io::{Read, Seek, SeekFrom, Write};
++use std::path::{Path, PathBuf};
+ use std::sync::Mutex;
+ 
+ /// Stores a database as a file on-disk.
+ #[derive(Debug)]
+ pub struct FileBackend {
+     file: Mutex<File>,
++    scratch_directory: Option<PathBuf>,
+ }
+ 
+ impl FileBackend {
+@@ -19,11 +21,37 @@
+     pub(crate) fn new_internal(file: File, _: bool) -> Result<Self, DatabaseError> {
+         Ok(Self {
+             file: Mutex::new(file),
++            scratch_directory: None,
+         })
++    }
++
++    pub(crate) fn new_with_path(file: File, path: &Path) -> Result<Self, DatabaseError> {
++        let directory = path
++            .canonicalize()?
++            .parent()
++            .ok_or_else(|| {
++                io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    "database file has no directory",
++                )
++            })?
++            .to_path_buf();
++        let mut backend = Self::new(file)?;
++        backend.scratch_directory = Some(directory);
++        Ok(backend)
+     }
+ }
+ 
+ impl StorageBackend for FileBackend {
++    fn scratch_backend(&self) -> io::Result<Option<Box<dyn ScratchBackend>>> {
++        let Some(directory) = &self.scratch_directory else {
++            // A raw handle is opaque on targets without path discovery. Preserve
++            // the same optional-backing contract as other opaque backends.
++            return Ok(None);
++        };
++        scratch_backend_in_directory(directory).map(Some)
++    }
++
+     fn len(&self) -> Result<u64, io::Error> {
+         Ok(self.file.lock().unwrap().metadata()?.len())
+     }
+--- a/src/tree_store/page_store/file_backend/optimized.rs
++++ b/src/tree_store/page_store/file_backend/optimized.rs
+@@ -1,6 +1,7 @@
+-use crate::{DatabaseError, Result, StorageBackend};
++use crate::{DatabaseError, Result, ScratchBackend, StorageBackend, scratch_backend_in_directory};
+ use std::fs::{File, TryLockError};
+ use std::io;
++use std::path::{Path, PathBuf};
+ 
+ #[cfg(feature = "logging")]
+ use log::warn;
+@@ -16,12 +17,29 @@
+ pub struct FileBackend {
+     lock_supported: bool,
+     file: File,
++    scratch_directory: Option<PathBuf>,
+ }
+ 
+ impl FileBackend {
+     /// Creates a new backend which stores data to the given file.
+     pub fn new(file: File) -> Result<Self, DatabaseError> {
+         Self::new_internal(file, false)
++    }
++
++    pub(crate) fn new_with_path(file: File, path: &Path) -> Result<Self, DatabaseError> {
++        let directory = path
++            .canonicalize()?
++            .parent()
++            .ok_or_else(|| {
++                io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    "database file has no directory",
++                )
++            })?
++            .to_path_buf();
++        let mut backend = Self::new(file)?;
++        backend.scratch_directory = Some(directory);
++        Ok(backend)
+     }
+ 
+     pub(crate) fn new_internal(file: File, read_only: bool) -> Result<Self, DatabaseError> {
+@@ -35,6 +53,7 @@
+             Ok(()) => Ok(Self {
+                 file,
+                 lock_supported: true,
++                scratch_directory: None,
+             }),
+             Err(TryLockError::WouldBlock) => Err(DatabaseError::DatabaseAlreadyOpen),
+             Err(TryLockError::Error(err)) if err.kind() == io::ErrorKind::Unsupported => {
+@@ -46,6 +65,7 @@
+                 Ok(Self {
+                     file,
+                     lock_supported: false,
++                    scratch_directory: None,
+                 })
+             }
+             Err(TryLockError::Error(err)) => Err(err.into()),
+@@ -54,6 +74,24 @@
+ }
+ 
+ impl StorageBackend for FileBackend {
++    fn scratch_backend(&self) -> io::Result<Option<Box<dyn ScratchBackend>>> {
++        if let Some(directory) = &self.scratch_directory {
++            return scratch_backend_in_directory(directory).map(Some);
++        }
++        let path = match path_from_file_handle(&self.file) {
++            Ok(path) => path,
++            Err(error) if error.kind() == io::ErrorKind::Unsupported => return Ok(None),
++            Err(error) => return Err(error),
++        };
++        let directory = path.parent().ok_or_else(|| {
++            io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "database file has no directory",
++            )
++        })?;
++        scratch_backend_in_directory(directory).map(Some)
++    }
++
+     fn len(&self) -> Result<u64, io::Error> {
+         Ok(self.file.metadata()?.len())
+     }
+@@ -117,6 +155,71 @@
+ 
+         Ok(())
+     }
++}
++
++#[cfg(any(target_os = "linux", target_os = "android"))]
++fn path_from_file_handle(file: &File) -> io::Result<PathBuf> {
++    use std::os::fd::AsRawFd;
++    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
++}
++
++#[cfg(target_os = "macos")]
++fn path_from_file_handle(file: &File) -> io::Result<PathBuf> {
++    use std::ffi::CStr;
++    use std::os::fd::AsRawFd;
++    use std::os::unix::ffi::OsStrExt;
++
++    // F_GETPATH is the path of this open descriptor, including files opened
++    // through FileBackend::new(File) with no separate pathname argument.
++    let mut path = [0i8; 1024];
++    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) };
++    if result == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    let bytes = unsafe { CStr::from_ptr(path.as_ptr()) }.to_bytes();
++    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
++}
++
++#[cfg(windows)]
++fn path_from_file_handle(file: &File) -> io::Result<PathBuf> {
++    use std::os::windows::ffi::OsStringExt;
++    use std::os::windows::io::AsRawHandle;
++
++    #[link(name = "kernel32")]
++    unsafe extern "system" {
++        fn GetFinalPathNameByHandleW(
++            handle: *mut std::ffi::c_void,
++            path: *mut u16,
++            length: u32,
++            flags: u32,
++        ) -> u32;
++    }
++    let handle = file.as_raw_handle();
++    let required = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0) };
++    if required == 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let mut path = vec![0u16; required as usize + 1];
++    let written =
++        unsafe { GetFinalPathNameByHandleW(handle, path.as_mut_ptr(), path.len() as u32, 0) };
++    if written == 0 || written as usize >= path.len() {
++        return Err(io::Error::last_os_error());
++    }
++    path.truncate(written as usize);
++    Ok(PathBuf::from(std::ffi::OsString::from_wide(&path)))
++}
++
++#[cfg(not(any(
++    target_os = "linux",
++    target_os = "android",
++    target_os = "macos",
++    windows
++)))]
++fn path_from_file_handle(_file: &File) -> io::Result<PathBuf> {
++    Err(io::Error::new(
++        io::ErrorKind::Unsupported,
++        "file-backed allocator scratch requires a path-based open on this platform",
++    ))
+ }
+ 
+ // TODO: replace these with wasi::FileExt when https://github.com/rust-lang/rust/issues/71213
 --- a/src/tree_store/page_store/layout.rs
 +++ b/src/tree_store/page_store/layout.rs
 @@ -1,10 +1,11 @@
@@ -7196,7 +8955,12 @@
  
 --- a/src/tree_store/page_store/mod.rs
 +++ b/src/tree_store/page_store/mod.rs
-@@ -19,6 +19,7 @@
+@@ -1,3 +1,4 @@
++mod allocator_pager;
+ mod backends;
+ mod base;
+ mod bitmap;
+@@ -19,6 +20,7 @@
  pub(crate) use base::{
      MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page, PageHint, PageNumber, PageTrackerPolicy,
  };
@@ -7206,33 +8970,156 @@
      FILE_FORMAT_VERSION3, ShrinkPolicy, TransactionalMemory, xxh3_checksum,
 --- a/src/tree_store/page_store/page_manager.rs
 +++ b/src/tree_store/page_store/page_manager.rs
-@@ -129,6 +129,25 @@
+@@ -1,5 +1,8 @@
++use crate::ScratchBackend;
++use crate::db::TransactionGuard;
+ use crate::transaction_tracker::TransactionId;
+ use crate::transactions::{AllocatorStateKey, AllocatorStateTree, AllocatorStateTreeMut};
++use crate::tree_store::btree::Btree;
+ use crate::tree_store::btree_base::{BtreeHeader, Checksum};
+ use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
+ use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
+@@ -7,7 +10,7 @@
+ use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
+ use crate::tree_store::page_store::header::{DB_HEADER_SIZE, DatabaseHeader, MAGICNUMBER};
+ use crate::tree_store::page_store::layout::DatabaseLayout;
+-use crate::tree_store::page_store::region::{Allocators, RegionTracker};
++use crate::tree_store::page_store::region::{Allocators, RegionTracker, SavedBitmapWindow};
+ use crate::tree_store::page_store::{PageImpl, PageMut, hash128_with_seed};
+ use crate::tree_store::{Page, PageNumber, PageTrackerPolicy};
+ use crate::{CacheStats, StorageBackend};
+@@ -18,11 +21,71 @@
+ #[cfg(debug_assertions)]
+ use std::collections::HashSet;
+ use std::convert::TryInto;
++use std::io;
+ use std::io::ErrorKind;
+ use std::marker::PhantomData;
+ #[cfg(debug_assertions)]
+ use std::sync::Arc;
++use std::sync::Arc as StdArc;
+ use std::sync::Mutex;
++
++fn saved_u32(bytes: &[u8], offset: usize) -> io::Result<usize> {
++    let word = bytes.get(offset..offset + 4).ok_or_else(|| {
++        io::Error::new(
++            ErrorKind::InvalidData,
++            "truncated allocator bitmap metadata",
++        )
++    })?;
++    Ok(u32::from_le_bytes(word.try_into().unwrap()) as usize)
++}
++
++fn saved_bitmap_window(
++    data: &[u8],
++    order: u8,
++    height: u8,
++    page: u32,
++    out: &mut [u8; 4096],
++) -> io::Result<()> {
++    out.fill(0xFF);
++    let max_order = *data
++        .first()
++        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "empty allocator region"))?;
++    if order > max_order {
++        return Ok(());
++    }
++    let headers_end = 8 + (usize::from(max_order) + 1) * 4;
++    let order_start = if order == 0 {
++        headers_end
++    } else {
++        saved_u32(data, 8 + (usize::from(order) - 1) * 4)?
++    };
++    let order_end = saved_u32(data, 8 + usize::from(order) * 4)?;
++    let bitmap = data
++        .get(order_start..order_end)
++        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid allocator order offsets"))?;
++    let count = saved_u32(bitmap, 0)?;
++    if usize::from(height) >= count {
++        return Ok(());
++    }
++    let layer_start = if height == 0 {
++        4 + count * 4
++    } else {
++        saved_u32(bitmap, 4 + (usize::from(height) - 1) * 4)?
++    };
++    let layer_end = saved_u32(bitmap, 4 + usize::from(height) * 4)?;
++    let layer = bitmap
++        .get(layer_start..layer_end)
++        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid allocator layer offsets"))?;
++    let words = layer
++        .get(4..)
++        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "truncated allocator layer"))?;
++    let start = page as usize * out.len();
++    if let Some(fragment) = words.get(start..) {
++        let count = fragment.len().min(out.len());
++        out[..count].copy_from_slice(&fragment[..count]);
++    }
++    Ok(())
++}
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::thread;
+ 
+@@ -82,17 +145,21 @@
+ }
+ 
+ impl InMemoryState {
+-    fn new(header: DatabaseHeader) -> Self {
+-        let allocators = Allocators::new(header.layout());
+-        Self { header, allocators }
+-    }
+-
+-    fn get_region(&self, region: u32) -> &BuddyAllocator {
+-        &self.allocators.region_allocators[region as usize]
++    fn new(header: DatabaseHeader, scratch: Option<Box<dyn ScratchBackend>>) -> Result<Self> {
++        let allocators = if let Some(scratch) = scratch {
++            Allocators::new_paged(header.layout(), scratch)?
++        } else {
++            Allocators::new(header.layout())
++        };
++        Ok(Self { header, allocators })
++    }
++
++    fn get_region(&mut self, region: u32) -> &BuddyAllocator {
++        self.allocators.get_region(region)
+     }
+ 
+     fn get_region_mut(&mut self, region: u32) -> &mut BuddyAllocator {
+-        &mut self.allocators.region_allocators[region as usize]
++        self.allocators.get_region_mut(region)
+     }
+ 
+     fn get_region_tracker_mut(&mut self) -> &mut RegionTracker {
+@@ -129,6 +196,28 @@
  }
  
  impl TransactionalMemory {
++    pub(crate) fn allocator_resident_bytes(&self) -> usize {
++        self.state.lock().unwrap().allocators.resident_bytes()
++    }
++
++    pub(crate) fn allocator_region_counts(&self) -> (usize, usize) {
++        let state = self.state.lock().unwrap();
++        (
++            state.allocators.loaded_region_count(),
++            state.allocators.region_count(),
++        )
++    }
++
 +    #[cfg(feature = "test-seams")]
 +    pub(crate) fn allocator_metadata_bytes_for_test(&self) -> usize {
-+        self.state
-+            .lock()
-+            .unwrap()
-+            .allocators
-+            .allocator_metadata_bytes_for_test()
++        self.allocator_resident_bytes()
 +    }
 +
 +    #[cfg(feature = "test-seams")]
 +    pub(crate) fn allocator_regions_for_test(&self) -> usize {
-+        self.state
-+            .lock()
-+            .unwrap()
-+            .allocators
-+            .region_allocators
-+            .len()
++        self.state.lock().unwrap().allocators.region_count()
 +    }
 +
      pub(crate) fn new(
          file: Box<dyn StorageBackend>,
          // Allow initializing a new database in an empty file
-@@ -137,9 +156,10 @@
+@@ -137,9 +226,10 @@
          requested_region_size: Option<u64>,
          cache_size: usize,
          read_only: bool,
@@ -7244,7 +9131,19 @@
          let region_size = requested_region_size.unwrap_or(MAX_USABLE_REGION_SPACE);
          let region_size = min(
              region_size,
-@@ -226,12 +246,17 @@
+@@ -147,6 +237,11 @@
+         );
+         assert!(region_size.is_power_of_two());
+ 
++        let scratch = if read_only {
++            None
++        } else {
++            file.scratch_backend()?
++        };
+         let storage = PagedCachedFile::new(file, page_size as u64, cache_size)?;
+ 
+         let initial_storage_len = storage.raw_file_len()?;
+@@ -226,12 +321,17 @@
          }
          let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
          let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
@@ -7265,7 +9164,7 @@
              if read_only {
                  return Err(DatabaseError::RepairAborted);
              }
-@@ -252,9 +277,14 @@
+@@ -252,12 +352,17 @@
                  .copy_from_slice(&header.to_bytes(true));
              storage.flush()?;
          }
@@ -7281,17 +9180,366 @@
 +        }
          let region_size = layout.full_region_layout().len();
          let region_header_size = layout.full_region_layout().data_section().start;
-         let state = InMemoryState::new(header);
-@@ -524,6 +554,8 @@
+-        let state = InMemoryState::new(header);
++        let state = InMemoryState::new(header, scratch)?;
+ 
+         assert!(page_size >= DB_HEADER_SIZE);
+ 
+@@ -285,7 +390,52 @@
+     }
+ 
+     pub(crate) fn check_io_errors(&self) -> Result {
++        if let Some(error) = self
++            .state
++            .lock()
++            .unwrap()
++            .allocators
++            .pager()
++            .and_then(|pager| pager.storage_failure())
++        {
++            return Err(error);
++        }
+         self.storage.check_io_errors()
++    }
++
++    #[cfg(debug_assertions)]
++    pub(crate) fn uses_paged_allocator(&self) -> bool {
++        self.state.lock().unwrap().allocators.pager().is_some()
++    }
++
++    pub(crate) fn has_saved_allocator_source(&self) -> bool {
++        self.state.lock().unwrap().allocators.has_saved_source()
++    }
++
++    pub(crate) fn materialize_allocator_source(&self) -> Result {
++        let mut state = self.state.lock().unwrap();
++        state.allocators.materialize_saved_source()?;
++        if let Some(error) = state
++            .allocators
++            .pager()
++            .and_then(|pager| pager.storage_failure())
++        {
++            return Err(error);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn materialize_small_allocator_source(&self) -> Result<bool> {
++        let mut state = self.state.lock().unwrap();
++        let retired = state.allocators.materialize_saved_source_if_small()?;
++        if let Some(error) = state
++            .allocators
++            .pager()
++            .and_then(|pager| pager.storage_failure())
++        {
++            return Err(error);
++        }
++        Ok(retired)
+     }
+ 
+     #[cfg(debug_assertions)]
+@@ -295,23 +445,30 @@
+ 
+     #[cfg(debug_assertions)]
+     pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
+-        self.allocated_pages
++        let pages: Vec<PageNumber> = self
++            .allocated_pages
+             .lock()
+             .unwrap()
+             .iter()
+             .copied()
+-            .collect()
++            .collect();
++        pages
+     }
+ 
+     #[cfg(debug_assertions)]
+     pub(crate) fn debug_check_allocator_consistency(&self) {
+-        let state = self.state.lock().unwrap();
+-        let mut region_pages = vec![vec![]; state.allocators.region_allocators.len()];
++        let mut state = self.state.lock().unwrap();
++        if state.allocators.pager().is_some() {
++            return;
++        }
++        let mut region_pages = vec![vec![]; state.allocators.region_count()];
+         for p in self.allocated_pages.lock().unwrap().iter() {
+             region_pages[p.region as usize].push(*p);
+         }
+-        for (i, allocator) in state.allocators.region_allocators.iter().enumerate() {
+-            allocator.check_allocated_pages(i.try_into().unwrap(), &region_pages[i]);
++        for (i, pages) in region_pages.iter().enumerate() {
++            state
++                .get_region(i.try_into().unwrap())
++                .check_allocated_pages(i.try_into().unwrap(), pages);
+         }
+     }
+ 
+@@ -346,7 +503,9 @@
+ 
+         self.needs_recovery
+             .store(header.recovery_required, Ordering::Release);
+-        self.state.lock().unwrap().header = header;
++        let mut state = self.state.lock().unwrap();
++        state.allocators.resize_to(header.layout())?;
++        state.header = header;
+ 
+         Ok(was_clean)
+     }
+@@ -379,7 +538,8 @@
+ 
+     pub(crate) fn begin_repair(&self) -> Result<()> {
+         let mut state = self.state.lock().unwrap();
+-        state.allocators = Allocators::new(state.header.layout());
++        let layout = state.header.layout();
++        state.allocators.reset_for_repair(layout)?;
+         #[cfg(debug_assertions)]
+         self.allocated_pages.lock().unwrap().clear();
+ 
+@@ -392,7 +552,9 @@
+         let allocator = state.get_region_mut(region_index);
+         allocator.record_alloc(page_number.page_index, page_number.page_order);
+         #[cfg(debug_assertions)]
+-        assert!(self.allocated_pages.lock().unwrap().insert(page_number));
++        if cfg!(test) || state.allocators.pager().is_none() {
++            assert!(self.allocated_pages.lock().unwrap().insert(page_number));
++        }
+     }
+ 
+     fn write_header(&self, header: &DatabaseHeader) -> Result {
+@@ -405,6 +567,7 @@
+     }
+ 
+     pub(crate) fn end_repair(&self) -> Result<()> {
++        self.check_io_errors()?;
+         let mut state = self.state.lock().unwrap();
+         state.header.recovery_required = false;
+         self.write_header(&state.header)?;
+@@ -419,30 +582,25 @@
+         tree: &mut AllocatorStateTreeMut,
+         transaction_id: TransactionId,
+     ) -> Result<u32> {
++        self.check_io_errors()?;
+         let state = self.state.lock().unwrap();
+         let layout = state.header.layout();
+         let num_regions = layout.num_regions();
+-        let region_tracker_len = state.allocators.region_tracker.to_vec().len();
+-        let region_lens: Vec<usize> = state
+-            .allocators
+-            .region_allocators
+-            .iter()
+-            .map(|x| x.to_vec().len())
+-            .collect();
++        let region_tracker_len = state.allocators.region_tracker.encoded_len();
+         drop(state);
+ 
+         for i in 0..num_regions {
+-            let region_bytes_len = region_lens[i as usize];
+-            tree.insert(
+-                &AllocatorStateKey::Region(i),
+-                &vec![0; region_bytes_len].as_ref(),
+-            )?;
+-        }
+-
+-        tree.insert(
+-            &AllocatorStateKey::RegionTracker,
+-            &vec![0; region_tracker_len].as_ref(),
+-        )?;
++            let region_bytes_len = self
++                .state
++                .lock()
++                .unwrap()
++                .allocators
++                .get_region(i)
++                .encoded_len();
++            drop(tree.insert_zeroed_reserve(&AllocatorStateKey::Region(i), region_bytes_len)?);
++        }
++
++        drop(tree.insert_zeroed_reserve(&AllocatorStateKey::RegionTracker, region_tracker_len)?);
+ 
+         tree.insert(
+             &AllocatorStateKey::TransactionId,
+@@ -458,43 +616,43 @@
+         tree: &mut AllocatorStateTreeMut,
+         num_regions: u32,
+     ) -> Result<bool> {
++        self.check_io_errors()?;
+         // Has the number of regions changed since reserve_allocator_state() was called?
+-        let state = self.state.lock().unwrap();
+-        if num_regions != state.header.layout().num_regions() {
++        if num_regions != self.state.lock().unwrap().header.layout().num_regions() {
+             return Ok(false);
+         }
+ 
+         for i in 0..num_regions {
+-            let region_bytes = &state.allocators.region_allocators[i as usize].to_vec();
+-            if tree
+-                .get(&AllocatorStateKey::Region(i))?
+-                .unwrap()
+-                .value()
+-                .len()
+-                < region_bytes.len()
+-            {
++            let mut destination = tree.get_mut(&AllocatorStateKey::Region(i))?.unwrap();
++            let mut state = self.state.lock().unwrap();
++            let region = state.allocators.get_region(i);
++            if destination.value().len() < region.encoded_len() {
+                 // The allocator state grew too much since we reserved space
+                 return Ok(false);
+             }
+-            tree.insert_inplace(&AllocatorStateKey::Region(i), &region_bytes.as_ref())?;
+-        }
+-
+-        let region_tracker_bytes = state.allocators.region_tracker.to_vec();
+-        if tree
+-            .get(&AllocatorStateKey::RegionTracker)?
+-            .unwrap()
+-            .value()
+-            .len()
+-            < region_tracker_bytes.len()
+-        {
++            region.encode_into(destination.value_mut());
++            drop(state);
++            drop(destination);
++        }
++
++        let mut destination = tree.get_mut(&AllocatorStateKey::RegionTracker)?.unwrap();
++        let state = self.state.lock().unwrap();
++        if destination.value().len() < state.allocators.region_tracker.encoded_len() {
+             // The allocator state grew too much since we reserved space
+             return Ok(false);
+         }
+-        tree.insert_inplace(
+-            &AllocatorStateKey::RegionTracker,
+-            &region_tracker_bytes.as_ref(),
+-        )?;
+-
++        state
++            .allocators
++            .region_tracker
++            .encode_into(destination.value_mut());
++
++        if let Some(error) = state
++            .allocators
++            .pager()
++            .and_then(|pager| pager.storage_failure())
++        {
++            return Err(error);
++        }
+         Ok(true)
+     }
+ 
+@@ -519,12 +677,46 @@
+     pub(crate) fn load_allocator_state(&self, tree: &AllocatorStateTree) -> Result {
+         assert!(self.is_valid_allocator_state(tree)?);
+ 
++        if self.state.lock().unwrap().allocators.pager().is_some() {
++            let mem = StdArc::downgrade(&tree.mem);
++            let root = tree.get_root();
++            let hint = tree.hint();
++            let source: StdArc<SavedBitmapWindow> =
++                StdArc::new(move |region, order, height, page, out| {
++                    let mem = mem.upgrade().ok_or_else(|| {
++                        io::Error::new(ErrorKind::BrokenPipe, "allocator source database closed")
++                    })?;
++                    let source_tree = Btree::<AllocatorStateKey, &'static [u8]>::new(
++                        root,
++                        hint,
++                        StdArc::new(TransactionGuard::fake()),
++                        mem,
++                    )
++                    .map_err(io::Error::other)?;
++                    let Some(saved) = source_tree
++                        .get(&AllocatorStateKey::Region(region))
++                        .map_err(io::Error::other)?
++                    else {
++                        return Ok(false);
++                    };
++                    saved_bitmap_window(saved.value(), order, height, page, out)?;
++                    Ok(true)
++                });
++            let mut state = self.state.lock().unwrap();
++            state.allocators.set_saved_source(source)?;
++            state.header.recovery_required = false;
++            self.needs_recovery.store(false, Ordering::Release);
++            return Ok(());
++        }
++
+         // Load the allocator state
+-        let mut region_allocators = vec![];
++        let mut regions = vec![];
          for region in
              tree.range(&(AllocatorStateKey::Region(0)..=AllocatorStateKey::Region(u32::MAX)))?
          {
+-            region_allocators.push(BuddyAllocator::from_bytes(region?.value()));
 +            #[cfg(feature = "test-seams")]
 +            crate::db::allocator_metadata_test_seams::note_loaded_regions(1);
-             region_allocators.push(BuddyAllocator::from_bytes(region?.value()));
++            regions.push(BuddyAllocator::from_bytes(region?.value()));
          }
  
-@@ -774,6 +806,24 @@
+         let region_tracker = RegionTracker::from_bytes(
+@@ -536,12 +728,13 @@
+         let mut state = self.state.lock().unwrap();
+         state.allocators = Allocators {
+             region_tracker,
+-            region_allocators,
++            regions,
++            paged: None,
+         };
+ 
+         // Resize the allocators to match the current file size
+         let layout = state.header.layout();
+-        state.allocators.resize_to(layout);
++        state.allocators.resize_to(layout)?;
+         drop(state);
+ 
+         self.state.lock().unwrap().header.recovery_required = false;
+@@ -554,8 +747,15 @@
+     pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
+         #[cfg(debug_assertions)]
+         {
+-            let allocated = self.allocated_pages.lock().unwrap();
+-            allocated.contains(&page)
++            let mut state = self.state.lock().unwrap();
++            // Unit tests ask whether this exact extent is still present after
++            // relocation. A covering larger extent is not the same identity.
++            if state.allocators.pager().is_some() && !cfg!(test) {
++                state.get_region(page.region).is_allocated(page)
++            } else {
++                let allocated = self.allocated_pages.lock().unwrap();
++                allocated.contains(&page)
++            }
+         }
+         #[cfg(not(debug_assertions))]
+         {
+@@ -612,6 +812,7 @@
+         // Copy the header so that we can release the state lock, while we flush the file
+         let mut header = state.header.clone();
+         drop(state);
++        self.check_io_errors()?;
+ 
+         let old_transaction_id = header.secondary_slot().transaction_id;
+         let secondary = header.secondary_slot_mut();
+@@ -678,6 +879,7 @@
+         #[cfg(debug_assertions)]
+         debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
+         assert!(!self.needs_recovery.load(Ordering::Acquire));
++        self.check_io_errors()?;
+ 
+         let mut unpersisted = self.unpersisted.lock().unwrap();
+         let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
+@@ -726,7 +928,9 @@
+                 .get_region_mut(region_index)
+                 .free(page_number.page_index, page_number.page_order);
+             #[cfg(debug_assertions)]
+-            assert!(self.allocated_pages.lock().unwrap().remove(page_number));
++            if cfg!(test) || state.allocators.pager().is_none() {
++                assert!(self.allocated_pages.lock().unwrap().remove(page_number));
++            }
+ 
+             let address = page_number.address_range(
+                 self.page_size.into(),
+@@ -774,6 +978,24 @@
              #[cfg(debug_assertions)]
              open_pages: self.read_page_ref_counts.clone(),
          })
@@ -7316,7 +9564,76 @@
      }
  
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
-@@ -1107,6 +1157,13 @@
+@@ -871,7 +1093,9 @@
+                     .unwrap()
+                     .contains_key(&page)
+             );
+-            assert!(self.allocated_pages.lock().unwrap().remove(&page));
++            if cfg!(test) || !self.uses_paged_allocator() {
++                assert!(self.allocated_pages.lock().unwrap().remove(&page));
++            }
+             assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
+         }
+         allocated.remove(page);
+@@ -953,12 +1177,32 @@
+             page_number
+         } else {
+             self.grow(&mut state, required_order)?;
+-            Self::allocate_helper_retry(&mut state, required_order, lowest)?.unwrap()
++            let page = Self::allocate_helper_retry(&mut state, required_order, lowest)?;
++            if let Some(error) = state
++                .allocators
++                .pager()
++                .and_then(|pager| pager.storage_failure())
++            {
++                return Err(error);
++            }
++            page.ok_or_else(|| {
++                StorageError::Corrupted("allocator growth yielded no free page".into())
++            })?
+         };
+ 
++        if let Some(error) = state
++            .allocators
++            .pager()
++            .and_then(|pager| pager.storage_failure())
++        {
++            return Err(error);
++        }
++
+         #[cfg(debug_assertions)]
+         {
+-            assert!(self.allocated_pages.lock().unwrap().insert(page_number));
++            if cfg!(test) || state.allocators.pager().is_none() {
++                assert!(self.allocated_pages.lock().unwrap().insert(page_number));
++            }
+             assert!(
+                 !self
+                     .read_page_ref_counts
+@@ -1024,6 +1268,13 @@
+             } else {
+                 region.alloc(required_order)
+             };
++            if let Some(error) = state
++                .allocators
++                .pager()
++                .and_then(|pager| pager.storage_failure())
++            {
++                return Err(error);
++            }
+             if let Some(page) = r {
+                 return Ok(Some(PageNumber::new(
+                     candidate_region,
+@@ -1061,7 +1312,7 @@
+ 
+         let mut new_layout = layout;
+         new_layout.reduce_last_region(reduce_by);
+-        state.allocators.resize_to(new_layout);
++        state.allocators.resize_to(new_layout)?;
+         assert!(new_layout.len() <= layout.len());
+         state.header.set_layout(new_layout);
+ 
+@@ -1107,13 +1358,20 @@
  
          let result = self.storage.resize(new_layout.len());
          if result.is_err() {
@@ -7330,7 +9647,33 @@
              // TODO: it would be nice to have a more cohesive approach to setting this.
              // we do it in commit() & rollback() on failure, but there are probably other places that need it
              self.needs_recovery.store(true, Ordering::Release);
-@@ -1158,6 +1215,36 @@
+             return result;
+         }
+ 
+-        state.allocators.resize_to(new_layout);
++        state.allocators.resize_to(new_layout)?;
+         state.header.set_layout(new_layout);
+         Ok(())
+     }
+@@ -1135,7 +1393,7 @@
+     }
+ 
+     pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
+-        let state = self.state.lock().unwrap();
++        let mut state = self.state.lock().unwrap();
+         let mut count = 0u64;
+         for i in 0..state.header.layout().num_regions() {
+             count += u64::from(state.get_region(i).count_allocated_pages());
+@@ -1145,7 +1403,7 @@
+     }
+ 
+     pub(crate) fn count_free_pages(&self) -> Result<u64> {
+-        let state = self.state.lock().unwrap();
++        let mut state = self.state.lock().unwrap();
+         let mut count = 0u64;
+         for i in 0..state.header.layout().num_regions() {
+             count += u64::from(state.get_region(i).count_free_pages());
+@@ -1158,8 +1416,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -7365,15 +9708,58 @@
 +    }
 +
      pub(crate) fn close(&self) -> Result {
-         if !self.needs_recovery.load(Ordering::Acquire) && !thread::panicking() {
+-        if !self.needs_recovery.load(Ordering::Acquire) && !thread::panicking() {
++        if !self.needs_recovery.load(Ordering::Acquire)
++            && !thread::panicking()
++            && self.check_io_errors().is_ok()
++        {
              let mut state = self.state.lock()?;
+             if self.storage.flush().is_ok() {
+                 state.header.recovery_required = false;
 --- a/src/tree_store/page_store/region.rs
 +++ b/src/tree_store/page_store/region.rs
-@@ -13,6 +13,16 @@
+@@ -1,10 +1,21 @@
++use super::allocator_pager::{AllocatorPager, bitmap_array_base};
++use super::allocator_pager::{WINDOW_BYTES, WINDOWS};
++use crate::ScratchBackend;
+ use crate::tree_store::page_store::base::MAX_REGIONS;
+ use crate::tree_store::page_store::bitmap::BtreeBitmap;
+ use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
+ use crate::tree_store::page_store::layout::DatabaseLayout;
+ use crate::tree_store::page_store::page_manager::{INITIAL_REGIONS, MAX_MAX_PAGE_ORDER};
+ use std::cmp::{self, max};
++use std::io;
+ use std::mem::size_of;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicU32, Ordering};
++
++pub(super) type SavedBitmapWindow =
++    dyn Fn(u32, u8, u8, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
++type PagedBaseLoader = dyn Fn(u64, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
+ 
+ // Tracks the page orders that MAY BE free in each region. This data structure is optimistic, so
+ // a region may not actually have a page free for a given order
+@@ -13,6 +24,31 @@
  }
  
  impl RegionTracker {
-+    #[cfg(feature = "test-seams")]
++    pub(crate) fn new_paged(regions: u32, orders: u8, pager: &Arc<AllocatorPager>) -> Self {
++        let mut data = Vec::with_capacity(orders as usize);
++        for order in 0..orders {
++            data.push(BtreeBitmap::new_padded_paged(
++                regions,
++                regions,
++                MAX_REGIONS,
++                bitmap_array_base(None, order),
++                pager,
++                true,
++            ));
++        }
++        Self {
++            order_trackers: data,
++        }
++    }
 +    fn allocator_metadata_bytes_for_test(&self) -> usize {
 +        self.order_trackers.capacity() * size_of::<BtreeBitmap>()
 +            + self
@@ -7386,24 +9772,542 @@
      pub(crate) fn new(regions: u32, orders: u8) -> Self {
          let mut data = vec![];
          for _ in 0..orders {
-@@ -105,6 +115,17 @@
+@@ -28,21 +64,35 @@
+     // allocator_lens: u32 length of each allocator
+     // data: BtreeBitmap data for each order
+     pub(super) fn to_vec(&self) -> Vec<u8> {
+-        let mut result = vec![];
+-        let orders: u32 = self.order_trackers.len().try_into().unwrap();
+-        let allocator_lens: Vec<u32> = self
+-            .order_trackers
+-            .iter()
+-            .map(|x| x.to_vec().len().try_into().unwrap())
+-            .collect();
+-        result.extend(orders.to_le_bytes());
+-        for allocator_len in allocator_lens {
+-            result.extend(allocator_len.to_le_bytes());
+-        }
+-        for order in &self.order_trackers {
+-            result.extend(&order.to_vec());
+-        }
++        let mut result = vec![0; self.encoded_len()];
++        self.encode_into(&mut result);
+         result
++    }
++
++    pub(super) fn encoded_len(&self) -> usize {
++        4 + self.order_trackers.len() * 4
++            + self
++                .order_trackers
++                .iter()
++                .map(BtreeBitmap::encoded_len)
++                .sum::<usize>()
++    }
++
++    pub(super) fn encode_into(&self, out: &mut [u8]) {
++        assert!(out.len() >= self.encoded_len());
++        out[..4].copy_from_slice(
++            &u32::try_from(self.order_trackers.len())
++                .unwrap()
++                .to_le_bytes(),
++        );
++        let mut offset = 4 + self.order_trackers.len() * 4;
++        for (order, bitmap) in self.order_trackers.iter().enumerate() {
++            let len = bitmap.encoded_len();
++            let field = 4 + order * 4;
++            out[field..field + 4].copy_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
++            bitmap.encode_into(&mut out[offset..offset + len]);
++            offset += len;
++        }
+     }
+ 
+     pub(super) fn from_bytes(page: &[u8]) -> Self {
+@@ -101,12 +151,46 @@
+ 
+ pub(super) struct Allocators {
+     pub(super) region_tracker: RegionTracker,
+-    pub(super) region_allocators: Vec<BuddyAllocator>,
++    pub(super) regions: Vec<BuddyAllocator>,
++    pub(super) paged: Option<PagedRegions>,
  }
  
++pub(super) struct PagedRegions {
++    pager: Arc<AllocatorPager>,
++    layout: Arc<Mutex<DatabaseLayout>>,
++    saved_region_limit: Arc<AtomicU32>,
++    active: Option<(u32, BuddyAllocator)>,
++}
++
  impl Allocators {
-+    #[cfg(feature = "test-seams")]
-+    pub(super) fn allocator_metadata_bytes_for_test(&self) -> usize {
-+        self.region_allocators.capacity() * size_of::<BuddyAllocator>()
++    /// A paged allocator's operation peak is `W * P + H + C`: W=32 windows,
++    /// P=4096 bytes each, H=4096 bytes of stack hashing scratch, and C<32KiB
++    /// for tags, pager control, both descriptor trees, one regional view and
++    /// source state. The source B-tree page belongs to the existing page owner.
++    /// This bound is independent of the file's region count.
++    pub(super) fn resident_bytes(&self) -> usize {
++        if let Some(paged) = &self.paged {
++            let descriptors = self.region_tracker.allocator_metadata_bytes_for_test()
++                + paged.active.as_ref().map_or(0, |(_, allocator)| {
++                    allocator.allocator_metadata_bytes_for_test()
++                })
++                + size_of::<Allocators>()
++                + 1024;
++            debug_assert!(descriptors <= 16 * 1024);
++            return AllocatorPager::resident_bytes() + 16 * 1024;
++        }
++        let resident = self.regions.capacity() * size_of::<BuddyAllocator>()
 +            + self
-+                .region_allocators
++                .regions
 +                .iter()
 +                .map(BuddyAllocator::allocator_metadata_bytes_for_test)
 +                .sum::<usize>()
-+            + self.region_tracker.allocator_metadata_bytes_for_test()
++            + self.region_tracker.allocator_metadata_bytes_for_test();
++        resident + size_of::<Allocators>()
 +    }
 +
      pub(super) fn new(layout: DatabaseLayout) -> Self {
-         let mut region_allocators = vec![];
+-        let mut region_allocators = vec![];
++        let mut regions = vec![];
          let initial_regions = max(INITIAL_REGIONS, layout.num_regions());
+         let mut region_tracker = RegionTracker::new(initial_regions, MAX_MAX_PAGE_ORDER + 1);
+         for i in 0..layout.num_regions() {
+@@ -117,30 +201,372 @@
+             );
+             let max_order = allocator.get_max_order();
+             region_tracker.mark_free(max_order, i);
+-            region_allocators.push(allocator);
++            regions.push(allocator);
+         }
+ 
+         Self {
+             region_tracker,
+-            region_allocators,
+-        }
+-    }
+-
+-    pub(crate) fn xxh3_hash(&self) -> u128 {
++            regions,
++            paged: None,
++        }
++    }
++
++    /// Bitmap payload resides in 32 fixed 4096-byte windows. The tracker and
++    /// the one active region retain only descriptor vectors; all other region
++    /// descriptors are reconstructed from scalar geometry on demand.
++    pub(super) fn new_paged(
++        layout: DatabaseLayout,
++        scratch: Box<dyn ScratchBackend>,
++    ) -> io::Result<Self> {
++        let pager = AllocatorPager::new(scratch);
++        let geometry = Arc::new(Mutex::new(layout));
++        let saved_region_limit = Arc::new(AtomicU32::new(0));
++        Self::install_paged_source(&pager, &geometry, &saved_region_limit, None)?;
++        Ok(Self {
++            region_tracker: RegionTracker::new_paged(
++                layout.num_regions(),
++                MAX_MAX_PAGE_ORDER + 1,
++                &pager,
++            ),
++            regions: Vec::new(),
++            paged: Some(PagedRegions {
++                pager,
++                layout: geometry,
++                saved_region_limit,
++                active: None,
++            }),
++        })
++    }
++
++    pub(super) fn set_saved_source(&mut self, source: Arc<SavedBitmapWindow>) -> io::Result<()> {
++        if let Some(paged) = &mut self.paged {
++            paged.active = None;
++            paged.saved_region_limit.store(
++                paged.layout.lock().unwrap().num_regions(),
++                Ordering::Release,
++            );
++            Self::install_paged_source(
++                &paged.pager,
++                &paged.layout,
++                &paged.saved_region_limit,
++                Some(source),
++            )?;
++        }
++        Ok(())
++    }
++
++    pub(super) fn reset_for_repair(&mut self, layout: DatabaseLayout) -> io::Result<()> {
++        if let Some(paged) = &mut self.paged {
++            *paged.layout.lock().unwrap() = layout;
++            paged.active = None;
++            paged.saved_region_limit.store(0, Ordering::Release);
++            Self::install_paged_source(
++                &paged.pager,
++                &paged.layout,
++                &paged.saved_region_limit,
++                None,
++            )?;
++            self.region_tracker = RegionTracker::new_paged(
++                layout.num_regions(),
++                MAX_MAX_PAGE_ORDER + 1,
++                &paged.pager,
++            );
++        } else {
++            *self = Self::new(layout);
++        }
++        Ok(())
++    }
++
++    fn install_paged_source(
++        pager: &Arc<AllocatorPager>,
++        geometry: &Arc<Mutex<DatabaseLayout>>,
++        saved_region_limit: &Arc<AtomicU32>,
++        source: Option<Arc<SavedBitmapWindow>>,
++    ) -> io::Result<()> {
++        pager.set_source(Some(Self::paged_source(
++            geometry,
++            saved_region_limit,
++            source,
++        )))
++    }
++
++    fn paged_source(
++        geometry: &Arc<Mutex<DatabaseLayout>>,
++        saved_region_limit: &Arc<AtomicU32>,
++        source: Option<Arc<SavedBitmapWindow>>,
++    ) -> Box<PagedBaseLoader> {
++        let geometry = Arc::clone(geometry);
++        let saved_region_limit = Arc::clone(saved_region_limit);
++        Box::new(move |array, page, out| {
++            let entity = array / (21 * 4);
++            if entity == 0 {
++                return Ok(false);
++            }
++            let region: u32 = (entity - 1).try_into().map_err(|_| {
++                io::Error::new(io::ErrorKind::InvalidData, "allocator region overflow")
++            })?;
++            let order = ((array % (21 * 4)) / 4) as u8;
++            let height = (array % 4) as u8;
++            if region < saved_region_limit.load(Ordering::Acquire)
++                && let Some(source) = &source
++                && source(region, order, height, page, out)?
++            {
++                return Ok(true);
++            }
++            let layout = *geometry.lock().unwrap();
++            if region >= layout.num_regions() {
++                return Ok(false);
++            }
++            out.fill(0xFF);
++            let region_pages = layout.region_layout(region).num_pages();
++            if ((region_pages >> order) & 1) == 0 {
++                return Ok(true);
++            }
++            let mut capacity = layout.full_region_layout().num_pages();
++            for _ in 0..order {
++                capacity = capacity.div_ceil(2);
++            }
++            let mut leaf_height = 0u8;
++            while capacity > 64 {
++                capacity = capacity.div_ceil(64);
++                leaf_height += 1;
++            }
++            if height > leaf_height {
++                return Ok(true);
++            }
++            let high_bits = region_pages & !((1u32 << (order + 1)) - 1);
++            let block = high_bits >> order;
++            let bit = block >> (6 * (leaf_height - height));
++            let start = u64::from(page) * (WINDOW_BYTES as u64 / 8) * 64;
++            if u64::from(bit) >= start && u64::from(bit) < start + (WINDOW_BYTES as u64 * 8) {
++                let relative = usize::try_from(u64::from(bit) - start).unwrap();
++                let word = relative / 64;
++                let position = relative % 64;
++                let offset = word * 8;
++                let mut value = u64::from_le_bytes(out[offset..offset + 8].try_into().unwrap());
++                value &= !(1u64 << position);
++                out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
++            }
++            Ok(true)
++        })
++    }
++
++    pub(super) fn pager(&self) -> Option<&Arc<AllocatorPager>> {
++        self.paged.as_ref().map(|paged| &paged.pager)
++    }
++
++    pub(super) fn has_saved_source(&self) -> bool {
++        self.paged
++            .as_ref()
++            .is_some_and(|paged| paged.saved_region_limit.load(Ordering::Acquire) != 0)
++    }
++
++    pub(super) fn materialize_saved_source(&mut self) -> io::Result<()> {
++        let Some(paged) = &self.paged else {
++            return Ok(());
++        };
++        let saved = paged.saved_region_limit.load(Ordering::Acquire);
++        if saved == 0 {
++            return Ok(());
++        }
++        for region in 0..saved.min(u32::try_from(self.region_count()).unwrap()) {
++            self.get_region_mut(region).materialize_paged_words();
++        }
++        let paged = self.paged.as_ref().unwrap();
++        if paged.pager.is_poisoned() {
++            return Err(paged
++                .pager
++                .io_failure()
++                .unwrap_or_else(|| io::Error::other("allocator scratch I/O failed")));
++        }
++        paged.pager.flush_and_detach_source(Self::paged_source(
++            &paged.layout,
++            &paged.saved_region_limit,
++            None,
++        ))?;
++        paged.saved_region_limit.store(0, Ordering::Release);
++        Ok(())
++    }
++
++    /// Retire a small saved allocator table during an ordinary commit. The
++    /// complete copy fits in one fixed window set; larger tables stay as the
++    /// lazy source until quick repair or explicit whole-file compaction materializes them.
++    pub(super) fn materialize_saved_source_if_small(&mut self) -> io::Result<bool> {
++        let Some(paged) = &self.paged else {
++            return Ok(true);
++        };
++        let saved = paged.saved_region_limit.load(Ordering::Acquire);
++        if saved == 0 {
++            return Ok(true);
++        }
++        let current_regions = u32::try_from(self.region_count())
++            .map_err(|_| io::Error::other("allocator region count overflow"))?;
++        let saved = saved.min(current_regions);
++        if saved as usize > WINDOWS {
++            return Ok(false);
++        }
++        let mut encoded_bytes = 0usize;
++        for region in 0..saved {
++            encoded_bytes = encoded_bytes
++                .checked_add(self.get_region(region).encoded_len())
++                .ok_or_else(|| io::Error::other("allocator source size overflow"))?;
++            if encoded_bytes > WINDOWS * WINDOW_BYTES {
++                return Ok(false);
++            }
++        }
++        self.materialize_saved_source()?;
++        Ok(true)
++    }
++
++    pub(super) fn region_count(&self) -> usize {
++        self.paged.as_ref().map_or(self.regions.len(), |paged| {
++            paged.layout.lock().unwrap().num_regions() as usize
++        })
++    }
++
++    pub(super) fn loaded_region_count(&self) -> usize {
++        self.paged.as_ref().map_or(self.regions.len(), |paged| {
++            usize::from(paged.active.is_some())
++        })
++    }
++
++    pub(super) fn get_region(&mut self, region: u32) -> &BuddyAllocator {
++        self.get_region_mut(region)
++    }
++
++    pub(super) fn get_region_mut(&mut self, region: u32) -> &mut BuddyAllocator {
++        if let Some(paged) = &mut self.paged {
++            if paged.active.as_ref().map(|(loaded, _)| *loaded) != Some(region) {
++                let layout = *paged.layout.lock().unwrap();
++                let regional = layout.region_layout(region);
++                // No holder can borrow the old view across this exclusive
++                // call; release its descriptor owner before building another.
++                paged.active = None;
++                let allocator = BuddyAllocator::new_paged(
++                    regional.num_pages(),
++                    layout.full_region_layout().num_pages(),
++                    region,
++                    &paged.pager,
++                    false,
++                );
++                paged.active = Some((region, allocator));
++                #[cfg(feature = "test-seams")]
++                crate::db::allocator_metadata_test_seams::note_loaded_regions(1);
++            }
++            &mut paged.active.as_mut().unwrap().1
++        } else {
++            &mut self.regions[region as usize]
++        }
++    }
++
++    pub(crate) fn xxh3_hash(&mut self) -> u128 {
+         // Ignore the region tracker because it is an optimistic cache, and so may not match
+         // between repairs of the allocators
+         let mut result = 0;
+-        for allocator in &self.region_allocators {
+-            result ^= allocator.xxh3_hash();
++        for region in 0..self.region_count() {
++            result ^= self.get_region(u32::try_from(region).unwrap()).xxh3_hash();
+         }
+         result
+     }
+ 
+-    pub(super) fn resize_to(&mut self, new_layout: DatabaseLayout) {
+-        let shrink = match (new_layout.num_regions() as usize).cmp(&self.region_allocators.len()) {
++    pub(super) fn resize_to(&mut self, new_layout: DatabaseLayout) -> io::Result<()> {
++        if self.paged.is_some() {
++            let old_layout = *self.paged.as_ref().unwrap().layout.lock().unwrap();
++            match new_layout.num_regions().cmp(&old_layout.num_regions()) {
++                cmp::Ordering::Equal => {
++                    let last_region = new_layout.num_regions() - 1;
++                    let new_len = new_layout.region_layout(last_region).num_pages();
++                    if old_layout.region_layout(last_region).num_pages() != new_len {
++                        let grew = new_len > old_layout.region_layout(last_region).num_pages();
++                        let allocator = self.get_region_mut(last_region);
++                        allocator.resize(new_len);
++                        if grew {
++                            let order = allocator.highest_free_order().ok_or_else(|| {
++                                self.paged
++                                    .as_ref()
++                                    .unwrap()
++                                    .pager
++                                    .io_failure()
++                                    .unwrap_or_else(|| {
++                                        io::Error::new(
++                                            io::ErrorKind::InvalidData,
++                                            "grown region has no free page",
++                                        )
++                                    })
++                            })?;
++                            self.region_tracker.mark_free(order, last_region);
++                        }
++                    }
++                }
++                cmp::Ordering::Greater => {
++                    let old_last = old_layout.num_regions() - 1;
++                    let new_len = new_layout.region_layout(old_last).num_pages();
++                    if old_layout.region_layout(old_last).num_pages() != new_len {
++                        let allocator = self.get_region_mut(old_last);
++                        allocator.resize(new_len);
++                        let order = allocator.highest_free_order().ok_or_else(|| {
++                            self.paged
++                                .as_ref()
++                                .unwrap()
++                                .pager
++                                .io_failure()
++                                .unwrap_or_else(|| {
++                                    io::Error::new(
++                                        io::ErrorKind::InvalidData,
++                                        "grown region has no free page",
++                                    )
++                                })
++                        })?;
++                        self.region_tracker.mark_free(order, old_last);
++                    }
++                    for region in old_layout.num_regions()..new_layout.num_regions() {
++                        if region >= self.region_tracker.len() {
++                            self.region_tracker.resize(region + 1);
++                        }
++                        let order =
++                            u8::try_from(new_layout.region_layout(region).num_pages().ilog2())
++                                .unwrap();
++                        self.region_tracker.mark_free(order, region);
++                    }
++                }
++                cmp::Ordering::Less => {
++                    for region in new_layout.num_regions()..old_layout.num_regions() {
++                        self.region_tracker.mark_full(0, region);
++                    }
++                    if self
++                        .paged
++                        .as_ref()
++                        .unwrap()
++                        .active
++                        .as_ref()
++                        .is_some_and(|(region, _)| *region >= new_layout.num_regions())
++                    {
++                        self.paged.as_mut().unwrap().active = None;
++                    }
++                    let last_region = new_layout.num_regions() - 1;
++                    let new_len = new_layout.region_layout(last_region).num_pages();
++                    if old_layout.region_layout(last_region).num_pages() != new_len {
++                        self.get_region_mut(last_region).resize(new_len);
++                    }
++                }
++            }
++            let paged = self.paged.as_mut().unwrap();
++            if let Some(error) = paged.pager.io_failure() {
++                return Err(error);
++            }
++            if new_layout.num_regions() < old_layout.num_regions() {
++                paged.pager.truncate_regions(new_layout.num_regions())?;
++                paged
++                    .saved_region_limit
++                    .fetch_min(new_layout.num_regions(), Ordering::AcqRel);
++            }
++            *paged.layout.lock().unwrap() = new_layout;
++            return Ok(());
++        }
++        let shrink = match (new_layout.num_regions() as usize).cmp(&self.regions.len()) {
+             cmp::Ordering::Less => true,
+             cmp::Ordering::Equal => {
+-                let allocator = self.region_allocators.last().unwrap();
++                let allocator = self.regions.last().unwrap();
+                 let last_region = new_layout
+                     .trailing_region_layout()
+                     .unwrap_or_else(|| new_layout.full_region_layout());
+@@ -148,7 +574,7 @@
+                     cmp::Ordering::Less => true,
+                     cmp::Ordering::Equal => {
+                         // No-op
+-                        return;
++                        return Ok(());
+                     }
+                     cmp::Ordering::Greater => false,
+                 }
+@@ -158,26 +584,25 @@
+ 
+         if shrink {
+             // Drop all regions that were removed
+-            for i in new_layout.num_regions()..(self.region_allocators.len().try_into().unwrap()) {
++            for i in new_layout.num_regions()..(self.regions.len().try_into().unwrap()) {
+                 self.region_tracker.mark_full(0, i);
+             }
+-            self.region_allocators
+-                .drain((new_layout.num_regions() as usize)..);
++            self.regions.drain((new_layout.num_regions() as usize)..);
+ 
+             // Resize the last region
+             let last_region = new_layout
+                 .trailing_region_layout()
+                 .unwrap_or_else(|| new_layout.full_region_layout());
+-            let allocator = self.region_allocators.last_mut().unwrap();
++            let allocator = self.regions.last_mut().unwrap();
+             if allocator.len() > last_region.num_pages() {
+                 allocator.resize(last_region.num_pages());
+             }
+         } else {
+-            let old_num_regions = self.region_allocators.len();
++            let old_num_regions = self.regions.len();
+             for i in 0..new_layout.num_regions() {
+                 let new_region = new_layout.region_layout(i);
+                 if (i as usize) < old_num_regions {
+-                    let allocator = &mut self.region_allocators[i as usize];
++                    let allocator = &mut self.regions[i as usize];
+                     assert!(new_region.num_pages() >= allocator.len());
+                     if new_region.num_pages() != allocator.len() {
+                         allocator.resize(new_region.num_pages());
+@@ -195,9 +620,10 @@
+                         self.region_tracker.resize(i + 1);
+                     }
+                     self.region_tracker.mark_free(highest_free, i);
+-                    self.region_allocators.push(allocator);
++                    self.regions.push(allocator);
+                 }
+             }
+         }
++        Ok(())
+     }
+ }
 --- a/src/tree_store/table_tree.rs
 +++ b/src/tree_store/table_tree.rs
 @@ -34,6 +34,18 @@
@@ -7557,7 +10461,7 @@
              table
          };
  
-@@ -675,6 +755,95 @@
+@@ -675,6 +755,104 @@
  
          self.tree.relocate(relocation_map)?;
  
@@ -7568,6 +10472,7 @@
 +        &self,
 +        cursor: &mut crate::transactions::CompactionCursor,
 +        maximum: usize,
++        protected_table: Option<&str>,
 +    ) -> Result<(Option<String>, Vec<PagePath>, usize)> {
 +        use std::ops::Bound;
 +        let target = if cursor.phase.is_multiple_of(2) {
@@ -7591,6 +10496,14 @@
 +            };
 +            let entry = entry?;
 +            let name = entry.key().to_owned();
++            if protected_table == Some(name.as_str()) {
++                // Advance exactly one table without faulting any protected
++                // source pages. A later call resumes the finite traversal.
++                cursor.table = Some(name);
++                cursor.advance_table = true;
++                cursor.position.clear();
++                return Ok((None, Vec::new(), 0));
++            }
 +            if cursor.table.as_ref() != Some(&name) {
 +                cursor.position.clear();
 +            }

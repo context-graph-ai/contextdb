@@ -41,6 +41,7 @@ num-traits = "0.2"
 num_cpus = "1.16"
 parking_lot = "0.12"
 rand = "0.9"
+rand_chacha = "0.9"
 rayon = "1.11"
 serde.workspace = true
 
