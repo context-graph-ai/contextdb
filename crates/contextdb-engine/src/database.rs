@@ -53910,19 +53910,14 @@ impl Database {
         Ok(log[start..].to_vec())
     }
 
-    pub fn ddl_log_since(&self, since_lsn: Lsn) -> Vec<DdlChange> {
-        let _operation = self.assert_open_operation();
+    /// Returns declaration history, propagating durable read and admission failures.
+    /// Callers without administrative access receive an empty history.
+    pub fn ddl_log_since(&self, since_lsn: Lsn) -> Result<Vec<DdlChange>> {
+        let _operation = self.open_operation()?;
         if !self.access_is_admin() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        // The public history read returns a list; a durable read refusal is
-        // logged here and reads as no history. Internal callers use the
-        // checked door and return the refusal.
         self.with_commit_lock(|| self.ddl_log_since_unlocked(since_lsn))
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "declaration history read failed");
-                Vec::new()
-            })
     }
 
     /// The latest durable declaration for each locally known table name.
