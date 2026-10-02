@@ -22120,7 +22120,11 @@ impl Database {
         };
         let _membership_capture = self.relational_store.begin_membership_capture();
         let (read_snapshot, root) =
-            self.capture_writer_transaction_statement(*self.session_tx.lock())?;
+            if self.persistence.is_some() && Self::statement_changes_table_schema(stmt) {
+                self.capture_writer_schema_statement()?
+            } else {
+                self.capture_writer_transaction_statement(*self.session_tx.lock())?
+            };
         let has_root = root.is_some();
         let _writer_read = self.enter_writer_read(root);
         let _snapshot_registration = self
@@ -23773,7 +23777,12 @@ impl Database {
             (&parsed_stmt, None)
         };
         let _membership_capture = self.relational_store.begin_membership_capture();
-        let (read_snapshot, root) = self.capture_writer_transaction_statement(Some(tx))?;
+        let (read_snapshot, root) =
+            if self.persistence.is_some() && Self::statement_changes_table_schema(stmt) {
+                self.capture_writer_schema_statement()?
+            } else {
+                self.capture_writer_transaction_statement(Some(tx))?
+            };
         let has_root = root.is_some();
         let _writer_read = self.enter_writer_read(root);
         let _snapshot_registration = self
@@ -46582,6 +46591,35 @@ impl Database {
             );
         }
         if let Some(root) = self.writer_read_root().map_err(E::from)? {
+            let meta = root
+                .borrow_captured_table_meta(table)
+                .ok_or_else(|| E::from(Error::TableNotFound(table.to_owned())))?;
+            let index_name = cursor.index_name().ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded ordered cursor requires a selected index".to_owned(),
+                ))
+            })?;
+            let declaration = meta
+                .indexes
+                .iter()
+                .find(|candidate| candidate.name == index_name)
+                .ok_or_else(|| {
+                    E::from(Error::IndexNotFound {
+                        table: table.to_owned(),
+                        index: index_name.to_owned(),
+                    })
+                })?;
+            let Some((leading, index_direction)) = declaration.columns.first() else {
+                return Err(E::from(Error::Other(format!(
+                    "index {index_name} has no columns"
+                ))));
+            };
+            if leading != column || cursor.source_reverse() != (*index_direction != direction) {
+                return Err(E::from(Error::Other(format!(
+                    "index {index_name} cannot provide the requested order for {table}.{column}"
+                ))));
+            }
+            cursor.source_configure(declaration.columns.len());
             let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)
                 .map_err(E::from)?;
             return self.writer_ordered_next(
@@ -51961,6 +51999,12 @@ impl Database {
         // tombstoned version handed its bytes back at the commit that
         // stamped it, so counting it here would release it a second time.
         let retained_rows = |rows: &[VersionedRow], meta: &TableMeta| {
+            // The file-backed publication discards the projected bodies and
+            // postings. Their source windows already own the temporary copy;
+            // the swap retains only metadata and transaction-local rows.
+            if self.relational_store.uses_disk_backed_committed_bodies() {
+                return 0;
+            }
             rows.iter()
                 .filter(|row| row.deleted_tx.is_none())
                 .fold(0usize, |bytes, row| {

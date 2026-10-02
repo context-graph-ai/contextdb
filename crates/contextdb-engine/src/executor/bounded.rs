@@ -13789,6 +13789,18 @@ pub(super) fn fetch_cursor(
     cancellation: OwnerReadCancellation,
     #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
+    // A request cancelled before it starts consumes no continuation state.
+    // Do not attach its already-fired listener to the parked cursor: that
+    // listener terminally withdraws a read, rather than cancelling this page.
+    if cancellation.is_cancelled()
+        && !cursor
+            ._state
+            .erased
+            .load(std::sync::atomic::Ordering::SeqCst)
+        && matches!(*cursor_lifecycle(cursor), BoundedCursorLifecycle::Open(_))
+    {
+        return Err(BoundedExecutionError::Cancelled);
+    }
     *cursor
         ._state
         .active_cancellation

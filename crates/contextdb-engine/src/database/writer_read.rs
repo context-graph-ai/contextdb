@@ -214,7 +214,7 @@ impl Database {
             return Ok(None);
         };
         let meta = root
-            .captured_table_meta(table)
+            .borrow_captured_table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
         let Some(index) = meta.indexes.iter().find(|index| {
             index.columns.len() >= columns.len()
@@ -506,10 +506,44 @@ impl Database {
                         }
                     }),
             };
+            let terminal = match cursor.source_terminal_bound() {
+                Bound::Included(key) => Some((
+                    true,
+                    source
+                        .index_position_key(
+                            current,
+                            key,
+                            if reverse { RowId(0) } else { RowId(u64::MAX) },
+                            if reverse { TxId(0) } else { TxId(u64::MAX) },
+                        )
+                        .map_err(E::from)?,
+                )),
+                Bound::Excluded(key) => Some((
+                    false,
+                    source
+                        .index_position_key(
+                            current,
+                            key,
+                            if reverse { RowId(u64::MAX) } else { RowId(0) },
+                            if reverse { TxId(u64::MAX) } else { TxId(0) },
+                        )
+                        .map_err(E::from)?,
+                )),
+                Bound::Unbounded => None,
+            };
+            let terminal = terminal
+                .as_ref()
+                .map_or(Bound::Unbounded, |(included, key)| {
+                    if *included {
+                        Bound::Included(key.as_bytes())
+                    } else {
+                        Bound::Excluded(key.as_bytes())
+                    }
+                });
             let range = RelationalIndexRange {
                 current,
-                lower: if reverse { Bound::Unbounded } else { edge },
-                upper: if reverse { edge } else { Bound::Unbounded },
+                lower: if reverse { terminal } else { edge },
+                upper: if reverse { edge } else { terminal },
                 reverse,
             };
             let index = cursor
@@ -1056,6 +1090,19 @@ impl Database {
 }
 
 impl Database {
+    /// Schema mutations use the actual writer frontier even when a callback
+    /// runs inside an older accepted read. The enclosing read retains its
+    /// original descriptor when this nested writer scope exits.
+    pub(super) fn capture_writer_schema_statement(
+        &self,
+    ) -> Result<(SnapshotId, Option<Arc<WriterSnapshot>>)> {
+        if self.already_closed() {
+            return Err(closed_database_error());
+        }
+        let published = self.tx_mgr.capture_published_read();
+        Ok((published.snapshot, durable_root(published.handle)?))
+    }
+
     pub(super) fn capture_writer_transaction_statement(
         &self,
         tx: Option<TxId>,

@@ -452,6 +452,26 @@ impl BoundedOrderedRowCursor {
         self.seek_from()
     }
 
+    /// A complete comparator-domain endpoint can be pushed into the durable
+    /// cursor. Short prefixes and appended seek-only sentinels keep their
+    /// existing conservative traversal until the source supplies that codec.
+    #[doc(hidden)]
+    pub fn source_terminal_bound(&self) -> Bound<&IndexKey> {
+        if self.run_prefix_len != self.image_components {
+            return Bound::Unbounded;
+        }
+        let edge = if self.reverse {
+            &self.run_start
+        } else {
+            &self.run_end
+        };
+        match edge {
+            Bound::Included(key) if key.len() == self.image_components => Bound::Included(key),
+            Bound::Excluded(key) if key.len() == self.image_components => Bound::Excluded(key),
+            _ => Bound::Unbounded,
+        }
+    }
+
     #[doc(hidden)]
     pub fn source_run_bounds(&self) -> (&Bound<IndexKey>, &Bound<IndexKey>, usize) {
         (&self.run_start, &self.run_end, self.run_prefix_len)
