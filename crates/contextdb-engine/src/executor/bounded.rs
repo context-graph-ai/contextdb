@@ -1436,7 +1436,7 @@ struct ScanState {
     snapshot: SnapshotId,
     mode: ScanMode,
     cursor_key_bytes: usize,
-    residual_pick: Option<IndexPick>,
+    residual_pick: Option<Box<IndexPick>>,
     /// Set when an exact whole-key probe over a single-column AUTOMATIC index
     /// was re-planned onto the authenticated ordered route. The source is an
     /// ordinary index run now, but the STATEMENT is still one that names the
@@ -1612,7 +1612,7 @@ enum ScanMode {
         cursor: BoundedPhysicalCursor,
     },
     Index {
-        pick: IndexPick,
+        pick: Box<IndexPick>,
         column: String,
         direction: contextdb_core::SortDirection,
         cursor: BoundedOrderedRowCursor,
@@ -3162,7 +3162,11 @@ fn bound_value_capacity_bytes(
 fn index_pick_capacity_bytes(
     pick: &IndexPick,
 ) -> std::result::Result<usize, BoundedExecutionError> {
-    let mut bytes = pick.name.capacity();
+    let mut bytes = checked_size_add(
+        std::mem::size_of::<IndexPick>(),
+        pick.name.capacity(),
+        "owned index pick",
+    )?;
     bytes = checked_size_add(
         bytes,
         checked_size_mul(
@@ -5317,8 +5321,8 @@ impl ScanState {
                 None
             } else {
                 match &self.mode {
-                    ScanMode::Index { pick, .. } => Some(pick),
-                    _ => self.residual_pick.as_ref(),
+                    ScanMode::Index { pick, .. } => Some(pick.as_ref()),
+                    _ => self.residual_pick.as_deref(),
                 }
             };
             if let Some(pick) = index_pick {
@@ -9689,8 +9693,8 @@ fn select_vector_candidate_identity_source(
         return note_vector_candidate_identity("candidate source carries no predicate");
     };
     let pick = match &state.mode {
-        ScanMode::Index { pick, .. } => pick,
-        ScanMode::Exact { .. } => match state.residual_pick.as_ref() {
+        ScanMode::Index { pick, .. } => pick.as_ref(),
+        ScanMode::Exact { .. } => match state.residual_pick.as_deref() {
             Some(pick) => pick,
             None => return note_vector_candidate_identity("exact source has no residual pick"),
         },
@@ -9926,7 +9930,7 @@ fn select_vector_candidate_identity_source(
         state.residual_pick = None;
         state.authenticated_exact_index = Some(index);
         state.mode = ScanMode::Index {
-            pick,
+            pick: Box::new(pick),
             column,
             direction,
             cursor,
@@ -11034,7 +11038,7 @@ fn build_scan(
             };
             ScanMode::Index {
                 cursor,
-                pick,
+                pick: Box::new(pick),
                 column,
                 direction,
             }
@@ -11144,7 +11148,7 @@ fn build_scan(
             snapshot,
             mode,
             cursor_key_bytes: 0,
-            residual_pick: ordered_pick.or(exact_pick),
+            residual_pick: ordered_pick.or(exact_pick).map(Box::new),
             authenticated_exact_index: None,
             committed_source_offers_every_row: offers_every_committed_row,
             pending_row: None,
@@ -11376,11 +11380,11 @@ fn build_direct_index_scan(
     // stays a residual the physical walk applies to every row it sees.
     let ordered = declaration.kind == contextdb_core::IndexKind::UserDeclared
         || declaration.columns.len() > 1;
-    let residual_pick = (!ordered).then(|| pick.clone());
+    let residual_pick = (!ordered).then(|| Box::new(pick.clone()));
     let mut mode = if ordered {
         let (run_start, run_end, prefix_len) = declared_index_run(&pick, direction, false);
         ScanMode::Index {
-            pick,
+            pick: Box::new(pick),
             column: leading_column,
             direction,
             cursor: BoundedOrderedRowCursor::for_index(index.to_string(), false)

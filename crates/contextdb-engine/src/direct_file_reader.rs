@@ -117,8 +117,6 @@ pub struct DirectTypedImageDigest {
 }
 
 /// One owned relational row in the committed image.
-// Owned fixture records are used only by the read-content test adapter.
-#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectStoredRow {
     pub table: String,
@@ -127,8 +125,6 @@ pub struct DirectStoredRow {
 }
 
 /// One owned graph edge, including all persisted edge properties.
-// Owned fixture records are used only by the read-content test adapter.
-#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectStoredEdge {
     pub source: Uuid,
@@ -146,8 +142,6 @@ pub enum DirectVectorQuantization {
 
 /// One decoded vector entry. Quantized stores are reconstructed into their
 /// owned queryable values during hydration, never by consulting the file later.
-// Owned fixture records are used only by the read-content test adapter.
-#[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectStoredVector {
     pub index: VectorIndexRef,

@@ -824,8 +824,6 @@ impl WriterReadCursor {
                 };
                 if self.table.starts_with("rel_")
                     && self.after.is_none()
-                    && matches!(self.lower, Bound::Unbounded)
-                    && matches!(self.upper, Bound::Unbounded)
                     && let Some(logical) = self.logical_table.as_deref()
                 {
                     memory.reserve(logical.len().saturating_add(32))?;

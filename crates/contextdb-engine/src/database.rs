@@ -9762,70 +9762,75 @@ impl SnapshotInspector {
                 });
             }
         }
-        let (total_retained_versions, versions_truncated, retained_versions) = {
-            let tables = self.database.relational_store.tables.read();
-            let mut directory = tables
-                .get(table)
-                .into_iter()
-                .flatten()
-                .filter(|row| natural_key.matches_values(&row.values))
-                .cloned()
-                .collect::<Vec<_>>();
-            drop(tables);
-            directory.sort_by_key(|row| (row.lsn, row.created_tx, row.row_id));
-            let total_retained_versions = directory.len() as u64;
-            let versions_truncated = directory.len() > Self::MAX_RETAINED_VERSIONS;
-            if versions_truncated {
-                directory.drain(..directory.len() - Self::MAX_RETAINED_VERSIONS);
-            }
-            let rows = if let Some(persistence) = self.database.persistence.as_ref() {
-                let mut hydrated = Vec::with_capacity(directory.len());
-                for row in &directory {
-                    let loaded = persistence
-                        .load_relational_row_by_id_lsn(table, &meta, row.row_id, row.lsn)?
-                        .ok_or_else(|| Error::StoreCorrupted {
-                            path: persistence.path().display().to_string(),
-                            reason: format!(
-                                "snapshot key inspection missing durable row {table} id {}",
-                                row.row_id.0
-                            ),
+        let root = self.database.writer_read_root()?.ok_or_else(|| {
+            Error::Other("snapshot inspection copy has no captured durable root".into())
+        })?;
+        let _directory_memory = OwnedMemoryReservation::try_new_for(
+            Arc::clone(&self.database.accountant),
+            Self::MAX_RETAINED_VERSIONS.saturating_mul(128),
+            "snapshot_inspection",
+            "selected_versions",
+            "Raise MEMORY_LIMIT to inspect retained versions.",
+        )?;
+        // Retain only the newest output coordinates, never a directory of
+        // every matching body. Each physical body belongs to its read window.
+        let mut selected = BTreeMap::new();
+        let mut total_retained_versions = 0_u64;
+        let mut cursor = root.cursor(
+            &RedbPersistence::rel_table_name(table),
+            crate::persistence::writer_source::WriterCursorFamily::Bytes,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            false,
+        )?;
+        while let Some(window) = cursor.next_row()? {
+            let row = &window.value;
+            if natural_key.matches_values(&row.values) {
+                total_retained_versions = total_retained_versions.saturating_add(1);
+                let key: [u8; 24] =
+                    window
+                        .position()
+                        .try_into()
+                        .map_err(|_| Error::StoreCorrupted {
+                            path: table.to_string(),
+                            reason: "snapshot row has an invalid physical version key".into(),
                         })?;
-                    hydrated.push(loaded);
+                selected.insert((row.lsn, row.created_tx, row.row_id), key);
+                if selected.len() > Self::MAX_RETAINED_VERSIONS {
+                    selected.pop_first();
                 }
-                hydrated
-            } else {
-                directory
-            };
-            let mut remaining_exact_bytes = Self::MAX_EXACT_VALUE_OUTPUT_BYTES;
-            let retained_versions = rows
-                .into_iter()
-                .map(|row| {
-                    let values = columns
-                        .iter()
-                        .filter_map(|column| {
-                            row.values.get(column).map(|value| {
-                                (
-                                    column.clone(),
-                                    Self::inspect_retained_value(value, &mut remaining_exact_bytes),
-                                )
-                            })
-                        })
-                        .collect();
-                    RetainedVersionInspection {
-                        row_id: row.row_id.0,
-                        created_tx: row.created_tx.0,
-                        deleted_tx: row.deleted_tx.map(|tx| tx.0),
-                        lsn: row.lsn.0,
-                        values,
-                    }
+            }
+        }
+        drop(cursor);
+        let versions_truncated = total_retained_versions > Self::MAX_RETAINED_VERSIONS as u64;
+        let mut remaining_exact_bytes = Self::MAX_EXACT_VALUE_OUTPUT_BYTES;
+        let mut retained_versions = Vec::with_capacity(selected.len());
+        for key in selected.into_values() {
+            let mut cursor = root.exact_row(table, &key)?;
+            let window = cursor.next_row()?.ok_or_else(|| Error::StoreCorrupted {
+                path: table.to_string(),
+                reason: "snapshot key inspection is missing a selected saved version".into(),
+            })?;
+            let row = &window.value;
+            let values = columns
+                .iter()
+                .filter_map(|column| {
+                    row.values.get(column).map(|value| {
+                        (
+                            column.clone(),
+                            Self::inspect_retained_value(value, &mut remaining_exact_bytes),
+                        )
+                    })
                 })
                 .collect();
-            (
-                total_retained_versions,
-                versions_truncated,
-                retained_versions,
-            )
-        };
+            retained_versions.push(RetainedVersionInspection {
+                row_id: row.row_id.0,
+                created_tx: row.created_tx.0,
+                deleted_tx: row.deleted_tx.map(|tx| tx.0),
+                lsn: row.lsn.0,
+                values,
+            });
+        }
         let lineage = self
             .database
             .durable_lineage_record(table, natural_key)?
@@ -9969,207 +9974,24 @@ impl SnapshotInspector {
     /// sidecars retain exact persisted key/value-byte coverage. Large
     /// row/vector values never enter the report.
     pub fn inspect_sync_apply_state(&self) -> Result<SyncApplyStateInspection> {
-        use contextdb_core::DirectedValue;
-
-        fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
-            hasher.update(&(bytes.len() as u64).to_be_bytes());
-            hasher.update(bytes);
-        }
-        fn encoded<T: Serialize>(hasher: &mut blake3::Hasher, value: &T) -> Result<()> {
-            rmp_serde::encode::write(hasher, value)
-                .map_err(|err| Error::Other(format!("failed to fingerprint snapshot state: {err}")))
-        }
-        fn values(hasher: &mut blake3::Hasher, source: &HashMap<String, Value>) -> Result<()> {
-            let mut keys = source.keys().collect::<Vec<_>>();
-            keys.sort();
-            encoded(hasher, &(keys.len() as u64))?;
-            for key in keys {
-                field(hasher, key.as_bytes());
-                encoded(hasher, &source[key])?;
-            }
-            Ok(())
-        }
-
-        let mut hasher = blake3::Hasher::new();
-        field(&mut hasher, b"contextdb.sync-apply-state.v1");
-
-        let table_meta = self.database.relational_store.table_meta.read();
-        let mut table_names = table_meta.keys().collect::<Vec<_>>();
-        table_names.sort();
-        field(&mut hasher, b"table-meta");
-        for table in &table_names {
-            field(&mut hasher, table.as_bytes());
-            encoded(&mut hasher, &table_meta[*table])?;
-        }
-        let tables = table_names.len() as u64;
-        drop(table_names);
-
-        let relational = self.database.relational_store.tables.read();
-        let mut row_tables = relational.keys().collect::<Vec<_>>();
-        row_tables.sort();
-        let mut retained_row_versions = 0_u64;
-        field(&mut hasher, b"retained-rows");
-        for table in row_tables {
-            field(&mut hasher, table.as_bytes());
-            let mut rows = relational[table].iter().collect::<Vec<_>>();
-            rows.sort_by_key(|row| (row.row_id, row.created_tx, row.deleted_tx, row.lsn));
-            retained_row_versions = retained_row_versions.saturating_add(rows.len() as u64);
-            for row in rows {
-                encoded(
-                    &mut hasher,
-                    &(
-                        row.row_id,
-                        row.created_tx,
-                        row.deleted_tx,
-                        row.lsn,
-                        row.created_at,
-                    ),
-                )?;
-                values(&mut hasher, &row.values)?;
-            }
-        }
-
-        let indexes = self.database.relational_store.indexes.read();
-        let mut index_tables = indexes.keys().collect::<Vec<_>>();
-        index_tables.sort();
-        let mut index_postings = 0_u64;
-        field(&mut hasher, b"indexes");
-        for table in index_tables {
-            field(&mut hasher, table.as_bytes());
-            let mut names = indexes[table].keys().collect::<Vec<_>>();
-            names.sort();
-            for name in names {
-                field(&mut hasher, name.as_bytes());
-                let index = &indexes[table][name];
-                encoded(&mut hasher, &index.columns)?;
-                for (key, postings) in &index.tree {
-                    encoded(&mut hasher, &(key.len() as u64))?;
-                    for directed in key {
-                        match directed {
-                            DirectedValue::Asc(value) => {
-                                hasher.update(&[0]);
-                                encoded(&mut hasher, &value.0)?;
-                            }
-                            DirectedValue::Desc(value) => {
-                                hasher.update(&[1]);
-                                encoded(&mut hasher, &value.0)?;
-                            }
-                        }
-                    }
-                    index_postings = index_postings.saturating_add(postings.len() as u64);
-                    for posting in postings {
-                        encoded(
-                            &mut hasher,
-                            &(posting.row_id, posting.created_tx, posting.deleted_tx),
-                        )?;
-                    }
-                }
-            }
-        }
-        drop(indexes);
-        drop(relational);
-        drop(table_meta);
-
-        let graph = self.database.graph_store.forward_adj.read();
-        let mut sources = graph.keys().copied().collect::<Vec<_>>();
-        sources.sort();
-        let mut edges = 0_u64;
-        field(&mut hasher, b"edges");
-        for source in sources {
-            let mut entries = graph[&source].iter().collect::<Vec<_>>();
-            entries.sort_by(|left, right| {
-                left.source
-                    .cmp(&right.source)
-                    .then(left.target.cmp(&right.target))
-                    .then(left.edge_type.cmp(&right.edge_type))
-                    .then(left.created_tx.cmp(&right.created_tx))
-                    .then(left.deleted_tx.cmp(&right.deleted_tx))
-                    .then(left.lsn.cmp(&right.lsn))
-            });
-            edges = edges.saturating_add(entries.len() as u64);
-            for entry in entries {
-                encoded(
-                    &mut hasher,
-                    &(
-                        entry.source,
-                        entry.target,
-                        &entry.edge_type,
-                        entry.created_tx,
-                        entry.deleted_tx,
-                        entry.lsn,
-                    ),
-                )?;
-                values(&mut hasher, &entry.properties)?;
-            }
-        }
-        drop(graph);
-
-        // This is a census of the copied durable image, not of its lazy
-        // process cache. Reading Redb directly keeps dormant vectors visible
-        // without faulting their partitions into the inspection database.
         let persistence = self.database.persistence.as_ref().ok_or_else(|| {
             Error::Other("snapshot inspection copy is not file-backed".to_string())
         })?;
-        let mut vector_entries = persistence.load_vectors()?;
-        vector_entries.sort_by(|left, right| {
-            left.index
-                .table
-                .cmp(&right.index.table)
-                .then(left.index.column.cmp(&right.index.column))
-                .then(left.row_id.cmp(&right.row_id))
-                .then(left.created_tx.cmp(&right.created_tx))
-                .then(left.lsn.cmp(&right.lsn))
-        });
-        let vectors = vector_entries.len() as u64;
-        field(&mut hasher, b"vectors");
-        for entry in &vector_entries {
-            encoded(&mut hasher, entry)?;
-        }
-
-        let ddl = self.database.ddl_log.read();
-        field(&mut hasher, b"ddl-log");
-        for entry in ddl.iter() {
-            encoded(&mut hasher, entry)?;
-        }
-        let ddl_log_entries = ddl.len() as u64;
-        drop(ddl);
-
-        let changes = self.database.change_log.read();
-        field(&mut hasher, b"change-log");
-        for entry in changes.iter() {
-            encoded(&mut hasher, entry)?;
-        }
-        let change_log_entries = changes.len() as u64;
-        drop(changes);
-
-        let commit_index = self.database.tx_mgr.commit_index_snapshot();
-        field(&mut hasher, b"commit-index");
-        for entry in &commit_index {
-            encoded(&mut hasher, &entry)?;
-        }
-        let commit_index_entries = commit_index.len() as u64;
-
-        let mut config = persistence.dump_config_raw()?;
-        config.sort_by(|left, right| left.0.cmp(&right.0));
-        field(&mut hasher, b"config");
-        for (key, value) in &config {
-            field(&mut hasher, key.as_bytes());
-            field(&mut hasher, value);
-        }
+        // The digest and census share one physical transaction. Lazy process
+        // caches do not describe the retained contents of the copied artifact.
         let raw = persistence.raw_sync_apply_state_digest()?;
-
         Ok(SyncApplyStateInspection {
             digest: raw.digest,
             current_lsn: self.database.current_lsn().0,
-            tables,
-            retained_row_versions,
-            index_postings,
-            edges,
-            vectors,
-            ddl_log_entries,
-            change_log_entries,
-            commit_index_entries,
-            persisted_config_entries: config.len() as u64,
+            tables: raw.tables,
+            retained_row_versions: raw.retained_row_versions,
+            index_postings: raw.index_postings,
+            edges: raw.edges,
+            vectors: raw.vectors,
+            ddl_log_entries: raw.ddl_log_entries,
+            change_log_entries: raw.change_log_entries,
+            commit_index_entries: raw.commit_index_entries,
+            persisted_config_entries: raw.persisted_config_entries,
             trigger_audit_entries: raw.trigger_audit_entries,
             sink_audit_entries: raw.sink_audit_entries,
             sink_queue_entries: raw.sink_queue_entries,
@@ -35505,7 +35327,8 @@ impl Database {
             )
     }
 
-    /// The same figure, for a proof that measures what storing a ROW costs.
+    /// Writer-owned log, cache and captured source controls, for a proof
+    /// that measures the separate retained cost of storing a row.
     ///
     /// A proof about what STORING A ROW costs reads the accountant net of
     /// this. The two are different retentions with different lifetimes: a
@@ -35517,6 +35340,10 @@ impl Database {
     #[doc(hidden)]
     pub fn __durable_writer_charged_bytes_for_test(&self) -> usize {
         self.durable_writer_retained_bytes()
+            .saturating_add(self.commit_source_reference_charge)
+            .saturating_add(self.persistence.as_ref().map_or(0, |persistence| {
+                persistence.writer_snapshot_charge_for_test()
+            }))
     }
 
     /// Test-only forced log-gap seam. Durable store state remains intact, so
@@ -39968,7 +39795,12 @@ impl Database {
         for (index, vector) in &captured {
             self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
             self.vector_store.validate_vector(index, vector.len())?;
-            self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
+            self.assert_row_id_write_allowed(
+                Some(tx),
+                &index.table,
+                row_id,
+                self.snapshot_for_read(),
+            )?;
             let bytes = self.vector_insert_accounted_bytes(index, vector.len());
             reservations.push(
                 crate::memory_accounting::OwnedMemoryReservation::try_new_for(
@@ -39984,7 +39816,7 @@ impl Database {
             .iter()
             .map(|(index, _)| {
                 self.vector_store
-                    .has_live_entry_for_row(index, row_id, self.snapshot())
+                    .has_live_entry_for_row(index, row_id, self.snapshot_for_read())
             })
             .collect::<Vec<_>>();
         self.record_vector_schema_epochs(tx, captured.iter().map(|(index, _)| index.clone()))?;
@@ -40131,7 +39963,12 @@ impl Database {
         let _vector_schema = self.vector_schema_read(&index);
         self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
         self.vector_store.index_layout(&index)?;
-        self.assert_existing_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
+        self.assert_existing_row_id_write_allowed(
+            Some(tx),
+            &index.table,
+            row_id,
+            self.snapshot_for_read(),
+        )?;
         if let Some(expected) = self.pending_vector_dimension(tx, &index)?
             && expected != vector.len()
         {
@@ -40167,7 +40004,7 @@ impl Database {
         let _vector_schema = self.vector_schema_read(&index);
         self.ensure_trigger_table_ready(&index.table, "delete_vector")?;
         self.vector_store.index_layout(&index)?;
-        self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
+        self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot_for_read())?;
         let checkpoint = self.write_set_checkpoint(tx)?;
         let result = self.delete_vector_within_operation(tx, index, row_id);
         if result.is_err() {
@@ -40184,7 +40021,7 @@ impl Database {
         self.record_vector_schema_epoch(tx, &index)?;
         let existing_live =
             self.vector_store
-                .has_live_entry_for_row(&index, row_id, self.snapshot());
+                .has_live_entry_for_row(&index, row_id, self.snapshot_for_read());
         let canceled_inserts = self.tx_mgr.with_write_set(tx, |ws| {
             let bytes = ws
                 .vector_inserts
@@ -40370,7 +40207,7 @@ impl Database {
         }
         let existing_live =
             self.vector_store
-                .has_live_entry_for_row(&index, old_row_id, self.snapshot());
+                .has_live_entry_for_row(&index, old_row_id, self.snapshot_for_read());
         let replaced_inserts = self.tx_mgr.with_write_set(tx, |ws| {
             let moving_position = ws
                 .vector_inserts

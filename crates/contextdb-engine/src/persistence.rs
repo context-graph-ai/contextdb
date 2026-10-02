@@ -16837,6 +16837,15 @@ pub(crate) struct RawSyncApplyStateDigest {
     pub(crate) trigger_audit_entries: u64,
     pub(crate) sink_audit_entries: u64,
     pub(crate) sink_queue_entries: u64,
+    pub(crate) tables: u64,
+    pub(crate) retained_row_versions: u64,
+    pub(crate) index_postings: u64,
+    pub(crate) edges: u64,
+    pub(crate) vectors: u64,
+    pub(crate) ddl_log_entries: u64,
+    pub(crate) change_log_entries: u64,
+    pub(crate) commit_index_entries: u64,
+    pub(crate) persisted_config_entries: u64,
 }
 
 fn digest_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
@@ -31154,7 +31163,8 @@ impl RedbPersistence {
                 "format-metadata",
                 &mut hasher,
             )?;
-            digest_redb_table(&read_txn, CONFIG_TABLE, "config", &mut hasher)?;
+            let persisted_config_entries =
+                digest_redb_table(&read_txn, CONFIG_TABLE, "config", &mut hasher)?;
             digest_redb_table(
                 &read_txn,
                 READ_OPEN_CONFIG_TABLE,
@@ -31167,9 +31177,12 @@ impl RedbPersistence {
                 "read-custody-config",
                 &mut hasher,
             )?;
-            digest_redb_table(&read_txn, CHANGE_LOG_TABLE, "change-log", &mut hasher)?;
-            digest_redb_table(&read_txn, DDL_LOG_TABLE, "ddl-log", &mut hasher)?;
-            digest_redb_table(&read_txn, COMMIT_INDEX_TABLE, "commit-index", &mut hasher)?;
+            let change_log_entries =
+                digest_redb_table(&read_txn, CHANGE_LOG_TABLE, "change-log", &mut hasher)?;
+            let ddl_log_entries =
+                digest_redb_table(&read_txn, DDL_LOG_TABLE, "ddl-log", &mut hasher)?;
+            let commit_index_entries =
+                digest_redb_table(&read_txn, COMMIT_INDEX_TABLE, "commit-index", &mut hasher)?;
             let sink_audit_entries =
                 digest_redb_table(&read_txn, SINK_AUDIT_TABLE, "sink-audit", &mut hasher)?;
             let trigger_audit_entries =
@@ -31180,9 +31193,10 @@ impl RedbPersistence {
                 "trigger-audit-stamps",
                 &mut hasher,
             )?;
-            digest_redb_table(&read_txn, GRAPH_FWD_TABLE, "graph-forward", &mut hasher)?;
+            let edges =
+                digest_redb_table(&read_txn, GRAPH_FWD_TABLE, "graph-forward", &mut hasher)?;
             digest_redb_table(&read_txn, GRAPH_REV_TABLE, "graph-reverse", &mut hasher)?;
-            digest_redb_table(&read_txn, VECTORS_TABLE, "vectors", &mut hasher)?;
+            let vectors = digest_redb_table(&read_txn, VECTORS_TABLE, "vectors", &mut hasher)?;
             digest_redb_table(
                 &read_txn,
                 VECTOR_PARTITION_MEMBERSHIP_TABLE,
@@ -31258,9 +31272,12 @@ impl RedbPersistence {
                 .collect::<Vec<_>>();
             dynamic_names.sort();
             let mut sink_queue_entries = 0_u64;
+            let mut retained_row_versions = 0_u64;
             for name in dynamic_names {
                 if name.starts_with("rel_") {
-                    self.digest_canonical_relational_table(&read_txn, &name, &mut hasher)?;
+                    retained_row_versions = retained_row_versions.saturating_add(
+                        self.digest_canonical_relational_table(&read_txn, &name, &mut hasher)?,
+                    );
                 } else {
                     let definition: TableDefinition<u64, &[u8]> =
                         TableDefinition::new(name.as_str());
@@ -31273,11 +31290,51 @@ impl RedbPersistence {
                 }
             }
 
+            let mut tables = 0_u64;
+            let mut index_postings = 0_u64;
+            let meta_table = match read_txn.open_table(META_TABLE) {
+                Ok(table) => Some(table),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            if let Some(meta_table) = meta_table {
+                for entry in meta_table
+                    .range("table:".."table;")
+                    .map_err(Self::storage_error)?
+                {
+                    let (key, value) = entry.map_err(Self::storage_error)?;
+                    let table = key.value().strip_prefix("table:").ok_or_else(|| {
+                        Error::Other("invalid inspection table metadata key".into())
+                    })?;
+                    let (meta, _) = Self::decode_table_meta_versioned(value.value())?;
+                    tables = tables.saturating_add(1);
+                    for declaration in Self::relational_index_declarations(&meta) {
+                        let name = Self::relational_index_table_name(table, &declaration.name);
+                        let postings = read_txn
+                            .open_table(TableDefinition::<DurableRelationalIndexKey, &[u8]>::new(
+                                &name,
+                            ))
+                            .map_err(Self::storage_error)?;
+                        index_postings = index_postings
+                            .saturating_add(postings.len().map_err(Self::storage_error)?);
+                    }
+                }
+            }
+
             Ok(RawSyncApplyStateDigest {
                 digest: hasher.finalize().to_hex().to_string(),
                 trigger_audit_entries,
                 sink_audit_entries,
                 sink_queue_entries,
+                tables,
+                retained_row_versions,
+                index_postings,
+                edges,
+                vectors,
+                ddl_log_entries,
+                change_log_entries,
+                commit_index_entries,
+                persisted_config_entries,
             })
         })
     }

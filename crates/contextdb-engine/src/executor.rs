@@ -10735,11 +10735,12 @@ fn planned_index_run_bytes(pick: &IndexPick, skip_first: bool) -> Result<usize> 
         0
     };
     let prefix_len = 1 + pick.suffix_shapes.len();
-    let pad_len = if pick
-        .columns
-        .iter()
-        .skip(prefix_len)
-        .all(|(_, direction)| *direction == contextdb_core::SortDirection::Asc)
+    let pad_len = if pick.trailing_range.is_none()
+        && pick
+            .columns
+            .iter()
+            .skip(prefix_len)
+            .all(|(_, direction)| *direction == contextdb_core::SortDirection::Asc)
     {
         pick.columns.len().saturating_sub(prefix_len)
     } else {
