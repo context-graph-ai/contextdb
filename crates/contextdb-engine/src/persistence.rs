@@ -24953,11 +24953,7 @@ impl RedbPersistence {
             return Ok(HashMap::new());
         }
         #[cfg(test)]
-        if STORED_ROW_BYTES_FAULT.with(|armed| armed.replace(false)) {
-            return Err(Error::Other(
-                "injected stored relational row size read failure".to_string(),
-            ));
-        }
+        stored_relational_row_bytes_fault_for_test()?;
         self.with_db(|db| {
             let mut answer = HashMap::new();
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -35537,6 +35533,16 @@ thread_local! {
     static STORED_ROW_BYTES_FAULT: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+}
+
+#[cfg(test)]
+pub(super) fn stored_relational_row_bytes_fault_for_test() -> Result<()> {
+    if STORED_ROW_BYTES_FAULT.with(|armed| armed.replace(false)) {
+        return Err(Error::Other(
+            "injected stored relational row size read failure".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

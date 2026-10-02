@@ -55,6 +55,27 @@ struct WriterTableMeta {
 }
 
 impl WriterSnapshot {
+    pub(crate) fn row_body_bytes(&self, table: &str, row: &VersionedRow) -> Result<usize> {
+        #[cfg(test)]
+        stored_relational_row_bytes_fault_for_test()?;
+        let _scratch = self.adapter_control(table.len().saturating_add(128))?;
+        self.check_table_scope(table)?;
+        let name = RedbPersistence::rel_table_name(table);
+        let physical = self
+            .read
+            .open_table(TableDefinition::<&[u8], &[u8]>::new(&name))
+            .map_err(RedbPersistence::storage_error)?;
+        let key = RedbPersistence::rel_row_key(row);
+        physical
+            .get(key.as_slice())
+            .map_err(RedbPersistence::storage_error)?
+            .map(|value| value.value().len())
+            .ok_or_else(|| Error::StoreCorrupted {
+                path: table.to_owned(),
+                reason: "selected saved row is missing".into(),
+            })
+    }
+
     pub(crate) fn captured_table_meta(&self, table: &str) -> Option<TableMeta> {
         self.borrow_captured_table_meta(table).cloned()
     }

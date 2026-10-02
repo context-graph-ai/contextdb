@@ -48763,6 +48763,45 @@ impl Database {
         whole_file_bytes: Option<u64>,
     ) -> Result<TableSizeEstimate> {
         let disk_backed = self.relational_store.uses_disk_backed_committed_bodies();
+        if disk_backed {
+            let root = self
+                .writer_read_root()?
+                .ok_or_else(|| Error::Other("table sizing requires its captured source".into()))?;
+            let meta = root
+                .borrow_captured_table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+            let mut cursor = root.cursor(
+                &RedbPersistence::rel_table_name(table),
+                crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+                true,
+            )?;
+            let mut selected = None;
+            let mut row_count = 0u64;
+            let mut estimated_live_bytes = 0u64;
+            while let Some(window) = cursor.next_row()? {
+                let row = &window.value;
+                if selected == Some(row.row_id) || row.created_tx.0 > root.snapshot.0 {
+                    continue;
+                }
+                selected = Some(row.row_id);
+                if !row.visible_at(root.snapshot) {
+                    continue;
+                }
+                let physical = root.row_body_bytes(table, row)?;
+                let resident = estimate_row_bytes_for_meta(&row.values, meta, true);
+                row_count = row_count.saturating_add(1);
+                estimated_live_bytes =
+                    estimated_live_bytes.saturating_add(resident.max(physical) as u64);
+            }
+            return Ok(TableSizeEstimate {
+                table: table.to_owned(),
+                estimated_live_bytes,
+                row_count,
+                whole_file_bytes,
+            });
+        }
         let mut row_count = 0u64;
         let mut estimated_live_bytes = 0u64;
         let mut offset = 0usize;
