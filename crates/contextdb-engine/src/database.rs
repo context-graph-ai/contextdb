@@ -35027,6 +35027,46 @@ impl Database {
         origin_tx: TxId,
         ws: &mut WriteSet,
     ) -> Result<CommitValidationOutcome> {
+        // Source probes used to validate indexed membership belong to the
+        // same publication preparation as its index keys. Keep their actual
+        // admission figures and the existing membership refusal identity.
+        let prepares_membership = {
+            let tables = self.relational_store.table_meta.read();
+            ws.relational_inserts
+                .iter()
+                .map(|(table, _)| table)
+                .chain(ws.relational_deletes.iter().map(|(table, _, _)| table))
+                .any(|table| {
+                    tables
+                        .get(table)
+                        .is_some_and(|meta| !meta.indexes.is_empty())
+                })
+        };
+        self.commit_validate_inner(origin_tx, ws)
+            .map_err(|mut error| {
+                if prepares_membership
+                    && let Error::MemoryBudgetExceeded {
+                        subsystem,
+                        operation,
+                        hint,
+                        ..
+                    } = &mut error
+                    && subsystem == "writer_source"
+                {
+                    *subsystem = "relational_index".into();
+                    *operation = "membership".into();
+                    *hint =
+                        "Raise MEMORY_LIMIT to prepare the indexed membership publication.".into();
+                }
+                error
+            })
+    }
+
+    fn commit_validate_inner(
+        &self,
+        origin_tx: TxId,
+        ws: &mut WriteSet,
+    ) -> Result<CommitValidationOutcome> {
         // The guards below are one-shot: each describes work this pass is
         // about to validate and must not be re-applied. The recorded vector
         // schema epochs are NOT one-shot — they describe the whole
