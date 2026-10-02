@@ -354,6 +354,12 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     );
     all_searches(&db, 0..ROWS + 8, "INDEXED");
     let generation = info.base_generation;
+    // Retained memberships count toward the consolidation population under HISTORY ALL.
+    // Declare a threshold that makes the following 128 tombstones due for replacement.
+    exec(
+        &db,
+        "ALTER TABLE building ALTER COLUMN v SET CONSOLIDATION (TOMBSTONE_PERCENT = 5)",
+    );
     let old = db.snapshot();
     let pin = db.pin_snapshot(old);
     for id in 0..128 {
