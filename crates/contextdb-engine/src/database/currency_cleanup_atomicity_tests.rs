@@ -1,6 +1,7 @@
 //! A currency cleanup crash cannot orphan vectors or commit-index entries.
 
 use super::*;
+include!("durable_test_observations.rs");
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use tempfile::TempDir;
 
@@ -148,7 +149,7 @@ fn assert_clean(db: &Database, obsolete_lsns: &[Lsn], untouched: &serde_json::Va
     let persistence = db.persistence.as_ref().unwrap();
     for table in ["currency_vectors", "currency_scalar"] {
         assert_eq!(persistence.load_relational_table(table).unwrap().len(), 1);
-        assert_eq!(db.relational_store.tables.read()[table].len(), 1);
+        assert_eq!(durable_observation::version_count(db, table), 1);
     }
     let vectors = persistence.load_vectors().unwrap();
     let memberships = persistence.load_vector_partition_memberships().unwrap();
