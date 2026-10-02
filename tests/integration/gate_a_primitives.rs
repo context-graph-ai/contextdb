@@ -141,7 +141,7 @@ fn rt1_composite_store_ddl_round_trip_parse() {
     )
     .unwrap();
 
-    let ddl = db.ddl_log_since(Lsn(0));
+    let ddl = db.ddl_log_since(Lsn(0)).unwrap();
     assert_eq!(ddl.len(), 3);
 
     for change in ddl {

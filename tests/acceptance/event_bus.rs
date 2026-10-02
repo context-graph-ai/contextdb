@@ -1647,7 +1647,7 @@ fn t5_23_idempotent_event_bus_sync_ddl_does_not_echo_log() {
     let db = Database::open_memory();
     declare_inv_schema(&db);
     let before_lsn = db.current_lsn();
-    let before_ddl = db.ddl_log_since(Lsn(0));
+    let before_ddl = db.ddl_log_since(Lsn(0)).unwrap();
 
     db.apply_changes(
         ChangeSet {
@@ -1683,7 +1683,7 @@ fn t5_23_idempotent_event_bus_sync_ddl_does_not_echo_log() {
         "idempotent EventBus DDL replay must not allocate an echo LSN"
     );
     assert_eq!(
-        format!("{:?}", db.ddl_log_since(Lsn(0))),
+        format!("{:?}", db.ddl_log_since(Lsn(0)).unwrap()),
         format!("{before_ddl:?}"),
         "idempotent EventBus DDL replay must not append duplicate DDL"
     );

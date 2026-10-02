@@ -927,7 +927,7 @@ fn ddl_sync_round_trip_single_column_fk_structured_payload_present() {
             &p(),
         )
         .unwrap();
-    let ddl = origin.ddl_log_since(Lsn(0));
+    let ddl = origin.ddl_log_since(Lsn(0)).unwrap();
     let create = ddl
         .iter()
         .find(|d| matches!(d, DdlChange::CreateTable { name, .. } if name == "c"))
@@ -972,7 +972,7 @@ fn ddl_sync_round_trip_composite_unique_structured_payload_present() {
     origin
         .execute("CREATE TABLE p (a INTEGER, b INTEGER, UNIQUE(a, b))", &p())
         .unwrap();
-    let create = origin.ddl_log_since(Lsn(0)).pop().unwrap();
+    let create = origin.ddl_log_since(Lsn(0)).unwrap().pop().unwrap();
     match create {
         DdlChange::CreateTable {
             composite_unique, ..
@@ -2010,6 +2010,7 @@ fn ddl_sync_round_trip_distinguishes_pk_covered_from_unique_covered_fk() {
     origin.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, FOREIGN KEY (x) REFERENCES pk_parent(id), FOREIGN KEY (x, y) REFERENCES uq_parent(a, b))", &p()).unwrap();
     let create_child = origin
         .ddl_log_since(Lsn(0))
+        .unwrap()
         .into_iter()
         .find(|change| matches!(change, DdlChange::CreateTable { name, .. } if name == "child"))
         .expect("child DDL");
