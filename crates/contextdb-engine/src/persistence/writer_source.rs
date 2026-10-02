@@ -45,7 +45,12 @@ pub(crate) struct WriterSnapshot {
 /// Data commits share it; schema writes build a replacement from their exact
 /// prepared mutation, without consulting a newer catalog during capture.
 pub(crate) struct WriterSchema {
-    tables: HashMap<String, TableMeta>,
+    tables: HashMap<String, Arc<WriterTableMeta>>,
+    _memory: OwnedMemoryReservation,
+}
+
+struct WriterTableMeta {
+    meta: TableMeta,
     _memory: OwnedMemoryReservation,
 }
 
@@ -55,7 +60,7 @@ impl WriterSnapshot {
     }
 
     pub(crate) fn borrow_captured_table_meta(&self, table: &str) -> Option<&TableMeta> {
-        self.schema.tables.get(table)
+        self.schema.tables.get(table).map(|owned| &owned.meta)
     }
 
     pub(crate) fn captured_table_names(&self) -> Vec<String> {
@@ -68,7 +73,7 @@ impl WriterSnapshot {
         self.schema
             .tables
             .iter()
-            .map(|(name, meta)| (name.as_str(), meta))
+            .map(|(name, owned)| (name.as_str(), &owned.meta))
     }
 }
 
@@ -141,14 +146,25 @@ impl RedbPersistence {
                     return Err(Error::Other("unsupported table metadata layout".into()));
                 }
                 memory.try_grow_for(
-                    name.len()
-                        .saturating_add(meta.estimated_bytes())
-                        .saturating_add(192),
+                    name.len().saturating_add(128),
                     "writer_source",
                     "captured_schema",
                     HINT,
                 )?;
-                tables.insert(name.to_owned(), meta);
+                let body_memory = OwnedMemoryReservation::try_new_for(
+                    accountant.clone(),
+                    meta.estimated_bytes().saturating_add(64),
+                    "writer_source",
+                    "captured_schema",
+                    HINT,
+                )?;
+                tables.insert(
+                    name.to_owned(),
+                    Arc::new(WriterTableMeta {
+                        meta,
+                        _memory: body_memory,
+                    }),
+                );
                 drop(scratch);
             }
             Ok(tables)
@@ -175,41 +191,49 @@ impl RedbPersistence {
         let base = self.prepared_writer_schema()?;
         let removed = removed.collect::<Vec<_>>();
         let installed = installed.collect::<Vec<_>>();
+        let unchanged = |name: &str| {
+            !removed.contains(&name) && !installed.iter().any(|(table, _)| *table == name)
+        };
         let bytes = base
             .tables
-            .iter()
-            .filter(|(name, _)| {
-                !removed.contains(&name.as_str())
-                    && !installed.iter().any(|(table, _)| *table == name.as_str())
-            })
-            .map(|(name, meta)| {
-                name.len()
-                    .saturating_add(meta.estimated_bytes())
-                    .saturating_add(192)
-            })
-            .chain(installed.iter().map(|(name, meta)| {
-                name.len()
-                    .saturating_add(meta.estimated_bytes())
-                    .saturating_add(192)
-            }))
+            .keys()
+            .filter(|name| unchanged(name))
+            .map(|name| name.len().saturating_add(128))
+            .chain(
+                installed
+                    .iter()
+                    .map(|(name, _)| name.len().saturating_add(128)),
+            )
             .fold(std::mem::size_of::<WriterSchema>(), usize::saturating_add);
+        let accountant = self.proof_accountant().unwrap();
         let memory = OwnedMemoryReservation::try_new_for(
-            self.proof_accountant().unwrap(),
+            accountant.clone(),
             bytes,
             "writer_source",
             "captured_schema",
             HINT,
         )?;
         let mut tables = HashMap::new();
-        for (name, meta) in &base.tables {
-            if !removed.contains(&name.as_str())
-                && !installed.iter().any(|(table, _)| *table == name.as_str())
-            {
-                tables.insert(name.clone(), meta.clone());
+        for (name, owned) in &base.tables {
+            if unchanged(name) {
+                tables.insert(name.clone(), owned.clone());
             }
         }
         for (name, meta) in installed {
-            tables.insert(name.to_owned(), meta.clone());
+            let body_memory = OwnedMemoryReservation::try_new_for(
+                accountant.clone(),
+                meta.estimated_bytes().saturating_add(64),
+                "writer_source",
+                "captured_schema",
+                HINT,
+            )?;
+            tables.insert(
+                name.to_owned(),
+                Arc::new(WriterTableMeta {
+                    meta: meta.clone(),
+                    _memory: body_memory,
+                }),
+            );
         }
         Ok(Some(Arc::new(WriterSchema {
             tables,
@@ -288,15 +312,26 @@ impl RedbPersistence {
             .filter_map(std::sync::Weak::upgrade)
             .collect::<Vec<_>>();
         let mut schemas = std::collections::HashSet::new();
+        let mut metadata = std::collections::HashSet::new();
         roots
             .iter()
             .map(|root| {
-                let bytes = root.control_bytes();
+                let mut bytes = root._control.bytes().saturating_add(
+                    root.erasure
+                        .read()
+                        ._memory
+                        .as_ref()
+                        .map_or(0, OwnedMemoryReservation::bytes),
+                );
                 if schemas.insert(Arc::as_ptr(&root.schema) as usize) {
-                    bytes
-                } else {
-                    bytes.saturating_sub(root.schema._memory.bytes())
+                    bytes = bytes.saturating_add(root.schema._memory.bytes());
+                    for owned in root.schema.tables.values() {
+                        if metadata.insert(Arc::as_ptr(owned) as usize) {
+                            bytes = bytes.saturating_add(owned._memory.bytes());
+                        }
+                    }
                 }
+                bytes
             })
             .sum()
     }
@@ -454,6 +489,13 @@ impl WriterSnapshot {
         self._control
             .bytes()
             .saturating_add(self.schema._memory.bytes())
+            .saturating_add(
+                self.schema
+                    .tables
+                    .values()
+                    .map(|owned| owned._memory.bytes())
+                    .sum::<usize>(),
+            )
             .saturating_add(
                 self.erasure
                     .read()
