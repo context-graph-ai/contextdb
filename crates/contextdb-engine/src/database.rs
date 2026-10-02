@@ -26460,8 +26460,9 @@ impl Database {
         else {
             return false;
         };
-        self.relational_store
-            .sync_source_kind(table, row.row_id)
+        self.relational_sync_source_at_read_root(table, row.row_id)
+            .ok()
+            .and_then(|(_, kind)| kind)
             .is_some_and(|kind| matches!(kind, contextdb_relational::store::SyncSourceKind::Pulled))
     }
 
@@ -26525,8 +26526,9 @@ impl Database {
                 .is_some_and(|current| {
                     current.lsn == row.lsn
                         && matches!(
-                            self.relational_store
-                                .sync_source_kind(&row.table, current.row_id),
+                            self.relational_sync_source_at_read_root(&row.table, current.row_id)
+                                .ok()
+                                .and_then(|(_, kind)| kind),
                             Some(contextdb_relational::store::SyncSourceKind::Pulled)
                         )
                 });
@@ -26666,8 +26668,12 @@ impl Database {
                 .is_some_and(|row| {
                     row.lsn == vector.lsn
                         && matches!(
-                            self.relational_store
-                                .sync_source_kind(&vector.index.table, vector.row_id),
+                            self.relational_sync_source_at_read_root(
+                                &vector.index.table,
+                                vector.row_id
+                            )
+                            .ok()
+                            .and_then(|(_, kind)| kind),
                             Some(contextdb_relational::store::SyncSourceKind::Pulled)
                         )
                 });
@@ -33523,7 +33529,7 @@ impl Database {
             }
             return Ok(());
         }
-        self.with_commit_lock(|| {
+        self.tx_mgr.with_maintenance_publication(|publication| {
             let snapshot = self.snapshot();
             let no_deleted = HashSet::new();
             let context = TerminalRefusalPullContext {
@@ -33608,6 +33614,7 @@ impl Database {
                 writes.push((tenant_id.config_key("sync_pending_push_confirmation"), RedbPersistence::encode_config_value(&through.0)?));
                 writes.push((tenant_id.config_key("sync_pending_push_result"), RedbPersistence::encode_config_value(&crate::protocol::WireApplyResult::from(result.clone()))?));
             }
+            publication.reserve()?;
             if let Some(persistence) = &self.persistence {
                 persistence.commit_sync_reply_effects(&sources, &writes, &deletes)?;
             } else {
@@ -33629,6 +33636,7 @@ impl Database {
                 self.terminal_refusal_markers.write().extend(refused_markers);
                 scans.insert(context_key, reset_scan);
             }
+            publication.complete();
             Ok(())
         })
     }
@@ -33773,36 +33781,17 @@ impl Database {
         hub_applied_source_watermark: Lsn,
     ) -> Result<()> {
         let _operation = self.assert_open_operation();
-        self.with_commit_lock(|| {
-            let entries = self
-                .relational_store
-                .tables
-                .read()
-                .iter()
-                .flat_map(|(table, rows)| {
-                    rows.iter()
-                        .filter(|row| {
-                            row.deleted_tx.is_none()
-                                && row.lsn > hub_applied_source_watermark
-                                && matches!(
-                                    self.relational_store.sync_source_kind(table, row.row_id),
-                                    Some(
-                                        contextdb_relational::store::SyncSourceKind::AcceptedLocal
-                                    )
-                                )
-                        })
-                        .map(|row| {
-                            (
-                                table.clone(),
-                                row.row_id,
-                                self.relational_store
-                                    .sync_source_lsn(table, row.row_id)
-                                    .expect("AcceptedLocal always carries source LSN"),
-                            )
-                        })
-                })
-                .collect::<Vec<_>>();
+        self.tx_mgr.with_maintenance_publication(|publication| {
+            let mut entries = Vec::new();
+            self.visit_authoritative_live_rows_for_outbound(|table, row| {
+                let (source_lsn, kind) = self.relational_sync_source_at_read_root(table, row.row_id)?;
+                if row.lsn > hub_applied_source_watermark && matches!(kind, Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal)) {
+                    entries.push((table.to_owned(), row.row_id, source_lsn.ok_or_else(|| Error::SyncError("AcceptedLocal lacks source LSN".into()))?));
+                }
+                Ok(())
+            })?;
             if !entries.is_empty() {
+                publication.reserve()?;
                 if let Some(persistence) = &self.persistence {
                     persistence.append_sync_source_provenance_batch(
                         &entries
@@ -33819,6 +33808,7 @@ impl Database {
                             contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
                         )
                     }));
+                publication.complete();
             }
             for marker in self.sync_tombstone_arrivals.write().values_mut() {
                 if matches!(
@@ -33846,27 +33836,15 @@ impl Database {
         through_inclusive: Option<Lsn>,
     ) -> Result<()> {
         let _operation = self.assert_open_operation();
-        self.with_commit_lock(|| {
-            let entries = self
-                .relational_store
-                .tables
-                .read()
-                .iter()
-                .flat_map(|(table, rows)| {
-                    rows.iter()
-                        .filter(|row| {
-                            row.deleted_tx.is_none()
-                                && row.lsn > after_exclusive
-                                && through_inclusive.is_none_or(|through| row.lsn <= through)
-                                && !matches!(
-                                    self.relational_store.sync_source_kind(table, row.row_id),
-                                    Some(contextdb_relational::store::SyncSourceKind::Pulled
-                                        | contextdb_relational::store::SyncSourceKind::AcceptedLocal)
-                                )
-                        })
-                        .map(|row| (table.clone(), row.row_id, row.lsn))
-                })
-                .collect::<Vec<_>>();
+        self.tx_mgr.with_maintenance_publication(|publication| {
+            let mut entries = Vec::new();
+            self.visit_authoritative_live_rows_for_outbound(|table, row| {
+                let (_, kind) = self.relational_sync_source_at_read_root(table, row.row_id)?;
+                if row.lsn > after_exclusive && through_inclusive.is_none_or(|through| row.lsn <= through) && !matches!(kind, Some(contextdb_relational::store::SyncSourceKind::Pulled | contextdb_relational::store::SyncSourceKind::AcceptedLocal)) {
+                    entries.push((table.to_owned(), row.row_id, row.lsn));
+                }
+                Ok(())
+            })?;
             let snapshot = self.snapshot();
             let empty_deleted = HashSet::new();
             let mut tombstones: HashMap<(String, String), (Lsn, RowId)> = HashMap::new();
@@ -33912,6 +33890,7 @@ impl Database {
                 }
             }
             if !entries.is_empty() {
+                publication.reserve()?;
                 if let Some(persistence) = &self.persistence {
                     persistence.append_sync_source_provenance_batch(
                         &entries
@@ -33929,6 +33908,7 @@ impl Database {
                             contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
                         )
                     }));
+                publication.complete();
             }
             if !tombstones.is_empty() {
                 let mut markers = self.sync_tombstone_arrivals.write();
@@ -33966,42 +33946,28 @@ impl Database {
                 return Ok(false);
             };
             let meta = self.table_meta(&row.table);
-            let accepted =
-                self.relational_store
-                    .tables
-                    .read()
-                    .get(&row.table)
-                    .map(|rows| {
-                        rows.iter()
-                            .filter(|local| {
-                                local.lsn == row.lsn
-                                    && matches!(
-                                    self.relational_store
-                                        .sync_source_kind(&row.table, local.row_id),
-                                    Some(
-                                        contextdb_relational::store::SyncSourceKind::AcceptedLocal
-                                    )
-                                ) && self
-                                    .relational_store
-                                    .sync_source_lsn(&row.table, local.row_id)
-                                    .is_some()
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
             let mut confirmed = false;
-            for local in &accepted {
-                if self.sync_incoming_row_matches_committed(
-                    &row.values,
-                    local,
-                    &row.table,
-                    meta.as_ref(),
-                )? {
-                    confirmed = true;
-                    break;
+            self.visit_authoritative_row_versions(|table, local| {
+                if table == row.table && local.lsn == row.lsn {
+                    let (arrival, kind) =
+                        self.relational_sync_source_at_read_root(table, local.row_id)?;
+                    if arrival.is_some()
+                        && matches!(
+                            kind,
+                            Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal)
+                        )
+                        && self.sync_incoming_row_matches_committed(
+                            &row.values,
+                            local,
+                            table,
+                            meta.as_ref(),
+                        )?
+                    {
+                        confirmed = true;
+                    }
                 }
-            }
+                Ok(())
+            })?;
             if !confirmed {
                 return Ok(false);
             }
@@ -34010,29 +33976,26 @@ impl Database {
     }
 
     pub(crate) fn has_unconfirmed_push_rows(&self, after: Lsn, through: Lsn) -> bool {
-        self.relational_store
-            .tables
-            .read()
-            .iter()
-            .any(|(table, rows)| {
-                rows.iter().any(|row| {
-                    row.lsn > after
-                        && row.lsn <= through
-                        && !matches!(
-                            self.relational_store.sync_source_kind(table, row.row_id),
-                            Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal)
-                        )
-                        // A pull can replace a refused local version while the
-                        // provenance sidecar follows the current RowId. Its
-                        // retained source version still lacks acceptance; a
-                        // Pulled mark on the replacement cannot confirm it.
-                        && (row.deleted_tx.is_some()
-                            || !matches!(
-                                self.relational_store.sync_source_kind(table, row.row_id),
-                                Some(contextdb_relational::store::SyncSourceKind::Pulled)
-                            ))
-                })
-            })
+        let mut unconfirmed = false;
+        let result = self.visit_authoritative_row_versions(|table, row| {
+            if row.lsn > after && row.lsn <= through {
+                let (_, kind) = self.relational_sync_source_at_read_root(table, row.row_id)?;
+                if !matches!(
+                    kind,
+                    Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal)
+                ) && (row.deleted_tx.is_some()
+                    || !matches!(
+                        kind,
+                        Some(contextdb_relational::store::SyncSourceKind::Pulled)
+                    ))
+                {
+                    unconfirmed = true;
+                }
+            }
+            Ok(())
+        });
+        // A refused read cannot certify that outstanding work was acknowledged.
+        result.is_err() || unconfirmed
     }
 
     /// Select only authenticated echoes of the local lineage before applying a
@@ -34082,28 +34045,23 @@ impl Database {
         arrivals: &HashMap<Lsn, Option<Lsn>>,
     ) -> Result<()> {
         let _operation = self.assert_open_operation();
-        self.with_commit_lock(|| {
+        self.tx_mgr.with_maintenance_publication(|publication| {
             let mut entries = Vec::new();
             let mut tombstone_refreshes = Vec::new();
             for row in rows.iter().filter(|row| !row.deleted) {
                 let Some(arrival) = Self::resolve_incoming_arrival(row, arrivals) else {
                     continue;
                 };
-                let tables = self.relational_store.tables.read();
-                let Some(versions) = tables.get(&row.table) else {
-                    continue;
-                };
                 let meta = self.table_meta(&row.table);
-                for current in versions {
-                    if matches!(
-                        self.relational_store.sync_source_kind(&row.table, current.row_id),
-                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
-                    ) && self.sync_incoming_row_matches_committed(
-                        &row.values, current, &row.table, meta.as_ref(),
-                    )? {
-                        entries.push((row.table.clone(), current.row_id, arrival));
+                self.visit_authoritative_row_versions(|table, current| {
+                    if table == row.table
+                        && matches!(self.relational_sync_source_at_read_root(table, current.row_id)?.1,
+                            Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending))
+                        && self.sync_incoming_row_matches_committed(&row.values, current, table, meta.as_ref())? {
+                        entries.push((table.to_owned(), current.row_id, arrival));
                     }
-                }
+                    Ok(())
+                })?;
             }
             for row in rows.iter().filter(|row| row.deleted) {
                 let Some(arrival) = Self::resolve_incoming_arrival(row, arrivals) else {
@@ -34131,6 +34089,7 @@ impl Database {
                 }
             }
             if !entries.is_empty() {
+                publication.reserve()?;
                 if let Some(persistence) = &self.persistence {
                     persistence.append_sync_source_provenance_batch(
                         &entries
@@ -34148,6 +34107,7 @@ impl Database {
                             contextdb_relational::store::SyncSourceKind::AcceptedLocal,
                         )
                     }));
+                publication.complete();
             }
             if !tombstone_refreshes.is_empty() {
                 let mut tombstones = self.sync_tombstone_arrivals.write();
@@ -49968,101 +49928,104 @@ impl Database {
         #[cfg(feature = "test-seams")]
         self.export_after_capture_pause.maybe_pause();
 
-        let table_meta = match &writer_root {
-            Some(root) => root
-                .captured_table_metadata()
-                .map(|(name, meta)| (name.to_owned(), meta.clone()))
-                .collect(),
-            None => self.relational_store.table_meta.read().clone(),
-        };
-        for (name, meta) in &table_meta {
-            artifact.flush_table_meta(name, meta)?;
-        }
-
-        // Rows: streaming storage-layer copy, batched by position. Positions
-        // are stable for the copy's duration: commits only append versions or
-        // set tombstones in place, and pruning (the only remover) is deferred.
-        let mut row_count = 0u64;
-        let mut table_names: Vec<&String> = table_meta.keys().collect();
-        table_names.sort();
-        for name in table_names {
-            let name = name.as_str();
-            let meta = table_meta.get(name);
-            if let (Some(root), Some(source), Some(meta)) = (&writer_root, &checkpoint_source, meta)
-            {
-                use std::ops::Bound;
-                let mut cursor = root.cursor(
-                    &RedbPersistence::rel_table_name(name),
-                    crate::persistence::writer_source::WriterCursorFamily::Bytes,
-                    Bound::Unbounded,
-                    Bound::Unbounded,
-                    false,
-                )?;
-                while let Some(window) = cursor.next_row()? {
-                    let _row_copy = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                        self.accountant.clone(),
-                        window.value.estimated_bytes(),
-                        "storage",
-                        "export_row",
-                        "Raise MEMORY_LIMIT to export this row.",
-                    )?;
-                    let Some(mut row) = export_row_at_snapshot(&window.value, watermark) else {
-                        continue;
-                    };
-                    let (_, admission) = source.load_export_row_values(
-                        name,
-                        meta,
-                        std::slice::from_mut(&mut row),
-                    )?;
-                    source.overlay_export_row_f32_projections(
-                        name,
-                        meta,
-                        std::slice::from_mut(&mut row),
-                    )?;
-                    artifact.append_table_rows_batch(
-                        name,
-                        Some(meta),
-                        std::slice::from_ref(&row),
-                    )?;
-                    if row.deleted_tx.is_none() {
-                        row_count += 1;
-                        if let Some((lsn, kind)) = root.sync_source(name, row.row_id)? {
-                            artifact.append_sync_source_provenance_batch(&[(
-                                name.to_owned(),
-                                row.row_id,
-                                lsn,
-                                kind,
-                            )])?;
-                        }
-                    }
-                    drop(admission);
-                }
-                artifact.rebuild_relational_indexes_for_current_table(name, meta)?;
-                continue;
+        let copied = (|| -> Result<ExportReport> {
+            let table_meta = match &writer_root {
+                Some(root) => root
+                    .captured_table_metadata()
+                    .map(|(name, meta)| (name.to_owned(), meta.clone()))
+                    .collect(),
+                None => self.relational_store.table_meta.read().clone(),
+            };
+            for (name, meta) in &table_meta {
+                artifact.flush_table_meta(name, meta)?;
             }
-            let mut offset = 0usize;
-            loop {
-                let (mut batch, source_provenance) = {
-                    let tables = self.relational_store.tables.read();
-                    let Some(stored) = tables.get(name) else {
-                        break;
-                    };
-                    if offset >= stored.len() {
-                        break;
-                    }
-                    let end = stored.len().min(offset + EXPORT_BATCH_SIZE);
-                    let mut batch = Vec::with_capacity(end - offset);
-                    let mut source_provenance = Vec::new();
-                    for row in &stored[offset..end] {
-                        let Some(row) = export_row_at_snapshot(row, watermark) else {
+
+            // Rows: streaming storage-layer copy, batched by position. Positions
+            // are stable for the copy's duration: commits only append versions or
+            // set tombstones in place, and pruning (the only remover) is deferred.
+            let mut row_count = 0u64;
+            let mut table_names: Vec<&String> = table_meta.keys().collect();
+            table_names.sort();
+            for name in table_names {
+                let name = name.as_str();
+                let meta = table_meta.get(name);
+                if let (Some(root), Some(source), Some(meta)) =
+                    (&writer_root, &checkpoint_source, meta)
+                {
+                    use std::ops::Bound;
+                    let mut cursor = root.cursor(
+                        &RedbPersistence::rel_table_name(name),
+                        crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                        Bound::Unbounded,
+                        Bound::Unbounded,
+                        false,
+                    )?;
+                    while let Some(window) = cursor.next_row()? {
+                        let _row_copy =
+                            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                                self.accountant.clone(),
+                                window.value.estimated_bytes(),
+                                "storage",
+                                "export_row",
+                                "Raise MEMORY_LIMIT to export this row.",
+                            )?;
+                        let Some(mut row) = export_row_at_snapshot(&window.value, watermark) else {
                             continue;
                         };
+                        let (_, admission) = source.load_export_row_values(
+                            name,
+                            meta,
+                            std::slice::from_mut(&mut row),
+                        )?;
+                        source.overlay_export_row_f32_projections(
+                            name,
+                            meta,
+                            std::slice::from_mut(&mut row),
+                        )?;
+                        artifact.append_table_rows_batch(
+                            name,
+                            Some(meta),
+                            std::slice::from_ref(&row),
+                        )?;
                         if row.deleted_tx.is_none() {
                             row_count += 1;
-                            if let Some(lsn) =
-                                self.relational_store.sync_source_lsn(name, row.row_id)
-                            {
-                                let kind = match self
+                            if let Some((lsn, kind)) = root.sync_source(name, row.row_id)? {
+                                artifact.append_sync_source_provenance_batch(&[(
+                                    name.to_owned(),
+                                    row.row_id,
+                                    lsn,
+                                    kind,
+                                )])?;
+                            }
+                        }
+                        drop(admission);
+                    }
+                    artifact.rebuild_relational_indexes_for_current_table(name, meta)?;
+                    continue;
+                }
+                let mut offset = 0usize;
+                loop {
+                    let (mut batch, source_provenance) = {
+                        let tables = self.relational_store.tables.read();
+                        let Some(stored) = tables.get(name) else {
+                            break;
+                        };
+                        if offset >= stored.len() {
+                            break;
+                        }
+                        let end = stored.len().min(offset + EXPORT_BATCH_SIZE);
+                        let mut batch = Vec::with_capacity(end - offset);
+                        let mut source_provenance = Vec::new();
+                        for row in &stored[offset..end] {
+                            let Some(row) = export_row_at_snapshot(row, watermark) else {
+                                continue;
+                            };
+                            if row.deleted_tx.is_none() {
+                                row_count += 1;
+                                if let Some(lsn) =
+                                    self.relational_store.sync_source_lsn(name, row.row_id)
+                                {
+                                    let kind = match self
                                     .relational_store
                                     .sync_source_kind(name, row.row_id)
                                 {
@@ -50074,361 +50037,392 @@ impl Database {
                                     ) => 2,
                                     _ => 0,
                                 };
-                                source_provenance.push((name.to_string(), row.row_id, lsn, kind));
+                                    source_provenance.push((
+                                        name.to_string(),
+                                        row.row_id,
+                                        lsn,
+                                        kind,
+                                    ));
+                                }
                             }
+                            batch.push(row);
                         }
-                        batch.push(row);
-                    }
-                    offset = end;
-                    (batch, source_provenance)
-                };
-                let mut appended = false;
-                if let (Some(source), Some(meta)) = (&checkpoint_source, meta) {
-                    // The pinned source is the one place an exported body may
-                    // come from: it is the snapshot this artifact claims. The
-                    // stored values come back first, then the projection
-                    // overlay authenticates them against that same root.
-                    if self.relational_store.uses_disk_backed_committed_bodies()
-                        && !batch.is_empty()
-                    {
-                        // The bodies come back in runs the memory budget
-                        // admits. Each run is written to the artifact and let
-                        // go before the next is loaded, so exporting a table
-                        // of large bodies never asks the process to hold the
-                        // whole batch of them at once.
-                        let mut written = 0usize;
-                        while written < batch.len() {
-                            let (filled, admitted) =
-                                source.load_export_row_values(name, meta, &mut batch[written..])?;
-                            if filled == 0 {
-                                return Err(Error::Other(
+                        offset = end;
+                        (batch, source_provenance)
+                    };
+                    let mut appended = false;
+                    if let (Some(source), Some(meta)) = (&checkpoint_source, meta) {
+                        // The pinned source is the one place an exported body may
+                        // come from: it is the snapshot this artifact claims. The
+                        // stored values come back first, then the projection
+                        // overlay authenticates them against that same root.
+                        if self.relational_store.uses_disk_backed_committed_bodies()
+                            && !batch.is_empty()
+                        {
+                            // The bodies come back in runs the memory budget
+                            // admits. Each run is written to the artifact and let
+                            // go before the next is loaded, so exporting a table
+                            // of large bodies never asks the process to hold the
+                            // whole batch of them at once.
+                            let mut written = 0usize;
+                            while written < batch.len() {
+                                let (filled, admitted) = source.load_export_row_values(
+                                    name,
+                                    meta,
+                                    &mut batch[written..],
+                                )?;
+                                if filled == 0 {
+                                    return Err(Error::Other(
                                     "checkpoint export admitted no row body and could not                                      make progress"
                                         .to_string(),
                                 ));
+                                }
+                                let end = written + filled;
+                                source.overlay_export_row_f32_projections(
+                                    name,
+                                    meta,
+                                    &mut batch[written..end],
+                                )?;
+                                artifact.append_table_rows_batch(
+                                    name,
+                                    Some(meta),
+                                    &batch[written..end],
+                                )?;
+                                // The artifact holds them now, so the copies and
+                                // the admission that covered them both go.
+                                for row in &mut batch[written..end] {
+                                    row.values = HashMap::new();
+                                }
+                                drop(admitted);
+                                written = end;
                             }
-                            let end = written + filled;
-                            source.overlay_export_row_f32_projections(
-                                name,
-                                meta,
-                                &mut batch[written..end],
-                            )?;
-                            artifact.append_table_rows_batch(
-                                name,
-                                Some(meta),
-                                &batch[written..end],
-                            )?;
-                            // The artifact holds them now, so the copies and
-                            // the admission that covered them both go.
-                            for row in &mut batch[written..end] {
-                                row.values = HashMap::new();
-                            }
-                            drop(admitted);
-                            written = end;
+                            appended = true;
+                        } else {
+                            source.overlay_export_row_f32_projections(name, meta, &mut batch)?;
                         }
-                        appended = true;
-                    } else {
-                        source.overlay_export_row_f32_projections(name, meta, &mut batch)?;
                     }
+                    if !appended {
+                        artifact.append_table_rows_batch(name, meta, &batch)?;
+                    }
+                    artifact.append_sync_source_provenance_batch(&source_provenance)?;
                 }
-                if !appended {
-                    artifact.append_table_rows_batch(name, meta, &batch)?;
+                if let Some(meta) = meta {
+                    artifact.rebuild_relational_indexes_for_current_table(name, meta)?;
                 }
-                artifact.append_sync_source_provenance_batch(&source_provenance)?;
             }
-            if let Some(meta) = meta {
-                artifact.rebuild_relational_indexes_for_current_table(name, meta)?;
-            }
-        }
 
-        // Edges: the forward adjacency is the canonical copy; the writer
-        // derives the reverse table from the same entries.
-        let mut edge_count = 0u64;
-        if let Some(root) = &writer_root {
-            use std::ops::Bound;
-            let mut cursor = root.cursor(
-                "graph_fwd",
-                crate::persistence::writer_source::WriterCursorFamily::Bytes,
-                Bound::Unbounded,
-                Bound::Unbounded,
-                false,
-            )?;
-            while let Some(window) = cursor.next_edge()? {
-                let _edge_copy = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                    self.accountant.clone(),
-                    window.value.estimated_bytes(),
-                    "storage",
-                    "export_edge",
-                    "Raise MEMORY_LIMIT to export this edge.",
+            // Edges: the forward adjacency is the canonical copy; the writer
+            // derives the reverse table from the same entries.
+            let mut edge_count = 0u64;
+            if let Some(root) = &writer_root {
+                use std::ops::Bound;
+                let mut cursor = root.cursor(
+                    "graph_fwd",
+                    crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                    false,
                 )?;
-                let Some(edge) = export_edge_at_snapshot(&window.value, watermark) else {
-                    continue;
-                };
-                if edge.deleted_tx.is_none() {
-                    edge_count += 1;
-                }
-                artifact.append_graph_edges_batch(std::slice::from_ref(&edge))?;
-            }
-        }
-        let nodes: Vec<NodeId> = if writer_root.is_some() {
-            Vec::new()
-        } else {
-            self.graph_store
-                .forward_adj
-                .read()
-                .keys()
-                .copied()
-                .collect()
-        };
-        for chunk in nodes.chunks(EXPORT_NODE_BATCH_SIZE) {
-            let batch = {
-                let forward = self.graph_store.forward_adj.read();
-                let mut batch = Vec::new();
-                for node in chunk {
-                    let Some(entries) = forward.get(node) else {
+                while let Some(window) = cursor.next_edge()? {
+                    let _edge_copy = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                        self.accountant.clone(),
+                        window.value.estimated_bytes(),
+                        "storage",
+                        "export_edge",
+                        "Raise MEMORY_LIMIT to export this edge.",
+                    )?;
+                    let Some(edge) = export_edge_at_snapshot(&window.value, watermark) else {
                         continue;
                     };
-                    for entry in entries {
-                        let Some(edge) = export_edge_at_snapshot(entry, watermark) else {
+                    if edge.deleted_tx.is_none() {
+                        edge_count += 1;
+                    }
+                    artifact.append_graph_edges_batch(std::slice::from_ref(&edge))?;
+                }
+            }
+            let nodes: Vec<NodeId> = if writer_root.is_some() {
+                Vec::new()
+            } else {
+                self.graph_store
+                    .forward_adj
+                    .read()
+                    .keys()
+                    .copied()
+                    .collect()
+            };
+            for chunk in nodes.chunks(EXPORT_NODE_BATCH_SIZE) {
+                let batch = {
+                    let forward = self.graph_store.forward_adj.read();
+                    let mut batch = Vec::new();
+                    for node in chunk {
+                        let Some(entries) = forward.get(node) else {
                             continue;
                         };
-                        if edge.deleted_tx.is_none() {
-                            edge_count += 1;
+                        for entry in entries {
+                            let Some(edge) = export_edge_at_snapshot(entry, watermark) else {
+                                continue;
+                            };
+                            if edge.deleted_tx.is_none() {
+                                edge_count += 1;
+                            }
+                            batch.push(edge);
                         }
-                        batch.push(edge);
                     }
-                }
-                batch
-            };
-            artifact.append_graph_edges_batch(&batch)?;
-        }
+                    batch
+                };
+                artifact.append_graph_edges_batch(&batch)?;
+            }
 
-        // Vectors: complete per-column copy with the column's declared
-        // quantization, so relational vector values re-hydrate on open and
-        // HNSW rebuilds deterministically from the same stored data.
-        let quantization = RedbPersistence::vector_quantization_map(&table_meta);
-        let mut vector_count = 0u64;
-        let mut vector_batch = Vec::new();
-        let mut membership_batch = Vec::new();
-        for partitioned in self.vector_store.try_all_partitioned_entries()? {
-            let Some(entry) = export_vector_at_snapshot(&partitioned.entry, watermark) else {
-                continue;
-            };
-            let owner = if let Some(root) = &writer_root {
-                let mut cursor = root.row_cursor(&entry.index.table, entry.row_id)?;
-                let mut owner = None;
-                while let Some(window) = cursor.next_row()? {
-                    let row = &window.value;
-                    if row.created_tx == entry.created_tx && row.lsn == entry.lsn {
-                        owner = Some((row.created_tx, row.lsn));
-                        break;
+            // Vectors: complete per-column copy with the column's declared
+            // quantization, so relational vector values re-hydrate on open and
+            // HNSW rebuilds deterministically from the same stored data.
+            let quantization = RedbPersistence::vector_quantization_map(&table_meta);
+            let mut vector_count = 0u64;
+            let mut vector_batch = Vec::new();
+            let mut membership_batch = Vec::new();
+            for partitioned in self.vector_store.try_all_partitioned_entries()? {
+                let Some(entry) = export_vector_at_snapshot(&partitioned.entry, watermark) else {
+                    continue;
+                };
+                let owner = if let Some(root) = &writer_root {
+                    let mut cursor = root.row_cursor(&entry.index.table, entry.row_id)?;
+                    let mut owner = None;
+                    while let Some(window) = cursor.next_row()? {
+                        let row = &window.value;
+                        if row.created_tx == entry.created_tx && row.lsn == entry.lsn {
+                            owner = Some((row.created_tx, row.lsn));
+                            break;
+                        }
                     }
+                    if owner.is_none() && entry.deleted_tx.is_none() {
+                        let source =
+                            crate::persistence::writer_adapters::WriterRelationalSource::new(
+                                root.clone(),
+                            )?;
+                        owner = contextdb_relational::source::visible_row(
+                            &source,
+                            &entry.index.table,
+                            entry.row_id,
+                            SnapshotId::from_tx(watermark),
+                        )?
+                        .map(|window| (window.value().created_tx, window.value().lsn));
+                    }
+                    owner
+                } else {
+                    self.relational_store
+                        .tables
+                        .read()
+                        .get(&entry.index.table)
+                        .and_then(|rows| {
+                            rows.iter()
+                                .find(|row| {
+                                    row.row_id == entry.row_id
+                                        && row.created_tx == entry.created_tx
+                                        && row.lsn == entry.lsn
+                                })
+                                .or_else(|| {
+                                    entry.deleted_tx.is_none().then(|| {
+                                        rows.iter()
+                                            .filter(|row| {
+                                                row.row_id == entry.row_id
+                                                    && row.deleted_tx.is_none()
+                                            })
+                                            .max_by_key(|row| (row.lsn, row.created_tx))
+                                    })?
+                                })
+                                .map(|row| (row.created_tx, row.lsn))
+                        })
                 }
-                if owner.is_none() && entry.deleted_tx.is_none() {
-                    let source = crate::persistence::writer_adapters::WriterRelationalSource::new(
-                        root.clone(),
-                    )?;
-                    owner = contextdb_relational::source::visible_row(
-                        &source,
-                        &entry.index.table,
-                        entry.row_id,
-                        SnapshotId::from_tx(watermark),
-                    )?
-                    .map(|window| (window.value().created_tx, window.value().lsn));
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "exported vector {} row {} has no owning relational version",
+                        entry.index, entry.row_id.0
+                    ))
+                })?;
+                if entry.deleted_tx.is_none() {
+                    vector_count += 1;
                 }
-                owner
-            } else {
-                self.relational_store
-                    .tables
-                    .read()
-                    .get(&entry.index.table)
-                    .and_then(|rows| {
-                        rows.iter()
-                            .find(|row| {
-                                row.row_id == entry.row_id
-                                    && row.created_tx == entry.created_tx
-                                    && row.lsn == entry.lsn
-                            })
-                            .or_else(|| {
-                                entry.deleted_tx.is_none().then(|| {
-                                    rows.iter()
-                                        .filter(|row| {
-                                            row.row_id == entry.row_id && row.deleted_tx.is_none()
-                                        })
-                                        .max_by_key(|row| (row.lsn, row.created_tx))
-                                })?
-                            })
-                            .map(|row| (row.created_tx, row.lsn))
-                    })
+                membership_batch.push(VectorPartitionMembershipRecord {
+                    index: entry.index.clone(),
+                    partition_key: partitioned.partition_key,
+                    row_id: entry.row_id,
+                    row_created_tx: owner.0,
+                    row_lsn: owner.1,
+                    vector_created_tx: entry.created_tx,
+                    vector_lsn: entry.lsn,
+                    visible_from: TxId(owner.0.0.max(entry.created_tx.0)),
+                    deleted_tx: entry.deleted_tx,
+                });
+                vector_batch.push(entry);
+                if vector_batch.len() >= EXPORT_BATCH_SIZE {
+                    artifact.append_vector_entries_batch(&vector_batch, &quantization)?;
+                    artifact.append_vector_partition_memberships_batch(&membership_batch)?;
+                    vector_batch.clear();
+                    membership_batch.clear();
+                }
             }
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "exported vector {} row {} has no owning relational version",
-                    entry.index, entry.row_id.0
-                ))
-            })?;
-            if entry.deleted_tx.is_none() {
-                vector_count += 1;
-            }
-            membership_batch.push(VectorPartitionMembershipRecord {
-                index: entry.index.clone(),
-                partition_key: partitioned.partition_key,
-                row_id: entry.row_id,
-                row_created_tx: owner.0,
-                row_lsn: owner.1,
-                vector_created_tx: entry.created_tx,
-                vector_lsn: entry.lsn,
-                visible_from: TxId(owner.0.0.max(entry.created_tx.0)),
-                deleted_tx: entry.deleted_tx,
-            });
-            vector_batch.push(entry);
-            if vector_batch.len() >= EXPORT_BATCH_SIZE {
-                artifact.append_vector_entries_batch(&vector_batch, &quantization)?;
-                artifact.append_vector_partition_memberships_batch(&membership_batch)?;
-                vector_batch.clear();
-                membership_batch.clear();
-            }
-        }
-        artifact.append_vector_entries_batch(&vector_batch, &quantization)?;
-        artifact.append_vector_partition_memberships_batch(&membership_batch)?;
+            artifact.append_vector_entries_batch(&vector_batch, &quantization)?;
+            artifact.append_vector_partition_memberships_batch(&membership_batch)?;
 
-        // Change log: entries at or below the snapshot LSN, with per-LSN key
-        // indices tracked across batches so multi-entry commits never collide.
-        let mut offset = 0usize;
-        let mut lsn_run: Option<(Lsn, usize)> = None;
-        if let Some(root) = &writer_root {
-            let mut cursor = root.change_log_cursor(Lsn(0), snapshot_lsn)?;
-            while let Some(window) = cursor.next_change()? {
-                let ordinal = usize::try_from(u64::from_be_bytes(
-                    window.position()[8..16]
-                        .try_into()
-                        .expect("numeric occurrence key"),
-                ))
-                .map_err(|_| Error::Other("export change ordinal exceeds usize".into()))?;
-                artifact.append_change_log_entries_batch(&[(ordinal, window.value.clone())])?;
+            // Change log: entries at or below the snapshot LSN, with per-LSN key
+            // indices tracked across batches so multi-entry commits never collide.
+            let mut offset = 0usize;
+            let mut lsn_run: Option<(Lsn, usize)> = None;
+            if let Some(root) = &writer_root {
+                let mut cursor = root.change_log_cursor(Lsn(0), snapshot_lsn)?;
+                while let Some(window) = cursor.next_change()? {
+                    let ordinal = usize::try_from(u64::from_be_bytes(
+                        window.position()[8..16]
+                            .try_into()
+                            .expect("numeric occurrence key"),
+                    ))
+                    .map_err(|_| Error::Other("export change ordinal exceeds usize".into()))?;
+                    artifact.append_change_log_entries_batch(&[(ordinal, window.value.clone())])?;
+                }
             }
-        }
-        loop {
-            if writer_root.is_some() {
-                break;
-            }
-            let batch: Vec<(usize, ChangeLogEntry)> = {
-                let log = self.change_log.read();
-                if offset >= log.len() {
+            loop {
+                if writer_root.is_some() {
                     break;
                 }
-                let end = log.len().min(offset + EXPORT_BATCH_SIZE);
-                let mut batch = Vec::new();
-                for entry in &log[offset..end] {
-                    let lsn = entry.lsn();
-                    if lsn > snapshot_lsn {
-                        continue;
+                let batch: Vec<(usize, ChangeLogEntry)> = {
+                    let log = self.change_log.read();
+                    if offset >= log.len() {
+                        break;
                     }
-                    let index = match lsn_run {
-                        Some((run_lsn, next)) if run_lsn == lsn => next,
-                        _ => 0,
-                    };
-                    lsn_run = Some((lsn, index + 1));
-                    batch.push((index, entry.clone()));
-                }
-                offset = end;
-                batch
-            };
-            artifact.append_change_log_entries_batch(&batch)?;
-        }
-
-        let ddl_entries: Vec<(Lsn, DdlChange)> = self
-            .ddl_log
-            .read()
-            .iter()
-            .filter(|(lsn, _)| *lsn <= snapshot_lsn)
-            .cloned()
-            .collect();
-        artifact.append_ddl_log_entries(&ddl_entries)?;
-
-        if let Some(root) = &writer_root {
-            let mut cursor = root.commit_cursor(Lsn(0), snapshot_lsn, false)?;
-            let mut batch = BTreeMap::new();
-            while let Some((lsn, tx)) = cursor.next()? {
-                batch.insert(lsn, tx);
-                if batch.len() == EXPORT_BATCH_SIZE {
-                    artifact.flush_commit_index_entries(&batch)?;
-                    batch.clear();
-                }
+                    let end = log.len().min(offset + EXPORT_BATCH_SIZE);
+                    let mut batch = Vec::new();
+                    for entry in &log[offset..end] {
+                        let lsn = entry.lsn();
+                        if lsn > snapshot_lsn {
+                            continue;
+                        }
+                        let index = match lsn_run {
+                            Some((run_lsn, next)) if run_lsn == lsn => next,
+                            _ => 0,
+                        };
+                        lsn_run = Some((lsn, index + 1));
+                        batch.push((index, entry.clone()));
+                    }
+                    offset = end;
+                    batch
+                };
+                artifact.append_change_log_entries_batch(&batch)?;
             }
-            artifact.flush_commit_index_entries(&batch)?;
-        } else {
-            artifact.flush_commit_index_entries(&commit_index)?;
-        }
 
-        // The owning Redb read transaction was captured with the relational
-        // snapshot tuple. Copy only its canonical manifest-owned blob roles;
-        // staging and orphan chunks are never backup-addressable.
-        blob_snapshot.copy_canonical_into(artifact)?;
+            let ddl_entries: Vec<(Lsn, DdlChange)> = self
+                .ddl_log
+                .read()
+                .iter()
+                .filter(|(lsn, _)| *lsn <= snapshot_lsn)
+                .cloned()
+                .collect();
+            artifact.append_ddl_log_entries(&ddl_entries)?;
 
-        match &self.persistence {
-            Some(persistence) => {
-                // File-backed source: raw copy of the whole config table
-                // (tenant watermark keys are dynamic), the durable sink
-                // queues, and the audit tables.
-                let config = persistence.dump_config_raw()?;
-                artifact.flush_encoded_config_values(
-                    config
-                        .iter()
-                        .map(|(key, value)| (key.as_str(), value.clone()))
-                        .collect(),
-                )?;
-                for sink in persistence.sink_queue_names()? {
-                    let entries = persistence.dump_sink_queue_raw(&sink)?;
-                    for chunk in entries.chunks(EXPORT_BATCH_SIZE) {
-                        artifact.append_sink_queue_raw(&sink, chunk)?;
+            if let Some(root) = &writer_root {
+                let mut cursor = root.commit_cursor(Lsn(0), snapshot_lsn, false)?;
+                let mut batch = BTreeMap::new();
+                while let Some((lsn, tx)) = cursor.next()? {
+                    batch.insert(lsn, tx);
+                    if batch.len() == EXPORT_BATCH_SIZE {
+                        artifact.flush_commit_index_entries(&batch)?;
+                        batch.clear();
                     }
                 }
-                let trigger_audits = persistence.dump_trigger_audit_raw()?;
-                for chunk in trigger_audits.chunks(EXPORT_BATCH_SIZE) {
-                    artifact.append_trigger_audit_raw(chunk)?;
-                }
-                let trigger_audit_stamps = persistence.dump_trigger_audit_stamps_raw()?;
-                for chunk in trigger_audit_stamps.chunks(EXPORT_BATCH_SIZE) {
-                    artifact.append_trigger_audit_stamps_raw(chunk)?;
-                }
-                let sink_audits = persistence.dump_sink_audit_raw()?;
-                for chunk in sink_audits.chunks(EXPORT_BATCH_SIZE) {
-                    artifact.append_sink_audit_raw(chunk)?;
-                }
+                artifact.flush_commit_index_entries(&batch)?;
+            } else {
+                artifact.flush_commit_index_entries(&commit_index)?;
             }
-            None => {
-                // In-memory source: persisted-only operational config does
-                // not exist here and is not exported, but DDL-declared state
-                // is database state — cron schedules, event-bus definitions,
-                // and trigger declarations live only in memory and export
-                // exactly as file-backed DDL persistence would have written
-                // them.
-                let mut config_values = self.export_cron_config_values()?;
-                config_values.extend(self.export_event_bus_config_values()?);
-                config_values.extend(self.export_trigger_config_values()?);
-                artifact.flush_encoded_config_values(config_values)?;
-                let custody = self
-                    .custody_metadata
-                    .lock()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<Vec<_>>();
-                artifact.flush_encoded_config_values(
-                    custody
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.clone()))
-                        .collect(),
-                )?;
-            }
-        }
 
-        Ok(ExportReport {
-            snapshot_lsn,
-            rows: row_count,
-            edges: edge_count,
-            vectors: vector_count,
-            bytes_written: 0,
-        })
+            // The owning Redb read transaction was captured with the relational
+            // snapshot tuple. Copy only its canonical manifest-owned blob roles;
+            // staging and orphan chunks are never backup-addressable.
+            blob_snapshot.copy_canonical_into(artifact)?;
+
+            match &self.persistence {
+                Some(persistence) => {
+                    // File-backed source: raw copy of the whole config table
+                    // (tenant watermark keys are dynamic), the durable sink
+                    // queues, and the audit tables.
+                    let config = persistence.dump_config_raw()?;
+                    artifact.flush_encoded_config_values(
+                        config
+                            .iter()
+                            .map(|(key, value)| (key.as_str(), value.clone()))
+                            .collect(),
+                    )?;
+                    for sink in persistence.sink_queue_names()? {
+                        let entries = persistence.dump_sink_queue_raw(&sink)?;
+                        for chunk in entries.chunks(EXPORT_BATCH_SIZE) {
+                            artifact.append_sink_queue_raw(&sink, chunk)?;
+                        }
+                    }
+                    let trigger_audits = persistence.dump_trigger_audit_raw()?;
+                    for chunk in trigger_audits.chunks(EXPORT_BATCH_SIZE) {
+                        artifact.append_trigger_audit_raw(chunk)?;
+                    }
+                    let trigger_audit_stamps = persistence.dump_trigger_audit_stamps_raw()?;
+                    for chunk in trigger_audit_stamps.chunks(EXPORT_BATCH_SIZE) {
+                        artifact.append_trigger_audit_stamps_raw(chunk)?;
+                    }
+                    let sink_audits = persistence.dump_sink_audit_raw()?;
+                    for chunk in sink_audits.chunks(EXPORT_BATCH_SIZE) {
+                        artifact.append_sink_audit_raw(chunk)?;
+                    }
+                }
+                None => {
+                    // In-memory source: persisted-only operational config does
+                    // not exist here and is not exported, but DDL-declared state
+                    // is database state — cron schedules, event-bus definitions,
+                    // and trigger declarations live only in memory and export
+                    // exactly as file-backed DDL persistence would have written
+                    // them.
+                    let mut config_values = self.export_cron_config_values()?;
+                    config_values.extend(self.export_event_bus_config_values()?);
+                    config_values.extend(self.export_trigger_config_values()?);
+                    artifact.flush_encoded_config_values(config_values)?;
+                    let custody = self
+                        .custody_metadata
+                        .lock()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<Vec<_>>();
+                    artifact.flush_encoded_config_values(
+                        custody
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.clone()))
+                            .collect(),
+                    )?;
+                }
+            }
+
+            Ok(ExportReport {
+                snapshot_lsn,
+                rows: row_count,
+                edges: edge_count,
+                vectors: vector_count,
+                bytes_written: 0,
+            })
+        })();
+        match copied {
+            Ok(report) => Ok(report),
+            Err(error) => self.with_commit_lock(|| {
+                if let Some(record) = self.purge_frontier_after_snapshot(snapshot_lsn)? {
+                    let frontier = record
+                        .purge_frontier
+                        .as_deref()
+                        .and_then(|frontier| frontier.parse::<u64>().ok())
+                        .expect("permanent purge frontier was checked");
+                    return Err(Error::PurgeExportSnapshotFence {
+                        table: record.table,
+                        key: record.natural_key.pairs(),
+                        lineage_root: record.lineage_root,
+                        frontier: Lsn(frontier),
+                        snapshot_lsn,
+                    });
+                }
+                Err(error)
+            }),
+        }
     }
 
     pub fn close(&self) -> Result<()> {
@@ -53903,57 +53897,54 @@ impl Database {
         let ddl = self.full_state_snapshot_ddl();
 
         let acl_snapshot = self.snapshot();
-        let live_rows = self.authoritative_live_rows_for_outbound();
         let meta_guard = self.relational_store.table_meta.read();
 
         // Rows (live only) — collect row_ids that have live rows for orphan vector filtering
         let mut live_row_ids: HashSet<RowId> = HashSet::new();
         let empty_skip_deleted = HashSet::new();
-        for (table_name, table_rows) in &live_rows {
+        self.visit_authoritative_live_rows_for_outbound(|table_name, row| {
             let meta = match meta_guard.get(table_name) {
                 Some(m) => m,
-                None => continue,
+                None => return Ok(()),
             };
             if natural_key_columns_for_meta(meta).is_none() {
-                continue;
+                return Ok(());
             }
-            for row in table_rows.values() {
-                if row.lsn > snapshot_ceiling {
-                    continue;
-                }
-                if !self.row_read_allowed_for_change(table_name, row, acl_snapshot) {
-                    continue;
-                }
-                let Some(natural_key) = natural_key_from_row_values(meta, &row.values) else {
-                    continue;
-                };
-                let Some(current) = self
-                    .visible_row_by_natural_key(
-                        table_name,
-                        &natural_key,
-                        acl_snapshot,
-                        &empty_skip_deleted,
-                    )
-                    .ok()
-                    .flatten()
-                else {
-                    continue;
-                };
-                if current.row_id != row.row_id {
-                    continue;
-                }
-                live_row_ids.insert(row.row_id);
-                rows.push(RowChange {
-                    table: table_name.clone(),
-                    natural_key,
-                    values: self.outbound_row_values(table_name, row)?,
-                    deleted: false,
-                    lsn: row.lsn,
-                    created_at: row.created_at,
-                });
+            if row.lsn > snapshot_ceiling {
+                return Ok(());
             }
-        }
-
+            if !self.row_read_allowed_for_change(table_name, row, acl_snapshot) {
+                return Ok(());
+            }
+            let Some(natural_key) = natural_key_from_row_values(meta, &row.values) else {
+                return Ok(());
+            };
+            let Some(current) = self
+                .visible_row_by_natural_key(
+                    table_name,
+                    &natural_key,
+                    acl_snapshot,
+                    &empty_skip_deleted,
+                )
+                .ok()
+                .flatten()
+            else {
+                return Ok(());
+            };
+            if current.row_id != row.row_id {
+                return Ok(());
+            }
+            live_row_ids.insert(row.row_id);
+            rows.push(RowChange {
+                table: table_name.to_owned(),
+                natural_key,
+                values: self.outbound_row_values(table_name, row)?,
+                deleted: false,
+                lsn: row.lsn,
+                created_at: row.created_at,
+            });
+            Ok(())
+        })?;
         drop(meta_guard);
 
         // Edges (live only)
@@ -54023,6 +54014,71 @@ impl Database {
             ddl,
             ddl_lsn,
         })
+    }
+
+    fn visit_authoritative_row_versions(
+        &self,
+        mut visit: impl FnMut(&str, &VersionedRow) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(root) = self.writer_read_root()? {
+            use std::ops::Bound;
+            for (table, _) in root.captured_table_metadata() {
+                let mut cursor = root.cursor(
+                    &RedbPersistence::rel_table_name(table),
+                    crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                    false,
+                )?;
+                while let Some(window) = cursor.next_row()? {
+                    visit(table, &window.value)?;
+                }
+            }
+        } else {
+            let tables = self.relational_store.tables.read();
+            for (table, rows) in tables.iter() {
+                for row in rows {
+                    visit(table, row)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_authoritative_live_rows_for_outbound(
+        &self,
+        mut visit: impl FnMut(&str, &VersionedRow) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(root) = self.writer_read_root()? {
+            use std::ops::Bound;
+            for (table, _) in root.captured_table_metadata() {
+                let mut cursor = root.cursor(
+                    &RedbPersistence::rel_table_name(table),
+                    crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                    Bound::Unbounded,
+                    Bound::Unbounded,
+                    true,
+                )?;
+                let mut selected = None;
+                while let Some(window) = cursor.next_row()? {
+                    let row = &window.value;
+                    if selected == Some(row.row_id) || row.created_tx.0 > root.snapshot.0 {
+                        continue;
+                    }
+                    selected = Some(row.row_id);
+                    if row.visible_at(root.snapshot) {
+                        visit(table, row)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for (table, rows) in self.authoritative_live_rows_for_outbound() {
+            for row in rows.values() {
+                visit(&table, row)?;
+            }
+        }
+        Ok(())
     }
 
     /// Enumerate each row instance through the current row-position map so a
@@ -54145,58 +54201,56 @@ impl Database {
         let mut ddl = Vec::new();
 
         let acl_snapshot = self.snapshot();
-        let live_rows = self.authoritative_live_rows_for_outbound();
         let meta_guard = self.relational_store.table_meta.read();
 
         let mut live_row_ids: HashSet<RowId> = HashSet::new();
         let empty_skip_deleted = HashSet::new();
-        for (table_name, table_rows) in &live_rows {
+        self.visit_authoritative_live_rows_for_outbound(|table_name, row| {
             let meta = match meta_guard.get(table_name) {
                 Some(meta) => meta,
-                None => continue,
+                None => return Ok(()),
             };
             if natural_key_columns_for_meta(meta).is_none() {
-                continue;
+                return Ok(());
             }
-            for row in table_rows.values() {
-                if row.lsn > snapshot_ceiling {
-                    continue;
-                }
-                if !self.row_read_allowed_for_change(table_name, row, acl_snapshot) {
-                    continue;
-                }
-                let Some(natural_key) = natural_key_from_row_values(meta, &row.values) else {
-                    continue;
-                };
-                let Some(current) = self
-                    .visible_row_by_natural_key(
-                        table_name,
-                        &natural_key,
-                        acl_snapshot,
-                        &empty_skip_deleted,
-                    )
-                    .ok()
-                    .flatten()
-                else {
-                    continue;
-                };
-                if current.row_id != row.row_id {
-                    continue;
-                }
-                live_row_ids.insert(row.row_id);
-                if row.lsn <= since_lsn {
-                    continue;
-                }
-                rows.push(RowChange {
-                    table: table_name.clone(),
-                    natural_key,
-                    values: self.outbound_row_values(table_name, row)?,
-                    deleted: false,
-                    lsn: row.lsn,
-                    created_at: row.created_at,
-                });
+            if row.lsn > snapshot_ceiling {
+                return Ok(());
             }
-        }
+            if !self.row_read_allowed_for_change(table_name, row, acl_snapshot) {
+                return Ok(());
+            }
+            let Some(natural_key) = natural_key_from_row_values(meta, &row.values) else {
+                return Ok(());
+            };
+            let Some(current) = self
+                .visible_row_by_natural_key(
+                    table_name,
+                    &natural_key,
+                    acl_snapshot,
+                    &empty_skip_deleted,
+                )
+                .ok()
+                .flatten()
+            else {
+                return Ok(());
+            };
+            if current.row_id != row.row_id {
+                return Ok(());
+            }
+            live_row_ids.insert(row.row_id);
+            if row.lsn <= since_lsn {
+                return Ok(());
+            }
+            rows.push(RowChange {
+                table: table_name.to_owned(),
+                natural_key,
+                values: self.outbound_row_values(table_name, row)?,
+                deleted: false,
+                lsn: row.lsn,
+                created_at: row.created_at,
+            });
+            Ok(())
+        })?;
         drop(meta_guard);
 
         let fwd = self.graph_store.forward_adj.read();
@@ -58310,16 +58364,16 @@ impl Database {
                 )
                 .ok()
                 .flatten()
-                .and_then(|versioned| {
+                .map(|versioned| {
+                    self.relational_sync_source_at_read_root(&row.table, versioned.row_id)
+                })
+                .transpose()?
+                .and_then(|(lsn, kind)| {
                     (!matches!(
-                        self.relational_store
-                            .sync_source_kind(&row.table, versioned.row_id),
+                        kind,
                         Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
                     ))
-                    .then(|| {
-                        self.relational_store
-                            .sync_source_lsn(&row.table, versioned.row_id)
-                    })
+                    .then_some(lsn)
                     .flatten()
                 })
             };
@@ -64650,13 +64704,16 @@ impl Database {
 
             if !pull_only_inbound
                 && adoption == SyncAdoption::Continuing
-                && existing.as_ref().is_some_and(|local| {
-                    matches!(
-                        self.relational_store
-                            .sync_source_kind(&row.table, local.row_id),
-                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
-                    )
-                })
+                && existing
+                    .as_ref()
+                    .map(|local| self.relational_sync_source_at_read_root(&row.table, local.row_id))
+                    .transpose()?
+                    .is_some_and(|(_, kind)| {
+                        matches!(
+                            kind,
+                            Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
+                        )
+                    })
             {
                 // This source was restored before it ordered the local row.
                 // Until resend receives a fresh hub acknowledgement, none of
@@ -64917,8 +64974,8 @@ impl Database {
                 let confirmed_pending_echo = adoption
                     == SyncAdoption::ConfirmedPendingReconciliation
                     && match self
-                        .relational_store
-                        .sync_source_kind(&row.table, local.row_id)
+                        .relational_sync_source_at_read_root(&row.table, local.row_id)?
+                        .1
                     {
                         Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending) => {
                             true
@@ -64929,8 +64986,8 @@ impl Database {
                         Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal) => {
                             Self::resolve_incoming_arrival(&row, arrivals)
                                 == self
-                                    .relational_store
-                                    .sync_source_lsn(&row.table, local.row_id)
+                                    .relational_sync_source_at_read_root(&row.table, local.row_id)?
+                                    .0
                         }
                         _ => false,
                     };
@@ -65442,13 +65499,13 @@ impl Database {
                     // A single sidecar probe per row keeps the hot apply path
                     // allocation- and double-probe-free.
                     let committed_source = self
-                        .relational_store
-                        .sync_source_lsn(&row.table, local.row_id);
+                        .relational_sync_source_at_read_root(&row.table, local.row_id)?
+                        .0;
                     let incoming_arrival = Self::resolve_incoming_arrival(&row, arrivals);
                     let incoming_wins = if adoption == SyncAdoption::ConfirmedPendingReconciliation
                         && matches!(
-                            self.relational_store
-                                .sync_source_kind(&row.table, local.row_id),
+                            self.relational_sync_source_at_read_root(&row.table, local.row_id)?
+                                .1,
                             Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
                         ) {
                         true
@@ -65707,8 +65764,8 @@ impl Database {
                         refusal_cause: None,
                     });
                     let committed_source = self
-                        .relational_store
-                        .sync_source_lsn(&row.table, local.row_id);
+                        .relational_sync_source_at_read_root(&row.table, local.row_id)?
+                        .0;
                     let mut overflow: Option<Error> = None;
                     for v in values.values() {
                         if let Value::TxId(incoming) = v
@@ -66858,9 +66915,7 @@ impl Database {
                 let winner_author = {
                     let accepted_author =
                         self.accepted_sync_row_author(&row.table, &row.natural_key)?;
-                    match self
-                        .relational_store
-                        .sync_source_kind(&row.table, winner.row_id)
+                    match self.relational_sync_source_at_read_root(&row.table, winner.row_id)?.1
                     {
                         Some(contextdb_relational::store::SyncSourceKind::Pulled)
                         | Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending) => {
@@ -66875,9 +66930,7 @@ impl Database {
                     // A synced winner carries the accepting hub's sidecar;
                     // a hub-local winner's row LSN is already its acceptance
                     // position. Never report the rejected edge's LSN here.
-                    hub_acceptance_position: self
-                        .relational_store
-                        .sync_source_lsn(&row.table, winner.row_id)
+                    hub_acceptance_position: self.relational_sync_source_at_read_root(&row.table, winner.row_id)?.0
                         .and_then(|lsn| Self::resolve_sync_source_lsn(Some(lsn), winner.lsn))
                         .or(Some(winner.lsn)),
                     natural_key: row.natural_key.clone(),
