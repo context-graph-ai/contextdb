@@ -8,10 +8,15 @@ use crate::store::{ResolvedVectorPolicy, VectorPartitionRef};
 use contextdb_core::{
     Error, Lsn, Result, RowId, SnapshotId, TxId, VectorEntry, VectorQuantization,
 };
-use hnsw_rs::hnsw::PointId;
+#[doc(hidden)]
+pub use hnsw_rs::hnsw::PointId;
+#[doc(hidden)]
+pub use hnsw_rs::hnswio::{decode_paged_point, encode_paged_point_into};
+#[doc(hidden)]
+pub use hnsw_rs::paged::{PagedEdge, PagedGraphState, PagedPoint};
 use hnsw_rs::paged::{
-    PagedGraphError, PagedGraphPolicy, PagedGraphState, PagedGraphWorkspace, PagedPoint,
-    PagedPointStorage, insert_paged, search_paged_allowed,
+    PagedGraphError, PagedGraphPolicy, PagedGraphWorkspace, PagedPointStorage, insert_paged,
+    search_paged_allowed,
 };
 use std::sync::{Arc, atomic::AtomicUsize};
 
@@ -1149,6 +1154,42 @@ pub enum PagedVectorValues {
     F32(Vec<f32>),
     Quantized(Vec<u8>),
 }
+impl PagedVectorValues {
+    /// Preserve an authenticated durable SQ payload in the existing graph
+    /// representation. The caller admits the returned header/body allocation;
+    /// no F32 reconstruction or second quantization occurs on this path.
+    #[doc(hidden)]
+    pub fn from_quantized_payload(
+        quantization: VectorQuantization,
+        len: usize,
+        min: f32,
+        max: f32,
+        payload: &[u8],
+    ) -> Result<Self> {
+        let expected = match quantization {
+            VectorQuantization::SQ8 => len,
+            VectorQuantization::SQ4 => len.div_ceil(2),
+            VectorQuantization::F32 => {
+                return Err(Error::Other("F32 has no quantized payload".into()));
+            }
+        };
+        if len == 0
+            || len > u32::MAX as usize
+            || !min.is_finite()
+            || !max.is_finite()
+            || min > max
+            || payload.len() != expected
+        {
+            return Err(Error::Other(
+                "invalid durable quantized vector payload".into(),
+            ));
+        }
+        Ok(Self::Quantized(
+            crate::quantized::encode_hnsw_quantized_payload(len, min, max, payload),
+        ))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PagedVectorBuildEntry {
     /// Full key in canonical insertion order: source LSN, creation tx,
@@ -1179,6 +1220,23 @@ pub trait PagedGenerationTransaction: PagedVectorTransaction {
         progress: &PagedVectorProgress,
         after: Option<&[u8]>,
     ) -> Result<Option<PagedVectorBuildEntry>>;
+    /// A provider may end one finite physical scan window before reaching EOF.
+    /// Existing providers return true; a bounded engine provider returns false
+    /// only after authenticating and skipping at least one complete source key.
+    fn source_window_exhausted(&self) -> bool {
+        true
+    }
+    /// Exclusive authenticated position reached by that finite scan window.
+    /// Rejected intervals advance progress without inserting a graph point.
+    fn source_window_position(&self) -> Option<&[u8]> {
+        None
+    }
+    /// Compare a canonical insertion key with a physical rejection position.
+    /// A provider using version buckets may resume inside an identity bucket;
+    /// ordinary providers retain the existing strict canonical comparison.
+    fn source_entry_after_position(&self, entry: &[u8], position: &[u8]) -> bool {
+        entry > position
+    }
     /// Persist one encoded point in the sealed change page layout, including
     /// its authenticated identity. Prior sealed pages stay durable, not resident.
     fn seal_point(&mut self, point: PointId, encoded: &[u8]) -> Result<()>;
@@ -1265,6 +1323,28 @@ pub struct PagedGenerationBuilder {
     live_workspace: Arc<AtomicUsize>,
     _partition_charge: PagedRootCharge,
 }
+impl PagedVectorBuildEntry {
+    #[doc(hidden)]
+    pub fn from_vector_entry(entry: VectorEntry, quantization: VectorQuantization) -> Self {
+        let source_key = canonical_source_key(entry.row_id, entry.lsn, entry.created_tx);
+        let values = if quantization == VectorQuantization::F32 {
+            PagedVectorValues::F32(entry.vector)
+        } else {
+            PagedVectorValues::Quantized(
+                StoredVector::from_f32(&entry.vector, quantization).to_hnsw_u8(),
+            )
+        };
+        Self {
+            source_key,
+            row_id: entry.row_id,
+            lsn: entry.lsn,
+            created_tx: entry.created_tx,
+            deleted_tx: entry.deleted_tx,
+            values,
+        }
+    }
+}
+
 impl PagedGenerationBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn resume(
@@ -1496,6 +1576,25 @@ impl PagedGenerationBuilder {
             transaction.checkpoint()?;
             let Some(entry) = transaction.source_next(previous, next.last_source_key.as_deref())?
             else {
+                if !transaction.source_window_exhausted() {
+                    let position = transaction.source_window_position().ok_or_else(|| {
+                        Error::Other(
+                            "paged generation finite source window made no progress".into(),
+                        )
+                    })?;
+                    if position.len() > plan.source_key_bytes
+                        || next
+                            .last_source_key
+                            .as_deref()
+                            .is_some_and(|last| position <= last)
+                    {
+                        return Err(Error::Other(
+                            "paged generation finite source position is invalid".into(),
+                        ));
+                    }
+                    next.last_source_key = Some(position.to_vec());
+                    return Ok(next);
+                }
                 if next.graph.points != next.total_points {
                     return Err(Error::Other(
                         "paged generation source count disagrees with its frontier".into(),
@@ -1507,10 +1606,9 @@ impl PagedGenerationBuilder {
             if entry.source_key.len() > plan.source_key_bytes
                 || entry.source_key
                     != canonical_source_key(entry.row_id, entry.lsn, entry.created_tx)
-                || next
-                    .last_source_key
-                    .as_ref()
-                    .is_some_and(|key| *key >= entry.source_key)
+                || next.last_source_key.as_ref().is_some_and(|key| {
+                    !transaction.source_entry_after_position(&entry.source_key, key)
+                })
                 || entry.created_tx > next.frontier_tx
                 || entry.lsn > next.frontier_lsn
                 || entry.deleted_tx.is_some_and(|tx| tx <= next.frontier_tx)
