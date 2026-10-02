@@ -531,7 +531,7 @@ fn assert_forbidden_statement_family_left_no_side_effects(
     context: &str,
     autocommit_probe_key: u128,
 ) {
-    let leaked_ddl = db.ddl_log_since(since);
+    let leaked_ddl = db.ddl_log_since(since).unwrap();
     assert!(
         leaked_ddl.is_empty(),
         "{context}: forbidden helper SQL leaked DDL entries after typed Err: {leaked_ddl:?}"

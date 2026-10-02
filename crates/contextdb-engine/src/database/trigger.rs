@@ -1974,7 +1974,7 @@ impl Database {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.clone())),
         );
-        let graph_edges = self.graph_edges_after_table_drop(table);
+        let graph_edges = self.graph_edges_after_table_drop(table)?;
         if let Some(persistence) = &self.persistence {
             persistence.remove_table_rewrite_aux_with_config_values_and_ddl_log(
                 table,

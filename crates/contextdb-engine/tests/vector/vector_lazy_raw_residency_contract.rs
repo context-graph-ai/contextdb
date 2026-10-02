@@ -5,6 +5,9 @@
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{ContextId, Error, RowId, Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
+use contextdb_engine::memory_accounting::{
+    take_budget_ledger_for_test, watch_budget_ledger_for_test,
+};
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
 use serial_test::serial;
 use std::collections::{BTreeSet, HashMap};
@@ -381,10 +384,10 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
 
     let reloaded_old_exact = db
         .execute_at_snapshot(exact_sql, &query, old_snapshot)
-        .expect("bulk exact reload preserves the historical replacement body");
+        .expect("exact reread preserves the historical replacement body");
     let reloaded_new_exact = db
         .execute_at_snapshot(exact_sql, &query, new_snapshot)
-        .expect("bulk exact reload preserves the current replacement body");
+        .expect("exact reread preserves the current replacement body");
     assert_eq!(reloaded_old_exact.rows, old_exact.rows);
     assert_eq!(reloaded_new_exact.rows, new_exact.rows);
     assert_eq!(
@@ -398,36 +401,26 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
     );
 
     let bytes_per_f32_body = MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>();
-    let minimum_bulk_reservation =
-        MANY_ROWS_PER_PARTITION * bytes_per_f32_body * 2 + bytes_per_f32_body * 2;
-    let point_reservation = bytes_per_f32_body * 4;
-    assert!(
-        point_reservation < minimum_bulk_reservation,
-        "one point body must fit where no complete partition can"
-    );
+    // The declared workspace cannot hold even one partition's F32 bodies.
+    const QUERY_WORKSPACE_BYTES: usize = 64 * 1024;
+    assert_eq!(MANY_ROWS_PER_PARTITION * bytes_per_f32_body, 102400);
     let settled_usage = db.accountant().usage().used;
-    db.set_memory_limit(Some(settled_usage + minimum_bulk_reservation - 1))
-        .expect("leave enough database memory for point scoring but not a bulk raw load");
+    db.set_memory_limit(Some(settled_usage + QUERY_WORKSPACE_BYTES))
+        .expect("admit candidate work while keeping partition bodies larger than the workspace");
     let settled_usage = db.accountant().usage().used;
-    let activity_before = db.__vector_passive_activity_counters_for_test();
     let ownership_before = db.vector_memory_ownership_receipt_for_test();
     let mut observed_graph_candidates = 0_u64;
     let mut observed_unique_candidates = 0_u64;
 
-    // Check the raw-load refusal while the fixture still owns every preloaded
-    // graph. Broad indexed reads below release that ownership as they finish,
-    // making the same memory cap less restrictive for later ordinary work.
-    let bulk_error = db
+    watch_budget_ledger_for_test();
+    let streamed = db
         .execute_at_snapshot(exact_sql, &query, new_snapshot)
-        .expect_err("the same memory ceiling must reject every complete raw-partition load");
-    assert!(
-        matches!(
-            &bulk_error,
-            Error::MemoryBudgetExceeded { operation, .. }
-                if operation == "load_raw_vector_partition"
-        ),
-        "the control must fail specifically at bulk raw-vector admission: {bulk_error:?}"
-    );
+        .expect("EXACT streams stored bodies under the same candidate ceiling");
+    let streamed_ledger = take_budget_ledger_for_test();
+    assert_eq!(streamed.rows, new_exact.rows);
+    assert_streamed_body_charges(&streamed_ledger, 1200);
+    assert_score_workspace(&streamed_ledger, true);
+    let activity_before = db.__vector_passive_activity_counters_for_test();
 
     for (snapshot, exact) in [(old_snapshot, &old_exact), (new_snapshot, &new_exact)] {
         for mode in ["AUTO", "INDEXED"] {
@@ -436,14 +429,29 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
                  ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 2"
             );
 
+            let arm_before = db.__vector_passive_activity_counters_for_test();
+            watch_budget_ledger_for_test();
             db.__reset_last_query_vector_trace_for_test();
             let ordinary = db
                 .execute_at_snapshot(&sql, &query, snapshot)
                 .unwrap_or_else(|error| panic!("ordinary {mode} candidate search failed: {error}"));
+            let ledger = take_budget_ledger_for_test();
             let ordinary_trace = db
                 .__take_last_query_vector_trace_for_test()
                 .expect("ordinary indexed route publishes a trace");
             assert_eq!(ordinary.rows, exact.rows);
+            assert_streamed_body_charges(&ledger, 20);
+            assert_score_workspace(&ledger, true);
+            let arm_after = db.__vector_passive_activity_counters_for_test();
+            assert_eq!(
+                arm_after.raw_candidate_point_loads - arm_before.raw_candidate_point_loads,
+                20
+            );
+            assert_eq!(
+                arm_after.raw_candidate_point_body_bytes
+                    - arm_before.raw_candidate_point_body_bytes,
+                10240
+            );
             assert!(
                 ordinary_trace.used_hnsw,
                 "{mode} must use all maintained graphs"
@@ -464,6 +472,8 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
                     .len() as u64,
             );
 
+            let arm_before = db.__vector_passive_activity_counters_for_test();
+            watch_budget_ledger_for_test();
             db.__reset_last_query_vector_trace_for_test();
             let bounded = db
                 .__with_snapshot_override_for_test(snapshot, || {
@@ -472,10 +482,23 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
                 .unwrap_or_else(|error| {
                     panic!("bounded {mode} candidate search failed: {error:?}")
                 });
+            let ledger = take_budget_ledger_for_test();
             let bounded_trace = db
                 .__take_last_query_vector_trace_for_test()
                 .expect("bounded indexed route publishes a trace");
             assert_eq!(bounded.result.rows, exact.rows);
+            assert_streamed_body_charges(&ledger, 20);
+            assert_score_workspace(&ledger, false);
+            let arm_after = db.__vector_passive_activity_counters_for_test();
+            assert_eq!(
+                arm_after.raw_candidate_point_loads - arm_before.raw_candidate_point_loads,
+                20
+            );
+            assert_eq!(
+                arm_after.raw_candidate_point_body_bytes
+                    - arm_before.raw_candidate_point_body_bytes,
+                10240
+            );
             assert_eq!(bounded.result.rows, ordinary.rows);
             assert!(
                 bounded_trace.used_hnsw,
@@ -504,22 +527,13 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
         activity_after.raw_partition_loads,
         activity_before.raw_partition_loads
     );
-    assert!(
-        point_loads > 0,
-        "the versioned graph candidate must use the point loader"
+    assert_eq!(observed_graph_candidates, 160);
+    assert_eq!(observed_unique_candidates, 160);
+    assert_eq!(
+        point_loads, 160,
+        "each selected visible identity is fetched once"
     );
-    // The one search scores its candidates nearest first and stops once the
-    // page cannot change, so it point-loads the rows it returns and never more
-    // than the distinct candidates its graph walk handed back, each once.
-    assert!(
-        (1..=observed_unique_candidates).contains(&point_loads),
-        "native scoring point-loads only distinct visible graph candidates, each once: \
-         {point_loads} point loads for {observed_unique_candidates} distinct candidates"
-    );
-    assert!(
-        point_loads <= observed_graph_candidates,
-        "point reads are bounded by graph candidates: {point_loads} > {observed_graph_candidates}"
-    );
+    assert_eq!(point_loads, observed_unique_candidates);
     assert_eq!(point_body_bytes, point_loads * bytes_per_f32_body as u64);
     assert_eq!(
         db.vector_store_for_test()
@@ -543,14 +557,14 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
     assert_eq!(
         graph_bytes(&ownership_after),
         graph_bytes(&ownership_before),
-        "without a memory limit, broad reads keep their reusable graphs resident"
+        "candidate reads preserve their preloaded graph ownership"
     );
     assert_eq!(db.accountant().usage().used, settled_usage);
     eprintln!(
         "indexed_candidate_memory_receipt partitions={MANY_PARTITIONS} rows={} \
          graph_candidates={observed_graph_candidates} unique_candidates={observed_unique_candidates} \
          point_loads={point_loads} point_body_bytes={point_body_bytes} raw_partition_load_delta=0 \
-         resident_raw_partitions=0 bulk_reservation_bytes={minimum_bulk_reservation}",
+         resident_raw_partitions=0 query_workspace_bytes={QUERY_WORKSPACE_BYTES}",
         MANY_PARTITIONS * MANY_ROWS_PER_PARTITION,
     );
     drop(old_pin);
@@ -559,9 +573,7 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
 /// When the automatic route compares rows exhaustively, it answers inside the
 /// memory the database declared by reading each stored vector through its own
 /// point read, instead of loading a whole partition of vectors it has no room
-/// for. An exhaustive search the caller asked for outright is the control:
-/// the same ceiling refuses its complete-partition load with the typed memory
-/// refusal, which proves no whole partition fits.
+/// for. Explicit EXACT has the same streamed-body and bounded-score contract.
 #[test]
 #[serial]
 fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
@@ -613,24 +625,23 @@ fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
     );
 
     let bytes_per_f32_body = MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>();
-    let minimum_bulk_reservation =
-        MANY_ROWS_PER_PARTITION * bytes_per_f32_body * 2 + bytes_per_f32_body * 2;
+    const QUERY_WORKSPACE_BYTES: usize = 64 * 1024;
+    assert_eq!(MANY_ROWS_PER_PARTITION * bytes_per_f32_body, 102400);
     let settled_usage = db.accountant().usage().used;
-    db.set_memory_limit(Some(settled_usage + minimum_bulk_reservation - 1))
+    db.set_memory_limit(Some(settled_usage + QUERY_WORKSPACE_BYTES))
         .expect("leave room for one stored vector at a time but not a whole partition");
     let settled_usage = db.accountant().usage().used;
 
-    let refused = db
+    let activity_before = db.__vector_passive_activity_counters_for_test();
+    watch_budget_ledger_for_test();
+    let streamed_exact = db
         .execute(exact_sql, &query)
-        .expect_err("no whole partition fits under this ceiling");
-    assert!(
-        matches!(
-            &refused,
-            Error::MemoryBudgetExceeded { operation, .. }
-                if operation == "load_raw_vector_partition"
-        ),
-        "the control is refused at the complete-partition load: {refused:?}"
-    );
+        .expect("EXACT streams inside the body and score workspace");
+    let exact_ledger = take_budget_ledger_for_test();
+    assert_streamed_body_charges(&exact_ledger, 1200);
+    assert_score_workspace(&exact_ledger, true);
+    assert_eq!(streamed_exact.rows, exact.rows);
+    watch_budget_ledger_for_test();
 
     let auto = db.execute(auto_sql, &query).unwrap_or_else(|error| {
         panic!(
@@ -638,6 +649,26 @@ fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
              one stored vector at a time, not load a whole partition: {error:?}"
         )
     });
+    let auto_ledger = take_budget_ledger_for_test();
+    assert_streamed_body_charges(&auto_ledger, 1200);
+    assert_score_workspace(&auto_ledger, true);
+    let activity_after = db.__vector_passive_activity_counters_for_test();
+    assert_eq!(
+        activity_after.raw_partition_loads,
+        activity_before.raw_partition_loads
+    );
+    assert_eq!(
+        activity_after.raw_candidate_point_loads - activity_before.raw_candidate_point_loads,
+        2400
+    );
+    assert_eq!(
+        activity_after.raw_candidate_point_body_bytes
+            - activity_before.raw_candidate_point_body_bytes,
+        1228800
+    );
+    let ownership = db.vector_memory_ownership_receipt_for_test();
+    assert_eq!(ownership.raw_vector_bodies, 0);
+    assert_eq!(ownership.temporary_workspace, 0);
     assert_eq!(auto.rows, exact.rows, "the automatic route answers exactly");
     assert_eq!(
         db.vector_store_for_test()
@@ -1732,4 +1763,50 @@ fn auto_refuses_typed_when_the_exact_score_array_cannot_fit() {
             "a refused search must not have materialized any payload_vec partition"
         );
     }
+}
+
+/// Each selected stored body owns 2,048 bytes from admission through decode
+/// and scoring; the next body cannot be admitted until that charge is returned.
+fn assert_streamed_body_charges(
+    ledger: &[contextdb_engine::memory_accounting::BudgetLedgerEntry],
+    expected_bodies: usize,
+) {
+    let mut outstanding = false;
+    let mut bodies = 0;
+    for entry in ledger {
+        if entry.what == "bounded_read/read/vector_candidates" && entry.bytes == 2048 {
+            assert!(
+                !outstanding,
+                "the previous body must be released before the next read"
+            );
+            outstanding = true;
+            bodies += 1;
+        } else if entry.what == "release" && entry.bytes == 2048 {
+            assert!(outstanding, "a body release must return an admitted body");
+            outstanding = false;
+        }
+    }
+    assert!(
+        !outstanding,
+        "the last stored body must release its workspace"
+    );
+    assert_eq!(bodies, expected_bodies);
+}
+
+fn assert_score_workspace(
+    ledger: &[contextdb_engine::memory_accounting::BudgetLedgerEntry],
+    ordinary: bool,
+) {
+    let search = ledger
+        .iter()
+        .filter(|entry| entry.what == "vector_search/search")
+        .map(|entry| entry.bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(search, if ordinary { vec![3072] } else { vec![] });
+    let ranking = ledger
+        .iter()
+        .filter(|entry| entry.what == "bounded_read/read/rank_candidates")
+        .map(|entry| entry.bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(ranking, vec![192]);
 }

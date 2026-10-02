@@ -2165,7 +2165,7 @@ impl OwnerReadService {
         // in the registry or this request receives the typed not-serving
         // refusal; a registration cannot appear after a successful drain.
         let state = self.state.lock().expect("owner service state");
-        if !matches!(*state, ServiceState::Serving) {
+        if !matches!(*state, ServiceState::Serving) || !self.admission.is_accepting() {
             return Err(OwnerReadScaffoldError::Refused(simple_failure(
                 ReadFailureKind::OwnerNotServing,
             )));
@@ -3484,6 +3484,14 @@ impl OwnerReadService {
             self.workers.request_stop();
         }
         Ok(still_in_flight)
+    }
+
+    /// Freeze admission while the owner finishes storage cleanup. The listener
+    /// remains published until the committed file is safe for direct readers.
+    pub(crate) fn pause_admission_for_handoff(&self) -> OwnerReadScaffoldResult<bool> {
+        let _state = self.state.lock().expect("owner service state");
+        self.admission.close_to_new_work()?;
+        Ok(!self.requests_drained_now())
     }
 
     /// A dropped owner stops admitting new work immediately, while the

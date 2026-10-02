@@ -3,6 +3,8 @@ use super::*;
 
 pub(super) const RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("writer_recovery");
+const RETENTION_CLOCK_BOUNDS: TableDefinition<&str, u64> =
+    TableDefinition::new("retention_clock_bounds");
 const BOUNDS_KEY: &str = "bounds";
 const COMMIT_ROOT_KEY: &str = "commit_directory_root";
 
@@ -27,6 +29,135 @@ pub(crate) struct WriterOpenBounds {
 }
 
 impl RedbPersistence {
+    pub(crate) fn config_prefix_exists_at_root(
+        root: &WriterSnapshot,
+        prefix: &str,
+    ) -> Result<bool> {
+        let read = root.owner_read();
+        let table = match read.open_table(CONFIG_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(Self::storage_error(error)),
+        };
+        let mut entries = table.range(prefix..).map_err(Self::storage_error)?;
+        match entries.next() {
+            Some(entry) => {
+                let (key, _) = entry.map_err(Self::storage_error)?;
+                Ok(key.value().starts_with(prefix))
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) fn pruned_change_counts_at_root(
+        root: &Arc<WriterSnapshot>,
+        pruned: &HashMap<String, HashSet<(RowId, Lsn)>>,
+    ) -> Result<(u64, HashMap<Lsn, u64>)> {
+        let mut counts = HashMap::new();
+        let mut total = 0;
+        for (table, identities) in pruned {
+            let lsns = identities
+                .iter()
+                .map(|(_, lsn)| *lsn)
+                .collect::<HashSet<_>>();
+            for lsn in lsns {
+                let mut cursor = root.table_change_cursor(table, lsn, lsn)?;
+                while let Some(window) = cursor.next_table_change()? {
+                    #[cfg(feature = "test-seams")]
+                    crate::database::resident_history_test_seams::note(|work| {
+                        work.log_keys_examined += 2
+                    });
+                    let row = match &window.value {
+                        ChangeLogEntry::RowInsert { row_id, .. }
+                        | ChangeLogEntry::RowDelete { row_id, .. } => Some(*row_id),
+                        _ => None,
+                    };
+                    if row.is_some_and(|row| identities.contains(&(row, lsn))) {
+                        total += 1;
+                        *counts.entry(lsn).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        Ok((total, counts))
+    }
+
+    pub(crate) fn commit_candidates_at_root(
+        root: &WriterSnapshot,
+        manager: &contextdb_tx::TransactionManager<Box<dyn contextdb_tx::WriteSetApplicator>>,
+        removed: &HashMap<Lsn, u64>,
+        affected: &HashSet<Lsn>,
+    ) -> Result<Vec<Lsn>> {
+        let read = root.owner_read();
+        let counts = read
+            .open_table(TableDefinition::<u64, u64>::new("change_log_lsn_count"))
+            .map_err(Self::storage_error)?;
+        let mut floor = None;
+        for entry in counts.iter().map_err(Self::storage_error)? {
+            let (lsn, count) = entry.map_err(Self::storage_error)?;
+            #[cfg(feature = "test-seams")]
+            crate::database::resident_history_test_seams::note(|work| work.log_keys_examined += 1);
+            let lsn = Lsn(lsn.value());
+            if count.value() > removed.get(&lsn).copied().unwrap_or(0) {
+                floor = Some(lsn);
+                break;
+            }
+        }
+        let anchor = manager
+            .try_commit_index_floor(
+                floor.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+            )?
+            .map(|(lsn, _)| lsn);
+        let mut candidates = Vec::new();
+        for lsn in affected {
+            #[cfg(feature = "test-seams")]
+            crate::database::resident_history_test_seams::note(|work| work.log_keys_examined += 1);
+            if Some(*lsn) != anchor
+                && root.change_log_occurrences(*lsn)? <= removed.get(lsn).copied().unwrap_or(0)
+            {
+                candidates.push(*lsn);
+            }
+        }
+        Ok(candidates)
+    }
+
+    pub(crate) fn admit_retention_probe_key(
+        root: &WriterSnapshot,
+        bytes: usize,
+    ) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
+        root.adapter_control(bytes)
+    }
+
+    /// A monotone upper bound can prove that no retained row is future-dated.
+    /// Deletes need not lower it: a high stale bound only keeps the exact scan.
+    pub(crate) fn retention_clock_upper_in_read(
+        root: &WriterSnapshot,
+        table: &str,
+    ) -> Result<Option<Wallclock>> {
+        let read = root.owner_read();
+        let bounds = match read.open_table(RETENTION_CLOCK_BOUNDS) {
+            Ok(bounds) => bounds,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(Self::storage_error(error)),
+        };
+        Ok(bounds
+            .get(table)
+            .map_err(Self::storage_error)?
+            .map(|value| Wallclock(value.value())))
+    }
+
+    pub(super) fn invalidate_retention_clock_in_write(
+        write: &redb::WriteTransaction,
+        table: &str,
+    ) -> Result<()> {
+        write
+            .open_table(RETENTION_CLOCK_BOUNDS)
+            .map_err(Self::storage_error)?
+            .remove(table)
+            .map_err(Self::storage_error)?;
+        Ok(())
+    }
+
     pub(crate) fn writer_recovery_floors_in_read(
         snapshot: &WriterSnapshot,
     ) -> Result<WriterRecoveryBounds> {
@@ -98,6 +229,43 @@ impl RedbPersistence {
         write: &redb::WriteTransaction,
         ws: Option<&WriteSet>,
     ) -> Result<()> {
+        {
+            let mut clocks = write
+                .open_table(RETENTION_CLOCK_BOUNDS)
+                .map_err(Self::storage_error)?;
+            if let Some(ws) = ws {
+                for (table, row) in &ws.relational_inserts {
+                    if let Some(stamp) = row.created_at {
+                        let previous = clocks
+                            .get(table.as_str())
+                            .map_err(Self::storage_error)?
+                            .map(|value| value.value());
+                        // An absent bound is unknown for an existing family.
+                        // Only its first ordinary insert can establish complete
+                        // coverage without scanning old versions.
+                        if previous.is_none() {
+                            let counts = write
+                                .open_table(RECOVERY_TABLE)
+                                .map_err(Self::storage_error)?;
+                            let key = format!("row_versions:{table}");
+                            let empty_before = counts
+                                .get(key.as_str())
+                                .map_err(Self::storage_error)?
+                                .is_some_and(|value| value.value() == 0u64.to_be_bytes());
+                            if !empty_before {
+                                continue;
+                            }
+                        }
+                        let maximum = previous.unwrap_or(0);
+                        if stamp.0 > maximum {
+                            clocks
+                                .insert(table.as_str(), stamp.0)
+                                .map_err(Self::storage_error)?;
+                        }
+                    }
+                }
+            }
+        }
         let (commit_count, last) = {
             let commits = write
                 .open_table(COMMIT_INDEX_TABLE)
@@ -110,6 +278,18 @@ impl RedbPersistence {
                     .map(|(lsn, tx)| (lsn.value(), tx.value())),
             )
         };
+        // Metadata-only declarations need not have a row commit-index entry.
+        // Preserve their frontier from one end-key seek, without decoding history.
+        let ddl_lsn = {
+            let ddl = write
+                .open_table(DDL_LOG_TABLE)
+                .map_err(Self::storage_error)?;
+            ddl.last()
+                .map_err(Self::storage_error)?
+                .map(|(key, _)| Self::ddl_lsn_from_key(key.value()))
+                .transpose()?
+                .unwrap_or(Lsn(0))
+        };
         let mut table = write
             .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
@@ -120,11 +300,18 @@ impl RedbPersistence {
             .transpose()?
             .unwrap_or_default();
         bounds.commit_count = commit_count;
+        bounds.source_lsn_floor = bounds.source_lsn_floor.max(ddl_lsn.0);
         if let Some((lsn, tx)) = last {
             bounds.identity_tx_floor = bounds.identity_tx_floor.max(tx);
             bounds.source_lsn_floor = bounds.source_lsn_floor.max(lsn);
         }
         if let Some(ws) = ws {
+            for (key, bytes) in &ws.config_writes {
+                let (row, lsn) =
+                    crate::database::Database::lineage_recovery_floors_for_write(key, bytes)?;
+                bounds.external_row_id_floor = bounds.external_row_id_floor.max(row.0);
+                bounds.source_lsn_floor = bounds.source_lsn_floor.max(lsn.0);
+            }
             // Imports can name identities beyond the local commit frontier.
             let tx = Self::write_set_visibility_tx(ws)
                 .into_iter()
@@ -350,6 +537,15 @@ impl RedbPersistence {
             commit_last,
             commit_count: count,
         };
+        match read.open_table(DDL_LOG_TABLE) {
+            Ok(ddl) => {
+                if let Some((key, _)) = ddl.last().map_err(Self::storage_error)? {
+                    bounds.max_lsn = bounds.max_lsn.max(Self::ddl_lsn_from_key(key.value())?);
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(Self::storage_error(error)),
+        }
         match read.open_table(writer_history::WRITER_CHANGE_LOG_TABLE) {
             Ok(log) => {
                 if let Some((key, _)) = log.last().map_err(Self::storage_error)? {
@@ -392,6 +588,18 @@ impl RedbPersistence {
 }
 
 impl RedbPersistence {
+    pub(super) fn raise_config_identity_floors_in_write(
+        write: &redb::WriteTransaction,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let (row, lsn) = crate::database::Database::lineage_recovery_floors_for_write(key, bytes)?;
+        if row.0 != 0 || lsn.0 != 0 {
+            Self::raise_noncanonical_writer_floors_in_write(write, TxId(0), lsn, row)?;
+        }
+        Ok(())
+    }
+
     /// Snapshot/import batching can install identities without a canonical
     /// commit entry in that batch. Preserve their floors before committing.
     pub(super) fn raise_noncanonical_writer_floors_in_write(

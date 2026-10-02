@@ -9906,19 +9906,10 @@ fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
     let vector_search_bytes = 3usize
         .saturating_mul(f.source_vec.len())
         .saturating_mul(std::mem::size_of::<f32>());
-    // Candidate-route preflight now reserves the score slots needed to prove
-    // this unindexed filter can still use exact work. Leave enough room for
-    // that transient check while keeping less than one overlay entry, so the
-    // active-transaction overlay remains the reservation the budget refuses.
+    // The statement overlay owns the active transaction's relational row
+    // before vector scoring. Leave 180 bytes after the source-vector working
+    // set so its 224-byte row-copy admission is the exact refusal boundary.
     const SLACK_BEFORE_OVERLAY: usize = 192;
-    let one_overlay_entry_bytes = std::mem::size_of::<contextdb_core::VectorEntry>()
-        .saturating_add(std::mem::size_of::<(RowId, Vec<f32>)>())
-        .saturating_add(f.source_vec.len() * std::mem::size_of::<f32>())
-        .saturating_add(64);
-    assert!(
-        SLACK_BEFORE_OVERLAY < one_overlay_entry_bytes,
-        "the fixture must still make the overlay reservation exceed its remaining headroom"
-    );
     accountant
         .set_budget(Some(
             before_budget_probe
@@ -9934,19 +9925,42 @@ fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
         ),
         "active transaction vector overlay should respect MEMORY_LIMIT",
     );
-    assert!(
-        matches!(
-            budget_err,
-            Error::MemoryBudgetExceeded { ref operation, .. }
-                if operation.starts_with("active_tx_vector_overlay@docs.embedding")
+    match budget_err {
+        Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        } => {
+            assert_eq!(
+                (subsystem.as_str(), operation.as_str()),
+                ("relational", "statement_overlay")
+            );
+            assert_eq!((requested_bytes, available_bytes), (224, 180));
+            assert_eq!(
+                budget_limit_bytes,
+                before_budget_probe + vector_search_bytes + SLACK_BEFORE_OVERLAY
+            );
+            assert!(!hint.is_empty());
+        }
+        other => panic!(
+            "the statement overlay must refuse before cloning its row/vector state: {other:?}"
         ),
-        "active tx exact overlay must be memory-accounted before cloning vectors: {budget_err:?}"
-    );
+    }
     assert_eq!(
         accountant.usage().used,
         before_budget_probe,
         "failed overlay reservation must release the vector-search working set"
     );
+    accountant.set_budget(Some(4 * 1024 * 1024)).unwrap();
+    let recovered = prv_expect_query_ok(db.execute_in_tx(tx,
+        "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+        &params(vec![("query_id", Value::Uuid(f.source))])), "same transaction remains readable after overlay refusal");
+    prv_assert_same_signature(&recovered, &persisted);
+    assert_eq!(accountant.usage().used, before_budget_probe);
+    db.rollback(tx).unwrap();
 }
 
 #[test]

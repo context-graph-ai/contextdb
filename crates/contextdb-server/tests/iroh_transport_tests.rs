@@ -2126,7 +2126,7 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
         .expect("read the bootstrapped hub source");
     let hub_schema_lsn = hub.current_lsn();
     assert!(
-        hub.ddl_log_since(hub_schema_lsn).is_empty(),
+        hub.ddl_log_since(hub_schema_lsn).unwrap().is_empty(),
         "the captured hub frontier has no later DDL to deliver during row-only reconciliation"
     );
     edge.persist_sync_pull_watermark(&tenant, hub_schema_lsn)

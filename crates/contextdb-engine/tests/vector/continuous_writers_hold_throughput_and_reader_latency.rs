@@ -1,4 +1,4 @@
-//! Acceptance statements 40 and 41 (continuous-writer fixture): under six closed-loop writers
+//! Continuous writers preserve throughput and reader latency: under six closed-loop writers
 //! running the fixed ten-commit mix (6 inserts, 3 vector replacements, 1 delete) the written
 //! partition stays on its maintained route, replacement base generations keep publishing, no
 //! writer starves, and the unrelated prebuilt partition keeps its generation.

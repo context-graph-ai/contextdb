@@ -432,6 +432,50 @@ fn database_public_methods(engine: &Path) -> Vec<ImplItemFn> {
         .collect()
 }
 
+// Inventory every declared method, but normal-build reachability also honors
+// the enclosing out-of-line module's test-only gate.
+fn database_normal_public_methods(engine: &Path) -> Vec<ImplItemFn> {
+    let root = engine.join("src/database.rs");
+    let source = std::fs::read_to_string(&root).expect("read Database module declarations");
+    let file = syn::parse_file(&source).expect("parse Database module declarations");
+    let gated = file
+        .items
+        .iter()
+        .filter_map(|item| {
+            let Item::Mod(module) = item else {
+                return None;
+            };
+            module
+                .attrs
+                .iter()
+                .any(cfg_is_test_only)
+                .then(|| module.ident.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut paths = vec![root];
+    collect_rust_files(&engine.join("src/database"), &mut paths);
+    paths
+        .iter()
+        .filter(|path| {
+            let Ok(relative) = path.strip_prefix(engine.join("src/database")) else {
+                return true;
+            };
+            let first = relative
+                .components()
+                .next()
+                .expect("module path")
+                .as_os_str();
+            let module = Path::new(first)
+                .file_stem()
+                .expect("module name")
+                .to_str()
+                .expect("UTF-8 module");
+            !gated.contains(module)
+        })
+        .flat_map(|path| public_impl_methods(path, "Database"))
+        .collect()
+}
+
 fn collect_rust_files(directory: &Path, paths: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory).expect("read Database implementation directory") {
         let path = entry.expect("Database implementation entry").path();
@@ -497,6 +541,7 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         .expect("read server reexports");
 
     let database_names = method_names(&database);
+    let database_normal_names = method_names(&database_normal_public_methods(&engine));
     let client_names = method_names(&client);
     let server_names = method_names(&server);
     let accountant = public_impl_methods(
@@ -568,7 +613,7 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         "SyncClient methods still expose policy, direction, or arbitrary transport types: {client_sensitive_reachability:?}"
     );
     for (surface, names) in [
-        ("Database", &database_names),
+        ("Database", &database_normal_names),
         ("SyncClient", &client_names),
         ("SyncServer", &server_names),
         ("MemoryAccountant", &accountant_names),

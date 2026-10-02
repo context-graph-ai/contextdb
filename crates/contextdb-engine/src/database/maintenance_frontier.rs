@@ -3,12 +3,17 @@ use super::*;
 use crate::persistence::writer_adapters::WriterRelationalSource;
 use contextdb_relational::source::RelationalReadSource;
 use parking_lot::RwLockReadGuard;
+use serde::{Deserialize, Serialize};
 use std::ops::Bound;
 
 pub(super) struct MaintenanceFrontier<'a> {
     memory: Option<RwLockReadGuard<'a, HashMap<String, Vec<VersionedRow>>>>,
     source: Option<WriterRelationalSource>,
     store: &'a RelationalStore,
+    root: Option<Arc<crate::persistence::WriterSnapshot>>,
+    retention_windows: HashMap<String, RetentionWindow>,
+    retention_progress: Vec<(String, Vec<u8>)>,
+    retention_scope: bool,
 }
 
 impl<'a> MaintenanceFrontier<'a> {
@@ -20,7 +25,7 @@ impl<'a> MaintenanceFrontier<'a> {
         manager: &TransactionManager<DynStore>,
     ) -> Result<Self> {
         let root = writer_read::durable_root(manager.capture_published_read().handle)?;
-        let source = root.map(WriterRelationalSource::new).transpose()?;
+        let source = root.clone().map(WriterRelationalSource::new).transpose()?;
         if store.uses_disk_backed_committed_bodies() && source.is_none() {
             return Err(Error::Other(
                 "maintenance has no committed durable root".into(),
@@ -31,7 +36,204 @@ impl<'a> MaintenanceFrontier<'a> {
             memory,
             source,
             store,
+            root,
+            retention_windows: HashMap::new(),
+            retention_progress: Vec::new(),
+            retention_scope: false,
         })
+    }
+
+    /// The repeated candidate, protection and mutation walks share one finite
+    /// physical window. Only its key bounds survive between walks; row bodies
+    /// are released with each admitted cursor window.
+    pub(super) fn retention_batch(
+        mut self,
+        metas: &HashMap<String, TableMeta>,
+        phase: &str,
+        workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<Self> {
+        self.retention_scope = true;
+        let (Some(root), Some(source)) = (&self.root, &self.source) else {
+            return Ok(self);
+        };
+        // A mutually dependent expiry cohort must retain its existing joint
+        // FK fixed point. Independent windows cannot decide that a child in a
+        // later window will disappear; keep that path until its work queue is
+        // durable and resumable as well.
+        if metas
+            .values()
+            .filter(|meta| meta.default_ttl_seconds.is_some())
+            .any(|meta| {
+                meta.columns
+                    .iter()
+                    .filter_map(|column| column.references.as_ref())
+                    .any(|reference| {
+                        metas
+                            .get(&reference.table)
+                            .is_some_and(|parent| parent.default_ttl_seconds.is_some())
+                    })
+                    || meta.composite_foreign_keys.iter().any(|reference| {
+                        metas
+                            .get(&reference.parent_table)
+                            .is_some_and(|parent| parent.default_ttl_seconds.is_some())
+                    })
+            })
+        {
+            return Ok(self);
+        }
+        workspace.try_grow_for(
+            1024usize.saturating_add(
+                metas
+                    .iter()
+                    .filter(|(_, meta)| meta.default_ttl_seconds.is_some())
+                    .map(|(name, _)| 512 + name.len() * 4)
+                    .sum::<usize>(),
+            ),
+            "retention",
+            "selection_continuation",
+            "Raise MEMORY_LIMIT to admit retention selection controls.",
+        )?;
+        let mut tables = metas
+            .iter()
+            .filter(|(_, meta)| meta.default_ttl_seconds.is_some())
+            .collect::<Vec<_>>();
+        tables.sort_unstable_by_key(|(name, _)| *name);
+        let rotation_key = format!("retention_selection/{phase}/");
+        if let Some(after) = root.config_point::<String>(&rotation_key)? {
+            let start = tables.partition_point(|(name, _)| name.as_str() <= after.value.as_str());
+            if start < tables.len() {
+                tables.rotate_left(start);
+            }
+        }
+        let mut rotation = None;
+        // Expiry only stamps visibility and can select a wider independent
+        // window than physical reclamation. Referenced parents retain the
+        // smaller probe budget for their FK checks.
+        let has_referenced_retained_table = metas.values().any(|child| {
+            child
+                .columns
+                .iter()
+                .filter_map(|column| column.references.as_ref())
+                .any(|reference| {
+                    metas
+                        .get(&reference.table)
+                        .is_some_and(|parent| parent.default_ttl_seconds.is_some())
+                })
+                || child.composite_foreign_keys.iter().any(|reference| {
+                    metas
+                        .get(&reference.parent_table)
+                        .is_some_and(|parent| parent.default_ttl_seconds.is_some())
+                })
+        });
+        let mut remaining = if phase == "expiry" && !has_referenced_retained_table {
+            128usize
+        } else {
+            32usize
+        };
+        for (table, meta) in tables {
+            let key = format!("retention_selection/{phase}/{table}");
+            let declaration = RedbPersistence::currency_cleanup_declaration(meta)?;
+            let saved = root.config_point::<RetentionPosition>(&key)?;
+            let saved = saved
+                .as_ref()
+                .filter(|saved| saved.value.declaration == declaration);
+            let after = saved.and_then(|saved| saved.value.after);
+            let mut window = RetentionWindow {
+                after,
+                through: None,
+            };
+            if remaining > 0 {
+                rotation = Some(table.clone());
+                // Freeze this sweep's last physical identity. New appended
+                // identities join the next sweep instead of extending this
+                // one indefinitely. Read only one admitted reverse window.
+                let end = if let Some(saved) = saved.filter(|saved| saved.value.after.is_some()) {
+                    saved.value.end
+                } else {
+                    let mut tail =
+                        source.row_cursor(table, Bound::Unbounded, Bound::Unbounded, true)?;
+                    let tail = tail.next_window()?;
+                    #[cfg(feature = "test-seams")]
+                    if tail.is_some() {
+                        resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+                    }
+                    tail.map(|row| {
+                        row.position_key()
+                            .try_into()
+                            .map_err(|_| Error::StoreCorrupted {
+                                path: table.clone(),
+                                reason: "retention end position has the wrong length".into(),
+                            })
+                    })
+                    .transpose()?
+                };
+                let mut cursor = source.row_cursor(
+                    table,
+                    after
+                        .as_ref()
+                        .map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_slice())),
+                    end.as_ref().map_or(Bound::Unbounded, |key: &[u8; 24]| {
+                        Bound::Included(key.as_slice())
+                    }),
+                    false,
+                )?;
+                let mut next = after;
+                while end.is_some() && remaining > 0 {
+                    let Some(row) = cursor.next_window()? else {
+                        next = None;
+                        break;
+                    };
+                    let physical: [u8; 24] =
+                        row.position_key()
+                            .try_into()
+                            .map_err(|_| Error::StoreCorrupted {
+                                path: table.clone(),
+                                reason: "retention position has the wrong length".into(),
+                            })?;
+                    window.through = Some(physical);
+                    next = Some(physical);
+                    remaining -= 1;
+                    #[cfg(feature = "test-seams")]
+                    resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+                }
+                self.retention_progress.push((
+                    key,
+                    RedbPersistence::encode_config_value(&RetentionPosition {
+                        declaration,
+                        after: next,
+                        end: next.and(end),
+                    })?,
+                ));
+            }
+            self.retention_windows.insert(table.clone(), window);
+        }
+        if let Some(rotation) = rotation {
+            self.retention_progress.push((
+                rotation_key,
+                RedbPersistence::encode_config_value(&rotation)?,
+            ));
+        }
+        Ok(self)
+    }
+
+    pub(super) fn retention_progress(&self) -> &[(String, Vec<u8>)] {
+        &self.retention_progress
+    }
+
+    pub(super) fn no_future_stamps(&self, table: &str, horizon: u64) -> Result<bool> {
+        match &self.root {
+            Some(root) => Ok(RedbPersistence::retention_clock_upper_in_read(root, table)?
+                .is_some_and(|stamp| stamp.0 <= horizon)),
+            None => Ok(false),
+        }
+    }
+
+    pub(super) fn visit_all(
+        &self,
+        table: &str,
+        visit: impl FnMut(&VersionedRow) -> Result<bool>,
+    ) -> Result<()> {
+        self.visit_selected(table, false, visit)
     }
 
     pub(super) fn cleanup_rotation(&self) -> Result<Option<[u8; 32]>> {
@@ -61,10 +263,105 @@ impl<'a> MaintenanceFrontier<'a> {
     pub(super) fn visit(
         &self,
         table: &str,
+        visit: impl FnMut(&VersionedRow) -> Result<bool>,
+    ) -> Result<()> {
+        self.visit_selected(table, true, visit)
+    }
+
+    /// FK protection probes the complete captured child frontier, independently
+    /// of the candidate window. Current-only postings avoid retained history.
+    pub(super) fn visit_references(
+        &self,
+        table: &str,
+        columns: &[String],
+        values: &[&Value],
         mut visit: impl FnMut(&VersionedRow) -> Result<bool>,
     ) -> Result<()> {
         if let Some(source) = &self.source {
-            let mut cursor = source.row_cursor(table, Bound::Unbounded, Bound::Unbounded, false)?;
+            let metas = self.store.table_meta.read();
+            let meta = metas
+                .get(table)
+                .ok_or_else(|| Error::TableNotFound(table.into()))?;
+            if let Some(index) = meta.indexes.iter().find(|index| {
+                index.columns.len() == columns.len()
+                    && index
+                        .columns
+                        .iter()
+                        .zip(columns)
+                        .all(|((name, _), column)| name == column)
+            }) {
+                let _key_memory = RedbPersistence::admit_retention_probe_key(
+                    self.root.as_ref().expect("durable reference root"),
+                    128usize.saturating_add(
+                        values
+                            .iter()
+                            .map(|value| held::value(value).saturating_mul(2))
+                            .sum::<usize>(),
+                    ),
+                )?;
+                let key = index
+                    .columns
+                    .iter()
+                    .zip(values)
+                    .map(|((_, direction), value)| match direction {
+                        SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc((*value).clone())),
+                        SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc((*value).clone())),
+                    })
+                    .collect::<Vec<_>>();
+                let mut cursor = source.exact_index_cursor(table, &index.name, true, &key)?;
+                while let Some(posting) = cursor.next_window()? {
+                    #[cfg(feature = "test-seams")]
+                    resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+                    if let Some(row) = contextdb_relational::source::visible_row(
+                        source,
+                        table,
+                        posting.value().entry.row_id,
+                        source.snapshot(),
+                    )? {
+                        #[cfg(feature = "test-seams")]
+                        resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+                        if !visit(row.value())? {
+                            break;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+        self.visit_selected(table, false, |row| {
+            #[cfg(feature = "test-seams")]
+            if self.is_durable() {
+                resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+            }
+            visit(row)
+        })
+    }
+
+    fn visit_selected(
+        &self,
+        table: &str,
+        selected_only: bool,
+        mut visit: impl FnMut(&VersionedRow) -> Result<bool>,
+    ) -> Result<()> {
+        if let Some(source) = &self.source {
+            let selected = if selected_only {
+                self.retention_windows.get(table)
+            } else {
+                None
+            };
+            if selected.is_some_and(|window| window.through.is_none()) {
+                return Ok(());
+            }
+            let mut cursor = source.row_cursor(
+                table,
+                selected
+                    .and_then(|window| window.after.as_ref())
+                    .map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_slice())),
+                selected
+                    .and_then(|window| window.through.as_ref())
+                    .map_or(Bound::Unbounded, |key| Bound::Included(key.as_slice())),
+                false,
+            )?;
             while let Some(window) = cursor.next_window()? {
                 if !visit(window.value())? {
                     break;
@@ -89,6 +386,10 @@ impl<'a> MaintenanceFrontier<'a> {
         if let Some(source) = &self.source {
             let mut cursor = source.row_id_cursor(table, row_id, source.snapshot())?;
             while let Some(window) = cursor.next_window()? {
+                #[cfg(feature = "test-seams")]
+                if self.retention_scope {
+                    resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+                }
                 if !visit(window.value())? {
                     break;
                 }
@@ -215,4 +516,16 @@ impl<'a> MaintenanceFrontier<'a> {
         }
         Ok(state)
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RetentionPosition {
+    declaration: [u8; 32],
+    after: Option<[u8; 24]>,
+    end: Option<[u8; 24]>,
+}
+
+struct RetentionWindow {
+    after: Option<[u8; 24]>,
+    through: Option<[u8; 24]>,
 }

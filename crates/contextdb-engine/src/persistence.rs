@@ -16815,7 +16815,12 @@ pub struct RedbPersistence {
     db: std::sync::RwLock<Option<redb::Database>>,
     writer_file: std::sync::RwLock<Option<Arc<LockedWriterFile>>>,
     lock_file: std::sync::RwLock<Option<CompanionGuard>>,
-    storage_compaction: Mutex<(redb::CompactionCursor, redb::CompactionProgress, f64)>,
+    storage_compaction: Mutex<(
+        redb::CompactionCursor,
+        redb::CompactionProgress,
+        f64,
+        Option<crate::memory_accounting::OwnedMemoryReservation>,
+    )>,
     #[cfg(feature = "test-seams")]
     handoff_prepare_io_fault: AtomicBool,
     /// The database's own memory accountant, attached once the owning
@@ -19292,8 +19297,15 @@ impl RedbPersistence {
         Self::open_with_cache(path, REDB_CACHE_BYTES)
     }
 
-    /// Open with the page cache a declared `MEMORY_LIMIT` allows, rather than
-    /// the flat ceiling.
+    /// Settle the native capacity after the effective persisted limit is known,
+    /// before writable startup publishes any source or reader root.
+    pub(crate) fn settle_writer_cache_budget(&self, bytes: usize) -> Result<usize> {
+        self.with_db(|db| {
+            db.settle_startup_cache_budget(bytes)
+                .map_err(Self::storage_error)
+        })
+    }
+
     /// Record what the owning database charged for this store's page cache.
     pub(crate) fn record_cache_charge(&self, bytes: usize) {
         let _ = self.cache_charge_bytes.set(bytes);
@@ -22073,6 +22085,7 @@ impl RedbPersistence {
                     config.remove(key.as_str()).map_err(Self::storage_error)?;
                 }
                 for (key, value) in stage.config_values.iter().chain(&ws.config_writes) {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, value)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     let value = if stage
                         .config_max_u64_keys
@@ -22576,6 +22589,7 @@ impl RedbPersistence {
                     config.remove(key.as_str()).map_err(Self::storage_error)?;
                 }
                 for (key, value) in stage.config_values.iter().chain(&ws.config_writes) {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, value)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     let value = if ws.config_max_u64_keys.iter().any(|max_key| max_key == key) {
                         let incoming = Self::decode::<u64>(value)?;
@@ -22764,6 +22778,7 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?;
                 }
                 for (key, encoded) in stage.config_values.iter().chain(&ws.config_writes) {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, encoded)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     config_table
                         .insert(key.as_str(), encoded.as_slice())
@@ -22801,6 +22816,7 @@ impl RedbPersistence {
                 identity_mutations.extend(content_identity::config_mutations(key, None));
             }
             for (key, encoded) in stage.config_values.iter().chain(&ws.config_writes) {
+                Self::raise_config_identity_floors_in_write(&write_txn, key, encoded)?;
                 identity_mutations.extend(content_identity::config_mutations(key, Some(encoded)));
             }
             for (index, change) in stage.ddl.iter().enumerate() {
@@ -22917,6 +22933,7 @@ impl RedbPersistence {
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
                 for (key, encoded) in config_values {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     config_table
                         .insert(key, encoded.as_slice())
@@ -23005,6 +23022,7 @@ impl RedbPersistence {
                 &content_identity::config_mutations(key, Some(&encoded)),
                 &mut self.proof_admission(),
             )?;
+            Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
@@ -23072,6 +23090,7 @@ impl RedbPersistence {
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
                 for (key, encoded) in config_values {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     config_table
                         .insert(key, encoded.as_slice())
@@ -23120,6 +23139,7 @@ impl RedbPersistence {
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
                 for (key, encoded) in config_values {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     config_table
                         .insert(key, encoded.as_slice())
@@ -23683,6 +23703,7 @@ impl RedbPersistence {
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
                 for (key, encoded) in config_values {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     config_table
                         .insert(key, encoded.as_slice())
@@ -23836,6 +23857,7 @@ impl RedbPersistence {
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
                 for (key, encoded) in config_values {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     config_table
                         .insert(key, encoded.as_slice())
@@ -23876,6 +23898,7 @@ impl RedbPersistence {
         let sources = self.load_sync_source_lsns()?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            Self::invalidate_retention_clock_in_write(&write_txn, name)?;
             {
                 let table_name = Self::rel_table_name(name);
                 let table_def: TableDefinition<&[u8], &[u8]> =
@@ -24107,6 +24130,7 @@ impl RedbPersistence {
             self.prepare_writer_schema_change(std::iter::empty(), std::iter::once((name, meta)))?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            Self::invalidate_retention_clock_in_write(&write_txn, name)?;
             let mut identity_mutations = content_identity::schema_mutations(name, meta)?;
             identity_mutations.extend(
                 previous_rows
@@ -24249,6 +24273,7 @@ impl RedbPersistence {
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
                 for (key, encoded) in config_values {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, &encoded)?;
                     Self::update_policy_hold_release_index(&write_txn, key, true)?;
                     config_table
                         .insert(key, encoded.as_slice())
@@ -24710,8 +24735,13 @@ impl RedbPersistence {
                 let Some(indexes) = &indexes else {
                     break;
                 };
+                let upper = writer_source::prefix_end(prefix.as_bytes())
+                    .and_then(|end| String::from_utf8(end).ok());
+                let upper = upper
+                    .as_deref()
+                    .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
                 for entry in indexes
-                    .range(prefix.as_str()..)
+                    .range::<&str>((std::ops::Bound::Included(prefix.as_str()), upper))
                     .map_err(Self::storage_error)?
                 {
                     let (key, value) = entry.map_err(Self::storage_error)?;
@@ -28961,6 +28991,7 @@ impl RedbPersistence {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
 
             for (name, rows) in table_rows {
+                Self::invalidate_retention_clock_in_write(&write_txn, name)?;
                 let table_name = Self::rel_table_name(name);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
@@ -29206,6 +29237,7 @@ impl RedbPersistence {
             None,
             &[],
             &Vec::new(),
+            &[],
         )
     }
 
@@ -29227,6 +29259,7 @@ impl RedbPersistence {
         )>,
         commit_index_lsns: &[Lsn],
         generations: &VectorGenerationCleanup,
+        selection_progress: &[(String, Vec<u8>)],
     ) -> Result<PruneScopedStats> {
         if row_keys.is_empty()
             && pruned_change_keys.is_empty()
@@ -29234,6 +29267,7 @@ impl RedbPersistence {
             && auxiliary.is_none()
             && commit_index_lsns.is_empty()
             && generations.is_empty()
+            && selection_progress.is_empty()
         {
             return Ok(PruneScopedStats::default());
         }
@@ -29329,6 +29363,20 @@ impl RedbPersistence {
             );
             for (catalog, retained) in generations {
                 self.reclaim_vector_generations_in_write(&write_txn, catalog, retained)?;
+            }
+            {
+                let mut config = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, bytes) in selection_progress {
+                    config
+                        .insert(key.as_str(), bytes.as_slice())
+                        .map_err(Self::storage_error)?;
+                    identity_mutations.extend(content_identity::config_mutations(
+                        key,
+                        Some(bytes.as_slice()),
+                    ));
+                }
             }
             Self::apply_content_identity_mutations_in_write(
                 &write_txn,
@@ -29738,12 +29786,19 @@ impl RedbPersistence {
         &self,
         projection: &AuthoritativePurgePersistenceProjection,
         marker: Option<purge_publication::DurableMarker>,
+        frontier: Lsn,
     ) -> Result<()> {
         let prepared_vector_generations =
             self.prepare_authoritative_purge_vector_generations(projection)?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             self.apply_local_erasure(&write_txn, projection, &prepared_vector_generations, marker)?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                TxId(0),
+                frontier,
+                RowId(0),
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)
         })
@@ -30342,6 +30397,7 @@ impl RedbPersistence {
                 identity_mutations.extend(content_identity::config_mutations(key, None));
             }
             for (key, bytes) in &projection.lifecycle_records {
+                Self::raise_config_identity_floors_in_write(write_txn, key, bytes)?;
                 config
                     .insert(key.as_str(), bytes.as_slice())
                     .map_err(Self::storage_error)?;
@@ -30937,7 +30993,13 @@ impl RedbPersistence {
         }
         let provider = owner.external_snapshot_provider();
         let reopened = Self::open_hook_suppressed(|| {
-            redb_builder().open_with_backend_and_external_snapshots(owner.view(), provider)
+            redb_builder_with_cache(
+                self.cache_charge_bytes
+                    .get()
+                    .copied()
+                    .unwrap_or(REDB_CACHE_BYTES),
+            )
+            .open_with_backend_and_external_snapshots(owner.view(), provider)
         });
         match reopened {
             Ok(Ok(fresh)) => {
@@ -31026,6 +31088,61 @@ impl RedbPersistence {
         })
     }
 
+    pub(crate) fn restore_storage_compaction(&self) -> Result<()> {
+        let checkpoint = self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read.open_table(TableDefinition::<&str, &[u8]>::new(
+                "writer_storage_compaction",
+            )) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let Some(value) = table.get("cursor").map_err(Self::storage_error)? else {
+                return Ok(None);
+            };
+            let memory = self
+                .proof_accountant
+                .get()
+                .map(|accountant| {
+                    crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                        accountant.clone(),
+                        512usize.saturating_add(value.value().len().saturating_mul(3)),
+                        "storage_compaction",
+                        "restore_checkpoint",
+                        "Raise MEMORY_LIMIT to restore storage maintenance controls.",
+                    )
+                })
+                .transpose()?;
+            let checkpoint: (u8, Option<String>, bool, Vec<usize>, bool, f64) =
+                Self::decode_exact(value.value())?;
+            Ok(Some((checkpoint, memory)))
+        })?;
+        if let Some(((phase, table, advance, position, active, ratio), memory)) = checkpoint {
+            let cursor =
+                redb::CompactionCursor::restore_checkpoint(phase, table, advance, position, active)
+                    .map_err(Self::storage_error)?;
+            let mut state = self
+                .storage_compaction
+                .lock()
+                .map_err(Self::storage_error)?;
+            state.0 = cursor;
+            state.2 = ratio;
+            state.3 = if active { memory } else { None };
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn storage_compaction_control_charge(&self) -> usize {
+        self.storage_compaction
+            .lock()
+            .unwrap()
+            .3
+            .as_ref()
+            .map_or(0, |memory| memory.bytes())
+    }
+
     /// One bounded durable relocation batch. Only a position survives the
     /// call: no read snapshot, transaction, companion lock, or page buffer
     /// remains pinned while the maintenance worker yields to foreground work.
@@ -31062,6 +31179,7 @@ impl RedbPersistence {
         if !state.0.is_active() {
             state.2 = fragmentation_ratio;
         }
+        let checkpoint_accountant = accountant.clone();
         let workspace = Arc::new(parking_lot::Mutex::new(
             crate::memory_accounting::OwnedMemoryReservation::new(accountant),
         ));
@@ -31096,8 +31214,10 @@ impl RedbPersistence {
         let txn = self.with_db(|db| db.begin_write().map_err(Self::storage_error))?;
         let fingerprint_failure = Arc::new(parking_lot::Mutex::new(None));
         let on_fingerprint_failure = Arc::clone(&fingerprint_failure);
+        let checkpoint_ratio = state.2;
+        let mut next_controls = None;
         let result = redb::with_read_memory_admission(admission.clone(), || {
-            txn.compact_step_with_hook(
+            txn.compact_step_with_cursor_hook(
                 &mut state.0,
                 STORAGE_MAINTENANCE_PAGE_BATCH,
                 |bytes| {
@@ -31109,10 +31229,39 @@ impl RedbPersistence {
                     });
                     admission(bytes)
                 },
-                |txn| {
+                |txn, successor| {
                     Self::write_vector_body_root_fingerprint(txn)
                         .and_then(|()| Self::write_commit_directory_root_in_write(txn))
                         .and_then(|()| Self::write_row_heads_root(txn))
+                        .and_then(|()| {
+                            let (phase, table, advance, position, active) = successor.checkpoint();
+                            if active {
+                                next_controls = Some(crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                                    checkpoint_accountant.clone(),
+                                    512usize.saturating_add(table.map_or(0, |name| name.len().saturating_mul(2)))
+                                        .saturating_add(position.len().saturating_mul(2 * std::mem::size_of::<usize>())),
+                                    "storage_compaction", "checkpoint_controls",
+                                    "Raise MEMORY_LIMIT to retain storage maintenance controls.",
+                                )?);
+                            }
+                            let bytes = Self::encode(&(
+                                phase,
+                                table,
+                                advance,
+                                position,
+                                active,
+                                checkpoint_ratio,
+                            ))?;
+                            let mut checkpoints = txn
+                                .open_table(TableDefinition::<&str, &[u8]>::new(
+                                    "writer_storage_compaction",
+                                ))
+                                .map_err(Self::storage_error)?;
+                            checkpoints
+                                .insert("cursor", bytes.as_slice())
+                                .map_err(Self::storage_error)?;
+                            Ok(())
+                        })
                         .map_err(|error| {
                             *on_fingerprint_failure.lock() = Some(error);
                             redb::StorageError::Io(std::io::Error::other(
@@ -31135,6 +31284,7 @@ impl RedbPersistence {
             work.compaction_pages_relocated += progress.pages_relocated;
         });
         state.1 = progress;
+        state.3 = next_controls;
         for _ in 0..2 {
             let txn = self.with_db(|db| db.begin_write().map_err(Self::storage_error))?;
             txn.commit_compaction_frees().map_err(Self::storage_error)?;
@@ -31644,6 +31794,7 @@ impl RedbPersistence {
         }
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            Self::invalidate_retention_clock_in_write(&write_txn, name)?;
             {
                 let table_name = Self::rel_table_name(name);
                 let table_def: TableDefinition<&[u8], &[u8]> =
@@ -31783,6 +31934,7 @@ impl RedbPersistence {
                     identity_mutations.extend(content_identity::config_mutations(key, None));
                 }
                 for (key, value) in config_writes {
+                    Self::raise_config_identity_floors_in_write(&write_txn, key, value)?;
                     config
                         .insert(key.as_str(), value.as_slice())
                         .map_err(Self::storage_error)?;

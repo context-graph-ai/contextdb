@@ -533,7 +533,7 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         .unwrap();
     let result = db.commit(tx);
     assert!(
-        matches!(result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes: 24, available_bytes: 0, budget_limit_bytes: 79664, .. }) if subsystem == "writer_source" && operation == "store_adapter"),
+        matches!(result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes: 24, available_bytes: 0, budget_limit_bytes: 13481, .. }) if subsystem == "writer_source" && operation == "store_adapter"),
         "source admission must refuse before publishing any changed state: {result:?}"
     );
     db.accountant().set_budget(None).unwrap();
@@ -600,7 +600,7 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         .unwrap();
     let mixed_result = db.commit(tx);
     assert!(
-        matches!(mixed_result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes: 24, available_bytes: 0, budget_limit_bytes: 78773, .. }) if subsystem == "writer_source" && operation == "store_adapter"),
+        matches!(mixed_result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes: 24, available_bytes: 0, budget_limit_bytes: 12275, .. }) if subsystem == "writer_source" && operation == "store_adapter"),
         "conditional-row admission keeps its source attribution beside an indexed write: {mixed_result:?}"
     );
     db.accountant().set_budget(None).unwrap();

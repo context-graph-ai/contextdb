@@ -8076,7 +8076,7 @@ fn including_sync_delete_received_ddl_is_typed_and_never_persisted() {
             .all(|trigger| trigger.name != "delete_received")
     );
     assert!(db
-        .ddl_log_since(before)
+        .ddl_log_since(before).unwrap()
         .iter()
         .all(|ddl| !matches!(ddl, DdlChange::CreateTriggerIncludingSync { name, .. } if name == "delete_received")));
 }

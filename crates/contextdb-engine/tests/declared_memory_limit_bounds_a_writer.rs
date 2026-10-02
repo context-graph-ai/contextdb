@@ -1890,7 +1890,7 @@ fn a_received_alter_priced_far_too_low_leaves_the_old_shape_the_log_and_the_rest
         names
     };
     let shape_before = columns_of(&db);
-    let log_before = format!("{:?}", db.ddl_log_since(contextdb_core::Lsn(0)));
+    let log_before = format!("{:?}", db.ddl_log_since(contextdb_core::Lsn(0)).unwrap());
 
     let error = db
         .apply_changes(
@@ -1909,7 +1909,7 @@ fn a_received_alter_priced_far_too_low_leaves_the_old_shape_the_log_and_the_rest
         "a refused unit installs none of itself: the table still has the shape it had"
     );
     assert_eq!(
-        format!("{:?}", db.ddl_log_since(contextdb_core::Lsn(0))),
+        format!("{:?}", db.ddl_log_since(contextdb_core::Lsn(0)).unwrap()),
         log_before,
         "the replicated DDL log is exactly what it was before the unit arrived -- nothing was \
          appended by the refused item, and nothing was written to take it back"
@@ -4804,7 +4804,7 @@ fn a_unit_with_no_provenance_installs_whole_or_not_at_all() {
         names
     };
     let shape_before = columns_of(&db);
-    let log_before = format!("{:?}", db.ddl_log_since(contextdb_core::Lsn(0)));
+    let log_before = format!("{:?}", db.ddl_log_since(contextdb_core::Lsn(0)).unwrap());
     let rows_before = db
         .execute("SELECT id FROM wide", &HashMap::new())
         .expect("the receiver answers before the unit")
@@ -4843,7 +4843,7 @@ fn a_unit_with_no_provenance_installs_whole_or_not_at_all() {
         "the table still has the shape it had"
     );
     assert_eq!(
-        format!("{:?}", db.ddl_log_since(contextdb_core::Lsn(0))),
+        format!("{:?}", db.ddl_log_since(contextdb_core::Lsn(0)).unwrap()),
         log_before,
         "the replicated DDL log is exactly what it was before the unit arrived -- the item that \
          would have succeeded appended nothing, so no peer that pulls afterwards sees half of \

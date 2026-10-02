@@ -2414,53 +2414,52 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<Vec<GatedGraphNeighbor>> {
         let mut results = Vec::new();
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
 
-        if matches!(direction, Direction::Outgoing | Direction::Both) {
-            let fwd = self.graph_store.forward_adj.read();
-            if let Some(entries) = fwd.get(&node) {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    results.push((
-                        entry.target,
-                        entry.edge_type.clone(),
-                        entry.properties.clone(),
-                        entry.source,
-                        entry.target,
-                    ));
-                }
+        let root = self.writer_graph_root()?;
+        for orientation in [Direction::Outgoing, Direction::Incoming] {
+            if !matches!(direction, Direction::Both) && direction != orientation {
+                continue;
             }
+            self.graph_store.visit_edges(
+                root.as_ref(),
+                contextdb_graph::source::GraphQuery {
+                    node,
+                    direction: orientation,
+                    identity: None,
+                },
+                |entry| {
+                    if entry.visible_at(snapshot)
+                        && edge_types.is_none_or(|types| types.contains(&entry.edge_type))
+                    {
+                        output.try_grow_for(
+                            entry
+                                .estimated_bytes()
+                                .saturating_mul(2)
+                                .saturating_add(128),
+                            "writer_source",
+                            "gated_graph_output",
+                            "Raise MEMORY_LIMIT to return these graph neighbors.",
+                        )?;
+                        results.push((
+                            if orientation == Direction::Outgoing {
+                                entry.target
+                            } else {
+                                entry.source
+                            },
+                            entry.edge_type.clone(),
+                            entry.properties.clone(),
+                            entry.source,
+                            entry.target,
+                        ));
+                    }
+                    Ok(true)
+                },
+            )?;
         }
 
-        if matches!(direction, Direction::Incoming | Direction::Both) {
-            let rev = self.graph_store.reverse_adj.read();
-            if let Some(entries) = rev.get(&node) {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    results.push((
-                        entry.source,
-                        entry.edge_type.clone(),
-                        entry.properties.clone(),
-                        entry.source,
-                        entry.target,
-                    ));
-                }
-            }
-        }
-
+        self.retain_writer_output(output);
         Ok(results)
     }
 
@@ -2479,55 +2478,48 @@ impl Database {
         let (deleted, staged_inserts) = self.graph_tx_edge_overlay(tx)?;
 
         let mut candidates = Vec::<CountedGraphNeighbor>::new();
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
 
-        if matches!(direction, Direction::Outgoing | Direction::Both) {
-            let fwd = self.graph_store.forward_adj.read();
-            if let Some(entries) = fwd.get(&node) {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    if deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target)) {
-                        continue;
-                    }
-                    candidates.push((
-                        entry.target,
-                        entry.edge_type.clone(),
-                        entry.source,
-                        entry.target,
-                    ));
-                }
+        let root = self.writer_graph_root()?;
+        for orientation in [Direction::Outgoing, Direction::Incoming] {
+            if !matches!(direction, Direction::Both) && direction != orientation {
+                continue;
             }
-        }
-
-        if matches!(direction, Direction::Incoming | Direction::Both) {
-            let rev = self.graph_store.reverse_adj.read();
-            if let Some(entries) = rev.get(&node) {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
+            self.graph_store.visit_edges(
+                root.as_ref(),
+                contextdb_graph::source::GraphQuery {
+                    node,
+                    direction: orientation,
+                    identity: None,
+                },
+                |entry| {
+                    if entry.visible_at(snapshot)
+                        && edge_types.is_none_or(|types| types.contains(&entry.edge_type))
+                        && !deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target))
                     {
-                        continue;
+                        output.try_grow_for(
+                            entry.edge_type.len().saturating_add(
+                                std::mem::size_of::<CountedGraphNeighbor>().saturating_mul(4),
+                            ),
+                            "writer_source",
+                            "gated_graph_candidates",
+                            "Raise MEMORY_LIMIT to return these graph neighbors.",
+                        )?;
+                        candidates.push((
+                            if orientation == Direction::Outgoing {
+                                entry.target
+                            } else {
+                                entry.source
+                            },
+                            entry.edge_type.clone(),
+                            entry.source,
+                            entry.target,
+                        ));
                     }
-                    if deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target)) {
-                        continue;
-                    }
-                    candidates.push((
-                        entry.source,
-                        entry.edge_type.clone(),
-                        entry.source,
-                        entry.target,
-                    ));
-                }
-            }
+                    Ok(true)
+                },
+            )?;
         }
 
         for entry in staged_inserts {
@@ -2537,6 +2529,14 @@ impl Database {
                 continue;
             }
             if matches!(direction, Direction::Outgoing | Direction::Both) && entry.source == node {
+                output.try_grow_for(
+                    entry.edge_type.len().saturating_add(
+                        std::mem::size_of::<CountedGraphNeighbor>().saturating_mul(4),
+                    ),
+                    "writer_source",
+                    "gated_graph_candidates",
+                    "Raise MEMORY_LIMIT to return these graph neighbors.",
+                )?;
                 candidates.push((
                     entry.target,
                     entry.edge_type.clone(),
@@ -2545,6 +2545,14 @@ impl Database {
                 ));
             }
             if matches!(direction, Direction::Incoming | Direction::Both) && entry.target == node {
+                output.try_grow_for(
+                    entry.edge_type.len().saturating_add(
+                        std::mem::size_of::<CountedGraphNeighbor>().saturating_mul(4),
+                    ),
+                    "writer_source",
+                    "gated_graph_candidates",
+                    "Raise MEMORY_LIMIT to return these graph neighbors.",
+                )?;
                 candidates.push((
                     entry.source,
                     entry.edge_type.clone(),
@@ -2565,6 +2573,7 @@ impl Database {
             }
         }
 
+        self.retain_writer_output(output);
         Ok((results, examined))
     }
 

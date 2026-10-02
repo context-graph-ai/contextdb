@@ -33,7 +33,12 @@ impl Database {
         }
         // The caller holds the outbound schema lease. A declaration change
         // invalidates hidden progress, so a newly pullable old row is revisited.
-        let schema = self.ddl_log.read().last().map(|(lsn, _)| *lsn);
+        let schema = if let Some(root) = self.writer_read_root()? {
+            let mut cursor = root.ddl_history_cursor_ordered(Lsn(0), true)?;
+            cursor.next_ddl_history()?.map(|window| window.value.0)
+        } else {
+            self.ddl_log.read().last().map(|(lsn, _)| *lsn)
+        };
         let incarnation = self.existing_sync_incarnation(tenant)?;
         let through = self.current_lsn();
         self.with_custody_store(|store| {

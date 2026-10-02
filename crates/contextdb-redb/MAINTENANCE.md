@@ -253,3 +253,27 @@ not assemble a whole canonical key. `materialize` uses ordinary complete-page
 admission and decoding. Checksum-verifying retained roots continue to require
 complete-page admission and checksum verification during navigation. Ordinary
 open, lookup, and iterator behavior is unchanged.
+
+The hidden `Database::settle_startup_cache_budget` entry point lets the engine settle the native
+writer cache share after reading the persisted memory limit and before publishing its first reader
+root. It flushes the write buffer before lowering capacity, evicts cache references through the
+existing eviction path, and returns a reserve covering both capacity and any pages still held by
+readers. Those pages retain their bytes and live-count owner until their final holder drops. The
+caller excludes concurrent operations during this startup step; ordinary limit transitions keep
+existing behavior. This additive internal proposal has not been submitted upstream.
+
+Idle-writer shutdown drains only deferred-free entries older than the ordinary
+commit's reader fence. It probes the oldest key in each free tree instead of
+refusing all cleanup whenever a reader exists. Protected entries and savepoints
+remain deferred; each cleanup commit keeps the builder's page and entry caps.
+
+Storage relocation exposes a bounded scalar cursor checkpoint and a successor-cursor hook.
+The engine records that successor in the same native transaction as relocation and restores
+it before publishing writer roots. Failed relocation or checkpoint encoding publishes neither
+the cursor nor moved pages; reader fences and per-batch page limits are unchanged.
+
+The hidden contextdb-internal `WriteTransaction::table_exists` performs a typed table-directory
+probe without flushing pending root updates or finalizing dirty payload checksums. It distinguishes
+an existing empty table from an absent family. The engine caches this existence result per table
+while maintaining row heads; ordinary `open_table` type validation and exact row-body checks remain.
+The finalized root fingerprint API is unchanged and still supplies durable root bindings.

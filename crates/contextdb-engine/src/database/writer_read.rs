@@ -1385,3 +1385,204 @@ impl contextdb_relational::mem::StagedPostingAdmission for WriterStagedPostingAd
         ))
     }
 }
+
+/// Storage consumers capture the same root as the statement currently running
+/// on this thread. The weak manager breaks the store/manager ownership cycle.
+pub(super) struct ScopedGraphSource {
+    manager: OnceLock<std::sync::Weak<TransactionManager<DynStore>>>,
+}
+impl ScopedGraphSource {
+    pub(super) fn new() -> Self {
+        Self {
+            manager: OnceLock::new(),
+        }
+    }
+    pub(super) fn bind(&self, manager: &Arc<TransactionManager<DynStore>>) {
+        self.manager
+            .set(Arc::downgrade(manager))
+            .expect("graph source bound once");
+    }
+}
+impl contextdb_graph::source::GraphReadSource for ScopedGraphSource {
+    fn capture(
+        &self,
+        snapshot: SnapshotId,
+    ) -> Result<Arc<dyn contextdb_graph::source::GraphSnapshot>> {
+        let manager = self
+            .manager
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| Error::Other("graph publication is unavailable".into()))?;
+        let owner = Arc::as_ptr(&manager) as usize;
+        let scoped = ROOT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(id, _, _)| *id == owner)
+                .map(|(_, root, _)| root.clone())
+        });
+        let root = match scoped {
+            Some(root) => root,
+            None => durable_root(manager.capture_published_read().handle)?
+                .ok_or_else(|| Error::Other("graph publication has no durable root".into()))?,
+        };
+        if snapshot.0 > root.snapshot.0 {
+            return Err(Error::Other(
+                "graph snapshot exceeds the captured source frontier".into(),
+            ));
+        }
+        Ok(Arc::new(
+            crate::persistence::writer_adapters::WriterGraphSnapshot::new(root)?,
+        ))
+    }
+}
+
+pub(super) fn visit_graph_versions(
+    store: &GraphStore,
+    root: Option<Arc<WriterSnapshot>>,
+    mut visit: impl FnMut(&AdjEntry) -> Result<()>,
+) -> Result<()> {
+    if let Some(root) = root {
+        let mut cursor = root.cursor(
+            "graph_fwd",
+            crate::persistence::writer_source::WriterCursorFamily::Bytes,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            false,
+        )?;
+        while let Some(window) = cursor.next_edge()? {
+            visit(&window.value)?;
+        }
+    } else {
+        for edge in store.forward_adj.read().values().flatten() {
+            visit(edge)?;
+        }
+    }
+    Ok(())
+}
+impl Database {
+    pub(super) fn visit_graph_versions(
+        &self,
+        visit: impl FnMut(&AdjEntry) -> Result<()>,
+    ) -> Result<()> {
+        visit_graph_versions(&self.graph_store, self.writer_read_root()?, visit)
+    }
+    pub(super) fn collect_graph_versions(
+        &self,
+        mut keep: impl FnMut(&AdjEntry) -> bool,
+    ) -> Result<Vec<AdjEntry>> {
+        let mut edges = Vec::new();
+        let mut memory =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        self.visit_graph_versions(|edge| {
+            if keep(edge) {
+                memory.try_grow_for(
+                    edge.estimated_bytes().saturating_mul(2).saturating_add(128),
+                    "writer_source",
+                    "graph_output",
+                    "Raise MEMORY_LIMIT to return these graph versions.",
+                )?;
+                edges.push(edge.clone());
+            }
+            Ok(())
+        })?;
+        self.retain_writer_output(memory);
+        Ok(edges)
+    }
+}
+
+impl Database {
+    pub(super) fn graph_path_with_sync_overlay(
+        &self,
+        snapshot: SnapshotId,
+        edge_type: &str,
+        start: NodeId,
+        goal: NodeId,
+        overlay: &HashMap<(NodeId, EdgeType, NodeId), bool>,
+    ) -> Result<bool> {
+        let root = self.writer_graph_root()?;
+        let mut memory =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        memory.try_grow_for(
+            256,
+            "writer_source",
+            "sync_cycle_frontier",
+            "Raise MEMORY_LIMIT to validate this graph traversal.",
+        )?;
+        visited.insert(start);
+        queue.push_back(start);
+        while let Some(node) = queue.pop_front() {
+            let mut found = false;
+            let mut enqueue = |target| -> Result<bool> {
+                if target == goal {
+                    found = true;
+                    return Ok(false);
+                }
+                if !visited.contains(&target) {
+                    memory.try_grow_for(
+                        128,
+                        "writer_source",
+                        "sync_cycle_frontier",
+                        "Raise MEMORY_LIMIT to validate this graph traversal.",
+                    )?;
+                    visited.insert(target);
+                    queue.push_back(target);
+                }
+                Ok(true)
+            };
+            self.graph_store.visit_edges(
+                root.as_ref(),
+                contextdb_graph::source::GraphQuery {
+                    node,
+                    direction: Direction::Outgoing,
+                    identity: None,
+                },
+                |entry| {
+                    if entry.visible_at(snapshot)
+                        && entry.edge_type == edge_type
+                        && overlay
+                            .get(&(entry.source, entry.edge_type.clone(), entry.target))
+                            .copied()
+                            .unwrap_or(true)
+                    {
+                        return enqueue(entry.target);
+                    }
+                    Ok(true)
+                },
+            )?;
+            for ((source, kind, target), present) in overlay {
+                if *source == node && kind == edge_type && *present && !enqueue(*target)? {
+                    break;
+                }
+            }
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn collect_change_log_versions(&self) -> Result<Vec<ChangeLogEntry>> {
+        let Some(root) = self.writer_read_root()? else {
+            return Ok(self.change_log.read().clone());
+        };
+        let mut cursor = root.change_log_cursor(Lsn(0), root.lsn)?;
+        let mut memory =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let mut entries = Vec::new();
+        while let Some(window) = cursor.next_change()? {
+            memory.try_grow_for(
+                crate::composite_store::change_log_entry_retained_bytes(&window.value)
+                    .saturating_mul(2)
+                    .saturating_add(128),
+                "writer_source",
+                "change_history_output",
+                "Raise MEMORY_LIMIT to prepare this history output.",
+            )?;
+            entries.push(window.value);
+        }
+        self.retain_writer_output(memory);
+        Ok(entries)
+    }
+}

@@ -3239,7 +3239,7 @@ async fn reopened_log_gap_pages_old_generation_purge_before_current_schema_snaps
         "fixture: reopening forces the durable persisted-state path instead of change-log replay"
     );
     assert!(
-        hub.db.ddl_log_since(Lsn(0)).is_empty(),
+        hub.db.ddl_log_since(Lsn(0)).unwrap().is_empty(),
         "fixture: reopening forces synthetic current schema rather than a live DDL log"
     );
 
