@@ -33366,7 +33366,7 @@ impl Database {
         hub_node_id: Option<&str>,
     ) -> Result<()> {
         let _operation = self.assert_open_operation();
-        self.with_commit_lock(|| {
+        self.tx_mgr.with_maintenance_publication(|publication| {
             let snapshot = self.snapshot();
             let empty_skip_deleted = HashSet::new();
             let mut source_entries = Vec::new();
@@ -33416,8 +33416,10 @@ impl Database {
             // exact earlier DELETE was acknowledged. Its row/tombstone sidecar
             // stays untouched, but the durable delete lifecycle still moves
             // Pending -> Accepted before the caller advances its watermark.
+            publication.reserve()?;
             self.record_durable_delete_acceptance(rows, hub_lsn, hub_node_id)?;
             if source_entries.is_empty() && tombstones.is_empty() {
+                publication.complete();
                 return Ok(());
             }
             if let Some(persistence) = &self.persistence {
@@ -33443,6 +33445,7 @@ impl Database {
             if !tombstones.is_empty() {
                 self.sync_tombstone_arrivals.write().extend(tombstones);
             }
+            publication.complete();
             Ok(())
         })
     }
@@ -46616,10 +46619,16 @@ impl Database {
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn __damage_first_saved_row_for_test(&self, table: &str, swap_body: bool) -> Result<()> {
-        self.persistence
+        let persistence = self
+            .persistence
             .as_ref()
-            .ok_or_else(|| Error::Other("saved-row damage requires a writer".to_owned()))?
-            .damage_first_saved_row_for_test(table, swap_body)
+            .ok_or_else(|| Error::Other("saved-row damage requires a writer".to_owned()))?;
+        self.tx_mgr.with_maintenance_publication(|publication| {
+            publication.reserve()?;
+            persistence.damage_first_saved_row_for_test(table, swap_body)?;
+            publication.complete();
+            Ok(())
+        })
     }
 
     pub(crate) fn bounded_visit_verified_ordered_identities<E>(

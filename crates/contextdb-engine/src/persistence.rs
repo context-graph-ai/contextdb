@@ -22898,7 +22898,12 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
-            Self::raise_noncanonical_writer_floors_in_write(&write_txn, 0, lsn.0, 0)?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                TxId(0),
+                Lsn(lsn.0),
+                RowId(0),
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             self.complete_writer_schema_change(schema);
@@ -23051,7 +23056,12 @@ impl RedbPersistence {
                 &identity_mutations,
                 &mut self.proof_admission(),
             )?;
-            Self::raise_noncanonical_writer_floors_in_write(&write_txn, 0, lsn.0, 0)?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                TxId(0),
+                Lsn(lsn.0),
+                RowId(0),
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
@@ -23430,7 +23440,12 @@ impl RedbPersistence {
                 &[content_identity::encoded_history_mutation(&key, change)?],
                 &mut self.proof_admission(),
             )?;
-            Self::raise_noncanonical_writer_floors_in_write(&write_txn, 0, lsn.0, 0)?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                TxId(0),
+                Lsn(lsn.0),
+                RowId(0),
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
@@ -23878,6 +23893,24 @@ impl RedbPersistence {
                 &write_txn,
                 &mutations,
                 &mut self.proof_admission(),
+            )?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                rows.iter()
+                    .chain(&previous_rows)
+                    .flat_map(|row| std::iter::once(row.created_tx).chain(row.deleted_tx))
+                    .max()
+                    .unwrap_or(TxId(0)),
+                rows.iter()
+                    .chain(&previous_rows)
+                    .map(|row| row.lsn)
+                    .max()
+                    .unwrap_or(Lsn(0)),
+                rows.iter()
+                    .chain(&previous_rows)
+                    .map(|row| row.row_id)
+                    .max()
+                    .unwrap_or(RowId(0)),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
@@ -28855,9 +28888,9 @@ impl RedbPersistence {
             )?;
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
-                entries.values().map(|tx| tx.0).max().unwrap_or(0),
-                0,
-                0,
+                TxId(entries.values().map(|tx| tx.0).max().unwrap_or(0)),
+                Lsn(0),
+                RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
@@ -31493,13 +31526,15 @@ impl RedbPersistence {
             )?;
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
-                rows.iter()
-                    .flat_map(|row| std::iter::once(row.created_tx).chain(row.deleted_tx))
-                    .map(|tx| tx.0)
-                    .max()
-                    .unwrap_or(0),
-                rows.iter().map(|row| row.lsn.0).max().unwrap_or(0),
-                0,
+                TxId(
+                    rows.iter()
+                        .flat_map(|row| std::iter::once(row.created_tx).chain(row.deleted_tx))
+                        .map(|tx| tx.0)
+                        .max()
+                        .unwrap_or(0),
+                ),
+                Lsn(rows.iter().map(|row| row.lsn.0).max().unwrap_or(0)),
+                RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
@@ -31656,14 +31691,16 @@ impl RedbPersistence {
             )?;
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
-                edges
-                    .iter()
-                    .flat_map(|edge| std::iter::once(edge.created_tx).chain(edge.deleted_tx))
-                    .map(|tx| tx.0)
-                    .max()
-                    .unwrap_or(0),
-                edges.iter().map(|edge| edge.lsn.0).max().unwrap_or(0),
-                0,
+                TxId(
+                    edges
+                        .iter()
+                        .flat_map(|edge| std::iter::once(edge.created_tx).chain(edge.deleted_tx))
+                        .map(|tx| tx.0)
+                        .max()
+                        .unwrap_or(0),
+                ),
+                Lsn(edges.iter().map(|edge| edge.lsn.0).max().unwrap_or(0)),
+                RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
@@ -31710,18 +31747,22 @@ impl RedbPersistence {
             )?;
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
-                entries
-                    .iter()
-                    .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
-                    .map(|tx| tx.0)
-                    .max()
-                    .unwrap_or(0),
-                entries.iter().map(|entry| entry.lsn.0).max().unwrap_or(0),
-                entries
-                    .iter()
-                    .map(|entry| entry.row_id.0)
-                    .max()
-                    .unwrap_or(0),
+                TxId(
+                    entries
+                        .iter()
+                        .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
+                        .map(|tx| tx.0)
+                        .max()
+                        .unwrap_or(0),
+                ),
+                Lsn(entries.iter().map(|entry| entry.lsn.0).max().unwrap_or(0)),
+                RowId(
+                    entries
+                        .iter()
+                        .map(|entry| entry.row_id.0)
+                        .max()
+                        .unwrap_or(0),
+                ),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;
@@ -31846,9 +31887,9 @@ impl RedbPersistence {
             )?;
             Self::raise_noncanonical_writer_floors_in_write(
                 &write_txn,
-                0,
-                entries.iter().map(|(lsn, _)| lsn.0).max().unwrap_or(0),
-                0,
+                TxId(0),
+                Lsn(entries.iter().map(|(lsn, _)| lsn.0).max().unwrap_or(0)),
+                RowId(0),
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)?;

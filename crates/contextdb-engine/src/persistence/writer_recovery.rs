@@ -201,9 +201,9 @@ impl RedbPersistence {
     /// commit entry in that batch. Preserve their floors before committing.
     pub(super) fn raise_noncanonical_writer_floors_in_write(
         write: &redb::WriteTransaction,
-        tx: u64,
-        lsn: u64,
-        external_row: u64,
+        tx: TxId,
+        lsn: Lsn,
+        external_row: RowId,
     ) -> Result<()> {
         let mut table = write
             .open_table(WRITER_RECOVERY_TABLE)
@@ -214,9 +214,9 @@ impl RedbPersistence {
             .map(|value| Self::decode_exact(value.value()))
             .transpose()?
             .unwrap_or_default();
-        bounds.identity_tx_floor = bounds.identity_tx_floor.max(tx);
-        bounds.source_lsn_floor = bounds.source_lsn_floor.max(lsn);
-        bounds.external_row_id_floor = bounds.external_row_id_floor.max(external_row);
+        bounds.identity_tx_floor = bounds.identity_tx_floor.max(tx.0);
+        bounds.source_lsn_floor = bounds.source_lsn_floor.max(lsn.0);
+        bounds.external_row_id_floor = bounds.external_row_id_floor.max(external_row.0);
         let encoded = Self::encode(&bounds)?;
         table
             .insert(BOUNDS_KEY, encoded.as_slice())
