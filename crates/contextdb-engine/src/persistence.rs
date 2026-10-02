@@ -5957,6 +5957,10 @@ impl CheckpointReadSource {
 }
 
 impl RetainedReadSource {
+    pub(crate) fn storage_identity(&self) -> redb::StorageSnapshotIdentity {
+        self.snapshot
+    }
+
     pub(crate) fn retain_raw_vector_memberships(
         &self,
         partition: VectorPartitionRef,

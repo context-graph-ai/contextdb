@@ -1073,35 +1073,47 @@ impl Database {
             events.1 |= declaration.on_events.contains(&TriggerEvent::Update);
         }
         let snapshot = self.trigger_dispatch_snapshot(tx, None, TriggerDispatchMode::Local)?;
-        self.tx_mgr.with_write_set(tx, |ws| -> Result<bool> {
-            for (index, (table, row)) in ws.relational_inserts.iter().enumerate() {
-                if !snapshot.triggered_tables.contains(table)
-                    || snapshot
-                        .latest_insert_index
-                        .get(&(table.clone(), row.row_id))
-                        != Some(&index)
-                {
-                    continue;
-                }
-                let event = if snapshot.deleted_rows.contains(&(table.clone(), row.row_id))
-                    && self.committed_row_exists_at_current_frontier(table, row.row_id)?
-                {
-                    TriggerEvent::Update
-                } else {
-                    TriggerEvent::Insert
-                };
-                if events_by_table
-                    .get(table)
-                    .is_some_and(|events| match event {
-                        TriggerEvent::Insert => events.0,
-                        TriggerEvent::Update => events.1,
-                    })
-                {
-                    return Ok(true);
-                }
+        let _order_memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            snapshot
+                .latest_insert_index
+                .len()
+                .saturating_mul(std::mem::size_of::<(&TriggerRowKey, &usize)>())
+                .saturating_add(held::ALLOCATION_BYTES),
+            "writer_source",
+            "trigger_identities",
+            "Raise MEMORY_LIMIT to inspect these trigger identities.",
+        )?;
+        let mut latest = snapshot.latest_insert_index.iter().collect::<Vec<_>>();
+        latest.sort_unstable_by_key(|(_, index)| **index);
+        for ((table, row_id), index) in latest {
+            if !snapshot.triggered_tables.contains(table)
+                || !self.tx_mgr.with_write_set(tx, |ws| {
+                    ws.relational_inserts
+                        .get(*index)
+                        .is_some_and(|(name, row)| name == table && row.row_id == *row_id)
+                })?
+            {
+                continue;
             }
-            Ok(false)
-        })?
+            let event = if snapshot.deleted_rows.contains(&(table.clone(), *row_id))
+                && self.committed_row_exists_at_current_frontier(table, *row_id)?
+            {
+                TriggerEvent::Update
+            } else {
+                TriggerEvent::Insert
+            };
+            if events_by_table
+                .get(table)
+                .is_some_and(|events| match event {
+                    TriggerEvent::Insert => events.0,
+                    TriggerEvent::Update => events.1,
+                })
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn dispatch_triggers_for_tx_from(

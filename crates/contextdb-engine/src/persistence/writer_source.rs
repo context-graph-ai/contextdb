@@ -51,13 +51,24 @@ pub(crate) struct WriterSchema {
 
 impl WriterSnapshot {
     pub(crate) fn captured_table_meta(&self, table: &str) -> Option<TableMeta> {
-        self.schema.tables.get(table).cloned()
+        self.borrow_captured_table_meta(table).cloned()
+    }
+
+    pub(crate) fn borrow_captured_table_meta(&self, table: &str) -> Option<&TableMeta> {
+        self.schema.tables.get(table)
     }
 
     pub(crate) fn captured_table_names(&self) -> Vec<String> {
         let mut names = self.schema.tables.keys().cloned().collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    pub(crate) fn captured_table_metadata(&self) -> impl Iterator<Item = (&str, &TableMeta)> {
+        self.schema
+            .tables
+            .iter()
+            .map(|(name, meta)| (name.as_str(), meta))
     }
 }
 
@@ -449,6 +460,12 @@ impl WriterSnapshot {
     }
     pub(super) fn owner_read(&self) -> Arc<redb::ReadTransaction> {
         Arc::clone(&self.read)
+    }
+
+    pub(crate) fn check_table_scope(&self, table: &str) -> Result<()> {
+        self.erasure
+            .read()
+            .check_scope(Some(table), "ACL entitlement")
     }
 
     pub(crate) fn storage_identity(&self) -> redb::StorageSnapshotIdentity {

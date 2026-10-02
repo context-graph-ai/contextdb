@@ -643,7 +643,63 @@ struct EventAclGate {
     ref_table: String,
     ref_column: String,
     grant_gate: Box<EventGateSnapshot>,
-    grant_rows: Vec<HashMap<String, Value>>,
+    grant_rows: EventGrantRows,
+}
+
+/// Immutable copied grant values travel with every prepared/queued event.
+/// Cloning a gate shares the payload and its charge rather than copying it.
+#[derive(Debug, Clone)]
+enum EventGrantRows {
+    Legacy(Vec<HashMap<String, Value>>),
+    Admitted(Arc<AdmittedEventGrants>),
+}
+impl Default for EventGrantRows {
+    fn default() -> Self {
+        Self::Legacy(Vec::new())
+    }
+}
+#[derive(Debug)]
+struct AdmittedEventGrants {
+    rows: Vec<HashMap<String, Value>>,
+    _memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
+}
+impl EventGrantRows {
+    fn new(
+        rows: Vec<HashMap<String, Value>>,
+        memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
+    ) -> Self {
+        if rows.is_empty() {
+            return Self::default();
+        }
+        Self::Admitted(Arc::new(AdmittedEventGrants {
+            rows,
+            _memory: memory,
+        }))
+    }
+    fn rows(&self) -> &[HashMap<String, Value>] {
+        match self {
+            Self::Legacy(rows) => rows.as_slice(),
+            Self::Admitted(owner) => owner.rows.as_slice(),
+        }
+    }
+    fn iter(&self) -> std::slice::Iter<'_, HashMap<String, Value>> {
+        self.rows().iter()
+    }
+}
+impl Serialize for EventGrantRows {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.rows().serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for EventGrantRows {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Vec::<HashMap<String, Value>>::deserialize(deserializer).map(Self::Legacy)
+    }
 }
 
 impl EventBusState {
@@ -1653,6 +1709,11 @@ impl Database {
         if definitions.event_types.is_empty() || definitions.routes.is_empty() {
             return Ok(Vec::new());
         }
+        // Preparation observes the committed predecessor after all callbacks,
+        // independently of a caller's retained transaction base.
+        let published = self.tx_mgr.capture_published_read();
+        let _current_source =
+            self.enter_writer_read(super::writer_read::durable_root(published.handle)?);
         let mut static_gate_cache = HashMap::new();
         if ws.relational_deletes.is_empty() {
             let mut out = Vec::with_capacity(ws.relational_inserts.len());
@@ -1669,11 +1730,11 @@ impl Database {
                     lsn,
                     ws,
                     &mut static_gate_cache,
-                );
+                )?;
             }
             return Ok(out);
         }
-        let candidates = self.row_event_candidates(ws)?;
+        let (candidates, _candidate_memory) = self.row_event_candidates(ws)?;
         let mut out = Vec::new();
         for candidate in candidates {
             self.append_prepared_sink_events_for_candidate(
@@ -1688,7 +1749,7 @@ impl Database {
                 lsn,
                 ws,
                 &mut static_gate_cache,
-            );
+            )?;
         }
         Ok(out)
     }
@@ -1850,7 +1911,7 @@ impl Database {
         lsn: Lsn,
         ws: &contextdb_tx::WriteSet,
         static_gate_cache: &mut HashMap<String, EventGateSnapshot>,
-    ) {
+    ) -> Result<()> {
         for event_type in definitions.event_types.values() {
             if event_type.table != candidate.table || event_type.trigger != candidate.trigger {
                 continue;
@@ -1866,7 +1927,7 @@ impl Database {
                 candidate.values,
                 ws,
                 static_gate_cache,
-            );
+            )?;
             for route in definitions
                 .routes
                 .values()
@@ -1896,6 +1957,7 @@ impl Database {
                 ));
             }
         }
+        Ok(())
     }
 
     fn event_gate_snapshot_cached(
@@ -1904,17 +1966,17 @@ impl Database {
         values: &HashMap<String, Value>,
         ws: &contextdb_tx::WriteSet,
         static_gate_cache: &mut HashMap<String, EventGateSnapshot>,
-    ) -> EventGateSnapshot {
+    ) -> Result<EventGateSnapshot> {
         if let Some(gate) = static_gate_cache.get(table) {
-            return gate.clone();
+            return Ok(gate.clone());
         }
         let Some(meta) = self.table_meta(table) else {
-            return EventGateSnapshot::default();
+            return Ok(EventGateSnapshot::default());
         };
         if meta.columns.iter().all(|column| column.acl_ref.is_none()) {
             let gate = event_gate_snapshot_from_meta(&meta);
             static_gate_cache.insert(table.to_string(), gate.clone());
-            return gate;
+            return Ok(gate);
         }
         self.event_gate_snapshot_with_meta(&meta, values, ws)
     }
@@ -1924,15 +1986,19 @@ impl Database {
         meta: &TableMeta,
         values: &HashMap<String, Value>,
         ws: &contextdb_tx::WriteSet,
-    ) -> EventGateSnapshot {
+    ) -> Result<EventGateSnapshot> {
         let snapshot = self.snapshot();
         let mut gate = event_gate_snapshot_from_meta(meta);
         let acl = meta
             .columns
             .iter()
             .find(|column| column.acl_ref.is_some())
-            .and_then(|column| {
-                let acl_ref = column.acl_ref.as_ref()?.clone();
+            .map(|column| -> Result<EventAclGate> {
+                let acl_ref = column
+                    .acl_ref
+                    .as_ref()
+                    .expect("selected ACL column")
+                    .clone();
                 let grant_meta = self.table_meta(&acl_ref.ref_table);
                 let grant_gate = grant_meta
                     .as_ref()
@@ -1942,19 +2008,21 @@ impl Database {
                     Some(Value::Uuid(acl_id)) => Some(*acl_id),
                     _ => None,
                 };
-                let grant_rows = acl_id
-                    .map(|acl_id| self.grant_rows_for_acl(&acl_ref, acl_id, snapshot, ws))
-                    .unwrap_or_default();
-                Some(EventAclGate {
+                let grant_rows = match acl_id {
+                    Some(acl_id) => self.grant_rows_for_acl(&acl_ref, acl_id, snapshot, ws)?,
+                    None => EventGrantRows::default(),
+                };
+                Ok(EventAclGate {
                     column: column.name.clone(),
                     ref_table: acl_ref.ref_table,
                     ref_column: acl_ref.ref_column,
                     grant_gate: Box::new(grant_gate),
                     grant_rows,
                 })
-            });
+            })
+            .transpose()?;
         gate.acl = acl;
-        gate
+        Ok(gate)
     }
 
     fn grant_rows_for_acl(
@@ -1963,41 +2031,68 @@ impl Database {
         acl_id: uuid::Uuid,
         snapshot: SnapshotId,
         ws: &contextdb_tx::WriteSet,
-    ) -> Vec<HashMap<String, Value>> {
+    ) -> Result<EventGrantRows> {
         let deleted_row_ids = ws
             .relational_deletes
             .iter()
             .filter_map(|(table, row_id, _)| (table == &acl_ref.ref_table).then_some(*row_id))
             .collect::<HashSet<_>>();
 
-        let mut grants = self
-            .relational_store
-            .tables
-            .read()
-            .get(&acl_ref.ref_table)
-            .map(|rows| {
-                rows.iter()
-                    .filter(|row| {
-                        row.visible_at(snapshot)
-                            && !deleted_row_ids.contains(&row.row_id)
-                            && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
-                    })
-                    .map(|row| row.values.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut grants = Vec::new();
+        let mut memory =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let visited = self.visit_writer_rows::<Error>(&acl_ref.ref_table, |row| {
+            if row.visible_at(snapshot)
+                && !deleted_row_ids.contains(&row.row_id)
+                && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
+            {
+                Self::admit_event_grant_copy(&mut memory, grants.is_empty(), row)?;
+                grants.push(row.values.clone());
+            }
+            Ok(())
+        })?;
+        if !visited {
+            let tables = self.relational_store.tables.read();
+            for row in tables.get(&acl_ref.ref_table).into_iter().flatten() {
+                if row.visible_at(snapshot)
+                    && !deleted_row_ids.contains(&row.row_id)
+                    && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
+                {
+                    Self::admit_event_grant_copy(&mut memory, grants.is_empty(), row)?;
+                    grants.push(row.values.clone());
+                }
+            }
+        }
 
-        grants.extend(
-            ws.relational_inserts
-                .iter()
-                .filter(|(table, row)| {
-                    table == &acl_ref.ref_table
-                        && row.deleted_tx.is_none()
-                        && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
-                })
-                .map(|(_, row)| row.values.clone()),
-        );
-        grants
+        for (table, row) in &ws.relational_inserts {
+            if table == &acl_ref.ref_table
+                && row.deleted_tx.is_none()
+                && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
+            {
+                Self::admit_event_grant_copy(&mut memory, grants.is_empty(), row)?;
+                grants.push(row.values.clone());
+            }
+        }
+        Ok(EventGrantRows::new(grants, Some(memory)))
+    }
+
+    fn admit_event_grant_copy(
+        memory: &mut crate::memory_accounting::OwnedMemoryReservation,
+        first: bool,
+        row: &VersionedRow,
+    ) -> Result<()> {
+        memory.try_grow_for(
+            row.estimated_bytes()
+                .saturating_add(128)
+                .saturating_add(if first {
+                    std::mem::size_of::<AdmittedEventGrants>().saturating_add(32)
+                } else {
+                    0
+                }),
+            "writer_source",
+            "event_grants",
+            "Raise MEMORY_LIMIT to prepare these sink grants.",
+        )
     }
 
     pub(super) fn publish_prepared_sink_events_to_memory(&self, events: Vec<PreparedSinkEvent>) {
@@ -2275,18 +2370,71 @@ impl Database {
         ])
     }
 
-    fn row_event_candidates(&self, ws: &contextdb_tx::WriteSet) -> Result<Vec<RowEventCandidate>> {
+    fn row_event_candidates(
+        &self,
+        ws: &contextdb_tx::WriteSet,
+    ) -> Result<(
+        Vec<RowEventCandidate>,
+        crate::memory_accounting::OwnedMemoryReservation,
+    )> {
         let snapshot = self.snapshot();
-        let mut delete_preimages: HashMap<(String, RowId), VersionedRow> = HashMap::new();
+        let delete_capacity = ws.relational_deletes.len();
+        let candidate_capacity = ws.relational_inserts.len().saturating_add(delete_capacity);
+        let mut memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            held::map::<(String, RowId), VersionedRow>(delete_capacity)
+                .saturating_add(held::map::<(String, RowId), ()>(delete_capacity))
+                .saturating_add(
+                    candidate_capacity.saturating_mul(std::mem::size_of::<RowEventCandidate>()),
+                )
+                .saturating_add(held::ALLOCATION_BYTES),
+            "writer_source",
+            "event_preimages",
+            "Raise MEMORY_LIMIT to prepare these sink events.",
+        )?;
+        let mut delete_preimages: HashMap<(String, RowId), VersionedRow> =
+            HashMap::with_capacity(delete_capacity);
+        let root = self.writer_read_root()?;
+        let source = root
+            .map(crate::persistence::writer_adapters::WriterRelationalSource::new)
+            .transpose()?;
         for (table, row_id, _) in &ws.relational_deletes {
-            if let Some(row) = self.relational_store.row_by_id(table, *row_id, snapshot) {
+            let row = if let Some(source) = &source {
+                if let Some(row) =
+                    contextdb_relational::source::visible_row(source, table, *row_id, snapshot)?
+                {
+                    memory.try_grow_for(
+                        row.value()
+                            .estimated_bytes()
+                            .saturating_add(table.len())
+                            .saturating_add(64),
+                        "writer_source",
+                        "event_preimages",
+                        "Raise MEMORY_LIMIT to prepare these sink events.",
+                    )?;
+                    Some(row.value().clone())
+                } else {
+                    None
+                }
+            } else {
+                self.relational_store.row_by_id(table, *row_id, snapshot)
+            };
+            if let Some(row) = row {
                 delete_preimages.insert((table.clone(), *row_id), row);
             }
         }
 
-        let mut consumed_deletes = HashSet::new();
-        let mut candidates = Vec::new();
+        let mut consumed_deletes = HashSet::with_capacity(delete_capacity);
+        let mut candidates = Vec::with_capacity(candidate_capacity);
         for (table, row) in &ws.relational_inserts {
+            memory.try_grow_for(
+                row.estimated_bytes()
+                    .saturating_add(table.len().saturating_mul(4))
+                    .saturating_add(128),
+                "writer_source",
+                "event_candidates",
+                "Raise MEMORY_LIMIT to prepare these sink events.",
+            )?;
             let same_row_key = (table.clone(), row.row_id);
             let same_id_key =
                 delete_preimages
@@ -2327,7 +2475,7 @@ impl Database {
                 values: row.values,
             });
         }
-        Ok(candidates)
+        Ok((candidates, memory))
     }
 }
 
@@ -2851,7 +2999,7 @@ fn event_gate_snapshot_from_projected_payload(
                 ref_table: acl_ref.ref_table,
                 ref_column: acl_ref.ref_column,
                 grant_gate: Box::new(grant_gate),
-                grant_rows,
+                grant_rows: EventGrantRows::Legacy(grant_rows),
             })
         });
     gate.acl = acl;

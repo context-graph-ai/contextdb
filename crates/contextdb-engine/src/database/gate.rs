@@ -1,4 +1,94 @@
 use super::*;
+
+/// Cached identities retain their actual controls independently of source
+/// windows and of the reader that originally built the cache entry.
+pub(super) struct AdmittedAclIds {
+    ids: HashSet<uuid::Uuid>,
+    memory: crate::memory_accounting::OwnedMemoryReservation,
+    map_bytes: usize,
+}
+impl AdmittedAclIds {
+    fn workspace(accountant: Arc<MemoryAccountant>) -> Self {
+        Self {
+            ids: HashSet::new(),
+            memory: crate::memory_accounting::OwnedMemoryReservation::new(accountant),
+            map_bytes: 0,
+        }
+    }
+    fn new(accountant: Arc<MemoryAccountant>) -> Result<Self> {
+        let mut owner = Self::workspace(accountant);
+        owner.memory.try_grow_for(
+            std::mem::size_of::<Self>().saturating_add(32),
+            "writer_source",
+            "acl_identities",
+            "Raise MEMORY_LIMIT to retain these ACL identities.",
+        )?;
+        Ok(owner)
+    }
+    fn insert(&mut self, id: uuid::Uuid) -> Result<bool> {
+        if self.ids.contains(&id) {
+            return Ok(false);
+        }
+        if self.ids.len() == self.ids.capacity() {
+            let wanted = self.ids.capacity().max(1).saturating_mul(2);
+            let bytes = held::map::<uuid::Uuid, ()>(wanted);
+            self.memory.try_grow_for(
+                bytes,
+                "writer_source",
+                "acl_identities",
+                "Raise MEMORY_LIMIT to retain these ACL identities.",
+            )?;
+            let mut replacement = HashSet::with_capacity(wanted);
+            replacement.extend(self.ids.iter().copied());
+            self.ids = replacement;
+            self.memory.try_shrink(self.map_bytes)?;
+            self.map_bytes = bytes;
+        }
+        Ok(self.ids.insert(id))
+    }
+    fn copy(&self, accountant: Arc<MemoryAccountant>) -> Result<Self> {
+        let mut copy = Self::new(accountant)?;
+        if !self.ids.is_empty() {
+            let bytes = held::map::<uuid::Uuid, ()>(self.ids.len());
+            copy.memory.try_grow_for(
+                bytes,
+                "writer_source",
+                "acl_identities",
+                "Raise MEMORY_LIMIT to retain these ACL identities.",
+            )?;
+            copy.ids = HashSet::with_capacity(self.ids.len());
+            copy.ids.extend(self.ids.iter().copied());
+            copy.map_bytes = bytes;
+        }
+        Ok(copy)
+    }
+    fn remove(&mut self, id: &uuid::Uuid) {
+        self.ids.remove(id);
+    }
+}
+impl std::ops::Deref for AdmittedAclIds {
+    type Target = HashSet<uuid::Uuid>;
+    fn deref(&self) -> &Self::Target {
+        &self.ids
+    }
+}
+
+pub(super) struct AdmittedAclGrantCache {
+    entries: HashMap<AclGrantCacheKey, AdmittedAclGrantCacheEntry>,
+    map_memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
+}
+struct AdmittedAclGrantCacheEntry {
+    ids: Arc<AdmittedAclIds>,
+    _key_memory: crate::memory_accounting::OwnedMemoryReservation,
+}
+impl AdmittedAclGrantCache {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            map_memory: None,
+        }
+    }
+}
 use contextdb_core::read_contract::{OwnerLimitExceededDetail, ReadFailureLimit};
 
 /// How many resolved grant sets the store keeps for reuse. One set is kept
@@ -354,6 +444,54 @@ fn bounded_graph_cursor_bytes(forward_capacity: usize, reverse_capacity: usize) 
 }
 
 impl Database {
+    fn admitted_acl_cache_key(
+        &self,
+        principal: &Principal,
+        acl_ref: &AclRef,
+        snapshot: SnapshotId,
+    ) -> Result<(
+        AclGrantCacheKey,
+        crate::memory_accounting::OwnedMemoryReservation,
+    )> {
+        let principal_bytes = match principal {
+            Principal::System => 0,
+            Principal::Agent(id) | Principal::Human(id) => held::text(id),
+        };
+        let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            principal_bytes
+                .saturating_add(held::text(&acl_ref.ref_table))
+                .saturating_add(held::text(&acl_ref.ref_column)),
+            "writer_source",
+            "acl_cache_key",
+            "Raise MEMORY_LIMIT to retain this ACL cache key.",
+        )?;
+        Ok((
+            AclGrantCacheKey {
+                principal: principal.clone(),
+                ref_table: acl_ref.ref_table.clone(),
+                ref_column: acl_ref.ref_column.clone(),
+                snapshot,
+                // Handle-local caches cannot cross database incarnations. The
+                // physical user root binds both rows and their durable schema;
+                // the tag keeps authenticated retained images distinct from
+                // writer publications even when their physical headers agree.
+                source: if let Some(source) = &self.retained_relational_source {
+                    Some((true, source.storage_identity()))
+                } else {
+                    let root = self.writer_read_root()?;
+                    if let Some(root) = &root {
+                        // Erasure masks can invalidate old capabilities without
+                        // changing the physical root header. A warm cache must
+                        // pass the same reject-only source boundary.
+                        root.check_table_scope(&acl_ref.ref_table)?;
+                    }
+                    root.map(|root| (false, root.storage_identity()))
+                },
+            },
+            memory,
+        ))
+    }
     pub(super) fn access_is_admin(&self) -> bool {
         self.access.contexts.is_none()
             && self.access.scope_labels.is_none()
@@ -471,6 +609,23 @@ impl Database {
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        if self.visit_writer_rows::<Error>(table, |row| {
+            if row.visible_at(snapshot)
+                && self.bounded_read_allowed_for_row(
+                    None,
+                    table,
+                    &meta,
+                    row,
+                    snapshot,
+                    &mut |_| Ok::<(), Error>(()),
+                )?
+            {
+                visit(row)?;
+            }
+            Ok(())
+        })? {
+            return Ok(());
+        }
         let tables = self.relational_store.tables.read();
         let rows = tables
             .get(table)
@@ -860,7 +1015,7 @@ impl Database {
                 snapshot,
                 &mut before_access_row,
             )?,
-            None if self.retained_relational_source.is_some() => self
+            None if self.retained_relational_source.is_some() || self.persistence.is_some() => self
                 .bounded_allowed_acl_ids_in_retained_source(
                     principal,
                     acl_ref,
@@ -895,55 +1050,77 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-    ) -> std::result::Result<Arc<HashSet<uuid::Uuid>>, E>
+    ) -> std::result::Result<Arc<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
-        let cache_key = AclGrantCacheKey {
-            principal: principal.clone(),
-            ref_table: acl_ref.ref_table.clone(),
-            ref_column: acl_ref.ref_column.clone(),
-            snapshot,
+        // Select the writer source once for both cache qualification and the
+        // eventual stream. Retained authenticated sources never rebind here.
+        let root = if self.retained_relational_source.is_none() {
+            self.writer_read_root().map_err(E::from)?
+        } else {
+            None
         };
-        if let Some(cached) = self.acl_grant_cache.read().get(&cache_key).cloned() {
+        let _scope = self.enter_writer_read(root);
+        let (cache_key, key_memory) = self
+            .admitted_acl_cache_key(principal, acl_ref, snapshot)
+            .map_err(E::from)?;
+        if let Some(cached) = self
+            .acl_grant_cache
+            .read()
+            .entries
+            .get(&cache_key)
+            .map(|entry| entry.ids.clone())
+        {
             return Ok(cached);
         }
         let (kind, principal_id) = match principal {
-            Principal::System => return Ok(Arc::new(HashSet::new())),
+            Principal::System => {
+                return Ok(Arc::new(
+                    AdmittedAclIds::new(self.accountant.clone()).map_err(E::from)?,
+                ));
+            }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
-        let source = self.retained_relational_source.as_ref().ok_or_else(|| {
-            E::from(Error::Other(
-                "retained ACL scan requested without a retained relational source".to_owned(),
-            ))
-        })?;
         let meta = self
             .table_meta(&acl_ref.ref_table)
             .ok_or_else(|| E::from(Error::TableNotFound(acl_ref.ref_table.clone())))?;
-        let mut allowed = HashSet::new();
-        source.bounded_visit_relational_rows::<E>(
-            &acl_ref.ref_table,
-            &meta,
-            snapshot,
-            |grant| {
-                before_access_row(grant.estimated_bytes())?;
-                if grant.visible_at(snapshot)
-                    && self
-                        .grant_row_context_scope_allowed(&acl_ref.ref_table, grant, snapshot)
-                        .map_err(E::from)?
-                    && grant.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
-                    && grant.values.get("principal_id")
-                        == Some(&Value::Text(principal_id.to_string()))
-                    && let Some(Value::Uuid(acl_id)) = grant.values.get(&acl_ref.ref_column)
-                {
-                    allowed.insert(*acl_id);
-                }
-                Ok(())
-            },
-        )?;
+        let mut allowed = AdmittedAclIds::new(self.accountant.clone()).map_err(E::from)?;
+        let mut admit = |grant: &VersionedRow| {
+            if grant.visible_at(snapshot)
+                && self
+                    .grant_row_context_scope_allowed(&acl_ref.ref_table, grant, snapshot)
+                    .map_err(E::from)?
+                && grant.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
+                && grant.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
+                && let Some(Value::Uuid(acl_id)) = grant.values.get(&acl_ref.ref_column)
+            {
+                allowed.insert(*acl_id).map_err(E::from)?;
+            }
+            Ok(())
+        };
+        if let Some(source) = self.retained_relational_source.as_ref() {
+            source.bounded_visit_relational_rows::<E>(
+                &acl_ref.ref_table,
+                &meta,
+                snapshot,
+                |grant| {
+                    before_access_row(grant.estimated_bytes())?;
+                    admit(grant)
+                },
+            )?;
+        } else if !self.visit_writer_rows_phased::<E>(&acl_ref.ref_table, |grant| match grant {
+            None => before_access_row(0),
+            Some(grant) => admit(grant),
+        })? {
+            return Err(E::from(Error::Other(
+                "ACL source requested without a captured relational source".to_owned(),
+            )));
+        }
         let allowed = Arc::new(allowed);
-        self.remember_allowed_acl_ids(cache_key, Arc::clone(&allowed));
+        self.remember_allowed_acl_ids(cache_key, key_memory, Arc::clone(&allowed))
+            .map_err(E::from)?;
         Ok(allowed)
     }
 
@@ -960,25 +1137,32 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-    ) -> std::result::Result<Arc<HashSet<uuid::Uuid>>, E>
+    ) -> std::result::Result<Arc<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
-        let cache_key = AclGrantCacheKey {
-            principal: principal.clone(),
-            ref_table: acl_ref.ref_table.clone(),
-            ref_column: acl_ref.ref_column.clone(),
-            snapshot,
-        };
-        if let Some(cached) = self.acl_grant_cache.read().get(&cache_key).cloned() {
+        let (cache_key, key_memory) = self
+            .admitted_acl_cache_key(principal, acl_ref, snapshot)
+            .map_err(E::from)?;
+        if let Some(cached) = self
+            .acl_grant_cache
+            .read()
+            .entries
+            .get(&cache_key)
+            .map(|entry| entry.ids.clone())
+        {
             return Ok(cached);
         }
         let (kind, principal_id) = match principal {
-            Principal::System => return Ok(Arc::new(HashSet::new())),
+            Principal::System => {
+                return Ok(Arc::new(
+                    AdmittedAclIds::new(self.accountant.clone()).map_err(E::from)?,
+                ));
+            }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
-        let mut allowed = HashSet::new();
+        let mut allowed = AdmittedAclIds::new(self.accountant.clone()).map_err(E::from)?;
         if let Some(rows) = tables.get(&acl_ref.ref_table) {
             for grant in rows {
                 before_access_row(grant.estimated_bytes())?;
@@ -991,12 +1175,13 @@ impl Database {
                         == Some(&Value::Text(principal_id.to_string()))
                     && let Some(Value::Uuid(acl_id)) = grant.values.get(&acl_ref.ref_column)
                 {
-                    allowed.insert(*acl_id);
+                    allowed.insert(*acl_id).map_err(E::from)?;
                 }
             }
         }
         let allowed = Arc::new(allowed);
-        self.remember_allowed_acl_ids(cache_key, Arc::clone(&allowed));
+        self.remember_allowed_acl_ids(cache_key, key_memory, Arc::clone(&allowed))
+            .map_err(E::from)?;
         Ok(allowed)
     }
 
@@ -1015,9 +1200,9 @@ impl Database {
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
-        committed: Arc<HashSet<uuid::Uuid>>,
+        committed: Arc<AdmittedAclIds>,
         before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-    ) -> std::result::Result<Arc<HashSet<uuid::Uuid>>, E>
+    ) -> std::result::Result<Arc<AdmittedAclIds>, E>
     where
         E: From<Error>,
     {
@@ -1038,14 +1223,35 @@ impl Database {
         // The grant rows this transaction staged, read one at a time and
         // charged like every other access row, and the committed grants it
         // withdrew, dropped by the identity they were granted under.
-        let mut staged_grants = Vec::new();
-        let mut withdrawn = HashSet::new();
+        let mut withdrawn = AdmittedAclIds::workspace(self.accountant.clone());
         for staged in overlay.staged_rows.iter().flat_map(|rows| rows.rows()) {
             before_access_row(staged.estimated_bytes())?;
-            staged_grants.push(staged.clone());
         }
+        let source = self
+            .writer_read_root()
+            .map_err(E::from)?
+            .map(crate::persistence::writer_adapters::WriterRelationalSource::new)
+            .transpose()
+            .map_err(E::from)?;
         for row_id in &overlay.deleted {
-            let withdrawn_grant = {
+            let withdrawn_grant = if let Some(source) = &source {
+                let row = contextdb_relational::source::visible_row(
+                    source,
+                    &acl_ref.ref_table,
+                    *row_id,
+                    snapshot,
+                )
+                .map_err(E::from)?;
+                if let Some(row) = row {
+                    before_access_row(row.value().estimated_bytes())?;
+                    match row.value().values.get(&acl_ref.ref_column) {
+                        Some(Value::Uuid(acl_id)) => Some(*acl_id),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
                 let tables = self.relational_store.tables.read();
                 tables
                     .get(&acl_ref.ref_table)
@@ -1056,25 +1262,30 @@ impl Database {
                     })
             };
             if let Some(acl_id) = withdrawn_grant {
-                withdrawn.insert(acl_id);
+                withdrawn.insert(acl_id).map_err(E::from)?;
             }
         }
-        if staged_grants.is_empty() && withdrawn.is_empty() {
+        if overlay
+            .staged_rows
+            .as_ref()
+            .is_none_or(|rows| rows.is_empty())
+            && withdrawn.is_empty()
+        {
             return Ok(committed);
         }
-        let mut allowed = committed.as_ref().clone();
-        for acl_id in withdrawn {
-            allowed.remove(&acl_id);
+        let mut allowed = committed.copy(self.accountant.clone()).map_err(E::from)?;
+        for acl_id in withdrawn.iter() {
+            allowed.remove(acl_id);
         }
-        for grant in staged_grants {
+        for grant in overlay.staged_rows.iter().flat_map(|rows| rows.rows()) {
             if self
-                .grant_row_context_scope_allowed(&acl_ref.ref_table, &grant, snapshot)
+                .grant_row_context_scope_allowed(&acl_ref.ref_table, grant, snapshot)
                 .map_err(E::from)?
                 && grant.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
                 && grant.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
                 && let Some(Value::Uuid(acl_id)) = grant.values.get(&acl_ref.ref_column)
             {
-                allowed.insert(*acl_id);
+                allowed.insert(*acl_id).map_err(E::from)?;
             }
         }
         Ok(Arc::new(allowed))
@@ -1209,6 +1420,42 @@ impl Database {
         Ok(None)
     }
 
+    pub(super) fn borrowed_row_read_allowed_for_query(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        self.assert_table_read_allowed(table)?;
+        if self.access_is_admin() {
+            return Ok(true);
+        }
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let allowed = if let Some(column) = self.acl_column(&meta) {
+            Some(
+                self.allowed_acl_ids_for_principal(
+                    self.access
+                        .principal
+                        .as_ref()
+                        .expect("assert_table_read_allowed rejects missing principals"),
+                    column.acl_ref.as_ref().expect("acl column"),
+                    snapshot,
+                )?,
+            )
+        } else {
+            None
+        };
+        self.read_allowed_for_row_cached(
+            table,
+            &meta,
+            row,
+            snapshot,
+            allowed.as_ref().map(|ids| &ids.ids),
+        )
+    }
+
     pub(crate) fn filter_rows_for_read(
         &self,
         table: &str,
@@ -1254,7 +1501,7 @@ impl Database {
                 &meta,
                 &row,
                 snapshot,
-                allowed_acl_ids.as_ref().map(|ids| ids.as_ref()),
+                allowed_acl_ids.as_ref().map(|ids| &ids.ids),
             )? {
                 out.push(row);
             }
@@ -1299,7 +1546,7 @@ impl Database {
                 &meta,
                 &row,
                 snapshot,
-                allowed_acl_ids.as_ref().map(|ids| ids.as_ref()),
+                allowed_acl_ids.as_ref().map(|ids| &ids.ids),
             )? {
                 Some(err) => {
                     if first_denial.is_none() {
@@ -1471,26 +1718,40 @@ impl Database {
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
-    ) -> Result<Arc<HashSet<uuid::Uuid>>> {
-        let cache_key = AclGrantCacheKey {
-            principal: principal.clone(),
-            ref_table: acl_ref.ref_table.clone(),
-            ref_column: acl_ref.ref_column.clone(),
-            snapshot,
-        };
-        if let Some(cached) = self.acl_grant_cache.read().get(&cache_key).cloned() {
+    ) -> Result<Arc<AdmittedAclIds>> {
+        if self.retained_relational_source.is_some() || self.writer_read_root()?.is_some() {
+            return self.bounded_allowed_acl_ids_in_retained_source(
+                principal,
+                acl_ref,
+                snapshot,
+                &mut |_| {
+                    crate::executor::observe_bounded_access_control_row();
+                    Ok::<(), Error>(())
+                },
+            );
+        }
+        let (cache_key, key_memory) = self.admitted_acl_cache_key(principal, acl_ref, snapshot)?;
+        if let Some(cached) = self
+            .acl_grant_cache
+            .read()
+            .entries
+            .get(&cache_key)
+            .map(|entry| entry.ids.clone())
+        {
             return Ok(cached);
         }
         let (kind, principal_id) = match principal {
-            Principal::System => return Ok(Arc::new(HashSet::new())),
+            Principal::System => {
+                return Ok(Arc::new(AdmittedAclIds::new(self.accountant.clone())?));
+            }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
         let tables = self.relational_store.tables.read();
         let Some(rows) = tables.get(&acl_ref.ref_table) else {
-            return Ok(Arc::new(HashSet::new()));
+            return Ok(Arc::new(AdmittedAclIds::new(self.accountant.clone())?));
         };
-        let mut allowed = HashSet::new();
+        let mut allowed = AdmittedAclIds::new(self.accountant.clone())?;
         for row in rows {
             crate::executor::observe_bounded_access_control_row();
             if row.visible_at(snapshot)
@@ -1499,11 +1760,11 @@ impl Database {
                 && row.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
                 && let Some(Value::Uuid(acl_id)) = row.values.get(&acl_ref.ref_column)
             {
-                allowed.insert(*acl_id);
+                allowed.insert(*acl_id)?;
             }
         }
         let allowed = Arc::new(allowed);
-        self.remember_allowed_acl_ids(cache_key, Arc::clone(&allowed));
+        self.remember_allowed_acl_ids(cache_key, key_memory, Arc::clone(&allowed))?;
         Ok(allowed)
     }
 
@@ -1517,13 +1778,48 @@ impl Database {
     fn remember_allowed_acl_ids(
         &self,
         cache_key: AclGrantCacheKey,
-        allowed: Arc<HashSet<uuid::Uuid>>,
-    ) {
-        let mut cache = self.acl_grant_cache.write();
-        if cache.len() >= RETAINED_GRANT_SET_CEILING && !cache.contains_key(&cache_key) {
-            cache.clear();
+        key_memory: crate::memory_accounting::OwnedMemoryReservation,
+        allowed: Arc<AdmittedAclIds>,
+    ) -> Result<()> {
+        loop {
+            let mut cache = self.acl_grant_cache.write();
+            if let Some(entry) = cache.entries.get_mut(&cache_key) {
+                entry.ids = allowed;
+                return Ok(());
+            }
+            if cache.entries.len() >= RETAINED_GRANT_SET_CEILING {
+                cache.entries.clear();
+            }
+            if cache.entries.len() < cache.entries.capacity() {
+                cache.entries.insert(
+                    cache_key,
+                    AdmittedAclGrantCacheEntry {
+                        ids: allowed,
+                        _key_memory: key_memory,
+                    },
+                );
+                return Ok(());
+            }
+            let wanted = cache.entries.capacity().max(1).saturating_mul(2);
+            drop(cache);
+            let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
+                held::map::<AclGrantCacheKey, AdmittedAclGrantCacheEntry>(wanted),
+                "writer_source",
+                "acl_cache_controls",
+                "Raise MEMORY_LIMIT to retain this ACL cache entry.",
+            )?;
+            let mut replacement = HashMap::with_capacity(wanted);
+            let mut cache = self.acl_grant_cache.write();
+            if cache.entries.len() < cache.entries.capacity()
+                || cache.entries.len() >= replacement.capacity()
+            {
+                continue;
+            }
+            replacement.extend(cache.entries.drain());
+            cache.entries = replacement;
+            cache.map_memory = Some(memory);
         }
-        cache.insert(cache_key, allowed);
     }
 
     fn allowed_acl_ids_for_principal_in_tx(
@@ -1532,24 +1828,26 @@ impl Database {
         principal: &Principal,
         acl_ref: &AclRef,
         snapshot: SnapshotId,
-    ) -> Result<Arc<HashSet<uuid::Uuid>>> {
+    ) -> Result<Arc<AdmittedAclIds>> {
         let Some(tx) = tx else {
             return self.allowed_acl_ids_for_principal(principal, acl_ref, snapshot);
         };
         let (kind, principal_id) = match principal {
-            Principal::System => return Ok(Arc::new(HashSet::new())),
+            Principal::System => {
+                return Ok(Arc::new(AdmittedAclIds::new(self.accountant.clone())?));
+            }
             Principal::Agent(id) => ("Agent", id.as_str()),
             Principal::Human(id) => ("Human", id.as_str()),
         };
         let rows = self.acl_grant_rows_in_tx(tx, &acl_ref.ref_table, snapshot)?;
-        let mut allowed = HashSet::new();
+        let mut allowed = AdmittedAclIds::new(self.accountant.clone())?;
         for row in rows {
             if self.grant_row_context_scope_allowed(&acl_ref.ref_table, &row, snapshot)?
                 && row.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
                 && row.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
                 && let Some(Value::Uuid(acl_id)) = row.values.get(&acl_ref.ref_column)
             {
-                allowed.insert(*acl_id);
+                allowed.insert(*acl_id)?;
             }
         }
         Ok(Arc::new(allowed))
@@ -1561,7 +1859,9 @@ impl Database {
         table: &str,
         snapshot: SnapshotId,
     ) -> Result<Vec<VersionedRow>> {
-        let mut rows = {
+        let mut rows = if self.writer_read_root()?.is_some() {
+            self.committed_rows_at(table, snapshot)?
+        } else {
             let tables = self.relational_store.tables.read();
             tables
                 .get(table)
@@ -1708,17 +2008,27 @@ impl Database {
                 return Ok(Some(candidates.clone()));
             }
             let mut readable = RoaringTreemap::new();
+            let root = self.writer_read_root()?;
+            let source = root
+                .map(crate::persistence::writer_adapters::WriterRelationalSource::new)
+                .transpose()?;
+            let meta = self
+                .table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
             for id in candidates.iter() {
-                if let Some(row) = self.relational_store.row_by_id(table, RowId(id), snapshot)
-                    && self.read_allowed_for_row(
-                        table,
-                        &self
-                            .table_meta(table)
-                            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?,
-                        &row,
-                        snapshot,
-                    )?
-                {
+                let allowed = if let Some(source) = &source {
+                    contextdb_relational::source::visible_row(source, table, RowId(id), snapshot)?
+                        .map(|row| self.read_allowed_for_row(table, &meta, row.value(), snapshot))
+                        .transpose()?
+                        .unwrap_or(false)
+                } else {
+                    self.relational_store
+                        .row_by_id(table, RowId(id), snapshot)
+                        .map(|row| self.read_allowed_for_row(table, &meta, &row, snapshot))
+                        .transpose()?
+                        .unwrap_or(false)
+                };
+                if allowed {
                     readable.insert(id);
                 }
             }
@@ -1736,6 +2046,9 @@ impl Database {
     ) -> Result<Option<Vec<VersionedRow>>> {
         if columns.is_empty() || columns.len() != values.len() {
             return Ok(Some(Vec::new()));
+        }
+        if self.writer_read_root()?.is_some() {
+            return self.writer_indexed_rows_for_values(table, columns, values, snapshot);
         }
 
         let row_ids = {
@@ -1808,14 +2121,7 @@ impl Database {
     ) -> Result<Vec<(String, VersionedRow)>> {
         let id_column = vec!["id".to_string()];
         let id_value = vec![Value::Uuid(node)];
-        let table_names = self
-            .relational_store
-            .table_meta
-            .read()
-            .iter()
-            .filter(|(_, meta)| Self::has_uuid_id_column(meta))
-            .map(|(table, meta)| (table.clone(), self.meta_has_read_gate(meta)))
-            .collect::<Vec<_>>();
+        let (table_names, _table_memory) = self.graph_metadata_tables(Self::has_uuid_id_column)?;
         let mut rows = Vec::new();
         for (table, has_read_gate) in table_names {
             match self.indexed_rows_for_values(&table, &id_column, &id_value, snapshot)? {
@@ -1834,6 +2140,42 @@ impl Database {
             }
         }
         Ok(rows)
+    }
+
+    fn graph_metadata_tables(
+        &self,
+        matches: fn(&TableMeta) -> bool,
+    ) -> Result<(
+        Vec<(String, bool)>,
+        crate::memory_accounting::OwnedMemoryReservation,
+    )> {
+        let mut memory =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        if let Some(root) = self.writer_read_root()? {
+            let mut names = Vec::new();
+            for (name, meta) in root
+                .captured_table_metadata()
+                .filter(|(_, meta)| matches(meta))
+            {
+                memory.try_grow_for(
+                    held::text(name).saturating_add(128),
+                    "writer_source",
+                    "graph_metadata_tables",
+                    "Raise MEMORY_LIMIT to inspect these graph metadata tables.",
+                )?;
+                names.push((name.to_owned(), self.meta_has_read_gate(meta)));
+            }
+            return Ok((names, memory));
+        }
+        let names = self
+            .relational_store
+            .table_meta
+            .read()
+            .iter()
+            .filter(|(_, meta)| matches(meta))
+            .map(|(table, meta)| (table.clone(), self.meta_has_read_gate(meta)))
+            .collect::<Vec<_>>();
+        Ok((names, memory))
     }
 
     fn overlay_tx_node_rows(
@@ -1879,16 +2221,6 @@ impl Database {
             && Self::has_exact_column_type(meta, "edge_type", &ColumnType::Text)
     }
 
-    fn edge_table_names(&self) -> Vec<(String, bool)> {
-        self.relational_store
-            .table_meta
-            .read()
-            .iter()
-            .filter(|(_, meta)| Self::has_graph_edge_columns(meta))
-            .map(|(table, meta)| (table.clone(), self.meta_has_read_gate(meta)))
-            .collect()
-    }
-
     fn edge_rows_for_graph_edge_in_tx(
         &self,
         tx: Option<TxId>,
@@ -1897,7 +2229,8 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
     ) -> Result<Vec<(String, VersionedRow)>> {
-        let edge_tables = self.edge_table_names();
+        let (edge_tables, _table_memory) =
+            self.graph_metadata_tables(Self::has_graph_edge_columns)?;
         let edge_table_set = edge_tables
             .iter()
             .map(|(table, _)| table.clone())

@@ -175,6 +175,11 @@ impl StatementRows {
     pub fn contains(&self, row: &RowId) -> bool {
         self.rows.contains_key(row)
     }
+    /// Borrow a row from this immutable admitted statement image.
+    #[doc(hidden)]
+    pub fn row(&self, row: RowId) -> Option<&VersionedRow> {
+        self.rows.get(&row).map(|owner| &owner.row)
+    }
     pub fn len(&self) -> usize {
         self.rows.len()
     }

@@ -7838,6 +7838,16 @@ struct ReceivedSchemaAdjudicationInputs<'a> {
     unattested_policies: Option<&'a ConflictPolicies>,
 }
 
+/// Immutable transaction controls captured under one write-set guard. Payloads
+/// retain their mutation-time owners; search never borrows a mutable WriteSet.
+struct CapturedVectorWriteSet {
+    vector: crate::executor::TransactionVectorOverlay,
+    rows: Option<Arc<contextdb_tx::StatementRows>>,
+    deleted_rows: HashSet<RowId>,
+    staged_entries: usize,
+    touches: bool,
+}
+
 struct StrictVectorOverlayRequest<'a> {
     index: VectorIndexRef,
     query: &'a [f32],
@@ -11697,7 +11707,7 @@ pub struct Database {
     /// answered "no such formula" to a search the other door answers.
     #[allow(clippy::type_complexity)]
     rank_formula_cache: Arc<RwLock<HashMap<(String, String), Arc<RankFormula>>>>,
-    acl_grant_cache: RwLock<HashMap<AclGrantCacheKey, Arc<HashSet<uuid::Uuid>>>>,
+    acl_grant_cache: RwLock<gate::AdmittedAclGrantCache>,
     rank_policy_eval_count: AtomicU64,
     rank_policy_formula_parse_count: AtomicU64,
     fk_indexed_tuple_probes: AtomicU64,
@@ -11803,6 +11813,7 @@ struct AclGrantCacheKey {
     ref_table: String,
     ref_column: String,
     snapshot: SnapshotId,
+    source: Option<(bool, redb::StorageSnapshotIdentity)>,
 }
 
 pub(crate) enum InsertRowResult {
@@ -19299,7 +19310,7 @@ impl Database {
             last_vector_search_trace: Arc::new(RwLock::new(None)),
             statement_cache: RwLock::new(HashMap::new()),
             rank_formula_cache: Arc::new(RwLock::new(HashMap::new())),
-            acl_grant_cache: RwLock::new(HashMap::new()),
+            acl_grant_cache: RwLock::new(gate::AdmittedAclGrantCache::new()),
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
             fk_indexed_tuple_probes: AtomicU64::new(0),
@@ -20372,7 +20383,7 @@ impl Database {
             // store, and a formula registered after the view was taken is one
             // the view must still find.
             rank_formula_cache: Arc::clone(&self.rank_formula_cache),
-            acl_grant_cache: RwLock::new(HashMap::new()),
+            acl_grant_cache: RwLock::new(gate::AdmittedAclGrantCache::new()),
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
             fk_indexed_tuple_probes: AtomicU64::new(0),
@@ -39133,6 +39144,15 @@ impl Database {
             return Ok(Some(committed));
         }
 
+        if self.writer_read_root()?.is_some() {
+            return self.writer_staged_row_matching(tx, table, snapshot, true, |row| {
+                columns
+                    .iter()
+                    .zip(values)
+                    .all(|(column, value)| row.values.get(column) == Some(value))
+            });
+        }
+
         self.tx_mgr.with_write_set(tx, |ws| {
             let mut seen_inserts = HashSet::new();
             ws.relational_inserts
@@ -39183,6 +39203,15 @@ impl Database {
             if !deleted_in_tx {
                 return Ok(Some(committed));
             }
+        }
+
+        if self.writer_read_root()?.is_some() {
+            return self.writer_staged_row_matching(tx, table, snapshot, true, |row| {
+                columns
+                    .iter()
+                    .zip(values)
+                    .all(|(column, value)| row.values.get(column) == Some(value))
+            });
         }
 
         if let Some(staged) = self.tx_mgr.with_write_set(tx, |ws| {
@@ -40937,10 +40966,15 @@ impl Database {
         search_mode: contextdb_core::VectorSearchMode,
     ) -> Result<(contextdb_vector::mem::SearchScores, VectorSearchDebugTrace)> {
         self.vector_store.validate_vector(&index, query.len())?;
-        if let Some(tx) = tx {
-            let overlay_result = self.tx_mgr.with_write_set(tx, |ws| {
-                if write_set_touches_vector_search(ws, &index) {
-                    Some(self.query_vector_strict_with_write_set_overlay(
+        let _scope = self.writer_read_scope()?;
+        if let Some(tx) = tx
+            && self
+                .tx_mgr
+                .with_write_set(tx, |ws| write_set_touches_vector_search(ws, &index))?
+        {
+            if k == 0 {
+                return self.tx_mgr.with_write_set(tx, |ws| {
+                    self.query_vector_strict_with_write_set_overlay(
                         ws,
                         StrictVectorOverlayRequest {
                             index: index.clone(),
@@ -40950,13 +40984,47 @@ impl Database {
                             snapshot,
                             search_mode,
                         },
-                    ))
-                } else {
-                    None
+                    )
+                })?;
+            }
+            let captured =
+                self.capture_vector_write_set::<Error>(tx, &index, true, &mut |_| Ok(()))?;
+            if let Some(captured) = captured {
+                if captured.touches {
+                    return self.query_vector_strict_with_captured_overlay(
+                        &captured,
+                        StrictVectorOverlayRequest {
+                            index,
+                            query,
+                            k,
+                            candidates,
+                            snapshot,
+                            search_mode,
+                        },
+                    );
                 }
-            })?;
-            if let Some(result) = overlay_result {
-                return result;
+            } else {
+                // Raw public WriteSet payloads without a mutation-time owner
+                // retain their existing legacy semantics. This branch is not
+                // certified as mutex-free; it must not gain a new refusal.
+                let overlay_result = self.tx_mgr.with_write_set(tx, |ws| {
+                    write_set_touches_vector_search(ws, &index).then(|| {
+                        self.query_vector_strict_with_write_set_overlay(
+                            ws,
+                            StrictVectorOverlayRequest {
+                                index: index.clone(),
+                                query,
+                                k,
+                                candidates,
+                                snapshot,
+                                search_mode,
+                            },
+                        )
+                    })
+                })?;
+                if let Some(result) = overlay_result {
+                    return result;
+                }
             }
         }
         let effective_candidates =
@@ -41248,6 +41316,193 @@ impl Database {
             })();
         self.accountant.release(overlay_bytes);
         result
+    }
+
+    fn query_vector_strict_with_captured_overlay(
+        &self,
+        captured: &CapturedVectorWriteSet,
+        request: StrictVectorOverlayRequest<'_>,
+    ) -> Result<(contextdb_vector::mem::SearchScores, VectorSearchDebugTrace)> {
+        let StrictVectorOverlayRequest {
+            index,
+            query,
+            k,
+            candidates,
+            snapshot,
+            search_mode,
+        } = request;
+        if k == 0 {
+            return Ok((
+                contextdb_vector::mem::SearchScores::new(index.clone(), self.accountant.clone()),
+                VectorSearchDebugTrace {
+                    index,
+                    used_hnsw: false,
+                    hnsw_len: None,
+                    hnsw_candidate_count: 0,
+                    hnsw_candidate_row_ids: Vec::new(),
+                    final_row_ids: Vec::new(),
+                    supplemented_row_count: 0,
+                    fallback_reason: Some("empty_limit"),
+                    partition_routes: Vec::new(),
+                    hnsw_ef_search: None,
+                    selected_generations: Vec::new(),
+                    budget_receipt: None,
+                },
+            ));
+        }
+        let staged_entries = captured.staged_entries;
+        let removed = &captured.vector.removed;
+        let moved = &captured.vector.moved;
+        let staged_identities = &captured.vector.staged_identities;
+        (|| -> Result<(contextdb_vector::mem::SearchScores, VectorSearchDebugTrace)> {
+            let mut committed_candidates = candidates.cloned();
+            if let Some(committed_candidates) = committed_candidates.as_mut() {
+                for (from, to) in moved {
+                    if committed_candidates.contains(to.0) {
+                        committed_candidates.insert(from.0);
+                    }
+                }
+            }
+            let effective_candidates = self.effective_vector_read_candidates(
+                &index,
+                snapshot,
+                committed_candidates.as_ref(),
+                search_mode,
+            )?;
+            let mut committed_k = k
+                .saturating_add(removed.len())
+                .saturating_add(moved.len())
+                .saturating_add(staged_identities.len());
+            let mut previous_progress = None;
+            let (mut scored, mut trace) = loop {
+                let (committed, next_trace) = self.owner_vector_search(
+                    index.clone(),
+                    query,
+                    committed_k,
+                    effective_candidates.as_ref(),
+                    snapshot,
+                    search_mode,
+                )?;
+                let returned = committed.len();
+                let mut eligible = contextdb_vector::mem::SearchScores::new(
+                    index.clone(),
+                    self.accountant.clone(),
+                );
+                if search_mode == contextdb_core::VectorSearchMode::Exact {
+                    eligible = eligible.for_exact();
+                }
+                eligible.reserve(returned.saturating_add(staged_entries))?;
+                for (row_id, score) in committed {
+                    if removed.contains(&row_id)
+                        || staged_identities.contains(&row_id)
+                        || moved.contains_key(&row_id)
+                    {
+                        continue;
+                    }
+                    let row_id = moved.get(&row_id).copied().unwrap_or(row_id);
+                    if let Some(candidates) = candidates
+                        && !candidates.contains(row_id.0)
+                    {
+                        continue;
+                    }
+                    if !self.row_id_read_allowed_in_captured_set_for_query(
+                        captured,
+                        &index.table,
+                        row_id,
+                        snapshot,
+                    )? {
+                        continue;
+                    }
+                    eligible.try_push((row_id, score))?;
+                }
+                if eligible.len() >= k || previous_progress == Some((returned, eligible.len())) {
+                    break (eligible, next_trace);
+                }
+                previous_progress = Some((returned, eligible.len()));
+                let refill = k.saturating_sub(eligible.len()).max(1);
+                let next_k = committed_k
+                    .saturating_add(refill)
+                    .max(committed_k.saturating_mul(2));
+                if next_k == committed_k {
+                    break (eligible, next_trace);
+                }
+                committed_k = next_k;
+            };
+
+            for (from, to) in moved {
+                if removed.contains(to)
+                    || staged_identities.contains(to)
+                    || candidates.is_some_and(|ids| !ids.contains(to.0))
+                {
+                    continue;
+                }
+                if !self.vector_captured_row_in_selected_partitions(captured, &index, *to)?
+                    || !self.row_id_read_allowed_in_captured_set_for_query(
+                        captured,
+                        &index.table,
+                        *to,
+                        snapshot,
+                    )?
+                {
+                    continue;
+                }
+                if let Some(score) = self.vector_store.bounded_score_live_row(
+                    &index,
+                    *from,
+                    snapshot,
+                    query,
+                    || Ok::<_, Error>(()),
+                    || Ok::<_, Error>(()),
+                    |bytes| {
+                        self.accountant.try_allocate_for(
+                            bytes,
+                            "vector_search",
+                            "score_moved_vector",
+                            "Reduce transaction scope or raise MEMORY_LIMIT.",
+                        )
+                    },
+                    |bytes| self.accountant.release(bytes),
+                )? {
+                    scored.try_push((*to, score))?;
+                }
+            }
+            for entry in &captured.vector.staged_vectors {
+                let row_id = entry.row_id();
+                if !self.vector_captured_row_in_selected_partitions(captured, &index, row_id)? {
+                    continue;
+                }
+                if let Some(candidates) = candidates
+                    && !candidates.contains(row_id.0)
+                {
+                    continue;
+                }
+                if !self.row_id_read_allowed_in_captured_set_for_query(
+                    captured,
+                    &index.table,
+                    row_id,
+                    snapshot,
+                )? {
+                    continue;
+                }
+                scored.try_push((row_id, cosine_similarity(entry.vector(), query)))?;
+            }
+            scored.sort_unstable_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            scored.truncate(k);
+            trace.final_row_ids = scored.iter().map(|(row_id, _)| *row_id).collect();
+            trace.supplemented_row_count = trace
+                .supplemented_row_count
+                .saturating_add(staged_entries.min(scored.len()));
+            let used_hnsw = trace.used_hnsw;
+            self.last_vector_search_used_hnsw
+                .store(used_hnsw, Ordering::SeqCst);
+            *self.last_vector_search_trace.write() = Some(trace.clone());
+            Ok((scored, trace))
+        })()
     }
 
     pub(crate) fn register_rank_formula(
@@ -42279,6 +42534,51 @@ impl Database {
             .row_by_id_at_lsn_or_latest(table, row_id, lsn)
             .or_else(|| self.relational_store.row_by_id(table, row_id, snapshot))
             .ok_or_else(|| Error::NotFound(format!("row {row_id} in table {table}")))
+    }
+
+    fn vector_captured_row_in_selected_partitions(
+        &self,
+        captured: &CapturedVectorWriteSet,
+        index: &VectorIndexRef,
+        row_id: RowId,
+    ) -> Result<bool> {
+        let Some(row) = captured.rows.as_ref().and_then(|rows| rows.row(row_id)) else {
+            return Ok(true);
+        };
+        let meta = self
+            .table_meta(&index.table)
+            .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+        let declaration = meta
+            .columns
+            .iter()
+            .find(|column| column.name == index.column)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+        let key =
+            crate::composite_store::vector_partition_key_for_row(index, &meta, declaration, row)?;
+        Ok(contextdb_vector::mem::partition_key_is_selected(
+            index, &key,
+        ))
+    }
+
+    fn row_id_read_allowed_in_captured_set_for_query(
+        &self,
+        captured: &CapturedVectorWriteSet,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        if let Some(row) = captured.rows.as_ref().and_then(|rows| rows.row(row_id)) {
+            return self.borrowed_row_read_allowed_for_query(table, row, snapshot);
+        }
+        if captured.deleted_rows.contains(&row_id) {
+            return Ok(false);
+        }
+        let Some(row) = self.committed_row_at(table, row_id, snapshot)? else {
+            return Ok(false);
+        };
+        self.borrowed_row_read_allowed_for_query(table, &row, snapshot)
     }
 
     fn vector_staged_row_in_selected_partitions(
@@ -45121,7 +45421,17 @@ impl Database {
         tx: TxId,
         table: &str,
     ) -> Result<crate::executor::TransactionTableOverlay> {
-        self.tx_mgr.with_write_set(tx, |ws| -> Result<_> {
+        let size = |ws: &WriteSet| {
+            let deleted = ws
+                .relational_deletes
+                .iter()
+                .filter(|(name, _, _)| name == table)
+                .count();
+            let predicates = ws
+                .relational_delete_predicates
+                .iter()
+                .filter(|p| p.table == table)
+                .count();
             let bytes = ws
                 .relational_deletes
                 .iter()
@@ -45147,6 +45457,11 @@ impl Database {
                         .sum::<usize>(),
                 )
                 .saturating_add(128);
+            (bytes, deleted, predicates)
+        };
+        loop {
+            let (bytes, deleted_capacity, predicate_capacity) =
+                self.tx_mgr.with_write_set(tx, |ws| size(ws))?;
             let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
                 self.accountant.clone(),
                 bytes,
@@ -45154,24 +45469,38 @@ impl Database {
                 "statement_overlay",
                 "Reduce staged rows or raise MEMORY_LIMIT.",
             )?;
-            Ok(crate::executor::TransactionTableOverlay {
-                deleted: ws
-                    .relational_deletes
-                    .iter()
-                    .filter(|(name, _, _)| name == table)
-                    .map(|(_, id, _)| *id)
-                    .collect(),
-                delete_predicates: ws
-                    .relational_delete_predicates
-                    .iter()
-                    .filter(|p| p.table == table)
-                    .cloned()
-                    .collect(),
-                staged_rows: ws.ordered_staged_rows.statement_rows(table),
+            let mut deleted = HashSet::with_capacity(deleted_capacity);
+            let mut delete_predicates = Vec::with_capacity(predicate_capacity);
+            let staged = self.tx_mgr.with_write_set(tx, |ws| {
+                let (needed, deletes, predicates) = size(ws);
+                if needed > bytes || deletes > deleted_capacity || predicates > predicate_capacity {
+                    return Err(());
+                }
+                deleted.extend(
+                    ws.relational_deletes
+                        .iter()
+                        .filter(|(name, _, _)| name == table)
+                        .map(|(_, id, _)| *id),
+                );
+                delete_predicates.extend(
+                    ws.relational_delete_predicates
+                        .iter()
+                        .filter(|p| p.table == table)
+                        .cloned(),
+                );
+                Ok(ws.ordered_staged_rows.statement_rows(table))
+            })?;
+            let Ok(staged_rows) = staged else {
+                continue;
+            };
+            return Ok(crate::executor::TransactionTableOverlay {
+                deleted,
+                delete_predicates,
+                staged_rows,
                 bytes: 0,
                 _memory: Some(memory),
-            })
-        })?
+            });
+        }
     }
 
     /// What an open transaction changes about the vectors one index can be
@@ -45181,6 +45510,198 @@ impl Database {
     /// (`query_vector_strict_with_write_set_exact`), read once and carried as
     /// decisions rather than as a copy of the index: what this transaction
     /// took out, what it re-filed elsewhere, and the immutable vectors it owns.
+    fn capture_vector_write_set<E: From<Error>>(
+        &self,
+        tx: TxId,
+        index: &VectorIndexRef,
+        retain_rows: bool,
+        before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<CapturedVectorWriteSet>, E> {
+        let sizes = |ws: &WriteSet| {
+            let deletes = ws
+                .relational_deletes
+                .iter()
+                .filter(|(table, _, _)| table == &index.table)
+                .count();
+            (
+                ws.vector_deletes
+                    .iter()
+                    .filter(|(have, _, _)| have == index)
+                    .count()
+                    .saturating_add(deletes),
+                ws.vector_moves
+                    .iter()
+                    .filter(|(have, _, _, _)| have == index)
+                    .count(),
+                ws.vector_inserts
+                    .iter()
+                    .filter(|entry| entry.index == *index && entry.deleted_tx.is_none())
+                    .count(),
+                if retain_rows { deletes } else { 0 },
+                if retain_rows {
+                    ws.relational_inserts
+                        .iter()
+                        .filter(|(table, _)| table == &index.table)
+                        .count()
+                } else {
+                    0
+                },
+            )
+        };
+        loop {
+            let (
+                removed_capacity,
+                moved_capacity,
+                staged_capacity,
+                row_delete_capacity,
+                anchor_capacity,
+            ) = self
+                .tx_mgr
+                .with_write_set(tx, |ws| sizes(ws))
+                .map_err(E::from)?;
+            let bytes = std::mem::size_of::<CapturedVectorWriteSet>()
+                .saturating_add(held::map::<RowId, ()>(removed_capacity))
+                .saturating_add(held::map::<RowId, RowId>(moved_capacity))
+                .saturating_add(held::map::<RowId, ()>(staged_capacity))
+                .saturating_add(held::map::<RowId, ()>(row_delete_capacity))
+                .saturating_add(staged_capacity.saturating_mul(std::mem::size_of::<
+                    Arc<contextdb_tx::ordered_staged::StagedVectorCapability>,
+                >()))
+                .saturating_add(if staged_capacity == 0 {
+                    0
+                } else {
+                    held::ALLOCATION_BYTES
+                });
+            let scratch_bytes = held::map::<RowId, ()>(anchor_capacity);
+            before_retain(bytes.saturating_add(scratch_bytes))?;
+            let scratch_memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
+                scratch_bytes,
+                "query",
+                "active_tx_anchor_identities",
+                "Reduce active transaction vector search scope or raise MEMORY_LIMIT.",
+            )
+            .map_err(E::from)?;
+            let mut seen_rows = HashSet::with_capacity(anchor_capacity);
+            let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
+                bytes,
+                "query",
+                &format!("active_tx_vector_overlay@{}.{}", index.table, index.column),
+                "Reduce active transaction vector search scope or raise MEMORY_LIMIT.",
+            )
+            .map_err(E::from)?;
+            let mut removed = HashSet::with_capacity(removed_capacity);
+            let mut moved = HashMap::with_capacity(moved_capacity);
+            let mut staged_identities = HashSet::with_capacity(staged_capacity);
+            let mut staged_vectors = Vec::with_capacity(staged_capacity);
+            let mut deleted_rows = HashSet::with_capacity(row_delete_capacity);
+            let captured = self
+                .tx_mgr
+                .with_write_set(tx, |ws| {
+                    let now = sizes(ws);
+                    if now.0 > removed_capacity
+                        || now.1 > moved_capacity
+                        || now.2 > staged_capacity
+                        || now.3 > row_delete_capacity
+                        || now.4 > anchor_capacity
+                    {
+                        return Err(());
+                    }
+                    let rows = retain_rows
+                        .then(|| ws.ordered_staged_rows.statement_rows(&index.table))
+                        .flatten();
+                    if retain_rows {
+                        for (table, row) in ws.relational_inserts.iter().rev() {
+                            if table == &index.table
+                                && seen_rows.insert(row.row_id)
+                                && rows.as_ref().and_then(|rows| rows.row(row.row_id)) != Some(row)
+                            {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    for (have, row, _) in &ws.vector_deletes {
+                        if have == index {
+                            removed.insert(*row);
+                        }
+                    }
+                    for (table, row_id, _) in &ws.relational_deletes {
+                        if table == &index.table {
+                            if retain_rows {
+                                deleted_rows.insert(*row_id);
+                            }
+                            let replaced = if retain_rows {
+                                ws.relational_inserts.iter().any(|(table, row)| {
+                                    table == &index.table && row.row_id == *row_id
+                                })
+                            } else {
+                                ws.ordered_staged_rows.contains_row(table, *row_id)
+                            };
+                            if !replaced {
+                                removed.insert(*row_id);
+                            }
+                        }
+                    }
+                    for (have, from, to, _) in &ws.vector_moves {
+                        if have == index {
+                            moved.insert(*from, *to);
+                        }
+                    }
+                    for entry in ws.vector_inserts.iter().rev() {
+                        if entry.index == *index
+                            && entry.deleted_tx.is_none()
+                            && staged_identities.insert(entry.row_id)
+                        {
+                            let Some(capability) = ws
+                                .ordered_staged_rows
+                                .vector_capability(index, entry.row_id)
+                            else {
+                                return Ok(None);
+                            };
+                            if retain_rows && capability.vector() != entry.vector.as_slice() {
+                                return Ok(None);
+                            }
+                            staged_vectors.push(capability);
+                        }
+                    }
+                    Ok(Some((
+                        rows,
+                        now.2,
+                        write_set_touches_vector_search(ws, index),
+                    )))
+                })
+                .map_err(E::from)?;
+            let Ok(captured) = captured else {
+                continue;
+            };
+            let Some((rows, staged_entries, touches)) = captured else {
+                return Ok(None);
+            };
+            drop(seen_rows);
+            drop(scratch_memory);
+            staged_vectors.reverse();
+            let searchable_entry_count = removed
+                .len()
+                .saturating_add(moved.len())
+                .saturating_add(staged_vectors.len());
+            return Ok(Some(CapturedVectorWriteSet {
+                vector: crate::executor::TransactionVectorOverlay {
+                    removed,
+                    moved,
+                    staged_identities,
+                    staged_vectors,
+                    searchable_entry_count,
+                    _memory: Some(memory),
+                },
+                rows,
+                deleted_rows,
+                staged_entries,
+                touches,
+            }));
+        }
+    }
+
     pub(crate) fn transaction_vector_overlay(
         &self,
         tx: TxId,
@@ -45195,103 +45716,11 @@ impl Database {
         crate::executor::TransactionVectorOverlay,
         crate::executor::BoundedExecutionError,
     > {
-        self.tx_mgr.with_write_set(
-            tx,
-            |ws| -> std::result::Result<_, crate::executor::BoundedExecutionError> {
-                let removed_capacity = ws
-                    .vector_deletes
-                    .iter()
-                    .filter(|(have, _, _)| have == index)
-                    .count()
-                    .saturating_add(
-                        ws.relational_deletes
-                            .iter()
-                            .filter(|(table, _, _)| table == &index.table)
-                            .count(),
-                    );
-                let moved_capacity = ws
-                    .vector_moves
-                    .iter()
-                    .filter(|(have, _, _, _)| have == index)
-                    .count();
-                let staged_capacity = ws
-                    .vector_inserts
-                    .iter()
-                    .filter(|entry| entry.index == *index && entry.deleted_tx.is_none())
-                    .count();
-                // Explicit requested capacities bound every hash allocation and the
-                // capability buffer before construction under the write-set lock.
-                let bytes = held::map::<RowId, ()>(removed_capacity)
-                    .saturating_add(held::map::<RowId, RowId>(moved_capacity))
-                    .saturating_add(held::map::<RowId, ()>(staged_capacity))
-                    .saturating_add(staged_capacity.saturating_mul(std::mem::size_of::<
-                        Arc<contextdb_tx::ordered_staged::StagedVectorCapability>,
-                    >()))
-                    .saturating_add(if staged_capacity == 0 {
-                        0
-                    } else {
-                        held::ALLOCATION_BYTES
-                    });
-                before_retain(bytes)?;
-                let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
-                    self.accountant.clone(),
-                    bytes,
-                    "query",
-                    &format!("active_tx_vector_overlay@{}.{}", index.table, index.column),
-                    "Reduce active transaction vector search scope or raise MEMORY_LIMIT.",
-                )?;
-                let mut removed = HashSet::with_capacity(removed_capacity);
-                for (have, row, _) in &ws.vector_deletes {
-                    if have == index {
-                        removed.insert(*row);
-                    }
-                }
-                for (table, row_id, _) in &ws.relational_deletes {
-                    if table != &index.table {
-                        continue;
-                    }
-                    let replaced = ws.ordered_staged_rows.contains_row(table, *row_id);
-                    if !replaced {
-                        removed.insert(*row_id);
-                    }
-                }
-                let mut moved = HashMap::with_capacity(moved_capacity);
-                for (have, from, to, _) in &ws.vector_moves {
-                    if have == index {
-                        moved.insert(*from, *to);
-                    }
-                }
-                let mut staged_identities = HashSet::with_capacity(staged_capacity);
-                let mut staged_vectors = Vec::with_capacity(staged_capacity);
-                for entry in ws.vector_inserts.iter().rev() {
-                    if entry.index == *index
-                        && entry.deleted_tx.is_none()
-                        && staged_identities.insert(entry.row_id)
-                    {
-                        let capability = ws
-                            .ordered_staged_rows
-                            .vector_capability(index, entry.row_id)
-                            .ok_or_else(|| {
-                                Error::Other("staged vector has no admitted immutable owner".into())
-                            })?;
-                        staged_vectors.push(capability);
-                    }
-                }
-                staged_vectors.reverse();
-                let searchable_entry_count = removed
-                    .len()
-                    .saturating_add(moved.len())
-                    .saturating_add(staged_vectors.len());
-                Ok(crate::executor::TransactionVectorOverlay {
-                    removed,
-                    moved,
-                    staged_identities,
-                    staged_vectors,
-                    searchable_entry_count,
-                    _memory: Some(memory),
-                })
-            },
-        )?
+        self.capture_vector_write_set(tx, index, false, before_retain)?
+            .map(|captured| captured.vector)
+            .ok_or_else(|| {
+                Error::Other("staged vector has no admitted immutable owner".into()).into()
+            })
     }
 
     /// One vector the transaction has staged, cloned under the caller's

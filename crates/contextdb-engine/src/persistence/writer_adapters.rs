@@ -94,7 +94,7 @@ impl RelationalCursor<RelationalPosting> for PostingCursor {
 impl RelationalReadSource for WriterRelationalSource {
     fn validate_table(&self, table: &str) -> Result<()> {
         self.root
-            .captured_table_meta(table)
+            .borrow_captured_table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.into()))
             .map(|_| ())
     }

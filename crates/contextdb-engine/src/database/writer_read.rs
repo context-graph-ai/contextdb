@@ -64,6 +64,233 @@ impl Drop for WriterReadScope {
     }
 }
 impl Database {
+    /// Retain a selected immutable staged row before touching its committed
+    /// predecessor. Legacy plugin rows use a prepaid, revalidated copy.
+    pub(super) fn writer_staged_row_matching(
+        &self,
+        tx: TxId,
+        table: &str,
+        snapshot: SnapshotId,
+        replaces_deleted: bool,
+        mut matches: impl FnMut(&VersionedRow) -> bool,
+    ) -> Result<Option<VersionedRow>> {
+        let root = self.writer_read_root()?.ok_or_else(|| {
+            Error::Other("staged writer lookup requires its captured root".into())
+        })?;
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+        let mut before = usize::MAX;
+        loop {
+            let selected = self.tx_mgr.with_write_set(tx, |ws| {
+                let rows = ws.ordered_staged_rows.statement_rows(table);
+                for (position, (name, row)) in ws.relational_inserts.iter().enumerate().rev() {
+                    if name != table || position >= before || !matches(row) {
+                        continue;
+                    }
+                    // Raw public WriteSet edits may leave superseded versions.
+                    // Inspect that suffix only after a matching row exists;
+                    // an absent/new key allocates no copied identity directory.
+                    if ws.relational_inserts[position + 1..]
+                        .iter()
+                        .any(|(name, newer)| name == table && newer.row_id == row.row_id)
+                    {
+                        continue;
+                    }
+                    let deleted = ws
+                        .relational_deletes
+                        .iter()
+                        .any(|(name, id, _)| name == table && *id == row.row_id);
+                    let owner = rows
+                        .as_ref()
+                        .filter(|rows| rows.row(row.row_id).is_some_and(|owned| owned == row))
+                        .cloned();
+                    return Some((
+                        position,
+                        row.row_id,
+                        row.created_tx,
+                        row.lsn,
+                        row.estimated_bytes(),
+                        deleted,
+                        owner,
+                    ));
+                }
+                None
+            })?;
+            let Some((position, id, created, lsn, bytes, deleted, owner)) = selected else {
+                return Ok(None);
+            };
+            if replaces_deleted
+                && deleted
+                && contextdb_relational::source::visible_row(&source, table, id, snapshot)?
+                    .is_none()
+            {
+                before = position;
+                continue;
+            }
+            let output = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
+                bytes,
+                "writer_source",
+                "staged_row_output",
+                "Raise MEMORY_LIMIT to return this staged row.",
+            )?;
+            let row = if let Some(owner) = owner {
+                Some(owner.row(id).expect("retained selected staged row").clone())
+            } else {
+                self.tx_mgr.with_write_set(tx, |ws| {
+                    let (name, row) = ws.relational_inserts.get(position)?;
+                    let now_deleted = ws
+                        .relational_deletes
+                        .iter()
+                        .any(|(name, row_id, _)| name == table && *row_id == id);
+                    (name == table
+                        && row.row_id == id
+                        && row.created_tx == created
+                        && row.lsn == lsn
+                        && row.estimated_bytes() <= bytes
+                        && now_deleted == deleted
+                        && matches(row))
+                    .then(|| row.clone())
+                })?
+            };
+            if let Some(row) = row {
+                self.retain_writer_output(output);
+                return Ok(Some(row));
+            }
+            // The live legacy write set changed while its copy was admitted.
+            // Nothing has been exposed; reselect without rebinding the root.
+            before = usize::MAX;
+        }
+    }
+
+    /// Visit one decoded record at a time from the statement's captured root.
+    /// `false` leaves the established borrowed-memory implementation to its caller.
+    pub(super) fn visit_writer_rows<E: From<Error>>(
+        &self,
+        table: &str,
+        mut visit: impl FnMut(&VersionedRow) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        self.visit_writer_rows_phased(table, |row| match row {
+            Some(row) => visit(row),
+            None => Ok(()),
+        })
+    }
+
+    /// The work phase precedes source decoding; the row phase borrows the
+    /// admitted window. The caller supplies one error vocabulary for both.
+    pub(super) fn visit_writer_rows_phased<E: From<Error>>(
+        &self,
+        table: &str,
+        mut visit: impl FnMut(Option<&VersionedRow>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        use contextdb_relational::source::RelationalReadSource;
+        use std::ops::Bound;
+        let Some(root) = self.writer_read_root().map_err(E::from)? else {
+            return Ok(false);
+        };
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)
+            .map_err(E::from)?;
+        let mut cursor = source
+            .row_cursor(table, Bound::Unbounded, Bound::Unbounded, false)
+            .map_err(E::from)?;
+        while let Some(window) = next_window_with_work(&mut *cursor, &mut || visit(None))? {
+            visit(Some(window.value()))?;
+        }
+        Ok(true)
+    }
+
+    /// A declared exact/prefix probe and its payloads share one storage root.
+    pub(super) fn writer_indexed_rows_for_values(
+        &self,
+        table: &str,
+        columns: &[String],
+        values: &[Value],
+        snapshot: SnapshotId,
+    ) -> Result<Option<Vec<VersionedRow>>> {
+        use contextdb_relational::source::{
+            RelationalIndexRange, RelationalReadSource, visible_row,
+        };
+        use std::ops::Bound;
+        let Some(root) = self.writer_read_root()? else {
+            return Ok(None);
+        };
+        let meta = root
+            .captured_table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let Some(index) = meta.indexes.iter().find(|index| {
+            index.columns.len() >= columns.len()
+                && (!index.is_exact_only() || index.columns.len() == columns.len())
+                && index
+                    .columns
+                    .iter()
+                    .zip(columns)
+                    .all(|((have, _), want)| have == want)
+        }) else {
+            return Ok(None);
+        };
+        let source =
+            crate::persistence::writer_adapters::WriterRelationalSource::new(root.clone())?;
+        let mut scratch = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            values
+                .iter()
+                .map(Value::estimated_bytes)
+                .sum::<usize>()
+                .saturating_mul(8)
+                .saturating_add(256),
+            "writer_source",
+            "metadata_keys",
+            "Raise MEMORY_LIMIT to inspect this metadata key.",
+        )?;
+        let key = index_key_from_values(&index.columns[..columns.len()], values);
+        let current = snapshot == source.snapshot();
+        let mut cursor = if index.columns.len() == columns.len() {
+            source.exact_index_cursor(table, &index.name, current, &key)?
+        } else {
+            let lower = source.index_position_key(current, &key, RowId(0), TxId(0))?;
+            source.index_cursor(
+                table,
+                &index.name,
+                RelationalIndexRange {
+                    current,
+                    lower: Bound::Included(lower.as_bytes()),
+                    upper: Bound::Unbounded,
+                    reverse: false,
+                },
+            )?
+        };
+        let mut seen = HashSet::new();
+        let mut rows = Vec::new();
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        while let Some(posting) = cursor.next_window()? {
+            let posting = posting.value();
+            if !posting.key.starts_with(&key) {
+                break;
+            }
+            if !posting.entry.visible_at(snapshot) || seen.contains(&posting.entry.row_id) {
+                continue;
+            }
+            scratch.try_grow_for(
+                96,
+                "writer_source",
+                "metadata_identities",
+                "Raise MEMORY_LIMIT to inspect these metadata rows.",
+            )?;
+            seen.insert(posting.entry.row_id);
+            if let Some(row) = visible_row(&source, table, posting.entry.row_id, snapshot)? {
+                output.try_grow_for(
+                    row.value().estimated_bytes().saturating_add(128),
+                    "writer_source",
+                    "metadata_output",
+                    "Raise MEMORY_LIMIT to return these metadata rows.",
+                )?;
+                rows.push(row.value().clone());
+            }
+        }
+        self.retain_writer_output(output);
+        Ok(Some(rows))
+    }
+
     /// Commit preparation needs the actual committed frontier, independently
     /// of an outer statement's retained transaction base.
     pub(super) fn committed_row_exists_at_current_frontier(
@@ -446,22 +673,9 @@ impl Database {
         let mut output =
             crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
         if let Some(tx) = tx {
-            let staged = self.tx_mgr.with_write_set(tx, |ws| {
-                ws.relational_inserts
-                    .iter()
-                    .rev()
-                    .find(|(t, row)| t == table && row.values.get(col) == Some(value))
-                    .map(|(_, row)| {
-                        output.try_grow_for(
-                            row.estimated_bytes(),
-                            "writer_source",
-                            "point_output",
-                            "Raise MEMORY_LIMIT to return this row.",
-                        )?;
-                        Ok::<_, Error>(row.clone())
-                    })
-                    .transpose()
-            })??;
+            let staged = self.writer_staged_row_matching(tx, table, snapshot, false, |row| {
+                row.values.get(col) == Some(value)
+            })?;
             if staged.is_some() {
                 self.retain_writer_output(output);
                 return Ok(staged);

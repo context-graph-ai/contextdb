@@ -975,7 +975,7 @@ impl Database {
             // The same cache, not a copy of it: a formula registered after this
             // handle was derived is one this handle must still find.
             rank_formula_cache: Arc::clone(&self.rank_formula_cache),
-            acl_grant_cache: RwLock::new(HashMap::new()),
+            acl_grant_cache: RwLock::new(super::gate::AdmittedAclGrantCache::new()),
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
             fk_indexed_tuple_probes: AtomicU64::new(0),
