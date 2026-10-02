@@ -47,7 +47,7 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
                 &format!("UPDATE history SET revision = 1 WHERE id = {id}"),
             );
         }
-        let log_entries = db.change_log_since(Lsn(0));
+        let log_entries = db.change_log_since(Lsn(0)).unwrap();
         let log = canonical(&log_entries);
         let commits = db.commit_index_for_test();
         let changes = canonical(&db.changes_since(Lsn(0)));
@@ -74,7 +74,7 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
             "durable cache pressure actually evicts pages"
         );
         assert_eq!(
-            canonical(&db.change_log_since(Lsn(0))),
+            canonical(&db.change_log_since(Lsn(0)).unwrap()),
             log,
             "exact log occurrence order including equal-LSN siblings"
         );
@@ -122,7 +122,7 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
         snapshot.close().unwrap();
         let last = checkpoints[n - 1].0;
         let before_tail = db.__writer_cache_stats_for_test().unwrap();
-        let (page, page_work) = observe(|| db.change_log_since(last));
+        let (page, page_work) = observe(|| db.change_log_since(last).unwrap());
         let after_tail = db.__writer_cache_stats_for_test().unwrap();
         assert_eq!(
             canonical(&page),

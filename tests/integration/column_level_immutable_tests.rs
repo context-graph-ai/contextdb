@@ -108,7 +108,7 @@ fn assert_no_ghost_write(
         "rejection must not emit any DDL change, got {} entries",
         ddl_after.len()
     );
-    let change_after = db.change_log_since(lsn_before);
+    let change_after = db.change_log_since(lsn_before).unwrap();
     assert!(
         change_after.is_empty(),
         "rejection must not emit any row-change log entry, got {} entries",
@@ -2256,7 +2256,7 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
         before,
         "refusal repair must preserve the authoritative row values"
     );
-    let repair = db.change_log_since(lsn_before);
+    let repair = db.change_log_since(lsn_before).unwrap();
     assert_eq!(
         repair.len(),
         2,

@@ -2632,7 +2632,7 @@ async fn authenticated_edge_push_borne_purge_is_refused_before_hub_mutation() {
         before_selected_deletion,
         "the rejected push cannot install deletion or purge state"
     );
-    let post_request_changes = hub.db.change_log_since(before_lsn);
+    let post_request_changes = hub.db.change_log_since(before_lsn).unwrap();
     // A contact timestamp can match the already-recorded millisecond and be
     // idempotent, so this exchange may leave no change-log entry. Any entry
     // that does exist must remain hub-local peer bookkeeping.
@@ -3235,7 +3235,7 @@ async fn reopened_log_gap_pages_old_generation_purge_before_current_schema_snaps
     let hub = start_hub(root.path(), tenant).await;
     hub.db.__force_sync_log_gap_for_test();
     assert!(
-        hub.db.change_log_since(Lsn(0)).is_empty(),
+        hub.db.change_log_since(Lsn(0)).unwrap().is_empty(),
         "fixture: reopening forces the durable persisted-state path instead of change-log replay"
     );
     assert!(

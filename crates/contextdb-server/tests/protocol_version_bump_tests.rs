@@ -115,7 +115,7 @@ fn row_count(db: &Database, table: &str) -> usize {
 }
 
 fn assert_only_optional_peer_contact_changes_since(db: &Database, before_lsn: Lsn, exchange: &str) {
-    let changes = db.change_log_since(before_lsn);
+    let changes = db.change_log_since(before_lsn).unwrap();
     assert!(
         changes.iter().all(|entry| matches!(
             entry,

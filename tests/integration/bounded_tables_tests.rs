@@ -1428,7 +1428,7 @@ fn c4_plain_retention_on_a_keyless_table_stays_allowed() {
 
 fn change_log_entries_for(db: &Database, table: &str) -> usize {
     use contextdb_engine::composite_store::ChangeLogEntry;
-    db.change_log_since(contextdb_core::Lsn(0))
+    db.change_log_since(contextdb_core::Lsn(0)).unwrap()
         .into_iter()
         .filter(|entry| match entry {
             ChangeLogEntry::RowInsert { table: name, .. }
@@ -1801,7 +1801,7 @@ fn c7_a_prune_that_expires_everything_leaves_the_database_answering_correctly() 
 /// changeset. So the floor is the ANCHOR: the greatest entry strictly below the
 /// surviving minimum is kept, and everything below THAT goes.
 fn surviving_change_log_lsns(db: &Database) -> std::collections::BTreeSet<contextdb_core::Lsn> {
-    db.change_log_since(contextdb_core::Lsn(0))
+    db.change_log_since(contextdb_core::Lsn(0)).unwrap()
         .iter()
         .map(|entry| entry.lsn())
         .collect()
