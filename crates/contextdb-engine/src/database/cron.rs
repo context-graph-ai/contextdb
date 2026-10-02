@@ -833,6 +833,8 @@ impl Database {
             vector_store: self.vector_store.clone(),
             vector_schema_gates: self.vector_schema_gates.clone(),
             change_log: self.change_log.clone(),
+            #[cfg(feature = "test-seams")]
+            forced_change_log_gap_through: self.forced_change_log_gap_through.clone(),
             change_log_table_index: self.change_log_table_index.clone(),
             change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
             ddl_log: self.ddl_log.clone(),

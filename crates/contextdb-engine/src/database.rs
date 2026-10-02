@@ -11236,6 +11236,8 @@ pub struct Database {
     vector_store: Arc<VectorStore>,
     vector_schema_gates: Arc<VectorSchemaGates>,
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+    #[cfg(feature = "test-seams")]
+    forced_change_log_gap_through: Arc<AtomicU64>,
     /// Per-table shadow of `change_log`'s own `RowInsert`/`RowDelete`
     /// entries, and a global LSN reference count over every entry kind --
     /// see `ChangeLogTableIndex`/`ChangeLogLsnRefcounts` on
@@ -19072,6 +19074,8 @@ impl Database {
             vector_store: vector_store.clone(),
             vector_schema_gates: Arc::new(VectorSchemaGates::default()),
             change_log,
+            #[cfg(feature = "test-seams")]
+            forced_change_log_gap_through: Arc::new(AtomicU64::new(0)),
             change_log_table_index,
             change_log_lsn_refcounts,
             ddl_log,
@@ -20141,6 +20145,8 @@ impl Database {
             vector_store: self.vector_store.clone(),
             vector_schema_gates: self.vector_schema_gates.clone(),
             change_log: self.change_log.clone(),
+            #[cfg(feature = "test-seams")]
+            forced_change_log_gap_through: self.forced_change_log_gap_through.clone(),
             change_log_table_index: self.change_log_table_index.clone(),
             change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
             ddl_log: self.ddl_log.clone(),
@@ -35329,6 +35335,8 @@ impl Database {
     pub fn __force_sync_log_gap_for_test(&self) {
         let _schema_publication = self.enter_schema_publication_gate(false);
         self.with_commit_lock(|| {
+            self.forced_change_log_gap_through
+                .store(self.current_lsn().0, Ordering::SeqCst);
             let mut change_log = self.change_log.write();
             self.accountant
                 .release(crate::composite_store::change_log_retained_bytes(
@@ -35349,6 +35357,8 @@ impl Database {
     pub fn __force_change_log_gap_for_test(&self) {
         let _schema_publication = self.enter_schema_publication_gate(false);
         self.with_commit_lock(|| {
+            self.forced_change_log_gap_through
+                .store(self.current_lsn().0, Ordering::SeqCst);
             self.change_log.write().clear();
             self.change_log_table_index.write().clear();
             self.change_log_lsn_refcounts.write().clear();
@@ -53584,6 +53594,12 @@ impl Database {
     }
 
     fn change_log_since_unlocked(&self, since_lsn: Lsn) -> Result<Vec<ChangeLogEntry>> {
+        // The forced gap hides the same committed prefix in resident and
+        // native logs; writes after the seam remain available for replay.
+        #[cfg(feature = "test-seams")]
+        let since_lsn = Lsn(since_lsn
+            .0
+            .max(self.forced_change_log_gap_through.load(Ordering::SeqCst)));
         let (_, root) = self.capture_writer_statement()?;
         if let Some(root) = root {
             if since_lsn >= root.lsn {
