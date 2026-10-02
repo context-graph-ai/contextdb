@@ -3779,7 +3779,8 @@ fn execute_create_table_plan(
     // final, because a declared list must be one some index leads
     // with.
     crate::maintained_counts::validate_maintained_counts_for_meta(&p.name, &meta)?;
-    let metadata_bytes = meta.estimated_bytes();
+    let metadata_bytes =
+        crate::database::retained_table_metadata_bytes(db.relational_store(), &meta);
     let has_vector_columns = meta
         .columns
         .iter()
@@ -12022,7 +12023,10 @@ fn dedupe_graph_frontier(
 
 pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
     let meta = db.table_meta(table);
-    let metadata_bytes = meta.as_ref().map(TableMeta::estimated_bytes).unwrap_or(0);
+    let metadata_bytes = meta
+        .as_ref()
+        .map(|meta| crate::database::retained_table_metadata_bytes(db.relational_store(), meta))
+        .unwrap_or(0);
     let snapshot = db.snapshot();
     // Only a live version still owns a charge: a superseded or deleted
     // version handed its bytes back at the commit that stamped its
