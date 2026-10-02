@@ -49260,22 +49260,25 @@ impl Database {
         (vector_hash, edge_hash)
     }
 
-    /// Test-introspection surface: the PHYSICAL row-version count a table
-    /// holds in memory right now -- every superseded version plus every
-    /// keeper, as opposed to `SELECT COUNT(*)`'s LIVE row count. This is
-    /// the disk-bounded-ness measurement's ground truth: a currency table
-    /// with 10 live rows can still hold hundreds of thousands of physical
-    /// versions between compaction cycles. Production-dead: pure read-only
-    /// observation, no behavior change.
+    /// Production-dead count of physical stored row versions, including
+    /// superseded keepers. File-backed writers count durable keys without
+    /// decoding bodies; in-memory stores count their resident versions.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __physical_version_count_for_test(&self, table: &str) -> usize {
+        if let Some(persistence) = &self.persistence {
+            if self.table_meta(table).is_none() {
+                return 0;
+            }
+            return persistence
+                .durable_version_count_for_test(table)
+                .expect("physical version observation requires the durable table");
+        }
         self.relational_store
             .tables
             .read()
             .get(table)
-            .map(|rows| rows.len())
-            .unwrap_or(0)
+            .map_or(0, Vec::len)
     }
 
     /// Test-introspection surface: the PHYSICAL vector-entry count across
@@ -55883,7 +55886,7 @@ impl Database {
                         policy,
                         Self::resolve_incoming_arrival(row, arrivals),
                         adoption,
-                    )
+                    )?
                 {
                     continue;
                 }
@@ -55939,7 +55942,7 @@ impl Database {
                         policy,
                         Self::resolve_incoming_arrival(row, arrivals),
                         adoption,
-                    )
+                    )?
                 {
                     continue;
                 }
@@ -56006,7 +56009,7 @@ impl Database {
                         policy,
                         Some(row.lsn),
                         adoption,
-                    )
+                    )?
                 {
                     continue;
                 }
@@ -56332,14 +56335,14 @@ impl Database {
         policy: ConflictPolicy,
         incoming_arrival: Option<Lsn>,
         adoption: SyncAdoption,
-    ) -> bool {
-        match policy {
+    ) -> Result<bool> {
+        Ok(match policy {
             ConflictPolicy::InsertIfNotExists | ConflictPolicy::ServerWins => false,
             ConflictPolicy::EdgeWins => true,
             ConflictPolicy::LatestWins => {
                 let committed_source = self
-                    .relational_store
-                    .sync_source_lsn(&row.table, committed.row_id);
+                    .relational_sync_source_at_read_root(&row.table, committed.row_id)?
+                    .0;
                 self.sync_latest_wins_incoming(
                     row,
                     committed,
@@ -56348,7 +56351,7 @@ impl Database {
                     adoption,
                 )
             }
-        }
+        })
     }
 
     /// LatestWins per-row comparison. `committed_source` is the row's stored
@@ -56500,13 +56503,16 @@ impl Database {
             // source lacks fresh ordering. Counting it here would invent an
             // FK/DDL effect that the real apply then skips.
             if adoption == SyncAdoption::Continuing
-                && existing.as_ref().is_some_and(|local| {
-                    matches!(
-                        self.relational_store
-                            .sync_source_kind(&row.table, local.row_id),
-                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
-                    )
-                })
+                && existing
+                    .as_ref()
+                    .map(|local| self.relational_sync_source_at_read_root(&row.table, local.row_id))
+                    .transpose()?
+                    .is_some_and(|(_, kind)| {
+                        matches!(
+                            kind,
+                            Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
+                        )
+                    })
             {
                 continue;
             }
@@ -56517,7 +56523,7 @@ impl Database {
                     self.table_meta(&row.table).as_ref(),
                     &row.table,
                 );
-                let applies = existing.as_ref().is_some_and(|local| {
+                let applies = if let Some(local) = existing.as_ref() {
                     Self::authenticated_fresh_creator_delete_permission(
                         row,
                         local,
@@ -56531,8 +56537,10 @@ impl Database {
                             policy,
                             Self::resolve_incoming_arrival(row, arrivals),
                             adoption,
-                        )
-                });
+                        )?
+                } else {
+                    false
+                };
                 if applies && let Some(local) = existing {
                     remove_cached_row(&mut projected_rows_cache, &row.table, local.row_id);
                     if !synthetic_row_ids.remove(&local.row_id) {
@@ -56571,7 +56579,7 @@ impl Database {
                         policy,
                         Self::resolve_incoming_arrival(row, arrivals),
                         adoption,
-                    ) && self
+                    )? && self
                         .sync_upsert_constraint_error_for_values(
                             &row.table,
                             &values,
@@ -64751,7 +64759,7 @@ impl Database {
                             policy,
                             incoming_arrival,
                             adoption,
-                        );
+                        )?;
                     if !applies {
                         if matches!(
                             policy,

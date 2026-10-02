@@ -36010,3 +36010,17 @@ mod retained_raw_body_guard_tests;
 
 #[cfg(test)]
 mod change_reload_decode_tests;
+
+#[cfg(any(test, feature = "test-seams"))]
+impl RedbPersistence {
+    /// Count physical durable keys without decoding bodies or building a mirror.
+    pub(crate) fn durable_version_count_for_test(&self, name: &str) -> Result<usize> {
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let name = Self::rel_table_name(name);
+            let definition = TableDefinition::<&[u8], &[u8]>::new(&name);
+            let table = read.open_table(definition).map_err(Self::storage_error)?;
+            Ok(table.len().map_err(Self::storage_error)? as usize)
+        })
+    }
+}

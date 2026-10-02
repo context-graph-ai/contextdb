@@ -59,17 +59,6 @@ impl RedbPersistence {
         self.with_db(|db| Ok(db.allocator_metadata_bytes_for_test()))
     }
 
-    /// Count physical durable keys without decoding bodies or building a mirror.
-    pub(crate) fn durable_version_count_for_test(&self, name: &str) -> Result<usize> {
-        self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
-            let name = Self::rel_table_name(name);
-            let definition = TableDefinition::<&[u8], &[u8]>::new(&name);
-            let table = read.open_table(definition).map_err(Self::storage_error)?;
-            Ok(table.len().map_err(Self::storage_error)? as usize)
-        })
-    }
-
     /// Actual durable relation height, observed only during fixture setup.
     pub(crate) fn durable_relation_tree_height_for_test(&self, name: &str) -> Result<u32> {
         self.with_db(|db| {
