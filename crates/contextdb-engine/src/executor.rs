@@ -6983,8 +6983,6 @@ fn exec_delete(
     let txid = tx.ok_or_else(|| Error::Other("missing tx for delete".to_string()))?;
     let _vector_schema = db.vector_schema_read_table(&p.table);
     let snapshot = db.snapshot_for_read();
-    let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
-    let rows = db.filter_rows_for_read(&p.table, rows, snapshot)?;
     let resolved_where = p
         .where_clause
         .as_ref()
@@ -6995,6 +6993,38 @@ fn exec_delete(
         .map(|expr| collect_simple_equality_predicates(expr, params, false))
         .transpose()?
         .flatten();
+    // DELETE uses the same admitted indexed candidate source as UPDATE.
+    // Keep the residual predicate and access checks on the selected rows;
+    // returning every unrelated row would charge a full-table output copy.
+    let rows = if let Some(where_clause) = resolved_where.as_ref() {
+        let indexed = db
+            .table_meta(&p.table)
+            .as_ref()
+            .and_then(|meta| analyze_filter_for_index(&p.table, meta, where_clause, params).pick)
+            .map(|pick| {
+                execute_index_scan(
+                    db,
+                    &p.table,
+                    &pick,
+                    snapshot,
+                    Some(txid),
+                    IndexScanAccessMode::Predicate,
+                    None,
+                    resolved_where.as_ref(),
+                    params,
+                )
+            })
+            .transpose()?;
+        if let Some((rows, examined)) = indexed {
+            db.__bump_rows_examined(examined);
+            rows
+        } else {
+            db.scan_in_tx_raw(txid, &p.table, snapshot)?
+        }
+    } else {
+        db.scan_in_tx_raw(txid, &p.table, snapshot)?
+    };
+    let rows = db.filter_rows_for_read(&p.table, rows, snapshot)?;
     let matched = filter_rows_by_predicate(rows, resolved_where.as_ref(), params)?;
 
     for row in &matched {
