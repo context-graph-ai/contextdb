@@ -48,7 +48,7 @@ fn change_log_coords_for_table(
     table: &str,
 ) -> Vec<(contextdb_core::Lsn, contextdb_core::RowId)> {
     let mut coords: Vec<(contextdb_core::Lsn, contextdb_core::RowId)> = db
-        .change_log_since(contextdb_core::Lsn(0))
+        .change_log_since(contextdb_core::Lsn(0)).unwrap()
         .into_iter()
         .filter_map(|entry| match entry {
             ChangeLogEntry::RowInsert {

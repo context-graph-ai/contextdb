@@ -484,10 +484,10 @@ fn run_scope_gates(gate: &mut Gate) -> ScopeResult {
     println!("building A1 (250k released, small ballast)...");
     let a1_arm = build_arm(released_large(), 1);
     let a1_fingerprint_before = a1_arm.db.__vector_and_graph_fingerprint_for_test();
-    let a1_change_log_len_before = a1_arm.db.change_log_since(contextdb_core::Lsn(0)).len();
+    let a1_change_log_len_before = a1_arm.db.change_log_since(contextdb_core::Lsn(0)).unwrap().len();
     let a1 = measure_one_cycle(&a1_arm.db);
     let a1_fingerprint_after = a1_arm.db.__vector_and_graph_fingerprint_for_test();
-    let a1_change_log_len_after = a1_arm.db.change_log_since(contextdb_core::Lsn(0)).len();
+    let a1_change_log_len_after = a1_arm.db.change_log_since(contextdb_core::Lsn(0)).unwrap().len();
     print_report("A1", &a1);
 
     println!("building A2 (250k released, 20x ballast)...");

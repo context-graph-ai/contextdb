@@ -929,12 +929,12 @@ fn p11_change_log_survives_reopen() {
     )
     .unwrap();
     db.commit(tx).unwrap();
-    assert!(!db.change_log_since(Lsn(0)).is_empty());
+    assert!(!db.change_log_since(Lsn(0)).unwrap().is_empty());
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
     assert!(
-        !db2.change_log_since(Lsn(0)).is_empty(),
+        !db2.change_log_since(Lsn(0)).unwrap().is_empty(),
         "durable sync restart semantics require the change log after reopen"
     );
 }
