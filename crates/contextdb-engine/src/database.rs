@@ -16947,25 +16947,30 @@ impl MaintenanceContext {
                             Ok(true)
                         })?;
                     }
-                    for entry in self.graph.forward_adj.read().values().flatten() {
-                        if entry.deleted_tx.is_none()
-                            && (expired_nodes.contains(&entry.source)
-                                || expired_nodes.contains(&entry.target))
-                        {
-                            workspace.borrow_mut().try_grow_for(
-                                128usize.saturating_add(entry.edge_type.len()),
-                                "retention",
-                                "prepare_expiry",
-                                "Raise MEMORY_LIMIT to admit the expiry transaction workspace.",
-                            )?;
-                            ws.adj_deletes.push((
-                                entry.source,
-                                entry.edge_type.clone(),
-                                entry.target,
-                                tx,
-                            ));
-                        }
-                    }
+                    writer_read::visit_graph_versions(
+                        &self.graph,
+                        writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?,
+                        |entry| {
+                            if entry.deleted_tx.is_none()
+                                && (expired_nodes.contains(&entry.source)
+                                    || expired_nodes.contains(&entry.target))
+                            {
+                                workspace.borrow_mut().try_grow_for(
+                                    128usize.saturating_add(entry.edge_type.len()),
+                                    "retention",
+                                    "prepare_expiry",
+                                    "Raise MEMORY_LIMIT to admit the expiry transaction workspace.",
+                                )?;
+                                ws.adj_deletes.push((
+                                    entry.source,
+                                    entry.edge_type.clone(),
+                                    entry.target,
+                                    tx,
+                                ));
+                            }
+                            Ok(())
+                        },
+                    )?;
                     Ok(())
                 })?
             },
@@ -20529,10 +20534,8 @@ impl Database {
         // Committed rows and provenance are read from the published root.
         // Opening installs only schema and index descriptors.
 
-        let graph = Arc::new(GraphStore::new());
-        for edge in persistence.load_forward_edges()? {
-            graph.insert_loaded_edge(edge);
-        }
+        let graph_source = Arc::new(writer_read::ScopedGraphSource::new());
+        let graph = Arc::new(GraphStore::with_source(graph_source.clone()));
 
         let hnsw = Arc::new(OnceLock::new());
         let vector = Arc::new(VectorStore::new(hnsw.clone()));
@@ -20621,6 +20624,7 @@ impl Database {
             persistence.clone(),
             Some(initial_root),
         ));
+        graph_source.bind(&tx_mgr);
         let blob_repository = BlobRepository::shared(persistence.clone());
 
         let db = Self::build_db(
@@ -24677,6 +24681,9 @@ impl Database {
                     if let Some(registration) = local_erasure_registration.borrow_mut().as_mut() {
                         registration.ownership_transferred();
                     }
+                    if self.graph_store.is_source_backed() {
+                        self.accountant.release(ws.adj_inserts.iter().map(AdjEntry::estimated_bytes).sum());
+                    }
                     if !ws.is_empty() {
                         if let Some(stage) = self.take_local_schema_stage(lsn) {
                             if let Some(registration) =
@@ -27952,9 +27959,13 @@ impl Database {
                     })
             })
         };
-        let edges = edges.iter().fold(0usize, |bytes, edge| {
-            bytes.saturating_add(edge.estimated_bytes())
-        });
+        let edges = if self.graph_store.is_source_backed() {
+            0
+        } else {
+            edges.iter().fold(0usize, |bytes, edge| {
+                bytes.saturating_add(edge.estimated_bytes())
+            })
+        };
         metadata
             .saturating_add(rows)
             .saturating_add(edges)
@@ -28542,15 +28553,9 @@ impl Database {
                 .map(|((table, row_id), (_, kind))| (table, row_id, kind)),
         );
         if !affected_graph_edge_types.is_empty() {
-            for edge in self
-                .graph_store
-                .forward_adj
-                .read()
-                .values()
-                .flat_map(|entries| entries.iter().cloned())
-            {
+            self.visit_graph_versions(|edge| {
                 if !affected_graph_edge_types.contains(&edge.edge_type) {
-                    continue;
+                    return Ok(());
                 }
                 #[cfg(any(test, feature = "test-seams"))]
                 record_received_schema_staged_graph_edge_for_test();
@@ -28560,9 +28565,11 @@ impl Database {
                     "stage_received_unit_edge_image",
                     STAGE_RECEIVED_UNIT_COPY_HINT,
                 )?;
-                working.graph_store.insert_loaded_edge(edge);
-            }
+                working.graph_store.insert_loaded_edge(edge.clone());
+                Ok(())
+            })?;
         }
+
         // Schema planning must preserve empty vector declarations too. Build
         // their complete layouts from the copied ColumnDefs. A registry entry
         // whose declaration no longer exists is retired state, not schema;
@@ -29652,8 +29659,15 @@ impl Database {
             .values()
             .flat_map(|entries| entries.iter().cloned())
             .collect::<Vec<_>>();
-        let graph =
-            copy_graph.then(|| GraphStore::prepare_received_schema_publication(edges.clone()));
+        let graph = copy_graph.then(|| {
+            GraphStore::prepare_received_schema_publication(
+                if self.graph_store.is_source_backed() {
+                    Vec::new()
+                } else {
+                    edges.clone()
+                },
+            )
+        });
         let dag_edge_types = MemGraphExecutor::<DynStore>::prepare_dag_edge_types(
             self.relational_store
                 .table_meta
@@ -29784,15 +29798,7 @@ impl Database {
             .map(|(table, rows)| (table.clone(), rows.clone()))
             .collect::<HashMap<_, _>>();
         let old_edges = if copy_graph {
-            {
-                self.graph_store
-                    .forward_adj
-                    .read()
-                    .values()
-                    .flat_map(|entries| entries.iter().cloned())
-                    .filter(|edge| affected_graph_edge_types.contains(&edge.edge_type))
-                    .collect::<Vec<_>>()
-            }
+            self.collect_graph_versions(|edge| affected_graph_edge_types.contains(&edge.edge_type))?
         } else {
             Default::default()
         };
@@ -30388,17 +30394,19 @@ impl Database {
                     .or_insert(value);
             }
         }
-        self.ddl_log
-            .write()
-            .extend(stage.persistence.ddl_log_replacement);
-        publish_prepared_change_log_entries(
-            &self.accountant,
-            &self.change_log,
-            &self.change_log_table_index,
-            &self.change_log_lsn_refcounts,
-            &stage.structurally_dropped_tables,
-            stage.change_log_entries,
-        );
+        if self.persistence.is_none() {
+            self.ddl_log
+                .write()
+                .extend(stage.persistence.ddl_log_replacement);
+            publish_prepared_change_log_entries(
+                &self.accountant,
+                &self.change_log,
+                &self.change_log_table_index,
+                &self.change_log_lsn_refcounts,
+                &stage.structurally_dropped_tables,
+                stage.change_log_entries,
+            );
+        }
         // This prepared path bypasses CompositeStore::apply_write_set, whose
         // ordinary path charges the commit-index entry alongside log entries.
         // The transaction manager still retains one entry for this commit.
@@ -42704,6 +42712,9 @@ impl Database {
     /// table that no longer has rows to identify its edges by, and every edge
     /// the dropped table owned would be kept.
     pub(crate) fn apply_graph_edges_after_table_drop(&self, edges: Vec<AdjEntry>) {
+        if self.graph_store.is_source_backed() {
+            return;
+        }
         let mut forward_next: HashMap<NodeId, Vec<AdjEntry>> = HashMap::new();
         let mut reverse_next: HashMap<NodeId, Vec<AdjEntry>> = HashMap::new();
         for edge in edges {
@@ -42717,52 +42728,36 @@ impl Database {
         *self.graph_store.reverse_adj.write() = reverse_next;
     }
 
-    pub(crate) fn graph_edges_after_table_drop(&self, table: &str) -> Vec<AdjEntry> {
-        let Some(meta) = self.table_meta(table) else {
-            return self
-                .graph_store
-                .forward_adj
-                .read()
-                .values()
-                .flat_map(|entries| entries.iter().cloned())
-                .collect();
+    pub(crate) fn graph_edges_after_table_drop(&self, table: &str) -> Result<Vec<AdjEntry>> {
+        let _scope = self.writer_read_scope()?;
+        let Some(meta) = self.table_meta(table).filter(has_graph_edge_table_shape) else {
+            return self.collect_graph_versions(|_| true);
         };
-        if !has_graph_edge_table_shape(&meta) {
-            return self
-                .graph_store
-                .forward_adj
-                .read()
-                .values()
-                .flat_map(|entries| entries.iter().cloned())
-                .collect();
-        }
         let snapshot = self.snapshot_for_read();
-        let rows = self.scan(table, snapshot).unwrap_or_default();
-        let edge_keys: HashSet<(NodeId, EdgeType, NodeId)> = rows
-            .iter()
-            .filter_map(|row| {
-                match (
+        let mut edge_keys = HashSet::new();
+        let mut identities =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        for row in self.committed_rows_at(table, snapshot)? {
+            if row.visible_at(snapshot)
+                && let (Some(source), Some(target), Some(edge_type)) = (
                     row.values.get("source_id").and_then(Value::as_uuid),
                     row.values.get("target_id").and_then(Value::as_uuid),
                     row.values.get("edge_type").and_then(Value::as_text),
-                ) {
-                    (Some(source), Some(target), Some(edge_type)) => {
-                        Some((*source, edge_type.to_string(), *target))
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
-
-        self.graph_store
-            .forward_adj
-            .read()
-            .values()
-            .flat_map(|entries| entries.iter().cloned())
-            .filter(|entry| {
-                !edge_keys.contains(&(entry.source, entry.edge_type.clone(), entry.target))
-            })
-            .collect()
+                )
+            {
+                identities.try_grow_for(
+                    128 + edge_type.len(),
+                    "writer_source",
+                    "drop_edge_identities",
+                    "Raise MEMORY_LIMIT to prepare the graph table drop.",
+                )?;
+                edge_keys.insert((*source, edge_type.to_owned(), *target));
+            }
+        }
+        let _ = meta;
+        self.collect_graph_versions(|entry| {
+            !edge_keys.contains(&(entry.source, entry.edge_type.clone(), entry.target))
+        })
     }
 
     pub fn table_names(&self) -> Vec<String> {
@@ -43459,14 +43454,7 @@ impl Database {
                 ))
             })
             .collect::<Vec<_>>();
-        let mut surviving_forward_entries = self
-            .graph_store
-            .forward_adj
-            .read()
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut surviving_forward_entries = self.collect_graph_versions(|_| true)?;
         let mut canonical_graph_entries = Vec::with_capacity(selected_edge_variants.len());
         for (source, target, edge_type, created_tx, creation_lsn) in &selected_edge_variants {
             let Some(position) = surviving_forward_entries.iter().position(|entry| {
@@ -43483,7 +43471,7 @@ impl Database {
             };
             canonical_graph_entries.push(surviving_forward_entries.remove(position));
         }
-        let change_log = self.change_log_since_unlocked(Lsn(0))?;
+        let change_log = self.collect_change_log_versions()?;
         let mut edge_insert_witnesses = canonical_graph_entries
             .iter()
             .map(|entry| {
@@ -43860,7 +43848,13 @@ impl Database {
             &replacement_change_log,
         );
         let survivor_graph_entries = surviving_forward_entries;
-        let graph = GraphStore::prepare_received_schema_publication(survivor_graph_entries.clone());
+        let graph = GraphStore::prepare_received_schema_publication(
+            if self.graph_store.is_source_backed() {
+                Vec::new()
+            } else {
+                survivor_graph_entries.clone()
+            },
+        );
         let vector_registry_entries = all_partitioned_vector_entries
             .into_iter()
             .filter(|entry| !selected(&entry.entry.index.table, &entry.entry.row_id))
@@ -44029,14 +44023,7 @@ impl Database {
         }
         let old_tables = all_table_meta;
         let old_rows = self.relational_store.tables.read().clone();
-        let old_edges = self
-            .graph_store
-            .forward_adj
-            .read()
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
+        let old_edges = self.collect_graph_versions(|_| true)?;
         let old_vector_infos = self.vector_store.index_infos();
         let old_vector_bytes = old_vector_infos
             .iter()
@@ -54239,30 +54226,27 @@ impl Database {
         drop(meta_guard);
 
         // Edges (live only)
-        let fwd = self.graph_store.forward_adj.read();
-        for (_source, entries) in fwd.iter() {
-            for entry in entries
-                .iter()
-                .filter(|e| e.deleted_tx.is_none() && e.lsn <= snapshot_ceiling)
-            {
-                if !self.graph_edge_read_allowed_for_change(
-                    entry.source,
-                    entry.target,
-                    &entry.edge_type,
-                    acl_snapshot,
-                ) {
-                    continue;
-                }
-                edges.push(EdgeChange {
-                    source: entry.source,
-                    target: entry.target,
-                    edge_type: entry.edge_type.clone(),
-                    properties: entry.properties.clone(),
-                    lsn: entry.lsn,
-                });
+        self.visit_graph_versions(|entry| {
+            if !(entry.deleted_tx.is_none() && entry.lsn <= snapshot_ceiling) {
+                return Ok(());
             }
-        }
-        drop(fwd);
+            if !self.graph_edge_read_allowed_for_change(
+                entry.source,
+                entry.target,
+                &entry.edge_type,
+                acl_snapshot,
+            ) {
+                return Ok(());
+            }
+            edges.push(EdgeChange {
+                source: entry.source,
+                target: entry.target,
+                edge_type: entry.edge_type.clone(),
+                properties: entry.properties.clone(),
+                lsn: entry.lsn,
+            });
+            Ok(())
+        })?;
 
         // Vectors (live only, skip orphans)
         for entry in self
@@ -54544,29 +54528,30 @@ impl Database {
         })?;
         drop(meta_guard);
 
-        let fwd = self.graph_store.forward_adj.read();
-        for entries in fwd.values() {
-            for entry in entries.iter().filter(|entry| {
-                entry.deleted_tx.is_none() && entry.lsn > since_lsn && entry.lsn <= snapshot_ceiling
-            }) {
-                if !self.graph_edge_read_allowed_for_change(
-                    entry.source,
-                    entry.target,
-                    &entry.edge_type,
-                    SnapshotId(entry.lsn.0),
-                ) {
-                    continue;
-                }
-                edges.push(EdgeChange {
-                    source: entry.source,
-                    target: entry.target,
-                    edge_type: entry.edge_type.clone(),
-                    properties: entry.properties.clone(),
-                    lsn: entry.lsn,
-                });
+        self.visit_graph_versions(|entry| {
+            if !(entry.deleted_tx.is_none()
+                && entry.lsn > since_lsn
+                && entry.lsn <= snapshot_ceiling)
+            {
+                return Ok(());
             }
-        }
-        drop(fwd);
+            if !self.graph_edge_read_allowed_for_change(
+                entry.source,
+                entry.target,
+                &entry.edge_type,
+                SnapshotId(entry.lsn.0),
+            ) {
+                return Ok(());
+            }
+            edges.push(EdgeChange {
+                source: entry.source,
+                target: entry.target,
+                edge_type: entry.edge_type.clone(),
+                properties: entry.properties.clone(),
+                lsn: entry.lsn,
+            });
+            Ok(())
+        })?;
 
         for entry in self
             .vector_store
@@ -57308,42 +57293,38 @@ impl Database {
         }
 
         let snapshot = self.snapshot_for_read();
-        let mut adjacency: HashMap<EdgeType, HashMap<NodeId, HashSet<NodeId>>> = HashMap::new();
-        {
-            let forward = self.graph_store.forward_adj.read();
-            for entries in forward.values() {
-                for edge in entries {
-                    if edge.visible_at(snapshot) && dag_edge_types.contains(&edge.edge_type) {
-                        adjacency
-                            .entry(edge.edge_type.clone())
-                            .or_default()
-                            .entry(edge.source)
-                            .or_default()
-                            .insert(edge.target);
-                    }
-                }
-            }
-        }
+        let mut overlay = HashMap::new();
+        let mut memory =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
 
         for edge in &changes.edges {
             if !dag_edge_types.contains(&edge.edge_type) {
                 continue;
             }
 
-            let by_type = adjacency.entry(edge.edge_type.clone()).or_default();
+            let identity = (edge.source, edge.edge_type.clone(), edge.target);
             let is_delete = matches!(edge.properties.get("__deleted"), Some(Value::Bool(true)));
+            if !overlay.contains_key(&identity) {
+                memory.try_grow_for(
+                    256 + edge.edge_type.len(),
+                    "writer_source",
+                    "sync_cycle_overlay",
+                    "Raise MEMORY_LIMIT to validate this graph transaction.",
+                )?;
+            }
             if is_delete {
-                if let Some(targets) = by_type.get_mut(&edge.source) {
-                    targets.remove(&edge.target);
-                    if targets.is_empty() {
-                        by_type.remove(&edge.source);
-                    }
-                }
+                overlay.insert(identity, false);
                 continue;
             }
 
             if edge.source == edge.target
-                || sync_projected_edge_has_path(by_type, edge.target, edge.source)
+                || self.graph_path_with_sync_overlay(
+                    snapshot,
+                    &edge.edge_type,
+                    edge.target,
+                    edge.source,
+                    &overlay,
+                )?
             {
                 return Err(Error::CycleDetected {
                     edge_type: edge.edge_type.clone(),
@@ -57352,7 +57333,7 @@ impl Database {
                 });
             }
 
-            by_type.entry(edge.source).or_default().insert(edge.target);
+            overlay.insert(identity, true);
         }
 
         Ok(())
@@ -57590,7 +57571,7 @@ impl Database {
                         continue;
                     }
                     let properties = self
-                        .edge_properties(source, target, &edge_type, lsn)
+                        .edge_properties(source, target, &edge_type, lsn)?
                         .unwrap_or_default();
                     let change = EdgeChange {
                         source,
@@ -57924,38 +57905,35 @@ impl Database {
             )?;
         }
         let mut edges = Vec::new();
-        {
-            let forward = self.graph_store.forward_adj.read();
-            for entry in forward
-                .values()
-                .flatten()
-                .filter(|entry| entry.deleted_tx.is_none() && entry.lsn <= snapshot_ceiling)
-            {
-                (projection.checkpoint)()?;
-                if !self.graph_edge_read_allowed_for_change(
-                    entry.source,
-                    entry.target,
-                    &entry.edge_type,
-                    acl_snapshot,
-                ) {
-                    continue;
-                }
-                if projection.bounded {
-                    (projection.admit)(answer_list_entry_bytes::<EdgeChange>(
-                        std::mem::size_of::<EdgeChange>()
-                            .saturating_add(held::text(&entry.edge_type))
-                            .saturating_add(held::values(&entry.properties)),
-                    ))?;
-                }
-                edges.push(EdgeChange {
-                    source: entry.source,
-                    target: entry.target,
-                    edge_type: entry.edge_type.clone(),
-                    properties: entry.properties.clone(),
-                    lsn: entry.lsn,
-                });
+        self.visit_graph_versions(|entry| {
+            if entry.deleted_tx.is_some() || entry.lsn > snapshot_ceiling {
+                return Ok(());
             }
-        }
+            (projection.checkpoint)()?;
+            if !self.graph_edge_read_allowed_for_change(
+                entry.source,
+                entry.target,
+                &entry.edge_type,
+                acl_snapshot,
+            ) {
+                return Ok(());
+            }
+            if projection.bounded {
+                (projection.admit)(answer_list_entry_bytes::<EdgeChange>(
+                    std::mem::size_of::<EdgeChange>()
+                        .saturating_add(held::text(&entry.edge_type))
+                        .saturating_add(held::values(&entry.properties)),
+                ))?;
+            }
+            edges.push(EdgeChange {
+                source: entry.source,
+                target: entry.target,
+                edge_type: entry.edge_type.clone(),
+                properties: entry.properties.clone(),
+                lsn: entry.lsn,
+            });
+            Ok(())
+        })?;
         let first_data_lsn = rows
             .iter()
             .map(|row| row.lsn)
@@ -67640,17 +67618,34 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         lsn: Lsn,
-    ) -> Option<HashMap<String, Value>> {
-        self.graph_store
-            .forward_adj
-            .read()
-            .get(&source)
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|e| e.target == target && e.edge_type == edge_type && e.lsn == lsn)
-                    .map(|e| e.properties.clone())
-            })
+    ) -> Result<Option<HashMap<String, Value>>> {
+        let root = self.writer_graph_root()?;
+        let mut properties = None;
+        let mut memory =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        self.graph_store.visit_edges(
+            root.as_ref(),
+            contextdb_graph::source::GraphQuery {
+                node: source,
+                direction: Direction::Outgoing,
+                identity: Some((target, edge_type)),
+            },
+            |edge| {
+                if edge.lsn == lsn {
+                    memory.try_grow_for(
+                        edge.estimated_bytes(),
+                        "writer_source",
+                        "edge_history_output",
+                        "Raise MEMORY_LIMIT to return edge history.",
+                    )?;
+                    properties = Some(edge.properties.clone());
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
+        self.retain_writer_output(memory);
+        Ok(properties)
     }
 }
 
@@ -69878,14 +69873,13 @@ fn prune_expired_rows(
             || reclaimable_edge_nodes.contains(&entry.target))
             && !any_registered_snapshot_sees_edge(active_removal_pass.registered_snapshots(), entry)
     };
+    let graph_root = writer_read::durable_root(tx_mgr.capture_published_read().handle)?;
     let mut removed_edges = Vec::new();
     if !reclaimable_edge_nodes.is_empty() {
-        let adjacency = graph_store.forward_adj.read();
-        for entry in adjacency
-            .values()
-            .flatten()
-            .filter(|entry| edge_is_reclaimable(entry))
-        {
+        writer_read::visit_graph_versions(graph_store, graph_root.clone(), |entry| {
+            if !edge_is_reclaimable(entry) {
+                return Ok(());
+            }
             workspace.try_grow_for(
                 1024usize.saturating_add(entry.edge_type.len().saturating_mul(4)),
                 "retention",
@@ -69903,7 +69897,8 @@ fn prune_expired_rows(
                 deleted_tx: entry.deleted_tx,
                 lsn: entry.lsn,
             });
-        }
+            Ok(())
+        })?;
     }
 
     if !removed_edges.is_empty() {
@@ -69913,51 +69908,55 @@ fn prune_expired_rows(
             .iter()
             .map(|entry| (entry.source, entry.edge_type.as_str(), entry.target))
             .collect::<HashSet<_>>();
-        let adjacency = graph_store.forward_adj.read();
-        for entry in adjacency.values().flatten().filter(|entry| {
-            !edge_is_reclaimable(entry)
-                && identities.contains(&(entry.source, entry.edge_type.as_str(), entry.target))
-        }) {
+        writer_read::visit_graph_versions(graph_store, graph_root.clone(), |entry| {
+            if edge_is_reclaimable(entry)
+                || !identities.contains(&(entry.source, entry.edge_type.as_str(), entry.target))
+            {
+                return Ok(());
+            }
             workspace.try_grow_for(
                 entry.estimated_bytes().saturating_mul(8),
                 "retention",
                 "prepare_prune",
                 "Raise MEMORY_LIMIT to repair retained edge identities.",
             )?;
-        }
+            Ok(())
+        })?;
     }
 
     let mut deferred_edge_nodes = HashSet::new();
     let mut deferred_edge_memory =
         crate::memory_accounting::OwnedMemoryReservation::new(ctx.accountant.clone());
     {
-        let adjacency = graph_store.forward_adj.read();
-        for node in adjacency
-            .values()
-            .flatten()
-            .filter(|entry| !edge_is_reclaimable(entry))
-            .flat_map(|entry| [entry.source, entry.target])
-            .filter(|node| reclaimable_edge_nodes.contains(node))
-        {
-            if deferred_edge_nodes.contains(&node) {
-                continue;
+        writer_read::visit_graph_versions(graph_store, graph_root.clone(), |entry| {
+            if edge_is_reclaimable(entry) {
+                return Ok(());
             }
-            // The request holds the serialization/B-tree copies; the next
-            // published carry state retains its own hash-bucket charge.
-            workspace.try_grow_for(
-                128,
-                "retention",
-                "prepare_prune",
-                "Raise MEMORY_LIMIT to encode reader-deferred retention identities.",
-            )?;
-            deferred_edge_memory.try_grow_for(
-                128,
-                "retention",
-                "prepare_prune",
-                "Raise MEMORY_LIMIT to retain reader-deferred retention identities.",
-            )?;
-            deferred_edge_nodes.insert(node);
-        }
+            for node in [entry.source, entry.target]
+                .into_iter()
+                .filter(|node| reclaimable_edge_nodes.contains(node))
+            {
+                if deferred_edge_nodes.contains(&node) {
+                    continue;
+                }
+                // The request holds the serialization/B-tree copies; the next
+                // published carry state retains its own hash-bucket charge.
+                workspace.try_grow_for(
+                    128,
+                    "retention",
+                    "prepare_prune",
+                    "Raise MEMORY_LIMIT to encode reader-deferred retention identities.",
+                )?;
+                deferred_edge_memory.try_grow_for(
+                    128,
+                    "retention",
+                    "prepare_prune",
+                    "Raise MEMORY_LIMIT to retain reader-deferred retention identities.",
+                )?;
+                deferred_edge_nodes.insert(node);
+            }
+            Ok(())
+        })?;
     }
 
     // Bounded to the tables THIS pass touches, never the whole change log
@@ -73501,33 +73500,6 @@ fn sync_singular_table_name(table: &str) -> String {
     } else {
         table.to_string()
     }
-}
-
-fn sync_projected_edge_has_path(
-    adjacency: &HashMap<NodeId, HashSet<NodeId>>,
-    start: NodeId,
-    goal: NodeId,
-) -> bool {
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-    visited.insert(start);
-    queue.push_back(start);
-
-    while let Some(current) = queue.pop_front() {
-        let Some(targets) = adjacency.get(&current) else {
-            continue;
-        };
-        for target in targets {
-            if *target == goal {
-                return true;
-            }
-            if visited.insert(*target) {
-                queue.push_back(*target);
-            }
-        }
-    }
-
-    false
 }
 
 fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {
