@@ -759,12 +759,7 @@ impl WriterReadCursor {
         if self.finished {
             return Ok(None);
         }
-        let memory = ImageMemory::charging_for(
-            Arc::clone(&self.root.accountant),
-            "writer_source",
-            "cursor_window",
-            HINT,
-        );
+        let memory = ImageMemory::charging_source(Arc::clone(&self.root.accountant));
         let result = self.read_one(&memory, before, decode)?;
         let Some((key, value)) = result else {
             self.finished = true;
@@ -832,6 +827,19 @@ impl WriterReadCursor {
                         logical,
                         table.len().map_err(RedbPersistence::storage_error)?,
                     )?;
+                }
+                if let (Bound::Included(low), Bound::Included(high)) = (&lower, &upper)
+                    && low == high
+                {
+                    #[cfg(feature = "test-seams")]
+                    if self.table.starts_with("rel_") {
+                        crate::read_work_probe::note_row_version_point_read();
+                    }
+                    return table
+                        .get(*low)
+                        .map_err(RedbPersistence::storage_error)?
+                        .map(|value| finish(low, value.value()))
+                        .transpose();
                 }
                 let mut range = table
                     .range::<&[u8]>((lower, upper))
@@ -1147,7 +1155,13 @@ impl WriterReadCursor {
     }
 
     pub(crate) fn next_change(&mut self) -> Result<Option<WriterWindow<ChangeLogEntry>>> {
-        self.next(|_, value| decode_window_exact(value))
+        self.next(|_, value| {
+            #[cfg(feature = "test-seams")]
+            crate::database::resident_history_test_seams::note(|work| {
+                work.log_keys_examined += 1;
+            });
+            decode_window_exact(value)
+        })
     }
 }
 

@@ -9373,7 +9373,9 @@ fn analyze_filter_for_index_with_sort(
                 }
             }
         }
-        let trailing_range = if probe_values_normalized {
+        let trailing_range = if shape_is_single_value_equality(&shape)
+            && suffix_shapes.iter().all(shape_is_single_value_equality)
+        {
             let position = 1 + suffix_shapes.len();
             decl.columns.get(position).and_then(|(column, _)| {
                 let ranges = conjunct_shapes
@@ -9489,10 +9491,15 @@ fn analyze_filter_for_index_with_sort(
                 "chosen index is UNIQUE and reads at most one row, so no sort is needed"
             } else if winner.sort_elides && !candidate.sort_elides {
                 "chosen index already answers the requested order without a sort"
-            } else if !candidate.whole_key && winner.whole_key {
+            } else if !candidate.whole_key
+                && winner.whole_key
+                && winner.pick.trailing_range.is_none()
+            {
                 "chosen index has whole-key coverage"
             } else if candidate.column_count > winner.column_count {
                 "more indexed columns than chosen index"
+            } else if !candidate.whole_key && winner.whole_key {
+                "chosen index has whole-key coverage"
             } else {
                 "tied with chosen index; lost by creation order"
             };

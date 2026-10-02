@@ -929,7 +929,13 @@ impl RequestContext {
             )
                 as Arc<dyn Fn(usize) -> std::io::Result<redb::ReadPageCharge> + Send + Sync>
         };
-        let result = redb::with_read_page_charge(admission, read);
+        let source_budget = Arc::new(SourceDecodeBudget {
+            context: Arc::clone(self),
+            source,
+        });
+        let result = crate::read_image_memory::with_source_budget(source_budget, || {
+            redb::with_read_page_charge(admission, read)
+        });
         // The storage layer reports a refused page as an I/O failure; the
         // caller is owed the memory refusal that caused it.
         if let Some(refusal) = refusal.lock().take() {
@@ -1315,8 +1321,45 @@ mod plan_layer_frame_size {
     }
 }
 
-/// Historical membership allocations live with their cursor and count against
-/// both this request and its engine until the last owned node is released.
+/// Decoded source records belong to the requesting read. Admission shares
+/// its aggregate memory and cancellation boundary; each window releases its
+/// temporary charge.
+struct SourceDecodeBudget {
+    context: Arc<RequestContext>,
+    source: BoundedWorkSource,
+}
+
+impl std::fmt::Debug for SourceDecodeBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceDecodeBudget")
+    }
+}
+
+impl contextdb_core::read_memory::ReadMemoryBudget for SourceDecodeBudget {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        _: &'static str,
+        _: &'static str,
+        _: &'static str,
+    ) -> Result<()> {
+        self.context
+            .reserve(self.source, bytes)
+            .map_err(|error| match error {
+                BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+                BoundedExecutionError::Cancelled => Error::ReadCancelled,
+                BoundedExecutionError::Engine(error) => error,
+                BoundedExecutionError::Unimplemented => {
+                    Error::Other("unsupported source allocation".into())
+                }
+            })
+    }
+
+    fn release(&self, bytes: usize) {
+        self.context.release_parked(bytes);
+    }
+}
+
 struct MembershipBudget(Arc<RequestContext>);
 
 impl std::fmt::Debug for MembershipBudget {
@@ -10872,6 +10915,7 @@ fn build_scan(
     let mut ordered_merge_keys = None;
     let mut exact_pick: Option<IndexPick> = None;
     let mut empty_pick: Option<IndexPick> = None;
+    let empty_ordered = ordered.is_some();
     let mut mode = if filter_matches_nothing {
         considered.extend(
             filter_analysis
@@ -11120,6 +11164,7 @@ fn build_scan(
                 let pick = empty_pick.as_ref().expect("empty scan pick");
                 QueryTrace {
                     physical_plan: "IndexScan",
+                    sort_elided: empty_ordered,
                     index_used: Some(pick.name.clone()),
                     predicates_pushed: pick
                         .pushed_columns
@@ -12173,6 +12218,17 @@ pub(crate) fn drain_chosen_plan(
     clock: Arc<dyn DeadlineClock>,
     #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<QueryResult, BoundedExecutionError> {
+    // These fixed control answers remain available when the operator has
+    // exhausted the store budget, including the kernel's scaffolding. They
+    // share the same recovery exemption as their uncharged static row.
+    if matches!(
+        plan,
+        PhysicalPlan::ShowMemoryLimit | PhysicalPlan::ShowDiskLimit
+    ) {
+        return db
+            .store_state_answer(plan)
+            .map_err(BoundedExecutionError::from);
+    }
     let _release_proofs = StatementProofReuse { db };
     let context = RequestContext::new(
         db,
@@ -12378,6 +12434,19 @@ pub(super) fn execute(
             #[cfg(feature = "test-seams")]
             probe,
         )?;
+        if matches!(
+            statement,
+            contextdb_parser::ast::Statement::ShowMemoryLimit
+                | contextdb_parser::ast::Statement::ShowDiskLimit
+        ) {
+            // The fixed recovery answer already exempts its row from the
+            // exhausted store budget. Its planner and result scaffolding need
+            // the same exemption. The request's own memory, result, work and
+            // deadline limits remain enforced by this context.
+            context.state().memory = OwnedMemoryReservation::new(Arc::new(
+                crate::memory_accounting::MemoryAccountant::no_limit(),
+            ));
+        }
         let schema_capture = db.capture_read_schema();
         let membership_capture = (!db.retained_relational_membership_source())
             .then(|| db.relational_membership_store().begin_membership_capture());

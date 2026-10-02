@@ -1543,8 +1543,10 @@ async fn handle_pull(
                 "schema-recovery acknowledgement requires an authenticated receiver".to_string(),
             )
         })?;
-        let (recovered_tables, remaining_capabilities) =
-            holdback_for_capabilities(&db, state, capabilities);
+        let CapabilityHoldbackSplit {
+            recoverable: recovered_tables,
+            remaining: remaining_capabilities,
+        } = holdback_for_capabilities(&db, state, capabilities)?;
         if recovered_tables.is_empty() {
             if state.compatible_through < *target_lsn {
                 return Err(contextdb_core::Error::SyncError(
@@ -1592,9 +1594,11 @@ async fn handle_pull(
     let recovering_tables = prior_holdback
         .as_ref()
         .map(|state| {
-            let (recoverable, _) = holdback_for_capabilities(&db, state, capabilities);
-            recoverable
+            Ok::<_, contextdb_core::Error>(
+                holdback_for_capabilities(&db, state, capabilities)?.recoverable,
+            )
         })
+        .transpose()?
         .filter(|tables| !tables.is_empty());
     let recovery_target = recovering_tables
         .as_ref()
@@ -1673,7 +1677,7 @@ async fn handle_pull(
     let consumed_hidden_frontier = hidden_scan.as_ref().and_then(|_| changes.max_lsn());
     if let Some(scan) = hidden_scan {
         changes = changes.filter_by_direction_history(
-            &db.sync_direction_history(),
+            &db.try_sync_direction_history()?,
             &[
                 SyncDirection::Push,
                 SyncDirection::Pull,
@@ -1706,7 +1710,7 @@ async fn handle_pull(
         next_holdback.recovery_after = None;
         next_holdback.compatible_through = next_holdback.compatible_through.max(request.since_lsn);
         for (table, capabilities) in
-            unsupported_schema_capabilities_in_changes(&db, &changes, capabilities)
+            unsupported_schema_capabilities_in_changes(&db, &changes, capabilities)?
         {
             next_holdback.capabilities.remove(&table);
             if !capabilities.is_empty() {
@@ -1916,7 +1920,7 @@ async fn handle_pull(
     // filtering excludes `SYNC OFF` rows without stranding the edge's pull
     // watermark.
     let changes = changes.filter_by_direction_history(
-        &db.sync_direction_history(),
+        &db.try_sync_direction_history()?,
         &[
             SyncDirection::Push,
             SyncDirection::Pull,
@@ -2232,15 +2236,15 @@ pub(crate) fn unsupported_schema_capabilities_for_table(
     db: &Database,
     table: &str,
     capabilities: SchemaCapabilities,
-) -> BTreeSet<SchemaSyncCapability> {
-    let mut declared = db.authored_schema_capabilities(table);
+) -> contextdb_core::Result<BTreeSet<SchemaSyncCapability>> {
+    let mut declared = db.authored_schema_capabilities(table)?;
     if let Some(meta) = db.table_meta(table) {
         declared.extend(schema_capabilities_in_meta(&meta));
     }
-    declared
+    Ok(declared
         .into_iter()
         .filter(|capability| !capabilities.supports(*capability))
-        .collect()
+        .collect())
 }
 
 /// Include the vocabulary of immutable authored history, even when a later
@@ -2250,7 +2254,7 @@ pub(crate) fn unsupported_schema_capabilities_in_changes(
     db: &Database,
     changes: &ChangeSet,
     capabilities: SchemaCapabilities,
-) -> BTreeMap<String, BTreeSet<SchemaSyncCapability>> {
+) -> contextdb_core::Result<BTreeMap<String, BTreeSet<SchemaSyncCapability>>> {
     let mut tables = HashSet::new();
     tables.extend(changes.rows.iter().map(|row| row.table.clone()));
     tables.extend(
@@ -2270,31 +2274,40 @@ pub(crate) fn unsupported_schema_capabilities_in_changes(
     tables
         .into_iter()
         .map(|table| {
-            let unsupported = unsupported_schema_capabilities_for_table(db, &table, capabilities);
-            (table, unsupported)
+            let unsupported = unsupported_schema_capabilities_for_table(db, &table, capabilities)?;
+            Ok((table, unsupported))
         })
         .collect()
+}
+
+/// A held-back peer's tables split by whether the receiver's current
+/// capabilities can now read them.
+struct CapabilityHoldbackSplit {
+    /// Tables whose every held capability the receiver now supports.
+    recoverable: HashSet<String>,
+    /// Tables that still need the listed capabilities.
+    remaining: BTreeMap<String, BTreeSet<SchemaSyncCapability>>,
 }
 
 fn holdback_for_capabilities(
     db: &Database,
     state: &PeerSchemaSyncHoldbackState,
     capabilities: SchemaCapabilities,
-) -> (
-    HashSet<String>,
-    BTreeMap<String, BTreeSet<SchemaSyncCapability>>,
-) {
+) -> contextdb_core::Result<CapabilityHoldbackSplit> {
     let mut recoverable = HashSet::new();
     let mut remaining = BTreeMap::new();
     for table in state.capabilities.keys() {
-        let unsupported = unsupported_schema_capabilities_for_table(db, table, capabilities);
+        let unsupported = unsupported_schema_capabilities_for_table(db, table, capabilities)?;
         if unsupported.is_empty() {
             recoverable.insert(table.clone());
         } else {
             remaining.insert(table.clone(), unsupported);
         }
     }
-    (recoverable, remaining)
+    Ok(CapabilityHoldbackSplit {
+        recoverable,
+        remaining,
+    })
 }
 
 fn schema_capabilities_in_meta(meta: &TableMeta) -> BTreeSet<SchemaSyncCapability> {
