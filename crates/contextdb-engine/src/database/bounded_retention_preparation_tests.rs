@@ -1,4 +1,5 @@
 use super::*;
+include!("durable_test_observations.rs");
 use crate::memory_accounting::{take_budget_ledger_for_test, watch_budget_ledger_for_test};
 
 fn history_fixture(db: &Database) {
@@ -109,12 +110,12 @@ fn due_retention_next_to_history_is_charged_atomic_and_snapshot_safe() {
     );
     assert!(db.accountant.high_water_for_test() - used < 256 * 1024);
     assert!(
-        db.relational_store.tables.read()["retained"]
+        durable_observation::rows(&db, "retained")
             .iter()
             .all(|row| row.deleted_tx.is_some())
     );
     assert_eq!(
-        db.relational_store.tables.read()["retained"]
+        durable_observation::rows(&db, "retained")
             .iter()
             .filter(|row| row.visible_at(snapshot))
             .count(),
@@ -123,15 +124,15 @@ fn due_retention_next_to_history_is_charged_atomic_and_snapshot_safe() {
     drop(pin);
     let report = db.run_pruning_cycle_checked().unwrap();
     assert_eq!(report.pruned_rows, 3);
-    assert!(db.relational_store.tables.read()["retained"].is_empty());
-    assert_eq!(db.relational_store.tables.read()["history"].len(), 128);
+    assert!(durable_observation::version_count(&db, "retained") == 0);
+    assert_eq!(durable_observation::version_count(&db, "history"), 128);
     db.accountant.set_budget(None).unwrap();
     db.close().unwrap();
     let reopened = Database::open(&path).unwrap();
     reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    assert!(reopened.relational_store.tables.read()["retained"].is_empty());
+    assert!(durable_observation::version_count(&reopened, "retained") == 0);
     assert_eq!(
-        reopened.relational_store.tables.read()["history"].len(),
+        durable_observation::version_count(&reopened, "history"),
         128
     );
     reopened.close().unwrap();
@@ -628,12 +629,12 @@ fn affected_lsn_siblings_are_admitted_before_reclamation() {
         matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, ref hint, .. } if subsystem == "retention" && operation == "prepare_prune" && hint.contains("change-log group"))
     );
     assert_eq!(db.accountant.usage().used, used);
-    assert_eq!(db.relational_store.tables.read()["history"].len(), 512);
-    assert_eq!(db.relational_store.tables.read()["retained"].len(), 1);
+    assert_eq!(durable_observation::version_count(&db, "history"), 512);
+    assert_eq!(durable_observation::version_count(&db, "retained"), 1);
     db.accountant.set_budget(None).unwrap();
     db.close().unwrap();
     let reopened = Database::open_with_options(&path, options).unwrap();
-    assert_eq!(reopened.relational_store.tables.read()["retained"].len(), 1);
+    assert_eq!(durable_observation::version_count(&reopened, "retained"), 1);
     let used = reopened.accountant.usage().used;
     reopened
         .accountant
@@ -641,7 +642,7 @@ fn affected_lsn_siblings_are_admitted_before_reclamation() {
         .unwrap();
     assert_eq!(reopened.run_pruning_cycle_checked().unwrap().pruned_rows, 1);
     assert_eq!(
-        reopened.relational_store.tables.read()["history"].len(),
+        durable_observation::version_count(&reopened, "history"),
         512
     );
     reopened.close().unwrap();
@@ -686,12 +687,12 @@ fn wide_partition_inventory_is_admitted_before_reclamation() {
         matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, ref hint, .. } if subsystem == "retention" && operation == "prepare_prune" && hint.contains("partition identities"))
     );
     assert_eq!(db.accountant.usage().used, used);
-    assert_eq!(db.relational_store.tables.read()["retained"].len(), 16);
+    assert_eq!(durable_observation::version_count(&db, "retained"), 16);
     db.accountant.set_budget(None).unwrap();
     db.close().unwrap();
     let reopened = Database::open_with_options(&path, options).unwrap();
     assert_eq!(
-        reopened.relational_store.tables.read()["retained"].len(),
+        durable_observation::version_count(&reopened, "retained"),
         16
     );
     let used = reopened.accountant.usage().used;
@@ -701,7 +702,7 @@ fn wide_partition_inventory_is_admitted_before_reclamation() {
         .unwrap();
     assert_eq!(reopened.run_pruning_cycle_checked().unwrap().pruned_rows, 1);
     assert_eq!(
-        reopened.relational_store.tables.read()["retained"].len(),
+        durable_observation::version_count(&reopened, "retained"),
         15
     );
     let index = VectorIndexRef::new("retained", "embedding");
@@ -747,12 +748,12 @@ fn repeated_wide_membership_copies_are_admitted_before_reclamation() {
         matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, ref hint, .. } if subsystem == "retention" && operation == "prepare_prune" && (hint.contains("membership records") || hint.contains("journal keys")))
     );
     assert_eq!(db.accountant.usage().used, used);
-    assert_eq!(db.relational_store.tables.read()["retained"].len(), 16);
+    assert_eq!(durable_observation::version_count(&db, "retained"), 16);
     db.accountant.set_budget(None).unwrap();
     db.close().unwrap();
     let reopened = Database::open_with_options(&path, options).unwrap();
     assert_eq!(
-        reopened.relational_store.tables.read()["retained"].len(),
+        durable_observation::version_count(&reopened, "retained"),
         16
     );
     let used = reopened.accountant.usage().used;
@@ -764,7 +765,7 @@ fn repeated_wide_membership_copies_are_admitted_before_reclamation() {
         reopened.run_pruning_cycle_checked().unwrap().pruned_rows,
         16
     );
-    assert!(reopened.relational_store.tables.read()["retained"].is_empty());
+    assert!(durable_observation::version_count(&reopened, "retained") == 0);
     reopened.close().unwrap();
 }
 
