@@ -1151,10 +1151,18 @@ impl Database {
 
     pub(super) fn writer_cursor_storage_pin(
         &self,
-        root: &WriterSnapshot,
+        snapshot: SnapshotId,
+        root: Arc<WriterSnapshot>,
+        recapture: bool,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-    ) -> Result<Option<crate::persistence::OwnerCursorStoragePin>> {
+    ) -> Result<
+        Option<(
+            SnapshotId,
+            Arc<WriterSnapshot>,
+            crate::persistence::OwnerCursorStoragePin,
+        )>,
+    > {
         let persistence = self
             .persistence
             .as_ref()
@@ -1167,6 +1175,7 @@ impl Database {
             let _state = cancelled.0.lock();
             cancelled.1.notify_all();
         });
+        let mut selected = Some((snapshot, root));
         loop {
             if withdrawn.is_cancelled() {
                 return Ok(None);
@@ -1175,12 +1184,23 @@ impl Database {
             let Some(remaining) = allowance.checked_sub(started.elapsed()) else {
                 return Err(budget.elapsed_timeout());
             };
+            let root = &selected.as_ref().expect("selected cursor root").1;
             match persistence.owner_cursor_pin_for_root(root) {
-                Ok(pin) => return Ok(Some(pin)),
+                Ok(pin) => {
+                    let (snapshot, root) = selected.take().expect("selected cursor root");
+                    return Ok(Some((snapshot, root, pin)));
+                }
                 Err(crate::persistence::OwnerCursorPinAdmissionError::Refused(error)) => {
                     return Err(error);
                 }
                 Err(crate::persistence::OwnerCursorPinAdmissionError::Busy(_)) => {
+                    // A failed unregistered attempt owns no accepted view.
+                    // Release it before waiting and select a whole successor
+                    // pair afterward. Graph registrations already accepted a
+                    // view, and therefore preserve their original root.
+                    if recapture {
+                        drop(selected.take());
+                    }
                     #[cfg(test)]
                     {
                         owner_cursor_pin_retry_tests::after_busy_attempt_for_test();
@@ -1192,6 +1212,13 @@ impl Database {
                     if !withdrawn.is_cancelled() {
                         wake.1
                             .wait_for(&mut state, remaining.min(Duration::from_millis(5)));
+                    }
+                    drop(state);
+                    if recapture && !withdrawn.is_cancelled() {
+                        budget.remaining()?;
+                        let (snapshot, root) = self
+                            .capture_writer_transaction_statement(self.active_read_transaction())?;
+                        selected = Some((snapshot, root.ok_or_else(closed_database_error)?));
                     }
                 }
             }

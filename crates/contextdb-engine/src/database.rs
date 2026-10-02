@@ -27779,24 +27779,29 @@ impl Database {
         let metadata = tables.values().fold(0usize, |bytes, meta| {
             bytes.saturating_add(meta.estimated_bytes())
         });
-        let rows = rows.iter().fold(0usize, |bytes, (table, rows)| {
-            let Some(meta) = tables.get(table) else {
-                return bytes;
-            };
-            rows.iter()
-                .filter(|row| {
-                    row.deleted_tx.is_none()
-                        || self.relational_store.is_retention_expired(
-                            table,
-                            row.row_id,
-                            row.created_tx,
-                        )
-                })
-                .fold(bytes, |bytes, row| {
-                    let values = self.relational_store.committed_projection_values(meta, row);
-                    bytes.saturating_add(retained_row_bytes_for_meta(table, &values, meta, true))
-                })
-        });
+        let rows = if self.relational_store.uses_disk_backed_committed_bodies() {
+            0
+        } else {
+            rows.iter().fold(0usize, |bytes, (table, rows)| {
+                let Some(meta) = tables.get(table) else {
+                    return bytes;
+                };
+                rows.iter()
+                    .filter(|row| {
+                        row.deleted_tx.is_none()
+                            || self.relational_store.is_retention_expired(
+                                table,
+                                row.row_id,
+                                row.created_tx,
+                            )
+                    })
+                    .fold(bytes, |bytes, row| {
+                        let values = self.relational_store.committed_projection_values(meta, row);
+                        bytes
+                            .saturating_add(retained_row_bytes_for_meta(table, &values, meta, true))
+                    })
+            })
+        };
         let edges = edges.iter().fold(0usize, |bytes, edge| {
             bytes.saturating_add(edge.estimated_bytes())
         });
@@ -45842,13 +45847,16 @@ impl Database {
             else {
                 return Ok(None);
             };
-            let storage = if let Some(root) = &root {
-                let Some(storage) = self.writer_cursor_storage_pin(root, budget, withdrawn)? else {
+            let (root, storage) = if let Some(root) = root {
+                let Some((selected, root, storage)) =
+                    self.writer_cursor_storage_pin(snapshot, root, false, budget, withdrawn)?
+                else {
                     return Ok(None);
                 };
-                Some(storage)
+                debug_assert_eq!(selected, snapshot);
+                (Some(root), Some(storage))
             } else {
-                None
+                (None, None)
             };
             return Ok(Some((snapshot, lsn, window, storage, registration, root)));
         }
@@ -45857,7 +45865,9 @@ impl Database {
             let (snapshot, root) =
                 self.capture_writer_transaction_statement(self.active_read_transaction())?;
             let root = root.ok_or_else(closed_database_error)?;
-            let Some(storage) = self.writer_cursor_storage_pin(&root, budget, withdrawn)? else {
+            let Some((snapshot, root, storage)) =
+                self.writer_cursor_storage_pin(snapshot, root, true, budget, withdrawn)?
+            else {
                 return Ok(None);
             };
 
