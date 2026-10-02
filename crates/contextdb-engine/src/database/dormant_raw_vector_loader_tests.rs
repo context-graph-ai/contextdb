@@ -158,7 +158,18 @@ fn streamed_unknown_membership_keeps_lifecycle_validation_and_release() {
     let DurableRawVectorSource::Writable(persistence) = &loader.source else {
         unreachable!()
     };
-    let invalid = VectorPartitionMembershipRecord {
+    let unknown_bodies = [10_000, 10_001].map(|id| VectorEntry {
+        index: loader.partition.index.clone(),
+        row_id: RowId(id),
+        vector: vec![id as f32],
+        created_tx: TxId(1),
+        deleted_tx: None,
+        lsn: Lsn(1),
+    });
+    persistence
+        .append_vector_entries_batch(&unknown_bodies, &HashMap::new())
+        .unwrap();
+    let unknown = VectorPartitionMembershipRecord {
         index: loader.partition.index.clone(),
         partition_key: loader.partition.partition_key.clone(),
         row_id: RowId(10_000),
@@ -166,18 +177,72 @@ fn streamed_unknown_membership_keeps_lifecycle_validation_and_release() {
         row_lsn: Lsn(1),
         vector_created_tx: TxId(1),
         vector_lsn: Lsn(1),
-        visible_from: TxId(2),
+        visible_from: TxId(1),
         deleted_tx: None,
     };
+    persistence
+        .append_vector_partition_memberships_batch(&[unknown.clone()])
+        .unwrap();
+    let loaded = loader
+        .load(&directory)
+        .expect("a valid unknown lifecycle preserves every selected identity");
+    assert_eq!(loaded.entries.len(), ROWS);
+    for (entry, expected) in loaded.entries.iter().zip(&directory) {
+        assert_eq!(
+            (entry.row_id, entry.created_tx, entry.deleted_tx, entry.lsn),
+            (
+                expected.row_id,
+                expected.created_tx,
+                expected.deleted_tx,
+                expected.lsn
+            )
+        );
+        assert_eq!(entry.vector, vec![(entry.row_id.0 - 1) as f32]);
+    }
+    assert_eq!(
+        (loaded.resident_bytes, loaded.workspace_bytes),
+        (4096, 141312)
+    );
+    let returned_charge = loaded.resident_bytes + loaded.workspace_bytes;
+    assert_eq!(
+        loader.accountant.usage().used,
+        returned_charge,
+        "only returned body and workspace owners remain after membership validation"
+    );
+    assert_eq!(returned_charge, 145408);
+    drop(loaded);
+    // The partition loader transfers these owners to its caller for adoption
+    // into stored residency. This caller discards the result instead.
+    loader.accountant.release(returned_charge);
+    assert_eq!(loader.accountant.usage().used, 0);
+
+    // Keep visible_from equal to the authenticated birth identity. Deleting
+    // at that boundary is invalid independently of envelope authentication,
+    // and this unknown identity still must be checked by the streaming loader.
+    let mut invalid = unknown;
+    invalid.row_id = RowId(10_001);
+    invalid.deleted_tx = Some(TxId(1));
     persistence
         .append_vector_partition_memberships_batch(&[invalid])
         .unwrap();
     let error = match loader.load(&directory) {
         Err(error) => error,
-        Ok(_) => panic!("invalid unknown lifecycle admitted"),
+        Ok(loaded) => {
+            let returned_charge = loaded.resident_bytes + loaded.workspace_bytes;
+            drop(loaded);
+            loader.accountant.release(returned_charge);
+            panic!("invalid unknown lifecycle admitted");
+        }
     };
-    assert!(error.to_string().contains("invalid lifecycle boundary"));
-    assert_eq!(loader.accountant.usage().used, 0);
+    assert!(
+        error.to_string().contains("invalid lifecycle boundary"),
+        "unknown lifecycle refusal: {error:?}"
+    );
+    assert_eq!(
+        loader.accountant.usage().used,
+        0,
+        "a failed unknown lifecycle releases every selected body and validation owner"
+    );
 }
 
 #[test]
