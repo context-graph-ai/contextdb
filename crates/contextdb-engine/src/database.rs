@@ -9,6 +9,8 @@
 pub(crate) mod custody_pull;
 mod custody_remainder;
 mod custody_store;
+mod maintenance_frontier;
+use maintenance_frontier::MaintenanceFrontier;
 #[cfg(test)]
 mod published_vector_install_tests;
 #[cfg(feature = "test-seams")]
@@ -16952,52 +16954,45 @@ impl MaintenanceContext {
                 // The reserved-LSN callback holds the commit frontier. Borrow
                 // authoritative rows there; copy only admitted mutation identities.
                 let metas = self.relational.table_meta.read();
-                let tables = self.relational.tables.read();
+                let frontier = MaintenanceFrontier::capture(&self.relational, &self.tx_mgr)?;
                 let watermark = self.sync_watermark.load(Ordering::SeqCst);
                 let candidates = retention_prune_candidates(
                     &metas,
-                    &tables,
+                    &frontier,
                     now,
                     watermark,
-                    &self.relational,
                     &mut workspace.borrow_mut(),
                     RetentionPreparation::Expiry,
                 )?;
-                let protected = fk_protected_prune_candidates(&metas, &tables, &candidates);
+                let protected = fk_protected_prune_candidates(&metas, &frontier, &candidates)?;
                 self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
                     let mut expired_nodes = HashSet::new();
-                    for (table, rows) in tables.iter() {
+                    for table in metas.keys() {
                         if metas
                             .get(table)
                             .is_none_or(|meta| meta.default_ttl_seconds.is_none())
                         {
                             continue;
                         }
-                        for row in rows {
+                        frontier.visit(table, |row| {
                             #[cfg(feature = "test-seams")]
                             resident_history_test_seams::note(|work| {
                                 work.retention_keys_examined += 1
                             });
-                            if row.deleted_tx.is_some()
-                                || !candidates.contains(&RetentionRowKey::new(
-                                    table,
-                                    row.row_id,
-                                    row.created_tx,
-                                ))
-                            {
-                                continue;
+                            if row.deleted_tx.is_some() || !candidates.contains(table, row) {
+                                return Ok(true);
                             }
                             if prune_blocker_for_referenced_parent(
                                 table,
                                 row,
                                 &metas,
-                                &tables,
+                                &frontier,
                                 &candidates,
                                 &protected,
-                            )
+                            )?
                             .is_some()
                             {
-                                continue;
+                                return Ok(true);
                             }
                             // Own the write-set strings, config encoding, node
                             // set and vector deletion identities before allocating.
@@ -17043,7 +17038,8 @@ impl MaintenanceContext {
                                 ),
                                 RedbPersistence::encode_config_value(&identity)?,
                             ));
-                        }
+                            Ok(true)
+                        })?;
                     }
                     for entry in self.graph.forward_adj.read().values().flatten() {
                         if entry.deleted_tx.is_none()
@@ -17122,8 +17118,13 @@ impl MaintenanceContext {
             .unwrap_or(0.0);
         let now = Wallclock::now();
         self.stamp_expired_rows(now)?;
-        let mut report = self.tx_mgr.with_commit_lock(|| {
-            prune_expired_rows(self, self.sync_watermark.load(Ordering::SeqCst), now)
+        let mut report = self.tx_mgr.with_maintenance_publication(|publication| {
+            prune_expired_rows(
+                self,
+                self.sync_watermark.load(Ordering::SeqCst),
+                now,
+                publication,
+            )
         })?;
         report.file_bytes_before = file_bytes_before;
         report.fragmentation_before = fragmentation_before;
@@ -17190,9 +17191,11 @@ impl MaintenanceContext {
         if gate == CurrencyGate::Scheduled
             && !currency_compaction_pending(
                 &self.relational,
+                &self.tx_mgr,
+                &self.accountant,
                 &tables,
                 CURRENCY_COMPACTION_SUPERSEDED_THRESHOLD,
-            )
+            )?
         {
             return Ok(CurrencyCompactionReport::default());
         }
@@ -17202,25 +17205,28 @@ impl MaintenanceContext {
         // waited to ACQUIRE the lock plus the hold itself, which is a
         // different, larger number that can make a quiet database look like
         // an expensive hold when the pass itself was instant.
-        self.tx_mgr
-            .with_commit_lock(|| -> Result<CurrencyCompactionReport> {
+        self.tx_mgr.with_maintenance_publication(
+            |publication| -> Result<CurrencyCompactionReport> {
                 let hold_start = Instant::now();
                 let mut report = compact_currency_versions_inner(
                     &self.relational,
                     &self.graph,
                     &self.vector,
-                    self.accountant.as_ref(),
+                    &self.accountant,
                     self.persistence.as_ref(),
                     &self.change_log,
                     &self.change_log_table_index,
                     &self.change_log_lsn_refcounts,
                     &self.tx_mgr,
                     &self.snapshot_registry,
+                    publication,
+                    &self.publication_interrupted,
                     &tables,
                 )?;
                 report.commit_lock_hold_micros = hold_start.elapsed().as_micros() as u64;
                 Ok(report)
-            })
+            },
+        )
     }
 
     /// Test-only twin of `run_currency`: the identical real mechanism
@@ -17234,25 +17240,28 @@ impl MaintenanceContext {
     #[cfg(any(test, feature = "test-seams"))]
     fn run_currency_for_tables(&self, tables: &[&str]) -> Result<CurrencyCompactionReport> {
         // Hold-only timing -- see the comment in `run_currency` above.
-        self.tx_mgr
-            .with_commit_lock(|| -> Result<CurrencyCompactionReport> {
+        self.tx_mgr.with_maintenance_publication(
+            |publication| -> Result<CurrencyCompactionReport> {
                 let hold_start = Instant::now();
                 let mut report = compact_currency_versions_inner(
                     &self.relational,
                     &self.graph,
                     &self.vector,
-                    self.accountant.as_ref(),
+                    &self.accountant,
                     self.persistence.as_ref(),
                     &self.change_log,
                     &self.change_log_table_index,
                     &self.change_log_lsn_refcounts,
                     &self.tx_mgr,
                     &self.snapshot_registry,
+                    publication,
+                    &self.publication_interrupted,
                     tables,
                 )?;
                 report.commit_lock_hold_micros = hold_start.elapsed().as_micros() as u64;
                 Ok(report)
-            })
+            },
+        )
     }
 
     /// The engine's own durable trigger-audit history is the first internal
@@ -46931,130 +46940,200 @@ impl Database {
                 policy.joined_table, policy.joined_column
             ))));
         }
-        let join_value = anchor_values
-            .get(&policy.anchor_column)
-            .cloned()
-            .map_or(Value::Null, |value| value);
-        if join_value == Value::Null {
+        let Some(join_value) = anchor_values.get(&policy.anchor_column) else {
+            return Ok(None);
+        };
+        if *join_value == Value::Null {
             return Ok(None);
         }
+        let key_bytes = join_value
+            .estimated_bytes()
+            .saturating_mul(8)
+            .saturating_add(256);
+        before_clone(key_bytes)?;
+        let result = (|| {
+            let _key_memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
+                key_bytes,
+                "query",
+                "rank_join_keys",
+                "Raise MEMORY_LIMIT to resolve this rank join.",
+            )
+            .map_err(E::from)?;
+            let source = self
+                .writer_read_root()
+                .map_err(E::from)?
+                .map(crate::persistence::writer_adapters::WriterRelationalSource::new)
+                .transpose()
+                .map_err(E::from)?;
 
-        let indexes = self.relational_store.indexes.read();
-        let storage = indexes
-            .get(&policy.joined_table)
-            .and_then(|table_indexes| table_indexes.get(&policy.protected_index))
-            .ok_or_else(|| {
-                E::from(Error::Other(format!(
-                    "rank policy protected index `{}` missing on table `{}`",
+            let indexes = self.relational_store.indexes.read();
+            let storage = indexes
+                .get(&policy.joined_table)
+                .and_then(|table_indexes| table_indexes.get(&policy.protected_index))
+                .ok_or_else(|| {
+                    E::from(Error::Other(format!(
+                        "rank policy protected index `{}` missing on table `{}`",
+                        policy.protected_index, policy.joined_table
+                    )))
+                })?;
+            let Some((first_column, direction)) = storage.columns.first() else {
+                return Err(E::from(Error::Other(format!(
+                    "rank policy protected index `{}` on `{}` has no columns",
                     policy.protected_index, policy.joined_table
-                )))
-            })?;
-        let Some((first_column, direction)) = storage.columns.first() else {
-            return Err(E::from(Error::Other(format!(
-                "rank policy protected index `{}` on `{}` has no columns",
-                policy.protected_index, policy.joined_table
-            ))));
-        };
-        if first_column != &policy.joined_column {
-            return Err(E::from(Error::Other(format!(
-                "rank policy protected index `{}` on `{}` no longer leads with `{}`",
-                policy.protected_index, policy.joined_table, policy.joined_column
-            ))));
-        }
-        let key_component = match direction {
-            SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(join_value.clone())),
-            SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(join_value.clone())),
-        };
-        let mut best_row_id = None;
-        let mut consider = |entries: &[contextdb_relational::IndexEntry]| {
-            for entry in entries {
-                before_candidate()?;
-                if entry.visible_at(snapshot)
-                    && best_row_id.is_none_or(|current| current < entry.row_id)
-                {
-                    best_row_id = Some(entry.row_id);
-                }
-            }
-            Ok::<(), E>(())
-        };
-        if storage.columns.len() == 1 {
-            if let Some(entries) = storage.exact_postings(&vec![key_component.clone()]) {
-                consider(entries)?;
-            }
-        } else if !storage.exact_only() {
-            for (key, entries) in storage.tree.range(vec![key_component.clone()]..) {
-                if key.first() != Some(&key_component) {
-                    break;
-                }
-                consider(entries)?;
-            }
-        }
-        drop(indexes);
-        // What this transaction has done to the joined table. A row it staged
-        // is in no index, so the walk above cannot see it; a row it deleted or
-        // rewrote must not win on the strength of the committed version the
-        // index still points at.
-        let overlay = match tx {
-            Some(tx) => Some(self.transaction_table_overlay(tx, &policy.joined_table)?),
-            None => None,
-        };
-        let best_row_id = best_row_id.filter(|row_id| {
-            overlay.as_ref().is_none_or(|overlay| {
-                !overlay.deleted.contains(row_id)
-                    && !overlay
-                        .staged_rows
-                        .as_ref()
-                        .is_some_and(|rows| rows.contains(row_id))
-            })
-        });
-        let committed = 'committed: {
-            let Some(row_id) = best_row_id else {
-                break 'committed None;
+                ))));
             };
-            self.bounded_committed_rank_join_row(
-                tx,
-                policy,
-                row_id,
-                &join_value,
-                snapshot,
-                overlay.as_ref(),
-                before_candidate,
-                &mut before_access,
-                &mut before_clone,
-                &mut release_clone,
-            )?
-        };
-        let staged = match (tx, overlay.as_ref()) {
-            (Some(tx), Some(overlay)) => self.bounded_staged_rank_join_row(
-                tx,
-                policy,
-                &join_value,
-                snapshot,
-                overlay,
-                before_candidate,
-                &mut before_access,
-                &mut before_clone,
-                &mut release_clone,
-            )?,
-            _ => None,
-        };
-        // Newest version wins, by the same rule the established merge applies
-        // over its own image of the table; the loser's copy is handed back
-        // where it was charged.
-        match (committed, staged) {
-            (Some(committed), Some(staged)) => {
-                if staged.0.row_id > committed.0.row_id {
-                    release_clone(committed.1)?;
-                    Ok(Some(staged))
-                } else {
-                    release_clone(staged.1)?;
-                    Ok(Some(committed))
-                }
+            if first_column != &policy.joined_column {
+                return Err(E::from(Error::Other(format!(
+                    "rank policy protected index `{}` on `{}` no longer leads with `{}`",
+                    policy.protected_index, policy.joined_table, policy.joined_column
+                ))));
             }
-            (Some(committed), None) => Ok(Some(committed)),
-            (None, Some(staged)) => Ok(Some(staged)),
-            (None, None) => Ok(None),
-        }
+            let key_component = match direction {
+                SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(join_value.clone())),
+                SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(join_value.clone())),
+            };
+            let mut best_row_id = None;
+            if let Some(source) = source.as_ref() {
+                use contextdb_relational::source::{RelationalIndexRange, RelationalReadSource};
+                use std::ops::Bound;
+                let key = vec![key_component.clone()];
+                let current = snapshot == source.snapshot();
+                let columns_len = storage.columns.len();
+                drop(indexes);
+                let mut cursor = if columns_len == 1 {
+                    source.exact_index_cursor(
+                        &policy.joined_table,
+                        &policy.protected_index,
+                        current,
+                        &key,
+                    )
+                } else {
+                    let endpoint = source
+                        .index_position_key(current, &key, RowId(0), TxId(0))
+                        .map_err(E::from)?;
+                    source.index_cursor(
+                        &policy.joined_table,
+                        &policy.protected_index,
+                        RelationalIndexRange {
+                            current,
+                            lower: Bound::Included(endpoint.as_bytes()),
+                            upper: Bound::Unbounded,
+                            reverse: false,
+                        },
+                    )
+                }
+                .map_err(E::from)?;
+                while let Some(window) =
+                    writer_read::next_window_with_work(&mut *cursor, before_candidate)?
+                {
+                    let posting = window.value();
+                    if posting.key.first() != Some(&key_component) {
+                        break;
+                    }
+                    if posting.entry.visible_at(snapshot)
+                        && best_row_id.is_none_or(|current| current < posting.entry.row_id)
+                    {
+                        best_row_id = Some(posting.entry.row_id);
+                    }
+                }
+            } else {
+                let mut consider = |entries: &[contextdb_relational::IndexEntry]| {
+                    for entry in entries {
+                        before_candidate()?;
+                        if entry.visible_at(snapshot)
+                            && best_row_id.is_none_or(|current| current < entry.row_id)
+                        {
+                            best_row_id = Some(entry.row_id);
+                        }
+                    }
+                    Ok::<(), E>(())
+                };
+                if storage.columns.len() == 1 {
+                    if let Some(entries) = storage.exact_postings(&vec![key_component.clone()]) {
+                        consider(entries)?;
+                    }
+                } else if !storage.exact_only() {
+                    for (key, entries) in storage.tree.range(vec![key_component.clone()]..) {
+                        if key.first() != Some(&key_component) {
+                            break;
+                        }
+                        consider(entries)?;
+                    }
+                }
+                drop(indexes);
+            }
+            // What this transaction has done to the joined table. A row it staged
+            // is in no index, so the walk above cannot see it; a row it deleted or
+            // rewrote must not win on the strength of the committed version the
+            // index still points at.
+            let overlay = match tx {
+                Some(tx) => Some(self.transaction_table_overlay(tx, &policy.joined_table)?),
+                None => None,
+            };
+            let best_row_id = best_row_id.filter(|row_id| {
+                overlay.as_ref().is_none_or(|overlay| {
+                    !overlay.deleted.contains(row_id)
+                        && !overlay
+                            .staged_rows
+                            .as_ref()
+                            .is_some_and(|rows| rows.contains(row_id))
+                })
+            });
+            let committed = 'committed: {
+                let Some(row_id) = best_row_id else {
+                    break 'committed None;
+                };
+                self.bounded_committed_rank_join_row(
+                    tx,
+                    source.as_ref().map(|source| {
+                        source as &dyn contextdb_relational::source::RelationalReadSource
+                    }),
+                    policy,
+                    row_id,
+                    join_value,
+                    snapshot,
+                    overlay.as_ref(),
+                    before_candidate,
+                    &mut before_access,
+                    &mut before_clone,
+                    &mut release_clone,
+                )?
+            };
+            let staged = match (tx, overlay.as_ref()) {
+                (Some(tx), Some(overlay)) => self.bounded_staged_rank_join_row(
+                    tx,
+                    policy,
+                    join_value,
+                    snapshot,
+                    overlay,
+                    before_candidate,
+                    &mut before_access,
+                    &mut before_clone,
+                    &mut release_clone,
+                )?,
+                _ => None,
+            };
+            // Newest version wins, by the same rule the established merge applies
+            // over its own image of the table; the loser's copy is handed back
+            // where it was charged.
+            match (committed, staged) {
+                (Some(committed), Some(staged)) => {
+                    if staged.0.row_id > committed.0.row_id {
+                        release_clone(committed.1)?;
+                        Ok(Some(staged))
+                    } else {
+                        release_clone(staged.1)?;
+                        Ok(Some(committed))
+                    }
+                }
+                (Some(committed), None) => Ok(Some(committed)),
+                (None, Some(staged)) => Ok(Some(staged)),
+                (None, None) => Ok(None),
+            }
+        })();
+        release_clone(key_bytes)?;
+        result
     }
 
     /// The committed row the join resolves to, read by the identity the index
@@ -47063,6 +47142,7 @@ impl Database {
     fn bounded_committed_rank_join_row<E>(
         &self,
         tx: Option<TxId>,
+        source: Option<&dyn contextdb_relational::source::RelationalReadSource>,
         policy: &RankPolicy,
         row_id: RowId,
         join_value: &Value,
@@ -47076,20 +47156,44 @@ impl Database {
     where
         E: From<Error>,
     {
-        let tables = self.relational_store.tables.read();
-        let Some(rows) = tables.get(&policy.joined_table) else {
-            return Ok(None);
+        // The posting and body share one immutable statement source. A
+        // durable window retains its own decode admission while access and
+        // caller-copy admission borrow the selected row.
+        let window = if let Some(source) = source {
+            writer_read::visible_row_with_work(
+                source,
+                &policy.joined_table,
+                row_id,
+                snapshot,
+                before_candidate,
+            )?
+        } else {
+            None
         };
-        // The index named the row identity, so the joined row is fetched by
-        // that identity: one charged inspection of the row the join resolves
-        // to, not a pass over rows the join excludes.
-        before_candidate()?;
-        let Some(row) = self
-            .relational_store
-            .visible_version_position(&policy.joined_table, rows, row_id, snapshot)
-            .and_then(|position| rows.get(position))
-        else {
-            return Ok(None);
+        let tables = source
+            .is_none()
+            .then(|| self.relational_store.tables.read());
+        let row = if source.is_some() {
+            let Some(window) = window.as_ref() else {
+                return Ok(None);
+            };
+            window.value()
+        } else {
+            let Some(rows) = tables
+                .as_ref()
+                .and_then(|tables| tables.get(&policy.joined_table))
+            else {
+                return Ok(None);
+            };
+            before_candidate()?;
+            let Some(row) = self
+                .relational_store
+                .visible_version_position(&policy.joined_table, rows, row_id, snapshot)
+                .and_then(|position| rows.get(position))
+            else {
+                return Ok(None);
+            };
+            row
         };
         if row
             .values
@@ -47112,17 +47216,27 @@ impl Database {
         let meta = self
             .table_meta(&policy.joined_table)
             .ok_or_else(|| E::from(Error::TableNotFound(policy.joined_table.clone())))?;
-        // Selected under the read guard taken above, so access evaluation
-        // borrows it rather than acquiring it a second time.
-        if !self.bounded_read_allowed_for_row_in_tables(
-            tx,
-            &tables,
-            &policy.joined_table,
-            &meta,
-            row,
-            snapshot,
-            &mut *before_access,
-        )? {
+        let allowed = if let Some(tables) = tables.as_ref() {
+            self.bounded_read_allowed_for_row_in_tables(
+                tx,
+                tables,
+                &policy.joined_table,
+                &meta,
+                row,
+                snapshot,
+                &mut *before_access,
+            )?
+        } else {
+            self.bounded_read_allowed_for_row(
+                tx,
+                &policy.joined_table,
+                &meta,
+                row,
+                snapshot,
+                &mut *before_access,
+            )?
+        };
+        if !allowed {
             return Ok(None);
         }
         let planned = bounded_rank_row_clone_planned_bytes(row).map_err(E::from)?;
@@ -58737,6 +58851,13 @@ impl Database {
         ApplyPhasePauseGuard { inner, generation }
     }
 
+    /// Observe the canonical removal-pass marker without changing its state.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn active_removal_pass_for_test(&self) -> bool {
+        self.snapshot_registry.state.lock().active_pass.is_some()
+    }
+
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __arm_one_shot_vector_maintenance_preparation_pause_for_test(
@@ -62772,8 +62893,8 @@ impl Database {
         table: &str,
         local: &VersionedRow,
     ) -> Result<()> {
-        let retained_source_lsn = self.relational_store.sync_source_lsn(table, local.row_id);
-        let retained_source_kind = self.relational_store.sync_source_kind(table, local.row_id);
+        let (retained_source_lsn, retained_source_kind) =
+            self.relational_sync_source_at_read_root(table, local.row_id)?;
         let (retained_acceptance_position, retained_source_kind) =
             match (retained_source_lsn, retained_source_kind) {
                 (Some(source_lsn), Some(source_kind)) => (
@@ -68382,20 +68503,24 @@ fn row_conditions_match(
         })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RetentionRowKey {
-    table: String,
-    row_id: RowId,
-    created_tx: TxId,
+#[derive(Default)]
+struct RetentionCandidates {
+    tables: HashMap<String, HashSet<(RowId, TxId)>>,
 }
-
-impl RetentionRowKey {
-    fn new(table: &str, row_id: RowId, created_tx: TxId) -> Self {
-        Self {
-            table: table.to_string(),
-            row_id,
-            created_tx,
-        }
+impl RetentionCandidates {
+    fn contains(&self, table: &str, row: &VersionedRow) -> bool {
+        self.tables
+            .get(table)
+            .is_some_and(|rows| rows.contains(&(row.row_id, row.created_tx)))
+    }
+    fn insert(&mut self, table: &str, row: &VersionedRow) -> bool {
+        self.tables
+            .entry(table.to_owned())
+            .or_default()
+            .insert((row.row_id, row.created_tx))
+    }
+    fn is_empty(&self) -> bool {
+        self.tables.values().all(HashSet::is_empty)
     }
 }
 
@@ -68426,6 +68551,7 @@ fn prune_expired_rows(
     ctx: &MaintenanceContext,
     sync_watermark: Lsn,
     now: Wallclock,
+    publication: &mut contextdb_tx::manager::MaintenancePublication<'_, DynStore>,
 ) -> Result<PruningReport> {
     let relational_store = &ctx.relational;
     let graph_store = &ctx.graph;
@@ -68473,7 +68599,7 @@ fn prune_expired_rows(
 
     // The caller owns the commit lock until publication. Keep a borrowed
     // frontier for FK probes and complete-lifetime checks, never a payload copy.
-    let table_snapshot = relational_store.tables.read();
+    let frontier = MaintenanceFrontier::capture(relational_store, tx_mgr)?;
     // A stamp further ahead than the tolerance can never age out on this
     // holder's clock, so it would pin its row silently. Count it per table,
     // every cycle, whether or not anything prunes.
@@ -68484,15 +68610,12 @@ fn prune_expired_rows(
     let mut future_dated_tables: Vec<String> = Vec::new();
     // Counted at the one place a row is actually held back, below.
     let mut rows_deferred_for_readers = 0u64;
-    for (table_name, rows) in table_snapshot.iter() {
-        let Some(meta) = metas.get(table_name) else {
-            continue;
-        };
+    for (table_name, meta) in metas.iter() {
         if meta.default_ttl_seconds.is_none() {
             continue;
         }
         let mut table_has_future_dated = false;
-        for row in rows {
+        frontier.visit(table_name, |row| {
             #[cfg(feature = "test-seams")]
             resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
             if row.deleted_tx.is_none()
@@ -68501,10 +68624,11 @@ fn prune_expired_rows(
                 future_dated_rows = future_dated_rows.saturating_add(1);
                 table_has_future_dated = true;
             }
-        }
+            Ok(true)
+        })?;
         if table_has_future_dated {
             workspace.try_grow_for(
-                64usize.saturating_add(table_name.len()),
+                256usize.saturating_add(table_name.len().saturating_mul(2)),
                 "retention",
                 "prepare_prune",
                 "Raise MEMORY_LIMIT to admit the retention reclamation workspace.",
@@ -68515,29 +68639,24 @@ fn prune_expired_rows(
     future_dated_tables.sort();
     let prune_candidates = retention_prune_candidates(
         &metas,
-        &table_snapshot,
+        &frontier,
         now,
         sync_watermark,
-        relational_store,
         &mut workspace,
         RetentionPreparation::Prune,
     )?;
     let protected_prune_candidates =
-        fk_protected_prune_candidates(&metas, &table_snapshot, &prune_candidates);
-    for (table_name, rows) in table_snapshot.iter() {
-        let Some(meta) = metas.get(table_name) else {
-            continue;
-        };
+        fk_protected_prune_candidates(&metas, &frontier, &prune_candidates)?;
+    for (table_name, meta) in metas.iter() {
         if meta.default_ttl_seconds.is_none() {
             continue;
         }
 
-        for row in rows {
+        frontier.visit(table_name, |row| {
             #[cfg(feature = "test-seams")]
             resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
-            let row_key = RetentionRowKey::new(table_name, row.row_id, row.created_tx);
-            if !prune_candidates.contains(&row_key) {
-                continue;
+            if !prune_candidates.contains(table_name, row) {
+                return Ok(true);
             }
             // An expired row a registered reader can still see is deferred,
             // never removed mid-read: a live expired row is visible at every
@@ -68547,18 +68666,18 @@ fn prune_expired_rows(
             // re-anchors against.
             if any_registered_snapshot_sees(active_removal_pass.registered_snapshots(), row) {
                 rows_deferred_for_readers = rows_deferred_for_readers.saturating_add(1);
-                continue;
+                return Ok(true);
             }
             if let Some(reason) = prune_blocker_for_referenced_parent(
                 table_name,
                 row,
                 &metas,
-                &table_snapshot,
+                &frontier,
                 &prune_candidates,
                 &protected_prune_candidates,
-            ) {
+            )? {
                 blocked.push(reason);
-                continue;
+                return Ok(true);
             }
 
             workspace.try_grow_for(
@@ -68584,8 +68703,13 @@ fn prune_expired_rows(
             row_keys.push((table_name.clone(), row.row_id, row.created_tx, row.lsn));
             let version_bytes = retained_row_bytes_for_meta(table_name, &row.values, meta, true);
             released_row_bytes = released_row_bytes.saturating_add(version_bytes);
-            if row.deleted_tx.is_none()
-                || relational_store.is_retention_expired(table_name, row.row_id, row.created_tx)
+            if !frontier.is_durable()
+                && (row.deleted_tx.is_none()
+                    || relational_store.is_retention_expired(
+                        table_name,
+                        row.row_id,
+                        row.created_tx,
+                    ))
             {
                 // A version that was never deleted still carries the charge it
                 // took at insert, so pruning it here is its ONE release. A
@@ -68596,7 +68720,8 @@ fn prune_expired_rows(
                 // lifecycle test; accounting must not decide data ownership.
                 accounted_row_bytes = accounted_row_bytes.saturating_add(version_bytes);
             }
-        }
+            Ok(true)
+        })?;
     }
 
     let pruned_version_count = pruned_versions_by_table
@@ -68651,27 +68776,27 @@ fn prune_expired_rows(
     // If even one version survives (including one owed to a pinned reader),
     // retain every row-scoped owner until a later pass can remove them together.
     for (table_name, pruned_versions) in &pruned_versions_by_table_sets {
-        let Some(rows) = table_snapshot.get(table_name) else {
-            continue;
-        };
         let candidate_row_ids = pruned_versions
             .iter()
             .map(|(row_id, _)| *row_id)
             .collect::<HashSet<_>>();
         for row_id in candidate_row_ids {
-            if rows.iter().any(|row| {
-                row.row_id == row_id && !pruned_versions.contains(&(row.row_id, row.created_tx))
-            }) {
+            let mut survives = false;
+            frontier.visit_row(table_name, row_id, |row| {
+                survives = !pruned_versions.contains(&(row.row_id, row.created_tx));
+                Ok(!survives)
+            })?;
+            if survives {
                 continue;
             }
             fully_pruned_row_ids.insert(row_id);
             orphaned_source_lsn_rows.push((table_name.clone(), row_id));
-            pruned_node_ids.extend(rows.iter().filter(|row| row.row_id == row_id).filter_map(
-                |row| match row.values.get("id") {
-                    Some(Value::Uuid(id)) => Some(*id),
-                    _ => None,
-                },
-            ));
+            frontier.visit_row(table_name, row_id, |row| {
+                if let Some(Value::Uuid(id)) = row.values.get("id") {
+                    pruned_node_ids.insert(*id);
+                }
+                Ok(true)
+            })?;
         }
     }
 
@@ -68680,6 +68805,9 @@ fn prune_expired_rows(
     // while the frontier is borrowed and before any durable removal. Count
     // only surviving keys and identity scaffolding, never unrelated payloads.
     for (table, versions) in &pruned_versions_by_table_sets {
+        if frontier.is_durable() {
+            continue;
+        }
         let Some(meta) = metas.get(table) else {
             continue;
         };
@@ -68690,31 +68818,30 @@ fn prune_expired_rows(
                 bytes.saturating_add(index.estimated_bytes().saturating_mul(2))
             })
             .saturating_add(meta.exact_probe_filter_bytes());
-        if let Some(rows) = table_snapshot.get(table) {
-            for row in rows {
-                #[cfg(feature = "test-seams")]
-                resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
-                if versions.contains(&(row.row_id, row.created_tx)) {
-                    continue;
-                }
-                // Hash buckets, both position maps, per-version vectors, the
-                // row-id set, sorting references/scratch and transient keys.
-                rebuild_bytes = rebuild_bytes
-                    .saturating_add(1024)
-                    .saturating_add(
-                        meta.columns
-                            .iter()
-                            .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
-                            .count()
-                            .saturating_mul(1024),
-                    )
-                    .saturating_add(table.len().saturating_mul(8))
-                    .saturating_add(
-                        contextdb_core::retained_index_posting_bytes_for_meta(&row.values, meta)
-                            .saturating_mul(4),
-                    );
+        frontier.visit(table, |row| {
+            #[cfg(feature = "test-seams")]
+            resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+            if versions.contains(&(row.row_id, row.created_tx)) {
+                return Ok(true);
             }
-        }
+            // Hash buckets, both position maps, per-version vectors, the
+            // row-id set, sorting references/scratch and transient keys.
+            rebuild_bytes = rebuild_bytes
+                .saturating_add(1024)
+                .saturating_add(
+                    meta.columns
+                        .iter()
+                        .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
+                        .count()
+                        .saturating_mul(1024),
+                )
+                .saturating_add(table.len().saturating_mul(8))
+                .saturating_add(
+                    contextdb_core::retained_index_posting_bytes_for_meta(&row.values, meta)
+                        .saturating_mul(4),
+                );
+            Ok(true)
+        })?;
         workspace.try_grow_for(
             rebuild_bytes,
             "retention",
@@ -68723,7 +68850,7 @@ fn prune_expired_rows(
         )?;
     }
 
-    drop(table_snapshot);
+    drop(frontier);
 
     // The vectors and edges being removed, not the wholesale survivor set the
     // old full-rewrite path needed. A fully removed row contributes every
@@ -68923,7 +69050,10 @@ fn prune_expired_rows(
         active_removal_pass.registered_snapshots(),
         &mut workspace,
     )?;
+    let mut publication_watch = None;
     if let Some(persistence) = persistence {
+        publication.reserve()?;
+        let watch = PublicationInterruptionWatch::arm(&ctx.publication_interrupted);
         // Point-removes in ONE redb write transaction: exactly the pruned
         // row versions, the change-log entries that referenced them
         // (change-log-first WITHIN that transaction, exactly as the cleanup
@@ -68932,7 +69062,7 @@ fn prune_expired_rows(
         // The same commit removes vectors and adjacency and retains retry
         // identities for edges still owed to registered readers, including a
         // pass that only revisits adjacency after its row is already gone.
-        persistence.prune_retention_scoped(
+        let persisted = persistence.prune_retention_scoped(
             &metas,
             &row_keys,
             &pruned_change_keys_vec,
@@ -68940,7 +69070,12 @@ fn prune_expired_rows(
             Some((&removed_vectors, &removed_edges, &deferred_edge_nodes)),
             &commit_index_candidates,
             &generation_cleanup,
-        )?;
+        );
+        if let Err(error) = persisted {
+            watch.completed();
+            return Err(error);
+        }
+        publication_watch = Some(watch);
     }
 
     // Only now, with every persisted step behind us, does memory follow —
@@ -69054,7 +69189,7 @@ fn prune_expired_rows(
             .saturating_add(accounted_edge_bytes),
     );
 
-    Ok(PruningReport {
+    let report = PruningReport {
         pruned_rows: pruned_version_count,
         blocked_count: blocked.len() as u64,
         blocked,
@@ -69066,7 +69201,14 @@ fn prune_expired_rows(
         pruned_commit_index_entries,
         rows_deferred_for_readers,
         ..PruningReport::default()
-    })
+    };
+    if let Some(watch) = publication_watch {
+        publication.complete();
+        watch.completed();
+    }
+    // The removal marker remains live through the physical-root swap.
+    drop(active_removal_pass);
+    Ok(report)
 }
 
 // Retention owns its catalog/key/reader-chain buffers until publication.
@@ -69495,13 +69637,15 @@ fn compact_currency_versions_inner(
     relational_store: &Arc<RelationalStore>,
     _graph_store: &Arc<GraphStore>,
     vector_store: &Arc<VectorStore>,
-    accountant: &MemoryAccountant,
+    accountant: &Arc<MemoryAccountant>,
     persistence: Option<&Arc<RedbPersistence>>,
     change_log: &Arc<RwLock<Vec<ChangeLogEntry>>>,
     change_log_table_index: &Arc<RwLock<ChangeLogTableIndex>>,
     change_log_lsn_refcounts: &Arc<RwLock<ChangeLogLsnRefcounts>>,
     tx_mgr: &Arc<TransactionManager<DynStore>>,
     snapshot_registry: &Arc<SnapshotFloorRegistry>,
+    publication: &mut contextdb_tx::manager::MaintenancePublication<'_, DynStore>,
+    publication_interrupted: &Arc<AtomicBool>,
     tables: &[&str],
 ) -> Result<CurrencyCompactionReport> {
     // This pass's own sampled state: the committed watermark right now, and
@@ -69531,22 +69675,12 @@ fn compact_currency_versions_inner(
     // `pin_snapshot` blocks while this pass is genuinely in flight.
     snapshot_registry.removal_pass_test_pause.maybe_pause();
     let metas = relational_store.table_meta.read().clone();
-    // Eligible-tables-only: read (and clone) only the DECLARED tables' row
-    // histories, not `relational_store.tables.read().clone()` (every table
-    // sharing the database, eligible or not). `tables_in_memory_snapshot`
-    // below is this scoped count, never inflated by unrelated tables merely
-    // sharing the file.
-    let table_snapshot: HashMap<String, Vec<VersionedRow>> = {
-        let guard = relational_store.tables.read();
-        tables
-            .iter()
-            .filter_map(|name| {
-                guard
-                    .get(*name)
-                    .map(|rows| ((*name).to_string(), rows.clone()))
-            })
-            .collect()
-    };
+    let frontier = MaintenanceFrontier::capture(relational_store, tx_mgr)?;
+    let tables_in_snapshot = tables
+        .iter()
+        .filter(|table| metas.contains_key(**table))
+        .count() as u64;
+    let mut workspace = crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone());
 
     let mut pruned_versions_by_table: HashMap<String, HashSet<(RowId, TxId)>> = HashMap::new();
     // Grouped by table (not a flat `(table, row_id, lsn)` set): every
@@ -69569,30 +69703,11 @@ fn compact_currency_versions_inner(
     let mut accounted_row_bytes = 0usize;
     let mut versions_deferred_for_readers = 0u64;
 
-    for table in tables {
-        let table = *table;
-        let Some(rows) = table_snapshot.get(table) else {
-            continue;
-        };
-        // The keeper for each row_id is its greatest-LSN version — the current
-        // one for a currency table (updates always advance the LSN).
-        let mut keeper_lsn: HashMap<RowId, Lsn> = HashMap::new();
-        for row in rows {
+    {
+        let mut select = |table: &str, row: &VersionedRow, keeper_lsn: Lsn| -> Result<bool> {
             #[cfg(feature = "test-seams")]
             resident_history_test_seams::note(|work| work.cleanup_versions_examined += 1);
-            keeper_lsn
-                .entry(row.row_id)
-                .and_modify(|current| {
-                    if row.lsn > *current {
-                        *current = row.lsn;
-                    }
-                })
-                .or_insert(row.lsn);
-        }
-        for row in rows {
-            #[cfg(feature = "test-seams")]
-            resident_history_test_seams::note(|work| work.cleanup_versions_examined += 1);
-            if keeper_lsn.get(&row.row_id).copied() == Some(row.lsn) {
+            if keeper_lsn == row.lsn {
                 // A deleted row's final version is still its relational
                 // keeper (the delete stamps that version; the tombstone stays
                 // for the relational and sync doors), but under `HISTORY
@@ -69609,9 +69724,15 @@ fn compact_currency_versions_inner(
                         row,
                     )
                 {
+                    workspace.try_grow_for(
+                        512usize.saturating_add(table.len().saturating_mul(8)),
+                        "version_cleanup",
+                        "prepare_currency",
+                        "Raise MEMORY_LIMIT to admit the selected cleanup identities.",
+                    )?;
                     pruned_row_identities.insert((row.row_id, row.created_tx, row.lsn));
                 }
-                continue;
+                return Ok(true);
             }
             // A superseded version still visible to ANY registered reader
             // (an in-flight statement, or a caller-held `SnapshotPin`) is
@@ -69622,8 +69743,14 @@ fn compact_currency_versions_inner(
             // lower) is still protected.
             if any_registered_snapshot_sees(active_removal_pass.registered_snapshots(), row) {
                 versions_deferred_for_readers = versions_deferred_for_readers.saturating_add(1);
-                continue;
+                return Ok(true);
             }
+            workspace.try_grow_for(
+                2048usize.saturating_add(table.len().saturating_mul(16)),
+                "version_cleanup",
+                "prepare_currency",
+                "Raise MEMORY_LIMIT to admit the selected cleanup identities.",
+            )?;
             pruned_versions_by_table
                 .entry(table.to_string())
                 .or_default()
@@ -69640,8 +69767,9 @@ fn compact_currency_versions_inner(
             // missing releases exactly what its load charged.
             let version_bytes = retained_row_bytes_with_optional_meta(table, row, metas.get(table));
             released_row_bytes = released_row_bytes.saturating_add(version_bytes);
-            if row.deleted_tx.is_none()
-                || relational_store.is_retention_expired(table, row.row_id, row.created_tx)
+            if !frontier.is_durable()
+                && (row.deleted_tx.is_none()
+                    || relational_store.is_retention_expired(table, row.row_id, row.created_tx))
             {
                 // An update stamps the version it supersedes with
                 // `deleted_tx` and releases its charge at commit, so this
@@ -69651,8 +69779,43 @@ fn compact_currency_versions_inner(
                 // release.
                 accounted_row_bytes = accounted_row_bytes.saturating_add(version_bytes);
             }
+            Ok(true)
+        };
+        for table in tables {
+            let table = *table;
+            if !metas.contains_key(table) {
+                continue;
+            }
+            if frontier.is_durable() {
+                frontier.visit_durable_groups(table, |row_id, keeper_lsn| {
+                    frontier.visit_row(table, row_id, |row| select(table, row, keeper_lsn))
+                })?;
+            } else {
+                let mut keeper_lsn = HashMap::<RowId, Lsn>::new();
+                let mut keeper_memory =
+                    crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone());
+                frontier.visit(table, |row| {
+                    #[cfg(feature = "test-seams")]
+                    resident_history_test_seams::note(|work| work.cleanup_versions_examined += 1);
+                    if !keeper_lsn.contains_key(&row.row_id) {
+                        keeper_memory.try_grow_for(
+                            256,
+                            "version_cleanup",
+                            "keeper_identities",
+                            "Raise MEMORY_LIMIT to admit the current-row keeper identities.",
+                        )?;
+                    }
+                    keeper_lsn
+                        .entry(row.row_id)
+                        .and_modify(|lsn| *lsn = (*lsn).max(row.lsn))
+                        .or_insert(row.lsn);
+                    Ok(true)
+                })?;
+                frontier.visit(table, |row| select(table, row, keeper_lsn[&row.row_id]))?;
+            }
         }
     }
+    drop(frontier);
 
     let pruned_version_count: u64 = pruned_versions_by_table
         .values()
@@ -69663,7 +69826,7 @@ fn compact_currency_versions_inner(
     // it returns early only when it has nothing at all to reclaim.
     if pruned_version_count == 0 && pruned_row_identities.is_empty() {
         return Ok(CurrencyCompactionReport {
-            tables_in_memory_snapshot: table_snapshot.len() as u64,
+            tables_in_memory_snapshot: tables_in_snapshot,
             versions_deferred_for_readers,
             ..CurrencyCompactionReport::default()
         });
@@ -69751,6 +69914,7 @@ fn compact_currency_versions_inner(
     )?;
     let mut vector_keys_rewritten = 0u64;
     let mut first_failure_details: Option<VectorMaintenanceFailureDetails> = None;
+    let mut publication_watch = None;
     if let Some(persistence) = persistence {
         // Fail before any durable or in-memory removal. The same selected
         // identities remain available to a later cycle after an error.
@@ -69767,13 +69931,30 @@ fn compact_currency_versions_inner(
         // `prune_currency_scoped` itself (retried unaccounted), never
         // propagated here -- this essential pass must not abort before its
         // in-memory prune the way the discretionary compaction pass may.
-        let stats = persistence.prune_currency_scoped(
+        publication.reserve()?;
+        let watch = PublicationInterruptionWatch::arm(publication_interrupted);
+        let durable = std::cell::Cell::new(false);
+        let persisted = persistence.prune_currency_scoped(
             &row_keys,
             &pruned_change_keys_vec,
             &released_vectors,
             &commit_index_candidates,
             &generation_cleanup,
-        )?;
+            &durable,
+        );
+        let stats = match persisted {
+            Ok(stats) => stats,
+            Err(error) => {
+                // An error after the durable boundary cannot certify rollback
+                // or keep serving the old canonical root. Its armed watch
+                // poisons this writer; only a precommit refusal disarms it.
+                if !durable.get() {
+                    watch.completed();
+                }
+                return Err(error);
+            }
+        };
+        publication_watch = Some(watch);
         vector_keys_rewritten = stats.vector_keys_removed;
         first_failure_details = stats.proof_admission_refused;
     }
@@ -69845,7 +70026,7 @@ fn compact_currency_versions_inner(
         .into_iter()
         .collect();
     compacted_tables.sort();
-    Ok(CurrencyCompactionReport {
+    let report = CurrencyCompactionReport {
         pruned_versions: pruned_version_count,
         pruned_change_log_entries,
         reclaimed_bytes: released_row_bytes.saturating_add(released_vector_bytes) as u64,
@@ -69859,11 +70040,17 @@ fn compact_currency_versions_inner(
         commit_lock_hold_micros: 0,
         redb_compact_micros: 0,
         commit_index_keys_removed,
-        tables_in_memory_snapshot: table_snapshot.len() as u64,
+        tables_in_memory_snapshot: tables_in_snapshot,
         versions_deferred_for_readers,
         first_failure: first_failure_details.map(|details| details.failure),
         first_failure_details,
-    })
+    };
+    if let Some(watch) = publication_watch {
+        publication.complete();
+        watch.completed();
+    }
+    drop(active_removal_pass);
+    Ok(report)
 }
 
 /// Cheap pre-tick gate for the maintenance thread: are there at least
@@ -69872,22 +70059,52 @@ fn compact_currency_versions_inner(
 /// node does near-zero work per tick.
 fn currency_compaction_pending(
     relational_store: &Arc<RelationalStore>,
+    manager: &TransactionManager<DynStore>,
+    accountant: &Arc<MemoryAccountant>,
     tables: &[&str],
     threshold: usize,
-) -> bool {
-    let snapshot = relational_store.tables.read();
+) -> Result<bool> {
+    // This read-only probe keeps its own published root. It never substitutes
+    // an empty resident directory for the durable candidate population.
+    let frontier = MaintenanceFrontier::capture(relational_store, manager)?;
     let mut superseded = 0usize;
     for table in tables {
-        let Some(rows) = snapshot.get(*table) else {
+        if !frontier.has_table(table)? {
             continue;
-        };
-        let distinct: HashSet<RowId> = rows.iter().map(|row| row.row_id).collect();
-        superseded += rows.len().saturating_sub(distinct.len());
+        }
+        if frontier.is_durable() {
+            let mut previous = None;
+            frontier.visit(table, |row| {
+                if previous == Some(row.row_id) {
+                    superseded = superseded.saturating_add(1);
+                }
+                previous = Some(row.row_id);
+                Ok(superseded < threshold)
+            })?;
+        } else {
+            let mut distinct = HashSet::<RowId>::new();
+            let mut scratch =
+                crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone());
+            frontier.visit(table, |row| {
+                if distinct.contains(&row.row_id) {
+                    superseded = superseded.saturating_add(1);
+                } else {
+                    scratch.try_grow_for(
+                        128,
+                        "version_cleanup",
+                        "pending_identities",
+                        "Raise MEMORY_LIMIT to inspect current-row cleanup identities.",
+                    )?;
+                    distinct.insert(row.row_id);
+                }
+                Ok(superseded < threshold)
+            })?;
+        }
         if superseded >= threshold {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 fn export_io_error(dest: &Path, err: &dyn std::fmt::Display) -> Error {
@@ -70001,198 +70218,174 @@ fn retention_candidate_workspace_bytes(table: &str, metas: &HashMap<String, Tabl
 
 fn retention_prune_candidates(
     metas: &HashMap<String, TableMeta>,
-    tables: &HashMap<String, Vec<VersionedRow>>,
+    frontier: &MaintenanceFrontier<'_>,
     now: Wallclock,
     sync_watermark: Lsn,
-    relational_store: &RelationalStore,
     workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
     preparation: RetentionPreparation,
-) -> Result<HashSet<RetentionRowKey>> {
-    let mut candidates = HashSet::new();
-    for (table_name, meta) in metas {
+) -> Result<RetentionCandidates> {
+    let mut candidates = RetentionCandidates::default();
+    for (table, meta) in metas {
         if meta.default_ttl_seconds.is_none() {
             continue;
         }
-        let Some(rows) = tables.get(table_name) else {
-            continue;
-        };
-        let candidate_bytes = retention_candidate_workspace_bytes(table_name, metas);
-        // A page borrows at most 128 source rows; each selected identity is
-        // admitted before insertion, and the complete attempt publishes once.
-        for page in rows.chunks(128) {
-            for row in page {
-                #[cfg(feature = "test-seams")]
-                resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
-                if matches!(preparation, RetentionPreparation::Expiry) && row.deleted_tx.is_some() {
-                    continue;
-                }
-                let arrived_by_sync = matches!(
-                    relational_store.sync_source_kind(table_name, row.row_id),
-                    Some(contextdb_relational::store::SyncSourceKind::Pulled)
-                );
-                if row_is_prunable(row, meta, now, sync_watermark, arrived_by_sync) {
-                    // Covers candidate/protected hash buckets and their owned table
-                    // names, including geometric growth. No row payload is copied.
-                    workspace.try_grow_for(
-                        candidate_bytes,
-                        "retention",
-                        preparation.operation(),
-                        "Raise MEMORY_LIMIT to admit the retention selection workspace.",
-                    )?;
-                    candidates.insert(RetentionRowKey::new(table_name, row.row_id, row.created_tx));
-                }
+        let candidate_bytes = retention_candidate_workspace_bytes(table, metas);
+        frontier.visit(table, |row| {
+            #[cfg(feature = "test-seams")]
+            resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+            if matches!(preparation, RetentionPreparation::Expiry) && row.deleted_tx.is_some() {
+                return Ok(true);
             }
-        }
+            let arrived_by_sync = matches!(
+                frontier.sync_source_kind(table, row.row_id)?,
+                Some(contextdb_relational::store::SyncSourceKind::Pulled)
+            );
+            if row_is_prunable(row, meta, now, sync_watermark, arrived_by_sync) {
+                workspace.try_grow_for(
+                    candidate_bytes,
+                    "retention",
+                    preparation.operation(),
+                    "Raise MEMORY_LIMIT to admit the retention selection workspace.",
+                )?;
+                candidates.insert(table, row);
+            }
+            Ok(true)
+        })?;
     }
     Ok(candidates)
 }
 
 fn fk_protected_prune_candidates(
     metas: &HashMap<String, TableMeta>,
-    tables: &HashMap<String, Vec<VersionedRow>>,
-    prune_candidates: &HashSet<RetentionRowKey>,
-) -> HashSet<RetentionRowKey> {
-    let mut protected = HashSet::new();
-    if prune_candidates.is_empty() {
-        return protected;
+    frontier: &MaintenanceFrontier<'_>,
+    candidates: &RetentionCandidates,
+) -> Result<RetentionCandidates> {
+    let mut protected = RetentionCandidates::default();
+    if candidates.is_empty() {
+        return Ok(protected);
     }
     loop {
         let mut changed = false;
-        for (parent_table, rows) in tables {
-            if metas
-                .get(parent_table)
-                .is_none_or(|meta| meta.default_ttl_seconds.is_none())
-            {
+        for (table, meta) in metas {
+            if meta.default_ttl_seconds.is_none() {
                 continue;
             }
-            for parent_row in rows {
+            frontier.visit(table, |row| {
                 #[cfg(feature = "test-seams")]
                 resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
-                let parent_key =
-                    RetentionRowKey::new(parent_table, parent_row.row_id, parent_row.created_tx);
-                if !prune_candidates.contains(&parent_key) || parent_row.deleted_tx.is_some() {
-                    continue;
+                if !candidates.contains(table, row) || row.deleted_tx.is_some() {
+                    return Ok(true);
                 }
                 if prune_blocker_for_referenced_parent(
-                    parent_table,
-                    parent_row,
-                    metas,
-                    tables,
-                    prune_candidates,
-                    &protected,
-                )
+                    table, row, metas, frontier, candidates, &protected,
+                )?
                 .is_some()
                 {
-                    changed |= protected.insert(parent_key);
+                    changed |= protected.insert(table, row);
                 }
-            }
+                Ok(true)
+            })?;
         }
         if !changed {
-            return protected;
+            return Ok(protected);
         }
     }
 }
 
 fn prune_blocker_for_referenced_parent(
     parent_table: &str,
-    parent_row: &VersionedRow,
+    parent: &VersionedRow,
     metas: &HashMap<String, TableMeta>,
-    tables: &HashMap<String, Vec<VersionedRow>>,
-    prune_candidates: &HashSet<RetentionRowKey>,
-    protected_prune_candidates: &HashSet<RetentionRowKey>,
-) -> Option<String> {
-    if parent_row.deleted_tx.is_some() {
-        return None;
+    frontier: &MaintenanceFrontier<'_>,
+    candidates: &RetentionCandidates,
+    protected: &RetentionCandidates,
+) -> Result<Option<String>> {
+    if parent.deleted_tx.is_some() {
+        return Ok(None);
     }
-
-    for (child_table, child_meta) in metas {
-        for column in &child_meta.columns {
+    for (child_table, meta) in metas {
+        for column in &meta.columns {
             let Some(reference) = &column.references else {
                 continue;
             };
             if reference.table != parent_table {
                 continue;
             }
-            let Some(parent_value) = parent_row.values.get(&reference.column) else {
+            let Some(value) = parent.values.get(&reference.column) else {
                 continue;
             };
-            if *parent_value == Value::Null {
+            if *value == Value::Null {
                 continue;
             }
             if child_rows_contain_live_reference(
                 child_table,
-                tables,
+                frontier,
                 std::slice::from_ref(&column.name),
-                parent_row,
+                parent,
                 std::slice::from_ref(&reference.column),
-                prune_candidates,
-                protected_prune_candidates,
-            ) {
-                return Some(format!(
+                candidates,
+                protected,
+            )? {
+                return Ok(Some(format!(
                     "blocked pruning {}({}) because live {}({}) references it",
                     parent_table, reference.column, child_table, column.name
-                ));
+                )));
             }
         }
-
-        for fk in &child_meta.composite_foreign_keys {
+        for fk in &meta.composite_foreign_keys {
             if fk.parent_table != parent_table {
                 continue;
             }
             if child_rows_contain_live_reference(
                 child_table,
-                tables,
+                frontier,
                 &fk.child_columns,
-                parent_row,
+                parent,
                 &fk.parent_columns,
-                prune_candidates,
-                protected_prune_candidates,
-            ) {
-                return Some(format!(
+                candidates,
+                protected,
+            )? {
+                return Ok(Some(format!(
                     "blocked pruning {}({}) because live {}({}) references it",
                     parent_table,
                     fk.parent_columns.join(", "),
                     child_table,
                     fk.child_columns.join(", ")
-                ));
+                )));
             }
         }
     }
-
-    None
+    Ok(None)
 }
 
 fn child_rows_contain_live_reference(
     child_table: &str,
-    tables: &HashMap<String, Vec<VersionedRow>>,
+    frontier: &MaintenanceFrontier<'_>,
     child_columns: &[String],
-    parent_row: &VersionedRow,
+    parent: &VersionedRow,
     parent_columns: &[String],
-    prune_candidates: &HashSet<RetentionRowKey>,
-    protected_prune_candidates: &HashSet<RetentionRowKey>,
-) -> bool {
+    candidates: &RetentionCandidates,
+    protected: &RetentionCandidates,
+) -> Result<bool> {
     if parent_columns
         .iter()
-        .any(|column| matches!(parent_row.values.get(column), None | Some(Value::Null)))
+        .any(|column| matches!(parent.values.get(column), None | Some(Value::Null)))
     {
-        return false;
+        return Ok(false);
     }
-    tables.get(child_table).is_some_and(|rows| {
-        rows.iter().any(|row| {
-            #[cfg(feature = "test-seams")]
-            resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
-            row.deleted_tx.is_none()
-                && child_columns
-                    .iter()
-                    .zip(parent_columns.iter())
-                    .all(|(column, value)| row.values.get(column) == parent_row.values.get(value))
-                && {
-                    let child_key = RetentionRowKey::new(child_table, row.row_id, row.created_tx);
-                    !prune_candidates.contains(&child_key)
-                        || protected_prune_candidates.contains(&child_key)
-                }
-        })
-    })
+    let mut found = false;
+    frontier.visit(child_table, |row| {
+        #[cfg(feature = "test-seams")]
+        resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+        found = row.deleted_tx.is_none()
+            && child_columns
+                .iter()
+                .zip(parent_columns)
+                .all(|(column, value)| row.values.get(column) == parent.values.get(value))
+            && (!candidates.contains(child_table, row) || protected.contains(child_table, row));
+        Ok(!found)
+    })?;
+    Ok(found)
 }
 
 fn row_is_prunable(

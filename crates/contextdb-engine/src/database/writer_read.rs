@@ -6,6 +6,51 @@ type OutputOwners =
     std::rc::Rc<std::cell::RefCell<Vec<crate::memory_accounting::OwnedMemoryReservation>>>;
 type ScopedRoot = (usize, Arc<WriterSnapshot>, OutputOwners);
 thread_local! { static ROOT: std::cell::RefCell<Option<ScopedRoot>> = const { std::cell::RefCell::new(None) }; }
+
+/// Preserve the consumer's typed refusal across the storage callback's shared
+/// core-error boundary; the private sentinel never reaches the caller.
+pub(super) fn next_window_with_work<T: Send, E: From<Error>>(
+    cursor: &mut dyn contextdb_relational::source::RelationalCursor<T>,
+    before: &mut dyn FnMut() -> std::result::Result<(), E>,
+) -> std::result::Result<Option<Box<dyn contextdb_relational::source::RelationalWindow<T>>>, E> {
+    let mut refused = None;
+    let result = cursor.next_window_before(&mut || {
+        before().map_err(|error| {
+            refused = Some(error);
+            Error::ReadCancelled
+        })
+    });
+    match refused {
+        Some(error) => Err(error),
+        None => result.map_err(E::from),
+    }
+}
+
+pub(super) fn visible_row_with_work<E: From<Error>>(
+    source: &dyn contextdb_relational::source::RelationalReadSource,
+    table: &str,
+    row_id: RowId,
+    snapshot: SnapshotId,
+    before: &mut dyn FnMut() -> std::result::Result<(), E>,
+) -> std::result::Result<
+    Option<Box<dyn contextdb_relational::source::RelationalWindow<VersionedRow>>>,
+    E,
+> {
+    if snapshot.0 > source.snapshot().0 {
+        return Err(E::from(Error::Other(
+            "relational snapshot exceeds the captured source frontier".into(),
+        )));
+    }
+    let mut cursor = source
+        .row_id_cursor(table, row_id, snapshot)
+        .map_err(E::from)?;
+    while let Some(window) = next_window_with_work(&mut *cursor, before)? {
+        if window.value().created_tx.0 <= snapshot.0 {
+            return Ok(window.value().visible_at(snapshot).then_some(window));
+        }
+    }
+    Ok(None)
+}
 pub(crate) struct WriterReadScope {
     prior: Option<ScopedRoot>,
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -19,6 +64,53 @@ impl Drop for WriterReadScope {
     }
 }
 impl Database {
+    /// Commit preparation needs the actual committed frontier, independently
+    /// of an outer statement's retained transaction base.
+    pub(super) fn committed_row_exists_at_current_frontier(
+        &self,
+        table: &str,
+        row_id: RowId,
+    ) -> Result<bool> {
+        let published = self.tx_mgr.capture_published_read();
+        if let Some(root) = durable_root(published.handle)? {
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+            return Ok(contextdb_relational::source::visible_row(
+                &source,
+                table,
+                row_id,
+                published.snapshot,
+            )?
+            .is_some());
+        }
+        Ok(self
+            .relational_store
+            .row_by_id(table, row_id, SnapshotId::from_raw_wire(u64::MAX))
+            .is_some())
+    }
+
+    /// The sidecars must come from the same retained root as the row being
+    /// selected; their resident maps are absent on a file-backed writer.
+    pub(super) fn relational_sync_source_at_read_root(
+        &self,
+        table: &str,
+        row_id: RowId,
+    ) -> Result<(
+        Option<Lsn>,
+        Option<contextdb_relational::store::SyncSourceKind>,
+    )> {
+        use contextdb_relational::source::RelationalReadSource;
+        if let Some(root) = self.writer_read_root()? {
+            let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+            return Ok(source
+                .sync_source(table, row_id)?
+                .map_or((None, None), |(lsn, kind)| (Some(lsn), Some(kind))));
+        }
+        Ok((
+            self.relational_store.sync_source_lsn(table, row_id),
+            self.relational_store.sync_source_kind(table, row_id),
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn insert_relational_row_from_read(
         &self,

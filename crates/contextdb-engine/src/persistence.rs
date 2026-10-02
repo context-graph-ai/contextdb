@@ -29489,6 +29489,7 @@ impl RedbPersistence {
         vector_versions: &[contextdb_vector::VectorVersionIdentity],
         commit_index_lsns: &[Lsn],
         generations: &VectorGenerationCleanup,
+        durable: &std::cell::Cell<bool>,
     ) -> Result<PruneScopedStats> {
         if row_keys.is_empty()
             && pruned_change_keys.is_empty()
@@ -29559,6 +29560,7 @@ impl RedbPersistence {
                 )?;
                 Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
                 write_txn.commit().map_err(Self::storage_error)?;
+                durable.set(true);
                 #[cfg(test)]
                 currency_reclaim_checkpoint_for_test(3)?;
                 Ok(PruneScopedStats {
@@ -29572,6 +29574,7 @@ impl RedbPersistence {
         };
         match run(&mut self.proof_admission()) {
             Ok(stats) => Ok(stats),
+            Err(error) if durable.get() => Err(error),
             Err(
                 error @ (Error::MemoryBudgetExceeded { .. } | Error::DiskBudgetExceeded { .. }),
             ) => {

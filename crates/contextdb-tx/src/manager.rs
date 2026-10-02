@@ -50,6 +50,43 @@ pub struct PublishedRead {
     pub handle: Option<Arc<dyn Any + Send + Sync>>,
 }
 
+/// Engine maintenance's borrowed authority under the actual commit guard.
+/// Construction is private; reservation and completion cannot escape the
+/// guard or move to another thread. Logical transaction identity is unchanged.
+#[doc(hidden)]
+pub struct MaintenancePublication<'guard, S: WriteSetApplicator> {
+    manager: &'guard TransactionManager<S>,
+    snapshot: SnapshotId,
+    lsn: Lsn,
+    reservation: Option<Option<Box<dyn Any + Send>>>,
+    completed: bool,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl<S: WriteSetApplicator> MaintenancePublication<'_, S> {
+    /// Admit the successor immediately before a nonempty durable mutation.
+    pub fn reserve(&mut self) -> Result<()> {
+        assert!(!self.completed && self.reservation.is_none());
+        self.reservation = Some(self.manager.store.reserve_metadata_publication()?);
+        Ok(())
+    }
+
+    /// Durability and memory settlement succeeded; preserve the logical pair
+    /// and use the manager's existing publisher before the removal marker ends.
+    pub fn complete(&mut self) {
+        assert!(!self.completed);
+        let reservation = self
+            .reservation
+            .take()
+            .expect("maintenance publication requires its admitted reservation");
+        self.manager
+            .store
+            .complete_metadata_publication(reservation, self.snapshot, self.lsn);
+        self.manager.publish_read_snapshot(self.lsn, None);
+        self.completed = true;
+    }
+}
+
 impl std::fmt::Debug for PublishedRead {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PublishedRead")
@@ -738,6 +775,34 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     {
         let _lock = self.lock_commit_boundary();
         f()
+    }
+
+    /// Engine-only physical maintenance at the existing publication boundary.
+    /// Quiet or memory passes need no reservation. The higher-ranked borrow
+    /// prevents a reservation or publication authority escaping this guard.
+    #[doc(hidden)]
+    pub fn with_maintenance_publication<F, R>(&self, f: F) -> Result<R>
+    where
+        F: for<'guard> FnOnce(&mut MaintenancePublication<'guard, S>) -> Result<R>,
+    {
+        let _lock = self.lock_commit_boundary();
+        let (snapshot, lsn) = self.published_read_snapshot();
+        let mut publication = MaintenancePublication {
+            manager: self,
+            snapshot,
+            lsn,
+            reservation: None,
+            completed: false,
+            _same_thread: std::marker::PhantomData,
+        };
+        let result = f(&mut publication);
+        if result.is_ok() {
+            assert!(
+                publication.reservation.is_none(),
+                "successful maintenance must complete its reserved publication"
+            );
+        }
+        result
     }
 
     fn lock_commit_boundary(&self) -> CommitLockGuard<'_> {

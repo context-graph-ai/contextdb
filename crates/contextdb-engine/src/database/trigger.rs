@@ -1073,37 +1073,35 @@ impl Database {
             events.1 |= declaration.on_events.contains(&TriggerEvent::Update);
         }
         let snapshot = self.trigger_dispatch_snapshot(tx, None, TriggerDispatchMode::Local)?;
-        self.tx_mgr.with_write_set(tx, |ws| {
-            ws.relational_inserts
-                .iter()
-                .enumerate()
-                .any(|(index, (table, row))| {
-                    if !snapshot.triggered_tables.contains(table)
-                        || snapshot
-                            .latest_insert_index
-                            .get(&(table.clone(), row.row_id))
-                            != Some(&index)
-                    {
-                        return false;
-                    }
-                    let event = if snapshot.deleted_rows.contains(&(table.clone(), row.row_id))
-                        && self
-                            .relational_store
-                            .row_by_id(table, row.row_id, SnapshotId::from_raw_wire(u64::MAX))
-                            .is_some()
-                    {
-                        TriggerEvent::Update
-                    } else {
-                        TriggerEvent::Insert
-                    };
-                    events_by_table
-                        .get(table)
-                        .is_some_and(|events| match event {
-                            TriggerEvent::Insert => events.0,
-                            TriggerEvent::Update => events.1,
-                        })
-                })
-        })
+        self.tx_mgr.with_write_set(tx, |ws| -> Result<bool> {
+            for (index, (table, row)) in ws.relational_inserts.iter().enumerate() {
+                if !snapshot.triggered_tables.contains(table)
+                    || snapshot
+                        .latest_insert_index
+                        .get(&(table.clone(), row.row_id))
+                        != Some(&index)
+                {
+                    continue;
+                }
+                let event = if snapshot.deleted_rows.contains(&(table.clone(), row.row_id))
+                    && self.committed_row_exists_at_current_frontier(table, row.row_id)?
+                {
+                    TriggerEvent::Update
+                } else {
+                    TriggerEvent::Insert
+                };
+                if events_by_table
+                    .get(table)
+                    .is_some_and(|events| match event {
+                        TriggerEvent::Insert => events.0,
+                        TriggerEvent::Update => events.1,
+                    })
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?
     }
 
     fn dispatch_triggers_for_tx_from(
@@ -1235,10 +1233,7 @@ impl Database {
                 continue;
             }
             let event = if snapshot.deleted_rows.contains(&(table.clone(), row.row_id))
-                && self
-                    .relational_store
-                    .row_by_id(&table, row.row_id, SnapshotId::from_raw_wire(u64::MAX))
-                    .is_some()
+                && self.committed_row_exists_at_current_frontier(&table, row.row_id)?
             {
                 TriggerEvent::Update
             } else {

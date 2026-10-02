@@ -43,8 +43,14 @@ impl RelationalPositionKey for WriterWindow<Vec<u8>> {
 }
 impl RelationalCursor<VersionedRow> for RowCursor {
     fn next_window(&mut self) -> Result<Option<Box<dyn RelationalWindow<VersionedRow>>>> {
+        self.next_window_before(&mut || Ok(()))
+    }
+    fn next_window_before(
+        &mut self,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Box<dyn RelationalWindow<VersionedRow>>>> {
         self.0
-            .next_row()?
+            .next_row_before(before)?
             .map(|window| {
                 window
                     .boxed()

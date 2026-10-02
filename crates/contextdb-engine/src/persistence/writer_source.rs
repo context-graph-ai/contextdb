@@ -820,10 +820,17 @@ impl WriterReadCursor {
     }
 
     pub(crate) fn next_row(&mut self) -> Result<Option<WriterWindow<VersionedRow>>> {
+        self.next_row_before(&mut || Ok(()))
+    }
+
+    pub(crate) fn next_row_before(
+        &mut self,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<WriterWindow<VersionedRow>>> {
         #[cfg(feature = "test-seams")]
         self.root
             .note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
-        self.next(|key, value| {
+        self.next_before(before, |key, value| {
             let row = RedbPersistence::decode_versioned_row(value, None)?;
             if RedbPersistence::rel_row_key(&row) != key {
                 return Err(Error::Other(
