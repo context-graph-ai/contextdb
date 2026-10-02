@@ -15,10 +15,12 @@ mod vector_membership_pages;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
+pub(crate) mod writer_cleanup_progress;
 mod writer_commit_directory;
 mod writer_file;
 mod writer_history;
 mod writer_recovery;
+mod writer_row_heads;
 pub(crate) mod writer_source;
 use writer_file::{LockedWriterFile, OpenedWriterDatabase};
 #[allow(unused_imports)] // Recovery types are consumed by writer integration.
@@ -29569,12 +29571,16 @@ impl RedbPersistence {
         commit_index_lsns: &[Lsn],
         generations: &VectorGenerationCleanup,
         durable: &std::cell::Cell<bool>,
+        cleanup_progress: &[(String, writer_cleanup_progress::CurrencyCleanupProgress)],
+        cleanup_rotation: Option<[u8; 32]>,
     ) -> Result<PruneScopedStats> {
         if row_keys.is_empty()
             && pruned_change_keys.is_empty()
             && vector_versions.is_empty()
             && commit_index_lsns.is_empty()
             && generations.is_empty()
+            && cleanup_progress.is_empty()
+            && cleanup_rotation.is_none()
         {
             return Ok(PruneScopedStats::default());
         }
@@ -29636,6 +29642,11 @@ impl RedbPersistence {
                     &write_txn,
                     &identity_mutations,
                     admission,
+                )?;
+                Self::write_currency_cleanup_progress(
+                    &write_txn,
+                    cleanup_progress,
+                    cleanup_rotation,
                 )?;
                 Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
                 write_txn.commit().map_err(Self::storage_error)?;
@@ -31060,6 +31071,7 @@ impl RedbPersistence {
                 |txn| {
                     Self::write_vector_body_root_fingerprint(txn)
                         .and_then(|()| Self::write_commit_directory_root_in_write(txn))
+                        .and_then(|()| Self::write_row_heads_root(txn))
                         .map_err(|error| {
                             *on_fingerprint_failure.lock() = Some(error);
                             redb::StorageError::Io(std::io::Error::other(

@@ -7737,6 +7737,37 @@ impl PublicationInterruptionWatch {
     }
 }
 
+/// Physical relocation changes the durable root while preserving its logical
+/// pair. Retire the writer's own predecessor before beginning another batch.
+fn publish_storage_compaction_batch(
+    manager: &Arc<TransactionManager<DynStore>>,
+    persistence: &Arc<RedbPersistence>,
+    accountant: &Arc<MemoryAccountant>,
+    interrupted: &Arc<AtomicBool>,
+    fragmentation: f64,
+) -> Result<(redb::CompactionProgress, Option<u64>)> {
+    manager.with_maintenance_publication(|publication| {
+        publication.reserve()?;
+        let watch = PublicationInterruptionWatch::arm(interrupted);
+        let result = persistence.compact_incremental(accountant.clone(), fragmentation);
+        match result {
+            Ok(progress) => {
+                publication.complete();
+                watch.completed();
+                Ok(progress)
+            }
+            Err(error) => {
+                // Page admission fails before the relocation transaction commits.
+                // Other storage errors may have crossed its durable boundary.
+                if matches!(error, Error::MemoryBudgetExceeded { .. }) {
+                    watch.completed();
+                }
+                Err(error)
+            }
+        }
+    })
+}
+
 impl Drop for PublicationInterruptionWatch {
     fn drop(&mut self) {
         if self.armed {
@@ -16739,8 +16770,13 @@ impl MaintenanceContext {
         }
         let bytes_before = self.file_bytes();
         let start = Instant::now();
-        let (progress, handle_recycle_micros) =
-            persistence.compact_incremental(self.accountant.clone(), fragmentation_before)?;
+        let (progress, handle_recycle_micros) = publish_storage_compaction_batch(
+            &self.tx_mgr,
+            persistence,
+            &self.accountant,
+            &self.publication_interrupted,
+            fragmentation_before,
+        )?;
         let duration_micros = start.elapsed().as_micros() as u64;
         if progress.complete {
             *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
@@ -17016,8 +17052,13 @@ impl MaintenanceContext {
             && let Some(persistence) = self.persistence.as_ref()
             && fragmentation_before >= REDB_COMPACT_FRAGMENTATION_THRESHOLD
         {
-            let (progress, _) =
-                persistence.compact_incremental(self.accountant.clone(), fragmentation_before)?;
+            let (progress, _) = publish_storage_compaction_batch(
+                &self.tx_mgr,
+                persistence,
+                &self.accountant,
+                &self.publication_interrupted,
+                fragmentation_before,
+            )?;
             if progress.complete {
                 *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
             }
@@ -48179,7 +48220,19 @@ impl Database {
         self.vector_store
             .attach_durable_raw_partition_loaders(raw_loaders)?;
         let start = Instant::now();
-        let recycled = persistence.compact(self.accountant.clone())?;
+        let recycled = loop {
+            let (progress, recycled) = publish_storage_compaction_batch(
+                &self.tx_mgr,
+                persistence,
+                &self.accountant,
+                &self.publication_interrupted,
+                fragmentation_before,
+            )?;
+            if progress.complete {
+                break recycled;
+            }
+            std::thread::yield_now();
+        };
         self.vector_store.evict_reloadable_raw_partitions();
         let duration_micros = start.elapsed().as_micros() as u64;
         *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
@@ -70250,11 +70303,40 @@ fn compact_currency_versions_inner(
     // superseded by an update carries `deleted_tx` and was released at commit.
     let mut accounted_row_bytes = 0usize;
     let mut versions_deferred_for_readers = 0u64;
+    let mut progress_memory =
+        crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone());
+    let mut cleanup_progress = Vec::new();
+    let mut cleanup_rotation = None;
+    let mut ordered_tables = Vec::new();
+    if durable_source {
+        progress_memory.try_grow_for(
+            512usize.saturating_add(tables.len().saturating_mul(64)),
+            "version_cleanup",
+            "progress_control",
+            "Raise MEMORY_LIMIT to admit cleanup scheduling controls.",
+        )?;
+        ordered_tables.extend(
+            tables
+                .iter()
+                .map(|table| (*blake3::hash(table.as_bytes()).as_bytes(), *table)),
+        );
+        ordered_tables.sort_unstable_by_key(|(hash, _)| *hash);
+        if let Some(after) = frontier.cleanup_rotation()? {
+            let start = ordered_tables.partition_point(|(hash, _)| *hash <= after);
+            if start < ordered_tables.len() {
+                ordered_tables.rotate_left(start);
+            }
+        }
+    }
+    let mut remaining = 128usize;
+    let mut removal_allowance = 64usize;
 
     {
         let mut select = |table: &str, row: &VersionedRow, keeper_lsn: Lsn| -> Result<bool> {
             #[cfg(feature = "test-seams")]
-            resident_history_test_seams::note(|work| work.cleanup_versions_examined += 1);
+            if !durable_source {
+                resident_history_test_seams::note(|work| work.cleanup_versions_examined += 1);
+            }
             if keeper_lsn == row.lsn {
                 // A deleted row's final version is still its relational
                 // keeper (the delete stamps that version; the tombstone stays
@@ -70280,7 +70362,7 @@ fn compact_currency_versions_inner(
                     )?;
                     pruned_row_identities.insert((row.row_id, row.created_tx, row.lsn));
                 }
-                return Ok(true);
+                return Ok(false);
             }
             // A superseded version still visible to ANY registered reader
             // (an in-flight statement, or a caller-held `SnapshotPin`) is
@@ -70291,7 +70373,7 @@ fn compact_currency_versions_inner(
             // lower) is still protected.
             if any_registered_snapshot_sees(active_removal_pass.registered_snapshots(), row) {
                 versions_deferred_for_readers = versions_deferred_for_readers.saturating_add(1);
-                return Ok(true);
+                return Ok(false);
             }
             workspace.try_grow_for(
                 2048usize.saturating_add(table.len().saturating_mul(16)),
@@ -70329,15 +70411,34 @@ fn compact_currency_versions_inner(
             }
             Ok(true)
         };
-        for table in tables {
-            let table = *table;
+        for ordinal in 0..tables.len() {
+            let table = if durable_source {
+                ordered_tables[ordinal].1
+            } else {
+                tables[ordinal]
+            };
             if !metas.contains_key(table) {
                 continue;
             }
             if frontier.is_durable() {
-                frontier.visit_durable_groups(table, |row_id, keeper_lsn| {
-                    frontier.visit_row(table, row_id, |row| select(table, row, keeper_lsn))
-                })?;
+                if remaining == 0 || removal_allowance == 0 || cleanup_progress.len() == 128 {
+                    break;
+                }
+                progress_memory.try_grow_for(
+                    2048usize.saturating_add(table.len().saturating_mul(16)),
+                    "version_cleanup",
+                    "progress_window",
+                    "Raise MEMORY_LIMIT to admit a finite cleanup continuation.",
+                )?;
+                let progress = frontier.select_durable_cleanup(
+                    table,
+                    &metas[table],
+                    &mut remaining,
+                    &mut removal_allowance,
+                    |row, keeper| select(table, row, keeper),
+                )?;
+                cleanup_progress.push((table.to_string(), progress));
+                cleanup_rotation = Some(*blake3::hash(table.as_bytes()).as_bytes());
             } else {
                 let mut keeper_lsn = HashMap::<RowId, Lsn>::new();
                 let mut keeper_memory =
@@ -70359,7 +70460,9 @@ fn compact_currency_versions_inner(
                         .or_insert(row.lsn);
                     Ok(true)
                 })?;
-                frontier.visit(table, |row| select(table, row, keeper_lsn[&row.row_id]))?;
+                frontier.visit(table, |row| {
+                    select(table, row, keeper_lsn[&row.row_id]).map(|_| true)
+                })?;
             }
         }
     }
@@ -70372,7 +70475,8 @@ fn compact_currency_versions_inner(
     // A pass with no superseded relational version may still owe the vector
     // copies of deleted rows (named into `pruned_row_identities` above), so
     // it returns early only when it has nothing at all to reclaim.
-    if pruned_version_count == 0 && pruned_row_identities.is_empty() {
+    if pruned_version_count == 0 && pruned_row_identities.is_empty() && cleanup_progress.is_empty()
+    {
         return Ok(CurrencyCompactionReport {
             tables_in_memory_snapshot: tables_in_snapshot,
             versions_deferred_for_readers,
@@ -70489,6 +70593,8 @@ fn compact_currency_versions_inner(
             &commit_index_candidates,
             &generation_cleanup,
             &durable,
+            &cleanup_progress,
+            cleanup_rotation,
         );
         let stats = match persisted {
             Ok(stats) => stats,

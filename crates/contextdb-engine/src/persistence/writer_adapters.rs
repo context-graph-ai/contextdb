@@ -14,6 +14,20 @@ pub(crate) struct WriterRelationalSource {
     _control: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl WriterRelationalSource {
+    pub(crate) fn row_head(&self, table: &str, row: RowId) -> Result<(Lsn, [u8; 24])> {
+        let key = RedbPersistence::writer_row_head(&self.root, table, row)?;
+        Ok((Lsn(u64::from_be_bytes(key[16..].try_into().unwrap())), key))
+    }
+    pub(crate) fn cleanup_rotation(&self) -> Result<Option<[u8; 32]>> {
+        RedbPersistence::currency_cleanup_rotation(&self.root)
+    }
+    pub(crate) fn cleanup_progress(
+        &self,
+        table: &str,
+        declaration: [u8; 32],
+    ) -> Result<super::writer_cleanup_progress::CurrencyCleanupProgress> {
+        RedbPersistence::currency_cleanup_progress(&self.root, table, declaration)
+    }
     pub(crate) fn new(root: Arc<WriterSnapshot>) -> Result<Self> {
         let control = root.adapter_control(std::mem::size_of::<Self>())?;
         Ok(Self {

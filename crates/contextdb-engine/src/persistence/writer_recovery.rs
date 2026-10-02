@@ -1,7 +1,8 @@
 //! Writable-open bounds: end-key probes and non-derivable identity floors.
 use super::*;
 
-const WRITER_RECOVERY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("writer_recovery");
+pub(super) const RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("writer_recovery");
 const BOUNDS_KEY: &str = "bounds";
 const COMMIT_ROOT_KEY: &str = "commit_directory_root";
 
@@ -31,7 +32,7 @@ impl RedbPersistence {
     ) -> Result<WriterRecoveryBounds> {
         let read = snapshot.owner_read();
         let table = read
-            .open_table(WRITER_RECOVERY_TABLE)
+            .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
         let value = table
             .get(BOUNDS_KEY)
@@ -64,7 +65,7 @@ impl RedbPersistence {
             let write = db.begin_write().map_err(Self::storage_error)?;
             {
                 let mut table = write
-                    .open_table(WRITER_RECOVERY_TABLE)
+                    .open_table(RECOVERY_TABLE)
                     .map_err(Self::storage_error)?;
                 let mut target: WriterRecoveryBounds = table
                     .get(BOUNDS_KEY)
@@ -110,7 +111,7 @@ impl RedbPersistence {
             )
         };
         let mut table = write
-            .open_table(WRITER_RECOVERY_TABLE)
+            .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
         let mut bounds: WriterRecoveryBounds = table
             .get(BOUNDS_KEY)
@@ -166,6 +167,7 @@ impl RedbPersistence {
             .map_err(Self::storage_error)?;
         drop(table);
         Self::write_commit_directory_root_in_write(write)?;
+        Self::write_row_heads_root(write)?;
         Self::write_writer_relational_counts_in_write(write)
     }
 
@@ -179,7 +181,7 @@ impl RedbPersistence {
             .map_err(Self::storage_error)?
             .unwrap_or([0; 32]);
         let mut table = write
-            .open_table(WRITER_RECOVERY_TABLE)
+            .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
         if table
             .get(COMMIT_ROOT_KEY)
@@ -201,7 +203,7 @@ impl RedbPersistence {
     fn write_writer_relational_counts_in_write(write: &redb::WriteTransaction) -> Result<()> {
         let metadata = write.open_table(META_TABLE).map_err(Self::storage_error)?;
         let mut counts = write
-            .open_table(WRITER_RECOVERY_TABLE)
+            .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
         for entry in metadata
             .range("table:".."table;")
@@ -243,7 +245,7 @@ impl RedbPersistence {
         actual: u64,
     ) -> Result<()> {
         let counts = read
-            .open_table(WRITER_RECOVERY_TABLE)
+            .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
         let key = format!("row_versions:{table}");
         let value = counts
@@ -288,7 +290,7 @@ impl RedbPersistence {
         tables: impl IntoIterator<Item = &'a str>,
     ) -> Result<WriterOpenBounds> {
         let record = read
-            .open_table(WRITER_RECOVERY_TABLE)
+            .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
         let stored: WriterRecoveryBounds = record
             .get(BOUNDS_KEY)
@@ -399,7 +401,7 @@ impl RedbPersistence {
         external_row: RowId,
     ) -> Result<()> {
         let mut table = write
-            .open_table(WRITER_RECOVERY_TABLE)
+            .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
         let mut bounds: WriterRecoveryBounds = table
             .get(BOUNDS_KEY)

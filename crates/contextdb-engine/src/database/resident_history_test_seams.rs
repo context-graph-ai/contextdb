@@ -188,8 +188,11 @@ impl Database {
     #[doc(hidden)]
     pub fn __storage_batch_for_test(&self) -> Result<(bool, usize, usize)> {
         let persistence = self.persistence.as_ref().expect("file fixture");
-        let (progress, _) = persistence.compact_incremental(
-            self.accountant.clone(),
+        let (progress, _) = publish_storage_compaction_batch(
+            &self.tx_mgr,
+            persistence,
+            &self.accountant,
+            &self.publication_interrupted,
             persistence.fragmentation_ratio().unwrap_or(0.0),
         )?;
         Ok((

@@ -593,6 +593,7 @@ pub(crate) struct ContentIdentityMutation {
     pub(crate) family: LogicalFamily,
     pub(crate) logical_key: Vec<u8>,
     pub(crate) logical_value: Option<Vec<u8>>,
+    pub(crate) row_head: Option<Option<[u8; 24]>>,
 }
 
 impl ContentIdentityMutation {
@@ -605,6 +606,7 @@ impl ContentIdentityMutation {
             family,
             logical_key: logical_key.into(),
             logical_value: Some(logical_value.into()),
+            row_head: None,
         }
     }
 
@@ -613,6 +615,7 @@ impl ContentIdentityMutation {
             family,
             logical_key: logical_key.into(),
             logical_value: None,
+            row_head: None,
         }
     }
 }
@@ -717,10 +720,9 @@ pub(crate) fn row_mutation(
     let row_id = row.row_id.0.to_le_bytes();
     let key = key_parts(&[table.as_bytes(), &row_id]);
     if row.deleted_tx.is_some() {
-        return Ok(ContentIdentityMutation::remove(
-            LogicalFamily::Relational,
-            key,
-        ));
+        let mut mutation = ContentIdentityMutation::remove(LogicalFamily::Relational, key);
+        mutation.row_head = Some(Some(RedbPersistence::rel_row_key(row).try_into().unwrap()));
+        return Ok(mutation);
     }
     let values = row
         .values
@@ -738,18 +740,19 @@ pub(crate) fn row_mutation(
         // row's values, and copying every value first would hold the row
         // twice while it is written.
         .collect::<BTreeMap<&String, &Value>>();
-    Ok(ContentIdentityMutation::put(
-        LogicalFamily::Relational,
-        key,
-        canonical_json(&values)?,
-    ))
+    let mut mutation =
+        ContentIdentityMutation::put(LogicalFamily::Relational, key, canonical_json(&values)?);
+    mutation.row_head = Some(Some(RedbPersistence::rel_row_key(row).try_into().unwrap()));
+    Ok(mutation)
 }
 
 pub(crate) fn remove_row_mutation(table: &str, row_id: RowId) -> ContentIdentityMutation {
-    ContentIdentityMutation::remove(
+    let mut mutation = ContentIdentityMutation::remove(
         LogicalFamily::Relational,
         key_parts(&[table.as_bytes(), &row_id.0.to_le_bytes()]),
-    )
+    );
+    mutation.row_head = Some(None);
+    mutation
 }
 
 pub(crate) fn edge_mutation(edge: &AdjEntry) -> Result<ContentIdentityMutation> {
@@ -5584,6 +5587,7 @@ impl RedbPersistence {
         mutations: &[ContentIdentityMutation],
         admission: &mut ProofAdmission,
     ) -> Result<DirectTypedImageDigest> {
+        Self::apply_writer_row_heads_in_write(write_txn, mutations)?;
         let metadata = write_txn
             .open_table(CONTENT_IDENTITY_METADATA_TABLE)
             .map_err(Self::storage_error)?;
