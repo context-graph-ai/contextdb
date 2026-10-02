@@ -1,4 +1,5 @@
 use super::*;
+include!("durable_test_observations.rs");
 
 type ReceivedSchemaFixture = (
     ChangeSet,
@@ -538,7 +539,7 @@ fn assert_durable_side_projection(
     trigger: &str,
     expected_ids: &[i64],
 ) {
-    let mut rows = db.relational_store.tables.read()[table].clone();
+    let mut rows = durable_observation::rows(db, table);
     rows.sort_by_key(|row| match row.values["id"] {
         Value::Int64(id) => id,
         ref value => panic!("{table} id must be Int64, got {value:?}"),
@@ -621,10 +622,7 @@ fn assert_received_ddl_is_appended(db: &Database, changes: &ChangeSet, receiver_
         &actual.ddl_lsn[actual.ddl_lsn.len() - changes.ddl.len()..],
         vec![receiver_lsn; changes.ddl.len()]
     );
-    assert_eq!(
-        db.relational_store.tables.read()["notes"][0].lsn,
-        receiver_lsn
-    );
+    assert_eq!(durable_observation::rows(db, "notes")[0].lsn, receiver_lsn);
 }
 
 fn config_snapshot(db: &Database) -> Vec<(String, Vec<u8>)> {
