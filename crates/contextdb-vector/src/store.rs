@@ -8847,6 +8847,31 @@ impl VectorStore {
                     .or_else(|| slot.progress.as_ref().map(|progress| (***progress).clone()))
             })
     }
+    /// Advance only the engine-selected partition by one persisted finite batch.
+    /// The operation guard restores its last committed progress on every exit;
+    /// the callback runs after the slot lock is released. A busy or absent
+    /// operation returns false without driving another partition.
+    #[doc(hidden)]
+    pub fn step_partition_paged_build(
+        &self,
+        partition: &VectorPartitionRef,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
+        else {
+            return Ok(false);
+        };
+        if state.paged_builder.lock().in_flight {
+            return Ok(false);
+        }
+        let Some(mut operation) = PagedBuildOperation::take(state, false)? else {
+            return Ok(false);
+        };
+        let (builder, plan) = operation.work();
+        builder.step(*plan, checkpoint)?;
+        Ok(true)
+    }
+
     /// Complete storage publication under the engine's commit gate, then
     /// release the pending-build slot. Serving roots are installed through
     /// install_loaded_sealed_generation / publish_replacement_base_generation;

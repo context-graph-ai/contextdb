@@ -12007,7 +12007,7 @@ impl Drop for RetainedNonVectorMemoryOwner {
     fn drop(&mut self) {
         let metadata = self.relational.table_meta.read().clone();
         let metadata_bytes = metadata.values().fold(0usize, |bytes, meta| {
-            bytes.saturating_add(meta.estimated_bytes())
+            bytes.saturating_add(retained_table_metadata_bytes(&self.relational, meta))
         });
         let row_bytes =
             self.relational
@@ -14374,7 +14374,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
     }
 
     fn exact_comparison_streams_when_partition_does_not_fit(&self) -> bool {
-        matches!(self.source, DurableRawVectorSource::CommittedImage(_))
+        true
     }
 
     fn load(&self, directory: &[RawVectorDirectoryEntry]) -> Result<LoadedRawVectorPartition> {
@@ -23924,7 +23924,7 @@ impl Database {
         };
         let old_bytes = old_metas.iter().fold(0usize, |bytes, (table, meta)| {
             bytes
-                .saturating_add(meta.estimated_bytes())
+                .saturating_add(retained_table_metadata_bytes(&self.relational_store, meta))
                 .saturating_add(self.committed_rows_priced_under(table, meta))
         });
         let new_bytes = projected_tables.iter().fold(0usize, |bytes, table| {
@@ -23932,7 +23932,7 @@ impl Database {
                 return bytes;
             };
             bytes
-                .saturating_add(meta.estimated_bytes())
+                .saturating_add(retained_table_metadata_bytes(&self.relational_store, meta))
                 .saturating_add(self.committed_rows_priced_under(table, meta))
         });
         // A transaction that another caller holds open over one of these
@@ -27747,7 +27747,7 @@ impl Database {
         vector_bytes: usize,
     ) -> usize {
         let metadata = tables.values().fold(0usize, |bytes, meta| {
-            bytes.saturating_add(meta.estimated_bytes())
+            bytes.saturating_add(retained_table_metadata_bytes(&self.relational_store, meta))
         });
         let rows = if self.relational_store.uses_disk_backed_committed_bodies() {
             0
@@ -33646,7 +33646,7 @@ impl Database {
             let snapshot = self.snapshot();
             let empty_deleted = HashSet::new();
             let mut tombstones: HashMap<(String, String), (Lsn, RowId)> = HashMap::new();
-            for entry in self.change_log_since_unlocked(after_exclusive) {
+            for entry in self.change_log_since_unlocked(after_exclusive)? {
                 let ChangeLogEntry::RowDelete {
                     table,
                     row_id,
@@ -35064,46 +35064,6 @@ impl Database {
     }
 
     fn commit_validate(
-        &self,
-        origin_tx: TxId,
-        ws: &mut WriteSet,
-    ) -> Result<CommitValidationOutcome> {
-        // Source probes used to validate indexed membership belong to the
-        // same publication preparation as its index keys. Keep their actual
-        // admission figures and the existing membership refusal identity.
-        let prepares_membership = {
-            let tables = self.relational_store.table_meta.read();
-            ws.relational_inserts
-                .iter()
-                .map(|(table, _)| table)
-                .chain(ws.relational_deletes.iter().map(|(table, _, _)| table))
-                .any(|table| {
-                    tables
-                        .get(table)
-                        .is_some_and(|meta| !meta.indexes.is_empty())
-                })
-        };
-        self.commit_validate_inner(origin_tx, ws)
-            .map_err(|mut error| {
-                if prepares_membership
-                    && let Error::MemoryBudgetExceeded {
-                        subsystem,
-                        operation,
-                        hint,
-                        ..
-                    } = &mut error
-                    && subsystem == "writer_source"
-                {
-                    *subsystem = "relational_index".into();
-                    *operation = "membership".into();
-                    *hint =
-                        "Raise MEMORY_LIMIT to prepare the indexed membership publication.".into();
-                }
-                error
-            })
-    }
-
-    fn commit_validate_inner(
         &self,
         origin_tx: TxId,
         ws: &mut WriteSet,
@@ -47908,7 +47868,7 @@ impl Database {
         if !self.access_is_admin() {
             return Ok(changes.rows);
         }
-        let entries = self.change_log_since(since);
+        let entries = self.change_log_since(since)?;
         let tables = self.relational_store.tables.read();
         let mut out = Vec::new();
         for e in entries {
@@ -50851,7 +50811,10 @@ impl Database {
                 ..WriterMemoryOwnershipReceiptForTest::default()
             };
             let metadata = self.relational_store.table_meta.read();
-            receipt.table_metadata = metadata.values().map(TableMeta::estimated_bytes).sum();
+            receipt.table_metadata = metadata
+                .values()
+                .map(|meta| retained_table_metadata_bytes(&self.relational_store, meta))
+                .sum();
             for (table, rows) in self.relational_store.tables.read().iter() {
                 let meta = metadata.get(table);
                 for row in rows {
@@ -51321,14 +51284,14 @@ impl Database {
                 .prepare_retention_expiries(identities, self.accountant.clone())?;
             self.relational_store.publish_retention_expiries(prepared);
         }
-        let metadata_bytes = self
-            .relational_store
-            .table_meta
-            .read()
-            .values()
-            .fold(0usize, |acc, meta| {
-                acc.saturating_add(meta.estimated_bytes())
-            });
+        let metadata_bytes =
+            self.relational_store
+                .table_meta
+                .read()
+                .values()
+                .fold(0usize, |acc, meta| {
+                    acc.saturating_add(retained_table_metadata_bytes(&self.relational_store, meta))
+                });
         self.accountant.try_allocate_for(
             metadata_bytes,
             "open",
@@ -52097,13 +52060,14 @@ impl Database {
         };
         let old_bytes = {
             let tables = self.relational_store.tables.read();
-            old_meta.estimated_bytes().saturating_add(retained_rows(
-                tables.get(name).map(Vec::as_slice).unwrap_or_default(),
-                old_meta,
-            ))
+            retained_table_metadata_bytes(&self.relational_store, old_meta).saturating_add(
+                retained_rows(
+                    tables.get(name).map(Vec::as_slice).unwrap_or_default(),
+                    old_meta,
+                ),
+            )
         };
-        let new_bytes = new_meta
-            .estimated_bytes()
+        let new_bytes = retained_table_metadata_bytes(&self.relational_store, new_meta)
             .saturating_add(retained_rows(new_rows, new_meta));
         // Rows a still-open transaction has staged into this table are
         // charged under the shape it had when their statement ran and
@@ -52175,12 +52139,10 @@ impl Database {
             self.staged_rows_priced_across_shape_change(table, old_meta, new_meta);
         PreparedMemorySwap::prepare_for(
             self.accountant.clone(),
-            old_meta
-                .estimated_bytes()
+            retained_table_metadata_bytes(&self.relational_store, old_meta)
                 .saturating_add(old_rows)
                 .saturating_add(staged_old),
-            new_meta
-                .estimated_bytes()
+            retained_table_metadata_bytes(&self.relational_store, new_meta)
                 .saturating_add(new_rows)
                 .saturating_add(staged_new),
             0,
@@ -53516,8 +53478,10 @@ impl Database {
             .max())
     }
 
-    pub fn change_log_since(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
-        let _operation = self.assert_open_operation();
+    /// Return ordered change occurrences after the watermark from one captured root.
+    /// Durable integrity and memory-admission refusals reach the caller unchanged.
+    pub fn change_log_since(&self, since_lsn: Lsn) -> Result<Vec<ChangeLogEntry>> {
+        let _operation = self.open_operation()?;
         if !self.access_is_admin() {
             return self.gated_change_log_since(since_lsn);
         }
@@ -53540,7 +53504,9 @@ impl Database {
         since_lsn: Lsn,
         commits: usize,
     ) -> usize {
-        let entries = self.change_log_since(since_lsn);
+        let entries = self
+            .change_log_since(since_lsn)
+            .expect("change-log charge observation must admit its source read");
         crate::composite_store::change_log_retained_bytes(&entries).saturating_add(
             if self.persistence.is_none() {
                 crate::composite_store::COMMIT_INDEX_ENTRY_BYTES.saturating_mul(commits)
@@ -53550,8 +53516,8 @@ impl Database {
         )
     }
 
-    fn gated_change_log_since(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
-        let changes = self.changes_since(since_lsn);
+    fn gated_change_log_since(&self, since_lsn: Lsn) -> Result<Vec<ChangeLogEntry>> {
+        let (changes, _, _) = self.checked_changes_since_with_arrivals(since_lsn)?;
         let mut entries = Vec::new();
         for row in changes.rows {
             if row.deleted {
@@ -53561,11 +53527,15 @@ impl Database {
                     natural_key: row.natural_key,
                     lsn: row.lsn,
                 });
-            } else if let Some(row_id) = self.row_id_for_natural_key_full(
-                &row.table,
-                &row.natural_key,
-                self.snapshot_at(row.lsn),
-            ) {
+            } else if let Some(row_id) = self
+                .visible_row_by_natural_key(
+                    &row.table,
+                    &row.natural_key,
+                    self.snapshot_at(row.lsn),
+                    &HashSet::new(),
+                )?
+                .map(|row| row.row_id)
+            {
                 entries.push(ChangeLogEntry::RowInsert {
                     table: row.table,
                     row_id,
@@ -53606,10 +53576,33 @@ impl Database {
             }
         }
         entries.sort_by_key(ChangeLogEntry::lsn);
-        entries
+        Ok(entries)
     }
 
-    fn change_log_since_unlocked(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
+    fn change_log_since_unlocked(&self, since_lsn: Lsn) -> Result<Vec<ChangeLogEntry>> {
+        let (_, root) = self.capture_writer_statement()?;
+        if let Some(root) = root {
+            if since_lsn >= root.lsn {
+                return Ok(Vec::new());
+            }
+            let mut cursor = root.change_log_cursor(Lsn(since_lsn.0 + 1), root.lsn)?;
+            let mut output =
+                crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+            let mut entries = Vec::new();
+            while let Some(window) = cursor.next_change()? {
+                output.try_grow_for(
+                    answer_list_entry_bytes::<ChangeLogEntry>(change_log_entry_copy_bytes(
+                        &window.value,
+                    )),
+                    "writer_source",
+                    "change_log_output",
+                    "Raise MEMORY_LIMIT to return these change-log entries.",
+                )?;
+                entries.push(window.value);
+            }
+            self.retain_writer_output(output);
+            return Ok(entries);
+        }
         let log = self.change_log.read();
         let start = log.partition_point(|e| {
             #[cfg(feature = "test-seams")]
@@ -53618,7 +53611,7 @@ impl Database {
         });
         #[cfg(feature = "test-seams")]
         resident_history_test_seams::note(|work| work.log_keys_examined += log.len() - start);
-        log[start..].to_vec()
+        Ok(log[start..].to_vec())
     }
 
     pub fn ddl_log_since(&self, since_lsn: Lsn) -> Vec<DdlChange> {
@@ -55062,7 +55055,8 @@ impl Database {
                             composite_foreign_keys,
                             composite_unique,
                         );
-                        running += meta.estimated_bytes() as i128;
+                        running +=
+                            retained_table_metadata_bytes(&self.relational_store, &meta) as i128;
                         projected.insert(name.clone(), meta);
                     }
                 }
@@ -55173,12 +55167,10 @@ impl Database {
     ) -> i128 {
         let (staged_old, staged_new, _) =
             self.staged_rows_priced_across_shape_change(table, old_meta, new_meta);
-        let old_bytes = old_meta
-            .estimated_bytes()
+        let old_bytes = retained_table_metadata_bytes(&self.relational_store, old_meta)
             .saturating_add(self.committed_rows_priced_under(table, old_meta))
             .saturating_add(staged_old) as i128;
-        let new_bytes = new_meta
-            .estimated_bytes()
+        let new_bytes = retained_table_metadata_bytes(&self.relational_store, new_meta)
             .saturating_add(self.committed_rows_priced_under(table, new_meta))
             .saturating_add(staged_new) as i128;
         // The postings are only part of what an index costs. Building one also
@@ -55190,8 +55182,8 @@ impl Database {
         // table already has.
         //
         // The exact-probe bitmap is NOT in that measurement and must not be.
-        // The metadata delta above already carries it -- `estimated_bytes` is
-        // `metadata_bytes` plus 64 KiB per exact-only index -- so adding an
+        // The resident backend metadata delta already carries its filter;
+        // source-backed descriptors allocate no filter. Adding an
         // average that contained it charged an arriving user-declared index a
         // bitmap it never allocates, and an arriving exact-only one the same
         // bitmap twice. Either way a unit the limit could hold was refused and
@@ -57129,7 +57121,7 @@ impl Database {
             } else {
                 Vec::new()
             };
-            let changes = self.change_log_since_unlocked(since_lsn);
+            let changes = self.change_log_since_unlocked(since_lsn)?;
             Ok((ddl, changes))
         })?;
         if !self.access_is_admin() {
@@ -68808,6 +68800,15 @@ pub(crate) fn retained_row_bytes_for_meta(
         non_vector.saturating_add(f32_projection_payload_bytes(values, meta))
     } else {
         non_vector
+    }
+}
+
+/// Price schema declarations and only the filters this backend actually retains.
+pub(crate) fn retained_table_metadata_bytes(store: &RelationalStore, meta: &TableMeta) -> usize {
+    if store.uses_disk_backed_committed_bodies() {
+        meta.metadata_bytes()
+    } else {
+        meta.estimated_bytes()
     }
 }
 

@@ -601,13 +601,22 @@ impl StoredVector {
                 payload,
             } => (*len, *min, *max, &payload[..]),
         };
-        let mut bytes = Vec::with_capacity(HNSW_HEADER_BYTES + payload.len());
-        bytes.extend_from_slice(&(len as u32).to_le_bytes());
-        bytes.extend_from_slice(&min.to_le_bytes());
-        bytes.extend_from_slice(&max.to_le_bytes());
-        bytes.extend_from_slice(payload);
-        bytes
+        encode_hnsw_quantized_payload(len, min, max, payload)
     }
+}
+
+pub(crate) fn encode_hnsw_quantized_payload(
+    len: usize,
+    min: f32,
+    max: f32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(HNSW_HEADER_BYTES + payload.len());
+    bytes.extend_from_slice(&(len as u32).to_le_bytes());
+    bytes.extend_from_slice(&min.to_le_bytes());
+    bytes.extend_from_slice(&max.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
 }
 
 #[derive(Debug, Clone, Copy)]

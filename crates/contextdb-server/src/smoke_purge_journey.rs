@@ -1552,7 +1552,10 @@ async fn run_forged_push(root: &Path) -> Result<(), String> {
         return Err("forged push partially mutated hub payload or progress".to_string());
     }
     let hub_state_after = sync_state(&hub.db, &case.join("after-forged-push.snapshot"))?;
-    let contact_changes = hub.db.change_log_since(hub_lsn_before);
+    let contact_changes = hub
+        .db
+        .change_log_since(hub_lsn_before)
+        .map_err(|error| format!("cannot read change log after forged push: {error}"))?;
     if !contact_changes.iter().all(|entry| {
         matches!(
             entry,
