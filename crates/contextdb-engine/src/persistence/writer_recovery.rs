@@ -82,9 +82,17 @@ impl RedbPersistence {
             if source_lsn > last.map_or(0, |(lsn, _)| lsn) {
                 bounds.source_lsn_floor = bounds.source_lsn_floor.max(source_lsn);
             }
-            // Vector keys sort by column/partition before row id: their final
-            // key is not a global row-id maximum.
-            if let Some(row_id) = ws.vector_inserts.iter().map(|entry| entry.row_id.0).max() {
+            // A final relational key may be reclaimed, and vector keys sort
+            // by column/partition before row id. Preserve every applied row
+            // identity in this non-derivable floor before either directory
+            // can lose its last witness.
+            if let Some(row_id) = ws
+                .vector_inserts
+                .iter()
+                .map(|entry| entry.row_id.0)
+                .chain(ws.relational_inserts.iter().map(|(_, row)| row.row_id.0))
+                .max()
+            {
                 bounds.external_row_id_floor = bounds.external_row_id_floor.max(row_id);
             }
         }
