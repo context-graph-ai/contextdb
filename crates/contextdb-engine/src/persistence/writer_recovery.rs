@@ -278,6 +278,18 @@ impl RedbPersistence {
                     .map(|(lsn, tx)| (lsn.value(), tx.value())),
             )
         };
+        // Metadata-only declarations need not have a row commit-index entry.
+        // Preserve their frontier from one end-key seek, without decoding history.
+        let ddl_lsn = {
+            let ddl = write
+                .open_table(DDL_LOG_TABLE)
+                .map_err(Self::storage_error)?;
+            ddl.last()
+                .map_err(Self::storage_error)?
+                .map(|(key, _)| Self::ddl_lsn_from_key(key.value()))
+                .transpose()?
+                .unwrap_or(Lsn(0))
+        };
         let mut table = write
             .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;
@@ -288,6 +300,7 @@ impl RedbPersistence {
             .transpose()?
             .unwrap_or_default();
         bounds.commit_count = commit_count;
+        bounds.source_lsn_floor = bounds.source_lsn_floor.max(ddl_lsn.0);
         if let Some((lsn, tx)) = last {
             bounds.identity_tx_floor = bounds.identity_tx_floor.max(tx);
             bounds.source_lsn_floor = bounds.source_lsn_floor.max(lsn);
@@ -524,6 +537,15 @@ impl RedbPersistence {
             commit_last,
             commit_count: count,
         };
+        match read.open_table(DDL_LOG_TABLE) {
+            Ok(ddl) => {
+                if let Some((key, _)) = ddl.last().map_err(Self::storage_error)? {
+                    bounds.max_lsn = bounds.max_lsn.max(Self::ddl_lsn_from_key(key.value())?);
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(Self::storage_error(error)),
+        }
         match read.open_table(writer_history::WRITER_CHANGE_LOG_TABLE) {
             Ok(log) => {
                 if let Some((key, _)) = log.last().map_err(Self::storage_error)? {

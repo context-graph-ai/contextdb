@@ -9,6 +9,17 @@ const CHANGE_LOG_LSN_COUNT: TableDefinition<u64, u64> =
     TableDefinition::new("change_log_lsn_count");
 
 impl RedbPersistence {
+    pub(super) fn ddl_lsn_from_key(key: &str) -> Result<Lsn> {
+        key.split_once(':')
+            .map_or(key, |(lsn, _)| lsn)
+            .parse::<u64>()
+            .map(Lsn)
+            .map_err(|_| Error::StoreCorrupted {
+                path: "ddl_log".into(),
+                reason: "invalid declaration log frontier".into(),
+            })
+    }
+
     pub(super) fn numeric_change_key(key: &str) -> Result<[u8; 16]> {
         let (lsn, ordinal) = key
             .split_once(':')
@@ -142,6 +153,14 @@ impl super::writer_source::WriterSnapshot {
         self: &Arc<Self>,
         since: Lsn,
     ) -> Result<super::writer_source::WriterReadCursor> {
+        self.ddl_history_cursor_ordered(since, false)
+    }
+
+    pub(crate) fn ddl_history_cursor_ordered(
+        self: &Arc<Self>,
+        since: Lsn,
+        reverse: bool,
+    ) -> Result<super::writer_source::WriterReadCursor> {
         // Encode bounds on the stack; cursor admission precedes their copies.
         let encode = |mut value: u64| {
             let mut key = [b'0'; 20];
@@ -159,11 +178,49 @@ impl super::writer_source::WriterSnapshot {
             super::writer_source::WriterCursorFamily::Text,
             std::ops::Bound::Included(&lower),
             std::ops::Bound::Included(&upper),
-            false,
+            reverse,
         )
     }
 }
 impl super::writer_source::WriterReadCursor {
+    /// Compare only the requested declaration kind. Other history payloads
+    /// remain borrowed storage bytes and never become decoded metadata copies.
+    pub(crate) fn next_ddl_candidate(
+        &mut self,
+        encoded_kind: u8,
+    ) -> Result<Option<super::writer_source::WriterWindow<(Lsn, Option<DdlChange>)>>> {
+        self.next(|key, value| {
+            let key = std::str::from_utf8(key)
+                .map_err(|_| Error::Other("invalid declaration log key".into()))?;
+            let lsn = RedbPersistence::ddl_lsn_from_key(key)?;
+            let Some(kind) = value.first() else {
+                return Err(Error::StoreCorrupted {
+                    path: "ddl_log".into(),
+                    reason: "empty declaration history record".into(),
+                });
+            };
+            // All current DDL discriminants use the codec's single-byte form.
+            // A matching kind still receives the complete strict decoder, so
+            // earlier payload forms retain their established semantic equality.
+            let change = if *kind == encoded_kind {
+                Some(RedbPersistence::decode_config_value_exact(value)?)
+            } else {
+                None
+            };
+            Ok((lsn, change))
+        })
+    }
+
+    pub(crate) fn next_ddl_position(
+        &mut self,
+    ) -> Result<Option<super::writer_source::WriterWindow<Lsn>>> {
+        self.next(|key, _| {
+            let key = std::str::from_utf8(key)
+                .map_err(|_| Error::Other("invalid declaration log key".into()))?;
+            RedbPersistence::ddl_lsn_from_key(key)
+        })
+    }
+
     pub(crate) fn next_ddl_history(
         &mut self,
     ) -> Result<Option<super::writer_source::WriterWindow<(Lsn, DdlChange)>>> {

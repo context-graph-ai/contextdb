@@ -19889,7 +19889,12 @@ impl Database {
             // release. An accepted request may still need to capture it, so
             // retain the root until that request drains. Suspended cursors and
             // external readers keep their own independent shared roots.
-            if self.stop_owner_reads_without_waiting() {
+            let reads_drained = self.owner_read_service.as_ref().is_none_or(|service| {
+                service
+                    .pause_admission_for_handoff()
+                    .is_ok_and(|in_flight| !in_flight)
+            });
+            if reads_drained {
                 self.tx_mgr.release_publication_handle();
             }
             persistence.drain_deferred_frees_before_handoff()?;
@@ -27236,6 +27241,105 @@ impl Database {
         Ok(candidates)
     }
 
+    fn durable_superseded_local_ddl_occurrences(
+        &self,
+        received_ddl: &[DdlChange],
+    ) -> Result<Vec<((Lsn, u32), DurableSupersededDdlOccurrence)>> {
+        let root = self.writer_read_root()?.ok_or_else(|| {
+            Error::Other("durable declaration comparison requires a writer root".into())
+        })?;
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let mut candidates = Vec::<((Lsn, u32), DurableSupersededDdlOccurrence)>::new();
+        for change in received_ddl {
+            let _encoded_memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                self.accountant.clone(),
+                change.estimated_bytes().saturating_add(128),
+                "writer_source",
+                "declaration_comparison",
+                "Raise MEMORY_LIMIT to compare this received declaration.",
+            )?;
+            let encoded = RedbPersistence::encode_config_value(change)?;
+            let kind = *encoded
+                .first()
+                .ok_or_else(|| Error::Other("empty encoded declaration".into()))?;
+            let mut cursor = root.ddl_history_cursor(Lsn(0))?;
+            let mut prior = None;
+            let mut ordinal = 0u32;
+            while let Some(window) = cursor.next_ddl_candidate(kind)? {
+                let (lsn, local) = &window.value;
+                ordinal = if prior == Some(*lsn) { ordinal + 1 } else { 0 };
+                prior = Some(*lsn);
+                if local.as_ref() != Some(change) {
+                    continue;
+                }
+                let key = (*lsn, ordinal);
+                if self.with_received_ddl_arrival(key, |value| Ok(value.is_some()))?
+                    || self.with_superseded_ddl_occurrence(key, |value| Ok(value.is_some()))?
+                    || candidates.iter().any(|(candidate, _)| *candidate == key)
+                {
+                    continue;
+                }
+                let Some(generation) = self.recorded_ddl_generation_sidecar(key.0, key.1)? else {
+                    continue;
+                };
+                output.try_grow_for(
+                    512,
+                    "writer_source",
+                    "declaration_comparison",
+                    "Raise MEMORY_LIMIT to retain matched declaration evidence.",
+                )?;
+                candidates.push((
+                    key,
+                    DurableSupersededDdlOccurrence {
+                        local_lsn: key.0,
+                        persisted_ordinal: key.1,
+                        digest: Self::canonical_local_ddl_arrival_digest(
+                            change,
+                            key.0,
+                            key.1,
+                            &generation,
+                        )?,
+                    },
+                ));
+                break;
+            }
+        }
+        let mut complete_commits = HashSet::new();
+        for (key, _) in &candidates {
+            if complete_commits.contains(&key.0) {
+                continue;
+            }
+            let mut cursor = root.ddl_history_cursor(Lsn(key.0.0.saturating_sub(1)))?;
+            let mut ordinal = 0u32;
+            let mut complete = true;
+            while let Some(window) = cursor.next_ddl_position()? {
+                if window.value != key.0 {
+                    break;
+                }
+                let occurrence = (key.0, ordinal);
+                ordinal += 1;
+                if !self.with_received_ddl_arrival(occurrence, |value| Ok(value.is_some()))?
+                    && !self
+                        .with_superseded_ddl_occurrence(occurrence, |value| Ok(value.is_some()))?
+                    && !candidates
+                        .iter()
+                        .any(|(candidate, _)| *candidate == occurrence)
+                {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete {
+                complete_commits.insert(key.0);
+            }
+        }
+        candidates.retain(|(key, _)| complete_commits.contains(&key.0));
+        candidates.sort_by_key(|(key, _)| *key);
+        self.retain_writer_output(output);
+        Ok(candidates)
+    }
+
     fn canonical_local_ddl_arrival_digest(
         ddl: &DdlChange,
         local_lsn: Lsn,
@@ -28960,17 +29064,15 @@ impl Database {
             &changes.ddl,
         )?;
         side_semantic.catalog_charge = Some(projected_charge);
-        let local_ddl_log_before_extension = if self.persistence.is_some() {
-            self.durable_ddl_entries_since(Lsn(0))?
-        } else {
-            self.ddl_log.read().clone()
-        };
         // Schema this node authored before the vector arrived, which the
         // vector itself restates, stops being outbound work. The comparison
         // uses the log as it stood before the received occurrences were
         // appended so the vector cannot match itself.
-        let superseded_occurrences =
-            self.superseded_local_ddl_occurrences(&local_ddl_log_before_extension, &changes.ddl)?;
+        let superseded_occurrences = if self.persistence.is_some() {
+            self.durable_superseded_local_ddl_occurrences(&changes.ddl)?
+        } else {
+            self.superseded_local_ddl_occurrences(&self.ddl_log.read(), &changes.ddl)?
+        };
         for (_, occurrence) in superseded_occurrences.iter() {
             persistence.superseded_occurrence_values.push((
                 Self::durable_superseded_ddl_occurrence_key(
@@ -29152,7 +29254,6 @@ impl Database {
             }
         }
         let vector_schema_changed = !additional_seeds.is_empty();
-        drop(local_ddl_log_before_extension);
         // A row's lineage sidecar is AUTHENTICATED evidence of who authored it.
         // An unattested unit carries none, and demanding one would refuse every
         // unit that has no signed provenance -- which is not what this door is
@@ -43382,7 +43483,7 @@ impl Database {
             };
             canonical_graph_entries.push(surviving_forward_entries.remove(position));
         }
-        let change_log = self.change_log.read().clone();
+        let change_log = self.change_log_since_unlocked(Lsn(0))?;
         let mut edge_insert_witnesses = canonical_graph_entries
             .iter()
             .map(|entry| {
@@ -43740,13 +43841,17 @@ impl Database {
             .relational_store
             .prepare_received_schema_publication(projections, std::iter::empty::<String>());
         relational.admit_current_memberships(self.accountant.clone())?;
-        let replacement_change_log = change_log
-            .into_iter()
-            .enumerate()
-            .filter_map(|(position, entry)| {
-                (!selected_change_log_position_set.contains(&position)).then_some(entry)
-            })
-            .collect::<Vec<_>>();
+        let replacement_change_log = if self.persistence.is_some() {
+            Vec::new()
+        } else {
+            change_log
+                .into_iter()
+                .enumerate()
+                .filter_map(|(position, entry)| {
+                    (!selected_change_log_position_set.contains(&position)).then_some(entry)
+                })
+                .collect::<Vec<_>>()
+        };
         let mut replacement_change_log_table_index = ChangeLogTableIndex::new();
         let mut replacement_change_log_lsn_refcounts = ChangeLogLsnRefcounts::new();
         record_change_log_entries(
@@ -44639,9 +44744,11 @@ impl Database {
                 #[cfg(feature = "test-seams")]
                 crash_at_purge_publication_boundary_for_test("before-durable-commit");
                 let marker = publication.as_ref().map(|publication| publication.marker());
-                if let Err(error) =
-                    persistence.commit_authoritative_purge(&persistence_projection, marker)
-                {
+                if let Err(error) = persistence.commit_authoritative_purge(
+                    &persistence_projection,
+                    marker,
+                    frontier,
+                ) {
                     if let Some(publication) = publication {
                         let _ = publication.abort();
                     }
@@ -50625,12 +50732,6 @@ impl Database {
         // failure to report after releasing the owner resources; handoff must
         // still publish the final committed root and stop later writes.
         if !already_closed {
-            // Writes and new statements have stopped. Accepted readers own
-            // their captured roots; the publisher must no longer pin pages
-            // that the final cleanup is entitled to reclaim.
-            if self.resource_owner {
-                self.tx_mgr.release_publication_handle();
-            }
             // A prior attempt has already crossed the handoff boundary; a
             // retry may only finish draining accepted owner reads. Retain a
             // failed drain across that wait and any deadline refusal.
@@ -62607,14 +62708,6 @@ impl Database {
         edges: &BTreeSet<String>,
     ) -> Result<ScopedPolicyHolds> {
         let memory = Self::policy_hold_memory(Arc::clone(&self.accountant));
-        if let Some(persistence) = &self.persistence
-            && !persistence.config_prefix_exists(Self::POLICY_HOLD_PREFIX)?
-        {
-            return Ok(ScopedPolicyHolds {
-                entries: Vec::new(),
-                memory,
-            });
-        }
         let mut entries = if let Some(persistence) = &self.persistence {
             let mut scopes = BTreeSet::new();
             let tenants = [None, identity.map(|(tenant, _)| tenant)];

@@ -24588,27 +24588,6 @@ impl RedbPersistence {
         })
     }
 
-    /// Probe one borrowed primary key before allocating selector controls.
-    /// An empty family needs no owned key or decoded value.
-    pub(crate) fn config_prefix_exists(&self, prefix: &str) -> Result<bool> {
-        self.with_db(|db| {
-            let txn = db.begin_read().map_err(Self::storage_error)?;
-            let table = match txn.open_table(CONFIG_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let mut entries = table.range(prefix..).map_err(Self::storage_error)?;
-            match entries.next() {
-                Some(entry) => {
-                    let (key, _) = entry.map_err(Self::storage_error)?;
-                    Ok(key.value().starts_with(prefix))
-                }
-                None => Ok(false),
-            }
-        })
-    }
-
     /// Policy-hold indexing enumerates keys without decoding unrelated values;
     /// the caller saves its cursor alongside each indexed record before advancing.
     pub(crate) fn next_config_key(
@@ -24726,8 +24705,13 @@ impl RedbPersistence {
                 let Some(indexes) = &indexes else {
                     break;
                 };
+                let upper = writer_source::prefix_end(prefix.as_bytes())
+                    .and_then(|end| String::from_utf8(end).ok());
+                let upper = upper
+                    .as_deref()
+                    .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
                 for entry in indexes
-                    .range(prefix.as_str()..)
+                    .range::<&str>((std::ops::Bound::Included(prefix.as_str()), upper))
                     .map_err(Self::storage_error)?
                 {
                     let (key, value) = entry.map_err(Self::storage_error)?;
@@ -29762,12 +29746,19 @@ impl RedbPersistence {
         &self,
         projection: &AuthoritativePurgePersistenceProjection,
         marker: Option<purge_publication::DurableMarker>,
+        frontier: Lsn,
     ) -> Result<()> {
         let prepared_vector_generations =
             self.prepare_authoritative_purge_vector_generations(projection)?;
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             self.apply_local_erasure(&write_txn, projection, &prepared_vector_generations, marker)?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write_txn,
+                TxId(0),
+                frontier,
+                RowId(0),
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             write_txn.commit().map_err(Self::storage_error)
         })
@@ -30366,6 +30357,7 @@ impl RedbPersistence {
                 identity_mutations.extend(content_identity::config_mutations(key, None));
             }
             for (key, bytes) in &projection.lifecycle_records {
+                Self::raise_config_identity_floors_in_write(write_txn, key, bytes)?;
                 config
                     .insert(key.as_str(), bytes.as_slice())
                     .map_err(Self::storage_error)?;
