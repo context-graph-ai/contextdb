@@ -3,6 +3,7 @@ use super::*;
 
 const WRITER_RECOVERY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("writer_recovery");
 const BOUNDS_KEY: &str = "bounds";
+const COMMIT_ROOT_KEY: &str = "commit_directory_root";
 
 /// Identity floors survive directory cleanup as well as noncanonical imports.
 /// Logical publication frontiers must not rewind when the final entry retires.
@@ -92,7 +93,33 @@ impl RedbPersistence {
             .insert(BOUNDS_KEY, encoded.as_slice())
             .map_err(Self::storage_error)?;
         drop(table);
+        Self::write_commit_directory_root_in_write(write)?;
         Self::write_writer_relational_counts_in_write(write)
+    }
+
+    /// Constant-size root binding, also refreshed after physical relocation.
+    /// It authenticates the committed directory without walking history.
+    pub(super) fn write_commit_directory_root_in_write(
+        write: &redb::WriteTransaction,
+    ) -> Result<()> {
+        let root = write
+            .table_root_fingerprint(COMMIT_INDEX_TABLE)
+            .map_err(Self::storage_error)?
+            .unwrap_or([0; 32]);
+        let mut table = write
+            .open_table(WRITER_RECOVERY_TABLE)
+            .map_err(Self::storage_error)?;
+        if table
+            .get(COMMIT_ROOT_KEY)
+            .map_err(Self::storage_error)?
+            .is_some_and(|existing| existing.value() == root)
+        {
+            return Ok(());
+        }
+        table
+            .insert(COMMIT_ROOT_KEY, root.as_slice())
+            .map_err(Self::storage_error)?;
+        Ok(())
     }
 
     // A full row cursor has no selected posting to attest a missing body.
@@ -200,6 +227,23 @@ impl RedbPersistence {
                 path: "writer_recovery".into(),
                 reason: "missing writer recovery bounds".into(),
             })?;
+        let expected_root = record
+            .get(COMMIT_ROOT_KEY)
+            .map_err(Self::storage_error)?
+            .ok_or_else(|| Error::StoreCorrupted {
+                path: "writer_recovery".into(),
+                reason: "missing authenticated commit directory root".into(),
+            })?;
+        let actual_root = read
+            .table_root_fingerprint(COMMIT_INDEX_TABLE)
+            .map_err(Self::storage_error)?
+            .unwrap_or([0; 32]);
+        if expected_root.value() != actual_root {
+            return Err(Error::StoreCorrupted {
+                path: "writer_recovery".into(),
+                reason: "commit directory differs from its committed root".into(),
+            });
+        }
         let commits = read
             .open_table(COMMIT_INDEX_TABLE)
             .map_err(Self::storage_error)?;

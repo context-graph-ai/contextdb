@@ -16771,7 +16771,16 @@ impl MaintenanceContext {
             .any(|meta| meta.default_ttl_seconds.is_some())
     }
 
+    #[cfg(test)]
     fn stamp_expired_rows(&self, now: Wallclock) -> Result<()> {
+        self.stamp_expired_rows_for(now, RetentionPreparation::Expiry)
+    }
+
+    fn stamp_expired_rows_for(
+        &self,
+        now: Wallclock,
+        preparation: RetentionPreparation,
+    ) -> Result<()> {
         let tx = self.tx_mgr.begin();
         let workspace = std::cell::RefCell::new(
             crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone()),
@@ -16923,7 +16932,7 @@ impl MaintenanceContext {
                     watch.completed();
                 }
                 let _ = self.tx_mgr.rollback(tx);
-                Err(failure.error)
+                Err(retention_source_admission_error(failure.error, preparation))
             }
         }
     }
@@ -16935,6 +16944,32 @@ impl MaintenanceContext {
         if !self.has_retention_work() {
             return Ok(PruningReport::default());
         }
+        // Admit the carry destination before expiry opens any row cursor. Its
+        // published owner remains charged; this receipt covers the replacement
+        // workspace and is transferred into reclamation rather than duplicated.
+        let mut carry_workspace =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        let prepaid_carry_bytes = {
+            let carried = self.retention_deferred_edge_nodes.lock();
+            let bytes = carried.nodes.len().saturating_mul(128);
+            carry_workspace.try_grow_for(
+                bytes,
+                "retention",
+                "prepare_prune",
+                "Raise MEMORY_LIMIT to admit reader-deferred retention identities.",
+            )?;
+            bytes
+        };
+        let prepaid_durable_carry_bytes = match &self.persistence {
+            Some(persistence) => persistence.retention_deferred_edge_workspace_bytes()?,
+            None => 0,
+        };
+        carry_workspace.try_grow_for(
+            prepaid_durable_carry_bytes,
+            "retention",
+            "prepare_prune",
+            "Raise MEMORY_LIMIT to load reader-deferred retention identities.",
+        )?;
         let file_bytes_before = self.file_bytes();
         // Sampled BEFORE the prune, deliberately. redb counts just-freed pages
         // as fragmented, so a reading taken AFTER a prune is dominated by the
@@ -16951,15 +16986,23 @@ impl MaintenanceContext {
             .map(|persistence| persistence.fragmentation_ratio().unwrap_or(0.0))
             .unwrap_or(0.0);
         let now = Wallclock::now();
-        self.stamp_expired_rows(now)?;
-        let mut report = self.tx_mgr.with_maintenance_publication(|publication| {
-            prune_expired_rows(
-                self,
-                self.sync_watermark.load(Ordering::SeqCst),
-                now,
-                publication,
-            )
-        })?;
+        self.stamp_expired_rows_for(now, RetentionPreparation::Prune)?;
+        let mut report = self
+            .tx_mgr
+            .with_maintenance_publication(|publication| {
+                prune_expired_rows(
+                    self,
+                    self.sync_watermark.load(Ordering::SeqCst),
+                    now,
+                    publication,
+                    carry_workspace,
+                    prepaid_carry_bytes,
+                    prepaid_durable_carry_bytes,
+                )
+            })
+            .map_err(|error| {
+                retention_source_admission_error(error, RetentionPreparation::Prune)
+            })?;
         report.file_bytes_before = file_bytes_before;
         report.fragmentation_before = fragmentation_before;
         // Compaction itself still runs AFTER the prune (there is no point
@@ -20372,7 +20415,6 @@ impl Database {
 
         let relational = Arc::new(RelationalStore::new());
         relational.enable_disk_backed_committed_bodies();
-        let mut sanitized_row_tables = HashSet::new();
         for (name, meta) in &all_meta {
             let mut runtime_meta = meta.clone();
             let user_indexes = runtime_meta
@@ -20399,72 +20441,9 @@ impl Database {
                     );
                 }
             }
-            persistence.visit_relational_table(name, |mut row| {
-                #[cfg(feature = "in-process-test-seams")]
-                crate::writer_query_test_seams::note_history(
-                    crate::writer_query_test_seams::HistoryFamily::IndexRebuildInput,
-                );
-                if sanitize_loaded_row_for_meta(&mut row, &runtime_meta) {
-                    sanitized_row_tables.insert(name.clone());
-                }
-                relational.insert_loaded_row(name, row)
-            })?;
         }
-        let loaded_row_ids = relational
-            .tables
-            .read()
-            .iter()
-            .map(|(table, rows)| {
-                (
-                    table.clone(),
-                    rows.iter()
-                        .filter(|row| row.deleted_tx.is_none())
-                        .map(|row| row.row_id)
-                        .collect::<HashSet<_>>(),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let sync_source_lsns: HashMap<(String, RowId), Lsn> = persistence
-            .load_sync_source_lsns()?
-            .into_iter()
-            .filter(|((table, row_id), _)| {
-                loaded_row_ids
-                    .get(table)
-                    .is_some_and(|row_ids| row_ids.contains(row_id))
-            })
-            .collect();
-        let mut sync_source_kinds = persistence
-            .load_sync_source_kinds()?
-            .into_iter()
-            .filter_map(|((table, row_id), kind)| {
-                (loaded_row_ids
-                    .get(&table)
-                    .is_some_and(|rows| rows.contains(&row_id))
-                    // A kind is a companion to an LSN, never independent
-                    // provenance. Ignore roots left by an older cleanup bug
-                    // rather than reclassifying a locally-authored row.
-                    && sync_source_lsns.contains_key(&(table.clone(), row_id)))
-                .then(|| {
-                    let kind = match kind {
-                        1 => contextdb_relational::store::SyncSourceKind::AcceptedLocal,
-                        2 => contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
-                        _ => contextdb_relational::store::SyncSourceKind::Pulled,
-                    };
-                    ((table, row_id), kind)
-                })
-            })
-            .collect::<HashMap<_, _>>();
-        // Roots written before the companion table existed contain only the
-        // source LSN. Those entries were historically pulled/echo provenance,
-        // so preserve that meaning rather than treating old remote data as
-        // newly authored local work.
-        for key in sync_source_lsns.keys() {
-            sync_source_kinds
-                .entry(key.clone())
-                .or_insert(contextdb_relational::store::SyncSourceKind::Pulled);
-        }
-        relational.replace_sync_source_lsns(sync_source_lsns);
-        relational.replace_sync_source_kinds(sync_source_kinds);
+        // Committed rows and provenance are read from the published root.
+        // Opening installs only schema and index descriptors.
 
         let graph = Arc::new(GraphStore::new());
         for edge in persistence.load_forward_edges()? {
@@ -20492,59 +20471,6 @@ impl Database {
         )?;
 
         let loaded_change_log = persistence.load_change_log()?;
-        let commit_index = persistence.load_commit_index()?;
-        if commit_index
-            .values()
-            .try_fold(TxId(0), |previous, tx| (*tx >= previous).then_some(*tx))
-            .is_none()
-        {
-            // Current-format ordering damage is repaired as one atomic MVCC
-            // rewrite, then hydrated again. Routine opens keep the lazy path.
-            drop(vector);
-            drop(graph);
-            drop(relational);
-            let mut workspace =
-                crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone());
-            let bytes = std::fs::metadata(persistence.path())
-                .map_err(RedbPersistence::storage_error)?
-                .len();
-            if let Some(limit) =
-                effective_disk_limit.filter(|limit| bytes.saturating_mul(2) > *limit)
-            {
-                return Err(Error::DiskBudgetExceeded {
-                    operation: "repair_commit_index".into(), current_bytes: bytes, budget_limit_bytes: limit,
-                    hint: "Reduce retained file-backed data or raise DISK_LIMIT before writing more data.".into(),
-                });
-            }
-            workspace.try_grow_for(
-                usize::try_from(bytes)
-                    .unwrap_or(usize::MAX)
-                    .saturating_mul(3),
-                "storage",
-                "repair_commit_index",
-                "Raise MEMORY_LIMIT to repair the current store.",
-            )?;
-            persistence.repair_current_transaction_order(&commit_index, &all_meta)?;
-            drop(workspace);
-            return Self::open_loaded_from_persistence(
-                registry_reservation,
-                persistence,
-                plugin,
-                accountant,
-                startup_disk_limit,
-            );
-        }
-        for table in sanitized_row_tables {
-            let meta = all_meta
-                .get(&table)
-                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
-            let mut rows = persistence.load_relational_table(&table)?;
-            for row in &mut rows {
-                sanitize_loaded_row_for_meta(row, meta);
-            }
-            persistence.rewrite_table_rows(&table, &rows)?;
-        }
-
         // Recovery uses durable end keys and maintained identity floors. It
         // must not depend on the resident projections or enumerate retained
         // versions to decide which identities a new writer may allocate.
@@ -68388,41 +68314,6 @@ pub(crate) struct CommittedImageStartupState {
     trigger_audit: Vec<(String, Vec<u8>)>,
 }
 
-fn sanitize_loaded_row_for_meta(row: &mut VersionedRow, meta: &TableMeta) -> bool {
-    let columns = meta
-        .columns
-        .iter()
-        .map(|column| (column.name.as_str(), column))
-        .collect::<HashMap<_, _>>();
-    let mut durable_repair_needed = false;
-    row.values.retain(|column, value| {
-        let Some(definition) = columns.get(column.as_str()) else {
-            durable_repair_needed = true;
-            return false;
-        };
-        let ColumnType::Vector(dimension) = definition.column_type else {
-            return true;
-        };
-        match value {
-            Value::Vector(vector) if vector.len() == dimension => {
-                // F32 is an ordinary row value. Quantized columns keep their
-                // body in the vector store and retain only a relational
-                // placeholder in the writable image.
-                if !matches!(definition.quantization, VectorQuantization::F32) {
-                    *value = Value::Null;
-                }
-                true
-            }
-            Value::Null if definition.nullable => true,
-            _ => {
-                durable_repair_needed = true;
-                false
-            }
-        }
-    });
-    durable_repair_needed
-}
-
 pub(crate) fn vector_index_layout_from_column(column: &ColumnDef) -> Option<VectorIndexLayout> {
     let ColumnType::Vector(dimension) = &column.column_type else {
         return None;
@@ -69133,6 +69024,9 @@ fn prune_expired_rows(
     sync_watermark: Lsn,
     now: Wallclock,
     publication: &mut contextdb_tx::manager::MaintenancePublication<'_, DynStore>,
+    mut workspace: crate::memory_accounting::OwnedMemoryReservation,
+    prepaid_carry_bytes: usize,
+    prepaid_durable_carry_bytes: usize,
 ) -> Result<PruningReport> {
     let relational_store = &ctx.relational;
     let graph_store = &ctx.graph;
@@ -69144,8 +69038,28 @@ fn prune_expired_rows(
     let change_log_lsn_refcounts = &ctx.change_log_lsn_refcounts;
     let tx_mgr = ctx.tx_mgr.as_ref();
     let metas = relational_store.table_meta.read();
-    let mut workspace =
-        crate::memory_accounting::OwnedMemoryReservation::new(ctx.accountant.clone());
+
+    let mut carried_edge_nodes = {
+        let carried = ctx.retention_deferred_edge_nodes.lock();
+        let bytes = carried.nodes.len().saturating_mul(128);
+        if prepaid_carry_bytes > bytes {
+            workspace.try_shrink(prepaid_carry_bytes - bytes)?;
+        }
+        workspace.try_grow_for(
+            bytes.saturating_sub(prepaid_carry_bytes),
+            "retention",
+            "prepare_prune",
+            "Raise MEMORY_LIMIT to admit reader-deferred retention identities.",
+        )?;
+        carried.nodes.clone()
+    };
+    if let Some(persistence) = persistence {
+        carried_edge_nodes.extend(persistence.load_retention_deferred_edge_nodes_prepaid(
+            &mut workspace,
+            prepaid_durable_carry_bytes,
+        )?);
+    }
+
     let mut pruned_versions_by_table: HashMap<String, Vec<(RowId, TxId)>> = HashMap::new();
     let mut fully_pruned_row_ids = HashSet::new();
     let mut pruned_node_ids = HashSet::new();
@@ -69315,20 +69229,6 @@ fn prune_expired_rows(
     // and had to leave adjacency behind because a registered reader could
     // still see it. A pass that prunes no row at all still has to revisit
     // that carry-over -- the reader it was waiting on may be gone.
-    let mut carried_edge_nodes = {
-        let carried = ctx.retention_deferred_edge_nodes.lock();
-        workspace.try_grow_for(
-            carried.nodes.len().saturating_mul(128),
-            "retention",
-            "prepare_prune",
-            "Raise MEMORY_LIMIT to admit reader-deferred retention identities.",
-        )?;
-        carried.nodes.clone()
-    };
-    if let Some(persistence) = persistence {
-        carried_edge_nodes
-            .extend(persistence.load_retention_deferred_edge_nodes_admitted(&mut workspace)?);
-    }
     if pruned_version_count == 0 && carried_edge_nodes.is_empty() {
         return Ok(PruningReport {
             pruned_rows: 0,
@@ -70745,6 +70645,25 @@ fn export_vector_at_snapshot(entry: &VectorEntry, watermark: TxId) -> Option<Vec
         entry.deleted_tx = None;
     }
     Some(entry)
+}
+
+// Source windows are preparation work owned by this retention request. Keep
+// their actual requested/headroom figures while preserving the public refusal
+// identity; all source receipts are dropped by the failed preparation itself.
+fn retention_source_admission_error(mut error: Error, preparation: RetentionPreparation) -> Error {
+    if let Error::MemoryBudgetExceeded {
+        subsystem,
+        operation,
+        hint,
+        ..
+    } = &mut error
+        && subsystem == "writer_source"
+    {
+        *subsystem = "retention".into();
+        *operation = preparation.operation().into();
+        *hint = "Raise MEMORY_LIMIT to admit the retention selection workspace.".into();
+    }
+    error
 }
 
 fn log_pruning_error(err: &Error) {

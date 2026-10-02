@@ -4,6 +4,10 @@ impl RedbPersistence {
     /// Repair damaged transaction ordering in the current storage format.
     /// Every keyed MVCC owner and the index switch in one transaction; a
     /// crash cannot expose renumbered rows with the previous snapshot index.
+    #[allow(
+        dead_code,
+        reason = "Full repair is never part of bounded writable startup"
+    )]
     pub(crate) fn repair_current_transaction_order(
         &self,
         commit_index: &BTreeMap<Lsn, TxId>,
@@ -211,7 +215,7 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?;
                 }
             }
-            Self::rebuild_open_vector_directory_in_write(&write)?;
+            self.rebuild_open_vector_directory_in_write(&write)?;
             Self::rebuild_read_open_config_in_write(&write)?;
             Self::rebuild_read_custody_config_in_write(&write)?;
             Self::write_vector_body_root_fingerprint(&write)?;

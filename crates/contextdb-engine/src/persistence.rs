@@ -11,6 +11,7 @@ mod reader_presence;
 #[cfg(feature = "test-seams")]
 mod resident_history_test_seams;
 mod transaction_repair;
+mod vector_membership_pages;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
@@ -20178,7 +20179,7 @@ impl RedbPersistence {
                 )?;
             }
         }
-        Self::rebuild_open_vector_directory_in_write(write_txn)
+        Self::ensure_open_vector_directory_in_write(write_txn)
     }
 
     fn write_vector_partition_mutations_in_write(
@@ -29480,39 +29481,75 @@ impl RedbPersistence {
         Ok(change_log_keys_removed)
     }
 
+    // Read the borrowed collection prefix before allocating a row-source
+    // adapter. A carry-only retry therefore admits its full destination at the
+    // caller's original headroom. Recheck the same price under the reclamation
+    // commit guard before decoding; a concurrent pass may replace the record.
+    pub(crate) fn retention_deferred_edge_workspace_bytes(&self) -> Result<usize> {
+        self.with_db(|db| {
+            let txn = db.begin_read().map_err(Self::storage_error)?;
+            let table = match txn.open_table(CONFIG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            let value = table
+                .get(RETENTION_DEFERRED_EDGE_NODES)
+                .map_err(Self::storage_error)?;
+            value.as_ref().map_or(Ok(0), |value| {
+                self.retention_deferred_edge_value_bytes(value.value())
+            })
+        })
+    }
+
+    fn retention_deferred_edge_value_bytes(&self, value: &[u8]) -> Result<usize> {
+        let (count, _) =
+            bincode::serde::decode_from_slice::<usize, _>(value, bincode::config::standard())
+                .map_err(|error| Error::StoreCorrupted {
+                    path: self.path.display().to_string(),
+                    reason: format!("bincode retention count decode error: {error}"),
+                })?;
+        Ok(count.saturating_mul(256).saturating_add(value.len()))
+    }
+
     /// Read only the carry-over identities. Admit their decoded B-tree and
     /// destination hash buckets before decoding, including carry-only retries.
+    #[cfg(test)]
     pub(crate) fn load_retention_deferred_edge_nodes_admitted(
         &self,
         workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<BTreeSet<NodeId>> {
+        self.load_retention_deferred_edge_nodes_prepaid(workspace, 0)
+    }
+
+    pub(crate) fn load_retention_deferred_edge_nodes_prepaid(
+        &self,
+        workspace: &mut crate::memory_accounting::OwnedMemoryReservation,
+        prepaid_bytes: usize,
     ) -> Result<BTreeSet<NodeId>> {
         self.with_db(|db| {
             let txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match txn.open_table(CONFIG_TABLE) {
                 Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeSet::new()),
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    workspace.try_shrink(prepaid_bytes)?;
+                    return Ok(BTreeSet::new());
+                }
                 Err(error) => return Err(Self::storage_error(error)),
             };
             let Some(value) = table
                 .get(RETENTION_DEFERRED_EDGE_NODES)
                 .map_err(Self::storage_error)?
             else {
+                workspace.try_shrink(prepaid_bytes)?;
                 return Ok(BTreeSet::new());
             };
-            // Bincode's collection prefix is the serialized element count,
-            // available from borrowed bytes without allocating any identities.
-            let (count, _) = bincode::serde::decode_from_slice::<usize, _>(
-                value.value(),
-                bincode::config::standard(),
-            )
-            .map_err(|error| Error::StoreCorrupted {
-                path: self.path.display().to_string(),
-                reason: format!("bincode retention count decode error: {error}"),
-            })?;
+            let bytes = self.retention_deferred_edge_value_bytes(value.value())?;
+            if prepaid_bytes > bytes {
+                workspace.try_shrink(prepaid_bytes - bytes)?;
+            }
             workspace.try_grow_for(
-                count
-                    .saturating_mul(256)
-                    .saturating_add(value.value().len()),
+                bytes.saturating_sub(prepaid_bytes),
                 "retention",
                 "prepare_prune",
                 "Raise MEMORY_LIMIT to load reader-deferred retention identities.",
@@ -30640,7 +30677,7 @@ impl RedbPersistence {
                 memberships
                     .remove(key.as_slice())
                     .map_err(Self::storage_error)?;
-                Self::write_open_directory_entry(write_txn, &key, None)?;
+                self.write_open_directory_entry(write_txn, &key, None)?;
                 if let Some(deleted_tx) = record.deleted_tx {
                     // The tombstone key extends this exact membership key.
                     key.extend_from_slice(&deleted_tx.0.to_be_bytes());
@@ -31021,12 +31058,14 @@ impl RedbPersistence {
                     admission(bytes)
                 },
                 |txn| {
-                    Self::write_vector_body_root_fingerprint(txn).map_err(|error| {
-                        *on_fingerprint_failure.lock() = Some(error);
-                        redb::StorageError::Io(std::io::Error::other(
-                            "vector root binding failed during compaction",
-                        ))
-                    })
+                    Self::write_vector_body_root_fingerprint(txn)
+                        .and_then(|()| Self::write_commit_directory_root_in_write(txn))
+                        .map_err(|error| {
+                            *on_fingerprint_failure.lock() = Some(error);
+                            redb::StorageError::Io(std::io::Error::other(
+                                "storage root binding failed during compaction",
+                            ))
+                        })
                 },
             )
         });
@@ -33834,6 +33873,10 @@ impl RedbPersistence {
             table
                 .remove(old_key.as_slice())
                 .map_err(Self::storage_error)?;
+            if kind == VectorPartitionRecordKind::Membership {
+                self.write_open_directory_entry(write_txn, &old_key, None)?;
+                self.write_open_directory_entry(write_txn, &new_key, Some(&bytes))?;
+            }
         }
         Ok(())
     }
@@ -34010,7 +34053,7 @@ impl RedbPersistence {
             |record, to| record.index = to.clone(),
             Self::vector_partition_catalog_key,
         )?;
-        Self::rebuild_open_vector_directory_in_write(write_txn)
+        Self::ensure_open_vector_directory_in_write(write_txn)
     }
 
     fn remove_vector_partition_records_matching_all_in_write(
@@ -34046,7 +34089,7 @@ impl RedbPersistence {
         self.remove_vector_partition_records_matching_in_write::<VectorPartitionGenerationCatalogRecord>(
             write_txn, VECTOR_PARTITION_GENERATION_CATALOG_TABLE, VectorPartitionRecordKind::GenerationCatalog, matches,
         )?;
-        Self::rebuild_open_vector_directory_in_write(write_txn)
+        Self::ensure_open_vector_directory_in_write(write_txn)
     }
 
     fn remove_vector_partition_graph_pages_matching_in_write(
@@ -34171,7 +34214,7 @@ impl RedbPersistence {
                 memberships
                     .remove(key.as_slice())
                     .map_err(Self::storage_error)?;
-                Self::write_open_directory_entry(write_txn, &key, None)?;
+                self.write_open_directory_entry(write_txn, &key, None)?;
             }
         }
 
@@ -34327,6 +34370,9 @@ impl RedbPersistence {
         }
         for key in keys {
             table.remove(key.as_slice()).map_err(Self::storage_error)?;
+            if kind == VectorPartitionRecordKind::Membership {
+                self.write_open_directory_entry(write_txn, &key, None)?;
+            }
         }
         Ok(())
     }
@@ -34470,7 +34516,7 @@ impl RedbPersistence {
                 VectorPartitionRecordKind::Membership,
                 record,
             )?;
-            Self::write_open_directory_entry(write_txn, &key, Some(&encoded))?;
+            self.write_open_directory_entry(write_txn, &key, Some(&encoded))?;
             return Ok(());
         }
         self.insert_vector_partition_record(
@@ -34481,14 +34527,49 @@ impl RedbPersistence {
         )?;
         let encoded =
             Self::encode_vector_partition_record(VectorPartitionRecordKind::Membership, record)?;
-        Self::write_open_directory_entry(write_txn, &key, Some(&encoded))
+        self.write_open_directory_entry(write_txn, &key, Some(&encoded))
+    }
+
+    fn ensure_open_vector_directory_in_write(write: &redb::WriteTransaction) -> Result<()> {
+        let mut directory = write
+            .open_table(VECTOR_OPEN_DIRECTORY_TABLE)
+            .map_err(Self::storage_error)?;
+        if directory
+            .get(VECTOR_OPEN_DIRECTORY_ROOT_KEY)
+            .map_err(Self::storage_error)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if !directory.is_empty().map_err(Self::storage_error)? {
+            return Err(Error::StoreCorrupted {
+                path: "vector_open_directory".into(),
+                reason: "non-empty membership directory has no root".into(),
+            });
+        }
+        directory
+            .insert(VECTOR_OPEN_DIRECTORY_ROOT_KEY, &[0_u8; 40][..])
+            .map_err(Self::storage_error)?;
+        drop(directory);
+        content_identity::SetCommitment::clear_in_write(
+            write,
+            content_identity::CompactIndexSet::VectorDirectory,
+        )?;
+        Self::write_open_index_commitment(write, VECTOR_OPEN_DIRECTORY_COMMITMENT_KEY, &[0_u8; 40])
     }
 
     fn write_open_directory_entry(
+        &self,
         write_txn: &redb::WriteTransaction,
         key: &[u8],
         membership: Option<&[u8]>,
     ) -> Result<()> {
+        vector_membership_pages::publish_membership(
+            write_txn,
+            key,
+            membership,
+            self.proof_accountant(),
+        )?;
         let mut directory = write_txn
             .open_table(VECTOR_OPEN_DIRECTORY_TABLE)
             .map_err(Self::storage_error)?;
@@ -34592,7 +34673,8 @@ impl RedbPersistence {
                 .insert(VECTOR_BODY_ROOT_FINGERPRINT_KEY, fingerprint.as_slice())
                 .map_err(Self::storage_error)?;
         }
-        Ok(())
+        drop(metadata);
+        vector_membership_pages::write_fingerprints(write_txn)
     }
 
     pub(super) fn write_read_open_config_entry(
@@ -34770,8 +34852,10 @@ impl RedbPersistence {
     /// Rebuild after a bulk schema or repair rewrite. Ordinary row commits
     /// update only their changed membership keys above.
     pub(super) fn rebuild_open_vector_directory_in_write(
+        &self,
         write_txn: &redb::WriteTransaction,
     ) -> Result<()> {
+        vector_membership_pages::reset_in_write(write_txn)?;
         match write_txn.delete_table(VECTOR_OPEN_DIRECTORY_TABLE) {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(Self::storage_error(error)),
@@ -34792,14 +34876,17 @@ impl RedbPersistence {
         )?;
         let memberships = match write_txn.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
             Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return vector_membership_pages::write_fingerprints(write_txn);
+            }
             Err(error) => return Err(Self::storage_error(error)),
         };
         for entry in memberships.iter().map_err(Self::storage_error)? {
             let (key, value) = entry.map_err(Self::storage_error)?;
-            Self::write_open_directory_entry(write_txn, key.value(), Some(value.value()))?;
+            self.write_open_directory_entry(write_txn, key.value(), Some(value.value()))?;
         }
-        Ok(())
+        drop(memberships);
+        vector_membership_pages::write_fingerprints(write_txn)
     }
 
     fn tombstone_vector_partition_membership(
@@ -34854,7 +34941,7 @@ impl RedbPersistence {
         memberships
             .insert(membership_key.as_slice(), encoded.as_slice())
             .map_err(Self::storage_error)?;
-        Self::write_open_directory_entry(write_txn, &membership_key, Some(&encoded))?;
+        self.write_open_directory_entry(write_txn, &membership_key, Some(&encoded))?;
 
         let tombstone = VectorPartitionTombstoneRecord {
             membership,

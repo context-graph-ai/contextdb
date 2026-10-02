@@ -39,6 +39,10 @@ pub struct WriterHistoryWork {
 
 pub(crate) enum HistoryFamily {
     Row,
+    #[allow(
+        dead_code,
+        reason = "Retained zero-work oracle for writable startup index rebuilding"
+    )]
     IndexRebuildInput,
     Graph,
     ChangeLog,
