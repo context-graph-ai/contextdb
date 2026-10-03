@@ -345,3 +345,12 @@ pub(crate) fn posting_operation(
     });
     physical_operation_selected(PhysicalFamily::Posting, table, matches)
 }
+
+/// Match an exact durable tuple at the source cursor before its physical read.
+pub(crate) fn source_posting_operation(
+    table: &str,
+    matches: impl FnOnce(&contextdb_core::IndexKey) -> bool,
+) -> redb::BackendReadObservation {
+    let selected = TARGET_KEY.with(|slot| slot.borrow().as_ref().is_none_or(matches));
+    physical_operation_selected(PhysicalFamily::Posting, table, selected)
+}

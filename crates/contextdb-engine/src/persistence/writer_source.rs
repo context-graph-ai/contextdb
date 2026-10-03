@@ -946,6 +946,13 @@ impl WriterReadCursor {
         #[cfg(feature = "test-seams")]
         self.root
             .note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
+        #[cfg(feature = "test-seams")]
+        let _target_reads = self.logical_table.as_deref().map(|table| {
+            crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Row,
+                table,
+            )
+        });
         self.next_before(before, |key, value| {
             let row = RedbPersistence::decode_versioned_row(value, None)?;
             if RedbPersistence::rel_row_key(&row) != key {
@@ -1097,6 +1104,16 @@ impl WriterReadCursor {
         #[cfg(feature = "test-seams")]
         self.root
             .note_read_source(crate::writer_query_test_seams::PhysicalFamily::Posting);
+        #[cfg(feature = "test-seams")]
+        let _target_reads = self.logical_table.as_deref().map(|table| {
+            crate::writer_query_test_seams::source_posting_operation(table, |target| {
+                let expected = DurableRelationalIndexKey::new(target.clone(), RowId(0), TxId(0));
+                expected.is_ok_and(|expected| {
+                    matches!(&self.lower,
+                    Bound::Included(lower) if *lower == expected.0)
+                })
+            })
+        });
         self.next_before(before, |key, value| {
             let encoded = decode_window_exact::<EncodedRelationalIndexPosition>(key)?;
             crate::read_image_memory::reserve(key.len().saturating_mul(2))?;
