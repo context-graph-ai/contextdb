@@ -11,7 +11,8 @@ compaction (`compact_step` with `CompactionCursor`/`CompactionProgress`, relocat
 batch that yields to a waiting writer), live-reader observations, a retained statistics snapshot
 (`storage_statistics_snapshot`), thread-scoped read admission and backend-read observation
 (`read_admission.rs`: `with_read_memory_admission`, `with_read_page_charge`, `ReadPageCharge`,
-`observe_backend_reads`), a graceful
+`observe_backend_reads`, and one-pass `scan_reads`/`with_scan_reads` under which a scan grows the
+read cache by at most a 16 KiB allowance and otherwise replaces evictable bytes), a graceful
 read-only handoff that publishes a clean committed header while the writer still owns the file
 (`Database::prepare_read_only_handoff`), and per-table root fingerprints read without faulting
 payload pages (`table_root_fingerprint`) with a same-transaction callback after a relocation batch

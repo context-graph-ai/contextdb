@@ -63,6 +63,50 @@ fn saved_bitmap_window(
     let bitmap = data
         .get(order_start..order_end)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid allocator order offsets"))?;
+    saved_bitmap_layer_window(bitmap, height, page, out)
+}
+
+fn saved_tracker_window(
+    data: &[u8],
+    order: u8,
+    height: u8,
+    page: u32,
+    out: &mut [u8; 4096],
+) -> io::Result<()> {
+    let orders = saved_u32(data, 0)?;
+    if orders != usize::from(MAX_MAX_PAGE_ORDER) + 1 || usize::from(order) >= orders {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid saved region tracker orders",
+        ));
+    }
+    let mut start = 4 + orders * 4;
+    for preceding in 0..usize::from(order) {
+        start = start
+            .checked_add(saved_u32(data, 4 + preceding * 4)?)
+            .ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "region tracker offset overflow")
+            })?;
+    }
+    let end = start
+        .checked_add(saved_u32(data, 4 + usize::from(order) * 4)?)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "region tracker offset overflow"))?;
+    let bitmap = data.get(start..end).ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid region tracker bitmap offsets",
+        )
+    })?;
+    out.fill(0xFF);
+    saved_bitmap_layer_window(bitmap, height, page, out)
+}
+
+fn saved_bitmap_layer_window(
+    bitmap: &[u8],
+    height: u8,
+    page: u32,
+    out: &mut [u8; 4096],
+) -> io::Result<()> {
     let count = saved_u32(bitmap, 0)?;
     if usize::from(height) >= count {
         return Ok(());
@@ -698,33 +742,28 @@ impl TransactionalMemory {
                         mem,
                     )
                     .map_err(io::Error::other)?;
-                    let Some(saved) = source_tree
-                        .get(&AllocatorStateKey::Region(region))
-                        .map_err(io::Error::other)?
-                    else {
+                    let key =
+                        region.map_or(AllocatorStateKey::RegionTracker, AllocatorStateKey::Region);
+                    let Some(saved) = source_tree.get(&key).map_err(io::Error::other)? else {
+                        if region.is_none() {
+                            return Err(io::Error::new(
+                                ErrorKind::InvalidData,
+                                "saved region tracker is missing",
+                            ));
+                        }
                         return Ok(false);
                     };
-                    saved_bitmap_window(saved.value(), order, height, page, out)?;
+                    match region {
+                        Some(_) => saved_bitmap_window(saved.value(), order, height, page, out)?,
+                        None => saved_tracker_window(saved.value(), order, height, page, out)?,
+                    }
                     Ok(true)
                 });
-            // The commit saved the region tracker beside the regional
-            // bitmaps. Reinstall it, so the first allocation after open goes
-            // to a region with room instead of loading and probing every
-            // region the paged default would report as possibly free.
-            let saved_tracker = tree
-                .get(&AllocatorStateKey::RegionTracker)?
-                .map(|saved| RegionTracker::from_bytes(saved.value()));
+            // Saved tracker words remain in the durable source and share
+            // AllocatorPager's fixed windows with regional bitmap words.
+            // Geometry masks slots past the real regions without loading them.
             let mut state = self.state.lock().unwrap();
             state.allocators.set_saved_source(source)?;
-            if let Some(mut tracker) = saved_tracker {
-                // The saved tracker is padded past the file's regions; those
-                // slots name no region and must never be chosen.
-                let regions = state.header.layout().num_regions();
-                for region in regions..tracker.region_slots() {
-                    tracker.mark_full(0, region);
-                }
-                state.allocators.region_tracker = tracker;
-            }
             state.header.recovery_required = false;
             self.needs_recovery.store(false, Ordering::Release);
             return Ok(());

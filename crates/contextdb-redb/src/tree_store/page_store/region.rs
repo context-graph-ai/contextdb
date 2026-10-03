@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(super) type SavedBitmapWindow =
-    dyn Fn(u32, u8, u8, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
+    dyn Fn(Option<u32>, u8, u8, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
 type PagedBaseLoader = dyn Fn(u64, u32, &mut [u8; WINDOW_BYTES]) -> io::Result<bool> + Send + Sync;
 
 // Tracks the page orders that MAY BE free in each region. This data structure is optimistic, so
@@ -126,7 +126,9 @@ impl RegionTracker {
     pub(crate) fn mark_free(&mut self, order: u8, region: u32) {
         let order: usize = order.into();
         for i in 0..=order {
-            self.order_trackers[i].clear(region);
+            if self.order_trackers[i].get(region) {
+                self.order_trackers[i].clear(region);
+            }
         }
     }
 
@@ -134,15 +136,15 @@ impl RegionTracker {
         self.order_trackers.len()
     }
 
-    pub(crate) fn region_slots(&self) -> u32 {
-        self.len()
-    }
-
     pub(crate) fn mark_full(&mut self, order: u8, region: u32) {
         let order: usize = order.into();
         assert!(order < self.order_trackers.len());
         for i in order..self.order_trackers.len() {
-            self.order_trackers[i].set(region);
+            // Already-full orders need no parent updates or dirty windows.
+            // Keep allocation's exact tracker update within the shared pager.
+            if !self.order_trackers[i].get(region) {
+                self.order_trackers[i].set(region);
+            }
         }
     }
 
@@ -185,7 +187,7 @@ impl Allocators {
                 + size_of::<Allocators>()
                 + 1024;
             debug_assert!(descriptors <= 16 * 1024);
-            return AllocatorPager::resident_bytes() + 16 * 1024;
+            return AllocatorPager::resident_bytes() + descriptors.max(16 * 1024);
         }
         let resident = self.regions.capacity() * size_of::<BuddyAllocator>()
             + self
@@ -259,6 +261,11 @@ impl Allocators {
                 &paged.saved_region_limit,
                 Some(source),
             )?;
+            self.region_tracker = RegionTracker::new_paged(
+                paged.layout.lock().unwrap().num_regions(),
+                MAX_MAX_PAGE_ORDER + 1,
+                &paged.pager,
+            );
         }
         Ok(())
     }
@@ -307,17 +314,20 @@ impl Allocators {
         let saved_region_limit = Arc::clone(saved_region_limit);
         Box::new(move |array, page, out| {
             let entity = array / (21 * 4);
+            let order = ((array % (21 * 4)) / 4) as u8;
+            let height = (array % 4) as u8;
             if entity == 0 {
-                return Ok(false);
+                return match &source {
+                    Some(source) => source(None, order, height, page, out),
+                    None => Ok(false),
+                };
             }
             let region: u32 = (entity - 1).try_into().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "allocator region overflow")
             })?;
-            let order = ((array % (21 * 4)) / 4) as u8;
-            let height = (array % 4) as u8;
             if region < saved_region_limit.load(Ordering::Acquire)
                 && let Some(source) = &source
-                && source(region, order, height, page, out)?
+                && source(Some(region), order, height, page, out)?
             {
                 return Ok(true);
             }
@@ -377,6 +387,11 @@ impl Allocators {
         if saved == 0 {
             return Ok(());
         }
+        // Tracker words have the same saved source as regional words. Spill
+        // them through the fixed windows before that source can be reclaimed.
+        for bitmap in &mut self.region_tracker.order_trackers {
+            bitmap.materialize_paged_words();
+        }
         for region in 0..saved.min(u32::try_from(self.region_count()).unwrap()) {
             self.get_region_mut(region).materialize_paged_words();
         }
@@ -413,7 +428,10 @@ impl Allocators {
         if saved as usize > WINDOWS {
             return Ok(false);
         }
-        let mut encoded_bytes = 0usize;
+        let mut encoded_bytes = self.region_tracker.encoded_len();
+        if encoded_bytes > WINDOWS * WINDOW_BYTES {
+            return Ok(false);
+        }
         for region in 0..saved {
             encoded_bytes = encoded_bytes
                 .checked_add(self.get_region(region).encoded_len())

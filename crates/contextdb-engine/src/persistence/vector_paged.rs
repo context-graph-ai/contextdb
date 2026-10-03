@@ -1972,6 +1972,69 @@ impl RedbPersistence {
         })
     }
 
+    /// Authoritative erasure of one partition route's paged storage, inside the
+    /// purge transaction: every paged base generation's pages, any unpublished
+    /// build's scratch pages and record, and its whole-build floor record.
+    pub(crate) fn erase_partition_paged_storage_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        prefix: &[u8],
+    ) -> Result<()> {
+        let mut storage_ids = Vec::new();
+        {
+            let bases = match write.open_table(VECTOR_PARTITION_BASE_GENERATION_TABLE) {
+                Ok(table) => Some(table),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            if let Some(bases) = bases {
+                for entry in bases.range(prefix..).map_err(Self::storage_error)? {
+                    let (key, value) = entry.map_err(Self::storage_error)?;
+                    if !key.value().starts_with(prefix) {
+                        break;
+                    }
+                    let record: VectorPartitionBaseGenerationRecord = self
+                        .decode_vector_partition_record(
+                            VectorPartitionRecordKind::BaseGeneration,
+                            value.value(),
+                        )?;
+                    if record.graph_format_version == VECTOR_GRAPH_PAGED_FORMAT_VERSION {
+                        storage_ids
+                            .push(PagedGenerationMeta::decode(&record.graph.bytes)?.storage_id);
+                    }
+                }
+            }
+        }
+        {
+            let mut builds = write.open_table(BUILDS).map_err(Self::storage_error)?;
+            let removed = builds.remove(prefix).map_err(Self::storage_error)?;
+            if let Some(value) = removed {
+                let record: PagedBuildRecord =
+                    Self::decode_exact(open_value(prefix, value.value())?)
+                        .map_err(|_| corruption("paged build record cannot be decoded"))?;
+                storage_ids.push(record.storage_id);
+            }
+        }
+        write
+            .open_table(FLOORS)
+            .map_err(Self::storage_error)?
+            .remove(prefix)
+            .map_err(Self::storage_error)?;
+        let mut pages = write.open_table(PAGES).map_err(Self::storage_error)?;
+        let mut cleanup = write.open_table(CLEANUP).map_err(Self::storage_error)?;
+        for storage_id in storage_ids {
+            let storage = storage_prefix(storage_id);
+            loop {
+                let step = reclaim_storage_keys(&mut pages, &storage, None, 4096)?;
+                if step.complete {
+                    break;
+                }
+            }
+            cleanup.remove(storage_id).map_err(Self::storage_error)?;
+        }
+        Ok(())
+    }
+
     /// Durably record a whole build's frontier before it builds.
     pub(crate) fn record_construction_floor(
         &self,

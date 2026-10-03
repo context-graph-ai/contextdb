@@ -516,6 +516,113 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+fn bounded_exact_merge_durable<E>(
+    index: &VectorIndexRef,
+    state: &crate::store::IndexState,
+    memberships: &dyn crate::store::RawVectorMembershipSource,
+    query: &[f32],
+    k: usize,
+    snapshot: SnapshotId,
+    scores: &mut Vec<(RowId, f32)>,
+    retained_bytes: &mut usize,
+    bodies: &mut crate::store::RawVectorBodyReads,
+    before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
+    before_candidate: &mut impl FnMut() -> std::result::Result<(), E>,
+    before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
+    before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    release_retained: &mut impl FnMut(usize),
+) -> std::result::Result<usize, E>
+where
+    E: From<Error>,
+{
+    let mut session = crate::store::OnePassSession::default();
+    let _one_pass = state.one_pass_reads(&mut session);
+    before_source_entry()?;
+    let mut reserved = 0usize;
+    let mut interrupted = None;
+    let opened = memberships.open(&mut |request| {
+        if interrupted.is_some() {
+            return false;
+        }
+        let result = match request {
+            crate::store::DormantVectorLoadRequest::Reserve(bytes) => {
+                before_retain(bytes).map(|()| reserved += bytes)
+            }
+            _ => before_source_entry(),
+        };
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                interrupted = Some(error);
+                false
+            }
+        }
+    });
+    let result = (|| {
+        if let Some(error) = interrupted.take() {
+            return Err(error);
+        }
+        let mut cursor = opened.map_err(E::from)?;
+        let mut compared = 0usize;
+        loop {
+            before_source_entry()?;
+            let mut interrupted = None;
+            let next = cursor.next(&mut |_| {
+                if interrupted.is_some() {
+                    return false;
+                }
+                match before_source_entry() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        interrupted = Some(error);
+                        false
+                    }
+                }
+            });
+            if let Some(error) = interrupted {
+                return Err(error);
+            }
+            let Some(entry) = next.map_err(E::from)? else {
+                break;
+            };
+            if entry.created_tx.0 > snapshot.0
+                || entry.deleted_tx.is_some_and(|tx| tx.0 <= snapshot.0)
+            {
+                continue;
+            }
+            before_candidate()?;
+            let Some(score) = state.bounded_score_stored_body(
+                index,
+                entry.row_id,
+                snapshot,
+                query,
+                bodies,
+                before_source_entry,
+                before_distance,
+                before_retain,
+                release_retained,
+            )?
+            else {
+                continue;
+            };
+            compared += 1;
+            merge_bounded_vector_score(
+                scores,
+                retained_bytes,
+                (entry.row_id, score),
+                k,
+                before_source_entry,
+                before_retain,
+                release_retained,
+            )?;
+        }
+        Ok(compared)
+    })();
+    release_retained(reserved);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
 fn bounded_exact_merge_state<E>(
     index: &VectorIndexRef,
     state: &crate::store::IndexState,
@@ -575,6 +682,31 @@ where
             )?;
         }
         return Ok(compared);
+    }
+    if let Some(memberships) = state.durable_membership_source()
+        && !state.try_cache_durable_bodies().map_err(E::from)?
+    {
+        // Bodies that do not fit stream: the durable directory through one
+        // admitted window, then each visible row's body point-read once.
+        let previous = bodies.set_one_pass(true);
+        let compared = bounded_exact_merge_durable(
+            index,
+            state,
+            &*memberships,
+            query,
+            k,
+            snapshot,
+            scores,
+            retained_bytes,
+            bodies,
+            before_source_entry,
+            before_candidate,
+            before_distance,
+            before_retain,
+            release_retained,
+        );
+        bodies.set_one_pass(previous);
+        return compared;
     }
     before_source_entry()?;
     // A partition whose vectors fit is loaded once and compared from memory,
@@ -779,6 +911,8 @@ pub enum BoundedVectorStep {
 #[derive(Debug)]
 pub struct BoundedBruteForceCursor {
     _index: VectorIndexRef,
+    /// The exhaustive scan's one-pass read state across resumed steps.
+    one_pass: crate::store::OnePassSession,
     query: Vec<f32>,
     k: usize,
     candidate_filter: bool,
@@ -2455,6 +2589,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return Err(error);
         }
         Ok(BoundedBruteForceCursor {
+            one_pass: crate::store::OnePassSession::default(),
             _index: index,
             query: owned_query,
             k,
@@ -2469,7 +2604,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             output_position: 0,
             prepared: false,
             retained_bytes,
-            body_reads: crate::store::RawVectorBodyReads::default(),
+            body_reads: crate::store::RawVectorBodyReads::one_pass(),
             stream_when_refused: false,
             streaming_source: false,
             membership_cursor: None,
@@ -2529,6 +2664,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             })?;
             return Ok(BoundedVectorStep::Row(row_id, score));
         }
+        // Exhaustive comparison reads each page once.
+        let state = cursor
+            .snapshot_sources
+            .get(cursor.source_position)
+            .map(|source| source.state.clone());
+        let _one_pass = state.and_then(|state| state.one_pass_reads(&mut cursor.one_pass));
 
         if let Some(candidate) = cursor.pending_score {
             // Score the complete authorized set while retaining only the
@@ -2617,7 +2758,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 )));
             };
             before_source_entry()?;
-            if let Some(memberships) = source.state.durable_membership_source() {
+            let durable_streams = source.state.durable_membership_source().is_some()
+                && !source.state.try_cache_durable_bodies().map_err(E::from)?;
+            if let Some(memberships) = source
+                .state
+                .durable_membership_source()
+                .filter(|_| durable_streams)
+            {
                 let mut interrupted = None;
                 let mut reserved = 0usize;
                 let opened = memberships.open(&mut |request| {
@@ -4499,7 +4646,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return Ok(scored);
         }
         for source in sources {
-            if source.state.durable_membership_source().is_some() {
+            if source.state.durable_membership_source().is_some()
+                && !source.state.try_cache_durable_bodies()?
+            {
                 self.stream_source_bodies(index, source, query, snapshot, &mut consider)?;
                 continue;
             }
@@ -4557,7 +4706,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             )
         };
         let mut release_retained = |bytes: usize| accountant.release(bytes);
-        let mut bodies = crate::store::RawVectorBodyReads::default();
+        let mut bodies = crate::store::RawVectorBodyReads::one_pass();
+        let mut session = crate::store::OnePassSession::default();
+        let _one_pass = source.state.one_pass_reads(&mut session);
         if source.state.durable_membership_source().is_some() {
             return source.state.bounded_visit_visible_ids_charged(
                 snapshot,

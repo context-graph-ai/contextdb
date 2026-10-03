@@ -252,7 +252,12 @@ impl AllocatorPager {
             return Ok(index);
         }
 
-        let victim = inner.next_victim;
+        // Source-only words can be reloaded without spilling. Keep dirty
+        // words in the same fixed owner while any clean window can be reused.
+        let victim = (0..WINDOWS)
+            .map(|offset| (inner.next_victim + offset) % WINDOWS)
+            .find(|index| !inner.windows[*index].dirty)
+            .unwrap_or(inner.next_victim);
         inner.next_victim = (victim + 1) % WINDOWS;
         let prior = &mut inner.windows[victim];
         if prior.dirty {

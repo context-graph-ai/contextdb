@@ -586,6 +586,49 @@ impl PagedCachedFile {
         }
 
         let (buffer, charge) = self.read_direct_into_arc(offset, len)?;
+        if crate::read_admission::scan_reads_active()
+            && !crate::read_admission::take_scan_growth(len)
+        {
+            // Past its growth allowance a scan's miss replaces evictable
+            // cached bytes and never grows the cache. When nothing evictable
+            // makes room, the page lives only while its reader holds it, with
+            // any admission charge.
+            let before = self.read_cache_bytes.load(Ordering::Acquire);
+            {
+                let lock = self.write_buffer.lock().unwrap();
+                self.evict_from_read_cache(len, &lock);
+            }
+            let after = self.read_cache_bytes.load(Ordering::Acquire);
+            if before.saturating_sub(after) < len {
+                return Ok(match charge {
+                    Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
+                        bytes: buffer,
+                        _charge: charge,
+                    })),
+                    None => PageMemory::Plain(buffer),
+                });
+            }
+            // Installed at lowest priority: the scan's next miss replaces it
+            // unless it is read again, leaving the warm working set in place.
+            let previous = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
+            let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
+            if previous + len + write_bytes <= self.max_cache_size.load(Ordering::Acquire) {
+                let page = CachedPage::admitted(buffer, &self.read_cache_bytes);
+                let mut write_lock = self.read_cache[cache_slot].write().unwrap();
+                drop(write_lock.insert_lowest_priority(offset, page.clone()));
+                drop(write_lock);
+                drop(charge);
+                return Ok(PageMemory::Cached(page));
+            }
+            self.read_cache_bytes.fetch_sub(len, Ordering::AcqRel);
+            return Ok(match charge {
+                Some(charge) => PageMemory::Charged(Arc::new(ChargedPage {
+                    bytes: buffer,
+                    _charge: charge,
+                })),
+                None => PageMemory::Plain(buffer),
+            });
+        }
 
         // Rule 3: make room for the page if the total would exceed the
         // budget. Eviction frees only pages no reader still holds; a held page
@@ -846,6 +889,50 @@ mod test {
         ));
         backend.set_len(1024).unwrap();
         assert_eq!(backend.len().unwrap(), 1024);
+    }
+
+    #[test]
+    fn scan_reads_grow_the_cache_only_within_their_allowance() {
+        let backend = InMemoryBackend::new();
+        backend.set_len(1024).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();
+        // Past its growth allowance, an empty cache has nothing to replace:
+        // the miss stays uncached.
+        let page = crate::read_admission::with_scan_reads(|| {
+            assert!(crate::read_admission::take_scan_growth(
+                crate::read_admission::SCAN_GROWTH_ALLOWANCE
+            ));
+            cached_file.read(0, 128, PageHint::None).unwrap()
+        });
+        assert_eq!(page.len(), 128);
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
+        drop(page);
+        // Within the allowance a miss uses free room.
+        let installed = crate::read_admission::with_scan_reads(|| {
+            cached_file.read(384, 128, PageHint::None).unwrap()
+        });
+        assert!(matches!(installed, super::PageMemory::Cached(_)));
+        drop(installed);
+        cached_file.invalidate_cache(384, 128);
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
+        cached_file.read(128, 128, PageHint::None).unwrap();
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 128);
+        // A hit is served from the cache.
+        let hit = crate::read_admission::with_scan_reads(|| {
+            cached_file.read(128, 128, PageHint::None).unwrap()
+        });
+        assert!(matches!(hit, super::PageMemory::Cached(_)));
+        drop(hit);
+        // Past the allowance a miss replaces the evictable page; the cache
+        // does not grow.
+        let replaced = crate::read_admission::with_scan_reads(|| {
+            assert!(crate::read_admission::take_scan_growth(
+                crate::read_admission::SCAN_GROWTH_ALLOWANCE
+            ));
+            cached_file.read(256, 128, PageHint::None).unwrap()
+        });
+        assert!(matches!(replaced, super::PageMemory::Cached(_)));
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 128);
     }
 
     #[test]

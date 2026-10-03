@@ -134,6 +134,7 @@ pub(crate) struct HnswUnionSearchResult {
     pub(crate) allowed_admissions: usize,
     /// The most evaluations the walk could spend beyond opening its layers,
     /// as its first pass started.
+    #[cfg(feature = "test-seams")]
     pub(crate) expansion_cap: usize,
     pub(crate) layers_admitted: usize,
     /// Every reachable admitted point was evaluated: the frontier ran empty
@@ -978,6 +979,7 @@ where
         admission_evaluations: 0,
         expansion_evaluations: 0,
         allowed_admissions: 0,
+        #[cfg(feature = "test-seams")]
         expansion_cap: 0,
         layers_admitted: 0,
         frontier_exhausted: true,
@@ -1242,6 +1244,7 @@ where
     let searched = (|| -> std::result::Result<HnswUnionSearchResult, E> {
         let mut admission_evaluations = 0usize;
         let mut expansion_evaluations = 0usize;
+        #[cfg(feature = "test-seams")]
         let mut expansion_cap = None;
         let mut layers_admitted = 0usize;
         let mut below_floor = None;
@@ -1292,6 +1295,7 @@ where
             walk.evaluation_cap = before_expansion
                 .saturating_add(budget.saturating_sub(expansion_evaluations))
                 .min(limits.max_vector_evaluations);
+            #[cfg(feature = "test-seams")]
             expansion_cap.get_or_insert(walk.evaluation_cap.saturating_sub(before_expansion));
             let expanded = expand(
                 &mut open,
@@ -1336,6 +1340,7 @@ where
             }
             break;
         }
+        #[cfg(feature = "test-seams")]
         let expansion_cap = expansion_cap.unwrap_or(0);
         let mut status = outcome.unwrap_or(HnswAllowedSearchStatus::Complete);
         let mut terminal = match status {
@@ -1704,6 +1709,7 @@ where
             admission_evaluations,
             expansion_evaluations,
             allowed_admissions: walk.admissions,
+            #[cfg(feature = "test-seams")]
             expansion_cap,
             layers_admitted,
             frontier_exhausted,

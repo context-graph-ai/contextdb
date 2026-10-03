@@ -12,6 +12,7 @@ mod reader_presence;
 mod resident_history_test_seams;
 mod transaction_repair;
 mod vector_membership_pages;
+pub(crate) mod vector_membership_source;
 pub(crate) mod vector_paged;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
@@ -34627,6 +34628,9 @@ impl RedbPersistence {
 
         for (index, partition_key) in affected_partitions {
             let prefix = Self::vector_partition_prefix(&index, &partition_key);
+            // Erasure covers native paged generations and unpublished paged
+            // builds too: their pages hold copies of the erased vectors.
+            self.erase_partition_paged_storage_in_write(write_txn, &prefix)?;
             Self::remove_vector_partition_graph_page_prefix_in_write(write_txn, &prefix)?;
             self.remove_vector_partition_prefix_records_in_write::<
                 VectorPartitionBaseGenerationRecord,

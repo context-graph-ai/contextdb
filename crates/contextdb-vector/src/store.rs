@@ -4,7 +4,7 @@ use membership::with_membership_read;
 pub use membership::{
     LazyRawVectorMembershipSource, RawVectorMembershipCursor, RawVectorMembershipFactory,
     RawVectorMembershipSource, RawVectorMembershipSummary, RawVectorReverseMembershipCursor,
-    RawVectorReverseMembershipSource,
+    RawVectorReverseMembershipSource, RawVectorSuffixChange,
 };
 
 use crate::hnsw::ServingPages;
@@ -1285,10 +1285,67 @@ impl Drop for LoadedRawVectorCandidate {
     }
 }
 
+/// Creates the durable membership source and body loader of a partition
+/// that a durable-membership column first writes after open. Creation only
+/// builds handles; it reads nothing and cannot fail.
+/// Creates the durable reverse source and partition factory of a vector
+/// column declared after a durable-membership store opened.
+/// A loader's state for one statement's one-pass scan, kept across the
+/// statement's resumed steps.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct OnePassSession(pub Option<Box<dyn std::any::Any + Send + Sync>>);
+
+impl std::fmt::Debug for OnePassSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("OnePassSession")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+#[doc(hidden)]
+pub trait DurableRawColumnFactory: Send + Sync {
+    fn create(
+        &self,
+        index: &VectorIndexRef,
+        layout: &VectorIndexLayout,
+    ) -> (
+        Arc<dyn RawVectorReverseMembershipSource>,
+        Arc<dyn DurableRawPartitionFactory>,
+    );
+}
+
+#[doc(hidden)]
+pub trait DurableRawPartitionFactory: Send + Sync {
+    fn create(
+        &self,
+        partition: &VectorPartitionRef,
+    ) -> (
+        Arc<dyn RawVectorMembershipSource>,
+        Arc<dyn DormantRawVectorLoader>,
+    );
+}
+
 #[doc(hidden)]
 pub trait DormantRawVectorLoader: Send + Sync {
+    /// Rebind a live writer loader after its durable index keys are renamed.
+    fn for_renamed_index(&self, index: &VectorIndexRef) -> Option<Arc<dyn DormantRawVectorLoader>> {
+        let _ = index;
+        None
+    }
+
     fn supports_bounded_candidate_load(&self) -> bool {
         false
+    }
+
+    /// Load every body of a durable-membership partition in durable key
+    /// order, admitting the complete load from its count before any body is
+    /// read.
+    fn load_all(&self) -> Result<LoadedRawVectorPartition> {
+        Err(Error::Other(
+            "this raw vector loader cannot load a durable partition".into(),
+        ))
     }
 
     /// A committed image has no raw-vector cache a later find reuses. When the
@@ -1320,6 +1377,27 @@ pub trait DormantRawVectorLoader: Send + Sync {
     /// and one authentication batch. `None` means this loader has none.
     fn open_body_scan(&self) -> Result<Option<Box<dyn RawVectorBodyScan>>> {
         Ok(None)
+    }
+
+    /// Enter one-pass reads on this thread for an exhaustive comparison:
+    /// every page it reads is read once and must not fill a shared page
+    /// cache. `session` carries the scan's state across resumed steps of one
+    /// statement; the returned guard ends the mode when dropped.
+    fn one_pass_reads(&self, session: &mut OnePassSession) -> Option<Box<dyn std::any::Any>> {
+        let _ = session;
+        None
+    }
+
+    /// `load_candidate_with_scan` for a one-pass exhaustive scan: a body read
+    /// once must not displace the warm working set of a shared page cache.
+    fn load_candidate_with_scan_once(
+        &self,
+        scan: &mut dyn RawVectorBodyScan,
+        identity: &RawVectorDirectoryEntry,
+        caller_charged: bool,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<LoadedRawVectorCandidate> {
+        self.load_candidate_with_scan(scan, identity, caller_charged, request)
     }
 
     /// `load_candidate`, reading the body through a statement's open scan.
@@ -1355,11 +1433,26 @@ pub trait RawVectorBodyScan: Send {
 #[derive(Default)]
 pub struct RawVectorBodyReads {
     open: Option<(usize, Box<dyn RawVectorBodyScan>)>,
+    /// Exhaustive comparison reads each body once.
+    one_pass: bool,
     #[cfg(any(test, feature = "test-seams"))]
     opened: usize,
 }
 
 impl RawVectorBodyReads {
+    /// Body reads for a one-pass exhaustive comparison.
+    pub(crate) fn one_pass() -> Self {
+        Self {
+            one_pass: true,
+            ..Self::default()
+        }
+    }
+
+    /// Switch between one-pass and reused reads; returns the previous mode.
+    pub(crate) fn set_one_pass(&mut self, one_pass: bool) -> bool {
+        std::mem::replace(&mut self.one_pass, one_pass)
+    }
+
     fn scan_for(
         &mut self,
         loader: &dyn DormantRawVectorLoader,
@@ -1697,6 +1790,10 @@ pub struct IndexState {
     visibility_counts: RwLock<VectorVisibilityCounts>,
     raw_loader: RwLock<Option<Arc<dyn DormantRawVectorLoader>>>,
     durable_memberships: RwLock<Option<Arc<dyn RawVectorMembershipSource>>>,
+    /// Counts of a durable-membership partition at the writer's current
+    /// frontier: the registered summary plus every published commit since.
+    durable_counts: Mutex<RawVectorMembershipSummary>,
+    durable_pending: Mutex<DurablePendingLog>,
     raw_residency_gate: RwLock<()>,
     raw_resident: AtomicBool,
     raw_resident_bytes: AtomicUsize,
@@ -1831,6 +1928,8 @@ impl IndexState {
             visibility_counts: RwLock::new(VectorVisibilityCounts::default()),
             raw_loader: RwLock::new(None),
             durable_memberships: RwLock::new(None),
+            durable_counts: Mutex::new(RawVectorMembershipSummary::default()),
+            durable_pending: Mutex::new(DurablePendingLog::default()),
             raw_residency_gate: RwLock::new(()),
             raw_resident: AtomicBool::new(true),
             raw_resident_bytes: AtomicUsize::new(0),
@@ -2064,6 +2163,493 @@ impl IndexState {
         self.durable_memberships.read().clone()
     }
 
+    fn install_durable_source(
+        &self,
+        memberships: Arc<dyn RawVectorMembershipSource>,
+        loader: Arc<dyn DormantRawVectorLoader>,
+        summary: RawVectorMembershipSummary,
+        payload: Arc<AtomicUsize>,
+        payload_headers: Arc<AtomicUsize>,
+    ) {
+        // An empty partition starts with an empty, resident body cache, so a
+        // body written in this process stays cached exactly as before; a
+        // partition with saved memberships stays dormant until first use.
+        let resident = summary.entries == 0;
+        *self.durable_memberships.write() = Some(memberships);
+        *self.durable_counts.lock() = summary;
+        *self.durable_pending.lock() = DurablePendingLog {
+            floor: summary.max_tx,
+            events: Vec::new(),
+            cached: None,
+        };
+        *self.raw_loader.write() = Some(loader);
+        self.raw_resident.store(resident, Ordering::SeqCst);
+        *self.raw_payload_counter.write() = payload;
+        *self.raw_payload_header_counter.write() = payload_headers;
+    }
+
+    /// Whether any retained membership of this durable partition is visible
+    /// to one of `snapshots`. Streams the durable directory once; a read that
+    /// cannot complete answers `true`, keeping the partition.
+    fn durable_visible_at_any(&self, snapshots: &[SnapshotId]) -> bool {
+        let Some(source) = self.durable_membership_source() else {
+            return true;
+        };
+        if snapshots.is_empty() {
+            return false;
+        }
+        let scan = || -> Result<bool> {
+            let mut cursor = source.open(&mut |_| true)?;
+            while let Some(entry) = cursor.next(&mut |_| true)? {
+                if snapshots.iter().any(|snapshot| {
+                    entry.created_tx.0 <= snapshot.0
+                        && entry.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+                }) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        scan().unwrap_or(true)
+    }
+
+    /// Keep the pending-work log and any cached frontier count current with
+    /// one published batch.
+    fn apply_durable_pending_events(&self, events: &[DurableMembershipEvent]) {
+        let mut log = self.durable_pending.lock();
+        if let Some(counts) = log.cached.as_mut() {
+            Self::count_pending_events(counts, events);
+        }
+        if log.events.len().saturating_add(events.len()) > DURABLE_PENDING_LOG_CAPACITY {
+            // Bounded: forget the log; later frontiers before the new floor
+            // are counted by one stream.
+            log.events = Vec::new();
+            log.floor = self.durable_counts.lock().max_tx;
+            return;
+        }
+        log.events.extend_from_slice(events);
+    }
+
+    fn count_pending_events(counts: &mut DurablePendingCounts, events: &[DurableMembershipEvent]) {
+        let after = |tx: TxId| counts.covered.is_none_or(|covered| tx > covered);
+        let (mut pending, mut tombstones) = (counts.pending_inserts, counts.tombstones);
+        for event in events {
+            match *event {
+                DurableMembershipEvent::Closed { created, deleted } => {
+                    if after(created) {
+                        pending = pending.saturating_sub(1);
+                    }
+                    if after(deleted) {
+                        tombstones = tombstones.saturating_add(1);
+                    }
+                }
+                DurableMembershipEvent::Opened(created) => {
+                    if after(created) {
+                        pending = pending.saturating_add(1);
+                    }
+                }
+                DurableMembershipEvent::PublishedClosed(deleted) => {
+                    if after(deleted) {
+                        tombstones = tombstones.saturating_add(1);
+                    }
+                }
+            }
+        }
+        counts.pending_inserts = pending;
+        counts.tombstones = tombstones;
+    }
+
+    /// Pending inserts and tombstones of a durable partition after `covered`.
+    /// With no covered frontier every live row is pending and every closed
+    /// one a tombstone; a frontier at or after the log floor is counted from
+    /// the log; an older one is counted once by a stream of the durable
+    /// directory. A stream that cannot complete reports every live row.
+    fn durable_pending_counts(
+        &self,
+        covered: Option<TxId>,
+        covered_lsn: Option<Lsn>,
+    ) -> (usize, usize) {
+        let Some(frontier) = covered else {
+            let counts = *self.durable_counts.lock();
+            return (
+                counts.live_entries,
+                counts.entries.saturating_sub(counts.live_entries),
+            );
+        };
+        {
+            let mut log = self.durable_pending.lock();
+            if let Some(counts) = log.cached
+                && counts.covered == covered
+            {
+                return (counts.pending_inserts, counts.tombstones);
+            }
+            if frontier >= log.floor {
+                let mut counts = DurablePendingCounts {
+                    covered,
+                    pending_inserts: 0,
+                    tombstones: 0,
+                };
+                Self::count_pending_events(&mut counts, &log.events);
+                // Frontiers only advance: events wholly at or before this
+                // one can no longer count.
+                log.events.retain(|event| event.relevant_after(frontier));
+                log.floor = frontier;
+                log.cached = Some(counts);
+                return (counts.pending_inserts, counts.tombstones);
+            }
+        }
+        let Some(source) = self.durable_membership_source() else {
+            return (0, 0);
+        };
+        if let Some(covered_lsn) = covered_lsn
+            && let Ok(Some((pending_inserts, tombstones))) = source.pending_after(covered_lsn)
+        {
+            self.durable_pending.lock().cached = Some(DurablePendingCounts {
+                covered,
+                pending_inserts,
+                tombstones,
+            });
+            return (pending_inserts, tombstones);
+        }
+        let scan = || -> Result<(usize, usize)> {
+            let mut pending = 0usize;
+            let mut tombstones = 0usize;
+            let mut cursor = source.open(&mut |_| true)?;
+            while let Some(entry) = cursor.next(&mut |_| true)? {
+                match entry.deleted_tx {
+                    None if entry.created_tx > frontier => pending += 1,
+                    Some(deleted) if deleted > frontier => tombstones += 1,
+                    _ => {}
+                }
+            }
+            Ok((pending, tombstones))
+        };
+        match scan() {
+            Ok((pending_inserts, tombstones)) => {
+                self.durable_pending.lock().cached = Some(DurablePendingCounts {
+                    covered,
+                    pending_inserts,
+                    tombstones,
+                });
+                (pending_inserts, tombstones)
+            }
+            Err(_) => (self.vector_count(), 0),
+        }
+    }
+
+    /// Re-read this durable partition's counts from the current root after a
+    /// removal published elsewhere. A failed read keeps the cached counts.
+    fn refresh_durable_counts(&self) {
+        let Some(source) = self.durable_membership_source() else {
+            return;
+        };
+        let Ok(summary) = source.current_summary() else {
+            return;
+        };
+        let previous = std::mem::replace(&mut *self.durable_counts.lock(), summary);
+        if previous == summary {
+            return;
+        }
+        // A removal published elsewhere is not in the body cache; drop it.
+        self.evict_raw_vectors();
+        // A removal published elsewhere changes pending work too: count the
+        // next frontier from the durable directory again.
+        let mut log = self.durable_pending.lock();
+        log.cached = None;
+        log.events = Vec::new();
+        log.floor = TxId(u64::MAX);
+    }
+
+    /// Every visibility interval of a durable partition, streamed.
+    fn visit_durable_intervals(
+        &self,
+        mut visit: impl FnMut(&RawVectorDirectoryEntry) -> Result<()>,
+    ) -> Result<()> {
+        let source = self.durable_membership_source().ok_or_else(|| {
+            Error::Other("durable vector partition lost its membership source".into())
+        })?;
+        let mut cursor = source.open(&mut |_| true)?;
+        while let Some(entry) = cursor.next(&mut |_| true)? {
+            visit(&entry)?;
+        }
+        Ok(())
+    }
+
+    /// Copy the bodies of every durable interval `select` accepts, one point
+    /// read each; a body is decoded only for a selected interval.
+    fn durable_entries_selected(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        select: impl Fn(&RawVectorDirectoryEntry) -> bool,
+    ) -> Result<Vec<VectorEntry>> {
+        let source = self.durable_membership_source().ok_or_else(|| {
+            Error::Other("durable vector partition lost its membership source".into())
+        })?;
+        let loader = self.raw_loader.read().clone().ok_or_else(|| {
+            Error::Other("durable vector membership has no raw-body loader".into())
+        })?;
+        let mut selected = Vec::new();
+        self.visit_durable_intervals(|interval| {
+            if select(interval) {
+                selected.push((interval.row_id, interval.lsn));
+            }
+            Ok(())
+        })?;
+        let mut entries = Vec::with_capacity(selected.len());
+        for (row_id, lsn) in selected {
+            let identity = source
+                .identity_by_row_lsn(row_id, lsn, &mut || true)?
+                .ok_or_else(|| Error::StoreCorrupted {
+                    path: format!("vector index {}.{}", index.table, index.column),
+                    reason: "durable membership interval has no body identity".into(),
+                })?;
+            let mut loaded = loader.load_candidate(&identity, false, &mut |request| {
+                !matches!(request, DormantVectorLoadRequest::Reserve(_))
+            })?;
+            let mut entry = std::mem::replace(
+                &mut loaded.entry,
+                VectorEntry {
+                    index: index.clone(),
+                    row_id,
+                    vector: Vec::new(),
+                    created_tx: TxId(0),
+                    deleted_tx: None,
+                    lsn,
+                },
+            );
+            drop(loaded);
+            if entry.deleted_tx.is_some_and(|tx| tx.0 > snapshot.0) {
+                entry.deleted_tx = None;
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// The live bodies at `snapshot` published after `after_lsn`, selected
+    /// from the durable change suffix alone; `None` without a suffix.
+    fn durable_suffix_entries(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+        after_lsn: Lsn,
+    ) -> Result<Option<Vec<VectorEntry>>> {
+        let source = self.durable_membership_source().ok_or_else(|| {
+            Error::Other("durable vector partition lost its membership source".into())
+        })?;
+        let mut opened = BTreeMap::<(RowId, TxId, Lsn), TxId>::new();
+        let mut closed = Vec::new();
+        let supported = source.visit_suffix(after_lsn, &mut |change| {
+            match change {
+                RawVectorSuffixChange::Opened {
+                    identity,
+                    visible_from,
+                } => {
+                    opened.insert(
+                        (identity.row_id, identity.created_tx, identity.lsn),
+                        visible_from,
+                    );
+                }
+                RawVectorSuffixChange::Closed {
+                    row_id,
+                    created_tx,
+                    lsn,
+                    deleted_tx,
+                } => {
+                    if deleted_tx.0 <= snapshot.0 {
+                        closed.push((row_id, created_tx, lsn));
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        if !supported {
+            return Ok(None);
+        }
+        for key in closed {
+            opened.remove(&key);
+        }
+        let loader = self.raw_loader.read().clone().ok_or_else(|| {
+            Error::Other("durable vector membership has no raw-body loader".into())
+        })?;
+        let mut entries = Vec::new();
+        for ((row_id, _, lsn), visible_from) in opened {
+            if visible_from.0 > snapshot.0 || lsn <= after_lsn {
+                continue;
+            }
+            let identity = source
+                .identity_by_row_lsn(row_id, lsn, &mut || true)?
+                .ok_or_else(|| Error::StoreCorrupted {
+                    path: format!("vector index {}.{}", index.table, index.column),
+                    reason: "durable change suffix names a membership the directory lacks".into(),
+                })?;
+            let mut loaded = loader.load_candidate(&identity, false, &mut |request| {
+                !matches!(request, DormantVectorLoadRequest::Reserve(_))
+            })?;
+            let mut entry = std::mem::replace(
+                &mut loaded.entry,
+                VectorEntry {
+                    index: index.clone(),
+                    row_id,
+                    vector: Vec::new(),
+                    created_tx: TxId(0),
+                    deleted_tx: None,
+                    lsn,
+                },
+            );
+            drop(loaded);
+            if entry.deleted_tx.is_some_and(|tx| tx.0 > snapshot.0) {
+                entry.deleted_tx = None;
+            }
+            entries.push(entry);
+        }
+        Ok(Some(entries))
+    }
+
+    /// Body identities of every retained version of `rows` in a durable
+    /// partition, each read from that row's own prefix.
+    fn durable_row_versions(&self, rows: &HashSet<RowId>) -> Result<Vec<RawVectorDirectoryEntry>> {
+        let source = self.durable_membership_source().ok_or_else(|| {
+            Error::Other("durable vector partition lost its membership source".into())
+        })?;
+        let mut ordered = rows.iter().copied().collect::<Vec<_>>();
+        ordered.sort_unstable();
+        let mut versions = Vec::new();
+        for row in ordered {
+            source.visit_row_versions(row, &mut || true, &mut |identity| {
+                versions.push(identity);
+                Ok(())
+            })?;
+        }
+        Ok(versions)
+    }
+
+    /// Drop a prepared resident image in favour of the durable directory it
+    /// mirrors, keeping its counts and any graph built from it.
+    fn convert_to_durable(
+        &self,
+        memberships: Arc<dyn RawVectorMembershipSource>,
+        loader: Arc<dyn DormantRawVectorLoader>,
+        payload: Arc<AtomicUsize>,
+        payload_headers: Arc<AtomicUsize>,
+    ) {
+        let summary = RawVectorMembershipSummary {
+            entries: self.entry_count(),
+            live_entries: self.vector_count(),
+            max_tx: self.max_tx(),
+        };
+        {
+            let _gate = self.raw_residency_gate.write();
+            let mut vectors = self.vectors.write();
+            *vectors = PartitionVectors::default();
+            *self.raw_directory.write() = Vec::new();
+            *self.raw_directory_by_row.write() = HashMap::new();
+            *self.visibility_counts.write() = VectorVisibilityCounts::default();
+            self.raw_resident_bytes.store(0, Ordering::SeqCst);
+            self.raw_accountant.write().take();
+        }
+        self.install_durable_source(memberships, loader, summary, payload, payload_headers);
+    }
+
+    /// Rows visible at a maintenance sample frontier.
+    fn sampled_visible_count(&self, snapshot: SnapshotId) -> Result<usize> {
+        match self.durable_membership_source() {
+            Some(source) => source.visible_count(snapshot, &mut || true),
+            None => Ok(self.visibility_counts.read().count(snapshot)),
+        }
+    }
+
+    /// One-pass reads for an exhaustive comparison over this partition.
+    pub(crate) fn one_pass_reads(
+        &self,
+        session: &mut OnePassSession,
+    ) -> Option<Box<dyn std::any::Any>> {
+        let loader = self.raw_loader.read().clone();
+        loader.and_then(|loader| loader.one_pass_reads(session))
+    }
+
+    /// Whether this partition's bodies are cached in memory.
+    pub(crate) fn bodies_resident(&self) -> bool {
+        self.raw_resident.load(Ordering::SeqCst)
+    }
+
+    /// Cache this durable partition's bodies when they fit. `Ok(false)` when
+    /// the memory to hold them is refused; the caller then reads bodies one
+    /// at a time through the durable source.
+    pub(crate) fn try_cache_durable_bodies(&self) -> Result<bool> {
+        match self.ensure_raw_vectors_loaded() {
+            Ok(()) => Ok(true),
+            Err(Error::MemoryBudgetExceeded { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Append one published body to a durable partition's body cache. The
+    /// membership itself is durable; no directory is kept.
+    fn push_resident_body(&self, mut entry: StoredVectorEntry) {
+        if let Some(accountant) = self.raw_accountant.read().clone() {
+            entry.vector.adopt_raw_charge(
+                accountant,
+                self.raw_payload_counter.read().clone(),
+                self.raw_payload_header_counter.read().clone(),
+            );
+        }
+        let mut vectors = self.vectors.write();
+        // A scalar publication retains another visibility interval, but its
+        // bit-identical stored body shares the prior allocation. Adopt the
+        // incoming charge first so replacing that body returns its payload
+        // and header reservation to their actual funder.
+        if let Some(positions) = vectors.by_row.get(&entry.row_id)
+            && let Some(prior) = positions
+                .iter()
+                .rev()
+                .map(|position| &vectors.entries[*position])
+                .find(|prior| prior.vector.representation_eq(&entry.vector))
+        {
+            entry.vector = prior.vector.clone();
+        }
+        if entry
+            .vector
+            .payload_identity()
+            .is_none_or(|identity| !vectors.payload_memberships.contains_key(&identity))
+        {
+            self.raw_resident_bytes
+                .fetch_add(entry.estimated_bytes(), Ordering::SeqCst);
+        }
+        vectors.push(entry);
+    }
+
+    /// Close a row's cached bodies at `deleted_tx`; returns the live bytes
+    /// the closed bodies were costing (see `tombstone_row`).
+    fn tombstone_resident_bodies(&self, row_id: RowId, deleted_tx: TxId) -> usize {
+        let mut released = 0usize;
+        let mut vectors = self.vectors.write();
+        let positions = vectors.by_row.get(&row_id).cloned().unwrap_or_default();
+        for position in positions {
+            if let Some(entry) = vectors.entries.get_mut(position) {
+                let boundary = deleted_tx.max(entry.created_tx);
+                if entry.deleted_tx.is_none_or(|previous| previous > boundary) {
+                    if entry.deleted_tx.is_none() {
+                        released = released.saturating_add(entry.estimated_bytes());
+                    }
+                    entry.deleted_tx = Some(boundary);
+                }
+            }
+        }
+        released
+    }
+
+    /// Whether this partition's membership lives only in durable storage.
+    /// Commits then change only its counts and fresh graph tail.
+    pub(crate) fn is_durable(&self) -> bool {
+        self.durable_memberships.read().is_some()
+    }
+
+    fn durable_counts(&self) -> Option<RawVectorMembershipSummary> {
+        self.is_durable().then(|| *self.durable_counts.lock())
+    }
+
     pub(crate) fn try_directory_has_visible_row(
         &self,
         row: RowId,
@@ -2130,6 +2716,11 @@ impl IndexState {
             self.ensure_raw_vectors_loaded()?;
             return Ok(self.vector_for_row_lsn(row_id, lsn));
         };
+        // A caller-facing projection caches a fitting partition, as a
+        // resident partition is loaded; otherwise one body is point-read.
+        if self.try_cache_durable_bodies()? {
+            return Ok(self.vector_for_row_lsn(row_id, lsn));
+        }
         let Some(identity) = source.identity_by_row_lsn(row_id, lsn, &mut || true)? else {
             return Ok(None);
         };
@@ -2167,7 +2758,27 @@ impl IndexState {
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Result<Option<VectorEntry>> {
+        self.load_visible_entry_by_row_caching(index, row_id, snapshot, true)
+    }
+
+    /// `cache` lets a caller-facing read fault in a fitting durable
+    /// partition; commit and maintenance reads only use an existing cache.
+    fn load_visible_entry_by_row_caching(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        cache: bool,
+    ) -> Result<Option<VectorEntry>> {
         if let Some(source) = self.durable_membership_source() {
+            let cached = if cache {
+                self.try_cache_durable_bodies()?
+            } else {
+                self.bodies_resident()
+            };
+            if cached {
+                return Ok(self.visible_entry_by_row(index, row_id, snapshot));
+            }
             let Some(identity) = source.visible_by_row(row_id, snapshot, &mut || true)? else {
                 return Ok(None);
             };
@@ -2208,11 +2819,6 @@ impl IndexState {
         if self.raw_resident.load(Ordering::SeqCst) {
             return Ok(());
         }
-        if self.durable_membership_source().is_some() {
-            return Err(Error::Other(
-                "durable vector memberships require bounded point or cursor access".to_string(),
-            ));
-        }
         let _gate = self.raw_residency_gate.write();
         if self.raw_resident.load(Ordering::SeqCst) {
             return Ok(());
@@ -2220,8 +2826,20 @@ impl IndexState {
         let loader = self.raw_loader.read().clone().ok_or_else(|| {
             Error::Other("dormant raw vector partition has no loader".to_string())
         })?;
-        let expected = self.raw_directory.read().clone();
-        let loaded = loader.load(&expected)?;
+        // A durable partition is loaded in its durable key order, admitted
+        // from its count before any body is read; the cached bodies are its
+        // only resident copy and its membership directory stays durable.
+        let durable = self.is_durable();
+        let expected = if durable {
+            Vec::new()
+        } else {
+            self.raw_directory.read().clone()
+        };
+        let loaded = if durable {
+            loader.load_all()?
+        } else {
+            loader.load(&expected)?
+        };
         let LoadedRawVectorPartition {
             entries,
             resident_bytes: reserved_resident_bytes,
@@ -2229,19 +2847,21 @@ impl IndexState {
             accountant,
         } = loaded;
         let reserved_bytes = reserved_resident_bytes.saturating_add(workspace_bytes);
-        if entries.len() != expected.len() {
+        if !durable && entries.len() != expected.len() {
             drop(entries);
             accountant.release(reserved_bytes);
             return Err(Error::Other(
                 "loaded raw vector partition does not match its directory count".to_string(),
             ));
         }
-        if entries.iter().zip(&expected).any(|(entry, identity)| {
-            entry.row_id != identity.row_id
-                || entry.created_tx != identity.created_tx
-                || entry.deleted_tx != identity.deleted_tx
-                || entry.lsn != identity.lsn
-        }) {
+        if !durable
+            && entries.iter().zip(&expected).any(|(entry, identity)| {
+                entry.row_id != identity.row_id
+                    || entry.created_tx != identity.created_tx
+                    || entry.deleted_tx != identity.deleted_tx
+                    || entry.lsn != identity.lsn
+            })
+        {
             drop(entries);
             accountant.release(reserved_bytes);
             return Err(Error::Other(
@@ -2444,6 +3064,14 @@ impl IndexState {
         row_id: RowId,
         snapshot: SnapshotId,
     ) -> Option<RawVectorDirectoryEntry> {
+        if let Some(source) = self.durable_membership_source() {
+            // Infallible callers treat an unreadable durable row as absent;
+            // fallible callers use `try_visible_directory_entry_by_row`.
+            return source
+                .visible_by_row(row_id, snapshot, &mut || true)
+                .ok()
+                .flatten();
+        }
         let directory = self.raw_directory.read();
         let by_row = self.raw_directory_by_row.read();
         let positions = by_row.get(&row_id)?;
@@ -2484,7 +3112,12 @@ impl IndexState {
                 .iter()
                 .filter(|id| self.directory_has_visible_row(RowId(*id), snapshot))
                 .count(),
-            None => self.visibility_counts.read().count(snapshot),
+            None => match self.durable_membership_source() {
+                Some(source) => source
+                    .visible_count(snapshot, &mut || true)
+                    .unwrap_or_else(|_| self.vector_count()),
+                None => self.visibility_counts.read().count(snapshot),
+            },
         }
     }
 
@@ -2679,15 +3312,15 @@ impl IndexState {
     }
 
     pub fn vector_count(&self) -> usize {
-        if let Some(source) = self.durable_membership_source() {
-            return source.published_summary().live_entries;
+        if let Some(counts) = self.durable_counts() {
+            return counts.live_entries;
         }
         self.visibility_counts.read().count(SnapshotId(u64::MAX))
     }
 
     pub fn max_tx(&self) -> TxId {
-        if let Some(source) = self.durable_membership_source() {
-            return source.published_summary().max_tx;
+        if let Some(counts) = self.durable_counts() {
+            return counts.max_tx;
         }
         self.visibility_counts.read().max_tx()
     }
@@ -2706,7 +3339,7 @@ impl IndexState {
         before_source_entry()?;
         if let Some(source) = self.durable_membership_source() {
             return Ok(BoundedIndexEligibility {
-                entry_count: source.published_summary().entries,
+                entry_count: self.entry_count(),
                 live_count: with_membership_read(&mut before_source_entry, |before_read| {
                     source.visible_count(SnapshotId(snapshot_tx.0), before_read)
                 })?,
@@ -3123,16 +3756,25 @@ impl IndexState {
                 }
             };
             match bodies {
-                Some(bodies) => match bodies.scan_for(loader.as_ref()) {
-                    Ok(Some(scan)) => loader.load_candidate_with_scan(
-                        scan,
-                        &identity,
-                        caller_charged,
-                        &mut request,
-                    ),
-                    Ok(None) => loader.load_candidate(&identity, caller_charged, &mut request),
-                    Err(error) => Err(error),
-                },
+                Some(bodies) => {
+                    let one_pass = bodies.one_pass;
+                    match bodies.scan_for(loader.as_ref()) {
+                        Ok(Some(scan)) if one_pass => loader.load_candidate_with_scan_once(
+                            scan,
+                            &identity,
+                            caller_charged,
+                            &mut request,
+                        ),
+                        Ok(Some(scan)) => loader.load_candidate_with_scan(
+                            scan,
+                            &identity,
+                            caller_charged,
+                            &mut request,
+                        ),
+                        Ok(None) => loader.load_candidate(&identity, caller_charged, &mut request),
+                        Err(error) => Err(error),
+                    }
+                }
                 None => loader.load_candidate(&identity, caller_charged, &mut request),
             }
         };
@@ -3299,6 +3941,12 @@ impl IndexState {
         position: usize,
         snapshot: SnapshotId,
     ) -> Option<Option<RowId>> {
+        if self.is_durable() {
+            // A durable partition's positions are its cached bodies.
+            let vectors = self.vectors.read();
+            let entry = vectors.entries.get(position)?;
+            return Some(entry.visible_at(snapshot).then_some(entry.row_id));
+        }
         let directory = self.raw_directory.read();
         let entry = directory.get(position)?;
         Some(
@@ -3346,8 +3994,8 @@ impl IndexState {
     }
 
     pub fn entry_count(&self) -> usize {
-        if let Some(source) = self.durable_membership_source() {
-            return source.published_summary().entries;
+        if let Some(counts) = self.durable_counts() {
+            return counts.entries;
         }
         self.raw_directory.read().len()
     }
@@ -3557,6 +4205,7 @@ impl IndexState {
         *self.visibility_counts.write() = VectorVisibilityCounts::default();
         self.raw_loader.write().take();
         self.durable_memberships.write().take();
+        *self.durable_counts.lock() = RawVectorMembershipSummary::default();
         self.raw_resident_bytes.store(0, Ordering::SeqCst);
         self.raw_accountant.write().take();
         self.raw_resident.store(true, Ordering::SeqCst);
@@ -3565,6 +4214,10 @@ impl IndexState {
     /// Whether this partition's durable directory names any version of one of
     /// `row_ids`. A directory-only answer: nothing is faulted in.
     fn directory_names_any_row<'a>(&self, row_ids: impl IntoIterator<Item = &'a RowId>) -> bool {
+        // A durable partition keeps no resident directory to prune.
+        if self.is_durable() {
+            return false;
+        }
         let by_row = self.raw_directory_by_row.read();
         row_ids
             .into_iter()
@@ -5546,14 +6199,26 @@ impl IndexState {
         }
 
         let sample_tx = self.max_tx();
-        let sample_lsn = self
-            .raw_directory
-            .read()
-            .iter()
-            .filter(|entry| entry.created_tx <= sample_tx)
-            .map(|entry| entry.lsn)
-            .max()
-            .unwrap_or_default();
+        let sample_lsn = match self.durable_membership_source() {
+            Some(source) => {
+                let mut cursor = source.open(&mut |_| true)?;
+                let mut sample_lsn = Lsn(0);
+                while let Some(entry) = cursor.next(&mut |_| true)? {
+                    if entry.created_tx <= sample_tx {
+                        sample_lsn = sample_lsn.max(entry.lsn);
+                    }
+                }
+                sample_lsn
+            }
+            None => self
+                .raw_directory
+                .read()
+                .iter()
+                .filter(|entry| entry.created_tx <= sample_tx)
+                .map(|entry| entry.lsn)
+                .max()
+                .unwrap_or_default(),
+        };
         let empty_bytes = HnswIndex::estimated_resident_bytes_with_m(
             0,
             self.dimension,
@@ -6570,6 +7235,10 @@ pub struct PreparedPartitionedVectorBatch {
     projected_live_or_retained_partitions: HashMap<VectorIndexRef, usize>,
     directory_reservation: PreparedDirectoryReservation,
     tail_insertions: PreparedTailInsertions,
+    /// Post-batch counts of each touched durable-membership partition. Their
+    /// memberships are published durably with the rows; publication installs
+    /// only these counts.
+    durable_counts: Vec<PreparedDurableCounts>,
 }
 
 struct PreparedTailInsertion {
@@ -6927,6 +7596,9 @@ struct VectorColumnState {
     partitions: RwLock<BTreeMap<VectorPartitionKey, Arc<IndexState>>>,
     row_to_partition: RwLock<HashMap<RowId, Arc<VectorPartitionKey>>>,
     durable_reverse_memberships: RwLock<Option<Arc<dyn RawVectorReverseMembershipSource>>>,
+    /// Present exactly when this column's memberships are durable: each new
+    /// partition state is created with its durable source and loader.
+    durable_partition_factory: RwLock<Option<Arc<dyn DurableRawPartitionFactory>>>,
     /// Every physical partition in which a row identity has retained history.
     /// The current directory above stays the fast path; this one makes an old
     /// snapshot resolve its own placement without probing every partition.
@@ -6957,6 +7629,7 @@ impl VectorColumnState {
             partitions: RwLock::new(partitions),
             row_to_partition: RwLock::new(HashMap::new()),
             durable_reverse_memberships: RwLock::new(None),
+            durable_partition_factory: RwLock::new(None),
             row_partition_history: RwLock::new(HashMap::new()),
             directory_accounting: Mutex::new(None),
         }
@@ -7091,6 +7764,13 @@ impl VectorColumnState {
     }
 
     fn current_partition(&self, row_id: RowId) -> Option<VectorPartitionKey> {
+        let reverse = self.durable_reverse_memberships.read().clone();
+        if let Some(reverse) = reverse {
+            return reverse
+                .visible_partition(row_id, SnapshotId(u64::MAX), &mut || true)
+                .ok()
+                .flatten();
+        }
         self.row_to_partition
             .read()
             .get(&row_id)
@@ -7193,6 +7873,10 @@ impl VectorColumnState {
                     "durable vector reverse directory names an absent partition".into(),
                 ))
             })?;
+            #[cfg(feature = "test-seams")]
+            crate::mem::observe_bounded_candidate_grouping_for_test(
+                crate::mem::BoundedCandidateGroupingEventForTest::SnapshotVisibilityProbe,
+            );
             // The reverse directory and partition source share one pinned root.
             // Authenticate the forward identity too, detecting inconsistent sidecars.
             if state
@@ -7610,6 +8294,69 @@ struct ProjectedPartitionState {
     live_by_row: HashMap<RowId, usize>,
     latest_live_rows: HashSet<RowId>,
     counts_toward_partition_limit: bool,
+    /// Live rows of a durable partition this batch does not touch; only the
+    /// touched rows are probed into `live_by_row`.
+    untracked_live: usize,
+    durable: bool,
+    /// Creation of each touched live durable row, and the membership events
+    /// this batch publishes, for the partition's pending-work counts.
+    live_created: HashMap<RowId, TxId>,
+    events: Vec<DurableMembershipEvent>,
+}
+
+/// One durable membership change of a published batch, as maintenance's
+/// pending-insert and tombstone counts see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableMembershipEvent {
+    /// A live membership created at `created` was closed at `deleted`.
+    Closed { created: TxId, deleted: TxId },
+    /// A live membership was opened at this transaction.
+    Opened(TxId),
+    /// An already-closed membership was published, closed at this transaction.
+    PublishedClosed(TxId),
+}
+
+impl DurableMembershipEvent {
+    /// Whether this event can still count against a covered frontier after
+    /// `covered` (frontiers only advance).
+    fn relevant_after(&self, covered: TxId) -> bool {
+        match *self {
+            Self::Closed { created, deleted } => created > covered || deleted > covered,
+            Self::Opened(created) => created > covered,
+            Self::PublishedClosed(deleted) => deleted > covered,
+        }
+    }
+}
+
+/// Membership events of a durable partition since `floor`: every event after
+/// `floor` is present, so pending work against any covered frontier at or
+/// after `floor` is counted from these alone. A frontier before `floor` is
+/// counted once by a stream and then kept current in `cached`. The log is
+/// bounded; past its capacity it is dropped and `floor` advances.
+#[derive(Default)]
+struct DurablePendingLog {
+    floor: TxId,
+    events: Vec<DurableMembershipEvent>,
+    cached: Option<DurablePendingCounts>,
+}
+
+const DURABLE_PENDING_LOG_CAPACITY: usize = 4096;
+
+/// Prepared post-batch state of one durable partition.
+#[derive(Debug, Clone, PartialEq)]
+struct PreparedDurableCounts {
+    partition: VectorPartitionRef,
+    summary: RawVectorMembershipSummary,
+    events: Vec<DurableMembershipEvent>,
+}
+
+/// Maintenance's pending counts of a durable partition against one covered
+/// frontier, computed once by a stream and then kept by commit events.
+#[derive(Debug, Clone, Copy)]
+struct DurablePendingCounts {
+    covered: Option<TxId>,
+    pending_inserts: usize,
+    tombstones: usize,
 }
 
 impl ProjectedPartitionState {
@@ -7621,6 +8368,44 @@ impl ProjectedPartitionState {
         }
     }
 
+    /// A durable partition is projected from its maintained counts plus a
+    /// point probe of each row this batch touches; nothing is enumerated.
+    fn from_durable_state(
+        state: &IndexState,
+        counts_toward_partition_limit: bool,
+        touched_rows: &HashSet<RowId>,
+    ) -> Result<Self> {
+        let source = state
+            .durable_membership_source()
+            .ok_or_else(|| Error::Other("durable projection lost its membership source".into()))?;
+        let mut projected = Self {
+            total_entries: state.entry_count(),
+            live_by_row: HashMap::new(),
+            latest_live_rows: HashSet::new(),
+            counts_toward_partition_limit,
+            untracked_live: state.vector_count(),
+            durable: true,
+            live_created: HashMap::new(),
+            events: Vec::new(),
+        };
+        let mut rows = touched_rows.iter().copied().collect::<Vec<_>>();
+        rows.sort_unstable();
+        for row in rows {
+            if let Some(identity) =
+                source.visible_by_row(row, SnapshotId(u64::MAX), &mut || true)?
+            {
+                projected.live_created.insert(row, identity.created_tx);
+                projected.live_by_row.insert(row, 1);
+                projected.latest_live_rows.insert(row);
+                projected.untracked_live =
+                    projected.untracked_live.checked_sub(1).ok_or_else(|| {
+                        Error::Other("durable vector live count is below its live rows".into())
+                    })?;
+            }
+        }
+        Ok(projected)
+    }
+
     fn from_state(state: &IndexState, counts_toward_partition_limit: bool) -> Self {
         {
             let entries = state.raw_directory.read();
@@ -7629,6 +8414,10 @@ impl ProjectedPartitionState {
                 live_by_row: HashMap::new(),
                 latest_live_rows: HashSet::new(),
                 counts_toward_partition_limit,
+                untracked_live: 0,
+                durable: false,
+                live_created: HashMap::new(),
+                events: Vec::new(),
             };
             for entry in entries.iter() {
                 if entry.deleted_tx.is_none() {
@@ -7642,9 +8431,17 @@ impl ProjectedPartitionState {
         }
     }
 
-    fn delete_live_row(&mut self, row_id: RowId) -> usize {
+    fn delete_live_row(&mut self, row_id: RowId, deleted: TxId) -> usize {
         self.latest_live_rows.remove(&row_id);
-        self.live_by_row.remove(&row_id).unwrap_or(0)
+        let removed = self.live_by_row.remove(&row_id).unwrap_or(0);
+        if self.durable
+            && removed != 0
+            && let Some(created) = self.live_created.remove(&row_id)
+        {
+            self.events
+                .push(DurableMembershipEvent::Closed { created, deleted });
+        }
+        removed
     }
 
     fn has_movable_row(&self, row_id: RowId) -> bool {
@@ -7654,7 +8451,13 @@ impl ProjectedPartitionState {
     fn insert(&mut self, entry: &VectorEntry) {
         self.total_entries = self.total_entries.saturating_add(1);
         self.counts_toward_partition_limit = true;
+        self.events.push(if entry.deleted_tx.is_none() {
+            DurableMembershipEvent::Opened(entry.created_tx)
+        } else {
+            DurableMembershipEvent::PublishedClosed(entry.deleted_tx.unwrap_or(entry.created_tx))
+        });
         if entry.deleted_tx.is_none() {
+            self.live_created.insert(entry.row_id, entry.created_tx);
             *self.live_by_row.entry(entry.row_id).or_default() += 1;
             self.latest_live_rows.insert(entry.row_id);
         } else {
@@ -7662,7 +8465,9 @@ impl ProjectedPartitionState {
         }
     }
 
-    fn insert_moved(&mut self, row_id: RowId) {
+    fn insert_moved(&mut self, row_id: RowId, tx: TxId) {
+        self.events.push(DurableMembershipEvent::Opened(tx));
+        self.live_created.insert(row_id, tx);
         self.total_entries = self.total_entries.saturating_add(1);
         self.counts_toward_partition_limit = true;
         *self.live_by_row.entry(row_id).or_default() += 1;
@@ -7670,7 +8475,11 @@ impl ProjectedPartitionState {
     }
 
     fn live_count(&self) -> usize {
-        self.live_by_row.values().copied().sum()
+        self.live_by_row
+            .values()
+            .copied()
+            .sum::<usize>()
+            .saturating_add(self.untracked_live)
     }
 
     fn retire_maintained_state(&mut self) {
@@ -7734,6 +8543,9 @@ pub struct VectorStore {
     /// only a holder outside the registry retains the shared body.
     raw_payload_header_bytes: Arc<AtomicUsize>,
     memory_accountant: RwLock<Option<Arc<dyn MemoryBudget>>>,
+    /// Present on a durable-membership store: every column declared after
+    /// open is created with its durable sources.
+    durable_columns: RwLock<Option<Arc<dyn DurableRawColumnFactory>>>,
     #[cfg(any(test, feature = "test-seams"))]
     memory_workspace_pause: Mutex<Option<Arc<MaintenanceProgressPauseSlot>>>,
 }
@@ -7900,6 +8712,7 @@ impl VectorStore {
             raw_payload_bytes: Arc::new(AtomicUsize::new(0)),
             raw_payload_header_bytes: Arc::new(AtomicUsize::new(0)),
             memory_accountant: RwLock::new(None),
+            durable_columns: RwLock::new(None),
             #[cfg(any(test, feature = "test-seams"))]
             memory_workspace_pause: Mutex::new(None),
         }
@@ -8291,6 +9104,11 @@ impl VectorStore {
                         index.table, index.column
                     )));
                 }
+                // A durable-membership column stays durable across purge.
+                *replacement_column.durable_reverse_memberships.write() =
+                    current_column.durable_reverse_memberships.read().clone();
+                *replacement_column.durable_partition_factory.write() =
+                    current_column.durable_partition_factory.read().clone();
                 for (partition_key, state) in current_column.partition_snapshots() {
                     let partition = VectorPartitionRef::new(index.clone(), partition_key.clone());
                     if affected_partitions.contains(&partition) {
@@ -8422,6 +9240,28 @@ impl VectorStore {
                 &mut || Ok(()),
             )?;
         }
+        // Rebuilt partitions of a durable column hold their survivors only
+        // to build their graph; afterwards they read the durable directory
+        // the purge commit leaves, like every other partition there.
+        for (index, column) in &publication.registry {
+            let Some(factory) = column.durable_partition_factory.read().clone() else {
+                continue;
+            };
+            for (partition_key, state) in column.partition_snapshots() {
+                if state.is_durable() {
+                    continue;
+                }
+                let (memberships, loader) =
+                    factory.create(&VectorPartitionRef::new(index.clone(), partition_key));
+                state.convert_to_durable(
+                    memberships,
+                    loader,
+                    self.raw_payload_bytes.clone(),
+                    self.raw_payload_header_bytes.clone(),
+                );
+            }
+            column.rebuild_current_rows();
+        }
         Ok(publication)
     }
 
@@ -8508,9 +9348,8 @@ impl VectorStore {
         if let Some((sample_tx, _)) = state.sampled_maintenance_frontier() {
             let need = need?;
             let sampled_count = state
-                .visibility_counts
-                .read()
-                .count(SnapshotId(sample_tx.0));
+                .sampled_visible_count(SnapshotId(sample_tx.0))
+                .unwrap_or_else(|_| state.vector_count());
             let policy = layout.resolve_policy(sampled_count, 1);
             return Some((policy, need.build_reason()));
         }
@@ -8576,10 +9415,7 @@ impl VectorStore {
                         state: state.clone(),
                         armed: true,
                     };
-                    let vector_count = state
-                        .visibility_counts
-                        .read()
-                        .count(SnapshotId(sample_tx.0));
+                    let vector_count = state.sampled_visible_count(SnapshotId(sample_tx.0))?;
                     let final_bytes = HnswIndex::estimated_resident_bytes_with_m(
                         vector_count,
                         state.dimension(),
@@ -8620,19 +9456,34 @@ impl VectorStore {
                             partition.index.table, partition.index.column
                         ))
                     })?;
-                    state.with_entries(|source| {
+                    if state.is_durable() {
+                        let sample = SnapshotId(sample_tx.0);
                         entries.extend(
-                            source
-                                .iter()
-                                .filter(|entry| {
+                            state
+                                .durable_entries_selected(&partition.index, sample, |entry| {
                                     entry.created_tx <= sample_tx
                                         && entry
                                             .deleted_tx
                                             .is_none_or(|deleted| deleted > sample_tx)
-                                })
-                                .cloned(),
+                                })?
+                                .into_iter()
+                                .map(|entry| state.stored_entry(entry)),
                         );
-                    });
+                    } else {
+                        state.with_entries(|source| {
+                            entries.extend(
+                                source
+                                    .iter()
+                                    .filter(|entry| {
+                                        entry.created_tx <= sample_tx
+                                            && entry
+                                                .deleted_tx
+                                                .is_none_or(|deleted| deleted > sample_tx)
+                                    })
+                                    .cloned(),
+                            );
+                        });
+                    }
                     if entries.len() != vector_count {
                         return Err(Error::Other(format!(
                             "maintenance vector snapshot disagrees with live count for {}.{}",
@@ -8945,6 +9796,22 @@ impl VectorStore {
         state.set_maintenance_vectors_done(vectors_done);
     }
 
+    /// Drop a registered paged build whose durable record was erased. Waits
+    /// for an in-flight batch; the engine never calls this under its gate.
+    #[doc(hidden)]
+    pub fn forget_partition_paged_build(&self, partition: &VectorPartitionRef) {
+        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
+        else {
+            return;
+        };
+        let mut slot = state.paged_builder.lock();
+        while slot.in_flight {
+            state.paged_build_finished.wait(&mut slot);
+        }
+        slot.pending = None;
+        slot.progress = None;
+    }
+
     /// Clear the reported progress of a published or abandoned paged build.
     #[doc(hidden)]
     pub fn clear_partition_paged_build_progress(&self, partition: &VectorPartitionRef) {
@@ -9006,6 +9873,13 @@ impl VectorStore {
         operation.finished = builder.progress().phase == PagedVectorPhase::Reclaimed;
         Ok(removed)
     }
+    /// Whether this partition owns native paged construction or serving storage.
+    #[doc(hidden)]
+    pub fn partition_has_paged_storage(&self, partition: &VectorPartitionRef) -> bool {
+        self.try_partition_state(&partition.index, &partition.partition_key)
+            .is_some_and(|state| state.paged_storage.load(Ordering::SeqCst))
+    }
+
     /// Install a captured-root fresh tail before enabling ordinary writer
     /// maintenance. Admission precedes the short state publication boundary.
     #[doc(hidden)]
@@ -9426,6 +10300,9 @@ impl VectorStore {
         let _bulk = self.bulk_gate.write();
         let (registry, preserved_states) = publication.into_parts();
         for (index, column) in &registry {
+            if column.durable_reverse_memberships.read().is_none() {
+                self.make_column_durable(index, column);
+            }
             if column.directory_accounting.lock().is_none() {
                 let bytes = column.directory_retained_bytes(index);
                 column.install_directory_accounting(bytes, accountant.clone());
@@ -9458,6 +10335,9 @@ impl VectorStore {
         let _bulk = self.bulk_gate.write();
         let (incoming, preserved_states) = publication.into_parts();
         for (index, column) in &incoming {
+            if column.durable_reverse_memberships.read().is_none() {
+                self.make_column_durable(index, column);
+            }
             if column.directory_accounting.lock().is_none() {
                 let bytes = column.directory_retained_bytes(index);
                 column.install_directory_accounting(bytes, accountant.clone());
@@ -9536,6 +10416,7 @@ impl VectorStore {
             let mut registry = self.registry.write();
             let Some(existing) = registry.get(&index).cloned() else {
                 let column = Arc::new(VectorColumnState::new(layout.clone()));
+                self.make_column_durable(&index, &column);
                 if let Some(accountant) = self.memory_accountant.read().clone() {
                     let bytes = column.directory_retained_bytes(&index);
                     accountant.try_allocate_for(
@@ -9572,6 +10453,7 @@ impl VectorStore {
                 )));
             }
             let column = Arc::new(VectorColumnState::new(layout.clone()));
+            self.make_column_durable(&index, &column);
             if let Some(accountant) = self.memory_accountant.read().clone() {
                 let bytes = column.directory_retained_bytes(&index);
                 accountant.try_allocate_for(
@@ -9818,10 +10700,16 @@ impl VectorStore {
                 if let Some(state) = column.partition_state(&partition.partition_key) {
                     let counts_toward_partition_limit =
                         !column.partition_is_historical_only(&partition.partition_key);
-                    states.insert(
-                        partition.partition_key.clone(),
-                        ProjectedPartitionState::from_state(&state, counts_toward_partition_limit),
-                    );
+                    let projection = if state.is_durable() {
+                        ProjectedPartitionState::from_durable_state(
+                            &state,
+                            counts_toward_partition_limit,
+                            &Self::batch_rows_touching(partition, deletes, inserts, moves),
+                        )?
+                    } else {
+                        ProjectedPartitionState::from_state(&state, counts_toward_partition_limit)
+                    };
+                    states.insert(partition.partition_key.clone(), projection);
                 }
             }
         }
@@ -9831,7 +10719,7 @@ impl VectorStore {
                 .get_mut(&delete.partition.index)
                 .and_then(|states| states.get_mut(&delete.partition.partition_key))
             {
-                state.delete_live_row(delete.row_id);
+                state.delete_live_row(delete.row_id, delete.deleted_tx);
             }
         }
         for insert in inserts {
@@ -9863,13 +10751,13 @@ impl VectorStore {
                 .expect("move index was validated")
                 .get_mut(&row_move.source_partition_key)
                 .expect("live move source has a projected state")
-                .delete_live_row(row_move.old_row_id);
+                .delete_live_row(row_move.old_row_id, row_move.tx);
             projected
                 .get_mut(&row_move.index)
                 .expect("move index was validated")
                 .entry(row_move.target_partition_key.clone())
                 .or_default()
-                .insert_moved(row_move.new_row_id);
+                .insert_moved(row_move.new_row_id, row_move.tx);
             valid_moves.push(row_move.clone());
         }
 
@@ -9926,6 +10814,9 @@ impl VectorStore {
                         // untouched route's pending durability or repair work.
                         return false;
                     }
+                }
+                if state.is_durable() {
+                    return !state.durable_visible_at_any(registered_snapshots);
                 }
                 !state.raw_directory.read().iter().any(|entry| {
                     registered_snapshots.iter().any(|snapshot| {
@@ -10100,6 +10991,60 @@ impl VectorStore {
 
         let tail_insertions = self.prepare_tail_insertions(inserts, &valid_moves)?;
 
+        let mut durable_counts = Vec::new();
+        for partition in Self::sorted_partition_refs(touched.iter().cloned()) {
+            let Some(column) = self.try_column(&partition.index) else {
+                continue;
+            };
+            if column.durable_partition_factory.read().is_none() {
+                continue;
+            }
+            let Some(projection) = projected
+                .get(&partition.index)
+                .and_then(|states| states.get(&partition.partition_key))
+            else {
+                continue;
+            };
+            let prior_tx = column
+                .partition_state(&partition.partition_key)
+                .map_or(TxId(0), |state| state.max_tx());
+            let batch_tx = deletes
+                .iter()
+                .filter(|delete| delete.partition == partition)
+                .map(|delete| delete.deleted_tx)
+                .chain(
+                    inserts
+                        .iter()
+                        .filter(|insert| {
+                            insert.entry.index == partition.index
+                                && insert.partition_key == partition.partition_key
+                        })
+                        .flat_map(|insert| [Some(insert.entry.created_tx), insert.entry.deleted_tx])
+                        .flatten(),
+                )
+                .chain(
+                    valid_moves
+                        .iter()
+                        .filter(|row_move| {
+                            row_move.index == partition.index
+                                && (row_move.source_partition_key == partition.partition_key
+                                    || row_move.target_partition_key == partition.partition_key)
+                        })
+                        .map(|row_move| row_move.tx),
+                )
+                .max()
+                .unwrap_or(TxId(0));
+            durable_counts.push(PreparedDurableCounts {
+                partition,
+                summary: RawVectorMembershipSummary {
+                    entries: projection.total_entries,
+                    live_entries: projection.live_count(),
+                    max_tx: prior_tx.max(batch_tx),
+                },
+                events: projection.events.clone(),
+            });
+        }
+
         Ok(PreparedPartitionedVectorBatch {
             deletes: deletes.to_vec(),
             inserts: inserts.to_vec(),
@@ -10110,7 +11055,45 @@ impl VectorStore {
             projected_live_or_retained_partitions: projected_counts,
             directory_reservation,
             tail_insertions,
+            durable_counts,
         })
+    }
+
+    /// Every row a keyed batch reads or writes in one partition.
+    fn batch_rows_touching(
+        partition: &VectorPartitionRef,
+        deletes: &[PartitionedVectorDelete],
+        inserts: &[PartitionedVectorEntry],
+        moves: &[PartitionedVectorMove],
+    ) -> HashSet<RowId> {
+        let mut rows = HashSet::new();
+        rows.extend(
+            deletes
+                .iter()
+                .filter(|delete| &delete.partition == partition)
+                .map(|delete| delete.row_id),
+        );
+        rows.extend(
+            inserts
+                .iter()
+                .filter(|insert| {
+                    insert.entry.index == partition.index
+                        && insert.partition_key == partition.partition_key
+                })
+                .map(|insert| insert.entry.row_id),
+        );
+        for row_move in moves
+            .iter()
+            .filter(|row_move| row_move.index == partition.index)
+        {
+            if row_move.source_partition_key == partition.partition_key {
+                rows.insert(row_move.old_row_id);
+            }
+            if row_move.target_partition_key == partition.partition_key {
+                rows.insert(row_move.new_row_id);
+            }
+        }
+        rows
     }
 
     fn prepare_tail_insertion(
@@ -10218,12 +11201,21 @@ impl VectorStore {
                     self.try_partition_state(&row_move.index, &row_move.target_partition_key)
             {
                 self.prepare_tail_insertion(&mut pending, target, Lsn(0), || {
-                    let mut entry =
+                    let mut entry = if source.is_durable() {
                         source
-                            .stored_by_row_id(row_move.old_row_id)
-                            .ok_or_else(|| {
-                                Error::Other("prepared vector move lost its source".to_string())
-                            })?;
+                            .load_visible_entry_by_row_caching(
+                                &row_move.index,
+                                row_move.old_row_id,
+                                SnapshotId(u64::MAX),
+                                false,
+                            )?
+                            .map(|entry| source.stored_entry(entry))
+                    } else {
+                        source.stored_by_row_id(row_move.old_row_id)
+                    }
+                    .ok_or_else(|| {
+                        Error::Other("prepared vector move lost its source".to_string())
+                    })?;
                     entry.row_id = row_move.new_row_id;
                     entry.created_tx = row_move.tx;
                     entry.deleted_tx = None;
@@ -10310,7 +11302,9 @@ impl VectorStore {
             if let Some(state) =
                 self.try_partition_state(&partition.index, &partition.partition_key)
             {
-                state.ensure_raw_vectors_loaded()?;
+                if !state.is_durable() {
+                    state.ensure_raw_vectors_loaded()?;
+                }
                 if state.hnsw.get().is_none_or(|tail| tail.read().is_none()) {
                     state.preload_dormant_sealed_generation(true)?;
                     state.preload_dormant_sealed_generation(false)?;
@@ -10368,6 +11362,7 @@ impl VectorStore {
                     projected_live_or_retained_partitions: _,
                     directory_reservation: _,
                     tail_insertions,
+                    durable_counts,
                 } = pending
                     .take()
                     .expect("prepared vector batch publishes once");
@@ -10379,6 +11374,7 @@ impl VectorStore {
                     accountant,
                     (&tail_insertions, &mut directory_reservations),
                 );
+                self.install_durable_counts(&durable_counts);
             });
             // Publish the matching retained-directory charge before releasing
             // the bulk read guard. Reclamation takes the write side of this
@@ -10406,6 +11402,7 @@ impl VectorStore {
                 projected_live_or_retained_partitions: _,
                 directory_reservation: _,
                 tail_insertions,
+                durable_counts,
             } = prepared;
             self.create_partition_states(&requested);
             let ordered = Self::sorted_partition_refs(touched);
@@ -10418,6 +11415,7 @@ impl VectorStore {
                     accountant,
                     (&tail_insertions, &mut directory_reservations),
                 );
+                self.install_durable_counts(&durable_counts);
 
                 let mut rebuild_indexes = HashSet::<VectorIndexRef>::new();
                 for partition in &reclaimable_partitions {
@@ -10490,10 +11488,23 @@ impl VectorStore {
                 continue;
             };
             let layout = column.layout();
+            let factory = column.durable_partition_factory.read().clone();
             let mut partitions = column.partitions.write();
             for key in keys {
                 partitions.entry(key.clone()).or_insert_with(|| {
-                    Arc::new(IndexState::new(layout.dimension, layout.quantization))
+                    let state = Arc::new(IndexState::new(layout.dimension, layout.quantization));
+                    if let Some(factory) = factory.as_ref() {
+                        let (memberships, loader) =
+                            factory.create(&VectorPartitionRef::new(index.clone(), key.clone()));
+                        state.install_durable_source(
+                            memberships,
+                            loader,
+                            RawVectorMembershipSummary::default(),
+                            self.raw_payload_bytes.clone(),
+                            self.raw_payload_header_bytes.clone(),
+                        );
+                    }
+                    state
                 });
             }
             drop(partitions);
@@ -10767,6 +11778,22 @@ impl VectorStore {
             let column = registry
                 .remove(old)
                 .ok_or_else(|| Error::UnknownVectorIndex { index: old.clone() })?;
+            for state in column.partitions.read().values() {
+                if let Some(source) = state
+                    .durable_membership_source()
+                    .and_then(|source| source.for_renamed_index(&new))
+                {
+                    *state.durable_memberships.write() = Some(source);
+                }
+                let loader = state.raw_loader.read().clone();
+                if let Some(loader) = loader.and_then(|loader| loader.for_renamed_index(&new)) {
+                    *state.raw_loader.write() = Some(loader);
+                }
+            }
+            let reverse = column.durable_reverse_memberships.read().clone();
+            if let Some(source) = reverse.and_then(|source| source.for_renamed_index(&new)) {
+                *column.durable_reverse_memberships.write() = Some(source);
+            }
             registry.insert(new.clone(), column);
             Ok(())
         })
@@ -11034,6 +12061,22 @@ impl VectorStore {
         )
     }
 
+    /// The row's vector visible at `snapshot` in one partition: a point read
+    /// for a durable partition, a load of the resident partition otherwise.
+    #[doc(hidden)]
+    pub fn try_live_entry_for_row_in_partition(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VectorEntry>> {
+        self.with_bulk_read(|| {
+            self.partition_state(index, partition_key)?
+                .load_visible_entry_by_row_caching(index, row_id, snapshot, false)
+        })
+    }
+
     pub fn live_entry_for_row_in_partition(
         &self,
         index: &VectorIndexRef,
@@ -11092,6 +12135,33 @@ impl VectorStore {
             .or(base)
             .map(|generation| generation.covered_tx)
             .or((local_generation_id != 0).then_some(TxId(local_base_tx)));
+        if state.is_durable() {
+            let covered_lsn = change.or(base).map(|generation| generation.covered_lsn);
+            let (pending_inserts, tombstones) =
+                state.durable_pending_counts(covered_tx, covered_lsn);
+            let durable_vector_bytes =
+                state
+                    .entry_count()
+                    .saturating_mul(crate::quantized::stored_vector_resident_bytes(
+                        state.dimension,
+                        state.quantization,
+                    ));
+            return Self::partition_info_from_counts(
+                index,
+                partition_key,
+                state,
+                layout,
+                (live_rows, retained_rows, bytes),
+                (base, change, base_generation, base_tx),
+                (
+                    pending_inserts,
+                    tombstones,
+                    durable_vector_bytes,
+                    charged_vector_bytes,
+                    charged_index_bytes,
+                ),
+            );
+        }
         let directory = state.raw_directory.read();
         #[cfg(test)]
         state.raw_directory_entries_inspected.fetch_add(
@@ -11124,6 +12194,44 @@ impl VectorStore {
             0
         };
         drop(directory);
+        Self::partition_info_from_counts(
+            index,
+            partition_key,
+            state,
+            layout,
+            (live_rows, retained_rows, bytes),
+            (base, change, base_generation, base_tx),
+            (
+                pending_inserts,
+                tombstones,
+                durable_vector_bytes,
+                charged_vector_bytes,
+                charged_index_bytes,
+            ),
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn partition_info_from_counts(
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        state: &Arc<IndexState>,
+        layout: &VectorIndexLayout,
+        (live_rows, retained_rows, bytes): (usize, usize, usize),
+        (base, change, base_generation, base_tx): (
+            Option<VectorGraphGeneration>,
+            Option<VectorGraphGeneration>,
+            Option<u64>,
+            Option<TxId>,
+        ),
+        (
+            pending_inserts,
+            tombstones,
+            durable_vector_bytes,
+            charged_vector_bytes,
+            charged_index_bytes,
+        ): (usize, usize, usize, usize, usize),
+    ) -> VectorPartitionInfo {
         let durable_index_bytes =
             base.into_iter()
                 .chain(change)
@@ -11943,6 +13051,47 @@ impl VectorStore {
         Ok(())
     }
 
+    fn install_durable_counts(&self, counts: &[PreparedDurableCounts]) {
+        for prepared in counts {
+            if let Some(state) = self
+                .try_partition_state(&prepared.partition.index, &prepared.partition.partition_key)
+                && state.is_durable()
+            {
+                *state.durable_counts.lock() = prepared.summary;
+                state.apply_durable_pending_events(&prepared.events);
+                #[cfg(feature = "test-seams")]
+                {
+                    let mut backlog = state.base_backlog.lock();
+                    let covered = backlog.covered_tx;
+                    for event in &prepared.events {
+                        match *event {
+                            DurableMembershipEvent::Opened(created) => {
+                                if created.0 > covered {
+                                    backlog.pending.inserts += 1;
+                                }
+                            }
+                            DurableMembershipEvent::Closed { created, deleted } => {
+                                if created.0 > covered {
+                                    backlog.pending.inserts =
+                                        backlog.pending.inserts.saturating_sub(1);
+                                }
+                                if deleted.0 > covered {
+                                    backlog.pending.tombstones += 1;
+                                }
+                            }
+                            DurableMembershipEvent::PublishedClosed(deleted) => {
+                                if deleted.0 > covered {
+                                    backlog.pending.tombstones += 1;
+                                }
+                            }
+                        }
+                    }
+                    backlog.record_high_water();
+                }
+            }
+        }
+    }
+
     fn apply_admitted_partitioned_changes(
         &self,
         deletes: Vec<PartitionedVectorDelete>,
@@ -11969,6 +13118,16 @@ impl VectorStore {
             let Some(state) = column.partition_state(&delete.partition.partition_key) else {
                 continue;
             };
+            if state.is_durable() {
+                // The membership closed durably with the row; counts are
+                // installed from the prepared projection. A body cache keeps
+                // the closed version for older snapshots.
+                let _residency = state.raw_residency_gate.read();
+                if state.bodies_resident() {
+                    state.tombstone_resident_bodies(delete.row_id, delete.deleted_tx);
+                }
+                continue;
+            }
             if state.tombstone_row(delete.row_id, delete.deleted_tx) != 0 {
                 column.note_tombstone(&delete.partition.partition_key, delete.row_id);
             }
@@ -11991,6 +13150,54 @@ impl VectorStore {
                 );
             }
             let index = insert.entry.index.clone();
+            let residency = state.is_durable().then(|| state.raw_residency_gate.read());
+            if state.is_durable() && state.bodies_resident() {
+                // The membership is durable with the row; a body cache keeps
+                // the body exactly as the resident path does.
+                let mut stored = state.stored_entry(insert.entry);
+                if state.raw_residency_is_accounted() && !stored.vector.payload_is_charged() {
+                    let reservation = directory_reservations
+                        .get_mut(&index)
+                        .expect("accounted insertion owns its prepared header reservation");
+                    let header_bytes = crate::quantized::shared_payload_header_bytes();
+                    assert!(
+                        reservation.bytes >= header_bytes,
+                        "prepared reservation covers the new shared allocation header"
+                    );
+                    reservation.bytes -= header_bytes;
+                    stored.vector.promote_to_shared();
+                }
+                let row_id = stored.row_id;
+                let entry_lsn = stored.lsn;
+                let live = stored.deleted_tx.is_none();
+                state.push_resident_body(stored);
+                drop(residency);
+                if live {
+                    tail_insertions.publish(&state, row_id, entry_lsn);
+                }
+                continue;
+            }
+            drop(residency);
+            if state.is_durable() {
+                // The body and membership are durable with the row. Only the
+                // fresh graph tail takes the vector; the caller's per-insert
+                // body admission is returned because nothing retains it.
+                let row_id = insert.entry.row_id;
+                let entry_lsn = insert.entry.lsn;
+                let live = insert.entry.deleted_tx.is_none();
+                let bytes = crate::quantized::stored_vector_resident_bytes(
+                    insert.entry.vector.len(),
+                    state.quantization,
+                );
+                drop(insert);
+                if let Some(accountant) = accountant {
+                    accountant.release(bytes);
+                }
+                if live {
+                    tail_insertions.publish(&state, row_id, entry_lsn);
+                }
+                continue;
+            }
             let mut stored = state.stored_entry(insert.entry);
             let already_present = state.with_entries(|entries| {
                 entries.iter().any(|existing| {
@@ -12050,6 +13257,52 @@ impl VectorStore {
                     self.raw_payload_bytes.clone(),
                     self.raw_payload_header_bytes.clone(),
                 );
+            }
+            if source.is_durable() || target.is_durable() {
+                // Both placements are durable with the row; preparation
+                // validated the live source. Body caches follow the move: the
+                // source closes its body, and the target takes a copy of it
+                // when the source cached one, or drops its cache otherwise.
+                let moved = {
+                    let _residency = source.raw_residency_gate.read();
+                    let body = source
+                        .bodies_resident()
+                        .then(|| source.stored_by_row_id(row_move.old_row_id))
+                        .flatten();
+                    if source.bodies_resident() {
+                        source.tombstone_resident_bodies(row_move.old_row_id, row_move.tx);
+                    }
+                    body
+                };
+                if target.bodies_resident() {
+                    match moved {
+                        Some(mut moved) if moved.deleted_tx.is_none() => {
+                            moved.row_id = row_move.new_row_id;
+                            moved.created_tx = row_move.tx;
+                            moved.deleted_tx = None;
+                            moved.lsn = lsn;
+                            if moved.vector.payload_identity().is_none()
+                                && let Some(reservation) =
+                                    directory_reservations.get_mut(&row_move.index)
+                            {
+                                // Preparation reserved this copy and its header.
+                                let bytes =
+                                    moved.estimated_bytes().saturating_add(
+                                        crate::quantized::shared_payload_header_bytes(),
+                                    );
+                                reservation.bytes = reservation.bytes.saturating_sub(bytes);
+                                moved.vector.promote_to_shared();
+                            }
+                            let _residency = target.raw_residency_gate.read();
+                            target.push_resident_body(moved);
+                        }
+                        _ => {
+                            target.evict_raw_vectors();
+                        }
+                    }
+                }
+                tail_insertions.publish(&target, row_move.new_row_id, lsn);
+                continue;
             }
             let Some(old) = source.stored_by_row_id(row_move.old_row_id) else {
                 continue;
@@ -12165,6 +13418,80 @@ impl VectorStore {
         })
     }
 
+    /// Make every partition this column creates after open durable, with the
+    /// source and loader `factory` builds. Register with the reverse source.
+    #[doc(hidden)]
+    pub fn register_durable_raw_partition_factory(
+        &self,
+        index: &VectorIndexRef,
+        factory: Arc<dyn DurableRawPartitionFactory>,
+    ) -> Result<()> {
+        self.with_bulk_maintenance(|| {
+            let column = self
+                .try_column(index)
+                .ok_or_else(|| Error::UnknownVectorIndex {
+                    index: index.clone(),
+                })?;
+            if column.durable_reverse_memberships.read().is_none() {
+                return Err(Error::Other(
+                    "durable vector partition factory requires a column reverse source".into(),
+                ));
+            }
+            *column.durable_partition_factory.write() = Some(factory);
+            Ok(())
+        })
+    }
+
+    /// Make every column declared from now on durable through `factory`.
+    #[doc(hidden)]
+    pub fn register_durable_raw_column_factory(&self, factory: Arc<dyn DurableRawColumnFactory>) {
+        *self.durable_columns.write() = Some(factory);
+    }
+
+    /// Install a new column's durable sources when this store is durable.
+    fn make_column_durable(&self, index: &VectorIndexRef, column: &VectorColumnState) {
+        let Some(factory) = self.durable_columns.read().clone() else {
+            return;
+        };
+        let layout = column.layout();
+        let (reverse, partitions) = factory.create(index, &layout);
+        for (key, state) in column.partition_snapshots() {
+            let (memberships, loader) =
+                partitions.create(&VectorPartitionRef::new(index.clone(), key));
+            if state.entry_count() == 0 {
+                state.install_durable_source(
+                    memberships,
+                    loader,
+                    RawVectorMembershipSummary::default(),
+                    self.raw_payload_bytes.clone(),
+                    self.raw_payload_header_bytes.clone(),
+                );
+            } else {
+                state.convert_to_durable(
+                    memberships,
+                    loader,
+                    self.raw_payload_bytes.clone(),
+                    self.raw_payload_header_bytes.clone(),
+                );
+            }
+        }
+        column.row_to_partition.write().clear();
+        column.row_partition_history.write().clear();
+        *column.durable_reverse_memberships.write() = Some(reverse);
+        *column.durable_partition_factory.write() = Some(partitions);
+    }
+
+    /// Whether any registered column keeps its memberships in durable storage.
+    #[doc(hidden)]
+    pub fn has_durable_memberships(&self) -> bool {
+        self.with_bulk_read(|| {
+            self.registry
+                .read()
+                .values()
+                .any(|column| column.durable_reverse_memberships.read().is_some())
+        })
+    }
+
     /// Register only captured catalog metadata and a source factory. The
     /// partition source is opened and verified on its first point/count/cursor
     /// use, never during writable-open registration.
@@ -12231,11 +13558,13 @@ impl VectorStore {
                     "durable vector membership source requires an empty partition".to_string(),
                 ));
             }
-            *state.durable_memberships.write() = Some(memberships);
-            *state.raw_loader.write() = Some(loader);
-            state.raw_resident.store(false, Ordering::SeqCst);
-            *state.raw_payload_counter.write() = self.raw_payload_bytes.clone();
-            *state.raw_payload_header_counter.write() = self.raw_payload_header_bytes.clone();
+            state.install_durable_source(
+                memberships,
+                loader,
+                summary,
+                self.raw_payload_bytes.clone(),
+                self.raw_payload_header_bytes.clone(),
+            );
             if summary.live_entries == 0 && summary.entries != 0 {
                 state.historical_only.store(true, Ordering::SeqCst);
             }
@@ -12536,6 +13865,15 @@ impl VectorStore {
                     continue;
                 };
                 for (_, state) in column.partition_snapshots() {
+                    if let Some(source) = state.durable_membership_source() {
+                        // A durable directory is read from its source; an
+                        // unreadable one contributes nothing to bookkeeping.
+                        let _ = source.visit_identities(&mut || true, &mut |entry| {
+                            entries.push((index.clone(), entry));
+                            Ok(())
+                        });
+                        continue;
+                    }
                     entries.extend(
                         state
                             .raw_directory
@@ -12586,7 +13924,18 @@ impl VectorStore {
                 // Existing resident values are cloned into the staged image;
                 // dormant unrelated partitions retain only their descriptors.
                 workspace = workspace.saturating_add(state.raw_payload_bytes().saturating_mul(4));
-                let contains_selected_row = {
+                let contains_selected_row = if state.is_durable() {
+                    let selected = rows
+                        .iter()
+                        .filter(|(table, _)| table == &index.table)
+                        .map(|(_, row)| *row)
+                        .collect::<HashSet<_>>();
+                    // An unreadable directory is priced as containing them.
+                    !selected.is_empty()
+                        && state
+                            .durable_row_versions(&selected)
+                            .map_or(true, |versions| !versions.is_empty())
+                } else {
                     let directory = state.raw_directory_by_row.read();
                     rows.iter()
                         .any(|(table, row)| table == &index.table && directory.contains_key(row))
@@ -12644,6 +13993,16 @@ impl VectorStore {
                     // Probe the existing row directory: a single-row public
                     // read must not enumerate every other vector on each call.
                     // All versions still select their owning partitions.
+                    if state.is_durable() {
+                        // A durable partition is cached when it holds one of
+                        // the rows and fits; otherwise its rows are point-read.
+                        if !state.durable_row_versions(row_ids)?.is_empty()
+                            && state.try_cache_durable_bodies()?
+                        {
+                            loaded.push(VectorPartitionRef::new(index.clone(), partition_key));
+                        }
+                        continue;
+                    }
                     let contains_selected_row = {
                         let by_row = state.raw_directory_by_row.read();
                         row_ids.iter().any(|row_id| by_row.contains_key(row_id))
@@ -12656,6 +14015,48 @@ impl VectorStore {
                 }
             }
             Ok(loaded)
+        })
+    }
+
+    /// Every version, with its body, of each durable partition that holds a
+    /// version of one of `row_ids`. Authoritative purge reads these as it
+    /// reads a faulted-in resident partition; other partitions stay unread.
+    #[doc(hidden)]
+    pub fn durable_entries_of_partitions_containing_rows(
+        &self,
+        table: &str,
+        row_ids: &HashSet<RowId>,
+    ) -> Result<Vec<PartitionedVectorEntry>> {
+        self.with_bulk_read(|| {
+            let mut entries = Vec::new();
+            for index in Self::sorted_refs(
+                self.registry
+                    .read()
+                    .keys()
+                    .filter(|index| index.table == table)
+                    .cloned(),
+            ) {
+                let Some(column) = self.try_column(&index) else {
+                    continue;
+                };
+                for (partition_key, state) in column.partition_snapshots() {
+                    // A cached durable partition is already among the resident
+                    // entries the caller reads.
+                    if !state.is_durable()
+                        || state.bodies_resident()
+                        || state.durable_row_versions(row_ids)?.is_empty()
+                    {
+                        continue;
+                    }
+                    entries.extend(
+                        state
+                            .durable_entries_selected(&index, SnapshotId(u64::MAX), |_| true)?
+                            .into_iter()
+                            .map(|entry| PartitionedVectorEntry::new(partition_key.clone(), entry)),
+                    );
+                }
+            }
+            Ok(entries)
         })
     }
 
@@ -12799,6 +14200,7 @@ impl VectorStore {
                                 }));
                         }
                         state.clear_hnsw(accountant);
+                        state.refresh_durable_counts();
                     }
                 }
                 if column.layout.read().is_partitioned() {
@@ -12851,6 +14253,7 @@ impl VectorStore {
                             }));
                     }
                     state.clear_hnsw(accountant);
+                    state.refresh_durable_counts();
                 }
                 column.remove_empty_partitioned_states();
                 column.rebuild_current_rows();
@@ -12916,6 +14319,10 @@ impl VectorStore {
                     .map(|(row_id, _, _)| *row_id)
                     .collect::<HashSet<_>>();
                 for (_, state) in column.partition_snapshots() {
+                    if state.is_durable() {
+                        state.evict_raw_vectors();
+                    }
+                    state.refresh_durable_counts();
                     if !state.directory_names_any_row(&row_ids) {
                         continue;
                     }
@@ -12953,6 +14360,26 @@ impl VectorStore {
                 .collect::<HashSet<_>>();
             let mut matched = Vec::new();
             for (_, state) in column.partition_snapshots() {
+                if state.is_durable() {
+                    // Read from the selected rows' own durable prefixes; an
+                    // unreadable directory names nothing for this pass.
+                    matched.extend(
+                        state
+                            .durable_row_versions(&row_ids)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|entry| {
+                                versions.contains(&(entry.row_id, entry.created_tx, entry.lsn))
+                            })
+                            .map(|entry| VectorVersionIdentity {
+                                index: index.clone(),
+                                row_id: entry.row_id,
+                                created_tx: entry.created_tx,
+                                lsn: entry.lsn,
+                            }),
+                    );
+                    continue;
+                }
                 if !state.directory_names_any_row(&row_ids) {
                     continue;
                 }
@@ -12995,6 +14422,12 @@ impl VectorStore {
             };
             let partitions = column.partitions.read();
             for state in partitions.values() {
+                if state.is_durable() {
+                    for entry in state.durable_row_versions(row_ids)? {
+                        visit(&entry)?;
+                    }
+                    continue;
+                }
                 if !state.directory_names_any_row(row_ids) {
                     continue;
                 }
@@ -13029,6 +14462,23 @@ impl VectorStore {
             };
             let mut matched = Vec::new();
             for (_, state) in column.partition_snapshots() {
+                if state.is_durable() {
+                    // An unreadable durable directory names nothing here; the
+                    // caller's durable removal reads the same rows itself.
+                    matched.extend(
+                        state
+                            .durable_row_versions(row_ids)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|entry| VectorVersionIdentity {
+                                index: index.clone(),
+                                row_id: entry.row_id,
+                                created_tx: entry.created_tx,
+                                lsn: entry.lsn,
+                            }),
+                    );
+                    continue;
+                }
                 if !state.directory_names_any_row(row_ids) {
                     continue;
                 }
@@ -13094,6 +14544,38 @@ impl VectorStore {
     ) -> Result<(usize, usize)> {
         self.with_bulk_read(|| {
             let state = self.partition_state(index, partition_key)?;
+            if state.is_durable() {
+                // At or after the frontier every membership is counted by the
+                // maintained summary, and a change suffix by the journal.
+                let counts = state.durable_counts().expect("durable state has counts");
+                if snapshot.0 >= counts.max_tx.0 {
+                    let selected = match after_lsn {
+                        None => Some(counts.live_entries),
+                        Some(after_lsn) => state
+                            .durable_membership_source()
+                            .and_then(|source| source.pending_after(after_lsn).transpose())
+                            .transpose()?
+                            .map(|(pending, _)| pending),
+                    };
+                    if let Some(selected) = selected {
+                        return Ok((counts.entries, selected));
+                    }
+                }
+                let mut raw = 0usize;
+                let mut selected = 0usize;
+                state.visit_durable_intervals(|entry| {
+                    if entry.created_tx.0 <= snapshot.0 {
+                        raw += 1;
+                        if entry.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+                            && after_lsn.is_none_or(|lsn| entry.lsn > lsn)
+                        {
+                            selected += 1;
+                        }
+                    }
+                    Ok(())
+                })?;
+                return Ok((raw, selected));
+            }
             let directory = state.raw_directory.read();
             let mut raw = 0usize;
             let mut selected = 0usize;
@@ -13129,6 +14611,11 @@ impl VectorStore {
     ) -> Result<Vec<VectorEntry>> {
         self.with_bulk_read(|| {
             let state = self.partition_state(index, partition_key)?;
+            if state.is_durable() {
+                return state.durable_entries_selected(index, snapshot, |entry| {
+                    entry.created_tx.0 <= snapshot.0
+                });
+            }
             state.ensure_raw_vectors_loaded()?;
             let (count, snapshot_count) = {
                 let vectors = state.vectors.read();
@@ -13189,12 +14676,23 @@ impl VectorStore {
     ) -> Result<Vec<VectorEntry>> {
         self.with_bulk_read(|| {
             let state = self.partition_state(index, partition_key)?;
-            state.ensure_raw_vectors_loaded()?;
             let selected = |created_tx: TxId, deleted_tx: Option<TxId>, lsn: Lsn| {
                 created_tx.0 <= snapshot.0
                     && deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
                     && after_lsn.is_none_or(|boundary| lsn > boundary)
             };
+            if state.is_durable() {
+                if let Some(after_lsn) = after_lsn
+                    && let Some(entries) =
+                        state.durable_suffix_entries(index, snapshot, after_lsn)?
+                {
+                    return Ok(entries);
+                }
+                return state.durable_entries_selected(index, snapshot, |entry| {
+                    selected(entry.created_tx, entry.deleted_tx, entry.lsn)
+                });
+            }
+            state.ensure_raw_vectors_loaded()?;
             let directory_count = state
                 .raw_directory
                 .read()
@@ -13508,25 +15006,38 @@ impl VectorStore {
             if is_base {
                 // A reopened process starts observation at its real durable
                 // base. Historical high-water before this process is unknown.
+                let durable_pending = state.is_durable().then(|| {
+                    state.durable_pending_counts(
+                        Some(descriptor.identity.covered_tx),
+                        Some(descriptor.identity.covered_lsn),
+                    )
+                });
                 let directory = state.raw_directory.read();
                 let mut backlog = state.base_backlog.lock();
                 if backlog.generation == 0 {
                     backlog.generation = descriptor.identity.generation_id;
                     backlog.covered_tx = descriptor.identity.covered_tx.0;
-                    backlog.pending = crate::observations::VectorBacklog {
-                        inserts: directory
-                            .iter()
-                            .filter(|entry| {
-                                entry.deleted_tx.is_none()
-                                    && entry.created_tx.0 > backlog.covered_tx
-                            })
-                            .count(),
-                        tombstones: directory
-                            .iter()
-                            .filter(|entry| {
-                                entry.deleted_tx.is_some_and(|tx| tx.0 > backlog.covered_tx)
-                            })
-                            .count(),
+                    backlog.pending = if let Some((inserts, tombstones)) = durable_pending {
+                        crate::observations::VectorBacklog {
+                            inserts,
+                            tombstones,
+                        }
+                    } else {
+                        crate::observations::VectorBacklog {
+                            inserts: directory
+                                .iter()
+                                .filter(|entry| {
+                                    entry.deleted_tx.is_none()
+                                        && entry.created_tx.0 > backlog.covered_tx
+                                })
+                                .count(),
+                            tombstones: directory
+                                .iter()
+                                .filter(|entry| {
+                                    entry.deleted_tx.is_some_and(|tx| tx.0 > backlog.covered_tx)
+                                })
+                                .count(),
+                        }
                     };
                     backlog.record_high_water();
                 }
@@ -13604,8 +15115,50 @@ impl VectorStore {
         partition: &VectorPartitionRef,
         generation: u64,
         covered_tx: TxId,
+        covered_lsn: Lsn,
     ) -> Result<()> {
         let state = self.partition_state(&partition.index, &partition.partition_key)?;
+        if state.is_durable() {
+            let prior_covered = {
+                let backlog = state.base_backlog.lock();
+                if backlog.generation == generation {
+                    return Ok(());
+                }
+                backlog.covered_tx
+            };
+            // The pending count before publication is the one commits kept;
+            // the count after is read at the new frontier.
+            let _ = prior_covered;
+            let (inserts, tombstones) =
+                state.durable_pending_counts(Some(covered_tx), Some(covered_lsn));
+            let after = crate::observations::VectorBacklog {
+                inserts,
+                tombstones,
+            };
+            let mut backlog = state.base_backlog.lock();
+            backlog.record_high_water();
+            let event = crate::observations::VectorBasePublicationEvent {
+                partition: partition.clone(),
+                previous_generation: backlog.generation,
+                generation,
+                covered_tx,
+                pending_before: backlog.pending,
+                pending_after: after,
+                previous_generation_high_water: backlog.high_water,
+                previous_generation_total_high_water: backlog.total_high_water,
+                generation_high_water: after,
+            };
+            *backlog = crate::observations::BaseBacklog {
+                generation,
+                covered_tx: covered_tx.0,
+                pending: after,
+                high_water: after,
+                total_high_water: after.inserts.saturating_add(after.tombstones),
+            };
+            drop(backlog);
+            crate::observations::emit(&event);
+            return Ok(());
+        }
         let directory = state.raw_directory.read();
         let mut backlog = state.base_backlog.lock();
         if backlog.generation == generation {
@@ -14290,11 +15843,15 @@ impl VectorStore {
                     continue;
                 };
                 for (_, state) in column.partition_snapshots() {
-                    let contains_selected_row = state
-                        .raw_directory
-                        .read()
-                        .iter()
-                        .any(|entry| row_ids.contains(&entry.row_id));
+                    let contains_selected_row = if state.is_durable() {
+                        !state.durable_row_versions(row_ids)?.is_empty()
+                    } else {
+                        state
+                            .raw_directory
+                            .read()
+                            .iter()
+                            .any(|entry| row_ids.contains(&entry.row_id))
+                    };
                     if !contains_selected_row {
                         continue;
                     }

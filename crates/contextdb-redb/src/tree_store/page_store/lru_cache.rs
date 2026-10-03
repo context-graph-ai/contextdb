@@ -32,6 +32,20 @@ impl<T> LRUCache<T> {
         result
     }
 
+    /// Insert at the front of the eviction order, without a second chance:
+    /// a page a one-pass scan read is the next one evicted unless it is read
+    /// again first, so a scan replaces its own pages rather than hot ones.
+    pub(crate) fn insert_lowest_priority(&mut self, key: u64, value: T) -> Option<T> {
+        let result = self
+            .cache
+            .insert(key, (value, AtomicBool::new(false)))
+            .map(|(x, _)| x);
+        if result.is_none() {
+            self.lru_queue.push_front(key);
+        }
+        result
+    }
+
     pub(crate) fn remove(&mut self, key: u64) -> Option<T> {
         if let Some((value, _)) = self.cache.remove(&key) {
             if self.lru_queue.len() > 2 * self.cache.len() {

@@ -84,7 +84,7 @@ pub(super) fn reverse_row_prefix(index: &VectorIndexRef, row: RowId) -> Vec<u8> 
     key
 }
 
-fn reverse_key(record: &VectorPartitionMembershipRecord) -> Vec<u8> {
+pub(super) fn reverse_key(record: &VectorPartitionMembershipRecord) -> Vec<u8> {
     let mut key = reverse_row_prefix(&record.index, record.row_id);
     key.extend_from_slice(&record.row_created_tx.0.to_be_bytes());
     key.extend_from_slice(&record.row_lsn.0.to_be_bytes());

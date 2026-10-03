@@ -2,7 +2,9 @@
 //! authenticate each record when used, and reuse one admitted decode window.
 //! No decoded directory is retained by the vector store.
 use super::{DormantVectorLoadRequest, RawVectorDirectoryEntry};
-use contextdb_core::{Error, Lsn, Result, RowId, SnapshotId, TxId, VectorPartitionKey};
+use contextdb_core::{
+    Error, Lsn, Result, RowId, SnapshotId, TxId, VectorIndexRef, VectorPartitionKey,
+};
 
 /// Catalog counts maintained atomically with membership publication. These
 /// describe the current published frontier, not a reconstructed history map.
@@ -12,6 +14,25 @@ pub struct RawVectorMembershipSummary {
     pub entries: usize,
     pub live_entries: usize,
     pub max_tx: TxId,
+}
+
+/// One membership change of a durable LSN-ordered change suffix.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawVectorSuffixChange {
+    /// A membership was published; `identity` is its body identity as
+    /// published, visible from `visible_from`.
+    Opened {
+        identity: RawVectorDirectoryEntry,
+        visible_from: TxId,
+    },
+    /// The membership with this body identity closed at `deleted_tx`.
+    Closed {
+        row_id: RowId,
+        created_tx: TxId,
+        lsn: Lsn,
+        deleted_tx: TxId,
+    },
 }
 
 /// Storage-neutral access to a partition's authoritative membership directory.
@@ -26,9 +47,27 @@ pub struct RawVectorMembershipSummary {
 /// root while a reader holds it.
 #[doc(hidden)]
 pub trait RawVectorMembershipSource: Send + Sync {
+    /// Rebind a live writer source after its durable index keys are renamed.
+    /// Captured cursors retain their original source and root.
+    fn for_renamed_index(
+        &self,
+        index: &VectorIndexRef,
+    ) -> Option<std::sync::Arc<dyn RawVectorMembershipSource>> {
+        let _ = index;
+        None
+    }
+
     /// Already-validated catalog metadata for the published frontier. This
     /// method performs no historical record reads or decoded allocations.
     fn published_summary(&self) -> RawVectorMembershipSummary;
+
+    /// The maintained counts at the writer's current published root, read
+    /// after a durable removal the store did not publish itself (retention,
+    /// version cleanup, purge). A source pinned to one root returns its
+    /// published summary.
+    fn current_summary(&self) -> Result<RawVectorMembershipSummary> {
+        Ok(self.published_summary())
+    }
 
     /// Count visible intervals against the same root used by `open` and point
     /// probes. Older frontiers use indexed durable interval work. Verify every
@@ -62,6 +101,52 @@ pub trait RawVectorMembershipSource: Send + Sync {
         lsn: Lsn,
         before_read: &mut dyn FnMut() -> bool,
     ) -> Result<Option<RawVectorDirectoryEntry>>;
+
+    /// Live memberships published after `covered_lsn` and memberships closed
+    /// after it, counted from a durable LSN-ordered change suffix without
+    /// reading the covered memberships. `None` when this source keeps no such
+    /// suffix.
+    fn pending_after(&self, covered_lsn: Lsn) -> Result<Option<(usize, usize)>> {
+        let _ = covered_lsn;
+        Ok(None)
+    }
+
+    /// Visit every membership change after `after_lsn` in LSN order.
+    /// `Ok(false)` when this source keeps no such suffix.
+    fn visit_suffix(
+        &self,
+        after_lsn: Lsn,
+        visit: &mut dyn FnMut(RawVectorSuffixChange) -> Result<()>,
+    ) -> Result<bool> {
+        let _ = (after_lsn, visit);
+        Ok(false)
+    }
+
+    /// Visit every retained version of one row in this partition, as body
+    /// identities, reading only that row's prefix.
+    fn visit_row_versions(
+        &self,
+        row: RowId,
+        before_read: &mut dyn FnMut() -> bool,
+        visit: &mut dyn FnMut(RawVectorDirectoryEntry) -> Result<()>,
+    ) -> Result<()> {
+        let _ = (row, before_read, visit);
+        Err(Error::Other(
+            "this vector membership source cannot visit row versions".into(),
+        ))
+    }
+
+    /// Every membership's body identity, in durable key order.
+    fn visit_identities(
+        &self,
+        before_read: &mut dyn FnMut() -> bool,
+        visit: &mut dyn FnMut(RawVectorDirectoryEntry) -> Result<()>,
+    ) -> Result<()> {
+        let _ = (before_read, visit);
+        Err(Error::Other(
+            "this vector membership source cannot list body identities".into(),
+        ))
+    }
 
     /// A root-pinned stream in full durable key order. Scratch is admitted
     /// before allocation through `request`. The caller owns the returned
@@ -104,6 +189,16 @@ impl std::fmt::Debug for dyn RawVectorMembershipCursor {
 /// A false callback stops before the read and returns an error.
 #[doc(hidden)]
 pub trait RawVectorReverseMembershipSource: Send + Sync {
+    /// Rebind a live writer source after its durable index keys are renamed.
+    /// Captured cursors retain their original source and root.
+    fn for_renamed_index(
+        &self,
+        index: &VectorIndexRef,
+    ) -> Option<std::sync::Arc<dyn RawVectorReverseMembershipSource>> {
+        let _ = index;
+        None
+    }
+
     fn visible_partition(
         &self,
         row: RowId,

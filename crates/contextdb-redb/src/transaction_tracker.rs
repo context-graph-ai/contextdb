@@ -157,6 +157,7 @@ impl TransactionTracker {
         }
     }
 
+    #[cfg(feature = "contextdb-internal")]
     pub(crate) fn install_local_snapshot_provider(&self, provider: ExternalSnapshotProvider) {
         self.local_snapshot_provider.get_or_init(|| provider);
     }

@@ -276,12 +276,29 @@ impl MaintenanceContext {
         if self.vector.partition_route_quarantine(partition).is_some() {
             return Ok(None);
         }
-        install_paged_root_capture(persistence, &self.tx_mgr);
-        let recorded = persistence.load_paged_build_record(partition)?;
-        if recorded.is_none()
-            && (!self.paged_base_build_applies(partition, persistence)?
-                || self.whole_build_fits(partition)?)
-        {
+        // Route selection owns keys and decoded catalog metadata before its
+        // first source read. This phase ends before a batch owns its workspace.
+        let (recorded, base_build_applies) = {
+            let inventory_bytes = partition
+                .partition_key
+                .estimated_bytes()
+                .saturating_add(partition.index.table.len())
+                .saturating_add(partition.index.column.len())
+                .saturating_add(1024)
+                .saturating_mul(64);
+            let _inventory = self.vector.reserve_workspace(
+                self.accountant.clone(),
+                inventory_bytes,
+                "prepare_vector_generation",
+                "Raise MEMORY_LIMIT before inspecting this maintained route.",
+            )?;
+            install_paged_root_capture(persistence, &self.tx_mgr);
+            let recorded = persistence.load_paged_build_record(partition)?;
+            let applies =
+                recorded.is_some() || self.paged_base_build_applies(partition, persistence)?;
+            (recorded, applies)
+        };
+        if recorded.is_none() && (!base_build_applies || self.whole_build_fits(partition)?) {
             return Ok(None);
         }
         // Admission first: a budget that cannot fund one construction batch
@@ -302,6 +319,18 @@ impl MaintenanceContext {
                 "prepare_vector_generation",
                 "Raise MEMORY_LIMIT with SET MEMORY_LIMIT <SIZE> (or reopen with --memory-limit <SIZE>) before compacting this maintained route.",
             )?);
+        }
+        if recorded.is_none()
+            && self
+                .vector
+                .partition_paged_build_progress(partition)
+                .is_some()
+        {
+            // Erasure removed this partition's build durably; forget the
+            // in-process registration, its floor and its reported progress.
+            self.vector.forget_partition_paged_build(partition);
+            self.snapshot_registry.release_construction_floor(partition);
+            self.vector.clear_partition_paged_build_progress(partition);
         }
         let record = match recorded {
             Some(record) => {
@@ -426,6 +455,7 @@ impl MaintenanceContext {
                 &partition.partition_key,
             )?
             .is_some_and(|catalog| catalog.change.is_none())
+            && !self.vector.partition_has_paged_storage(partition)
             && !topology_replacement;
         Ok(!publish_change)
     }
@@ -487,6 +517,7 @@ impl MaintenanceContext {
         let publish_change = current
             .as_ref()
             .is_some_and(|catalog| catalog.change.is_none())
+            && !self.vector.partition_has_paged_storage(partition)
             && !topology_replacement;
         if publish_change {
             return Ok(None);
@@ -644,6 +675,7 @@ impl MaintenanceContext {
             partition,
             progress.generation_id,
             progress.frontier_tx,
+            progress.frontier_lsn,
         )?;
         let published_catalog = candidate.catalog;
         drop(candidate.base);

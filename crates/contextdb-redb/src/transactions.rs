@@ -998,7 +998,7 @@ impl WriteTransaction {
     }
 
     /// Inspect only the oldest entry in each free tree using the same fence
-    /// as durable_commit. A live reader protects newer entries, not every
+    /// as `durable_commit`. A live reader protects newer entries, not every
     /// deferred allocation in the file.
     pub(crate) fn eligible_pending_free_pages(&self) -> Result<bool> {
         let free_until = self

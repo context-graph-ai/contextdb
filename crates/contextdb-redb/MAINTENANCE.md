@@ -40,7 +40,8 @@ binds every recorded source hunk to the maintained file it produces.
 | `src/tree_store/table_tree.rs` | Advance a finite compaction cursor past a protected allocator source without reading its payload. Enumerate and relocate the selected page batch, expose consistent statistics, the read transaction's user-tree root and its read hint; authenticate just the root page for bounded external admission; pop a deferred-free list tail in place without a scratch collection; report actual user-directory inserts/removals, and each copy-on-write page the table tree makes unreachable, under `test-seams`. |
 | `src/tree_store/btree_base.rs` | Let an access guard hold a read page as `PageMemory`, keeping any charge the page carries alive while the guard is; allow crate-private mutation of an existing copy-on-write value so partial free-list cleanup needs no temporary page vector. |
 | `src/tree_store/table_tree_base.rs` | Forward bounded page traversal for the table root. |
-| `src/tree_store/page_store/cached_file.rs` | Admit page/cache-entry bytes before allocation and observe successful backend reads; hand readers a `PageMemory` that, for a page the read cache does not keep, carries the charge its admission returned until the last holder drops the page; count a cached page against the cache budget until the page itself is dropped (`CachedPage`), so a page evicted while a reader still holds it stays counted, eviction frees only pages no reader holds, and a miss is cached only when its count fits the budget; keep caller quota refusals recoverable while real backend I/O failures still poison the handle; read contextdb-internal bounded windows with admission before allocation and backend I/O, copying cached or buffered sources without installing a partial cache page; on resize invalidate only cached pages that reach past the new end, so a truncating compaction step keeps the valid working set instead of dropping the whole read cache. |
+| `src/tree_store/page_store/cached_file.rs` | Admit page/cache-entry bytes before allocation and observe successful backend reads; hand readers a `PageMemory` that, for a page the read cache does not keep, carries the charge its admission returned until the last holder drops the page; count a cached page against the cache budget until the page itself is dropped (`CachedPage`), so a page evicted while a reader still holds it stays counted, eviction frees only pages no reader holds, and a miss is cached only when its count fits the budget; keep caller quota refusals recoverable while real backend I/O failures still poison the handle; read contextdb-internal bounded windows with admission before allocation and backend I/O, copying cached or buffered sources without installing a partial cache page; on resize invalidate only cached pages that reach past the new end, so a truncating compaction step keeps the valid working set instead of dropping the whole read cache; under one-pass scan reads a miss may use free cache room only within the scan's 16 KiB growth allowance; past it a miss first evicts as many bytes as it needs and enters the cache at lowest priority only if that eviction made room, otherwise it is returned uncached (hits are still served), so an exhaustive scan grows the cache by at most the allowance and replaces its own pages before the warm working set. |
+| `src/tree_store/page_store/lru_cache.rs` | Insert a page at the front of the eviction order without a second chance (`insert_lowest_priority`), so a page a one-pass scan installs is the next one evicted unless it is read again, and a scan replaces its own pages rather than the warm working set. |
 | `src/tree_store/page_store/mod.rs` | Re-export `PageMemory` to the tree code that holds read pages and register the allocator pager. |
 | `src/tree_store/page_store/page_manager.rs` | Leave the allocator layout and recovery state unchanged when a caller refuses projected file growth before resize; allow caller-retained external readers to use file geometry while a live writer has marked the current header dirty, without recovery or allocator writes, and without asserting that a concurrently growing file still matches the captured header length; publish the clean committed header before a graceful read-only handoff without closing the writer backend; validate byte-window ranges against their allocation extent before storage access. Choose paged allocators when the backend supplies scratch, lazily read saved allocator words, preserve repair and growth ordering, and refuse publication or clean Drop after a sticky scratch fault. Before explicit integrity repair, align an aborted writer's free tail to the committed header geometry. |
 | `src/tree_store/page_store/file_backend/optimized.rs`, `src/tree_store/page_store/file_backend/fallback.rs` | Supply same-directory scratch for normal path-based file opens on every supported platform. File-only opens recover the path from Linux/Android, macOS, and Windows handles; other targets treat pathless raw handles as opaque backends with optional backing `None`, preserving raw `File` opens. Known paths always request same-directory scratch and propagate scratch errors. The scratch directory entry is removed immediately after creation, so process death leaves no orphan. |
@@ -49,7 +50,7 @@ binds every recorded source hunk to the maintained file it produces.
 | `src/tree_store/btree.rs`, `src/tree_store/btree_base.rs`, `src/tree_store/btree_mutator.rs` | Reserve allocator values from a length-only zero source, initialize the destination directly, and preserve arbitrary byte-value insertion and the v3 serialized node layout. Replacement accounting is separate from retaining the discarded old value. |
 | `src/tree_store/page_store/layout.rs` | Reuse the rounding remainder, preserving arithmetic while satisfying current strict lints. |
 | `src/tree_store/page_store/base.rs` | Hold a read page as `PageMemory` so a charge it carries lives exactly as long as the page; validate serialized external page identities before constructing allocation extents, including the encoded allocation order; distinguish checksum-verifying retained page faults from ordinary cache hints. |
-| `src/read_admission.rs` (added) | Scope read admission and backend-read observation callbacks to the active thread using RAII guards; a charging admission (`with_read_page_charge`) returns a per-page charge that the page carries. |
+| `src/read_admission.rs` (added) | Scope read admission and backend-read observation callbacks to the active thread using RAII guards; a charging admission (`with_read_page_charge`) returns a per-page charge that the page carries. One-pass scan reads (`scan_reads` guard, `with_scan_reads`) mark this thread's reads so, past a 16 KiB growth allowance (`ScanAllowance`, shared by nested scopes and re-entered across one statement's resumed steps), a cache miss replaces evictable cached bytes instead of growing the read cache. |
 | `src/open_with_backend_region_override_tests.rs` (added) | Verify existing-storage backend open ignores a creation-only region-size override. |
 
 The allocator metadata seam is compiled only under `test-seams`; it delegates to the production resident-byte count. A nested, thread-local `observe_allocator_region_loads_for_test` counter counts region views materialized during its scope. Writable startup uses lazy saved-word lookup, so that counter does not imply a whole-table load. The read-only `allocator_regions_for_test` accessor reads the current scalar region count under the state mutex; `Builder::set_region_size` remains a `test-seams` fixture constructor.
@@ -277,6 +278,32 @@ probe without flushing pending root updates or finalizing dirty payload checksum
 an existing empty table from an absent family. The engine caches this existence result per table
 while maintaining row heads; ordinary `open_table` type validation and exact row-body checks remain.
 The finalized root fingerprint API is unchanged and still supplies durable root bindings.
+
+The one-pass scan seam carries an operation-owned cache-growth allowance across
+resumed reads and nested scopes; once that allowance is exhausted, misses replace
+evictable pages at lowest priority rather than filling unused cache capacity. This
+keeps exhaustive reads from displacing the useful working set or allocating a
+second scan cache. Propose the storage-neutral RAII scan scope, shared allowance
+and lowest-priority insertion upstream against redb 4.1.0; an upstream equivalent
+would let `ScanAllowance`, `scan_reads`, `with_scan_reads` and their cache hooks
+shrink out of the fork. This proposal has not been submitted upstream.
+
+Saved region-tracker payloads remain source-backed on writable reopen: only
+order/height geometry is resident, while tracker words and regional bitmap words
+share `AllocatorPager`'s 32 fixed windows. A tracker lookup reads one saved layer
+window; geometry masks padding past the actual region count. Successful allocation
+marks the used region's now-full orders immediately, retaining fast startup
+selection without a decoded tracker directory. Before detaching a saved source,
+tracker words also spill through those windows; the small-source bound includes
+the tracker encoding. The resident observation keeps its fixed control allowance
+and reports any larger actual descriptor owner rather than hiding it. These
+changes extend the existing upstream proposal for source-backed fixed-window
+allocator metadata against redb 4.1.0.
+
+Tracker marking skips already-equal leaf states. Source-only cache misses reuse
+clean windows before spilling dirty words, so serializing saved geometry does
+not force dirty allocator words out while a clean window is available. These
+rules stay inside the same fixed window owner and add no resident directory.
 
 The engine can install a process-local snapshot provider beside authenticated
 external registrations. New local roots pass the same native-pin and checksum

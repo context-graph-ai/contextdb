@@ -132,7 +132,10 @@ mod read_admission;
 #[doc(hidden)]
 pub use read_admission::{BackendReadObservation, observe_backend_reads};
 #[doc(hidden)]
-pub use read_admission::{ReadPageCharge, with_read_memory_admission, with_read_page_charge};
+pub use read_admission::{
+    ReadPageCharge, ScanAllowance, ScanReads, scan_reads, with_read_memory_admission,
+    with_read_page_charge, with_scan_reads,
+};
 
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]

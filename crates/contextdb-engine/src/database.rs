@@ -14559,8 +14559,123 @@ impl DurableRawVectorPartitionLoader {
 }
 
 impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
+    fn for_renamed_index(&self, index: &VectorIndexRef) -> Option<Arc<dyn DormantRawVectorLoader>> {
+        if !matches!(self.source, DurableRawVectorSource::Writable(_)) {
+            return None;
+        }
+        Some(Arc::new(Self {
+            source: self.source.clone(),
+            accountant: self.accountant.clone(),
+            partition: VectorPartitionRef::new(index.clone(), self.partition.partition_key.clone()),
+            dimension: self.dimension,
+            quantization: self.quantization,
+        }))
+    }
+
     fn supports_bounded_candidate_load(&self) -> bool {
         true
+    }
+
+    fn load_all(&self) -> Result<LoadedRawVectorPartition> {
+        let decoded_bytes_per_entry = Self::checked_mul(
+            self.dimension,
+            std::mem::size_of::<f32>(),
+            "decoded F32 body",
+        )?;
+        let stored_bytes_per_entry = self.stored_bytes_per_entry()?;
+        let index_bytes = Self::checked_add(
+            self.partition.index.table.len(),
+            self.partition.index.column.len(),
+            "index metadata",
+        )?;
+        let workspace_per_entry = Self::checked_add(
+            decoded_bytes_per_entry,
+            Self::checked_add(
+                std::mem::size_of::<VectorEntry>(),
+                index_bytes,
+                "entry metadata",
+            )?,
+            "entry workspace",
+        )?;
+        // One decoded route and one body decode coexist with the entries.
+        let decode_scratch = Self::checked_add(
+            Self::checked_add(
+                decoded_bytes_per_entry,
+                stored_bytes_per_entry,
+                "decode scratch",
+            )?,
+            Self::checked_add(
+                Self::checked_mul(
+                    Self::checked_add(
+                        index_bytes.saturating_add(self.partition.partition_key.estimated_bytes()),
+                        128,
+                        "route framing",
+                    )?,
+                    8,
+                    "streamed route scratch",
+                )?,
+                1024 * 1024,
+                "serde initial sequence capacity",
+            )?,
+            "body and metadata scratch",
+        )?;
+        let mut charged = (0usize, 0usize, 0usize);
+        let loaded = self.source.stream_memberships(
+            &self.partition,
+            self.dimension,
+            self.quantization,
+            |count| {
+                let resident = Self::checked_mul(count, stored_bytes_per_entry, "partition residency")?;
+                let workspace =
+                    Self::checked_mul(count, workspace_per_entry, "returned decode workspace")?;
+                let total = Self::checked_add(
+                    Self::checked_add(resident, workspace, "partition retained reservation")?,
+                    decode_scratch,
+                    "partition load reservation",
+                )?;
+                self.accountant.try_allocate_for(total, "vector_store", "load_raw_vector_partition",
+                    "Evict another raw vector partition, narrow the selected scope, or raise MEMORY_LIMIT before reading these vector bodies.")?;
+                charged = (resident, workspace, total);
+                Ok(Vec::<VectorEntry>::with_capacity(count))
+            },
+            |entries, membership, load_body| {
+                if membership.visible_from
+                    != TxId(membership.row_created_tx.0.max(membership.vector_created_tx.0))
+                    || membership
+                        .deleted_tx
+                        .is_some_and(|deleted| deleted.0 <= membership.visible_from.0)
+                {
+                    return Err(Error::Other(
+                        "raw vector partition membership has an invalid lifecycle boundary"
+                            .to_string(),
+                    ));
+                }
+                if entries.len() == entries.capacity() {
+                    return Err(Error::Other(
+                        "raw vector partition grew outside its counted load".to_string(),
+                    ));
+                }
+                entries.push(load_body(&membership)?);
+                Ok(())
+            },
+        );
+        let (resident_bytes, workspace_bytes, total) = charged;
+        match loaded {
+            Err(error) => {
+                self.accountant.release(total);
+                Err(error)
+            }
+            Ok(entries) => {
+                self.accountant
+                    .release(total - resident_bytes - workspace_bytes);
+                Ok(LoadedRawVectorPartition {
+                    entries,
+                    resident_bytes,
+                    workspace_bytes,
+                    accountant: self.accountant.clone(),
+                })
+            }
+        }
     }
 
     fn exact_comparison_streams_when_partition_does_not_fit(&self) -> bool {
@@ -14761,6 +14876,36 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
             scan.read_body(&self.partition, identity, self.dimension, self.quantization)
         })
     }
+
+    fn one_pass_reads(
+        &self,
+        session: &mut contextdb_vector::store::OnePassSession,
+    ) -> Option<Box<dyn std::any::Any>> {
+        // One cache-growth allowance for the whole statement's scan, however
+        // many resumed steps it takes.
+        let allowance = session
+            .0
+            .get_or_insert_with(|| Box::new(redb::ScanAllowance::new()))
+            .downcast_ref::<redb::ScanAllowance>()?
+            .clone();
+        Some(Box::new(allowance.enter()))
+    }
+
+    fn load_candidate_with_scan_once(
+        &self,
+        scan: &mut dyn RawVectorBodyScan,
+        identity: &RawVectorDirectoryEntry,
+        caller_charged: bool,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<LoadedRawVectorCandidate> {
+        // A one-pass exhaustive scan's body pages must not fill the shared
+        // read cache and displace its warm working set.
+        self.load_candidate_via(identity, caller_charged, request, &mut || {
+            redb::with_scan_reads(|| {
+                scan.read_body(&self.partition, identity, self.dimension, self.quantization)
+            })
+        })
+    }
 }
 
 impl contextdb_vector::store::RawVectorBodyScan for crate::persistence::RetainedRawVectorBodyScan {
@@ -14952,18 +15097,83 @@ fn durable_raw_vector_partitions(
     Ok(dormant)
 }
 
+/// A writable open registers durable membership sources: one reverse source
+/// and one partition factory per vector column, and one forward source per
+/// partition with a maintained summary. Registration reads only those
+/// summary records; no membership record is enumerated and no directory is
+/// retained. Every later operation reads the writer's current root.
 fn register_dormant_raw_vector_partitions(
     vector: &VectorStore,
     persistence: &Arc<RedbPersistence>,
     accountant: &Arc<MemoryAccountant>,
 ) -> Result<()> {
-    let memberships = persistence.load_vector_partition_memberships()?;
-    vector.replace_with_dormant_raw_partitions(durable_raw_vector_partitions(
-        vector,
-        DurableRawVectorSource::Writable(persistence.clone()),
-        memberships,
-        accountant,
-    )?)
+    use crate::persistence::vector_membership_source::{
+        DurableColumnSourceFactory, DurableMembershipSource,
+    };
+    let loader_for: crate::persistence::vector_membership_source::DurableLoaderBuilder = {
+        let persistence = persistence.clone();
+        let accountant = accountant.clone();
+        Arc::new(
+            move |partition: &VectorPartitionRef, layout: &contextdb_vector::VectorIndexLayout| {
+                Arc::new(DurableRawVectorPartitionLoader {
+                    source: DurableRawVectorSource::Writable(persistence.clone()),
+                    accountant: accountant.clone(),
+                    partition: partition.clone(),
+                    dimension: layout.dimension,
+                    quantization: layout.quantization,
+                }) as Arc<dyn DormantRawVectorLoader>
+            },
+        )
+    };
+    let columns = Arc::new(DurableColumnSourceFactory {
+        persistence: persistence.clone(),
+        accountant: accountant.clone(),
+        loader: loader_for.clone(),
+    });
+    let layouts = vector.index_layout_infos();
+    for info in &layouts {
+        let (reverse, partitions) = columns.column_sources(&info.index, &info.layout);
+        vector.register_durable_raw_reverse_source(&info.index, reverse)?;
+        vector.register_durable_raw_partition_factory(&info.index, partitions)?;
+    }
+    let mut partitions = persistence.durable_membership_partitions()?;
+    // An unpartitioned column's single partition exists from declaration;
+    // it is durable even before its first membership is published.
+    for info in &layouts {
+        if !info.layout.is_partitioned()
+            && !partitions
+                .iter()
+                .any(|(partition, _)| partition.index == info.index)
+        {
+            partitions.push((
+                VectorPartitionRef::new(info.index.clone(), VectorPartitionKey::unpartitioned()),
+                contextdb_vector::store::RawVectorMembershipSummary::default(),
+            ));
+        }
+    }
+    for (partition, summary) in partitions {
+        let Some(info) = layouts.iter().find(|info| info.index == partition.index) else {
+            return Err(Error::StoreCorrupted {
+                path: "vector_membership_summary_pages".into(),
+                reason: format!(
+                    "membership summary names undeclared vector column {}.{}",
+                    partition.index.table, partition.index.column
+                ),
+            });
+        };
+        vector.register_durable_raw_partition(
+            &partition,
+            DurableMembershipSource::new(
+                persistence.clone(),
+                partition.clone(),
+                summary,
+                accountant.clone(),
+            ),
+            loader_for(&partition, &info.layout),
+        )?;
+    }
+    vector.register_durable_raw_column_factory(columns);
+    Ok(())
 }
 
 /// Persistence-owned loader attached to one lightweight generation
@@ -17594,12 +17804,12 @@ impl MaintenanceContext {
         // Base generations are built by finite restartable paged batches;
         // only sealed changes over a published base and route repair remain
         // on the resident path below.
-        if let Some(outcome) = self.advance_paged_vector_build(partition)? {
+        if let Some(outcome) = vector_source_page_admission::with_preparation_source_page_admission(
+            Arc::clone(&self.accountant),
+            || self.advance_paged_vector_build(partition),
+        )? {
             return Ok(outcome);
         }
-        // The durable floor of a whole build lives exactly as long as this
-        // call; only a crash leaves it for the next open to restore.
-        let _whole_build_floor = vector_paged_build::WholeBuildFloor::new(self, partition);
         loop {
             let layout = self.vector.index_layout(&partition.index)?;
             let live_vectors = self
@@ -17646,6 +17856,9 @@ impl MaintenanceContext {
                 "prepare_vector_generation",
                 "Raise MEMORY_LIMIT before inspecting this maintained route.",
             )?;
+            // Install cleanup only after metadata admission, so an early
+            // refusal cannot read storage while dropping a construction floor.
+            let _whole_build_floor = vector_paged_build::WholeBuildFloor::new(self, partition);
             // Borrow the fixed catalog suffix for pricing under the admitted
             // metadata workspace; graph owners wait for complete build sizing.
             let current_descriptors = if quarantined {
@@ -17664,6 +17877,7 @@ impl MaintenanceContext {
             let publish_change = current_descriptors
                 .as_ref()
                 .is_some_and(|(_, change)| change.is_none())
+                && !self.vector.partition_has_paged_storage(partition)
                 && partition_state_present
                 && !topology_replacement;
             let after_lsn = publish_change.then(|| {
@@ -18347,6 +18561,7 @@ impl MaintenanceContext {
                                 partition,
                                 candidate.catalog.base.generation_id,
                                 candidate.catalog.base.covered_tx,
+                                candidate.catalog.base.covered_lsn,
                             )?;
                         }
                         Ok(true)
@@ -44023,7 +44238,13 @@ impl Database {
             self.vector_store
                 .ensure_raw_partitions_containing_rows(table, row_ids)?;
         }
-        let all_partitioned_vector_entries = self.vector_store.all_partitioned_entries();
+        let mut all_partitioned_vector_entries = self.vector_store.all_partitioned_entries();
+        for (table, row_ids) in &selected_by_table {
+            all_partitioned_vector_entries.extend(
+                self.vector_store
+                    .durable_entries_of_partitions_containing_rows(table, row_ids)?,
+            );
+        }
         let selected_partitioned_vector_entries = all_partitioned_vector_entries
             .iter()
             .filter(|entry| selected(&entry.entry.index.table, &entry.entry.row_id))
@@ -48825,15 +49046,17 @@ impl Database {
         };
         let fragmentation_before = persistence.fragmentation_ratio().unwrap_or(0.0);
         let bytes_before = self.disk_file_size();
-        let memberships = persistence.load_vector_partition_memberships()?;
-        let raw_loaders = durable_raw_vector_partitions(
-            &self.vector_store,
-            DurableRawVectorSource::Writable(persistence.clone()),
-            memberships,
-            &self.accountant,
-        )?;
-        self.vector_store
-            .attach_durable_raw_partition_loaders(raw_loaders)?;
+        if !self.vector_store.has_durable_memberships() {
+            let memberships = persistence.load_vector_partition_memberships()?;
+            let raw_loaders = durable_raw_vector_partitions(
+                &self.vector_store,
+                DurableRawVectorSource::Writable(persistence.clone()),
+                memberships,
+                &self.accountant,
+            )?;
+            self.vector_store
+                .attach_durable_raw_partition_loaders(raw_loaders)?;
+        }
         let start = Instant::now();
         let recycled = loop {
             let (progress, recycled) = publish_storage_compaction_batch(

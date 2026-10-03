@@ -838,14 +838,12 @@ impl CompositeStore {
                 index.table, index.column
             )));
         }
-        self.vector
-            .ensure_raw_partition_loaded(index, partition_key)?;
-        Ok(self.vector.live_entry_for_row_in_partition(
+        self.vector.try_live_entry_for_row_in_partition(
             index,
             partition_key,
             row_id,
             SnapshotId::from_raw_wire(u64::MAX),
-        ))
+        )
     }
 
     fn prepared_binding(
