@@ -11489,16 +11489,18 @@ fn ordered_scan<'a>(
     // leading equality prefix leaves the following index column ordered, so
     // it asks the same prefix rule as the eager executor instead of falling
     // through to a buffered sort.
-    let decl = crate::executor::sort_elision_index_decl(db, input, keys).or_else(|| {
+    let automatic_ordered = db.automatic_indexes_are_ordered();
+    let decl = crate::executor::bounded_sort_elision_index_decl(db, input, keys).or_else(|| {
         let filter = filter.as_ref()?;
         let meta = db.table_meta(table)?;
-        let pick = crate::executor::analyze_filter_for_index_with_sort(
+        let pick = crate::executor::analyze_filter_for_index_with_capability(
             table,
             &meta,
             filter,
             params,
             Some(keys),
             true,
+            automatic_ordered,
         )
         .pick?;
         meta.indexes
@@ -11539,13 +11541,14 @@ fn ordered_scan<'a>(
     // otherwise turns a selective ordered query into a full ordered scan.
     let sort_analysis = filter.as_ref().and_then(|filter| {
         let meta = db.table_meta(table)?;
-        Some(crate::executor::analyze_filter_for_index_with_sort(
+        Some(crate::executor::analyze_filter_for_index_with_capability(
             table,
             &meta,
             filter,
             params,
             Some(keys),
             true,
+            automatic_ordered,
         ))
     });
     let predicate_pick = sort_analysis

@@ -167,6 +167,20 @@ pub(crate) struct BoundedGraphEdgeCursor {
     last_emitted: Option<BoundedGraphEdgeAnchor>,
     snapshot: SnapshotId,
     retained_bytes: usize,
+    /// A durable writer's committed edges, read from the root this read
+    /// captured. Present instead of the resident key lists above.
+    durable: Option<DurableGraphEdgeScan>,
+}
+
+/// The committed-edge source of an unpinned bounded read over a durable
+/// writer. The root is immutable, so the continuation is the physical key of
+/// the last entry fully consumed; a live cursor is kept between pulls and is
+/// reopened after that key whenever a pull failed part way through an entry.
+struct DurableGraphEdgeScan {
+    root: Arc<crate::persistence::WriterSnapshot>,
+    cursor: Option<crate::persistence::writer_source::WriterReadCursor>,
+    last_key: Vec<u8>,
+    has_last_key: bool,
 }
 
 /// The first staged phase this direction has anything to walk in.
@@ -2878,62 +2892,44 @@ impl Database {
         let (deleted, staged_inserts) = self.graph_tx_edge_overlay(tx)?;
         let mut candidates = Vec::<CountedGraphScanCandidate>::new();
 
-        if matches!(direction, Direction::Outgoing | Direction::Both) {
-            let forward = self.graph_store.forward_adj.read();
-            for entries in forward.values() {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    if deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target)) {
-                        continue;
-                    }
-                    candidates.push((
-                        GraphScanCandidate {
-                            start: entry.source,
-                            neighbor: entry.target,
-                            source: entry.source,
-                            target: entry.target,
-                        },
-                        entry.edge_type.clone(),
-                        (entry.source, entry.target),
-                    ));
-                }
+        let mut output =
+            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
+        for (orientation, reverse) in [(Direction::Outgoing, false), (Direction::Incoming, true)] {
+            if !matches!(direction, Direction::Both) && direction != orientation {
+                continue;
             }
-        }
-
-        if matches!(direction, Direction::Incoming | Direction::Both) {
-            let reverse = self.graph_store.reverse_adj.read();
-            for entries in reverse.values() {
-                for entry in entries {
-                    if !entry.visible_at(snapshot) {
-                        continue;
-                    }
-                    if let Some(types) = edge_types
-                        && !types.contains(&entry.edge_type)
-                    {
-                        continue;
-                    }
-                    if deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target)) {
-                        continue;
-                    }
-                    candidates.push((
-                        GraphScanCandidate {
-                            start: entry.target,
-                            neighbor: entry.source,
-                            source: entry.source,
-                            target: entry.target,
-                        },
-                        entry.edge_type.clone(),
-                        (entry.target, entry.source),
-                    ));
+            self.visit_graph_adjacency(reverse, |entry| {
+                if !entry.visible_at(snapshot)
+                    || edge_types.is_some_and(|types| !types.contains(&entry.edge_type))
+                    || deleted.contains(&(entry.source, entry.edge_type.clone(), entry.target))
+                {
+                    return Ok(());
                 }
-            }
+                output.try_grow_for(
+                    entry.edge_type.len().saturating_add(
+                        std::mem::size_of::<CountedGraphScanCandidate>().saturating_mul(2),
+                    ),
+                    "writer_source",
+                    "graph_scan_candidates",
+                    "Raise MEMORY_LIMIT to scan these graph edges.",
+                )?;
+                let (start, neighbor) = if reverse {
+                    (entry.target, entry.source)
+                } else {
+                    (entry.source, entry.target)
+                };
+                candidates.push((
+                    GraphScanCandidate {
+                        start,
+                        neighbor,
+                        source: entry.source,
+                        target: entry.target,
+                    },
+                    entry.edge_type.clone(),
+                    (start, neighbor),
+                ));
+                Ok(())
+            })?;
         }
 
         for entry in staged_inserts {
@@ -2980,6 +2976,7 @@ impl Database {
             }
         }
 
+        self.retain_writer_output(output);
         Ok((results, examined))
     }
 
@@ -3106,6 +3103,34 @@ impl Database {
     where
         E: From<Error>,
     {
+        if let Some(root) = self.writer_read_root().map_err(E::from)? {
+            let phase = if matches!(direction, Direction::Outgoing | Direction::Both) {
+                BoundedGraphScanPhase::Forward
+            } else if matches!(direction, Direction::Incoming) {
+                BoundedGraphScanPhase::Reverse
+            } else {
+                BoundedGraphScanPhase::Done
+            };
+            return Ok(BoundedGraphEdgeCursor {
+                forward: Vec::new(),
+                reverse: Vec::new(),
+                phase,
+                direction,
+                staged_position: 0,
+                key_position: 0,
+                edge_position: 0,
+                last_inspected: None,
+                last_emitted: None,
+                snapshot,
+                retained_bytes: 0,
+                durable: Some(DurableGraphEdgeScan {
+                    root,
+                    cursor: None,
+                    last_key: Vec::new(),
+                    has_last_key: false,
+                }),
+            });
+        }
         let forward_adjacency = self.graph_store.forward_adj.read();
         let reverse_adjacency = self.graph_store.reverse_adj.read();
         let forward_len = if matches!(direction, Direction::Outgoing | Direction::Both) {
@@ -3180,6 +3205,7 @@ impl Database {
             last_emitted: None,
             snapshot,
             retained_bytes: actual_bytes,
+            durable: None,
         })
     }
 
@@ -3217,6 +3243,27 @@ impl Database {
                     tx,
                     staged_count,
                     edge_types,
+                    &mut before_edge,
+                    &mut before_access,
+                    &mut before_retain,
+                    &mut release_retained,
+                    &mut entry_read,
+                )? {
+                    return Ok(Some(edge));
+                }
+                continue;
+            }
+            if cursor.durable.is_some() {
+                if !matches!(
+                    cursor.phase,
+                    BoundedGraphScanPhase::Forward | BoundedGraphScanPhase::Reverse
+                ) {
+                    return Ok(None);
+                }
+                if let Some(edge) = self.bounded_graph_durable_edge_next(
+                    cursor,
+                    edge_types,
+                    tx,
                     &mut before_edge,
                     &mut before_access,
                     &mut before_retain,
@@ -3552,6 +3599,194 @@ impl Database {
                 return Ok(Some(oriented));
             }
         }
+    }
+
+    /// One committed edge from a durable writer's captured root in the
+    /// current committed phase, or `None` once that phase is finished and the
+    /// cursor has moved to the next one. Every entry is charged before it is
+    /// read; the continuation key advances only after the entry is fully
+    /// decided, so a refused pull re-reads that entry instead of losing it.
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_graph_durable_edge_next<E>(
+        &self,
+        cursor: &mut BoundedGraphEdgeCursor,
+        edge_types: Option<&[EdgeType]>,
+        tx: Option<TxId>,
+        before_edge: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        entry_read: &mut impl FnMut(),
+    ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
+    where
+        E: From<Error>,
+    {
+        let reverse = match cursor.phase {
+            BoundedGraphScanPhase::Forward => false,
+            BoundedGraphScanPhase::Reverse => true,
+            _ => return Ok(None),
+        };
+        loop {
+            before_edge()?;
+            let durable = cursor.durable.as_mut().ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded graph edge scan lost its durable source".to_string(),
+                ))
+            })?;
+            if durable.cursor.is_none() {
+                let lower = if durable.has_last_key {
+                    std::ops::Bound::Excluded(durable.last_key.as_slice())
+                } else {
+                    std::ops::Bound::Unbounded
+                };
+                durable.cursor = Some(
+                    durable
+                        .root
+                        .cursor(
+                            if reverse { "graph_rev" } else { "graph_fwd" },
+                            crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                            lower,
+                            std::ops::Bound::Unbounded,
+                            false,
+                        )
+                        .map_err(E::from)?,
+                );
+            }
+            let next = durable
+                .cursor
+                .as_mut()
+                .map(|live| live.next_edge())
+                .transpose();
+            let window = match next {
+                Ok(window) => window.flatten(),
+                Err(error) => {
+                    durable.cursor = None;
+                    return Err(E::from(error));
+                }
+            };
+            let Some(window) = window else {
+                // This orientation is finished; its continuation key is spent.
+                durable.cursor = None;
+                durable.has_last_key = false;
+                let held = durable.last_key.capacity();
+                durable.last_key = Vec::new();
+                cursor.retained_bytes = cursor.retained_bytes.saturating_sub(held);
+                if held > 0 {
+                    release_retained(held)?;
+                }
+                cursor.phase = match cursor.phase {
+                    BoundedGraphScanPhase::Forward
+                        if matches!(cursor.direction, Direction::Both) =>
+                    {
+                        BoundedGraphScanPhase::Reverse
+                    }
+                    _ => bounded_graph_first_staged_phase(cursor.direction),
+                };
+                return Ok(None);
+            };
+            entry_read();
+            let decided = self.bounded_graph_durable_edge_decide(
+                cursor,
+                &window.value,
+                reverse,
+                edge_types,
+                tx,
+                before_access,
+            );
+            let emitted = match decided {
+                Ok(emitted) => emitted,
+                Err(error) => {
+                    if let Some(durable) = cursor.durable.as_mut() {
+                        durable.cursor = None;
+                    }
+                    return Err(error);
+                }
+            };
+            // Move the continuation onto this entry, reusing the buffer it
+            // already holds and charging only growth.
+            let position = window.position();
+            let durable = cursor.durable.as_mut().ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded graph edge scan lost its durable source".to_string(),
+                ))
+            })?;
+            let held = durable.last_key.capacity();
+            if position.len() > held {
+                let growth = position.len() - held;
+                if let Err(error) = before_retain(growth) {
+                    durable.cursor = None;
+                    return Err(error);
+                }
+                if durable.last_key.try_reserve_exact(growth).is_err() {
+                    durable.cursor = None;
+                    release_retained(growth)?;
+                    return Err(E::from(bounded_memory_refusal(growth)));
+                }
+                let actual = durable.last_key.capacity();
+                if actual > position.len()
+                    && let Err(error) = before_retain(actual - position.len())
+                {
+                    durable.cursor = None;
+                    return Err(error);
+                }
+                cursor.retained_bytes = cursor
+                    .retained_bytes
+                    .saturating_add(actual.saturating_sub(held));
+            }
+            durable.last_key.clear();
+            durable.last_key.extend_from_slice(position);
+            durable.has_last_key = true;
+            if let Some(edge) = emitted {
+                return Ok(Some(edge));
+            }
+        }
+    }
+
+    /// Decide one committed durable edge: the oriented pair when this read may
+    /// see it, `None` when it is invisible, filtered, hidden by the reader's
+    /// own transaction, or denied by the node/edge gates.
+    fn bounded_graph_durable_edge_decide<E>(
+        &self,
+        cursor: &BoundedGraphEdgeCursor,
+        entry: &AdjEntry,
+        reverse: bool,
+        edge_types: Option<&[EdgeType]>,
+        tx: Option<TxId>,
+        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
+    where
+        E: From<Error>,
+    {
+        if !entry.visible_at(cursor.snapshot)
+            || edge_types.is_some_and(|types| !types.contains(&entry.edge_type))
+            || self
+                .transaction_hides_edge(tx, entry.source, &entry.edge_type, entry.target)
+                .map_err(E::from)?
+        {
+            return Ok(None);
+        }
+        let oriented = if reverse {
+            (entry.target, entry.source)
+        } else {
+            (entry.source, entry.target)
+        };
+        if self.access_is_admin() {
+            return Ok(Some(oriented));
+        }
+        before_access()?;
+        let allowed = self.bounded_graph_scan_edge_allowed(
+            tx,
+            GraphScanCandidate {
+                start: oriented.0,
+                neighbor: oriented.1,
+                source: entry.source,
+                target: entry.target,
+            },
+            &entry.edge_type,
+            cursor.snapshot,
+            before_access,
+        )?;
+        Ok(allowed.then_some(oriented))
     }
 
     /// One edge this transaction staged, in the orientation the current phase

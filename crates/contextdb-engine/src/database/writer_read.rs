@@ -1460,6 +1460,45 @@ pub(super) fn visit_graph_versions(
     Ok(())
 }
 impl Database {
+    /// A durable store, writer or retained reader, keeps every relational
+    /// posting, automatic or declared, in one ordered family, so a bounded
+    /// cursor can walk a single-column automatic index in key order.
+    pub(crate) fn automatic_indexes_are_ordered(&self) -> bool {
+        self.persistence.is_some() || self.retained_relational_source.is_some()
+    }
+
+    /// Every committed adjacency version in one orientation: the reverse
+    /// family is keyed by target, the forward family by source. A durable
+    /// writer reads the statement's root; only a memory store has resident
+    /// maps to walk.
+    pub(super) fn visit_graph_adjacency(
+        &self,
+        reverse: bool,
+        mut visit: impl FnMut(&AdjEntry) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(root) = self.writer_read_root()? {
+            let mut cursor = root.cursor(
+                if reverse { "graph_rev" } else { "graph_fwd" },
+                crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+                false,
+            )?;
+            while let Some(window) = cursor.next_edge()? {
+                visit(&window.value)?;
+            }
+            return Ok(());
+        }
+        let adjacency = if reverse {
+            &self.graph_store.reverse_adj
+        } else {
+            &self.graph_store.forward_adj
+        };
+        for edge in adjacency.read().values().flatten() {
+            visit(edge)?;
+        }
+        Ok(())
+    }
     pub(super) fn visit_graph_versions(
         &self,
         visit: impl FnMut(&AdjEntry) -> Result<()>,

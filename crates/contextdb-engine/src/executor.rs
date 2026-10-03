@@ -344,6 +344,14 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
 
     fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant>;
 
+    /// Whether this target's single-column automatic indexes are ordered
+    /// trees a bounded cursor can walk. A durable store keeps every posting in
+    /// one ordered family; a memory store keeps automatic single-column
+    /// postings as an exact hash that only answers point probes.
+    fn automatic_indexes_are_ordered(&self) -> bool {
+        false
+    }
+
     /// How the store this target reads names itself, for a damage report.
     fn bounded_store_path(&self) -> String;
 
@@ -1290,6 +1298,10 @@ impl ReadExecutionTarget for Database {
         params: &HashMap<String, Value>,
     ) -> Result<(Statement, PhysicalPlan)> {
         Database::prepare_bounded_read_plan(self, parsed, params)
+    }
+
+    fn automatic_indexes_are_ordered(&self) -> bool {
+        Database::automatic_indexes_are_ordered(self)
     }
 
     fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
@@ -8771,8 +8783,9 @@ fn automatic_index_supports_pick(
     decl: &contextdb_core::IndexDecl,
     shape: &IndexPredicateShape,
     pushed_columns: usize,
+    automatic_ordered: bool,
 ) -> bool {
-    if decl.kind != contextdb_core::IndexKind::Auto {
+    if decl.kind != contextdb_core::IndexKind::Auto || automatic_ordered {
         return true;
     }
     let finite = matches!(
@@ -8840,8 +8853,9 @@ fn candidate_elides_sort(
     filter: &Expr,
     sort_keys: &[contextdb_planner::SortKey],
     allow_reverse: bool,
+    automatic_ordered: bool,
 ) -> bool {
-    if sort_keys.is_empty() || automatic_index_is_exact_only(decl) {
+    if sort_keys.is_empty() || automatic_index_is_exact_only(decl, automatic_ordered) {
         return false;
     }
     if let Some(leading_col) = decl.columns.first().map(|(c, _)| c.as_str())
@@ -9273,6 +9287,30 @@ fn analyze_filter_for_index_with_sort(
     sort_keys: Option<&[contextdb_planner::SortKey]>,
     allow_reverse: bool,
 ) -> IndexAnalysis {
+    analyze_filter_for_index_with_capability(
+        table,
+        meta,
+        filter,
+        params,
+        sort_keys,
+        allow_reverse,
+        false,
+    )
+}
+
+/// [`analyze_filter_for_index_with_sort`] for a route that walks durable
+/// single-column automatic indexes as ordered trees (`automatic_ordered`):
+/// such an index then answers ranges and orders like a declared one. Only the
+/// bounded ordered route can take that walk; every other caller passes false.
+fn analyze_filter_for_index_with_capability(
+    table: &str,
+    meta: &TableMeta,
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+    sort_keys: Option<&[contextdb_planner::SortKey]>,
+    allow_reverse: bool,
+    automatic_ordered: bool,
+) -> IndexAnalysis {
     #[cfg(feature = "test-seams")]
     let _finite_planner_observation = FinitePlannerObservationScope::enter();
 
@@ -9408,7 +9446,7 @@ fn analyze_filter_for_index_with_sort(
         };
         let match_count = pushed_columns.len() + usize::from(trailing_range.is_some());
         let automatic_supported =
-            automatic_index_supports_pick(decl, &shape, 1 + suffix_shapes.len());
+            automatic_index_supports_pick(decl, &shape, 1 + suffix_shapes.len(), automatic_ordered);
         let single_row_probe = trailing_range.is_none()
             && shape_is_single_value_equality(&shape)
             && suffix_shapes.iter().all(shape_is_single_value_equality);
@@ -9432,8 +9470,9 @@ fn analyze_filter_for_index_with_sort(
             creation_index: i_idx,
             unique: index_is_unique(decl, meta),
             single_row_probe,
-            sort_elides: sort_keys
-                .is_some_and(|keys| candidate_elides_sort(decl, filter, keys, allow_reverse)),
+            sort_elides: sort_keys.is_some_and(|keys| {
+                candidate_elides_sort(decl, filter, keys, allow_reverse, automatic_ordered)
+            }),
         };
         if !automatic_supported {
             deferred_exact_auto_rejections.push(plan);
@@ -11618,6 +11657,25 @@ pub(crate) fn sort_elision_index_decl(
     input: &PhysicalPlan,
     keys: &[contextdb_planner::SortKey],
 ) -> Option<contextdb_core::IndexDecl> {
+    sort_elision_index_decl_with_capability(db, input, keys, false)
+}
+
+/// [`sort_elision_index_decl`] for the bounded ordered route, which walks a
+/// durable store's single-column automatic index as an ordered tree.
+pub(crate) fn bounded_sort_elision_index_decl(
+    db: &dyn ReadExecutionTarget,
+    input: &PhysicalPlan,
+    keys: &[contextdb_planner::SortKey],
+) -> Option<contextdb_core::IndexDecl> {
+    sort_elision_index_decl_with_capability(db, input, keys, db.automatic_indexes_are_ordered())
+}
+
+fn sort_elision_index_decl_with_capability(
+    db: &dyn ReadExecutionTarget,
+    input: &PhysicalPlan,
+    keys: &[contextdb_planner::SortKey],
+    automatic_ordered: bool,
+) -> Option<contextdb_core::IndexDecl> {
     fn find_scan(plan: &PhysicalPlan) -> Option<(&String, &Option<Expr>)> {
         match plan {
             PhysicalPlan::Scan { table, filter, .. } => Some((table, filter)),
@@ -11647,7 +11705,7 @@ pub(crate) fn sort_elision_index_decl(
     meta.indexes
         .iter()
         .find(|decl| {
-            if automatic_index_is_exact_only(decl) {
+            if automatic_index_is_exact_only(decl, automatic_ordered) {
                 return false;
             }
             if decl.columns.len() < key_cols.len() {
@@ -11759,7 +11817,7 @@ pub(crate) fn sort_keys_match_index_prefix(
     index_name: &str,
     keys: &[contextdb_planner::SortKey],
 ) -> bool {
-    sort_keys_match_index_prefix_with_direction(db, input, index_name, keys, false)
+    sort_keys_match_index_prefix_with_direction(db, input, index_name, keys, false, false)
 }
 
 /// Whether the selected index supplies the requested order when a bounded
@@ -11770,7 +11828,14 @@ pub(crate) fn sort_keys_match_index_prefix_in_either_direction(
     index_name: &str,
     keys: &[contextdb_planner::SortKey],
 ) -> bool {
-    sort_keys_match_index_prefix_with_direction(db, input, index_name, keys, true)
+    sort_keys_match_index_prefix_with_direction(
+        db,
+        input,
+        index_name,
+        keys,
+        true,
+        db.automatic_indexes_are_ordered(),
+    )
 }
 
 fn sort_keys_match_index_prefix_with_direction(
@@ -11779,6 +11844,7 @@ fn sort_keys_match_index_prefix_with_direction(
     index_name: &str,
     keys: &[contextdb_planner::SortKey],
     allow_reverse: bool,
+    automatic_ordered: bool,
 ) -> bool {
     fn find_scan_and_filter(plan: &PhysicalPlan) -> Option<(&String, &Option<Expr>)> {
         match plan {
@@ -11802,7 +11868,7 @@ fn sort_keys_match_index_prefix_with_direction(
     let Some(decl) = decl else {
         return false;
     };
-    if automatic_index_is_exact_only(decl) {
+    if automatic_index_is_exact_only(decl, automatic_ordered) {
         return false;
     }
     // Shape guard: IndexScan with InList or NotEqual shape on the leading
@@ -11868,11 +11934,16 @@ fn declared_columns_answer_sort_keys(
                 })))
 }
 
-/// Single-column automatic indexes back point probes only. Composite automatic
-/// indexes have their ordered tree and can supply the same prefix ordering as
-/// an equivalent declared index.
-fn automatic_index_is_exact_only(decl: &contextdb_core::IndexDecl) -> bool {
-    decl.kind == contextdb_core::IndexKind::Auto && decl.columns.len() == 1
+/// Single-column automatic indexes back point probes only in a memory store.
+/// Composite automatic indexes have their ordered tree and can supply the same
+/// prefix ordering as an equivalent declared index; so does every automatic
+/// index of a durable store, whose postings live in one ordered family, when
+/// the calling route can walk it (`automatic_ordered`).
+fn automatic_index_is_exact_only(
+    decl: &contextdb_core::IndexDecl,
+    automatic_ordered: bool,
+) -> bool {
+    !automatic_ordered && decl.is_exact_only()
 }
 
 fn leading_filter_has_fragmented_order_shape(filter: &Expr, leading_col: &str) -> bool {
@@ -18988,6 +19059,10 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_read_accountant(&self) -> Arc<crate::memory_accounting::MemoryAccountant> {
         self.store.bounded_read_accountant()
+    }
+
+    fn automatic_indexes_are_ordered(&self) -> bool {
+        self.store.automatic_indexes_are_ordered()
     }
 
     fn bounded_store_path(&self) -> String {
