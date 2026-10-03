@@ -672,29 +672,81 @@ fn f118_cli_renders_unknown_vector_index_error() {
     );
 }
 
-/// I drove the CLI to MEMORY_LIMIT exhaustion on a vector insert; stderr's Error: line carried the
-/// offending (table, column) tag so the operator could attribute the budget exhaustion.
+fn vector_insert_refusal_limit(extra_table: bool) -> usize {
+    use contextdb_engine::memory_accounting::{
+        MemoryAccountant, take_budget_ledger_for_test, watch_budget_ledger_for_test,
+    };
+    let root = tempfile::tempdir().expect("task-scoped owner profile");
+    let accountant = std::sync::Arc::new(MemoryAccountant::no_limit());
+    let db = contextdb_engine::Database::open_with_config(
+        root.path().join("profile.db"),
+        std::sync::Arc::new(contextdb_engine::plugin::CorePlugin),
+        accountant,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048))",
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    if extra_table {
+        db.execute(
+            "CREATE TABLE empty_t (id UUID PRIMARY KEY)",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+    }
+    watch_budget_ledger_for_test();
+    let literal = std::iter::repeat_n("1.0", 2048)
+        .collect::<Vec<_>>()
+        .join(",");
+    db.execute(
+        &format!(
+            "INSERT INTO audio_clips VALUES ('11111111-1111-1111-1111-111111111111', [{literal}])"
+        ),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let ledger = take_budget_ledger_for_test();
+    let position = ledger
+        .iter()
+        .position(|entry| {
+            entry
+                .what
+                .contains("vector_insert@audio_clips.vector_audio")
+        })
+        .unwrap_or_else(|| panic!("vector owner must be present: {ledger:?}"));
+    let owner = &ledger[position];
+    // SQL exposes whole KiB units; use the largest expressible ceiling below this owner.
+    let limit = (owner.used_after - 1) / 1024 * 1024;
+    assert!(
+        ledger[..position]
+            .iter()
+            .all(|entry| entry.used_after <= limit),
+        "prior real owners fit before the vector body"
+    );
+    eprintln!("vector refusal profile extra_table={extra_table} owner={owner:?} limit={limit}");
+    db.close().unwrap();
+    limit
+}
+
+fn attributed_vector_memory_refusal(message: &str) -> bool {
+    message.to_lowercase().contains("memory")
+        && message.contains("vector_insert@audio_clips.vector_audio")
+}
+
+/// A vector refusal names its real table and column, after setup fits.
 #[test]
 fn f117b_cli_renders_memory_budget_exceeded_with_index_tag() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("budget.db");
-    // The setup budget must clear CREATE TABLE's own fixed charge before the intended statement
-    // (the INSERT) gets a chance to trip the refusal under test. The engine counts
-    // index postings and row side maps against the memory limit, and a table's primary-key index
-    // allocates a fixed 64 KiB exact-probe filter that is charged to MEMORY_LIMIT at CREATE TABLE
-    // time (measured here: 66088 bytes) — independent of the vector column's own dimension. A
-    // budget too small to cover that charge makes CREATE TABLE
-    // itself the refused statement, so the table never exists and the follow-on INSERT then fails
-    // with its own, unrelated `table not found: audio_clips` — two stderr lines instead of the one
-    // this test means to observe. `72K` (73728 bytes) leaves headroom (measured: ~4593 bytes
-    // available) after CREATE TABLE succeeds, and the INSERT's own vector body (measured: 8192
-    // bytes for this VECTOR(2048) literal) is what exceeds that remaining budget and trips the
-    // single refusal under test.
+    let limit = vector_insert_refusal_limit(false);
+    let limit_kib = limit / 1024;
     let vector_literal = std::iter::repeat_n("1.0", 2048)
         .collect::<Vec<_>>()
         .join(",");
     let script = format!(
-        "SET MEMORY_LIMIT '72K';\n\
+        "SET MEMORY_LIMIT '{limit_kib}K';\n\
          CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048));\n\
          INSERT INTO audio_clips (id, vector_audio) VALUES \
          ('11111111-1111-1111-1111-111111111111', [{vector_literal}]);\n\
@@ -706,9 +758,13 @@ fn f117b_cli_renders_memory_budget_exceeded_with_index_tag() {
         "CLI must exit non-zero for vector memory budget exhaustion"
     );
     let stderr = output_string(&output.stderr);
-    // Exactly one refusal: the setup's CREATE TABLE succeeded under the 72K budget, so this is
+    // Exactly one refusal: the setup's CREATE TABLE succeeded under the derived budget, so this is
     // the INSERT's own refusal, not a `table not found` echo of a failed setup statement.
     let error_line = single_cli_error_line(&stderr, "memory budget exhaustion");
+    assert!(attributed_vector_memory_refusal(error_line), "{error_line}");
+    assert!(!attributed_vector_memory_refusal(
+        &error_line.replace("audio_clips.vector_audio", "other.vector_audio")
+    ));
     assert!(
         error_line.to_lowercase().contains("memory"),
         "Error line must be memory-related; got: {error_line}"
