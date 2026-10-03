@@ -730,6 +730,43 @@ fn ssh_c3_maint_edge_indegree() {
     assert_eq!(db.__index_maintenance_visits(), 2);
 }
 
+/// Writable open restores identity bounds without replaying any history family.
+fn assert_open_reads_only_bounds(
+    work: &contextdb_engine::writer_query_test_seams::WriterHistoryWork,
+) {
+    assert_eq!(
+        (
+            work.row_versions,
+            work.index_rebuild_inputs,
+            work.graph_versions,
+            work.change_log_entries,
+            work.commit_index_entries,
+            work.vector_memberships
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "open must not replay this table or its siblings: {work:?}"
+    );
+    assert_eq!(
+        (
+            work.ddl_occurrences,
+            work.sidecar_entries,
+            work.sidecar_decodes,
+            work.selection_entries
+        ),
+        (0, [0; 8], [0; 8], 0),
+        "open must not enumerate durable declarations or sidecars: {work:?}"
+    );
+    assert!(
+        work.commit_bound_keys > 0,
+        "a populated open observes real commit bounds: {work:?}"
+    );
+    #[cfg(feature = "test-seams")]
+    assert!(
+        work.allocator_regions_loaded > 0,
+        "open observes real allocator metadata: {work:?}"
+    );
+}
+
 #[test]
 fn ssh_c3_open_isolated() {
     let tmp = TempDir::new().unwrap();
@@ -754,30 +791,160 @@ fn ssh_c3_open_isolated() {
         }
         db.close().unwrap();
     }
-    let db = Database::open(&path).unwrap();
-    assert_eq!(db.__open_index_maintenance_visits(), 12);
+    let (opened, work) =
+        contextdb_engine::writer_query_test_seams::observe(|| Database::open(&path));
+    let db = opened.unwrap();
+    assert_open_reads_only_bounds(&work.history);
+    assert_eq!(
+        db.execute("SELECT id FROM t WHERE col = 3", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(203))]]
+    );
+    assert_eq!(
+        db.execute("SELECT id FROM sib WHERE x = 1", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(301))]]
+    );
+    assert_eq!(
+        db.execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
+            .unwrap()
+            .rows,
+        (0..5)
+            .map(|i| vec![Value::Uuid(uuid(200 + i)), Value::Int64(i as i64)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        db.execute("SELECT id, x FROM sib ORDER BY x", &HashMap::new())
+            .unwrap()
+            .rows,
+        (0..2)
+            .map(|i| vec![Value::Uuid(uuid(300 + i)), Value::Int64(i as i64)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        db.change_log_since(contextdb_core::Lsn(0)).unwrap().len(),
+        7
+    );
+    let prior = db.snapshot();
+    insert_uuid_row(&db, "t", uuid(205), 5);
+    assert!(db.snapshot().0 > prior.0);
+    assert_eq!(
+        db.execute("SELECT id FROM t WHERE col = 5", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(205))]]
+    );
 }
 
 #[test]
 fn ssh_c3_open_sibling_scaling() {
-    let tmp1 = setup_file_db_for_open("open_sibling_1.redb", false, 1);
-    let db1 = Database::open(tmp1.path().join("open_sibling_1.redb")).unwrap();
-    let o1 = db1.__open_index_maintenance_visits();
-
-    let tmp2 = setup_file_db_for_open("open_sibling_2.redb", true, 1);
-    let db2 = Database::open(tmp2.path().join("open_sibling_2.redb")).unwrap();
-    let o2 = db2.__open_index_maintenance_visits();
-
-    assert_eq!(o1, 7);
-    assert_eq!(o2, 10);
-    assert_eq!(o1 - 1, o2 - 4);
+    // Preserve both original sibling index shapes. Within each shape, only the
+    // sibling history doubles; target history and schema stay identical.
+    for extra_indexes in [false, true] {
+        let mut measurements = Vec::new();
+        for sibling_rows in [16, 32] {
+            let tmp = setup_file_db_for_open("open_sibling.redb", extra_indexes, sibling_rows);
+            let (opened, work) = contextdb_engine::writer_query_test_seams::observe(|| {
+                Database::open(tmp.path().join("open_sibling.redb"))
+            });
+            let db = opened.unwrap();
+            assert_open_reads_only_bounds(&work.history);
+            assert_eq!(
+                db.change_log_since(contextdb_core::Lsn(0)).unwrap().len(),
+                3 + sibling_rows
+            );
+            assert_eq!(
+                db.execute("SELECT id FROM t WHERE col = 1", &HashMap::new())
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Uuid(uuid(0x1001))]]
+            );
+            assert_eq!(
+                db.execute("SELECT x, y FROM sib ORDER BY x", &HashMap::new())
+                    .unwrap()
+                    .rows,
+                (0..sibling_rows)
+                    .map(|i| vec![Value::Int64(i as i64), Value::Int64(i as i64)])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                db.execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
+                    .unwrap()
+                    .rows,
+                (0..3)
+                    .map(|i| vec![Value::Uuid(uuid(0x1000 + i)), Value::Int64(i as i64)])
+                    .collect::<Vec<_>>()
+            );
+            let prior = db.snapshot();
+            insert_uuid_row(&db, "t", uuid(0x1003), 3);
+            assert!(db.snapshot().0 > prior.0);
+            assert_eq!(
+                db.execute("SELECT id FROM t WHERE col = 3", &HashMap::new())
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Uuid(uuid(0x1003))]]
+            );
+            measurements.push(work.history);
+        }
+        assert_eq!(
+            measurements[0].commit_bound_keys, measurements[1].commit_bound_keys,
+            "doubling unrelated history adds no bound reads: {measurements:?}"
+        );
+        #[cfg(feature = "test-seams")]
+        assert_eq!(
+            measurements[0].allocator_regions_loaded, measurements[1].allocator_regions_loaded,
+            "doubling unrelated history adds no allocator-region reads: {measurements:?}"
+        );
+    }
 }
 
 #[test]
 fn ssh_c3_open_empty_sibling() {
     let tmp = setup_file_db_for_open("open_empty_sibling.redb", true, 0);
-    let db = Database::open(tmp.path().join("open_empty_sibling.redb")).unwrap();
-    assert_eq!(db.__open_index_maintenance_visits(), 6);
+    let (opened, work) = contextdb_engine::writer_query_test_seams::observe(|| {
+        Database::open(tmp.path().join("open_empty_sibling.redb"))
+    });
+    let db = opened.unwrap();
+    assert_open_reads_only_bounds(&work.history);
+    assert_eq!(
+        db.change_log_since(contextdb_core::Lsn(0)).unwrap().len(),
+        3
+    );
+    assert_eq!(
+        db.execute("SELECT id FROM t WHERE col = 1", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(0x1001))]]
+    );
+    assert!(
+        db.execute("SELECT id FROM sib WHERE x = 1", &HashMap::new())
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        db.execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
+            .unwrap()
+            .rows,
+        (0..3)
+            .map(|i| vec![Value::Uuid(uuid(0x1000 + i)), Value::Int64(i as i64)])
+            .collect::<Vec<_>>()
+    );
+    let prior = db.snapshot();
+    db.execute(
+        "INSERT INTO sib (id, x, y) VALUES ($id, 1, 1)",
+        &params(vec![("id", Value::Uuid(uuid(0x2000)))]),
+    )
+    .unwrap();
+    assert!(db.snapshot().0 > prior.0);
+    assert_eq!(
+        db.execute("SELECT id FROM sib WHERE x = 1 AND y = 1", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Uuid(uuid(0x2000))]]
+    );
 }
 
 #[test]
