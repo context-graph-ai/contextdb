@@ -31292,10 +31292,17 @@ impl RedbPersistence {
                         .and_then(|()| {
                             let (phase, table, advance, position, active) = successor.checkpoint();
                             if active {
+                                // The cursor's controls are charged in whole
+                                // KiB classes: a cursor advancing into a named
+                                // table or a deeper page path keeps the same
+                                // retained owner instead of re-pricing it on
+                                // every batch.
                                 next_controls = Some(crate::memory_accounting::OwnedMemoryReservation::try_new_for(
                                     checkpoint_accountant.clone(),
                                     512usize.saturating_add(table.map_or(0, |name| name.len().saturating_mul(2)))
-                                        .saturating_add(position.len().saturating_mul(2 * std::mem::size_of::<usize>())),
+                                        .saturating_add(position.len().saturating_mul(2 * std::mem::size_of::<usize>()))
+                                        .div_ceil(1024)
+                                        .saturating_mul(1024),
                                     "storage_compaction", "checkpoint_controls",
                                     "Raise MEMORY_LIMIT to retain storage maintenance controls.",
                                 )?);
