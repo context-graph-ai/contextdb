@@ -27270,6 +27270,30 @@ impl Database {
             let kind = *encoded
                 .first()
                 .ok_or_else(|| Error::Other("empty encoded declaration".into()))?;
+            // A declaration that names a table can only restate an occurrence
+            // recorded for that same table. Select those occurrences from the
+            // small per-occurrence generation records and decode only them, so
+            // unrelated declarations (event routes with large filters, other
+            // tables) are never read. An occurrence without a generation
+            // record never qualifies below either way.
+            if let Some(table) = Self::ddl_affected_table(change) {
+                if let Some(found) = self.durable_superseded_table_occurrence(
+                    &root,
+                    table,
+                    change,
+                    kind,
+                    &candidates,
+                )? {
+                    output.try_grow_for(
+                        512,
+                        "writer_source",
+                        "declaration_comparison",
+                        "Raise MEMORY_LIMIT to retain matched declaration evidence.",
+                    )?;
+                    candidates.push(found);
+                }
+                continue;
+            }
             let mut cursor = root.ddl_history_cursor(Lsn(0))?;
             let mut prior = None;
             let mut ordinal = 0u32;
@@ -27345,6 +27369,78 @@ impl Database {
         candidates.sort_by_key(|(key, _)| *key);
         self.retain_writer_output(output);
         Ok(candidates)
+    }
+
+    /// The first locally recorded, not yet received or superseded occurrence
+    /// of `change` among the occurrences recorded for `table`, in log order.
+    fn durable_superseded_table_occurrence(
+        &self,
+        root: &Arc<crate::persistence::WriterSnapshot>,
+        table: &str,
+        change: &DdlChange,
+        kind: u8,
+        candidates: &[((Lsn, u32), DurableSupersededDdlOccurrence)],
+    ) -> Result<Option<((Lsn, u32), DurableSupersededDdlOccurrence)>> {
+        const PREFIX: &str = "sync_ddl_generation.v1.";
+        let mut sidecars = root.config_cursor(PREFIX)?;
+        while let Some(window) = sidecars.next(|_, bytes| {
+            RedbPersistence::decode_config_value_exact::<DurableDdlGenerationSidecar>(bytes)
+        })? {
+            if window.value.table.as_deref() != Some(table) {
+                continue;
+            }
+            let key = std::str::from_utf8(window.position())
+                .ok()
+                .and_then(|key| key.strip_prefix(PREFIX))
+                .and_then(|rest| rest.split_once('.'))
+                .and_then(|(lsn, ordinal)| {
+                    Some((Lsn(lsn.parse().ok()?), ordinal.parse::<u32>().ok()?))
+                })
+                .ok_or_else(|| Error::StoreCorrupted {
+                    path: "config".into(),
+                    reason: "declaration generation key does not name one occurrence".into(),
+                })?;
+            if self.with_received_ddl_arrival(key, |value| Ok(value.is_some()))?
+                || self.with_superseded_ddl_occurrence(key, |value| Ok(value.is_some()))?
+                || candidates.iter().any(|(candidate, _)| *candidate == key)
+            {
+                continue;
+            }
+            // Read only this occurrence's log position.
+            let mut occurrences = root.ddl_history_cursor(Lsn(key.0.0.saturating_sub(1)))?;
+            let mut ordinal = 0u32;
+            let mut local = None;
+            while let Some(entry) = occurrences.next_ddl_candidate(kind)? {
+                if entry.value.0 != key.0 {
+                    break;
+                }
+                if ordinal == key.1 {
+                    local = Some(entry);
+                    break;
+                }
+                ordinal += 1;
+            }
+            let Some(local) = local else {
+                continue;
+            };
+            if local.value.1.as_ref() != Some(change) {
+                continue;
+            }
+            return Ok(Some((
+                key,
+                DurableSupersededDdlOccurrence {
+                    local_lsn: key.0,
+                    persisted_ordinal: key.1,
+                    digest: Self::canonical_local_ddl_arrival_digest(
+                        change,
+                        key.0,
+                        key.1,
+                        &window.value,
+                    )?,
+                },
+            )));
+        }
+        Ok(None)
     }
 
     fn canonical_local_ddl_arrival_digest(
@@ -60975,14 +61071,15 @@ impl Database {
         // binding/declaration admission, using the existing owners.
         let installer_owned = crate::executor::ENGINE_OWNED_LEDGER_TABLES.contains(&name.as_str())
             || crate::executor::is_hub_refereed_sync_conflict_table(name);
-        if !installer_owned
-            && self.locally_declared_custody_policy(name)?
-            && let Some(local) = self.table_meta(name)
-        {
+        // Compare the live policies first: only a statement that restates a
+        // clause differently needs to know whether this node declared it,
+        // and that question reads the declaration history.
+        if !installer_owned && let Some(local) = self.table_meta(name) {
             let local_policy = crate::custody::policy::from_meta(&local);
             let arriving_policy = crate::custody::policy::from_meta(&incoming);
             if let Some(clause) =
                 crate::custody::policy::differing_clause(&local_policy, &arriving_policy)
+                && self.locally_declared_custody_policy(name)?
             {
                 // The existing invalid-policy preflights must still refuse an
                 // impossible promise before this transaction is refused.
