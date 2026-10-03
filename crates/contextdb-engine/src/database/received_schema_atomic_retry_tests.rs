@@ -276,13 +276,20 @@ fn reopen_if_requested(db: Database, path: &std::path::Path, reopen: bool) -> Da
 }
 
 fn assert_structured_received_schema_has_no_pending_ddl(db: &Database) {
-    let trigger_arrival = db
-        .received_ddl_arrivals
-        .read()
-        .keys()
-        .find(|(_, ordinal)| *ordinal == 3)
-        .copied()
-        .expect("the INCLUDING SYNC trigger keeps source-order ordinal three");
+    let mut trigger_arrivals = Vec::new();
+    db.visit_received_ddl_arrivals(|occurrence, _| {
+        if occurrence.1 == 3 {
+            trigger_arrivals.push(occurrence);
+        }
+        Ok(())
+    })
+    .expect("visit durable received occurrences");
+    assert_eq!(
+        trigger_arrivals.len(),
+        1,
+        "the INCLUDING SYNC trigger keeps one source-order ordinal three"
+    );
+    let trigger_arrival = trigger_arrivals[0];
     assert!(matches!(
         db.raw_ddl_log_occurrence(trigger_arrival.0, trigger_arrival.1)
             .unwrap(),
