@@ -23029,6 +23029,56 @@ impl RedbPersistence {
         })
     }
 
+    /// Commit the fixed control left by a schema memory refusal. Its proof is
+    /// charged before allocation, without re-admitting the refused operation.
+    /// Arbitrary configuration/data writes keep their ordinary admission path.
+    pub(crate) fn flush_memory_schema_holdback_control(
+        &self,
+        key: &str,
+        state: Option<&crate::sync_types::DurableSchemaSyncHoldback>,
+    ) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        if verified_ordered_run_test_seams::config_write_refused_for_test() {
+            return Err(Error::Other(format!(
+                "injected durable memory-hold configuration write failure for {key}"
+            )));
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            Self::update_policy_hold_release_index(&write_txn, key, state.is_some())?;
+            let encoded = {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                match state {
+                    Some(state) => {
+                        let encoded = Self::encode(state)?;
+                        config_table
+                            .insert(key, encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        Some(encoded)
+                    }
+                    None => {
+                        config_table.remove(key).map_err(Self::storage_error)?;
+                        None
+                    }
+                }
+            };
+            Self::apply_content_identity_mutations_in_write(
+                &write_txn,
+                &content_identity::config_mutations(key, encoded.as_deref()),
+                &mut content_identity::ProofAdmission::fixed_refusal_control(
+                    self.proof_accountant(),
+                ),
+            )?;
+            if let Some(encoded) = &encoded {
+                Self::raise_config_identity_floors_in_write(&write_txn, key, encoded)?;
+            }
+            Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
+            write_txn.commit().map_err(Self::storage_error)
+        })
+    }
+
     /// Persist a sync transport cursor and its covered configuration identity
     /// in the same transaction. Configuration remains part of the committed
     /// image even when this cursor does not change user rows.

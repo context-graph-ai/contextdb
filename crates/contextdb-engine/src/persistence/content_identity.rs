@@ -2257,6 +2257,7 @@ pub(crate) struct ProofAdmission {
     /// A cache this admission may reclaim from before it refuses. A proved
     /// chunk is a cache; a read that needs its bytes gets them.
     reclaim: Option<Arc<ResidentProofChunkSet>>,
+    charge_fixed_refusal_control: bool,
     held: usize,
     peak: usize,
 }
@@ -2266,6 +2267,7 @@ impl ProofAdmission {
         Self {
             accountant,
             reclaim: None,
+            charge_fixed_refusal_control: false,
             held: 0,
             peak: 0,
         }
@@ -2281,9 +2283,21 @@ impl ProofAdmission {
         Self {
             accountant,
             reclaim: Some(reclaim),
+            charge_fixed_refusal_control: false,
             held: 0,
             peak: 0,
         }
+    }
+
+    /// A fixed refusal control must land even when the refused operation has
+    /// exhausted its limit. Charge its proof before allocation; ordinary proof
+    /// mutations continue to use admission.
+    pub(super) fn fixed_refusal_control(
+        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+    ) -> Self {
+        let mut admission = Self::new(accountant);
+        admission.charge_fixed_refusal_control = true;
+        admission
     }
 
     /// For engine-internal contracts that hold no database accountant. The
@@ -2296,21 +2310,25 @@ impl ProofAdmission {
     /// budget error and leaves this transaction to abort with nothing written.
     fn admit(&mut self, bytes: usize) -> Result<()> {
         if let Some(accountant) = &self.accountant {
-            loop {
-                match accountant.try_allocate_for(
-                    bytes,
-                    "content_identity",
-                    "maintain_committed_proof",
-                    "Raise MEMORY_LIMIT to admit the proof this transaction maintains.",
-                ) {
-                    Ok(()) => break,
-                    Err(refusal) => {
-                        // Evict before refusing. The work asking for these
-                        // bytes is a read; what is holding them is a cache of
-                        // chunks this reader can prove again.
-                        match &self.reclaim {
-                            Some(chunks) if chunks.reclaim() => continue,
-                            _ => return Err(refusal),
+            if self.charge_fixed_refusal_control {
+                accountant.charge_retained(bytes);
+            } else {
+                loop {
+                    match accountant.try_allocate_for(
+                        bytes,
+                        "content_identity",
+                        "maintain_committed_proof",
+                        "Raise MEMORY_LIMIT to admit the proof this transaction maintains.",
+                    ) {
+                        Ok(()) => break,
+                        Err(refusal) => {
+                            // Evict before refusing. The work asking for these
+                            // bytes is a read; what is holding them is a cache of
+                            // chunks this reader can prove again.
+                            match &self.reclaim {
+                                Some(chunks) if chunks.reclaim() => continue,
+                                _ => return Err(refusal),
+                            }
                         }
                     }
                 }

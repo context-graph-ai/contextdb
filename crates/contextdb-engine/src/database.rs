@@ -53233,11 +53233,7 @@ impl Database {
             peer_node_id,
         );
         if let Some(persistence) = &self.persistence {
-            match state {
-                Some(state) => persistence.flush_config_value(&key, state)?,
-                None => persistence.remove_config_value(&key)?,
-            }
-            return Ok(());
+            return persistence.flush_memory_schema_holdback_control(&key, state);
         }
         let mut progress = self.in_memory_sync_progress.lock();
         match state {
@@ -61123,16 +61119,14 @@ impl Database {
         // A request this node's declared policy refuses whole is answered with
         // its typed refusals: the apply records the distinct schema outcome,
         // while this door must not write an acceptance receipt or progress.
-        let mut policy_plan = if let Some(hub) = hub_local_author {
-            self.received_policy_plan_for_push(&changes, received_ddl, &receipt, hub)?
-        } else {
-            self.received_policy_plan(
-                &changes,
-                received_ddl,
-                Some(&receipt.node_id),
-                Some((&receipt.tenant_id, receipt.incarnation)),
-            )?
-        };
+        let mut policy_plan = self.received_policy_plan_for_apply(
+            &changes,
+            received_ddl,
+            Some(&receipt),
+            SyncApplyRole::HubPushApply,
+            hub_local_author,
+            Some(&receipt.node_id),
+        )?;
         Self::hold_complete_policy_data(&mut policy_plan, &changes, receipt.dependency_complete);
         let wholly_refused_by_policy = Self::policy_plan_covers_all(&policy_plan, &changes);
         let applied = self.apply_changes_impl(
@@ -61556,6 +61550,45 @@ impl Database {
             identity,
             &HashMap::new(),
         )
+    }
+
+    /// Apply attempts also hold schema units refused while reading policy
+    /// state, before the staged door is reached. Keep policy previews pure
+    /// and preserve non-memory refusals and successful planning unchanged.
+    fn received_policy_plan_for_apply(
+        &self,
+        changes: &ChangeSet,
+        received: Option<&crate::protocol::ReceivedDdlContext>,
+        receipt: Option<&SyncApplyReceipt>,
+        role: SyncApplyRole,
+        hub: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<ReceivedPolicyPlan> {
+        let planned = if role == SyncApplyRole::HubPushApply
+            && let (Some(receipt), Some(hub)) = (receipt, hub)
+        {
+            self.received_policy_plan_for_push(changes, received, receipt, hub)
+        } else {
+            self.received_policy_plan(
+                changes,
+                received,
+                source,
+                receipt.map(|receipt| (&receipt.tenant_id, receipt.incarnation)),
+            )
+        };
+        if let Err(refusal @ Error::MemoryBudgetExceeded { .. }) = &planned
+            && self.access_is_admin()
+            && !changes.ddl.is_empty()
+        {
+            let holder = Self::received_unit_hold_identity(&changes.ddl_lsn, received);
+            // An earlier unit remains the reason a later one cannot apply,
+            // even when the policy lookup itself no longer fits the limit.
+            self.refuse_received_unit_behind_a_memory_holdback(&changes.ddl, &holder)?;
+            // Lookup reservations have already dropped. As at the staged
+            // door, a failed hold write must not replace the original refusal.
+            let _ = self.hold_back_received_unit_for_memory(&changes.ddl, &holder, refusal);
+        }
+        planned
     }
 
     fn received_policy_plan_for_push(
@@ -63589,29 +63622,14 @@ impl Database {
                     .as_ref()
                     .map(|receipt| (receipt.tenant_id.clone(), receipt.incarnation))
             });
-        let mut plan = if apply_role == SyncApplyRole::HubPushApply {
-            if let (Some(receipt), Some(hub)) = (receipt.as_ref(), hub_local_author) {
-                self.received_policy_plan_for_push(&changes, received_ddl, receipt, hub)?
-            } else {
-                self.received_policy_plan(
-                    &changes,
-                    received_ddl,
-                    delivery_source.as_deref(),
-                    receipt
-                        .as_ref()
-                        .map(|receipt| (&receipt.tenant_id, receipt.incarnation)),
-                )?
-            }
-        } else {
-            self.received_policy_plan(
-                &changes,
-                received_ddl,
-                delivery_source.as_deref(),
-                receipt
-                    .as_ref()
-                    .map(|receipt| (&receipt.tenant_id, receipt.incarnation)),
-            )?
-        };
+        let mut plan = self.received_policy_plan_for_apply(
+            &changes,
+            received_ddl,
+            receipt.as_ref(),
+            apply_role,
+            hub_local_author,
+            delivery_source.as_deref(),
+        )?;
         Self::hold_complete_policy_data(&mut plan, &changes, dependency_complete);
         let wholly_refused_by_policy = Self::policy_plan_covers_all(&plan, &changes);
         // The hold must survive before the author can observe a terminal refusal.
