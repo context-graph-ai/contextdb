@@ -371,6 +371,17 @@ impl<'a> MaintenanceFrontier<'a> {
             .map_or(Ok(None), WriterRelationalSource::cleanup_rotation)
     }
 
+    /// Once a finite cleanup has started, its remaining windows must run even
+    /// when earlier windows took the superseded population below the start gate.
+    pub(super) fn cleanup_in_progress(&self, table: &str, meta: &TableMeta) -> Result<bool> {
+        let Some(source) = &self.source else {
+            return Ok(false);
+        };
+        let declaration = RedbPersistence::currency_cleanup_declaration(meta)?;
+        let progress = source.cleanup_progress(table, declaration)?;
+        Ok(progress.group.is_some() || progress.after_group.is_some())
+    }
+
     pub(super) fn is_durable(&self) -> bool {
         self.source.is_some()
     }

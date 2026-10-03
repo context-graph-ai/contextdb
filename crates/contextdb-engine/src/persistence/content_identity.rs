@@ -213,6 +213,9 @@ thread_local! {
     /// rather than counted once.
     static WRITTEN_KEYS: std::cell::RefCell<std::collections::BTreeSet<[u8; 33]>> =
         const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+    // Exact rewrite identities belong only to an explicitly reset/taken
+    // measurement window, never to the lifetime of an ordinary writer thread.
+    static WRITTEN_KEYS_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Chunk rewrites by the level of the chunk rewritten, and the pages the
     /// storage engine copied while each level was being written. A chunk's id
     /// opens with its level, so the level is read from the key rather than
@@ -238,7 +241,9 @@ pub(crate) fn take_writes_by_level_for_test() -> Vec<(u8, u64, u64)> {
 /// would look like.
 #[cfg(feature = "test-seams")]
 fn observe_written_key(key: &[u8; 33], is_key_blob: bool) {
-    let repeated = WRITTEN_KEYS.with(|written| !written.borrow_mut().insert(*key));
+    let repeated = WRITTEN_KEYS_ACTIVE.with(|active| {
+        active.get() && WRITTEN_KEYS.with(|written| !written.borrow_mut().insert(*key))
+    });
     if !is_key_blob {
         // Byte 1 of a stored key is the chunk's level; byte 0 is its family.
         WRITES_BY_LEVEL.with(|levels| levels.borrow_mut().entry(key[1]).or_default().0 += 1);
@@ -321,6 +326,7 @@ fn forget_status_namespace(logical_key: &[u8]) {
 
 #[cfg(feature = "test-seams")]
 pub(crate) fn reset_family_work_for_test() {
+    WRITTEN_KEYS_ACTIVE.with(|active| active.set(true));
     FAMILY_WORK.with(|work| work.borrow_mut().clear());
     WRITTEN_KEYS.with(|written| written.borrow_mut().clear());
     WRITES_BY_LEVEL.with(|levels| levels.borrow_mut().clear());
@@ -333,6 +339,8 @@ pub(crate) fn reset_family_work_for_test() {
 /// Per-family work since the last reset, as `(tag, family name, counts)`.
 #[cfg(feature = "test-seams")]
 pub(crate) fn take_family_work_for_test() -> Vec<(u8, &'static str, FamilyWork)> {
+    WRITTEN_KEYS_ACTIVE.with(|active| active.set(false));
+    WRITTEN_KEYS.with(|written| written.borrow_mut().clear());
     FAMILY_WORK.with(|work| {
         std::mem::take(&mut *work.borrow_mut())
             .into_iter()

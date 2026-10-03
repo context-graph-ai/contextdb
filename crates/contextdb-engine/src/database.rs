@@ -33,6 +33,8 @@ mod vector_quarantine_inventory_admission_tests;
 #[cfg(all(test, feature = "test-seams"))]
 mod vector_retry_frontier_integrity_tests;
 mod vector_source_page_admission;
+#[cfg(feature = "test-seams")]
+mod writer_ownership_receipt;
 pub(crate) mod writer_read;
 #[cfg(test)]
 mod writer_row_charge_tests;
@@ -16722,6 +16724,8 @@ struct RetentionDeferredEdges {
 /// synchronously (`Database::run_maintenance_cycle`) or the engine's own loop
 /// dispatches it on a tick.
 pub(crate) struct MaintenanceContext {
+    #[cfg(feature = "test-seams")]
+    writer_receipt_observer: Option<Arc<Database>>,
     disk_limit: Arc<AtomicU64>,
     vector_serving_cache_bytes: Arc<AtomicU64>,
     resource_closed: Arc<AtomicBool>,
@@ -17458,11 +17462,19 @@ impl MaintenanceContext {
         take_local_commit_stage_fault_for_test(
             LocalCommitStageFaultPoint::AfterReservedLsnDurableCommit,
         );
+        #[cfg(feature = "test-seams")]
+        let writer_checkpoint = result
+            .as_ref()
+            .is_ok_and(|committed| committed.1.commit_lsn.is_some());
         let watch_completed = publication_watch.borrow_mut().take();
         match result {
             Ok(_) => {
                 if let Some(watch) = watch_completed {
                     watch.completed();
+                }
+                #[cfg(feature = "test-seams")]
+                if writer_checkpoint && let Some(observer) = &self.writer_receipt_observer {
+                    observer.emit_writer_memory_ownership_receipt_for_test("commit");
                 }
                 Ok(())
             }
@@ -25332,6 +25344,8 @@ impl Database {
 
         if !ws.is_empty() {
             self.release_committed_row_body_allocations(&ws);
+            #[cfg(feature = "test-seams")]
+            self.emit_writer_memory_ownership_receipt_for_test("commit");
             self.plugin.post_commit(&ws, source);
             let sink_events_to_publish = if self.persistence.is_some() {
                 ws.commit_lsn
@@ -31353,6 +31367,8 @@ impl Database {
             watch.completed();
         }
         committed?;
+        #[cfg(feature = "test-seams")]
+        self.emit_writer_memory_ownership_receipt_for_test("commit");
         #[cfg(any(test, feature = "test-seams"))]
         record_received_schema_profile_nanos_for_test(
             "transaction-commit-total",
@@ -50103,6 +50119,8 @@ impl Database {
 
     fn maintenance_context(&self) -> MaintenanceContext {
         MaintenanceContext {
+            #[cfg(feature = "test-seams")]
+            writer_receipt_observer: self.writer_receipt_observer_for_maintenance(),
             disk_limit: self.disk_limit.clone(),
             vector_serving_cache_bytes: self.vector_serving_cache_bytes.clone(),
             resource_closed: self.resource_closed.clone(),
@@ -51367,6 +51385,10 @@ impl Database {
             crate::read_session::QuiescentStopPhase::AcceptedDrained,
         );
         if self.resource_owner {
+            // Sample the final logical root after accepted reads drain, while
+            // the durable commit directory and its owner are still available.
+            #[cfg(feature = "test-seams")]
+            self.emit_writer_memory_ownership_receipt_for_test("close");
             self.resource_closed.store(true, Ordering::SeqCst);
             self.tx_mgr.release_publication_handle();
             self.blob_repository.close();
@@ -51693,6 +51715,14 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn writer_memory_ownership_receipt_for_test(&self) -> WriterMemoryOwnershipReceiptForTest {
+        self.with_writer_memory_ownership_receipt_for_test(|receipt| receipt)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    fn with_writer_memory_ownership_receipt_for_test<R>(
+        &self,
+        observe: impl FnOnce(WriterMemoryOwnershipReceiptForTest) -> R,
+    ) -> R {
         self.with_commit_lock(|| {
             let mut receipt = WriterMemoryOwnershipReceiptForTest {
                 vector: self.vector_memory_ownership_receipt_for_test(),
@@ -51857,7 +51887,7 @@ impl Database {
                 + receipt.captured_membership_charge;
             receipt.reconciliation_gap =
                 receipt.vector.accountant_total as i64 - receipt.named_owner_total as i64;
-            receipt
+            observe(receipt)
         })
     }
 
@@ -52811,14 +52841,24 @@ impl Database {
     where
         F: FnOnce(Lsn) -> Result<R>,
     {
-        self.tx_mgr.allocate_ddl_lsn(f)
+        let committed = self.tx_mgr.allocate_ddl_lsn(f);
+        #[cfg(feature = "test-seams")]
+        if committed.is_ok() {
+            self.emit_writer_memory_ownership_receipt_for_test("commit");
+        }
+        committed
     }
 
     pub(crate) fn allocate_ddl_lsn_maybe<F, R>(&self, f: F) -> Result<Option<R>>
     where
         F: FnOnce(Lsn) -> Result<Option<R>>,
     {
-        self.tx_mgr.allocate_ddl_lsn_maybe(f)
+        let committed = self.tx_mgr.allocate_ddl_lsn_maybe(f);
+        #[cfg(feature = "test-seams")]
+        if matches!(&committed, Ok(Some(_))) {
+            self.emit_writer_memory_ownership_receipt_for_test("commit");
+        }
+        committed
     }
 
     pub(crate) fn with_commit_lock<F, R>(&self, f: F) -> R
@@ -71947,6 +71987,14 @@ fn currency_compaction_pending(
     for table in tables {
         if !frontier.has_table(table)? {
             continue;
+        }
+        {
+            let metadata = relational_store.table_meta.read();
+            if let Some(meta) = metadata.get(*table)
+                && frontier.cleanup_in_progress(table, meta)?
+            {
+                return Ok(true);
+            }
         }
         if frontier.is_durable() {
             let mut previous = None;

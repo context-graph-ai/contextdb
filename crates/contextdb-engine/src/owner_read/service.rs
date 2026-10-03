@@ -4054,12 +4054,24 @@ async fn send_authoritative_response(
             publication.budget.exceeded_failure(),
         ));
     }
+    let write_budget = publication.budget.clone();
     let send = carrier.send_message_async(
         stream,
         boundary,
         LocalOutboundMessage::Response {
             response,
             expectation,
+        },
+        move || {
+            if write_budget.cancellation.is_cancelled() {
+                return Err(crate::local_transport::owner_disconnected());
+            }
+            if write_budget.elapsed() {
+                return Err(crate::local_transport::LocalTransportError::Refusal(
+                    write_budget.exceeded_failure(),
+                ));
+            }
+            Ok(())
         },
     );
     await_authoritative_response_send(&publication.budget, send).await

@@ -160,6 +160,7 @@ impl UnixLocalCarrier {
         stream: &'a std::os::unix::net::UnixStream,
         boundary: &'a LocalProtocolBoundary,
         message: LocalOutboundMessage<'_>,
+        allow_write: impl Fn() -> Result<(), LocalTransportError> + Send + 'static,
     ) -> LocalDeadlineOperation<'a> {
         let ordinary_response = matches!(
             message,
@@ -169,7 +170,7 @@ impl UnixLocalCarrier {
             } if *expectation == LocalResponseExpectation::OrdinaryResult
         );
         let operation: LocalDeadlineOperation<'a> = match boundary.encode_frame(message) {
-            Ok(frame) => match write_readiness(stream, frame) {
+            Ok(frame) => match guarded_write_readiness(stream, frame, allow_write) {
                 Ok(write) => Box::pin(write),
                 Err(error) => Box::pin(std::future::ready(Err(error))),
             },
@@ -624,6 +625,128 @@ fn write_readiness(
             .write_all(&frame)
             .map_err(|_| owner_disconnected())
     })
+}
+
+/// A complete frame and its completion flag publish under one state guard.
+/// The syscall cannot wait for a slow peer; readiness waits release that guard,
+/// so deadline cancellation still interrupts a partially written frame.
+#[cfg(unix)]
+fn guarded_write_readiness(
+    stream: &std::os::unix::net::UnixStream,
+    frame: Vec<u8>,
+    allow_write: impl Fn() -> Result<(), LocalTransportError> + Send + 'static,
+) -> Result<UnixReadiness<()>, LocalTransportError> {
+    use nix::errno::Errno;
+    use nix::sys::socket::{MsgFlags, send};
+    use std::os::fd::AsRawFd;
+
+    let (worker_stream, cancellation) = cloned_blocking_streams(stream)?;
+    let shared = std::sync::Arc::new((
+        std::sync::Mutex::new(ReadinessState {
+            result: None,
+            waker: None,
+            cancelled: false,
+        }),
+        std::sync::Condvar::new(),
+    ));
+    let worker_shared = shared.clone();
+    let worker = std::thread::Builder::new()
+        .name("contextdb-local-write".to_owned())
+        .spawn(move || {
+            let (state, completion) = &*worker_shared;
+            let mut offset = 0;
+            let mut readiness_error = None;
+            loop {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.cancelled {
+                    return;
+                }
+                let mut wait_for_socket = false;
+                let outcome = if let Some(error) = readiness_error.take() {
+                    Some(Err(error))
+                } else if offset == frame.len() {
+                    Some(Ok(()))
+                } else if let Err(error) = allow_write() {
+                    Some(Err(error))
+                } else {
+                    let flags = MsgFlags::MSG_DONTWAIT;
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "android",
+                        target_os = "freebsd",
+                        target_os = "dragonfly",
+                        target_os = "netbsd",
+                        target_os = "openbsd",
+                        target_os = "solaris",
+                        target_os = "illumos",
+                        target_os = "fuchsia",
+                        target_os = "haiku"
+                    ))]
+                    let flags = flags | MsgFlags::MSG_NOSIGNAL;
+                    match send(worker_stream.as_raw_fd(), &frame[offset..], flags) {
+                        Ok(0) => Some(Err(owner_disconnected())),
+                        Ok(written) => {
+                            offset += written;
+                            (offset == frame.len()).then_some(Ok(()))
+                        }
+                        Err(Errno::EINTR) => None,
+                        Err(Errno::EAGAIN) => {
+                            wait_for_socket = true;
+                            None
+                        }
+                        Err(_) => Some(Err(owner_disconnected())),
+                    }
+                };
+                if let Some(result) = outcome {
+                    // A reader may receive the last bytes immediately. Its
+                    // next clock advance must see this completion, even if the
+                    // write worker is descheduled before waking the owner.
+                    state.result = Some(result);
+                    let waker = state.waker.take();
+                    completion.notify_all();
+                    drop(state);
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                    return;
+                }
+                drop(state);
+                if wait_for_socket {
+                    readiness_error = wait_for_write_ready(&worker_stream).err();
+                }
+            }
+        })
+        .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
+    Ok(UnixReadiness {
+        shared,
+        cancellation: Some(cancellation),
+        worker: Some(worker),
+        completed: false,
+    })
+}
+
+#[cfg(unix)]
+fn wait_for_write_ready(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), LocalTransportError> {
+    use nix::errno::Errno;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+
+    loop {
+        let mut readiness = [PollFd::new(
+            stream.as_fd(),
+            PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP,
+        )];
+        match poll(&mut readiness, PollTimeout::NONE) {
+            Ok(0) => return Err(owner_disconnected()),
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => continue,
+            Err(_) => return Err(owner_disconnected()),
+        }
+    }
 }
 
 #[cfg(unix)]
