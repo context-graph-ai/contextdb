@@ -393,15 +393,30 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         }
     }
     let (refused_id, refusal) = refused.expect("allocator must reach projected growth boundary");
-    assert!(matches!(
-        refusal,
-        Error::DiskBudgetExceeded {
-            current_bytes,
-            budget_limit_bytes,
-            ..
-        } if current_bytes <= limit && budget_limit_bytes == limit
-    ));
-    assert!(std::fs::metadata(&path).expect("stat refused store").len() <= limit);
+    let refused_file_bytes = std::fs::metadata(&path).unwrap().len();
+    let attributed = |error: &Error| {
+        matches!(error, Error::DiskBudgetExceeded {
+        operation, current_bytes, budget_limit_bytes, .. }
+        if operation == "allocate storage pages" && *current_bytes == refused_file_bytes
+            && *current_bytes <= limit && *budget_limit_bytes == limit)
+    };
+    assert!(attributed(&refusal), "{refusal:?}");
+    if let Error::DiskBudgetExceeded {
+        current_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = &refusal
+    {
+        assert!(!attributed(&Error::DiskBudgetExceeded {
+            operation: "purge".to_owned(),
+            current_bytes: *current_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone()
+        }));
+    }
+    assert!(refused_file_bytes <= limit);
+    eprintln!("allocator refusal={refusal:?}");
     assert_eq!(
         writer
             .__projected_disk_growth_bytes_for_test()
@@ -425,16 +440,24 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         .expect("a smaller transaction reuses available pages after refusal");
 
     drop(reader);
-    for generation in 0..3i64 {
+    // Each admitted storage commit frees at most 64 native page-list entries.
+    // Drain the observed backlog, including the two commit fences, before retry.
+    let initial = writer.__deferred_free_backlog_for_test().unwrap();
+    let passes = initial
+        .iter()
+        .map(|(_, pages)| *pages)
+        .sum::<usize>()
+        .div_ceil(64)
+        + 2;
+    for pass in 0..passes {
+        eprintln!(
+            "deferred-free pass={pass} retained={:?} backlog={:?}",
+            writer.__external_snapshot_retention_for_test().unwrap(),
+            writer.__deferred_free_backlog_for_test().unwrap()
+        );
         writer
-            .execute(
-                "UPDATE allocation_churn SET value = $value WHERE id = 0",
-                &HashMap::from([(
-                    "value".into(),
-                    contextdb_core::Value::Text(format!("reclaim-{generation}")),
-                )]),
-            )
-            .expect("reclaim after retained reader release");
+            .__commit_storage_transaction_for_test()
+            .expect("finite deferred-free pass fits the unchanged disk ceiling");
     }
     assert_eq!(
         writer
