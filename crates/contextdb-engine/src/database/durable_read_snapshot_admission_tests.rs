@@ -1,5 +1,5 @@
-//! A durable bounded read must install its logical version hold before the
-//! commit boundary that supplied its snapshot can admit another writer.
+//! A durable bounded read keeps its captured physical root across publication
+//! and cleanup, including the pause before logical registration.
 use super::*;
 use crate::local_transport::ManualDeadlineClock;
 
@@ -32,21 +32,28 @@ fn captured_read_survives_compaction(cursor: bool) {
         let budget = ReadRegistrationBudget::new(Arc::clone(&clock), 0, 10_000);
         let withdrawn = OwnerReadCancellation::new();
         if cursor {
-            let (snapshot, _, _, storage, registration) = reader_db
-                .bounded_cursor_snapshot_registration(clock, 10_000, &budget, &withdrawn)
+            let (snapshot, _, _, storage, registration, root) = reader_db
+                .bounded_cursor_snapshot_registration_with_root(
+                    false, clock, 10_000, &budget, &withdrawn,
+                )
                 .expect("cursor admission succeeds")
                 .expect("cursor remains active");
             assert!(storage.is_some(), "cursor captured a durable root");
             (
                 snapshot,
                 Box::new((storage, registration)) as Box<dyn Send + Sync>,
+                root.expect("cursor retains its captured physical root"),
             )
         } else {
-            let (snapshot, _, registration) = reader_db
-                .bounded_read_snapshot_registration(&budget, &withdrawn)
+            let (snapshot, _, registration, root) = reader_db
+                .bounded_read_snapshot_registration_with_root(false, &budget, &withdrawn)
                 .expect("read admission succeeds")
                 .expect("read remains active");
-            (snapshot, registration)
+            (
+                snapshot,
+                registration,
+                root.expect("pull retains its captured physical root"),
+            )
         }
     });
 
@@ -57,8 +64,8 @@ fn captured_read_survives_compaction(cursor: bool) {
     assert!(
         db.tx_mgr
             .try_with_commit_lock_for(Duration::ZERO, || ())
-            .is_none(),
-        "the captured root is still protected by the commit boundary"
+            .is_some(),
+        "a captured physical root permits foreground commit progress"
     );
     let writer_db = Arc::clone(&db);
     let (attempted, attempt_seen) = std::sync::mpsc::sync_channel(1);
@@ -77,11 +84,31 @@ fn captured_read_survives_compaction(cursor: bool) {
     attempt_seen
         .recv()
         .expect("writer starts while reader is paused");
+    // Join before releasing capture: writer and latest-root cleanup must finish
+    // while the reader is still paused, protected solely by its physical root.
+    let report = writer
+        .join()
+        .expect("writer completes while capture is paused");
     pause.release();
-    let (snapshot, pin) = reader.join().expect("reader thread completes");
-    let report = writer.join().expect("writer thread completes");
-    assert_eq!(report.pruned_versions, 0, "cleanup must defer the old row");
+    let (snapshot, pin, root) = reader.join().expect("reader thread completes");
+    assert_eq!(
+        report.pruned_versions, 1,
+        "latest-root cleanup reclaims the superseded version"
+    );
+    assert_eq!(db.__physical_version_count_for_test("items"), 2);
+    let identity = root.storage_identity();
+    assert_ne!(
+        identity,
+        db.writer_read_root().unwrap().unwrap().storage_identity(),
+        "the registered reader retains the old physical identity"
+    );
+    assert!(
+        db.__native_read_transaction_count_for_test(identity.transaction_id)
+            .unwrap()
+            > 0
+    );
 
+    let scope = db.enter_writer_read(Some(root.clone()));
     let result = db
         .execute_at_snapshot(
             "SELECT id, body FROM items ORDER BY id",
@@ -96,12 +123,26 @@ fn captured_read_survives_compaction(cursor: bool) {
             vec![Value::Int64(2), Value::Text("stable".to_owned())],
         ]
     );
+    drop(scope);
     drop(pin);
+    drop(root);
+    assert!(db.snapshot_registry.state.lock().active.is_empty());
     assert_eq!(
-        db.compact_currency_versions()
-            .expect("cleanup after reader release")
-            .pruned_versions,
-        1
+        db.__native_read_transaction_count_for_test(identity.transaction_id)
+            .unwrap(),
+        0,
+        "final unpin releases the retained physical transaction"
+    );
+    db.compact_currency_versions()
+        .expect("cleanup after reader release");
+    assert_eq!(
+        db.execute("SELECT id, body FROM items ORDER BY id", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Int64(1), Value::Text("replacement".to_owned())],
+            vec![Value::Int64(2), Value::Text("stable".to_owned())]
+        ]
     );
 }
 
@@ -121,6 +162,10 @@ fn durable_admission_rechecks_cancellation_and_deadline_before_registering() {
         for cancelled in [false, true] {
             let dir = tempfile::tempdir().expect("temporary durable store");
             let db = Arc::new(Database::open(dir.path().join("withdrawn.db")).expect("open store"));
+            let physical = db.writer_read_root().unwrap().unwrap().storage_identity();
+            let native_before = db
+                .__native_read_transaction_count_for_test(physical.transaction_id)
+                .unwrap();
             let pause = ApplyPhasePauseGuard::arm_for_test(
                 db.snapshot_registry.durable_admission_test_pause.clone(),
             );
@@ -161,6 +206,12 @@ fn durable_admission_rechecks_cancellation_and_deadline_before_registering() {
                 ));
             }
             assert!(db.snapshot_registry.state.lock().active.is_empty());
+            assert_eq!(
+                db.__native_read_transaction_count_for_test(physical.transaction_id)
+                    .unwrap(),
+                native_before,
+                "cancelled or expired registration retains no extra physical root"
+            );
         }
     }
 }
