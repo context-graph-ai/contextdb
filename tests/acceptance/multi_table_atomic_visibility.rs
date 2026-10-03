@@ -1159,9 +1159,9 @@ fn t21_11_snapshot_at_lsn_preserves_reinserted_graph_edge_after_reopen() {
 }
 
 #[test]
-fn t21_12_reconstructed_commit_index_is_backfilled_before_new_commits() {
+fn t21_12_missing_commit_directory_refuses_without_repair() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let path = tmp.path().join("commit-index-backfill.db");
+    let path = tmp.path().join("missing-commit-directory.db");
     let old_id = Uuid::from_u128(0x2116);
     let new_id = Uuid::from_u128(0x2117);
 
@@ -1186,13 +1186,6 @@ fn t21_12_reconstructed_commit_index_is_backfilled_before_new_commits() {
         lsn
     };
 
-    let redb_db = redb::Database::open(&path).unwrap();
-    let write_txn = redb_db.begin_write().unwrap();
-    let commit_index: redb::TableDefinition<u64, u64> = redb::TableDefinition::new("commit_index");
-    let _ = write_txn.delete_table(commit_index);
-    write_txn.commit().unwrap();
-    drop(redb_db);
-
     {
         let db = Database::open(&path).unwrap();
         db.execute(
@@ -1211,15 +1204,82 @@ fn t21_12_reconstructed_commit_index_is_backfilled_before_new_commits() {
         old_rows
             .iter()
             .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == old_id)),
-        "reopened snapshot_at(old_lsn) must still resolve through the backfilled commit index"
+        "reopened snapshot_at(old_lsn) must still resolve through the intact commit directory"
     );
     assert!(
         !old_rows
             .iter()
             .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == new_id)),
-        "old snapshot must not floor to the later commit-index entry after backfill"
+        "old snapshot must not floor to the later commit-index entry after later publication"
     );
     reopened.close().unwrap();
+
+    // The commit directory is authoritative; its committed root cannot be
+    // reconstructed from row history when the entire directory is missing.
+    let redb_db = redb::Database::open(&path).unwrap();
+    let write = redb_db.begin_write().unwrap();
+    assert!(
+        write
+            .delete_table(redb::TableDefinition::<u64, u64>::new("commit_index"))
+            .unwrap()
+    );
+    write.commit().unwrap();
+    drop(redb_db);
+
+    fn durable_state(path: &std::path::Path) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>) {
+        use redb::{ReadableDatabase, ReadableTable};
+        let db = redb::Database::open(path).unwrap();
+        let read = db.begin_read().unwrap();
+        assert!(matches!(
+            read.open_table(redb::TableDefinition::<u64, u64>::new("commit_index")),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        let rows = read
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("rel_items"))
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect();
+        let recovery = read
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new("writer_recovery"))
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.value().to_owned(), value.value().to_vec())
+            })
+            .collect();
+        (rows, recovery)
+    }
+    let damaged = durable_state(&path);
+    let is_directory_refusal = |error: &contextdb_core::Error| {
+        matches!(error,
+        contextdb_core::Error::StoreCorrupted { path, reason }
+        if path == "writer_recovery" && reason == "commit directory differs from its committed root")
+    };
+    assert!(!is_directory_refusal(
+        &contextdb_core::Error::StoreCorrupted {
+            path: "rel_items".to_owned(),
+            reason: "commit directory differs from its committed root".to_owned(),
+        }
+    ));
+    for _ in 0..2 {
+        let error = match Database::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("a missing authoritative directory must refuse before publication"),
+        };
+        assert!(is_directory_refusal(&error), "{error:?}");
+        assert_eq!(
+            durable_state(&path),
+            damaged,
+            "refused open must preserve row and recovery bytes and keep the directory missing"
+        );
+    }
 }
 
 #[test]
