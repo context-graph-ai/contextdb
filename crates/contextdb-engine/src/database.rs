@@ -74371,24 +74371,18 @@ mod retention_prune_persistence_tests {
     }
 
     fn visible_rows(db: &Database, table: &str) -> usize {
-        // Closed persistence is a rewrite failure, not a read. Disk-backed
-        // bodies live in Redb, so SELECT after close would fail at the read
-        // boundary even when memory still holds the directory row. Count the
-        // in-memory directory the prune mutates.
         let snapshot = db.snapshot();
-        db.relational_store
-            .tables
-            .read()
-            .get(table)
-            .map(|rows| rows.iter().filter(|row| row.visible_at(snapshot)).count())
-            .unwrap_or(0)
+        durable_observation::rows(db, table)
+            .iter()
+            .filter(|row| row.visible_at(snapshot))
+            .count()
     }
 
     /// Returns the DB plus the mock-clock guard, which the caller must hold:
     /// the expiry read (`Wallclock::now()` inside `run_pruning_cycle*`) runs
     /// on the test thread later in the test body, and dropping the guard
     /// early would hand it the real clock again.
-    fn db_with_expired_row() -> (Database, contextdb_core::WallclockTestClockGuard) {
+    fn db_with_expired_row() -> (Database, contextdb_core::WallclockTestClockGuard, PathBuf) {
         let mock_now = Arc::new(AtomicU64::new(1_000_000));
         let clock = {
             let mock_now = Arc::clone(&mock_now);
@@ -74408,12 +74402,16 @@ mod retention_prune_persistence_tests {
         // the insert stamp and the expiry read happen on this thread, so the
         // mock governs both; no real sleep needed.
         mock_now.fetch_add(2_000, Ordering::SeqCst);
-        (db, clock)
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        (db, clock, path)
     }
 
     #[test]
     fn checked_prune_reports_persistence_failure_without_mutating_memory() {
-        let (db, _clock) = db_with_expired_row();
+        let (db, _clock, path) = db_with_expired_row();
+        let before = durable_observation::rows(&db, "obs");
+        assert_eq!(before.len(), 1);
+        let snapshot = db.snapshot();
 
         db.persistence.as_ref().unwrap().close();
         let err = db.run_pruning_cycle_checked().unwrap_err();
@@ -74422,16 +74420,24 @@ mod retention_prune_persistence_tests {
             err.to_string().contains("database persistence is closed"),
             "checked pruning must surface persistence rewrite failure; got {err:?}"
         );
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        assert_eq!(reopened.snapshot(), snapshot);
         assert_eq!(
-            visible_rows(&db, "obs"),
-            1,
-            "failed persistence must leave in-memory rows unchanged for retry"
+            durable_observation::rows(&reopened, "obs"),
+            before,
+            "failed persistence preserves exact durable row versions and expiry stamps for retry"
         );
+        assert_eq!(visible_rows(&reopened, "obs"), 1);
     }
 
     #[test]
     fn compatibility_prune_keeps_memory_when_persistence_fails() {
-        let (db, _clock) = db_with_expired_row();
+        let (db, _clock, path) = db_with_expired_row();
+        let before = durable_observation::rows(&db, "obs");
+        assert_eq!(before.len(), 1);
+        let snapshot = db.snapshot();
 
         db.persistence.as_ref().unwrap().close();
         let pruned = db.run_pruning_cycle();
@@ -74440,11 +74446,16 @@ mod retention_prune_persistence_tests {
             pruned, 0,
             "compatibility pruning cannot surface errors and must report no durable prune"
         );
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        assert_eq!(reopened.snapshot(), snapshot);
         assert_eq!(
-            visible_rows(&db, "obs"),
-            1,
-            "failed persistence must leave in-memory rows unchanged for retry"
+            durable_observation::rows(&reopened, "obs"),
+            before,
+            "failed persistence preserves exact durable row versions and expiry stamps for retry"
         );
+        assert_eq!(visible_rows(&reopened, "obs"), 1);
     }
 }
 
@@ -75521,16 +75532,10 @@ mod checkpoint_export_body_tests {
         database
     }
 
-    /// The rows the export loop hands the loader: the committed directory's
-    /// own, whose large bodies it no longer carries.
+    /// Select exact physical identities from the published durable root before
+    /// narrowing the export budget; the checkpoint loader fills their bodies.
     fn exportable_rows(database: &Database, table: &str) -> Vec<VersionedRow> {
-        database
-            .relational_store
-            .tables
-            .read()
-            .get(table)
-            .cloned()
-            .unwrap_or_default()
+        durable_observation::rows(database, table)
     }
 
     /// An artifact claims one commit boundary and every body in it. A body the
