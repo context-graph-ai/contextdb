@@ -1200,11 +1200,14 @@ mod received_schema_stage_tests {
                 "the receiver's durable DDL log replays create -> trigger -> alter as authored \
                  {when}"
             );
-            let arrivals = peer.db.received_ddl_arrivals.read().clone();
             for (ordinal, entry) in served.ddl_provenance.iter().enumerate() {
                 let ordinal = ordinal as u32;
                 assert!(
-                    arrivals.contains_key(&(local_lsn, ordinal)),
+                    peer.db
+                        .with_received_ddl_arrival((local_lsn, ordinal), |arrival| Ok(
+                            arrival.is_some()
+                        ))
+                        .expect("read the durable received occurrence"),
                     "occurrence {ordinal} is recorded as received {when}"
                 );
                 let generation = peer
@@ -3642,20 +3645,50 @@ mod received_schema_stage_tests {
         );
         let immediate_changes = db.changes_since(Lsn(0));
         assert_eq!(immediate_changes.rows.len(), 1);
-        let table_index = db.__change_log_table_index_for_test("events");
+        let durable_coordinates = |database: &Database, table: &str| {
+            let mut coordinates = database
+                .change_log_since(Lsn(0))
+                .expect("read durable table history")
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    ChangeLogEntry::RowInsert {
+                        table: name,
+                        row_id,
+                        lsn,
+                    }
+                    | ChangeLogEntry::RowDelete {
+                        table: name,
+                        row_id,
+                        lsn,
+                        ..
+                    } if name == table => Some((lsn, row_id)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            coordinates.sort();
+            coordinates
+        };
+        let table_index = durable_coordinates(&db, "events");
         assert_eq!(table_index.len(), 1);
         let staged_lsn = table_index[0].0;
         assert_eq!(
-            db.change_log_lsn_refcounts.read().get(&staged_lsn),
-            Some(&1)
+            immediate_changes
+                .rows
+                .iter()
+                .filter(|row| row.lsn == staged_lsn)
+                .count(),
+            1
         );
-        let received_ddl_lsn = db
-            .received_ddl_arrivals
-            .read()
-            .keys()
-            .next()
-            .map(|(lsn, _)| *lsn)
-            .expect("received schema commit publishes local DDL arrival evidence");
+        let mut received_occurrences = Vec::new();
+        db.visit_received_ddl_arrivals(|occurrence, _| {
+            received_occurrences.push(occurrence);
+            Ok(())
+        })
+        .expect("visit durable received schema arrivals");
+        assert_eq!(received_occurrences.len(), 1);
+        let (received_ddl_lsn, received_ordinal) = received_occurrences[0];
+        assert_eq!(received_ordinal, 0);
+        assert_eq!(immediate_changes.ddl_lsn, vec![received_ddl_lsn]);
         let (pending_before_close, source_before_close) = db
             .changes_since_base(Lsn(received_ddl_lsn.0.saturating_sub(1)))
             .expect("materialize received DDL changes before close");
@@ -3682,19 +3715,19 @@ mod received_schema_stage_tests {
         assert_eq!(reopened_changes.rows, immediate_changes.rows);
         assert_eq!(reopened_changes.ddl, immediate_changes.ddl);
         assert_eq!(reopened_changes.ddl_lsn, immediate_changes.ddl_lsn);
+        assert_eq!(durable_coordinates(&reopened, "events"), table_index);
         assert_eq!(
-            reopened.__change_log_table_index_for_test("events"),
-            table_index
-        );
-        assert_eq!(
-            reopened.change_log_lsn_refcounts.read().get(&staged_lsn),
-            Some(&1)
+            reopened_changes
+                .rows
+                .iter()
+                .filter(|row| row.lsn == staged_lsn)
+                .count(),
+            1
         );
         assert!(
             reopened
-                .received_ddl_arrivals
-                .read()
-                .contains_key(&(received_ddl_lsn, 0))
+                .with_received_ddl_arrival((received_ddl_lsn, 0), |arrival| Ok(arrival.is_some()))
+                .expect("read the durable received occurrence after reopen")
         );
         let (pending_after_reopen, source_after_reopen) = reopened
             .changes_since_base(Lsn(received_ddl_lsn.0.saturating_sub(1)))
@@ -5121,15 +5154,25 @@ mod received_schema_stage_tests {
         db.execute("INSERT INTO kept (id) VALUES (2)", &params)
             .unwrap();
 
-        assert!(db.change_log.read().iter().any(|entry| {
-            matches!(entry, ChangeLogEntry::RowInsert { table, .. } if table == "retired")
-        }));
-        assert!(db.change_log.read().iter().any(|entry| {
+        assert!(
+            db.change_log_since(Lsn(0))
+                .expect("read durable history")
+                .iter()
+                .any(|entry| {
+                    matches!(entry, ChangeLogEntry::RowInsert { table, .. } if table == "retired")
+                })
+        );
+        assert!(db.change_log_since(Lsn(0)).expect("read durable history").iter().any(|entry| {
             matches!(entry, ChangeLogEntry::VectorInsert { index, .. } if index.table == "retired")
         }));
-        assert!(db.change_log.read().iter().any(|entry| {
-            matches!(entry, ChangeLogEntry::RowInsert { table, .. } if table == "kept")
-        }));
+        assert!(
+            db.change_log_since(Lsn(0))
+                .expect("read durable history")
+                .iter()
+                .any(|entry| {
+                    matches!(entry, ChangeLogEntry::RowInsert { table, .. } if table == "kept")
+                })
+        );
 
         let drop_change = DdlChange::DropTable {
             name: "retired".to_string(),
@@ -5147,46 +5190,85 @@ mod received_schema_stage_tests {
         )
         .expect("received drop commits one replacement image");
 
-        assert!(!db.change_log.read().iter().any(|entry| match entry {
-            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } => {
-                table == "retired"
-            }
-            ChangeLogEntry::VectorInsert { index, .. }
-            | ChangeLogEntry::VectorDelete { index, .. } => index.table == "retired",
-            ChangeLogEntry::EdgeInsert { .. } | ChangeLogEntry::EdgeDelete { .. } => false,
-        }));
-        assert!(db.change_log.read().iter().any(|entry| {
-            matches!(entry, ChangeLogEntry::RowInsert { table, .. } if table == "kept")
-        }));
-        assert!(db.__change_log_table_index_for_test("retired").is_empty());
-        assert!(!db.__change_log_table_index_for_test("kept").is_empty());
+        assert!(
+            !db.change_log_since(Lsn(0))
+                .expect("read durable history")
+                .iter()
+                .any(|entry| match entry {
+                    ChangeLogEntry::RowInsert { table, .. }
+                    | ChangeLogEntry::RowDelete { table, .. } => {
+                        table == "retired"
+                    }
+                    ChangeLogEntry::VectorInsert { index, .. }
+                    | ChangeLogEntry::VectorDelete { index, .. } => index.table == "retired",
+                    ChangeLogEntry::EdgeInsert { .. } | ChangeLogEntry::EdgeDelete { .. } => false,
+                })
+        );
+        assert!(
+            db.change_log_since(Lsn(0))
+                .expect("read durable history")
+                .iter()
+                .any(|entry| {
+                    matches!(entry, ChangeLogEntry::RowInsert { table, .. } if table == "kept")
+                })
+        );
+        let durable_coordinates = |database: &Database, table: &str| {
+            let mut coordinates = database
+                .change_log_since(Lsn(0))
+                .expect("read durable table history")
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    ChangeLogEntry::RowInsert {
+                        table: name,
+                        row_id,
+                        lsn,
+                    }
+                    | ChangeLogEntry::RowDelete {
+                        table: name,
+                        row_id,
+                        lsn,
+                        ..
+                    } if name == table => Some((lsn, row_id)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            coordinates.sort();
+            coordinates
+        };
+        assert!(durable_coordinates(&db, "retired").is_empty());
+        assert!(!durable_coordinates(&db, "kept").is_empty());
 
         db.close().unwrap();
         drop(db);
 
         let reopened = Database::open(&path).unwrap();
         assert!(reopened.table_meta("retired").is_none());
-        assert!(!reopened.change_log.read().iter().any(|entry| match entry {
-            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } => {
-                table == "retired"
-            }
-            ChangeLogEntry::VectorInsert { index, .. }
-            | ChangeLogEntry::VectorDelete { index, .. } => index.table == "retired",
-            ChangeLogEntry::EdgeInsert { .. } | ChangeLogEntry::EdgeDelete { .. } => false,
-        }));
-        assert!(reopened.change_log.read().iter().any(|entry| {
-            matches!(entry, ChangeLogEntry::RowInsert { table, .. } if table == "kept")
-        }));
-        assert!(
-            reopened
-                .__change_log_table_index_for_test("retired")
-                .is_empty()
-        );
         assert!(
             !reopened
-                .__change_log_table_index_for_test("kept")
-                .is_empty()
+                .change_log_since(Lsn(0))
+                .expect("read durable history after reopen")
+                .iter()
+                .any(|entry| match entry {
+                    ChangeLogEntry::RowInsert { table, .. }
+                    | ChangeLogEntry::RowDelete { table, .. } => {
+                        table == "retired"
+                    }
+                    ChangeLogEntry::VectorInsert { index, .. }
+                    | ChangeLogEntry::VectorDelete { index, .. } => index.table == "retired",
+                    ChangeLogEntry::EdgeInsert { .. } | ChangeLogEntry::EdgeDelete { .. } => false,
+                })
         );
+        assert!(
+            reopened
+                .change_log_since(Lsn(0))
+                .expect("read durable history after reopen")
+                .iter()
+                .any(|entry| {
+                    matches!(entry, ChangeLogEntry::RowInsert { table, .. } if table == "kept")
+                })
+        );
+        assert!(durable_coordinates(&reopened, "retired").is_empty());
+        assert!(!durable_coordinates(&reopened, "kept").is_empty());
     }
 
     fn custody_cache_holds(db: &Database, key: &str) -> bool {
