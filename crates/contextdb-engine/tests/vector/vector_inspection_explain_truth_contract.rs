@@ -894,6 +894,116 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
     db.close().expect("close durable inspection verification");
 }
 
+// A saved base with a nonempty suffix must inspect without replaying that suffix.
+// Each arm has N surviving inserts and N insert/delete pairs after the same base.
+fn inspect_reopened_backlog_without_maintenance(backlog: usize) -> usize {
+    use contextdb_engine::{DatabaseOpenOptions, writer_query_test_seams};
+    let root = TempDir::new().expect("temporary pending inspection store");
+    let path = root.path().join("vector-inspection-pending.redb");
+    let open = || {
+        Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .expect("open caller-driven inspection store")
+    };
+    let db = open();
+    seed_fixture(&db);
+    drive_to_ready(&db);
+    let context = Uuid::from_u128(0xA11C_E000_0000_0000_0000_0000_0000_0101);
+    for ordinal in 0..backlog {
+        for deleted in [false, true] {
+            let id = Uuid::from_u128(0xBACC_0000 + ordinal as u128 * 2 + u128::from(deleted));
+            db.execute("INSERT INTO vector_inspection_docs (id,context_id,scope_id,kind,embedding) VALUES ($id,$context,$scope,'pending','[0.8,0.2,0.0]')",
+                &params([("id",Value::Uuid(id)),("context",Value::Uuid(context)),
+                         ("scope",Value::Text(SCOPE_ALPHA.to_owned()))])).unwrap();
+            if deleted {
+                db.execute(
+                    "DELETE FROM vector_inspection_docs WHERE id = $id",
+                    &params([("id", Value::Uuid(id))]),
+                )
+                .unwrap();
+            }
+        }
+    }
+    // Do not consolidate the suffix or inspect it before closing.
+    db.close().expect("seal a nonempty insert/delete suffix");
+    drop(db);
+    let db = open();
+    let cache_before = db.__writer_cache_stats_for_test().unwrap();
+    let activity_before = db.__vector_passive_activity_counters_for_test();
+    let charged_before = db.accountant().usage().used;
+    let generations_before = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
+        db.vector_store_for_test()
+            .partition_graph_generation_status(&route(scope))
+            .unwrap()
+    });
+    db.__reset_vector_membership_records_decoded_for_test();
+    let ((indexes, partitions), work) =
+        writer_query_test_seams::observe(|| (show_indexes(&db), show_partitions(&db)));
+    let cache_after = db.__writer_cache_stats_for_test().unwrap();
+    let row = row_for(&indexes, "vector_inspection_docs", "embedding");
+    assert_eq!(int(&indexes, row, "pending_inserts"), backlog as i64);
+    assert_eq!(int(&indexes, row, "tombstones"), backlog as i64);
+    assert_eq!(int(&indexes, row, "vector_count"), backlog as i64 + 4);
+    let alpha = partition_row_for_scope(&partitions, SCOPE_ALPHA);
+    let bravo = partition_row_for_scope(&partitions, SCOPE_BRAVO);
+    assert_eq!(int(&partitions, alpha, "pending_inserts"), backlog as i64);
+    assert_eq!(int(&partitions, alpha, "tombstones"), backlog as i64);
+    assert_eq!(int(&partitions, alpha, "live_rows"), backlog as i64 + 2);
+    assert_eq!(int(&partitions, bravo, "pending_inserts"), 0);
+    assert_eq!(int(&partitions, bravo, "tombstones"), 0);
+    assert_eq!(int(&partitions, bravo, "live_rows"), 2);
+    assert_eq!(
+        work.history.vector_memberships, 0,
+        "inspection never traverses durable membership history"
+    );
+    assert_eq!(
+        db.__vector_membership_records_decoded_for_test(),
+        0,
+        "truthful pending counts never decode the membership population"
+    );
+    assert_eq!(
+        db.__vector_passive_activity_counters_for_test(),
+        activity_before,
+        "pending inspection cannot load, replay, build, repair, compact or evict vector state"
+    );
+    assert_eq!(db.accountant().usage().used, charged_before);
+    let generations_after = [SCOPE_ALPHA, SCOPE_BRAVO].map(|scope| {
+        db.vector_store_for_test()
+            .partition_graph_generation_status(&route(scope))
+            .unwrap()
+    });
+    assert_eq!(generations_after, generations_before);
+    let indexes_again = show_indexes(&db);
+    let partitions_again = show_partitions(&db);
+    assert_eq!(indexes_again.rows, indexes.rows);
+    assert_eq!(partitions_again.rows, partitions.rows);
+    assert_eq!(
+        db.__vector_passive_activity_counters_for_test(),
+        activity_before
+    );
+    let growth = cache_after.3.checked_sub(cache_before.3).unwrap();
+    eprintln!(
+        "pending inspection backlog={backlog} cache={cache_before:?}->{cache_after:?} work={work:?}"
+    );
+    db.close().unwrap();
+    growth
+}
+
+#[test]
+fn reopened_nonempty_vector_backlog_inspection_has_fixed_cache_work_and_truthful_counts() {
+    let small = inspect_reopened_backlog_without_maintenance(8);
+    let grown = inspect_reopened_backlog_without_maintenance(256);
+    assert_eq!(
+        grown, small,
+        "metadata-only inspection has the same cache residency increase with a grown insert/delete backlog"
+    );
+}
+
 #[test]
 fn active_inspection_reports_one_atomic_progress_snapshot_without_advancing_it() {
     let (db, _) = fixture();
