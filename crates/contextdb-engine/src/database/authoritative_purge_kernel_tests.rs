@@ -54,10 +54,10 @@ struct OwnedCopies {
     survivor_note_disk_sync_source: Option<(Lsn, u8)>,
     selected_edge_disk_sync_source: Option<(Lsn, u8)>,
     survivor_edge_disk_sync_source: Option<(Lsn, u8)>,
-    selected_note_memory_sync_source: Option<(Lsn, u8)>,
-    survivor_note_memory_sync_source: Option<(Lsn, u8)>,
-    selected_edge_memory_sync_source: Option<(Lsn, u8)>,
-    survivor_edge_memory_sync_source: Option<(Lsn, u8)>,
+    selected_note_scoped_sync_source: Option<(Lsn, u8)>,
+    survivor_note_scoped_sync_source: Option<(Lsn, u8)>,
+    selected_edge_scoped_sync_source: Option<(Lsn, u8)>,
+    survivor_edge_scoped_sync_source: Option<(Lsn, u8)>,
     selected_note_live_sidecar: Option<AuthoritativePurgeLiveRowSidecarSnapshot>,
     survivor_note_live_sidecar: Option<AuthoritativePurgeLiveRowSidecarSnapshot>,
     selected_edge_live_sidecar: Option<AuthoritativePurgeLiveRowSidecarSnapshot>,
@@ -224,14 +224,13 @@ fn disk_sync_source(db: &Database, table: &str, row_id: RowId) -> Option<(Lsn, u
     ))
 }
 
-fn memory_sync_source(db: &Database, table: &str, row_id: RowId) -> Option<(Lsn, u8)> {
-    let lsn = db.relational_store.sync_source_lsn(table, row_id)?;
-    let kind = match db.relational_store.sync_source_kind(table, row_id)? {
-        contextdb_relational::store::SyncSourceKind::Pulled => 0,
-        contextdb_relational::store::SyncSourceKind::AcceptedLocal => 1,
-        contextdb_relational::store::SyncSourceKind::AcceptedLocalPending => 2,
-    };
-    Some((lsn, kind))
+fn scoped_sync_source(db: &Database, table: &str, row_id: RowId) -> Option<(Lsn, u8)> {
+    let (_, root) = db
+        .capture_writer_statement()
+        .expect("capture durable sidecar root");
+    root.expect("file-backed sidecar source")
+        .sync_source(table, row_id)
+        .expect("read only this row's durable provenance sidecar")
 }
 
 fn exact_edge_rows(db: &Database, id: Uuid) -> Vec<Vec<Value>> {
@@ -368,22 +367,22 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
             EDGES,
             fixture.survivor_edge_lineage.row_id,
         ),
-        selected_note_memory_sync_source: memory_sync_source(
+        selected_note_scoped_sync_source: scoped_sync_source(
             db,
             NOTES,
             fixture.selected_note.row_id,
         ),
-        survivor_note_memory_sync_source: memory_sync_source(
+        survivor_note_scoped_sync_source: scoped_sync_source(
             db,
             NOTES,
             fixture.survivor_note.row_id,
         ),
-        selected_edge_memory_sync_source: memory_sync_source(
+        selected_edge_scoped_sync_source: scoped_sync_source(
             db,
             EDGES,
             fixture.selected_edge_lineage.row_id,
         ),
-        survivor_edge_memory_sync_source: memory_sync_source(
+        survivor_edge_scoped_sync_source: scoped_sync_source(
             db,
             EDGES,
             fixture.survivor_edge_lineage.row_id,
@@ -405,23 +404,25 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
         survivor_edge_deletion_state: db
             .durable_deletion_state_for_test(EDGES, &Value::Uuid(fixture.survivor_edge)),
         selected_graph_arrival: db
-            .sync_graph_arrivals
-            .read()
-            .get(&(
-                fixture.selected,
-                fixture.selected_graph_target,
-                EDGE_TYPE.to_string(),
-            ))
-            .cloned(),
+            .with_graph_arrival(
+                &(
+                    fixture.selected,
+                    fixture.selected_graph_target,
+                    EDGE_TYPE.to_string(),
+                ),
+                |record| Ok(record.cloned()),
+            )
+            .expect("read scoped durable graph arrival"),
         survivor_graph_arrival: db
-            .sync_graph_arrivals
-            .read()
-            .get(&(
-                fixture.survivor,
-                fixture.survivor_graph_target,
-                EDGE_TYPE.to_string(),
-            ))
-            .cloned(),
+            .with_graph_arrival(
+                &(
+                    fixture.survivor,
+                    fixture.survivor_graph_target,
+                    EDGE_TYPE.to_string(),
+                ),
+                |record| Ok(record.cloned()),
+            )
+            .expect("read scoped durable graph arrival"),
     }
 }
 
@@ -852,7 +853,7 @@ fn assert_full_selected_absence_after_reopen(
         None
     );
     assert_eq!(
-        memory_sync_source(db, NOTES, fixture.selected_note.row_id),
+        scoped_sync_source(db, NOTES, fixture.selected_note.row_id),
         None
     );
     assert_eq!(
@@ -860,7 +861,7 @@ fn assert_full_selected_absence_after_reopen(
         None
     );
     assert_eq!(
-        memory_sync_source(db, EDGES, fixture.selected_edge_lineage.row_id),
+        scoped_sync_source(db, EDGES, fixture.selected_edge_lineage.row_id),
         None
     );
     assert_eq!(
@@ -868,16 +869,16 @@ fn assert_full_selected_absence_after_reopen(
         survivor_before.survivor_note_disk_sync_source
     );
     assert_eq!(
-        memory_sync_source(db, NOTES, fixture.survivor_note.row_id),
-        survivor_before.survivor_note_memory_sync_source
+        scoped_sync_source(db, NOTES, fixture.survivor_note.row_id),
+        survivor_before.survivor_note_scoped_sync_source
     );
     assert_eq!(
         disk_sync_source(db, EDGES, fixture.survivor_edge_lineage.row_id),
         survivor_before.survivor_edge_disk_sync_source
     );
     assert_eq!(
-        memory_sync_source(db, EDGES, fixture.survivor_edge_lineage.row_id),
-        survivor_before.survivor_edge_memory_sync_source
+        scoped_sync_source(db, EDGES, fixture.survivor_edge_lineage.row_id),
+        survivor_before.survivor_edge_scoped_sync_source
     );
     assert_eq!(
         db.authoritative_purge_live_row_sidecar_for_test(&fixture.note_selection),
@@ -930,10 +931,10 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     assert_eq!(before.survivor_note_disk_sync_source, Some((Lsn(702), 1)));
     assert_eq!(before.selected_edge_disk_sync_source, Some((Lsn(703), 1)));
     assert_eq!(before.survivor_edge_disk_sync_source, Some((Lsn(704), 1)));
-    assert_eq!(before.selected_note_memory_sync_source, Some((Lsn(701), 1)));
-    assert_eq!(before.survivor_note_memory_sync_source, Some((Lsn(702), 1)));
-    assert_eq!(before.selected_edge_memory_sync_source, Some((Lsn(703), 1)));
-    assert_eq!(before.survivor_edge_memory_sync_source, Some((Lsn(704), 1)));
+    assert_eq!(before.selected_note_scoped_sync_source, Some((Lsn(701), 1)));
+    assert_eq!(before.survivor_note_scoped_sync_source, Some((Lsn(702), 1)));
+    assert_eq!(before.selected_edge_scoped_sync_source, Some((Lsn(703), 1)));
+    assert_eq!(before.survivor_edge_scoped_sync_source, Some((Lsn(704), 1)));
     assert!(!before.selected_live.is_empty());
     assert!(!before.selected_secondary_index.rows.is_empty());
     assert_eq!(
@@ -1008,7 +1009,7 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
             .contains_key(&fixture.selected_note.row_id)
     );
     assert_eq!(after_notes.selected_note_disk_sync_source, None);
-    assert_eq!(after_notes.selected_note_memory_sync_source, None);
+    assert_eq!(after_notes.selected_note_scoped_sync_source, None);
     assert_eq!(after_notes.selected_note_live_sidecar, None);
     assert_eq!(
         after_notes
@@ -1049,8 +1050,8 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         before.survivor_note_disk_sync_source
     );
     assert_eq!(
-        after_notes.survivor_note_memory_sync_source,
-        before.survivor_note_memory_sync_source
+        after_notes.survivor_note_scoped_sync_source,
+        before.survivor_note_scoped_sync_source
     );
     assert_eq!(after_notes.selected_edge_live, before.selected_edge_live);
     assert_eq!(after_notes.survivor_edge_live, before.survivor_edge_live);
@@ -1071,12 +1072,12 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         before.survivor_edge_disk_sync_source
     );
     assert_eq!(
-        after_notes.selected_edge_memory_sync_source,
-        before.selected_edge_memory_sync_source
+        after_notes.selected_edge_scoped_sync_source,
+        before.selected_edge_scoped_sync_source
     );
     assert_eq!(
-        after_notes.survivor_edge_memory_sync_source,
-        before.survivor_edge_memory_sync_source
+        after_notes.survivor_edge_scoped_sync_source,
+        before.survivor_edge_scoped_sync_source
     );
     assert_eq!(after_notes.graph, before.graph);
     assert_eq!(
@@ -1110,7 +1111,7 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     assert!(after_edges.selected_edge_history.is_empty());
     assert_eq!(after_edges.selected_edge_history_count, 0);
     assert_eq!(after_edges.selected_edge_disk_sync_source, None);
-    assert_eq!(after_edges.selected_edge_memory_sync_source, None);
+    assert_eq!(after_edges.selected_edge_scoped_sync_source, None);
     assert_eq!(after_edges.selected_edge_live_sidecar, None);
     assert_eq!(after_edges.selected_graph_arrival, None);
     assert_eq!(
@@ -1131,8 +1132,8 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         before.survivor_edge_disk_sync_source
     );
     assert_eq!(
-        after_edges.survivor_edge_memory_sync_source,
-        before.survivor_edge_memory_sync_source
+        after_edges.survivor_edge_scoped_sync_source,
+        before.survivor_edge_scoped_sync_source
     );
     assert_eq!(
         after_edges.survivor_edge_live_sidecar,
