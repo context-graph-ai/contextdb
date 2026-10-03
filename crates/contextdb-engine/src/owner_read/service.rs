@@ -4210,8 +4210,8 @@ mod authoritative_response_send_tests {
         assert_eq!(clock.timer_arm_failure_polls_for_test(), 1);
         assert_eq!(
             operation_polls.load(Ordering::SeqCst),
-            1,
-            "the fallback sleeps until the fixed deadline instead of hot-looping or retrying"
+            2,
+            "one initial poll and one completion probe on wake precede refusal without hot-looping or retrying"
         );
         sender.join().expect("arm-failure send thread exits");
     }
