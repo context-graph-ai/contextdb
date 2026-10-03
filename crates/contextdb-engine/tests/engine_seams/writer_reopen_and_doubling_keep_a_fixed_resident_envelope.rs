@@ -107,7 +107,10 @@ fn sample(db: &Database, path: &Path) -> Sample {
             r.change_log_charges.iter().sum(),
             db.__resident_commit_directory_bytes_for_test(),
             db.vector_store_for_test()
-                .resident_membership_directory_bytes_for_test(),
+                .resident_membership_directory_bytes_for_test()
+                + r.vector.raw_vector_bodies
+                + r.vector.raw_reverse_directory
+                + r.vector.partition_vectors,
             r.vector.mutable_tail,
             db.__retention_directory_bytes_for_test(),
         ],
@@ -269,13 +272,50 @@ fn prepare(path: &Path, n: usize) {
         vec![vec![Value::Int64((n / 4) as i64)]]
     );
     drop(pin);
+    exec(
+        &db,
+        "CREATE TABLE cache_pressure (id INT PRIMARY KEY, body TEXT) HISTORY ALL SYNC OFF",
+    );
+    for batch in 0..64 {
+        let mut params =
+            std::collections::HashMap::from([("body".to_owned(), Value::Text("p".repeat(1024)))]);
+        let values = (0..128)
+            .map(|offset| {
+                let name = format!("id{offset}");
+                params.insert(name.clone(), Value::Int64(batch * 128 + offset));
+                format!("(${name},$body)")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(
+            &format!("INSERT INTO cache_pressure VALUES {values}"),
+            &params,
+        )
+        .unwrap();
+    }
     db.close().unwrap();
+}
+fn saturate_cache(db: &Database) {
+    // Uniform small leaves fill the declared share without wide-page eviction
+    // overshoot. The same 8 MiB fixture warms every measured checkpoint.
+    // The ordinal seam walks every prior wide leaf; visit the range once.
+    drop(db.__hold_row_page_for_test("cache_pressure", 8191).unwrap());
+    let stats = db.__writer_cache_stats_for_test().unwrap();
+    assert!(
+        stats.2 > 0,
+        "the declared share must reach real eviction: {stats:?}"
+    );
+    assert!(
+        stats.3 >= CEILING / 16 - 4096 && stats.3 <= CEILING / 16,
+        "cache occupancy has saturated its fixed share: {stats:?}"
+    );
 }
 fn arm(path: &Path, n: usize) -> Vec<Sample> {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     // The measured process never constructs a source, fixture, or full oracle.
     reset_allocation_peak_for_test();
     let db = open(path, Some(CEILING));
+    saturate_cache(&db);
     let mut samples = vec![sample(&db, path)];
     for checkpoint in 0..2 {
         for id in n + checkpoint * n / 2..n + (checkpoint + 1) * n / 2 {
@@ -328,6 +368,7 @@ fn arm(path: &Path, n: usize) -> Vec<Sample> {
                 .unwrap(),
             1
         );
+        saturate_cache(&db);
         samples.push(sample(&db, path));
     }
     assert_eq!(
@@ -368,6 +409,10 @@ fn writer_reopen_and_doubling_keep_a_fixed_resident_envelope() {
         assert!(
             output.status.success(),
             "valid fixture arm failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!(
+            "{n}-row arm owner receipts:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8(output.stdout).unwrap();
