@@ -3226,9 +3226,9 @@ async fn reopened_log_gap_pages_old_generation_purge_before_current_schema_snaps
     create_notes(&hub.db);
     put(&hub.db, current_id, "current-generation-row");
 
-    // Reopen proves the durable image is complete; then force the exact
-    // unavailable-log condition while retaining that store image. The next
-    // pull must use persisted-state recovery, not convenient live history.
+    // The row-log gap requires persisted row recovery. Authoritative DDL
+    // history survives both reopening and that row-log gap.
+    let durable_ddl = format!("{:?}", hub.db.ddl_log_since(Lsn(0)).unwrap());
     let old_hub_handle = hub.db.clone();
     hub.stop().await;
     drop(old_hub_handle);
@@ -3238,9 +3238,15 @@ async fn reopened_log_gap_pages_old_generation_purge_before_current_schema_snaps
         hub.db.change_log_since(Lsn(0)).unwrap().is_empty(),
         "fixture: reopening forces the durable persisted-state path instead of change-log replay"
     );
+    let reopened_ddl = hub.db.ddl_log_since(Lsn(0)).unwrap();
     assert!(
-        hub.db.ddl_log_since(Lsn(0)).unwrap().is_empty(),
-        "fixture: reopening forces synthetic current schema rather than a live DDL log"
+        !reopened_ddl.is_empty(),
+        "authoritative DDL history remains available"
+    );
+    assert_eq!(
+        format!("{reopened_ddl:?}"),
+        durable_ddl,
+        "reopen and a row-log gap preserve the exact durable schema history"
     );
 
     let edge_identity_value = Arc::new(
