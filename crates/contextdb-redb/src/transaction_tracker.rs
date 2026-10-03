@@ -119,6 +119,7 @@ pub(crate) struct TransactionTracker {
     state: Mutex<State>,
     live_write_transaction_available: Condvar,
     external_snapshot_provider: Option<ExternalSnapshotProvider>,
+    local_snapshot_provider: std::sync::OnceLock<ExternalSnapshotProvider>,
     external_snapshot_refresh: Mutex<()>,
     pub(crate) deferred_free_budget: (usize, usize),
 }
@@ -148,6 +149,7 @@ impl TransactionTracker {
             }),
             live_write_transaction_available: Condvar::new(),
             external_snapshot_provider,
+            local_snapshot_provider: std::sync::OnceLock::new(),
             external_snapshot_refresh: Mutex::new(()),
             deferred_free_budget,
             #[cfg(feature = "test-seams")]
@@ -155,10 +157,16 @@ impl TransactionTracker {
         }
     }
 
+    pub(crate) fn install_local_snapshot_provider(&self, provider: ExternalSnapshotProvider) {
+        self.local_snapshot_provider.get_or_init(|| provider);
+    }
+
     pub(crate) fn refresh_external_snapshots(&self, mem: &Arc<TransactionalMemory>) -> Result {
-        let Some(provider) = &self.external_snapshot_provider else {
+        if self.external_snapshot_provider.is_none() && self.local_snapshot_provider.get().is_none()
+        {
             return Ok(());
-        };
+        }
+        let provider = self.external_snapshot_provider.as_ref();
         // Dynamic owner registrations may race ordinary writer admission.
         // Serialize provider observations so an older one cannot discard a
         // newly admitted root. No page inventory is built here.
@@ -168,9 +176,11 @@ impl TransactionTracker {
 
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn try_refresh_external_snapshots(&self, mem: &Arc<TransactionalMemory>) -> Result {
-        let Some(provider) = &self.external_snapshot_provider else {
+        if self.external_snapshot_provider.is_none() && self.local_snapshot_provider.get().is_none()
+        {
             return Ok(());
-        };
+        }
+        let provider = self.external_snapshot_provider.as_ref();
         let _refresh = match self.external_snapshot_refresh.try_lock() {
             Ok(refresh) => refresh,
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -196,9 +206,15 @@ impl TransactionTracker {
     fn refresh_external_snapshots_locked(
         &self,
         mem: &Arc<TransactionalMemory>,
-        provider: &ExternalSnapshotProvider,
+        provider: Option<&ExternalSnapshotProvider>,
     ) -> Result {
-        let snapshots = provider().map_err(StorageError::Io)?;
+        let mut snapshots = match provider {
+            Some(provider) => provider().map_err(StorageError::Io)?,
+            None => Vec::new(),
+        };
+        if let Some(local) = self.local_snapshot_provider.get() {
+            snapshots.extend(local().map_err(StorageError::Io)?);
+        }
         let supplied = snapshots.iter().copied().collect::<HashSet<_>>();
         {
             let state = self.state.lock()?;
@@ -303,6 +319,32 @@ impl TransactionTracker {
                 Ok((snapshot, pages))
             })
             .collect()
+    }
+
+    /// Page sets of the authenticated external snapshots only. Process-local
+    /// roots are pinned through the same set but are not file-reader holds,
+    /// so retention diagnostics leave them out.
+    pub(crate) fn authenticated_external_snapshot_page_sets(
+        &self,
+        mem: &Arc<TransactionalMemory>,
+    ) -> Result<Vec<(StorageSnapshotIdentity, HashSet<PageNumber>)>> {
+        let mut local = match self.local_snapshot_provider.get() {
+            Some(local) => local()
+                .map_err(StorageError::Io)?
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            None => HashSet::new(),
+        };
+        if let Some(provider) = &self.external_snapshot_provider {
+            for snapshot in provider().map_err(StorageError::Io)? {
+                local.remove(&snapshot);
+            }
+        }
+        Ok(self
+            .external_snapshot_page_sets(mem)?
+            .into_iter()
+            .filter(|(snapshot, _)| !local.contains(snapshot))
+            .collect())
     }
 
     pub(crate) fn start_write_transaction(&self) -> TransactionId {

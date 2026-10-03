@@ -946,6 +946,15 @@ impl Database {
         Ok(counts)
     }
 
+    /// Install the engine's process-local exact-root leases. Newly supplied
+    /// roots require a native pin, like authenticated external registrations.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn install_local_snapshot_provider(&self, provider: ExternalSnapshotProvider) {
+        self.transaction_tracker
+            .install_local_snapshot_provider(provider);
+    }
+
     /// Begin a read at one root currently supplied by the authenticated
     /// external snapshot provider. This does not register another lifetime;
     /// the provider's owner remains the sole authority for retention.

@@ -2336,7 +2336,7 @@ impl WriteTransaction {
     pub fn external_snapshot_retention_stats(&self) -> Result<ExternalSnapshotRetentionStats> {
         let snapshots = self
             .transaction_tracker
-            .external_snapshot_page_sets(&self.mem)?;
+            .authenticated_external_snapshot_page_sets(&self.mem)?;
         let protected = snapshots
             .iter()
             .flat_map(|(_, pages)| pages.iter().copied())

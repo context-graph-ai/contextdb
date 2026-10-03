@@ -277,3 +277,12 @@ probe without flushing pending root updates or finalizing dirty payload checksum
 an existing empty table from an absent family. The engine caches this existence result per table
 while maintaining row heads; ordinary `open_table` type validation and exact row-body checks remain.
 The finalized root fingerprint API is unchanged and still supplies durable root bindings.
+
+The engine can install a process-local snapshot provider beside authenticated
+external registrations. New local roots pass the same native-pin and checksum
+admission as external roots. This lets engine descriptors retain exact user roots
+without a native read transaction, and lets a replacement handle register those
+roots before allocator housekeeping. The provider owns lifetimes; redb owns page
+retention. Active storage views remain fenced by the engine during replacement.
+Retention statistics (`external_snapshot_retention_stats`) count only authenticated external
+registrations; process-local roots are pinned but excluded from that diagnostic.

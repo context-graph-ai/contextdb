@@ -45,7 +45,7 @@ impl RedbPersistence {
             after_group: None,
             group: None,
         };
-        let read = root.owner_read();
+        let read = root.owner_read()?;
         let progress = match read.open_table(TABLE) {
             Ok(progress) => progress,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(fresh()),
@@ -98,7 +98,7 @@ impl RedbPersistence {
     }
 
     pub(crate) fn currency_cleanup_rotation(root: &WriterSnapshot) -> Result<Option<[u8; 32]>> {
-        let read = root.owner_read();
+        let read = root.owner_read()?;
         let table = match read.open_table(TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),

@@ -18749,7 +18749,7 @@ impl RedbPersistence {
         &self,
         root: &WriterSnapshot,
     ) -> std::result::Result<OwnerCursorStoragePin, OwnerCursorPinAdmissionError> {
-        self.owner_cursor_pin_from_read(Some(root.owner_read()))
+        self.owner_cursor_pin_from_read(Some(root.owner_read()?))
     }
 
     fn owner_cursor_pin_from_read(
@@ -30930,7 +30930,40 @@ impl RedbPersistence {
         }
     }
 
-    fn recycle_database_handle(&self, db_guard: &mut Option<redb::Database>) -> Result<u64> {
+    fn recycle_database_handle(
+        &self,
+        db_guard: &mut Option<redb::Database>,
+    ) -> Result<Option<u64>> {
+        // Source operations clone a view under this same lock. Never strand
+        // an active operation on an old PageManager or create a second pool.
+        let roots = self.live_writer_roots();
+        let mut leases = Vec::with_capacity(roots.len());
+        for root in &roots {
+            let Some(lease) = root.read.try_write() else {
+                return Ok(None);
+            };
+            if lease
+                .as_ref()
+                .is_some_and(|read| Arc::strong_count(read) != 1)
+            {
+                return Ok(None);
+            }
+            leases.push(lease);
+        }
+        for lease in &mut leases {
+            **lease = None;
+        }
+        if let Some(db) = db_guard.as_ref()
+            && db.has_live_read_transactions()
+        {
+            for (root, lease) in roots.iter().zip(leases.iter_mut()) {
+                **lease = Some(Arc::new(
+                    db.begin_external_read(root.storage_identity())
+                        .map_err(Self::storage_error)?,
+                ));
+            }
+            return Ok(None);
+        }
         let recycle_started = std::time::Instant::now();
         let owner = self.writer_file.read().map_err(Self::storage_error)?;
         let owner = owner
@@ -30951,7 +30984,18 @@ impl RedbPersistence {
                 reason: "injected reopen failure (test seam)".to_string(),
             });
         }
-        let provider = owner.external_snapshot_provider();
+        let external = owner.external_snapshot_provider();
+        let local = self.writer_root_provider();
+        let installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider_installed = installed.clone();
+        // The fresh allocator must see old roots before its first housekeeping.
+        let provider: redb::ExternalSnapshotProvider = Arc::new(move || {
+            let mut roots = external()?;
+            if !provider_installed.load(std::sync::atomic::Ordering::Acquire) {
+                roots.extend(local()?);
+            }
+            Ok(roots)
+        });
         let reopened = Self::open_hook_suppressed(|| {
             redb_builder_with_cache(
                 self.cache_charge_bytes
@@ -30963,12 +31007,24 @@ impl RedbPersistence {
         });
         match reopened {
             Ok(Ok(fresh)) => {
+                fresh.install_local_snapshot_provider(self.writer_root_provider());
+                installed.store(true, std::sync::atomic::Ordering::Release);
+                for (root, lease) in roots.iter().zip(leases.iter_mut()) {
+                    **lease = Some(Arc::new(
+                        fresh
+                            .begin_external_read(root.storage_identity())
+                            .map_err(|error| Error::StoreHandleRecycleFailed {
+                                path: self.path.display().to_string(),
+                                reason: error.to_string(),
+                            })?,
+                    ));
+                }
                 *db_guard = Some(fresh);
                 #[cfg(any(test, feature = "test-seams"))]
                 owner.observe(
                     read_persistence_test_scaffold::WriterFileRecycleBoundary::AfterViewOpen,
                 );
-                Ok(recycle_started.elapsed().as_micros() as u64)
+                Ok(Some(recycle_started.elapsed().as_micros() as u64))
             }
             Ok(Err(err)) => Err(Error::StoreHandleRecycleFailed {
                 path: self.path.display().to_string(),
@@ -31252,14 +31308,7 @@ impl RedbPersistence {
         let recycle_micros = if progress.complete {
             let _companion = self.lock_companion_slot()?;
             let mut db_guard = self.lock_database()?;
-            if db_guard
-                .as_ref()
-                .is_some_and(|db| !db.has_live_read_transactions())
-            {
-                Some(self.recycle_database_handle(&mut db_guard)?)
-            } else {
-                None
-            }
+            self.recycle_database_handle(&mut db_guard)?
         } else {
             None
         };

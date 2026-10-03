@@ -33,7 +33,7 @@ impl RedbPersistence {
         root: &WriterSnapshot,
         prefix: &str,
     ) -> Result<bool> {
-        let read = root.owner_read();
+        let read = root.owner_read()?;
         let table = match read.open_table(CONFIG_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
@@ -88,7 +88,7 @@ impl RedbPersistence {
         removed: &HashMap<Lsn, u64>,
         affected: &HashSet<Lsn>,
     ) -> Result<Vec<Lsn>> {
-        let read = root.owner_read();
+        let read = root.owner_read()?;
         let counts = read
             .open_table(TableDefinition::<u64, u64>::new("change_log_lsn_count"))
             .map_err(Self::storage_error)?;
@@ -134,7 +134,7 @@ impl RedbPersistence {
         root: &WriterSnapshot,
         table: &str,
     ) -> Result<Option<Wallclock>> {
-        let read = root.owner_read();
+        let read = root.owner_read()?;
         let bounds = match read.open_table(RETENTION_CLOCK_BOUNDS) {
             Ok(bounds) => bounds,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -161,7 +161,7 @@ impl RedbPersistence {
     pub(crate) fn writer_recovery_floors_in_read(
         snapshot: &WriterSnapshot,
     ) -> Result<WriterRecoveryBounds> {
-        let read = snapshot.owner_read();
+        let read = snapshot.owner_read()?;
         let table = read
             .open_table(RECOVERY_TABLE)
             .map_err(Self::storage_error)?;

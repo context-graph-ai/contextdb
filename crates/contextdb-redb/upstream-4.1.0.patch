@@ -566,7 +566,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -676,6 +822,209 @@
+@@ -676,6 +822,218 @@
          }
 
          Ok(compacted)
@@ -694,6 +694,15 @@
 +        Ok(counts)
 +    }
 +
++    /// Install the engine's process-local exact-root leases. Newly supplied
++    /// roots require a native pin, like authenticated external registrations.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn install_local_snapshot_provider(&self, provider: ExternalSnapshotProvider) {
++        self.transaction_tracker
++            .install_local_snapshot_provider(provider);
++    }
++
 +    /// Begin a read at one root currently supplied by the authenticated
 +    /// external snapshot provider. This does not register another lifetime;
 +    /// the provider's owner remains the sole authority for retention.
@@ -776,7 +785,7 @@
      }
 
      #[cfg_attr(not(debug_assertions), expect(dead_code))]
-@@ -891,6 +1240,7 @@
+@@ -891,6 +1249,7 @@
          Ok([data_root, system_root])
      }
 
@@ -784,7 +793,7 @@
      fn new(
          file: Box<dyn StorageBackend>,
          allow_initialize: bool,
-@@ -898,6 +1248,8 @@
+@@ -898,6 +1257,8 @@
          region_size: Option<u64>,
          cache_size: usize,
          repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
@@ -793,7 +802,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -910,6 +1262,7 @@
+@@ -910,6 +1271,7 @@
              region_size,
              cache_size,
              false,
@@ -801,7 +810,7 @@
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +1272,12 @@
+@@ -919,7 +1281,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -815,7 +824,7 @@
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,8 +1302,20 @@
+@@ -944,8 +1311,20 @@
 
          let db = Database {
              mem,
@@ -837,7 +846,7 @@
 
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-@@ -1035,12 +1405,21 @@
+@@ -1035,12 +1414,21 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -859,7 +868,7 @@
          WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
              .map_err(|e| e.into())
      }
-@@ -1056,16 +1435,74 @@
+@@ -1056,16 +1444,74 @@
 
          Ok(())
      }
@@ -936,7 +945,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +1543,7 @@
+@@ -1106,6 +1552,7 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -944,7 +953,7 @@
  }
 
  impl Builder {
-@@ -1125,6 +1563,7 @@
+@@ -1125,6 +1572,7 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -952,7 +961,7 @@
          }
      }
 
-@@ -1157,13 +1596,27 @@
+@@ -1157,13 +1605,27 @@
          self
      }
 
@@ -981,7 +990,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +1628,7 @@
+@@ -1175,6 +1637,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -989,7 +998,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +1637,71 @@
+@@ -1183,26 +1646,71 @@
              .open(path)?;
 
          Database::new(
@@ -1063,7 +1072,7 @@
          )
      }
 
-@@ -1222,6 +1721,36 @@
+@@ -1222,6 +1730,36 @@
              self.page_size,
              None,
              self.cache_size,
@@ -1100,7 +1109,7 @@
          )
      }
 
-@@ -1236,6 +1765,29 @@
+@@ -1236,6 +1774,29 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -1130,7 +1139,7 @@
          )
      }
 
-@@ -1251,6 +1803,8 @@
+@@ -1251,6 +1812,8 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -1139,7 +1148,7 @@
          )
      }
  }
-@@ -1260,18 +1814,215 @@
+@@ -1260,18 +1823,215 @@
          f.debug_struct("Database").finish()
      }
  }
@@ -1914,7 +1923,7 @@
 +
 +#[cfg(feature = "contextdb-internal")]
 +impl std::error::Error for ExternalSnapshotRefreshBusy {}
- 
+
  #[derive(Copy, Clone, Hash, Ord, PartialOrd, Eq, PartialEq, Debug)]
  pub(crate) struct TransactionId(u64);
 @@ -80,6 +96,7 @@
@@ -1925,7 +1934,7 @@
      valid_savepoints: BTreeMap<SavepointId, TransactionId>,
      // Non-durable commits that are still in-memory, and waiting for a durable commit to get flushed
      // We need to make sure that the freed-table does not get processed for these, since they are not durable yet
-@@ -89,33 +106,211 @@
+@@ -89,33 +106,253 @@
      pending_non_durable_commits: HashMap<TransactionId, TransactionId>,
      // Non-durable commits which have NOT been processed in the freed table
      unprocessed_freed_non_durable_commits: BTreeSet<TransactionId>,
@@ -1935,17 +1944,18 @@
 +    external_snapshots: HashSet<StorageSnapshotIdentity>,
 +    external_snapshot_admission_complete: bool,
  }
- 
+
  pub(crate) struct TransactionTracker {
 +    #[cfg(feature = "test-seams")]
 +    pub(crate) table_write_observer: crate::table_write_observer::ObserverSlot,
      state: Mutex<State>,
      live_write_transaction_available: Condvar,
 +    external_snapshot_provider: Option<ExternalSnapshotProvider>,
++    local_snapshot_provider: std::sync::OnceLock<ExternalSnapshotProvider>,
 +    external_snapshot_refresh: Mutex<()>,
 +    pub(crate) deferred_free_budget: (usize, usize),
  }
- 
+
  impl TransactionTracker {
      pub(crate) fn new(next_transaction_id: TransactionId) -> Self {
 +        Self::new_with_external_snapshots(next_transaction_id, None, (usize::MAX, usize::MAX))
@@ -1972,6 +1982,7 @@
              live_write_transaction_available: Condvar::new(),
 -        }
 +            external_snapshot_provider,
++            local_snapshot_provider: std::sync::OnceLock::new(),
 +            external_snapshot_refresh: Mutex::new(()),
 +            deferred_free_budget,
 +            #[cfg(feature = "test-seams")]
@@ -1979,10 +1990,16 @@
 +        }
 +    }
 +
++    pub(crate) fn install_local_snapshot_provider(&self, provider: ExternalSnapshotProvider) {
++        self.local_snapshot_provider.get_or_init(|| provider);
++    }
++
 +    pub(crate) fn refresh_external_snapshots(&self, mem: &Arc<TransactionalMemory>) -> Result {
-+        let Some(provider) = &self.external_snapshot_provider else {
++        if self.external_snapshot_provider.is_none() && self.local_snapshot_provider.get().is_none()
++        {
 +            return Ok(());
-+        };
++        }
++        let provider = self.external_snapshot_provider.as_ref();
 +        // Dynamic owner registrations may race ordinary writer admission.
 +        // Serialize provider observations so an older one cannot discard a
 +        // newly admitted root. No page inventory is built here.
@@ -1992,9 +2009,11 @@
 +
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn try_refresh_external_snapshots(&self, mem: &Arc<TransactionalMemory>) -> Result {
-+        let Some(provider) = &self.external_snapshot_provider else {
++        if self.external_snapshot_provider.is_none() && self.local_snapshot_provider.get().is_none()
++        {
 +            return Ok(());
-+        };
++        }
++        let provider = self.external_snapshot_provider.as_ref();
 +        let _refresh = match self.external_snapshot_refresh.try_lock() {
 +            Ok(refresh) => refresh,
 +            Err(std::sync::TryLockError::WouldBlock) => {
@@ -2020,9 +2039,15 @@
 +    fn refresh_external_snapshots_locked(
 +        &self,
 +        mem: &Arc<TransactionalMemory>,
-+        provider: &ExternalSnapshotProvider,
++        provider: Option<&ExternalSnapshotProvider>,
 +    ) -> Result {
-+        let snapshots = provider().map_err(StorageError::Io)?;
++        let mut snapshots = match provider {
++            Some(provider) => provider().map_err(StorageError::Io)?,
++            None => Vec::new(),
++        };
++        if let Some(local) = self.local_snapshot_provider.get() {
++            snapshots.extend(local().map_err(StorageError::Io)?);
++        }
 +        let supplied = snapshots.iter().copied().collect::<HashSet<_>>();
 +        {
 +            let state = self.state.lock()?;
@@ -2127,8 +2152,34 @@
 +                Ok((snapshot, pages))
 +            })
 +            .collect()
++    }
++
++    /// Page sets of the authenticated external snapshots only. Process-local
++    /// roots are pinned through the same set but are not file-reader holds,
++    /// so retention diagnostics leave them out.
++    pub(crate) fn authenticated_external_snapshot_page_sets(
++        &self,
++        mem: &Arc<TransactionalMemory>,
++    ) -> Result<Vec<(StorageSnapshotIdentity, HashSet<PageNumber>)>> {
++        let mut local = match self.local_snapshot_provider.get() {
++            Some(local) => local()
++                .map_err(StorageError::Io)?
++                .into_iter()
++                .collect::<HashSet<_>>(),
++            None => HashSet::new(),
++        };
++        if let Some(provider) = &self.external_snapshot_provider {
++            for snapshot in provider().map_err(StorageError::Io)? {
++                local.remove(&snapshot);
++            }
++        }
++        Ok(self
++            .external_snapshot_page_sets(mem)?
++            .into_iter()
++            .filter(|(snapshot, _)| !local.contains(snapshot))
++            .collect())
      }
- 
+
      pub(crate) fn start_write_transaction(&self) -> TransactionId {
          let mut state = self.state.lock().unwrap();
          while state.live_write_transaction.is_some() {
@@ -2138,9 +2189,9 @@
          }
          assert!(state.live_write_transaction.is_none());
          let transaction_id = state.next_transaction_id.increment();
-@@ -124,6 +319,11 @@
+@@ -124,6 +361,11 @@
          state.live_write_transaction = Some(transaction_id);
- 
+
          transaction_id
 +    }
 +
@@ -2148,11 +2199,11 @@
 +    pub(crate) fn has_waiting_write_transactions(&self) -> bool {
 +        self.state.lock().unwrap().waiting_write_transactions > 0
      }
- 
+
      pub(crate) fn end_write_transaction(&self, id: TransactionId) {
-@@ -293,13 +493,37 @@
+@@ -293,13 +535,37 @@
      }
- 
+
      pub(crate) fn oldest_live_read_transaction(&self) -> Option<TransactionId> {
 +        let state = self.state.lock().unwrap();
 +        state
@@ -2188,7 +2239,7 @@
              .copied()
 +            .unwrap_or(0)
      }
- 
+
      // Returns the transaction id of the oldest non-durable transaction which has not been processed
 --- a/src/transactions.rs
 +++ b/src/transactions.rs
@@ -2848,7 +2899,7 @@
 +    pub fn external_snapshot_retention_stats(&self) -> Result<ExternalSnapshotRetentionStats> {
 +        let snapshots = self
 +            .transaction_tracker
-+            .external_snapshot_page_sets(&self.mem)?;
++            .authenticated_external_snapshot_page_sets(&self.mem)?;
 +        let protected = snapshots
 +            .iter()
 +            .flat_map(|(_, pages)| pages.iter().copied())

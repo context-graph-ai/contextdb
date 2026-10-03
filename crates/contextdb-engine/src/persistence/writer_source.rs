@@ -31,7 +31,8 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 /// An admitted durable descriptor prepared before the transaction manager's
 /// publication swap. Only capture_published_read captures statement roots.
 pub(crate) struct WriterSnapshot {
-    read: Arc<redb::ReadTransaction>,
+    pub(super) read: parking_lot::RwLock<Option<Arc<redb::ReadTransaction>>>,
+    identity: redb::StorageSnapshotIdentity,
     pub(crate) snapshot: SnapshotId,
     pub(crate) lsn: Lsn,
     accountant: Arc<MemoryAccountant>,
@@ -56,13 +57,13 @@ struct WriterTableMeta {
 
 impl WriterSnapshot {
     pub(crate) fn row_body_bytes(&self, table: &str, row: &VersionedRow) -> Result<usize> {
+        let read = self.owner_read()?;
         #[cfg(test)]
         stored_relational_row_bytes_fault_for_test()?;
         let _scratch = self.adapter_control(table.len().saturating_add(128))?;
         self.check_table_scope(table)?;
         let name = RedbPersistence::rel_table_name(table);
-        let physical = self
-            .read
+        let physical = read
             .open_table(TableDefinition::<&[u8], &[u8]>::new(&name))
             .map_err(RedbPersistence::storage_error)?;
         let key = RedbPersistence::rel_row_key(row);
@@ -377,7 +378,7 @@ impl RedbPersistence {
         })?;
         OwnedMemoryReservation::try_new_for(
             accountant,
-            std::mem::size_of::<WriterSnapshot>() + 128,
+            std::mem::size_of::<WriterSnapshot>() + 56,
             "writer_source",
             "published_root",
             HINT,
@@ -400,9 +401,12 @@ impl RedbPersistence {
             Error::Other("publication schema was not prepared before durability".into())
         })?;
         self.with_db(|db| {
+            db.install_local_snapshot_provider(self.writer_root_provider());
             let read = Arc::new(db.begin_read().map_err(Self::storage_error)?);
+            let identity = read.storage_snapshot_identity();
             let root = Arc::new(WriterSnapshot {
-                read,
+                read: parking_lot::RwLock::new(Some(read)),
+                identity,
                 snapshot,
                 lsn,
                 accountant,
@@ -414,6 +418,13 @@ impl RedbPersistence {
             let mut roots = self.writer_snapshots.lock();
             roots.retain(|root| root.strong_count() != 0);
             roots.push(Arc::downgrade(&root));
+            drop(roots);
+            // Admit the lease while its original native view protects the pages.
+            // Keep that view until recycle, so accepted cursors retain native pins.
+            drop(
+                db.begin_external_read(identity)
+                    .map_err(Self::storage_error)?,
+            );
             Ok(root)
         })
     }
@@ -525,8 +536,15 @@ impl WriterSnapshot {
                     .map_or(0, OwnedMemoryReservation::bytes),
             )
     }
-    pub(super) fn owner_read(&self) -> Arc<redb::ReadTransaction> {
-        Arc::clone(&self.read)
+    pub(super) fn owner_read(&self) -> Result<Arc<redb::ReadTransaction>> {
+        self.read
+            .read()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| Error::StoreHandleRecycleFailed {
+                path: "writer source".into(),
+                reason: "the retained source has no open storage view".into(),
+            })
     }
 
     pub(crate) fn check_table_scope(&self, table: &str) -> Result<()> {
@@ -536,11 +554,13 @@ impl WriterSnapshot {
     }
 
     pub(crate) fn storage_identity(&self) -> redb::StorageSnapshotIdentity {
-        self.read.storage_snapshot_identity()
+        self.identity
     }
     #[cfg(feature = "test-seams")]
     pub(crate) fn note_read_source(&self, family: crate::writer_query_test_seams::PhysicalFamily) {
-        crate::writer_query_test_seams::note_physical_source(family, &self.read);
+        if let Ok(read) = self.owner_read() {
+            crate::writer_query_test_seams::note_physical_source(family, &read);
+        }
     }
 
     pub(crate) fn cursor(
@@ -792,6 +812,7 @@ impl WriterReadCursor {
         before: &mut dyn FnMut() -> Result<()>,
         decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
     ) -> Result<Option<(Vec<u8>, T)>> {
+        let read = self.root.owner_read()?;
         self.root
             .erasure
             .read()
@@ -808,10 +829,7 @@ impl WriterReadCursor {
         };
         match self.family {
             WriterCursorFamily::Bytes => {
-                let table = match self
-                    .root
-                    .read
-                    .open_table(TableDefinition::<&[u8], &[u8]>::new(&self.table))
+                let table = match read.open_table(TableDefinition::<&[u8], &[u8]>::new(&self.table))
                 {
                     Ok(table) => table,
                     Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -823,7 +841,7 @@ impl WriterReadCursor {
                 {
                     memory.reserve(logical.len().saturating_add(32))?;
                     RedbPersistence::verify_writer_relational_count_in_read(
-                        &self.root.read,
+                        &read,
                         logical,
                         table.len().map_err(RedbPersistence::storage_error)?,
                     )?;
@@ -855,9 +873,7 @@ impl WriterReadCursor {
                     .transpose()
             }
             WriterCursorFamily::Index => {
-                let table = match self
-                    .root
-                    .read
+                let table = match read
                     .open_table(TableDefinition::<BorrowedRelationalIndexKey, &[u8]>::new(
                         &self.table,
                     )) {
@@ -897,10 +913,7 @@ impl WriterReadCursor {
                     Bound::Excluded(v) => Bound::Excluded(utf8(v)?),
                     Bound::Unbounded => Bound::Unbounded,
                 };
-                let table = match self
-                    .root
-                    .read
-                    .open_table(TableDefinition::<&str, &[u8]>::new(&self.table))
+                let table = match read.open_table(TableDefinition::<&str, &[u8]>::new(&self.table))
                 {
                     Ok(table) => table,
                     Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -1016,8 +1029,8 @@ impl WriterSnapshot {
     }
 
     pub(crate) fn commit_bounds(&self) -> Result<(Option<(Lsn, TxId)>, Option<(Lsn, TxId)>, u64)> {
-        let table = self
-            .read
+        let read = self.owner_read()?;
+        let table = read
             .open_table(COMMIT_INDEX_TABLE)
             .map_err(RedbPersistence::storage_error)?;
         let first = table
@@ -1036,6 +1049,7 @@ impl WriterSnapshot {
     }
 
     pub(crate) fn sync_source(&self, table: &str, row_id: RowId) -> Result<Option<(Lsn, u8)>> {
+        let read = self.owner_read()?;
         let erasure = self.erasure.read();
         erasure.check_scope(Some(table), "sync provenance")?;
         let _scratch = OwnedMemoryReservation::try_new_for(
@@ -1046,7 +1060,7 @@ impl WriterSnapshot {
             HINT,
         )?;
         let key = RedbPersistence::sync_row_source_lsn_key(table, row_id);
-        let lsns = match self.read.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
+        let lsns = match read.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(RedbPersistence::storage_error(e)),
@@ -1057,8 +1071,7 @@ impl WriterSnapshot {
         else {
             return Ok(None);
         };
-        let kinds = self
-            .read
+        let kinds = read
             .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
             .map_err(RedbPersistence::storage_error)?;
         let kind = kinds
@@ -1167,9 +1180,8 @@ impl WriterReadCursor {
 
 impl WriterCommitCursor {
     pub(crate) fn next(&mut self) -> Result<Option<(Lsn, TxId)>> {
-        let table = self
-            .root
-            .read
+        let read = self.root.owner_read()?;
+        let table = read
             .open_table(COMMIT_INDEX_TABLE)
             .map_err(RedbPersistence::storage_error)?;
         let lower = if !self.reverse {
@@ -1238,9 +1250,8 @@ impl WriterSnapshot {
     }
 
     pub(crate) fn change_log_occurrences(&self, lsn: Lsn) -> Result<u64> {
-        let counts = match self
-            .read
-            .open_table(TableDefinition::<u64, u64>::new("change_log_lsn_count"))
+        let read = self.owner_read()?;
+        let counts = match read.open_table(TableDefinition::<u64, u64>::new("change_log_lsn_count"))
         {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -1256,9 +1267,10 @@ impl WriterSnapshot {
         &self,
         key: &str,
     ) -> Result<Option<WriterWindow<T>>> {
+        let read = self.owner_read()?;
         let erasure = self.erasure.read();
         erasure.check_scope(None, "config")?;
-        let table = match self.read.open_table(CONFIG_TABLE) {
+        let table = match read.open_table(CONFIG_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(RedbPersistence::storage_error(e)),
@@ -1290,8 +1302,8 @@ impl WriterReadCursor {
                     "table log selector has an invalid position width".into(),
                 ));
             }
-            let log = root
-                .read
+            let read = root.owner_read()?;
+            let log = read
                 .open_table(writer_history::WRITER_CHANGE_LOG_TABLE)
                 .map_err(RedbPersistence::storage_error)?;
             let record = log
@@ -1773,5 +1785,32 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+}
+
+impl RedbPersistence {
+    pub(super) fn writer_root_provider(&self) -> redb::ExternalSnapshotProvider {
+        let registry = Arc::downgrade(&self.writer_snapshots);
+        Arc::new(move || {
+            let Some(registry) = registry.upgrade() else {
+                return Ok(Vec::new());
+            };
+            let roots = {
+                let mut roots = registry.lock();
+                roots.retain(|root| root.strong_count() != 0);
+                roots.clone()
+            };
+            Ok(roots
+                .into_iter()
+                .filter_map(|root| root.upgrade().map(|root| root.storage_identity()))
+                .collect())
+        })
+    }
+    pub(super) fn live_writer_roots(&self) -> Vec<Arc<WriterSnapshot>> {
+        let roots = self.writer_snapshots.lock().clone();
+        roots
+            .into_iter()
+            .filter_map(|root| root.upgrade())
+            .collect()
     }
 }
