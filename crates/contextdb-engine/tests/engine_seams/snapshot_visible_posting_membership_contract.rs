@@ -505,6 +505,41 @@ fn same_id_membership_and_vector_replacements_compose_with_rollback_and_reopen()
 
 #[test]
 fn membership_admission_refusal_publishes_no_row_or_vector_state() {
+    // Keep the owner boundary exact, including when every numeric field matches.
+    let assert_source_refusal = |error: &Error, expected_budget: usize| {
+        let is_source_refusal = |candidate: &Error| {
+            matches!(candidate, Error::MemoryBudgetExceeded {
+                subsystem, operation, requested_bytes: 24, available_bytes: 0,
+                budget_limit_bytes, ..
+            } if subsystem == "writer_source" && operation == "store_adapter"
+                && *budget_limit_bytes == expected_budget)
+        };
+        assert!(
+            is_source_refusal(error),
+            "source admission attribution: {error:?}"
+        );
+        if let Error::MemoryBudgetExceeded {
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+            ..
+        } = error
+        {
+            let relabeled = Error::MemoryBudgetExceeded {
+                subsystem: "relational_index".to_owned(),
+                operation: "membership".to_owned(),
+                requested_bytes: *requested_bytes,
+                available_bytes: *available_bytes,
+                budget_limit_bytes: *budget_limit_bytes,
+                hint: hint.clone(),
+            };
+            assert!(
+                !is_source_refusal(&relabeled),
+                "a wrong-owner relabel must fail the same oracle"
+            );
+        }
+    };
     use contextdb_core::Error;
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("refused-members.redb");
@@ -528,13 +563,25 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         &params([("vector", Value::Vector(vec![0.0, 1.0]))]),
     )
     .unwrap();
-    db.accountant()
-        .set_budget(Some(db.accountant().usage().used))
-        .unwrap();
+    let first_budget = db.accountant().usage().used;
+    let first_owners = db.writer_memory_ownership_receipt_for_test();
+    assert_eq!(
+        db.accountant().usage().used,
+        first_budget,
+        "owner observation must remain passive"
+    );
+    eprintln!(
+        "MEMBERSHIP_CALIBRATION first budget={} owners={:?}",
+        first_budget, first_owners
+    );
+    assert_eq!(first_budget, 13481, "exact current owner envelope");
+    db.accountant().set_budget(Some(first_budget)).unwrap();
     let result = db.commit(tx);
-    assert!(
-        matches!(result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes: 24, available_bytes: 0, budget_limit_bytes: 13481, .. }) if subsystem == "writer_source" && operation == "store_adapter"),
-        "source admission must refuse before publishing any changed state: {result:?}"
+    assert_source_refusal(
+        result
+            .as_ref()
+            .expect_err("source admission must refuse before publication"),
+        13481,
     );
     db.accountant().set_budget(None).unwrap();
     let _ = db.rollback(tx);
@@ -585,23 +632,34 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         &HashMap::new(),
     )
     .unwrap();
-    assert!(
-        db.guard_row_conditions_in_tx(
+    assert!(db
+        .guard_row_conditions_in_tx(
             tx,
             "guarded_row",
             "id",
             &Value::Int64(7),
             &[("active".to_owned(), Value::Bool(true))],
         )
-        .unwrap()
+        .unwrap());
+    let mixed_budget = db.accountant().usage().used;
+    let mixed_owners = db.writer_memory_ownership_receipt_for_test();
+    assert_eq!(
+        db.accountant().usage().used,
+        mixed_budget,
+        "owner observation must remain passive"
     );
-    db.accountant()
-        .set_budget(Some(db.accountant().usage().used))
-        .unwrap();
+    eprintln!(
+        "MEMBERSHIP_CALIBRATION mixed budget={} owners={:?}",
+        mixed_budget, mixed_owners
+    );
+    assert_eq!(mixed_budget, 12418, "exact current owner envelope");
+    db.accountant().set_budget(Some(mixed_budget)).unwrap();
     let mixed_result = db.commit(tx);
-    assert!(
-        matches!(mixed_result, Err(Error::MemoryBudgetExceeded { ref subsystem, ref operation, requested_bytes: 24, available_bytes: 0, budget_limit_bytes: 12275, .. }) if subsystem == "writer_source" && operation == "store_adapter"),
-        "conditional-row admission keeps its source attribution beside an indexed write: {mixed_result:?}"
+    assert_source_refusal(
+        mixed_result
+            .as_ref()
+            .expect_err("source admission must refuse before publication"),
+        12418,
     );
     db.accountant().set_budget(None).unwrap();
     let _ = db.rollback(tx);
