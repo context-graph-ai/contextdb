@@ -1516,6 +1516,7 @@ struct SourceLoopPoisonProbe {
     work_calls: AtomicU64,
     source_touches: Mutex<BTreeMap<bounded::TestSourceTouch, u64>>,
     peak_temporary_accounted_bytes: AtomicU64,
+    peak_request_owned_bytes: AtomicU64,
     cancellation_calls: AtomicU64,
     cancelled: AtomicBool,
 }
@@ -1537,6 +1538,7 @@ impl SourceLoopPoisonProbe {
             work_calls: AtomicU64::new(0),
             source_touches: Mutex::new(BTreeMap::new()),
             peak_temporary_accounted_bytes: AtomicU64::new(0),
+            peak_request_owned_bytes: AtomicU64::new(0),
             cancellation_calls: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
         }
@@ -1651,6 +1653,8 @@ impl bounded::ExecutionProbe for SourceLoopPoisonProbe {
         );
         self.peak_temporary_accounted_bytes
             .fetch_max(actually_accounted, Ordering::SeqCst);
+        self.peak_request_owned_bytes
+            .fetch_max(held_temporary_bytes, Ordering::SeqCst);
     }
 
     fn cancellation_observed(&self, _completed_work: u64) {
@@ -1678,7 +1682,15 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
     profile_request.probe = Some(profile_probe.clone());
     let profile = bounded_success(case.db, &profile_request);
     let exact_work = profile_probe.work_units();
-    let exact_memory = profile_probe.peak_temporary_accounted_bytes();
+    let exact_memory = profile_probe
+        .peak_request_owned_bytes
+        .load(Ordering::SeqCst);
+    let accountant_peak = profile_probe.peak_temporary_accounted_bytes();
+    assert!(accountant_peak >= exact_memory);
+    eprintln!(
+        "{} request_owned_peak={exact_memory} accountant_peak={accountant_peak}",
+        case.name
+    );
     let source_items = profile_probe.source_items(case.touch);
     assert!(exact_work > 0, "{} performs real charged work", case.name);
     assert!(
