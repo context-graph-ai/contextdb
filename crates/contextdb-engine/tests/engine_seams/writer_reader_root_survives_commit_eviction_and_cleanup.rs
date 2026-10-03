@@ -615,6 +615,71 @@ impl bounded::ExecutionProbe for PagedStatementPause {
     fn cancellation_observed(&self, _: u64) {}
 }
 
+// Decode the one published BASE while the writer is closed. This checks the
+// actual saved graph format, rather than a transient in-memory paging flag.
+fn assert_native_paged_base(path: &std::path::Path) {
+    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+    #[derive(serde::Deserialize)]
+    struct Base {
+        _index: VectorIndexRef,
+        _partition: VectorPartitionKey,
+        _generation: u64,
+        _base_tx: contextdb_core::TxId,
+        _base_lsn: contextdb_core::Lsn,
+        _highest_tx: contextdb_core::TxId,
+        _highest_lsn: contextdb_core::Lsn,
+        dimension: u32,
+        _quantization: contextdb_core::VectorQuantization,
+        _algorithm: u16,
+        format: u16,
+        graph: (Vec<u8>, [u8; 32]),
+        _digest: [u8; 32],
+    }
+    let store = redb::Database::open(path).unwrap();
+    let read = store.begin_read().unwrap();
+    let table = read
+        .open_table(TableDefinition::<&[u8], &[u8]>::new(
+            "vector_partition_base_generations",
+        ))
+        .unwrap();
+    let mut records = table.iter().unwrap();
+    let (_, value) = records.next().unwrap().unwrap();
+    assert!(
+        records.next().is_none(),
+        "this fixture publishes exactly one BASE"
+    );
+    let encoded = value.value();
+    let magic = b"contextdb-vector-partition";
+    assert_eq!(&encoded[..magic.len()], magic);
+    let length_offset = magic.len() + 3;
+    let payload_offset = length_offset + 8;
+    let length =
+        u64::from_be_bytes(encoded[length_offset..payload_offset].try_into().unwrap()) as usize;
+    assert_eq!(encoded.len(), payload_offset + length + 32);
+    let (base, consumed): (Base, usize) = bincode::serde::decode_from_slice(
+        &encoded[payload_offset..payload_offset + length],
+        bincode::config::standard(),
+    )
+    .unwrap();
+    assert_eq!(consumed, length);
+    assert_eq!(base.dimension, 3);
+    assert_eq!(
+        base.format, 0x0100,
+        "published BASE uses VECTOR_GRAPH_PAGED_FORMAT_VERSION"
+    );
+    assert_eq!(
+        &base.graph.0[..8],
+        b"CDBVPG01",
+        "BASE contains native paged metadata"
+    );
+    assert_eq!(*blake3::hash(&base.graph.0).as_bytes(), base.graph.1);
+    eprintln!(
+        "saved native BASE format={}, metadata_bytes={}",
+        base.format,
+        base.graph.0.len()
+    );
+}
+
 // Pause after the kernel captures its sources, before its first paged pull.
 // The successor must publish while this reader still owns the old native root.
 #[test]
@@ -633,12 +698,15 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
         )
         .unwrap(),
     );
+    const DIMENSION: usize = 3;
+    const ROWS: i64 = 1024;
+    let vector = |axis: usize| {
+        let mut value = vec![0.0; DIMENSION];
+        value[axis] = 1.0;
+        value
+    };
     database.execute("CREATE TABLE paged_items (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 8, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC OFF", &HashMap::new()).unwrap();
-    for (id, vector) in [
-        (1, vec![1.0, 0.0, 0.0]),
-        (2, vec![0.0, 1.0, 0.0]),
-        (3, vec![0.0, 0.0, 1.0]),
-    ] {
+    for (id, vector) in [(1, vector(0)), (2, vector(1)), (3, vector(2))] {
         database
             .execute(
                 "INSERT INTO paged_items VALUES ($id,$v)",
@@ -649,11 +717,100 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
             )
             .unwrap();
     }
-    for _ in 0..8 {
+    let tx = database.begin_or_panic();
+    for id in 4..=ROWS {
+        database
+            .execute_in_tx(
+                tx,
+                "INSERT INTO paged_items VALUES ($id,$v)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("v".into(), Value::Vector(vec![1.0, 1.0, 1.0])),
+                ]),
+            )
+            .unwrap();
+    }
+    database.commit(tx).unwrap();
+    let route = contextdb_vector::VectorPartitionRef::new(
+        VectorIndexRef::new("paged_items", "embedding"),
+        VectorPartitionKey::default(),
+    );
+    // Price the existing owners before the FIRST build. The complete 1024 x
+    // 3 graph must exceed this finite construction allowance; the first
+    // committed cursor below verifies that admission in the actual cache state.
+    let owners = database
+        .writer_memory_ownership_receipt_for_test()
+        .named_owner_total;
+    database
+        .set_memory_limit(Some(owners + 256 * 1024))
+        .unwrap();
+    database.run_maintenance_cycle().unwrap();
+    let first = database
+        .vector_store_for_test()
+        .partition_info(&route.index, &route.partition_key)
+        .unwrap();
+    eprintln!("native initial owners={owners}, first={first:?}");
+    assert!(
+        first
+            .maintenance_progress
+            .is_some_and(|p| p.vectors_done > 0 && p.vectors_done < ROWS as usize),
+        "native base construction must commit unfinished finite progress: {first:?}"
+    );
+    // The recorded unfinished build fixes the native paged route. Restore the
+    // original writer budget so storage relocation can accompany completion;
+    // this fixture proves serving-root identity, not builder peak residency.
+    database.set_memory_limit(Some(64 * 1024 * 1024)).unwrap();
+    for _ in 0..256 {
+        let info = database
+            .vector_store_for_test()
+            .partition_info(&route.index, &route.partition_key)
+            .unwrap();
+        if info.graph_available && info.maintenance_progress.is_none() {
+            break;
+        }
         database.run_maintenance_cycle().unwrap();
+    }
+    let published = database
+        .vector_store_for_test()
+        .partition_info(&route.index, &route.partition_key)
+        .unwrap();
+    assert!(
+        published.graph_available && published.maintenance_progress.is_none(),
+        "the native paged BASE must be finished and published before reopen: {published:?}"
+    );
+    assert!(
+        database
+            .vector_store_for_test()
+            .partition_has_paged_storage(&route),
+        "the finite native BASE must publish paged storage"
+    );
+    database.set_memory_limit(Some(64 * 1024 * 1024)).unwrap();
+    database
+        .execute(
+            "CREATE TABLE displacement (id INT PRIMARY KEY, body TEXT) SYNC OFF",
+            &HashMap::new(),
+        )
+        .unwrap();
+    for batch in 0..16 {
+        let mut params = HashMap::from([("body".into(), Value::Text("p".repeat(128 * 1024)))]);
+        let values = (0..64)
+            .map(|offset| {
+                let name = format!("id{offset}");
+                params.insert(name.clone(), Value::Int64(batch * 64 + offset));
+                format!("(${name},$body)")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        database
+            .execute(
+                &format!("INSERT INTO displacement VALUES {values}"),
+                &params,
+            )
+            .unwrap();
     }
     database.close().unwrap();
     drop(database);
+    assert_native_paged_base(&path);
     let database = Arc::new(
         Database::open_with_options(
             &path,
@@ -664,6 +821,18 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
             },
         )
         .unwrap(),
+    );
+    eprintln!(
+        "native reopened info={:?}, generations={:?}, paged_storage={}",
+        database
+            .vector_store_for_test()
+            .partition_info(&route.index, &route.partition_key),
+        database
+            .vector_store_for_test()
+            .partition_graph_generation_status(&route),
+        database
+            .vector_store_for_test()
+            .partition_has_paged_storage(&route)
     );
     let snapshot = database.snapshot();
     let (_, old_work) = observe_target("paged_items", || {
@@ -693,7 +862,7 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
             let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
             let mut request = bounded::BoundedReadRequest::new(
                 "SELECT id, embedding FROM paged_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-                HashMap::from([("q".into(),Value::Vector(vec![0.0,1.0,0.0]))]),
+                HashMap::from([("q".into(),Value::Vector(vector(1)))]),
                 ReadLimits { cursor_page_rows: 1, result_rows: 3, work: 100_000, active_ms: 1000,
                     memory: 64 * 1024 * 1024, ..Default::default() },
                 Arc::new(ManualDeadlineClock::at(0)));
@@ -707,8 +876,11 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
             database
                 .execute_in_tx(
                     tx,
-                    "UPDATE paged_items SET embedding = '[0.1,0.2,0.3]' WHERE id = $id",
-                    &HashMap::from([("id".into(), Value::Int64(id))]),
+                    "UPDATE paged_items SET embedding = $v WHERE id = $id",
+                    &HashMap::from([
+                        ("id".into(), Value::Int64(id)),
+                        ("v".into(), Value::Vector(vec![0.1, 0.2, 0.3])),
+                    ]),
                 )
                 .unwrap();
         }
@@ -718,6 +890,17 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
             "successor publishes before the first page read"
         );
         database.compact_currency_versions().unwrap();
+        let before = database.__writer_cache_stats_for_test().unwrap();
+        drop(
+            database
+                .__hold_row_page_for_test("displacement", 1023)
+                .unwrap(),
+        );
+        let after = database.__writer_cache_stats_for_test().unwrap();
+        assert!(
+            after.1 > before.1 && after.2 > before.2,
+            "paused reader must survive actual displacement: before={before:?}, after={after:?}"
+        );
         assert!(
             database
                 .__native_read_transaction_count_for_test(old_root.transaction_id)
@@ -736,6 +919,12 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
     );
     eprintln!("paged captured-root work old={old_root:?} actual={work:?}");
     assert_eq!(registered.load(Ordering::SeqCst), snapshot.0);
+    for (_, root) in work.physical_sources.iter().flatten() {
+        assert_eq!(
+            root.transaction_id, old_root.transaction_id,
+            "row and vector pages use the same captured physical transaction, never a fresh successor root"
+        );
+    }
     for family in [
         PhysicalFamily::Row,
         PhysicalFamily::Vector,
@@ -747,12 +936,6 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
                 .flatten()
                 .any(|(observed, _)| *observed == family),
             "the paged reader exercises its actual {family:?} source: {work:?}"
-        );
-    }
-    for (_, root) in work.physical_sources.iter().flatten() {
-        assert_eq!(
-            root.transaction_id, old_root.transaction_id,
-            "row and vector pages use the same captured physical transaction, never a fresh successor root"
         );
     }
     opened.cursor.close().unwrap();
