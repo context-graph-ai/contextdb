@@ -75778,6 +75778,9 @@ mod currency_version_compaction_tests {
             "installing the currency schema must start the maintenance thread in-session"
         );
 
+        // Preserve the accumulated-version precondition before the measured
+        // background work is released at the fast test cadence below.
+        db.__set_currency_maintenance_interval(Duration::from_secs(3600));
         for advertised_at in 1..=200 {
             crate::work_ledger::advertise_capability(
                 &db,
@@ -75788,7 +75791,7 @@ mod currency_version_compaction_tests {
             )
             .expect("advertise");
         }
-        assert_eq!(physical_versions(&db, "work_capabilities"), 200);
+        assert_eq!(durable_physical_versions(&db, "work_capabilities"), 200);
 
         // Speed the cadence up and let the thread heal the accumulated versions.
         db.__set_currency_maintenance_interval(Duration::from_millis(40));
@@ -75801,14 +75804,14 @@ mod currency_version_compaction_tests {
         let start = std::time::Instant::now();
         while start.elapsed() < Duration::from_secs(10) {
             if db.__maintenance_wakes() > baseline_wakes
-                && physical_versions(&db, "work_capabilities") == 1
+                && durable_physical_versions(&db, "work_capabilities") == 1
             {
                 break;
             }
             std::thread::yield_now();
         }
         assert_eq!(
-            physical_versions(&db, "work_capabilities"),
+            durable_physical_versions(&db, "work_capabilities"),
             1,
             "the background maintenance thread must auto-compact accumulated versions"
         );
