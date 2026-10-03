@@ -848,6 +848,9 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
         );
         row.unwrap()
     };
+    let durable_idx = indexes.columns.iter().position(|c| c == "durable_vector_bytes").unwrap();
+    let charged_vector_idx = indexes.columns.iter().position(|c| c == "charged_vector_bytes").unwrap();
+    let charged_index_idx = indexes.columns.iter().position(|c| c == "charged_index_bytes").unwrap();
     let text_row = find("vector_text", 4);
     let vision_row = find("vector_vision", 8);
     // vector_count must reflect actual inserted rows, not hardcoded zero.
@@ -859,17 +862,14 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
             ),
             other => panic!("{label}.vector_count must be Int64; got {other:?}"),
         }
-        // bytes must be at least dim * count for f32 storage (4 bytes per dim per row); a hardcoded
-        // bytes=1 stub fails this lower bound.
+        // SHOW's compatibility bytes are actual charged owners. Dormant
+        // durable bodies have their own exact physical-payload field.
         let declared_dim = if label == "vector_text" { 4 } else { 8 };
-        let f32_floor = (row_count * declared_dim * std::mem::size_of::<f32>()) as i64;
-        match &row[bytes_idx] {
-            Value::Int64(n) => assert!(
-                *n >= f32_floor,
-                "{label}.bytes must be at least f32-floor {f32_floor}; got {n}"
-            ),
-            other => panic!("{label}.bytes must be Int64; got {other:?}"),
-        }
+        let durable_bytes = (row_count * declared_dim * std::mem::size_of::<f32>()) as i64;
+        assert_eq!(row[charged_vector_idx], Value::Int64(0), "{label}: dormant bodies own no resident vector payload");
+        assert_eq!(row[charged_index_idx], Value::Int64(24), "{label}: exact index ownership");
+        assert_eq!(row[bytes_idx], Value::Int64(24), "{label}: charged vector plus charged index bytes");
+        assert_eq!(row[durable_idx], Value::Int64(durable_bytes), "{label}: exact durable F32 payload");
         // Quantization defaults to F32 when no clause is declared.
         assert!(
             matches!(&row[quant_idx], Value::Text(s) if s == "F32"),
