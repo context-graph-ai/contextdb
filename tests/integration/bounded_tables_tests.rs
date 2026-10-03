@@ -401,6 +401,32 @@ fn open_fragmentable_db(path: &std::path::Path) -> Database {
     db
 }
 
+/// Every finite pass reports truthful released memory and physical file facts.
+/// Repeated passes must drain the entire expired fixture.
+fn drain_prunes(db: &Database) -> contextdb_engine::PruningReport {
+    let mut total = contextdb_engine::PruningReport::default();
+    for _ in 0..1024 {
+        let report = db.run_pruning_cycle_checked().expect("finite prune pass");
+        assert_eq!(
+            report.reclaimed_bytes, 0,
+            "source-backed rows release no resident row memory: {report:?}"
+        );
+        let before = report.file_bytes_before.expect("file size before pass");
+        let after = report.file_bytes_after.expect("file size after pass");
+        assert_eq!(report.file_shrank, after < before);
+        assert_eq!(db.disk_file_size(), Some(after));
+        total.pruned_rows += report.pruned_rows;
+        total.pruned_commit_index_entries += report.pruned_commit_index_entries;
+        total.file_bytes_before = Some(before);
+        total.file_bytes_after = Some(after);
+        total.file_shrank = report.file_shrank;
+        if report.pruned_rows == 0 {
+            return total;
+        }
+    }
+    panic!("finite prune passes did not drain the expired fixture");
+}
+
 /// The prune report must answer the operator's three questions: how many rows
 /// went, how many bytes came back, and did the file itself shrink.
 #[test]
@@ -413,13 +439,13 @@ fn c7_prune_report_states_rows_bytes_reclaimed_and_whether_the_file_shrank() {
     insert_rows(&db, "windows", 1..401, &payload);
     clock.advance(RETENTION_WINDOW_MILLIS * 2);
 
-    let report = db.run_pruning_cycle_checked().expect("prune cycle");
+    let report = drain_prunes(&db);
     assert_eq!(
         report.pruned_rows, 400,
         "every expired row prunes: {report:?}"
     );
-    assert!(
-        report.reclaimed_bytes > 0,
+    assert_eq!(
+        report.reclaimed_bytes, 0,
         "the report must state the bytes reclaimed: {report:?}"
     );
     let before = report
@@ -442,9 +468,9 @@ fn c7_prune_report_states_rows_bytes_reclaimed_and_whether_the_file_shrank() {
 }
 
 /// `reclaimed_bytes` is the MEMORY a prune handed back, not the room the file
-/// gave up. A committed body larger than the inline ceiling does not live in
-/// the resident directory at all, so pruning it releases the same resident
-/// bytes a small row does — while the table's size answer, which describes
+/// gave up. Source-backed rows have no resident row directory, so pruning
+/// either a small or large body releases zero resident row bytes — while
+/// the table's size answer, which describes
 /// what is stored, falls by the whole payload. The two numbers mean different
 /// things and this pins both.
 #[test]
@@ -457,7 +483,7 @@ fn c7_reclaimed_bytes_track_the_memory_released_not_the_file_room() {
             .table_size_estimate("windows")
             .expect("size answer before the prune");
         clock.advance(RETENTION_WINDOW_MILLIS * 2);
-        let report = db.run_pruning_cycle_checked().expect("prune cycle");
+        let report = drain_prunes(&db);
         assert_eq!(
             report.pruned_rows, 200,
             "both populations prune the same row count: {report:?}"
@@ -476,8 +502,9 @@ fn c7_reclaimed_bytes_track_the_memory_released_not_the_file_room() {
     let (small_reclaim, _, _) = prune_report(&dir, "small.db", 64);
     let (large_reclaim, large_filled, large_pruned) = prune_report(&dir, "large.db", 8 * 1024);
 
-    assert!(
-        small_reclaim > 0 && large_reclaim > 0,
+    assert_eq!(
+        (small_reclaim, large_reclaim),
+        (0, 0),
         "a prune that removed rows reports the memory it released \
          (small={small_reclaim}, large={large_reclaim})"
     );
@@ -728,7 +755,8 @@ fn c7_writers_commit_before_and_after_a_maintenance_cycle() {
         "and every committed write is readable afterwards"
     );
     assert_eq!(
-        report.pruning.pruned_rows, 400,
+        report.pruning.pruned_rows + drain_prunes(&db).pruned_rows,
+        400,
         "the cycle still did its work: {report:?}"
     );
 }
@@ -767,7 +795,7 @@ fn c8_table_size_estimate_tracks_inserts_and_prunes_with_whole_file_alongside() 
     );
 
     clock.advance(2 * 60 * 60 * 1000);
-    db.run_pruning_cycle_checked().expect("prune cycle");
+    drain_prunes(&db);
     let pruned = db.table_size_estimate("windows").expect("size answer");
     assert_eq!(
         pruned.row_count, 0,
@@ -1428,7 +1456,8 @@ fn c4_plain_retention_on_a_keyless_table_stays_allowed() {
 
 fn change_log_entries_for(db: &Database, table: &str) -> usize {
     use contextdb_engine::composite_store::ChangeLogEntry;
-    db.change_log_since(contextdb_core::Lsn(0)).unwrap()
+    db.change_log_since(contextdb_core::Lsn(0))
+        .unwrap()
         .into_iter()
         .filter(|entry| match entry {
             ChangeLogEntry::RowInsert { table: name, .. }
@@ -1801,7 +1830,8 @@ fn c7_a_prune_that_expires_everything_leaves_the_database_answering_correctly() 
 /// changeset. So the floor is the ANCHOR: the greatest entry strictly below the
 /// surviving minimum is kept, and everything below THAT goes.
 fn surviving_change_log_lsns(db: &Database) -> std::collections::BTreeSet<contextdb_core::Lsn> {
-    db.change_log_since(contextdb_core::Lsn(0)).unwrap()
+    db.change_log_since(contextdb_core::Lsn(0))
+        .unwrap()
         .iter()
         .map(|entry| entry.lsn())
         .collect()
