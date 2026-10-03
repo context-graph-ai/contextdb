@@ -37,13 +37,6 @@ impl MemoryAccountant {
         }
     }
 
-    fn with_budget(limit: usize) -> Self {
-        Self {
-            limit,
-            used: AtomicUsize::new(0),
-        }
-    }
-
     fn usage(&self) -> MemoryUsage {
         let used = self.used.load(Ordering::SeqCst);
         let limit = (self.limit != 0).then_some(self.limit);
@@ -355,28 +348,6 @@ fn maintain_until_hnsw_ready(
         }
     }
     panic!("finite maintenance did not materialize HNSW for {index:?}");
-}
-
-fn hnsw_final_estimate(entry_count: usize, dimension: usize) -> usize {
-    contextdb_vector::hnsw::HnswIndex::estimated_resident_bytes_for_count(
-        entry_count,
-        dimension,
-        VectorQuantization::F32,
-    )
-}
-
-fn hnsw_build_reservation_estimate(entry_count: usize, dimension: usize) -> usize {
-    let policy = contextdb_vector::store::VectorIndexLayout::unpartitioned(
-        dimension,
-        VectorQuantization::F32,
-    )
-    .resolve_policy(entry_count, 1);
-    contextdb_vector::hnsw::HnswIndex::estimated_build_reservation(
-        entry_count,
-        dimension,
-        VectorQuantization::F32,
-        policy,
-    )
 }
 
 fn vector_count_for(store: &VectorStore, index: &VectorIndexRef) -> usize {
@@ -2339,11 +2310,31 @@ fn unknown_vector_index_error_under_concurrent_multi_ref_apply_with_positive_con
 fn memory_accountant_rejection_on_a_leaves_b_accountant_byte_balance_correct() {
     let a = ref_named("large", "embedding");
     let b = ref_named("small", "embedding");
-    let final_b = hnsw_final_estimate(HNSW_ROWS_FOR_TEST, 3);
-    let reservation_b = hnsw_build_reservation_estimate(HNSW_ROWS_FOR_TEST, 3);
-    let reservation_a = hnsw_build_reservation_estimate(HNSW_ROWS_FOR_TEST, 256);
+    let final_b = contextdb_vector::hnsw::HnswIndex::estimated_resident_bytes_for_count(
+        HNSW_ROWS_FOR_TEST,
+        3,
+        VectorQuantization::F32,
+    );
+    let reservation_for = |dimension| {
+        let policy = contextdb_vector::store::VectorIndexLayout::unpartitioned(
+            dimension,
+            VectorQuantization::F32,
+        )
+        .resolve_policy(HNSW_ROWS_FOR_TEST, 1);
+        contextdb_vector::hnsw::HnswIndex::estimated_build_reservation(
+            HNSW_ROWS_FOR_TEST,
+            dimension,
+            VectorQuantization::F32,
+            policy,
+        )
+    };
+    let reservation_b = reservation_for(3);
+    let reservation_a = reservation_for(256);
     assert!(reservation_a > reservation_b);
-    let accountant = Arc::new(MemoryAccountant::with_budget(reservation_b + 1024));
+    let accountant = Arc::new(MemoryAccountant {
+        limit: reservation_b + 1024,
+        used: AtomicUsize::new(0),
+    });
     let (store, _tx_mgr, exec) =
         setup_refs(&[(a.clone(), 256), (b.clone(), 3)], accountant.clone());
     seed_ranked(&store, &a, 1, HNSW_ROWS_FOR_TEST, 256, 10, &accountant);
@@ -2405,7 +2396,10 @@ fn concurrent_distinct_hnsw_builds_do_not_oversubscribe_transient_budget() {
     let reservation =
         estimate_hnsw_build_reservation_for_test(HNSW_ROWS_FOR_TEST, dim, VectorQuantization::F32);
     assert!(reservation > final_bytes);
-    let accountant = Arc::new(MemoryAccountant::with_budget(reservation + final_bytes - 1));
+    let accountant = Arc::new(MemoryAccountant {
+        limit: reservation + final_bytes - 1,
+        used: AtomicUsize::new(0),
+    });
     let (store, _tx_mgr, exec) =
         setup_refs(&[(a.clone(), dim), (b.clone(), dim)], accountant.clone());
     seed_ranked(&store, &a, 1, HNSW_ROWS_FOR_TEST, dim, 10, &accountant);
@@ -2488,7 +2482,10 @@ fn same_ref_concurrent_hnsw_builders_reserve_and_install_once() {
     let fresh_tail_bytes = estimate_hnsw_final_bytes_for_test(0, dim, VectorQuantization::F32);
     let reservation =
         estimate_hnsw_build_reservation_for_test(HNSW_ROWS_FOR_TEST, dim, VectorQuantization::F32);
-    let accountant = Arc::new(MemoryAccountant::with_budget(reservation * 2));
+    let accountant = Arc::new(MemoryAccountant {
+        limit: reservation * 2,
+        used: AtomicUsize::new(0),
+    });
     let (store, _tx_mgr, exec) = setup_refs(&[(r.clone(), dim)], accountant.clone());
     seed_ranked(&store, &r, 1, HNSW_ROWS_FOR_TEST, dim, 10, &accountant);
 
