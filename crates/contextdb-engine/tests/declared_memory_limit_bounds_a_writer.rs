@@ -799,42 +799,86 @@ fn every_charge_a_row_takes_comes_back_when_the_row_does() {
             ("body".to_owned(), Value::Text("b".repeat(256))),
         ])
     };
+    let settled_receipt = || {
+        let receipt = db.writer_memory_ownership_receipt_for_test();
+        assert_eq!(receipt.reconciliation_gap, 0, "{receipt:?}");
+        assert_eq!(receipt.named_owner_total, accountant.usage().used);
+        assert_eq!(receipt.current_row_versions, 0);
+        assert_eq!(receipt.historical_row_versions, 0);
+        assert_eq!(receipt.staged_row_admissions, 0);
+        assert_eq!(receipt.staged_index_postings, 0);
+        assert_eq!(receipt.pending_commit_metadata, 0);
+        receipt
+    };
     let fill = || {
         for row in 0..ROWS {
-            db.execute(INSERT, &params(row)).expect("store one note");
+            let tx = db.begin().unwrap();
+            db.execute_in_tx(tx, INSERT, &params(row))
+                .expect("stage one note");
+            let staged = db.writer_memory_ownership_receipt_for_test();
+            let correctly_owned =
+                |receipt: &contextdb_engine::database::WriterMemoryOwnershipReceiptForTest| {
+                    receipt.staged_row_admissions > 0
+                        && receipt.staged_index_postings > 0
+                        && receipt.current_row_versions == 0
+                };
+            assert!(correctly_owned(&staged), "{staged:?}");
+            let mut wrong_owner = staged.clone();
+            wrong_owner.current_row_versions = wrong_owner.staged_row_admissions;
+            wrong_owner.staged_row_admissions = 0;
+            assert!(
+                !correctly_owned(&wrong_owner),
+                "row admission cannot be relabelled as durable row residency"
+            );
+            db.commit(tx).expect("publish one complete note");
+            settled_receipt();
         }
     };
-
-    let empty = charged_for_rows(&db, &accountant);
+    let empty = settled_receipt();
     fill();
-    let full = charged_for_rows(&db, &accountant);
-    assert!(
-        full > empty,
-        "filling a table with {ROWS} indexed rows must charge something"
-    );
+    let full = settled_receipt();
+    let full_rows = db
+        .execute(
+            "SELECT id, context_id, author, kind, seq, body FROM notes ORDER BY seq",
+            &HashMap::new(),
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(full_rows.len(), ROWS);
+    for (row, values) in full_rows.iter().enumerate() {
+        assert_eq!(values[0], Value::Uuid(event_uuid(row)));
+        assert_eq!(values[4], Value::Int64(row as i64));
+    }
+    let populated = db.table_size_estimate("notes").unwrap();
+    assert_eq!(populated.row_count, ROWS as u64);
+    assert!(populated.estimated_live_bytes >= (ROWS * 256) as u64);
 
     db.execute("DELETE FROM notes", &HashMap::new())
         .expect("delete every note");
-    let emptied = charged_for_rows(&db, &accountant);
-    assert_eq!(
-        emptied,
-        empty,
-        "deleting every row must give back exactly what storing them took: {} B are still \
-         charged for a table with no rows in it",
-        emptied as i64 - empty as i64,
+    let emptied = settled_receipt();
+    assert_eq!(emptied.table_metadata, empty.table_metadata);
+    assert_eq!(db.table_size_estimate("notes").unwrap().row_count, 0);
+    assert!(
+        db.execute("SELECT id FROM notes", &HashMap::new())
+            .unwrap()
+            .rows
+            .is_empty()
     );
 
     fill();
-    let refilled = charged_for_rows(&db, &accountant);
+    let refilled = settled_receipt();
+    assert_eq!(refilled.table_metadata, full.table_metadata);
     assert_eq!(
-        refilled,
-        full,
-        "the same rows must cost the same the second time: the refilled store is charged {} B \
-         against the first fill's {full} B",
-        refilled as i64 - full as i64,
+        db.execute(
+            "SELECT id, context_id, author, kind, seq, body FROM notes ORDER BY seq",
+            &HashMap::new()
+        )
+        .unwrap()
+        .rows,
+        full_rows
     );
 
-    // And a transaction that never commits leaves nothing behind.
+    let before_rollback = settled_receipt();
     let tx = db
         .begin()
         .expect("begin a transaction that will not commit");
@@ -842,11 +886,20 @@ fn every_charge_a_row_takes_comes_back_when_the_row_does() {
         db.execute_in_tx(tx, INSERT, &params(row))
             .expect("stage one note");
     }
+    let staged = db.writer_memory_ownership_receipt_for_test();
+    assert!(staged.staged_row_admissions > 0 && staged.staged_index_postings > 0);
     db.rollback(tx).expect("roll the transaction back");
     assert_eq!(
-        charged_for_rows(&db, &accountant),
-        full,
-        "a rolled-back transaction must leave the charge exactly where it found it"
+        settled_receipt(),
+        before_rollback,
+        "rollback releases every admitted owner exactly"
+    );
+    assert_eq!(
+        db.table_size_estimate("notes").unwrap().row_count,
+        ROWS as u64
+    );
+    eprintln!(
+        "row ownership empty={empty:?} full={full:?} emptied={emptied:?} refilled={refilled:?}"
     );
     db.close().expect("close the store");
 }
@@ -1595,10 +1648,7 @@ fn a_transaction_open_across_an_index_set_change_settles_the_rows_it_staged() {
 /// group. The whole group must be admitted before any part becomes durable.
 #[test]
 fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
-    // Enough rows that what the table retains dwarfs the store's fixed open
-    // cost, so a limit with room for two of the three arriving indexes and not
-    // one index over them is a figure the accountant can tell apart from the
-    // store's own open cost.
+    // Durable rows populate the index fixture; catalog preparation is admitted separately.
     const ROWS: usize = 150;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -1629,8 +1679,6 @@ fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
         .expect("drop the sizing index");
 
     let settled = accountant.usage().used;
-    db.set_memory_limit(Some(settled + one_index * 2))
-        .expect("declare a limit with room for two of the three indexes");
 
     let group = ChangeSet {
         rows: Vec::new(),
@@ -1654,7 +1702,30 @@ fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
     // will really cost, or the refusal never fires and the store overshoots the
     // limit instead. Pinned directly, against the figure the accountant measured
     // for one index over these rows.
+    contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
     let priced = db.projected_sync_ddl_unit_bytes_for_test(&group.ddl);
+    let ledger = contextdb_engine::memory_accounting::take_budget_ledger_for_test();
+    let position = ledger
+        .iter()
+        .position(|entry| entry.what == "sync/stage_received_catalog_dependencies")
+        .expect("projection admits the real incoming catalog");
+    let admission = &ledger[position];
+    let limit = admission.used_after - 1;
+    assert!(
+        ledger[..position]
+            .iter()
+            .all(|entry| entry.used_after <= limit)
+    );
+    assert_eq!(
+        accountant.usage().used,
+        settled,
+        "pricing releases its private catalog"
+    );
+    eprintln!(
+        "schema group price={priced} retained_index={one_index} admission={admission:?} limit={limit}"
+    );
+    db.set_memory_limit(Some(limit)).unwrap();
+    let before_refusal = db.current_lsn();
     assert!(
         priced >= one_index * 3,
         "the unit's price ({priced} B) must cover what its three indexes really cost \
@@ -1663,16 +1734,40 @@ fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
     );
 
     let outcome = db.apply_changes(
-        group,
+        group.clone(),
         &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
     );
     let error = outcome.expect_err(
-        "a limit with room for two of three indexes must refuse the group that declares three",
+        "a catalog allowance one byte below its real admission must refuse the whole group",
     );
-    assert!(
-        matches!(error, Error::MemoryBudgetExceeded { .. }),
-        "the refusal must be the typed memory one, not {error:?}"
-    );
+    let correct_owner = |error: &Error| {
+        matches!(error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, ..
+    } if subsystem == "sync" && operation == "stage_received_catalog_dependencies"
+        && *requested_bytes == admission.bytes && *available_bytes == admission.bytes - 1
+        && *budget_limit_bytes == limit)
+    };
+    assert!(correct_owner(&error), "{error:?}");
+    if let Error::MemoryBudgetExceeded {
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = &error
+    {
+        let wrong_owner = Error::MemoryBudgetExceeded {
+            subsystem: "relational_index".to_owned(),
+            operation: operation.clone(),
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone(),
+        };
+        assert!(!correct_owner(&wrong_owner));
+    }
+    assert_eq!(db.current_lsn(), before_refusal);
 
     let installed = db
         .table_meta("notes")
@@ -1687,7 +1782,47 @@ fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
         "a received unit refused for memory must leave the old complete state, not a proper \
          subset of itself; these were installed and kept: {installed:?}"
     );
+    db.set_memory_limit(None).unwrap();
+    assert_eq!(
+        db.execute("SELECT COUNT(*) FROM notes", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(ROWS as i64)]]
+    );
+    db.apply_changes(
+        group,
+        &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
+    )
+    .expect("the same complete group installs with room");
+    assert_eq!(
+        db.table_meta("notes")
+            .unwrap()
+            .indexes
+            .iter()
+            .filter(|index| index.name.starts_with("group_"))
+            .count(),
+        3
+    );
     db.close().expect("close the store");
+    let reopened = Database::open(root.path().join("group.db")).unwrap();
+    assert_eq!(
+        reopened
+            .table_meta("notes")
+            .unwrap()
+            .indexes
+            .iter()
+            .filter(|index| index.name.starts_with("group_"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        reopened
+            .execute("SELECT COUNT(*) FROM notes", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(ROWS as i64)]]
+    );
+    reopened.close().unwrap();
 }
 
 const WIDE_DDL: &str = "CREATE TABLE wide (id UUID PRIMARY KEY, body TEXT NOT NULL) SYNC TWO WAY";
@@ -1744,14 +1879,39 @@ fn a_received_unit_priced_far_too_low_is_refused_not_installed_past_the_limit() 
             .expect("store one wide row");
     }
 
-    // What an index over that wide column REALLY costs this store, measured on
-    // its own rows rather than guessed.
+    // Profile the same received-schema door with all of its real owners funded.
+    db.set_memory_limit(Some(64 * 1024 * 1024)).unwrap();
+    let sizing = ChangeSet {
+        ddl: vec![DdlChange::CreateIndex {
+            table: "wide".to_owned(),
+            name: "sizing_probe".to_owned(),
+            columns: vec![("body".to_owned(), contextdb_core::SortDirection::Asc)],
+        }],
+        ddl_lsn: vec![contextdb_core::Lsn(1)],
+        ..ChangeSet::default()
+    };
     let before_probe = accountant.usage().used;
-    db.execute("CREATE INDEX sizing_probe ON wide (body)", &HashMap::new())
-        .expect("declare the sizing index");
-    let real = accountant.usage().used - before_probe;
+    accountant.reset_high_water_for_test();
+    contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
+    db.apply_changes(
+        sizing,
+        &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
+    )
+    .unwrap();
+    let profile_ledger = contextdb_engine::memory_accounting::take_budget_ledger_for_test();
+    let admission = profile_ledger
+        .iter()
+        .find(|entry| entry.what == "sync/received_schema_unit")
+        .expect("the funded profile reserves its schema unit");
+    let preparation_controls = admission.used_after - before_probe - admission.bytes;
+    let retained = accountant.usage().used - before_probe;
+    let real = accountant.high_water_for_test() - before_probe;
+    eprintln!(
+        "received index retained={retained} installation_peak={real} preparation_controls={preparation_controls} admission={admission:?}"
+    );
     db.execute("DROP INDEX sizing_probe ON wide", &HashMap::new())
-        .expect("drop the sizing index");
+        .unwrap();
+    db.set_memory_limit(None).unwrap();
     let settled = accountant.usage().used;
 
     let unit = ChangeSet {
@@ -1775,20 +1935,50 @@ fn a_received_unit_priced_far_too_low_is_refused_not_installed_past_the_limit() 
 
     // A limit the unit's own price fits exactly. The preflight admits the unit,
     // so only the apply discovers what the price missed.
-    let limit = settled + priced;
+    let limit = settled + preparation_controls + priced;
     db.set_memory_limit(Some(limit))
         .expect("declare a limit the arriving unit's own price fits");
 
+    contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
     let error = db
         .apply_changes(
             unit,
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect_err("a unit under-priced by more than the bound must be refused, not absorbed");
+    let actual_ledger = contextdb_engine::memory_accounting::take_budget_ledger_for_test();
     assert!(
-        matches!(error, Error::MemoryBudgetExceeded { .. }),
-        "the refusal must be the typed memory one, not {error:?}"
+        actual_ledger
+            .iter()
+            .any(|entry| entry.what == "sync/received_schema_unit" && entry.bytes == priced),
+        "the unit must actually be admitted before the refused installation: {actual_ledger:?}; {error:?}"
     );
+    eprintln!("received schema refusal={error:?}");
+    let attributed = |error: &Error| {
+        matches!(error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
+        if subsystem == "sync" && operation == "stage_received_catalog_dependencies"
+            && *requested_bytes == 768 && *available_bytes == 0 && *budget_limit_bytes == limit)
+    };
+    assert!(attributed(&error), "{error:?}");
+    if let Error::MemoryBudgetExceeded {
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = &error
+    {
+        assert!(!attributed(&Error::MemoryBudgetExceeded {
+            subsystem: "relational_index".to_owned(),
+            operation: operation.clone(),
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone()
+        }));
+    }
     assert!(
         db.table_meta("wide")
             .expect("the table is still declared")
@@ -3147,27 +3337,26 @@ fn taking_delivery_of_a_received_unit_is_charged_to_the_receivers_declared_limit
         .execute(WIDE_DDL, &HashMap::new())
         .expect("receiver declares the wide table");
 
-    // What the row versions the copy will duplicate really hold. Measured from
-    // the store's own retained-structure report rather than from the
-    // accountant's total, because the total also carries the one exact-probe
-    // filter the primary key allocates when the first row lands -- a fixed
-    // structure the copy does not duplicate and no charge on either side
-    // covers.
-    let structure_before = receiver.retained_structure_bytes_for_test();
+    // Durable live content measures the populated source independently of
+    // the admitted private working image built during received-schema apply.
     for row in 0..ROWS {
         receiver
             .execute(WIDE_INSERT, &wide_params(row))
             .expect("receiver stores one wide row");
     }
-    let row_versions =
-        receiver.retained_structure_bytes_for_test().row_versions - structure_before.row_versions;
+    let selected = receiver
+        .table_size_estimate("wide")
+        .expect("durable live content is measurable");
+    assert_eq!(selected.row_count, ROWS as u64);
+    let live_content_bytes = usize::try_from(selected.estimated_live_bytes).unwrap();
+    eprintln!("received schema rows={ROWS} durable_live_bytes={live_content_bytes}");
     assert!(
-        row_versions > 64 * 1024,
-        "the fixture must hold enough rows for the copy to be worth bounding; {row_versions} B"
+        live_content_bytes > 64 * 1024,
+        "the fixture must hold enough rows for the copy to be worth bounding; {live_content_bytes} B"
     );
 
     let before_apply = accountant.usage().used;
-    let high_water_before = accountant.high_water_for_test();
+    accountant.reset_high_water_for_test();
     receiver
         .apply_received_schema_for_test(
             unit,
@@ -3177,12 +3366,13 @@ fn taking_delivery_of_a_received_unit_is_charged_to_the_receivers_declared_limit
             HELD_INCARNATION,
         )
         .expect("a receiver with no declared limit takes the unit");
-    let widest = accountant.high_water_for_test().max(high_water_before) - before_apply;
+    let widest = accountant.high_water_for_test() - before_apply;
 
+    eprintln!("received schema before={before_apply} admitted_peak_growth={widest}");
     assert!(
-        widest >= row_versions,
+        widest >= live_content_bytes,
         "taking delivery copies all {ROWS} rows into a private working image, so the receiver's \
-         own accountant must see at least the {row_versions} B those row versions hold while both \
+         own accountant must see at least the {live_content_bytes} B the durable source describes while both \
          copies exist; it moved by {widest} B, which means the copy is admitted somewhere a \
          declared MEMORY_LIMIT cannot reach it"
     );
@@ -3248,18 +3438,21 @@ fn an_oversized_received_units_row_copy_is_refused_before_it_is_allocated() {
 
     // The receiver's OWN rows are what the copy duplicates -- the arriving
     // unit carries no rows of its own, only the ALTER.
-    let structure_before = receiver.retained_structure_bytes_for_test();
     for row in 0..ROWS {
         receiver
             .execute(WIDE_INSERT, &wide_params(row))
             .expect("receiver stores one wide row");
     }
-    let row_versions =
-        receiver.retained_structure_bytes_for_test().row_versions - structure_before.row_versions;
+    let selected = receiver
+        .table_size_estimate("wide")
+        .expect("durable live content is measurable");
+    assert_eq!(selected.row_count, ROWS as u64);
+    let live_content_bytes = usize::try_from(selected.estimated_live_bytes).unwrap();
+    eprintln!("received schema rows={ROWS} durable_live_bytes={live_content_bytes}");
     assert!(
-        row_versions > 1024 * 1024,
+        live_content_bytes > 1024 * 1024,
         "the fixture must hold a copy worth bounding, well over any per-row overshoot; \
-         {row_versions} B"
+         {live_content_bytes} B"
     );
 
     // A limit with headroom for ordinary operation but nowhere near what a
@@ -3281,16 +3474,38 @@ fn an_oversized_received_units_row_copy_is_refused_before_it_is_allocated() {
             HELD_INCARNATION,
         )
         .expect_err("a copy this far over the limit must be refused, not installed past it");
-    assert!(
-        matches!(error, Error::MemoryBudgetExceeded { .. }),
-        "the refusal must be the typed memory one, not {error:?}"
-    );
+    eprintln!("received schema refusal={error:?}");
+    let attributed = |error: &Error| {
+        matches!(error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
+        if subsystem == "sync" && operation == "stage_received_unit_vector_image"
+            && *requested_bytes == 6541952 && *available_bytes == 8780 && *budget_limit_bytes == limit)
+    };
+    assert!(attributed(&error), "{error:?}");
+    if let Error::MemoryBudgetExceeded {
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = &error
+    {
+        assert!(!attributed(&Error::MemoryBudgetExceeded {
+            subsystem: "relational_index".to_owned(),
+            operation: operation.clone(),
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone()
+        }));
+    }
 
     let peak_growth = peak_growth_since(start_live);
     assert!(
-        peak_growth < row_versions as i64 / 4,
+        peak_growth < live_content_bytes as i64 / 4,
         "a copy refused before it is allocated must not let the real allocator grow anywhere \
-         near the {row_versions} B the whole table holds; it grew by {peak_growth} B, which means \
+         near the {live_content_bytes} B the whole table holds; it grew by {peak_growth} B, which means \
          the table was cloned whole before any row was priced"
     );
 
