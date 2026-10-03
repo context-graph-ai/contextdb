@@ -2381,8 +2381,10 @@ fn a_received_unit_that_installed_is_reported_applied_even_when_its_hold_will_no
     // publishes anything, and that copy is charged to this receiver's declared
     // limit -- so the limit has to cover a second copy of what the affected
     // tables already hold, not just the shape the unit settles to.
+    let retry_limit =
+        receiver.accountant().usage().used + measured_held_retry_room(false, false, false);
     receiver
-        .set_memory_limit(Some(tight + one_index * 4 + settled))
+        .set_memory_limit(Some(retry_limit))
         .expect("raise the limit above what the held unit needs to arrive and to install");
     Database::refuse_memory_schema_holdback_writes_for_test(true);
     let applied = receiver.apply_received_schema_for_test(
@@ -2444,9 +2446,8 @@ fn a_received_unit_that_installed_is_reported_applied_even_when_its_hold_will_no
 struct HeldTablePair {
     author: Database,
     receiver: Database,
+    accountant: Arc<MemoryAccountant>,
     receiver_path: std::path::PathBuf,
-    tight: usize,
-    one_index: usize,
     unit: ChangeSet,
     provenance: Vec<contextdb_engine::protocol::WireDdlProvenance>,
     later_unit: ChangeSet,
@@ -2458,6 +2459,10 @@ struct HeldTablePair {
 /// unit brings -- and a second, LATER unit for that same table waiting behind
 /// it.
 fn a_receiver_holding_a_table_back_for_memory(root: &std::path::Path) -> HeldTablePair {
+    held_table_budget_control(root, false)
+}
+
+fn held_table_budget_control(root: &std::path::Path, include_other: bool) -> HeldTablePair {
     const ROWS: usize = 150;
 
     let author = Database::open(root.join("author.db")).expect("open the author store");
@@ -2465,6 +2470,14 @@ fn a_receiver_holding_a_table_back_for_memory(root: &std::path::Path) -> HeldTab
     author
         .execute(NOTES_DDL, &HashMap::new())
         .expect("author declares notes");
+    if include_other {
+        author
+            .execute(
+                "CREATE TABLE other (id UUID PRIMARY KEY, label TEXT NOT NULL) SYNC TWO WAY",
+                &HashMap::new(),
+            )
+            .expect("declare the matching unrelated table");
+    }
     for row in 0..ROWS {
         author
             .execute(NOTES_INSERT, &note_params(row))
@@ -2519,6 +2532,14 @@ fn a_receiver_holding_a_table_back_for_memory(root: &std::path::Path) -> HeldTab
     receiver
         .execute(NOTES_DDL, &HashMap::new())
         .expect("receiver declares notes");
+    if include_other {
+        receiver
+            .execute(
+                "CREATE TABLE other (id UUID PRIMARY KEY, label TEXT NOT NULL) SYNC TWO WAY",
+                &HashMap::new(),
+            )
+            .expect("declare the matching unrelated table");
+    }
     for row in 0..ROWS {
         receiver
             .execute(NOTES_INSERT, &note_params(row))
@@ -2556,9 +2577,8 @@ fn a_receiver_holding_a_table_back_for_memory(root: &std::path::Path) -> HeldTab
     HeldTablePair {
         author,
         receiver,
+        accountant,
         receiver_path,
-        tight,
-        one_index,
         unit,
         provenance,
         later_unit,
@@ -2574,6 +2594,111 @@ fn holdback_refusal_operation(refusal: &Error) -> &str {
     }
 }
 
+// Prices the successful path from its actual allocation/release ledger. The
+// durable hold write itself is charged without admission (cluster-4 b9);
+// successful delivery still admits table images, catalog and policy owners.
+fn measured_held_retry_room(include_later: bool, include_other: bool, other_only: bool) -> usize {
+    let root = tempfile::tempdir().expect("isolated held-image budget control");
+    let control = held_table_budget_control(root.path(), include_other);
+    let accountant = control.accountant.clone();
+    control.receiver.set_memory_limit(None).unwrap();
+    if include_other {
+        let position = control.author.current_lsn();
+        control
+            .author
+            .execute("CREATE INDEX other_label ON other (label)", &HashMap::new())
+            .unwrap();
+        let unit = control.author.changes_since(position);
+        let provenance = control
+            .author
+            .outbound_ddl_provenance_for_test(
+                &unit,
+                &contextdb_core::TenantId::from(HELD_TENANT),
+                &fixture_schema_author().node_id(),
+                HELD_INCARNATION,
+                &fixture_signer(),
+            )
+            .unwrap();
+        contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
+        let baseline = accountant.usage().used;
+        control
+            .receiver
+            .apply_received_schema_for_test(
+                unit,
+                provenance,
+                contextdb_core::TenantId::from(HELD_TENANT),
+                HELD_SOURCE,
+                HELD_INCARNATION,
+            )
+            .expect("the unrelated control unit installs while notes is held");
+        let ledger = contextdb_engine::memory_accounting::take_budget_ledger_for_test();
+        if other_only {
+            let peak = ledger.iter().map(|entry| entry.used_after).max().unwrap();
+            let room = peak.checked_sub(baseline).unwrap();
+            assert!(room > 0);
+            eprintln!(
+                "HELD_OTHER_OWNERS baseline={baseline} peak={peak} room={room} ledger={ledger:?}"
+            );
+            control.receiver.close().unwrap();
+            control.author.close().unwrap();
+            drop(control);
+            assert_eq!(accountant.usage().used, 0);
+            assert_eq!(accountant.underflow_count_for_test(), 0);
+            return room;
+        }
+    }
+    let baseline = accountant.usage().used;
+    contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
+    control
+        .receiver
+        .apply_received_schema_for_test(
+            control.unit.clone(),
+            control.provenance.clone(),
+            contextdb_core::TenantId::from(HELD_TENANT),
+            HELD_SOURCE,
+            HELD_INCARNATION,
+        )
+        .expect("the matching held control installs its first unit");
+    if include_later {
+        control
+            .receiver
+            .apply_received_schema_for_test(
+                control.later_unit.clone(),
+                control.later_provenance.clone(),
+                contextdb_core::TenantId::from(HELD_TENANT),
+                HELD_SOURCE,
+                HELD_INCARNATION,
+            )
+            .expect("the matching control installs the later unit");
+    }
+    let ledger = contextdb_engine::memory_accounting::take_budget_ledger_for_test();
+    let peak = ledger.iter().map(|entry| entry.used_after).max().unwrap();
+    let room = peak
+        .checked_sub(baseline)
+        .expect("the private image has positive owners");
+    assert!(room > 0);
+    assert_eq!(
+        control
+            .receiver
+            .writer_memory_ownership_receipt_for_test()
+            .reconciliation_gap,
+        0
+    );
+    eprintln!(
+        "HELD_RETRY_OWNERS later={include_later} baseline={baseline} peak={peak} room={room} ledger={ledger:?}"
+    );
+    control.receiver.close().unwrap();
+    control.author.close().unwrap();
+    drop(control);
+    assert_eq!(
+        accountant.usage().used,
+        0,
+        "the control releases every real owner after final drop"
+    );
+    assert_eq!(accountant.underflow_count_for_test(), 0);
+    room
+}
+
 /// A LATER UNIT FOR A HELD TABLE WAITS FOR THE HELD ONE, AND SAYS SO.
 ///
 /// The hold is only worth having if it actually queues. A receiver that could
@@ -2584,6 +2709,7 @@ fn holdback_refusal_operation(refusal: &Error) -> &str {
 /// So a unit arriving for a held table at a LATER author position is refused
 /// with a typed error that names the table, the position it is waiting at and
 /// what that unit needed -- and once the held unit lands, the later one applies.
+
 #[test]
 fn a_later_unit_for_a_held_table_waits_until_the_held_one_lands() {
     let root = tempfile::tempdir().expect("task-scoped fixture root");
@@ -2621,8 +2747,10 @@ fn a_later_unit_for_a_held_table_waits_until_the_held_one_lands() {
 
     // The held unit lands once there is room, and the later one is no longer
     // waiting for anything.
+    let retry_limit =
+        held.receiver.accountant().usage().used + measured_held_retry_room(true, false, false);
     held.receiver
-        .set_memory_limit(Some(held.tight + held.one_index * 12))
+        .set_memory_limit(Some(retry_limit))
         .expect("raise the limit above what the held unit and the one behind it need");
     held.receiver
         .apply_received_schema_for_test(
@@ -2868,6 +2996,11 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
 
     // An unrelated table's unit still applies while that hold stands.
     receiver
+        .set_memory_limit(Some(
+            accountant.usage().used + measured_held_retry_room(false, true, true),
+        ))
+        .expect("fund the unrelated unit's exact successful owners while notes stays held");
+    receiver
         .apply_received_schema_for_test(
             other_unit,
             other_provenance,
@@ -2886,6 +3019,12 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
         "the unrelated unit installed while the first was held"
     );
 
+    assert_eq!(
+        receiver.memory_held_received_schema_units(&tenant).unwrap(),
+        held,
+        "the unrelated success preserves the exact held identity and required bytes",
+    );
+
     // Raise the limit and the SAME unit -- the one the author never stopped
     // offering, because nothing acknowledged it -- installs.
     // Room for the unit AND for taking delivery of it. Taking delivery copies
@@ -2894,7 +3033,9 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
     // limit -- so the limit has to cover a second copy of what the affected
     // tables already hold, not just the shape the unit settles to.
     receiver
-        .set_memory_limit(Some(tight + one_index * 4 + settled))
+        .set_memory_limit(Some(
+            accountant.usage().used + measured_held_retry_room(false, true, false),
+        ))
         .expect("raise the limit above what the held unit needs to arrive and to install");
     receiver
         .apply_received_schema_for_test(
@@ -4949,16 +5090,22 @@ fn a_receiver_that_prices_a_unit_as_fitting_but_cannot_copy_it(
     receiver
         .execute(SIDE_DDL, &HashMap::new())
         .expect("receiver declares the unrelated table");
-    let structure_before = receiver.retained_structure_bytes_for_test();
     for row in 0..ROWS {
         receiver
             .execute(WIDE_INSERT, &wide_params(row))
             .expect("receiver stores one wide row");
     }
-    let row_versions =
-        receiver.retained_structure_bytes_for_test().row_versions - structure_before.row_versions;
+    let selected = receiver
+        .table_size_estimate("wide")
+        .expect("the captured durable table exposes its live row footprint");
+    assert_eq!(selected.row_count, ROWS as u64);
+    assert!(
+        selected.estimated_live_bytes >= (ROWS * 512) as u64,
+        "the allowance must derive from the populated durable bodies, not an empty mirror"
+    );
+    let row_image_bytes = usize::try_from(selected.estimated_live_bytes).unwrap();
     receiver
-        .set_memory_limit(Some(accountant.usage().used + row_versions / 4))
+        .set_memory_limit(Some(accountant.usage().used + row_image_bytes / 4))
         .expect("declare room for the unit's shape but not for a second copy of its table");
     (
         StagedRefusal {
