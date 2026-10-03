@@ -300,10 +300,18 @@ fn automatic_storage_memory_refusal_keeps_the_store_usable() {
     .unwrap();
     assert_eq!(db.__physical_version_count_for_test("recordings"), 2);
     let used = db.accountant().usage().used;
-    db.set_memory_limit(Some(used + 1024)).unwrap();
+    // Fund the measured simultaneous currency controls and source cursors,
+    // the real vector inventory, and the captured published root.
+    let allowance = 8_027 + 16_512 + 264;
+    db.set_memory_limit(Some(used + allowance)).unwrap();
     let error = db.run_maintenance_cycle().unwrap_err();
     assert!(
-        matches!(error, contextdb_core::Error::MemoryBudgetExceeded { .. }),
+        matches!(error, contextdb_core::Error::MemoryBudgetExceeded {
+            ref subsystem, ref operation, requested_bytes: 65_536,
+            available_bytes, budget_limit_bytes, ..
+        } if subsystem == "storage_compaction" && operation == "page_paths"
+            && available_bytes == allowance - 264
+            && budget_limit_bytes == used + allowance),
         "typed compaction refusal: {error:?}"
     );
     assert_eq!(
