@@ -599,3 +599,170 @@ fn continuation_sources_cold(
             && work.target_backend_bytes[PhysicalFamily::Posting as usize] > 0
     })
 }
+
+struct PagedStatementPause {
+    pause: StatementPause,
+    registered: Arc<AtomicU64>,
+}
+impl bounded::ExecutionProbe for PagedStatementPause {
+    fn before_work(&self, _: bounded::TestWorkSource, _: u64) {}
+    fn after_source_capture(&self) {
+        self.pause.after_source_capture();
+    }
+    fn registered_snapshot_for_test(&self, snapshot: contextdb_core::SnapshotId) {
+        self.registered.store(snapshot.0, Ordering::SeqCst);
+    }
+    fn cancellation_observed(&self, _: u64) {}
+}
+
+// Pause after the kernel captures its sources, before its first paged pull.
+// The successor must publish while this reader still owns the old native root.
+#[test]
+fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("paged-vector-root.redb");
+    let database = Arc::new(
+        Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                memory_limit: Some(64 * 1024 * 1024),
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    database.execute("CREATE TABLE paged_items (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 8, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC OFF", &HashMap::new()).unwrap();
+    for (id, vector) in [
+        (1, vec![1.0, 0.0, 0.0]),
+        (2, vec![0.0, 1.0, 0.0]),
+        (3, vec![0.0, 0.0, 1.0]),
+    ] {
+        database
+            .execute(
+                "INSERT INTO paged_items VALUES ($id,$v)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("v".into(), Value::Vector(vector)),
+                ]),
+            )
+            .unwrap();
+    }
+    for _ in 0..8 {
+        database.run_maintenance_cycle().unwrap();
+    }
+    database.close().unwrap();
+    drop(database);
+    let database = Arc::new(
+        Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                memory_limit: Some(64 * 1024 * 1024),
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let snapshot = database.snapshot();
+    let (_, old_work) = observe_target("paged_items", || {
+        database
+            .execute("SELECT id FROM paged_items WHERE id = 2", &HashMap::new())
+            .unwrap()
+    });
+    let old_root = old_work
+        .physical_sources
+        .iter()
+        .flatten()
+        .find_map(|(family, identity)| (*family == PhysicalFamily::Row).then_some(*identity))
+        .unwrap();
+    let (reached, captured) = mpsc::channel();
+    let release = Arc::new(Barrier::new(2));
+    let registered = Arc::new(AtomicU64::new(0));
+    let pause = Arc::new(PagedStatementPause {
+        pause: StatementPause {
+            reached,
+            release: release.clone(),
+            entered: AtomicBool::new(false),
+        },
+        registered: registered.clone(),
+    });
+    let (opened, work) = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+            let mut request = bounded::BoundedReadRequest::new(
+                "SELECT id, embedding FROM paged_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+                HashMap::from([("q".into(),Value::Vector(vec![0.0,1.0,0.0]))]),
+                ReadLimits { cursor_page_rows: 1, result_rows: 3, work: 100_000, active_ms: 1000,
+                    memory: 64 * 1024 * 1024, ..Default::default() },
+                Arc::new(ManualDeadlineClock::at(0)));
+            request.probe = Some(pause);
+            observe_target("paged_items", || bounded::open_cursor(database.clone(), &request))
+        });
+        captured.recv().unwrap();
+        let release_reader = StatementRelease(release);
+        let tx = database.begin_or_panic();
+        for id in 1..=3 {
+            database
+                .execute_in_tx(
+                    tx,
+                    "UPDATE paged_items SET embedding = '[0.1,0.2,0.3]' WHERE id = $id",
+                    &HashMap::from([("id".into(), Value::Int64(id))]),
+                )
+                .unwrap();
+        }
+        database.commit(tx).unwrap();
+        assert!(
+            database.snapshot() > snapshot,
+            "successor publishes before the first page read"
+        );
+        database.compact_currency_versions().unwrap();
+        assert!(
+            database
+                .__native_read_transaction_count_for_test(old_root.transaction_id)
+                .unwrap()
+                > 0,
+            "the paused paged reader retains its original physical transaction"
+        );
+        drop(release_reader);
+        reader.join().unwrap()
+    });
+    let mut opened = opened.unwrap();
+    assert_eq!(
+        opened.first_page.rows,
+        vec![vec![Value::Int64(2), Value::Vector(vec![0.0, 1.0, 0.0])]],
+        "the first paged answer retains its captured row and vector after successor publication"
+    );
+    eprintln!("paged captured-root work old={old_root:?} actual={work:?}");
+    assert_eq!(registered.load(Ordering::SeqCst), snapshot.0);
+    for family in [
+        PhysicalFamily::Row,
+        PhysicalFamily::Vector,
+        PhysicalFamily::Graph,
+    ] {
+        assert!(
+            work.physical_sources
+                .iter()
+                .flatten()
+                .any(|(observed, _)| *observed == family),
+            "the paged reader exercises its actual {family:?} source: {work:?}"
+        );
+    }
+    for (_, root) in work.physical_sources.iter().flatten() {
+        assert_eq!(
+            root.transaction_id, old_root.transaction_id,
+            "row and vector pages use the same captured physical transaction, never a fresh successor root"
+        );
+    }
+    opened.cursor.close().unwrap();
+    assert_eq!(
+        database
+            .__native_read_transaction_count_for_test(old_root.transaction_id)
+            .unwrap(),
+        0,
+        "release drops the original native root"
+    );
+    database.compact_currency_versions().unwrap();
+    database.close().unwrap();
+}
