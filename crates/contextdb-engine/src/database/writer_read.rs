@@ -7,6 +7,17 @@ type OutputOwners =
 type ScopedRoot = (usize, Arc<WriterSnapshot>, OutputOwners);
 thread_local! { static ROOT: std::cell::RefCell<Option<ScopedRoot>> = const { std::cell::RefCell::new(None) }; }
 
+pub(super) fn scoped_root_for_manager(
+    manager: &Arc<TransactionManager<DynStore>>,
+) -> Option<Arc<WriterSnapshot>> {
+    ROOT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(id, _, _)| *id == Arc::as_ptr(manager) as usize)
+            .map(|(_, root, _)| root.clone())
+    })
+}
+
 /// Preserve the consumer's typed refusal across the storage callback's shared
 /// core-error boundary; the private sentinel never reaches the caller.
 pub(super) fn next_window_with_work<T: Send, E: From<Error>>(

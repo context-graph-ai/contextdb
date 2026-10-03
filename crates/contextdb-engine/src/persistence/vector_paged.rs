@@ -1579,7 +1579,7 @@ fn reclaim_storage_keys(
 }
 
 /// A published generation's serving source: each reader captures the
-/// writer's current published root and reads only that root's pages.
+/// operation's captured writer root and reads only that root's pages.
 pub(crate) struct NativePagedGraphSource {
     pub(crate) capture: PagedRootCapture,
     pub(crate) storage_id: u64,

@@ -247,7 +247,8 @@ impl Database {
 }
 
 /// Serving readers of published paged generations capture the writer's
-/// current published root; they never begin a fresh storage read.
+/// captured operation root, or the published root outside a read scope; they
+/// never begin a fresh storage read.
 pub(super) fn install_paged_root_capture(
     persistence: &RedbPersistence,
     tx_mgr: &Arc<TransactionManager<DynStore>>,
@@ -257,6 +258,9 @@ pub(super) fn install_paged_root_capture(
         let manager = manager
             .upgrade()
             .ok_or_else(|| Error::Other("paged vector reader outlived its writer".into()))?;
+        if let Some(root) = writer_read::scoped_root_for_manager(&manager) {
+            return Ok(root);
+        }
         writer_read::durable_root(manager.capture_published_read().handle)?
             .ok_or_else(|| Error::Other("writer has no durable published root".into()))
     }));

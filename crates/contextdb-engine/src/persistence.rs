@@ -5104,7 +5104,8 @@ pub(crate) struct WritableRawVectorBodyScan {
     vectors: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     verifier: content_identity::ContentIdentityReadVerifier,
     proof: content_identity::ReadAuthenticationNodes,
-    _transaction: redb::ReadTransaction,
+    _transaction: Arc<redb::ReadTransaction>,
+    _root: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl WritableRawVectorBodyScan {
@@ -5199,6 +5200,11 @@ impl WritableRawVectorBodyScan {
             identity.row_id,
             membership.vector_created_tx,
             membership.vector_lsn,
+        );
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Vector,
+            &self._transaction,
         );
         let stored = vectors
             .get(key.as_slice())
@@ -25760,7 +25766,16 @@ impl RedbPersistence {
 
     pub(crate) fn open_raw_vector_body_scan(self: &Arc<Self>) -> Result<WritableRawVectorBodyScan> {
         self.with_db(|db| {
-            let transaction = db.begin_read().map_err(Self::storage_error)?;
+            let (transaction, root) = match self.paged_root_capture.get() {
+                Some(capture) => {
+                    let (read, root) = capture()?;
+                    (read, Some(root))
+                }
+                None => (
+                    Arc::new(db.begin_read().map_err(Self::storage_error)?),
+                    None,
+                ),
+            };
             let memberships = match transaction.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
                 Ok(table) => Some(table),
                 Err(redb::TableError::TableDoesNotExist(_)) => None,
@@ -25786,6 +25801,7 @@ impl RedbPersistence {
                     self.proof_accountant(),
                 ),
                 _transaction: transaction,
+                _root: root,
             })
         })
     }
