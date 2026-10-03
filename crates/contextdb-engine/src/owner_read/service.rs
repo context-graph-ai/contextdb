@@ -4078,6 +4078,17 @@ async fn await_authoritative_response_send<T>(
         .tell_on_cancel(move || waiting_thread.unpark());
     std::future::poll_fn(|context| {
         loop {
+            if !expiry_completed {
+                expiry_completed = std::future::Future::poll(expiry.as_mut(), context).is_ready();
+            }
+            // A completed frame has already published its answer. The caller
+            // can advance its clock after receiving it, before this owner
+            // thread observes completion; that later deadline cannot withdraw
+            // the answer or disconnect the next request. Pending sends remain
+            // subject to their original cancellation and active-time budget.
+            if let Poll::Ready(result) = std::future::Future::poll(send.as_mut(), context) {
+                return Poll::Ready(result);
+            }
             if budget.cancellation.is_cancelled() {
                 return Poll::Ready(Err(crate::local_transport::owner_disconnected()));
             }
@@ -4085,12 +4096,6 @@ async fn await_authoritative_response_send<T>(
                 return Poll::Ready(Err(crate::local_transport::LocalTransportError::Refusal(
                     budget.exceeded_failure(),
                 )));
-            }
-            if !expiry_completed {
-                expiry_completed = std::future::Future::poll(expiry.as_mut(), context).is_ready();
-            }
-            if let Poll::Ready(result) = std::future::Future::poll(send.as_mut(), context) {
-                return Poll::Ready(result);
             }
             if !expiry_completed {
                 return Poll::Pending;

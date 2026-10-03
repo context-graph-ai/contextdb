@@ -44964,6 +44964,10 @@ impl Database {
         &self,
         items: &[AuthoritativePurgeDeliveryItem],
     ) -> Result<()> {
+        // Earlier units in this pull page may already have published writes.
+        // Select this mutation from the current publication.
+        let _inherited_read = self.enter_writer_read(None);
+        let _plan_read = self.writer_read_scope()?;
         let mut plan = self.incoming_authoritative_purge_plan(items)?;
         let mut groups = plan
             .selections
@@ -44973,6 +44977,10 @@ impl Database {
             .cloned()
             .collect::<BTreeSet<_>>();
         for group in std::mem::take(&mut groups) {
+            // A prior group has erased its old storage capabilities. Each
+            // subsequent mutation must use the root that group published.
+            let _prior_group_read = self.enter_writer_read(None);
+            let _group_read = self.writer_read_scope()?;
             let selections = plan.selections.remove(&group).unwrap_or_default();
             let adoptions = plan.frontier_adoptions.remove(&group).unwrap_or_default();
             let receipts = plan.instruction_receipts.remove(&group).unwrap_or_default();
@@ -46541,6 +46549,10 @@ impl Database {
                 self.capture_writer_transaction_statement(self.active_read_transaction())?;
             let root = root.ok_or_else(closed_database_error)?;
 
+            #[cfg(test)]
+            self.snapshot_registry
+                .durable_admission_test_pause
+                .maybe_pause();
             let Some(registration) = self
                 .snapshot_registry
                 .register_pinned_root_with_budget(snapshot, None, budget, withdrawn)?
@@ -46624,10 +46636,6 @@ impl Database {
                         return Err(closed_database_error());
                     };
                     let publication_lsn = self.current_lsn();
-                    #[cfg(test)]
-                    self.snapshot_registry
-                        .durable_admission_test_pause
-                        .maybe_pause();
                     Ok(self
                         .snapshot_registry
                         .register_withdrawable_at_commit_boundary(
@@ -46723,6 +46731,10 @@ impl Database {
                 return Ok(None);
             };
 
+            #[cfg(test)]
+            self.snapshot_registry
+                .durable_admission_test_pause
+                .maybe_pause();
             let window = Arc::new(CursorIdleWindow::new(
                 Arc::clone(&clock),
                 idle_ms,
@@ -46864,10 +46876,6 @@ impl Database {
                         .as_ref()
                         .map(|p| p.owner_cursor_pin_for_admission())
                         .transpose()?;
-                    #[cfg(test)]
-                    self.snapshot_registry
-                        .durable_admission_test_pause
-                        .maybe_pause();
                     let opened_ms = clock.now_ms();
                     let window = Arc::new(CursorIdleWindow::new(
                         Arc::clone(&clock),
@@ -68025,7 +68033,9 @@ impl Database {
                 )
             })
             .collect::<HashSet<_>>();
-        let snapshot = self.snapshot();
+        // Outbound extraction holds its captured writer root across this repair.
+        // A concurrent commit must not move the logical read past that root.
+        let snapshot = self.snapshot_for_read();
         for vector in vectors {
             (projection.checkpoint)()?;
             let Some(row) = self.committed_row_at(&vector.index.table, vector.row_id, snapshot)?
@@ -75542,8 +75552,14 @@ mod currency_version_compaction_tests {
         }
 
         // The defect: one logical row, N physical versions, N change-log entries.
-        assert_eq!(durable_physical_versions(&db, "work_capabilities"), N as usize);
-        assert_eq!(durable_change_log_row_inserts(&db, "work_capabilities"), N as usize);
+        assert_eq!(
+            durable_physical_versions(&db, "work_capabilities"),
+            N as usize
+        );
+        assert_eq!(
+            durable_change_log_row_inserts(&db, "work_capabilities"),
+            N as usize
+        );
 
         let (pruned_versions, pruned_history) = drain_currency(&db);
         assert_eq!(pruned_versions, (N - 1) as u64);

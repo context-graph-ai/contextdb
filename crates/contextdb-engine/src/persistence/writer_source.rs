@@ -1412,6 +1412,33 @@ impl WriterSnapshot {
     }
 }
 
+impl RedbPersistence {
+    pub(super) fn writer_root_provider(&self) -> redb::ExternalSnapshotProvider {
+        let registry = Arc::downgrade(&self.writer_snapshots);
+        Arc::new(move || {
+            let Some(registry) = registry.upgrade() else {
+                return Ok(Vec::new());
+            };
+            let roots = {
+                let mut roots = registry.lock();
+                roots.retain(|root| root.strong_count() != 0);
+                roots.clone()
+            };
+            Ok(roots
+                .into_iter()
+                .filter_map(|root| root.upgrade().map(|root| root.storage_identity()))
+                .collect())
+        })
+    }
+    pub(super) fn live_writer_roots(&self) -> Vec<Arc<WriterSnapshot>> {
+        let roots = self.writer_snapshots.lock().clone();
+        roots
+            .into_iter()
+            .filter_map(|root| root.upgrade())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1800,32 +1827,5 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-    }
-}
-
-impl RedbPersistence {
-    pub(super) fn writer_root_provider(&self) -> redb::ExternalSnapshotProvider {
-        let registry = Arc::downgrade(&self.writer_snapshots);
-        Arc::new(move || {
-            let Some(registry) = registry.upgrade() else {
-                return Ok(Vec::new());
-            };
-            let roots = {
-                let mut roots = registry.lock();
-                roots.retain(|root| root.strong_count() != 0);
-                roots.clone()
-            };
-            Ok(roots
-                .into_iter()
-                .filter_map(|root| root.upgrade().map(|root| root.storage_identity()))
-                .collect())
-        })
-    }
-    pub(super) fn live_writer_roots(&self) -> Vec<Arc<WriterSnapshot>> {
-        let roots = self.writer_snapshots.lock().clone();
-        roots
-            .into_iter()
-            .filter_map(|root| root.upgrade())
-            .collect()
     }
 }
