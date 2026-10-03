@@ -130,6 +130,14 @@ impl RegionTracker {
         }
     }
 
+    pub(crate) fn orders(&self) -> usize {
+        self.order_trackers.len()
+    }
+
+    pub(crate) fn region_slots(&self) -> u32 {
+        self.len()
+    }
+
     pub(crate) fn mark_full(&mut self, order: u8, region: u32) {
         let order: usize = order.into();
         assert!(order < self.order_trackers.len());

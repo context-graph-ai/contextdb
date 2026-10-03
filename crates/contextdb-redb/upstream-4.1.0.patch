@@ -9650,7 +9650,7 @@
          Ok(true)
      }
 
-@@ -519,12 +682,46 @@
+@@ -519,12 +682,62 @@
      pub(crate) fn load_allocator_state(&self, tree: &AllocatorStateTree) -> Result {
          assert!(self.is_valid_allocator_state(tree)?);
 
@@ -9679,8 +9679,24 @@
 +                    saved_bitmap_window(saved.value(), order, height, page, out)?;
 +                    Ok(true)
 +                });
++            // The commit saved the region tracker beside the regional
++            // bitmaps. Reinstall it, so the first allocation after open goes
++            // to a region with room instead of loading and probing every
++            // region the paged default would report as possibly free.
++            let saved_tracker = tree
++                .get(&AllocatorStateKey::RegionTracker)?
++                .map(|saved| RegionTracker::from_bytes(saved.value()));
 +            let mut state = self.state.lock().unwrap();
 +            state.allocators.set_saved_source(source)?;
++            if let Some(mut tracker) = saved_tracker {
++                // The saved tracker is padded past the file's regions; those
++                // slots name no region and must never be chosen.
++                let regions = state.header.layout().num_regions();
++                for region in regions..tracker.region_slots() {
++                    tracker.mark_full(0, region);
++                }
++                state.allocators.region_tracker = tracker;
++            }
 +            state.header.recovery_required = false;
 +            self.needs_recovery.store(false, Ordering::Release);
 +            return Ok(());
@@ -9699,7 +9715,7 @@
          }
 
          let region_tracker = RegionTracker::from_bytes(
-@@ -536,12 +733,13 @@
+@@ -536,12 +749,13 @@
          let mut state = self.state.lock().unwrap();
          state.allocators = Allocators {
              region_tracker,
@@ -9715,7 +9731,7 @@
          drop(state);
 
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -554,8 +752,15 @@
+@@ -554,8 +768,15 @@
      pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
          #[cfg(debug_assertions)]
          {
@@ -9733,7 +9749,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -612,6 +817,7 @@
+@@ -612,6 +833,7 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
@@ -9741,7 +9757,7 @@
 
          let old_transaction_id = header.secondary_slot().transaction_id;
          let secondary = header.secondary_slot_mut();
-@@ -678,6 +884,7 @@
+@@ -678,6 +900,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -9749,7 +9765,7 @@
 
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -726,7 +933,9 @@
+@@ -726,7 +949,9 @@
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
              #[cfg(debug_assertions)]
@@ -9760,7 +9776,7 @@
 
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -774,6 +983,24 @@
+@@ -774,6 +999,24 @@
              #[cfg(debug_assertions)]
              open_pages: self.read_page_ref_counts.clone(),
          })
@@ -9785,7 +9801,7 @@
      }
 
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
-@@ -871,7 +1098,9 @@
+@@ -871,7 +1114,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -9796,7 +9812,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -953,12 +1182,32 @@
+@@ -953,12 +1198,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -9831,10 +9847,11 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -1024,6 +1273,13 @@
+@@ -1024,7 +1289,27 @@
              } else {
                  region.alloc(required_order)
              };
++            let highest_free = r.map(|_| region.highest_free_order());
 +            if let Some(error) = state
 +                .allocators
 +                .pager()
@@ -9843,9 +9860,22 @@
 +                return Err(error);
 +            }
              if let Some(page) = r {
++                // Keep the tracker exact for the region just used: a region
++                // this allocation filled is recorded full now, not left for a
++                // later allocation (or the next open, from the saved tracker)
++                // to discover by loading and probing it.
++                let tracker = state.get_region_tracker_mut();
++                match highest_free.flatten().map(|order| order.checked_add(1)) {
++                    None => tracker.mark_full(0, candidate_region),
++                    Some(Some(above)) if usize::from(above) < tracker.orders() => {
++                        tracker.mark_full(above, candidate_region);
++                    }
++                    Some(_) => {}
++                }
                  return Ok(Some(PageNumber::new(
                      candidate_region,
-@@ -1061,7 +1317,7 @@
+                     page,
+@@ -1061,7 +1346,7 @@
 
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -9854,7 +9884,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
 
-@@ -1107,13 +1363,20 @@
+@@ -1107,13 +1392,20 @@
 
          let result = self.storage.resize(new_layout.len());
          if result.is_err() {
@@ -9876,7 +9906,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1135,7 +1398,7 @@
+@@ -1135,7 +1427,7 @@
      }
 
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -9885,7 +9915,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +1408,7 @@
+@@ -1145,7 +1437,7 @@
      }
 
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -9894,7 +9924,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +1421,41 @@
+@@ -1158,8 +1450,41 @@
          self.page_size.try_into().unwrap()
      }
 
@@ -10043,7 +10073,22 @@
      }
  
      pub(super) fn from_bytes(page: &[u8]) -> Self {
-@@ -101,12 +151,46 @@
+@@ -80,6 +130,14 @@
+         }
+     }
+ 
++    pub(crate) fn orders(&self) -> usize {
++        self.order_trackers.len()
++    }
++
++    pub(crate) fn region_slots(&self) -> u32 {
++        self.len()
++    }
++
+     pub(crate) fn mark_full(&mut self, order: u8, region: u32) {
+         let order: usize = order.into();
+         assert!(order < self.order_trackers.len());
+@@ -101,12 +159,46 @@
  
  pub(super) struct Allocators {
      pub(super) region_tracker: RegionTracker,
@@ -10092,7 +10137,7 @@
          let initial_regions = max(INITIAL_REGIONS, layout.num_regions());
          let mut region_tracker = RegionTracker::new(initial_regions, MAX_MAX_PAGE_ORDER + 1);
          for i in 0..layout.num_regions() {
-@@ -117,30 +201,372 @@
+@@ -117,30 +209,372 @@
              );
              let max_order = allocator.get_max_order();
              region_tracker.mark_free(max_order, i);
@@ -10476,7 +10521,7 @@
                  let last_region = new_layout
                      .trailing_region_layout()
                      .unwrap_or_else(|| new_layout.full_region_layout());
-@@ -148,7 +574,7 @@
+@@ -148,7 +582,7 @@
                      cmp::Ordering::Less => true,
                      cmp::Ordering::Equal => {
                          // No-op
@@ -10485,7 +10530,7 @@
                      }
                      cmp::Ordering::Greater => false,
                  }
-@@ -158,26 +584,25 @@
+@@ -158,26 +592,25 @@
  
          if shrink {
              // Drop all regions that were removed
@@ -10517,7 +10562,7 @@
                      assert!(new_region.num_pages() >= allocator.len());
                      if new_region.num_pages() != allocator.len() {
                          allocator.resize(new_region.num_pages());
-@@ -195,9 +620,10 @@
+@@ -195,9 +628,10 @@
                          self.region_tracker.resize(i + 1);
                      }
                      self.region_tracker.mark_free(highest_free, i);

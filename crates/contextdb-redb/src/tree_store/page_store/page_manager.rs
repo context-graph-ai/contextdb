@@ -707,8 +707,24 @@ impl TransactionalMemory {
                     saved_bitmap_window(saved.value(), order, height, page, out)?;
                     Ok(true)
                 });
+            // The commit saved the region tracker beside the regional
+            // bitmaps. Reinstall it, so the first allocation after open goes
+            // to a region with room instead of loading and probing every
+            // region the paged default would report as possibly free.
+            let saved_tracker = tree
+                .get(&AllocatorStateKey::RegionTracker)?
+                .map(|saved| RegionTracker::from_bytes(saved.value()));
             let mut state = self.state.lock().unwrap();
             state.allocators.set_saved_source(source)?;
+            if let Some(mut tracker) = saved_tracker {
+                // The saved tracker is padded past the file's regions; those
+                // slots name no region and must never be chosen.
+                let regions = state.header.layout().num_regions();
+                for region in regions..tracker.region_slots() {
+                    tracker.mark_full(0, region);
+                }
+                state.allocators.region_tracker = tracker;
+            }
             state.header.recovery_required = false;
             self.needs_recovery.store(false, Ordering::Release);
             return Ok(());
@@ -1273,6 +1289,7 @@ impl TransactionalMemory {
             } else {
                 region.alloc(required_order)
             };
+            let highest_free = r.map(|_| region.highest_free_order());
             if let Some(error) = state
                 .allocators
                 .pager()
@@ -1281,6 +1298,18 @@ impl TransactionalMemory {
                 return Err(error);
             }
             if let Some(page) = r {
+                // Keep the tracker exact for the region just used: a region
+                // this allocation filled is recorded full now, not left for a
+                // later allocation (or the next open, from the saved tracker)
+                // to discover by loading and probing it.
+                let tracker = state.get_region_tracker_mut();
+                match highest_free.flatten().map(|order| order.checked_add(1)) {
+                    None => tracker.mark_full(0, candidate_region),
+                    Some(Some(above)) if usize::from(above) < tracker.orders() => {
+                        tracker.mark_full(above, candidate_region);
+                    }
+                    Some(_) => {}
+                }
                 return Ok(Some(PageNumber::new(
                     candidate_region,
                     page,
