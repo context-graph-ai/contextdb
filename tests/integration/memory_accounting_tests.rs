@@ -6,6 +6,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+fn assert_posting_refusal(error: &Error, limit: usize) {
+    let attributed = |error: &Error| {
+        matches!(error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
+        if subsystem == "relational" && operation == "staged_index_posting"
+            && *requested_bytes == 457 && *available_bytes == 456 && *budget_limit_bytes == limit)
+    };
+    assert!(attributed(error), "{error:?}");
+    if let Error::MemoryBudgetExceeded {
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = error
+    {
+        assert!(!attributed(&Error::MemoryBudgetExceeded {
+            subsystem: "writer_source".to_owned(),
+            operation: operation.clone(),
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone()
+        }));
+    }
+}
+
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
 }
@@ -157,17 +185,24 @@ fn m02_insert_rejected_when_budget_exceeded() {
 #[test]
 fn m03_delete_reclaims_memory_for_insert() {
     let measured = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
-    let (schema_bytes, row_bytes) = measure_schema_and_row(
-        &Database::open_memory_with_accountant(measured.clone()),
-        &measured,
-        "first",
-    );
+    let profile_db = Database::open_memory_with_accountant(measured.clone());
+    measured.reset_high_water_for_test();
+    let (schema_bytes, row_bytes) = measure_schema_and_row(&profile_db, &measured, "first");
 
-    // The live limit holds the schema, one row, and half a row of slack: one row
-    // fits, a second does not, and a row re-inserted after the DELETE fits again.
-    // The ceiling stays generous so the closing read-back can be paid for once the
-    // insert promises are settled.
-    let budget = schema_bytes + row_bytes + row_bytes / 2;
+    let first_peak = measured.high_water_for_test();
+    measured.reset_high_water_for_test();
+    profile_db
+        .execute(ITEMS_INSERT, &items_row("second"))
+        .unwrap();
+    let second_peak = measured.high_water_for_test();
+    let budget = second_peak - 1;
+    assert!(
+        first_peak <= budget,
+        "first insertion fits before the second's exact admitted peak"
+    );
+    eprintln!(
+        "m03 schema={schema_bytes} retained_row={row_bytes} first_peak={first_peak} second_peak={second_peak} limit={budget}"
+    );
     let accountant = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
     accountant
         .set_budget(Some(budget))
@@ -197,7 +232,14 @@ fn m03_delete_reclaims_memory_for_insert() {
             ("name", Value::Text("second".to_string())),
         ]),
     );
-    assert!(result2.is_err(), "second INSERT must fail — budget full");
+    let error = result2.expect_err("second INSERT must refuse at its admitted peak");
+    assert_posting_refusal(&error, budget);
+    eprintln!("m03 refusal={error:?}");
+    assert_eq!(
+        accountant.usage().used,
+        used_after_first,
+        "the refused second row releases every admission"
+    );
 
     // DELETE the first row to free memory.
     db.execute(
@@ -581,82 +623,110 @@ fn m11_set_above_startup_ceiling_rejected() {
 fn m12_open_with_config_wires_accountant() {
     const NAME: &str = "a long enough string to exceed sixty four bytes of budget for sure";
     let tmp = tempfile::TempDir::new().unwrap();
-
-    let measured = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
-    let (schema_bytes, row_bytes) = measure_schema_and_row(
-        &Database::open_with_config(
-            tmp.path().join("m12-measurement.db"),
+    let reserve = |limit| {
+        contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(limit))
+    };
+    let mut profile_limit = MEASUREMENT_BUDGET;
+    let mut final_profile = None;
+    for attempt in 0..16 {
+        let measured = Arc::new(MemoryAccountant::with_budget(profile_limit));
+        let profile = Database::open_with_config(
+            tmp.path().join(format!("m12-profile-{attempt}.db")),
             Arc::new(contextdb_engine::plugin::CorePlugin),
             measured.clone(),
         )
-        .unwrap(),
-        &measured,
-        NAME,
-    );
-
-    // The writer's page-cache reserve charged at open (`redb_writer_cache_bytes_for_limit`)
-    // is sized from the declared budget itself, so the measurement db (opened under
-    // the large flat `MEASUREMENT_BUDGET`) and the real db below (opened under a much
-    // smaller, self-referential budget) are charged different reserves at open, even
-    // though the DDL and row costs measured on the measurement db are identical to
-    // what the real db pays. `schema_bytes` above is a TOTAL (`accountant.usage().used`
-    // right after CREATE TABLE), so it already has the measurement db's reserve baked
-    // in; pull that out to get the reserve-independent DDL charge, then size the real
-    // budget so it, in turn, pays exactly `ddl_charge + row_bytes / 2` over ITS OWN
-    // reserve. The real db's own reserve is a function of the budget being solved for,
-    // so resolve the two simultaneously with a fixed-point iteration — the reserve
-    // function is a bounded, monotonic share of the limit, so this converges in a few
-    // steps.
-    let measurement_reserve =
-        contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(
-            MEASUREMENT_BUDGET,
-        ));
-    let ddl_charge = schema_bytes - measurement_reserve;
-    let margin = row_bytes / 2;
-    // CREATE TABLE's own content-identity proof-maintenance step needs a small
-    // transient allowance ABOVE its final settled `ddl_charge`; at the fixed point with zero slack
-    // the DDL step itself is refused (observed: requested 228, available 127 —
-    // 101 bytes short) before the INSERT this test is calibrating for is ever
-    // reached. `ddl_transient_slack` covers that with headroom, and stays
-    // small enough that the margin the INSERT sees (`margin + ddl_transient_slack`)
-    // is still well under a full `row_bytes`, so a missing row charge fails
-    // this assertion.
-    let ddl_transient_slack: usize = 400;
-    assert!(
-        margin + ddl_transient_slack < row_bytes,
-        "the DDL transient slack must not swallow the INSERT margin: margin={margin} \
-         slack={ddl_transient_slack} row_bytes={row_bytes}"
-    );
-    let mut real_budget = schema_bytes + margin; // seed: the pre-fix formula
-    for _ in 0..16 {
-        let real_reserve =
-            contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(
-                real_budget,
+        .unwrap();
+        measured.reset_high_water_for_test();
+        profile.execute(ITEMS_SCHEMA, &empty()).unwrap();
+        let ddl_peak = measured.high_water_for_test();
+        let schema_bytes = measured.usage().used;
+        measured.reset_high_water_for_test();
+        profile.execute(ITEMS_INSERT, &items_row(NAME)).unwrap();
+        let row_peak = measured.high_water_for_test();
+        eprintln!(
+            "m12 profile_limit={profile_limit} reserve={} schema={schema_bytes} ddl_peak={ddl_peak} row_peak={row_peak}",
+            reserve(profile_limit)
+        );
+        profile.close().unwrap();
+        if row_peak == profile_limit {
+            // If subtracting one also reduces the reserve, subtract one more
+            // so the actual operation still sees exactly one byte too little.
+            let mut limit = row_peak - 1;
+            if reserve(limit) < reserve(profile_limit) {
+                limit -= 1;
+            }
+            final_profile = Some((
+                limit,
+                schema_bytes - reserve(profile_limit) + reserve(limit),
+                ddl_peak - reserve(profile_limit) + reserve(limit),
             ));
-        let next_budget = real_reserve + ddl_charge + margin + ddl_transient_slack;
-        if next_budget == real_budget {
             break;
         }
-        real_budget = next_budget;
+        assert!(
+            row_peak < profile_limit,
+            "the funded admission profile stays inside its startup ceiling"
+        );
+        profile_limit = row_peak;
     }
+    let (real_budget, schema_bytes, ddl_peak) =
+        final_profile.expect("the bounded cache share reaches its exact fixed point");
+    assert!(ddl_peak <= real_budget);
+    eprintln!("m12 refusal limit={real_budget} schema={schema_bytes} ddl_peak={ddl_peak}");
+
     let accountant = Arc::new(MemoryAccountant::with_budget(real_budget));
     let db = Database::open_with_config(
         tmp.path().join("m12.db"),
         Arc::new(contextdb_engine::plugin::CorePlugin),
-        accountant,
+        accountant.clone(),
     )
     .unwrap();
-
     db.execute(ITEMS_SCHEMA, &empty()).unwrap();
-
-    let result = db.execute(ITEMS_INSERT, &items_row(NAME));
-    assert!(
-        result.is_err(),
-        "INSERT must fail with tight budget via open_with_config"
+    assert_eq!(accountant.usage().used, schema_bytes);
+    let before = accountant.usage().used;
+    let error = db.execute(ITEMS_INSERT, &items_row(NAME)).unwrap_err();
+    let attributed = |error: &Error| {
+        matches!(error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
+        if subsystem == "content_identity" && operation == "maintain_committed_proof"
+            && *requested_bytes == 248 && *available_bytes == 247 && *budget_limit_bytes == real_budget)
+    };
+    assert!(attributed(&error), "{error:?}");
+    if let Error::MemoryBudgetExceeded {
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = &error
+    {
+        assert!(!attributed(&Error::MemoryBudgetExceeded {
+            subsystem: "relational_index".to_owned(),
+            operation: operation.clone(),
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone()
+        }));
+    }
+    eprintln!("m12 refusal={error:?}");
+    assert_eq!(accountant.usage().used, before);
+    assert_eq!(
+        db.execute("SELECT * FROM items", &empty())
+            .unwrap()
+            .rows
+            .len(),
+        0
     );
-    assert!(
-        matches!(result.unwrap_err(), Error::MemoryBudgetExceeded { .. }),
-        "error must be MemoryBudgetExceeded"
+    db.execute(ITEMS_INSERT, &items_row("ok")).unwrap();
+    db.close().unwrap();
+    let reader = contextdb_engine::ReadSession::open(tmp.path().join("m12.db")).unwrap();
+    assert_eq!(
+        reader
+            .execute("SELECT name FROM items", &empty())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("ok".to_owned())]]
     );
 }
 
@@ -986,10 +1056,7 @@ fn mt1_drop_table_releases_accounting() {
 // ---------------------------------------------------------------------------
 #[test]
 fn mt2_update_rejection_leaves_accounting_unchanged() {
-    // Budget tight enough over the schema that the 4 KiB UPDATE below is
-    // rejected, and wide enough that the small row and the indexed read that
-    // locates it are not.
-    let accountant = Arc::new(MemoryAccountant::with_budget(budget_over_schema(1, 4096)));
+    let accountant = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
     let db = Database::open_memory_with_accountant(accountant.clone());
 
     db.execute(
@@ -1008,7 +1075,34 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
     )
     .unwrap();
 
+    let profile_accountant = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
+    let profile = Database::open_memory_with_accountant(profile_accountant.clone());
+    profile.execute(ITEMS_SCHEMA, &empty()).unwrap();
+    profile
+        .execute(
+            ITEMS_INSERT,
+            &make_params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text("small".to_owned())),
+            ]),
+        )
+        .unwrap();
+    profile_accountant.reset_high_water_for_test();
+    profile
+        .execute(
+            "UPDATE items SET name = $name WHERE id = $id",
+            &make_params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text("x".repeat(4096))),
+            ]),
+        )
+        .unwrap();
+    let update_peak = profile_accountant.high_water_for_test();
+    let budget = update_peak - 1;
+    accountant.set_budget(Some(budget)).unwrap();
     let used_before_update = accountant.usage().used;
+    let old_snapshot = db.snapshot();
+    eprintln!("mt2 baseline={used_before_update} update_peak={update_peak} limit={budget}");
 
     // Attempt an UPDATE to a very large value — should fail.
     let result = db.execute(
@@ -1018,7 +1112,9 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
             ("name", Value::Text("x".repeat(4096))),
         ]),
     );
-    assert!(result.is_err(), "UPDATE exceeding budget must fail");
+    let error = result.expect_err("UPDATE exceeding its real admitted peak must refuse");
+    assert_posting_refusal(&error, budget);
+    eprintln!("mt2 refusal={error:?}");
 
     let used_after_update = accountant.usage().used;
     assert_eq!(
@@ -1038,6 +1134,21 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
         select.rows[0][0],
         Value::Text("small".to_string()),
         "original row must be unchanged after failed UPDATE"
+    );
+    let old_rows = db.scan("items", old_snapshot).unwrap();
+    assert_eq!(old_rows.len(), 1);
+    assert_eq!(
+        old_rows[0].values.get("name"),
+        Some(&Value::Text("small".to_owned()))
+    );
+    db.execute(
+        "UPDATE items SET name = 'fits' WHERE id = $id",
+        &make_params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute("SELECT name FROM items", &empty()).unwrap().rows,
+        vec![vec![Value::Text("fits".to_owned())]]
     );
 }
 
