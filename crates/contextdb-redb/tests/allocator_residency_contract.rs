@@ -13,6 +13,81 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+// Independent heap observation for this synchronous backend. The measured
+// scope owns every object it allocates and drops them before ending; the exact
+// zero at the end catches accidental inclusion of pre-existing allocations.
+// This observes actual allocation sizes, including directories and non-paged
+// bitmap payload, rather than the allocator's fixed pager residency estimate.
+struct ObservedHeap;
+thread_local! {
+    static OBSERVE_HEAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OWNED_HEAP: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+fn note_heap(bytes: isize) {
+    let _ = OBSERVE_HEAP.try_with(|active| {
+        if active.get() {
+            OWNED_HEAP.with(|owned| owned.set(owned.get() + bytes));
+        }
+    });
+}
+unsafe impl std::alloc::GlobalAlloc for ObservedHeap {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let pointer = unsafe { std::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) };
+        if !pointer.is_null() {
+            note_heap(layout.size() as isize);
+        }
+        pointer
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let pointer = unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) };
+        if !pointer.is_null() {
+            note_heap(layout.size() as isize);
+        }
+        pointer
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        note_heap(-(layout.size() as isize));
+        unsafe {
+            std::alloc::GlobalAlloc::dealloc(&std::alloc::System, pointer, layout);
+        }
+    }
+    unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        let resized =
+            unsafe { std::alloc::GlobalAlloc::realloc(&std::alloc::System, pointer, layout, size) };
+        if !resized.is_null() {
+            note_heap(size as isize - layout.size() as isize);
+        }
+        resized
+    }
+}
+#[global_allocator]
+static OBSERVED_HEAP: ObservedHeap = ObservedHeap;
+struct HeapScope;
+impl HeapScope {
+    fn start() -> Self {
+        assert!(!OBSERVE_HEAP.with(|active| active.replace(true)));
+        OWNED_HEAP.with(|owned| owned.set(0));
+        Self
+    }
+    fn retained(&self) -> usize {
+        usize::try_from(OWNED_HEAP.with(std::cell::Cell::get))
+            .expect("the measured scope owns its heap")
+    }
+    fn finish(self) {
+        let remaining = OWNED_HEAP.with(std::cell::Cell::get);
+        drop(self);
+        assert_eq!(
+            remaining, 0,
+            "the complete measured store releases every observed allocation"
+        );
+    }
+}
+impl Drop for HeapScope {
+    fn drop(&mut self) {
+        OBSERVE_HEAP.with(|active| active.set(false));
+    }
+}
+
 const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("allocator_regions");
 const REGION_BYTES: u64 = 1 << 20;
 const VALUE_BYTES: usize = 3 << 18;
@@ -1442,4 +1517,159 @@ fn allocator_scratch_failure_during_repair_can_retry_from_durable_root() {
     let table = read.open_table(TABLE).unwrap();
     assert!(table.get(1).unwrap().is_none());
     assert!(table.get(96).unwrap().is_none());
+}
+
+/// Saved tracker directories and non-paged bitmap payload must remain bounded
+/// as actual regions grow, including ordinary append and reuse of freed pages.
+/// Startup decoding and storage reads retain their independent work oracles.
+#[test]
+fn region_tracker_allocations_stay_bounded_across_reopen_append_and_recycle() {
+    const SMALL_ROWS: u64 = 4096;
+    const BODY_BYTES: usize = 64 << 10;
+    fn tracker_builder() -> redb::Builder {
+        let mut builder = redb::Builder::new();
+        builder.set_region_size(32 * 4096).set_cache_size(0);
+        builder
+    }
+    fn seed(path: &Path, rows: u64) -> usize {
+        let db = tracker_builder()
+            .create(path)
+            .expect("create growing tracker fixture");
+        let payload = vec![0x35; BODY_BYTES];
+        let mut write = db.begin_write().unwrap();
+        write.set_quick_repair(true);
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            for key in 0..rows {
+                table.insert(key, payload.as_slice()).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        let regions = db.allocator_regions_for_test();
+        assert!(
+            regions >= rows as usize,
+            "one large value forces a distinct small region"
+        );
+        regions
+    }
+    fn check(db: &redb::Database, key: u64, marker: u8) {
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(TABLE).unwrap();
+        let row = table.get(key).unwrap().unwrap();
+        assert_eq!(row.value().len(), BODY_BYTES);
+        assert!(row.value().iter().all(|&byte| byte == marker));
+    }
+    fn observe(path: &Path, rows: u64) -> ([usize; 3], [usize; 3], u64, usize) {
+        // Caller-owned controls exist before tracking and survive the scope.
+        let fault = Arc::new(ScratchFault::default());
+        let appended = vec![0x59; BODY_BYTES];
+        let recycled = vec![0x72; BODY_BYTES];
+        let heap = HeapScope::start();
+        let (db, loaded) = redb::observe_allocator_region_loads_for_test(|| {
+            tracker_builder().open_with_backend(FaultBackend {
+                inner: file_backend(path),
+                fault: Arc::clone(&fault),
+            })
+        });
+        let db = db.expect("reopen the saved tracker");
+        let startup_reads = fault.backend_read_bytes.load(Ordering::SeqCst);
+        let opened_regions = db.allocator_regions_for_test();
+        check(&db, rows - 1, 0x35);
+        let opened = heap.retained();
+        // Identical finite write batches avoid pricing a dataset-sized driver.
+        for first in (rows..rows + rows / 2).step_by(64) {
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(TABLE).unwrap();
+                for key in first..first + 64 {
+                    table.insert(key, appended.as_slice()).unwrap();
+                }
+            }
+            write.commit().unwrap();
+        }
+        let appended_regions = db.allocator_regions_for_test();
+        assert!(
+            appended_regions > opened_regions,
+            "append must actually grow region geometry"
+        );
+        check(&db, rows + rows / 2 - 1, 0x59);
+        let after_append = heap.retained();
+        for first in (0..rows / 2).step_by(64) {
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(TABLE).unwrap();
+                for key in first..first + 64 {
+                    table.remove(key).unwrap();
+                }
+            }
+            write.commit().unwrap();
+        }
+        for first in (rows + rows / 2..2 * rows).step_by(64) {
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(TABLE).unwrap();
+                for key in first..first + 64 {
+                    table.insert(key, recycled.as_slice()).unwrap();
+                }
+            }
+            write.commit().unwrap();
+        }
+        let recycled_regions = db.allocator_regions_for_test();
+        assert!(
+            recycled_regions <= appended_regions + 64,
+            "freed regional pages must be reused"
+        );
+        check(&db, rows - 1, 0x35);
+        check(&db, rows + rows / 2 - 1, 0x59);
+        check(&db, 2 * rows - 1, 0x72);
+        {
+            let read = db.begin_read().unwrap();
+            let table = read.open_table(TABLE).unwrap();
+            assert!(
+                table.get(0).unwrap().is_none(),
+                "recycling preserves the row deletion"
+            );
+        }
+        let after_recycle = heap.retained();
+        drop(db);
+        heap.finish();
+        (
+            [opened, after_append, after_recycle],
+            [opened_regions, appended_regions, recycled_regions],
+            loaded,
+            startup_reads,
+        )
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let small = directory.path().join("tracker-n.redb");
+    let large = directory.path().join("tracker-2n.redb");
+    let small_regions = seed(&small, SMALL_ROWS);
+    let large_regions = seed(&large, 2 * SMALL_ROWS);
+    assert!(large_regions > small_regions);
+    let (small_bytes, small_regions, small_loaded, small_reads) = observe(&small, SMALL_ROWS);
+    let (large_bytes, large_regions, large_loaded, large_reads) = observe(&large, 2 * SMALL_ROWS);
+    eprintln!(
+        "actual tracker heap N={small_bytes:?}/{small_regions:?} 2N={large_bytes:?}/{large_regions:?}"
+    );
+    eprintln!(
+        "tracker startup Nloads={small_loaded} 2Nloads={large_loaded} Nreads={small_reads} 2Nreads={large_reads}"
+    );
+    assert_eq!(
+        small_loaded, large_loaded,
+        "startup region decoding stays independent of geometry"
+    );
+    assert!(large_loaded <= 2, "startup retains the fixed prewarm set");
+    assert!(
+        large_reads <= small_reads + 64 * 1024,
+        "startup storage reads stay bounded"
+    );
+    for checkpoint in 0..3 {
+        assert!(large_regions[checkpoint] > small_regions[checkpoint]);
+        assert!(
+            large_bytes[checkpoint].abs_diff(small_bytes[checkpoint]) <= 4096,
+            "checkpoint {checkpoint}: actual directory/non-paged payload grows with regions: N={} 2N={}",
+            small_bytes[checkpoint],
+            large_bytes[checkpoint]
+        );
+    }
 }
