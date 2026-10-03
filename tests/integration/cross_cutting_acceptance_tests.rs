@@ -25,17 +25,10 @@ fn ignored_arm64() {}
 
 #[test]
 fn oom_does_not_partially_commit_visible_state() {
-    // The accountant charges redb's writer
-    // page-cache floor on every open where a memory limit is already installed -- which is
-    // every open but the very first, since `SET MEMORY_LIMIT` runs after that one. A `1K`
-    // declared limit is below what the engine can operate a file-backed store under at all
-    // (the same reason `si_09_reopen_preserves_configured_memory_limit` needed correcting):
-    // reopening after `close` now fails at `open/load_table_metadata` before the test's own
-    // insert ever runs. `80K` is comfortably above the fixed reload cost (schema reload +
-    // writer cache floor, ~77.7 KiB measured), while still refusing the 4096-byte oversized
-    // insert this test pins (~4.2 KiB of headroom remains after reopen, well under what that
-    // insert requests) -- so both the reopen-succeeds and the oversized-insert-is-refused
-    // halves of the promise stay provable.
+    // Keep the reopen budget fixed. The durable row workload must exceed
+    // that ceiling under its real write owner, independently of cache residency.
+    const LIMIT: usize = 80 * 1024;
+    let payload = "x".repeat(LIMIT * 2);
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("t01.db");
     let db = Database::open(&path).unwrap();
@@ -49,24 +42,71 @@ fn oom_does_not_partially_commit_visible_state() {
     db.close().unwrap();
 
     let reopened = Database::open(&path).unwrap();
+    let before = reopened.writer_memory_ownership_receipt_for_test();
+    let original_lsn = reopened.current_lsn();
     let err = reopened
         .execute(
             "INSERT INTO big (id, payload) VALUES ($id, $payload)",
             &make_params(vec![
                 ("id", Value::Uuid(uuid::Uuid::new_v4())),
-                ("payload", Value::Text("x".repeat(4096))),
+                ("payload", Value::Text(payload.clone())),
             ]),
         )
         .unwrap_err();
-    assert!(
-        matches!(err, contextdb_core::Error::MemoryBudgetExceeded { .. }),
-        "reopened database must keep enforcing the configured memory limit: {err:?}"
-    );
+    let attributed = |error: &contextdb_core::Error| {
+        matches!(error,
+        contextdb_core::Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes,
+            available_bytes, budget_limit_bytes, .. }
+        if subsystem == "insert" && operation == "row_insert"
+            && *requested_bytes == 164942
+            && *available_bytes == LIMIT - before.named_owner_total
+            && *available_bytes < *requested_bytes
+            && *budget_limit_bytes == LIMIT)
+    };
+    assert!(attributed(&err), "{err:?}");
+    if let contextdb_core::Error::MemoryBudgetExceeded {
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = &err
+    {
+        let wrong_owner = contextdb_core::Error::MemoryBudgetExceeded {
+            subsystem: "vector".to_owned(),
+            operation: operation.clone(),
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone(),
+        };
+        assert!(!attributed(&wrong_owner));
+    }
+    assert_eq!(reopened.current_lsn(), original_lsn);
+    assert_eq!(reopened.writer_memory_ownership_receipt_for_test(), before);
+    eprintln!("reopened row refusal={err:?} before={before:?}");
     assert_eq!(
         reopened.scan("big", reopened.snapshot()).unwrap().len(),
         0,
         "OOM failure after reopen must not leave a partially visible row"
     );
+    reopened
+        .execute(
+            "INSERT INTO big VALUES ('22222222-2222-2222-2222-222222222222', 'fitting')",
+            &HashMap::new(),
+        )
+        .unwrap();
+    reopened.close().unwrap();
+    let recovered = Database::open(&path).unwrap();
+    assert_eq!(
+        recovered
+            .execute("SELECT payload FROM big", &HashMap::new())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("fitting".to_owned())]]
+    );
+    recovered.close().unwrap();
 }
 
 #[tokio::test]
