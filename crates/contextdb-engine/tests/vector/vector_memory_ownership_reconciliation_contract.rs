@@ -430,6 +430,19 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
     let control_path = root.path().join("restart-churn-control.redb");
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let before_open = accountant.usage().used;
+    // Logical row/schema owners exclude real root and maintenance controls.
+    // Full receipts and final drop still reconcile every control charge.
+    let comparable_non_vector = |db: &Database| {
+        let owners = db.writer_memory_ownership_receipt_for_test();
+        assert_eq!(owners.reconciliation_gap, 0);
+        owners
+            .vector
+            .non_vector_total
+            .checked_sub(db.__durable_writer_charged_bytes_for_test())
+            .unwrap()
+            .checked_sub(owners.storage_maintenance_control_charge)
+            .unwrap()
+    };
 
     {
         let db = open_with_accountant(&path, accountant.clone());
@@ -450,6 +463,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
     let mut stable_reopen_receipt: Option<VectorMemoryOwnershipReceiptForTest> = None;
     let mut fresh_control_receipt: Option<VectorMemoryOwnershipReceiptForTest> = None;
     let mut fresh_control_writer_retention: Option<usize> = None;
+    let mut fresh_control_logical_non_vector: Option<usize> = None;
     // Independent of the accountant total: the fresh surviving-state
     // control's own physical row-version population, counted directly
     // through the same test seam used against the reopened store below.
@@ -491,11 +505,17 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             loaded.base_graph > dormant.base_graph,
             "the selected partition adds positive saved-graph ownership; F32 projection remains in the relational row"
         );
+        assert_eq!(
+            loaded.raw_vector_bodies, 0,
+            "indexed F32 reads keep raw bodies dormant"
+        );
+        assert_eq!(
+            loaded.raw_reverse_directory, 0,
+            "durable membership keeps neither a resident reverse directory nor dormant body headers"
+        );
         assert!(
-            loaded.raw_reverse_directory > 0
-                && loaded.partition_vectors > 0
-                && loaded.typed_partition_keys > 0,
-            "the live fixture separately owns its reverse directory, partition registry, and typed keys"
+            loaded.partition_vectors > 0 && loaded.typed_partition_keys > 0,
+            "the live fixture still owns its partition registry and typed keys"
         );
         assert_exact_reconciliation!(
             &db,
@@ -556,15 +576,21 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             )
             .expect("replace alpha's vector atomically");
             let after_embedding_receipt = receipt!(&db);
+            eprintln!(
+                "CHURN_REPLACEMENT_OWNERS before={before_embedding_receipt:?} after={after_embedding_receipt:?}"
+            );
             let after_writer_retention = db.__durable_writer_charged_bytes_for_test();
             let after_physical_versions = db.__physical_version_count_for_test("ownership_items");
             assert_eq!(
                 after_embedding_receipt.raw_vector_bodies,
-                before_embedding_receipt.raw_vector_bodies
-                    + one_vector_payload_bytes
-                    + one_vector_payload_bytes,
-                "the replacement's raw storage owns exactly the new row's body plus the \
-                 still-resident superseded body"
+                before_embedding_receipt.raw_vector_bodies,
+                "a durable F32 replacement keeps raw cache bodies dormant; both physical \
+                 row projections are counted below independently"
+            );
+            assert_eq!(
+                after_embedding_receipt.raw_reverse_directory,
+                before_embedding_receipt.raw_reverse_directory,
+                "the dormant durable route adds no cached body header or reverse-directory owner"
             );
             assert_eq!(
                 after_physical_versions,
@@ -682,6 +708,11 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             drop(control);
             let control = open_with_accountant(&control_path, control_accountant.clone());
             fresh_control_receipt = Some(receipt!(&control));
+            fresh_control_logical_non_vector = Some(comparable_non_vector(&control));
+            eprintln!(
+                "FRESH_CONTROL_NON_VECTOR_OWNERS {:?}",
+                control.writer_memory_ownership_receipt_for_test()
+            );
             fresh_control_writer_retention =
                 Some(control.__durable_writer_charged_bytes_for_test());
             assert_exact_reconciliation!(
@@ -723,7 +754,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             // zero rows, so the retained-tombstone figure below isolates
             // only the incremental cost of the lineage's history, never the
             // schema's own standing overhead.
-            let lineage_baseline_non_vector_total = logical_non_vector(&lineage);
+            let lineage_baseline_non_vector_total = comparable_non_vector(&lineage);
             insert(&lineage, "ownership_items", 0x101, "alpha", 0);
             lineage
                 .execute(
@@ -769,7 +800,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
                 "currency compaction prunes the isolated lineage's update-superseded versions, \
                  proving a real prune, even though the lineage ends in a delete"
             );
-            let lineage_retained_non_vector_bytes = logical_non_vector(&lineage)
+            let lineage_retained_non_vector_bytes = comparable_non_vector(&lineage)
                 .checked_sub(lineage_baseline_non_vector_total)
                 .expect(
                     "the retained tombstone's charge cannot be lower than the bare schema's \
@@ -797,11 +828,17 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             + retained_deleted_row_physical_versions.expect(
                 "the isolated deleted-row-lineage control's retained version count was measured",
             );
-        let expected_reconciled_non_vector_total = expected_control
-            .non_vector_total
-            .saturating_sub(fresh_control_writer_retention.expect("control writer retention was measured"))
+        let expected_reconciled_non_vector_total = fresh_control_logical_non_vector
+            .expect("the fresh control's independently attributed logical owners were measured")
             + retained_deleted_row_non_vector_bytes
                 .expect("the isolated deleted-row-lineage control's retained non-vector bytes were measured");
+        eprintln!(
+            "REOPEN_NON_VECTOR_OWNERS actual={:?} control_vector={:?} control_writer_retention={:?} actual_vector={:?}",
+            reopened.writer_memory_ownership_receipt_for_test(),
+            expected_control,
+            fresh_control_writer_retention,
+            receipt!(&reopened)
+        );
         if round == 0 {
             // Only this iteration's churn (the replaced, moved, and deleted
             // 0x101 row) leaves superseded history physically resident in
@@ -814,9 +851,9 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
                 "the reopened HISTORY ALL store still physically holds the superseded history"
             );
             assert_eq!(
-                logical_non_vector(&reopened),
-                expected_control.non_vector_total.saturating_sub(
-                    fresh_control_writer_retention.expect("control writer retention was measured")
+                comparable_non_vector(&reopened),
+                fresh_control_logical_non_vector.expect(
+                    "the fresh control's logical owners exclude its actual maintenance control"
                 ),
                 "reopen's logical non-vector charge equals the fresh control without \
                  needing a compaction loop -- the retained tombstone's bytes were already \
@@ -874,7 +911,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
              the retained tombstone is relational-row history, not vector-index state"
         );
         assert_eq!(
-            logical_non_vector(&reopened),
+            comparable_non_vector(&reopened),
             expected_reconciled_non_vector_total,
             "the reopened store's non-vector charge reconciles to the control plus the \
              deleted row's permanently retained tombstone bytes; every engine-held copy is \
@@ -937,7 +974,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             "two replacements leave the live row plus two retained historical copies \
              physically resident, distinct from a single-version table"
         );
-        let pinned_logical_non_vector = logical_non_vector(&db);
+        let pinned_logical_non_vector = comparable_non_vector(&db);
 
         // Exact per-snapshot visibility (docs/architecture.md:337): the held
         // pin's registered snapshot was taken before either UPDATE, so it can
@@ -994,7 +1031,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             "the deferred pass physically removes exactly the one invisible intermediate \
              version, leaving the pin-visible version and the live row resident"
         );
-        let deferred_logical_non_vector = logical_non_vector(&db);
+        let deferred_logical_non_vector = comparable_non_vector(&db);
         assert_eq!(
             deferred_logical_non_vector, pinned_logical_non_vector,
             "pruning the pin-invisible intermediate version while the pin is held leaves the \
@@ -1032,14 +1069,14 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             "the resident row-held F32 projection bytes of the retained historical copy \
              persist across a reopen, counted independently of the accountant"
         );
-        let reopened_logical_non_vector = logical_non_vector(&db);
+        let reopened_logical_non_vector = comparable_non_vector(&db);
         assert_eq!(
             reopened_logical_non_vector, deferred_logical_non_vector,
             "reopen charges the identical retained non-vector total for the one \
              still-deferred historical copy, not merely the live row"
         );
 
-        let before_release_logical_non_vector = logical_non_vector(&db);
+        let before_release_logical_non_vector = comparable_non_vector(&db);
         let release_report = db
             .compact_currency_versions()
             .expect("prune the released historical copy through the production door");
@@ -1055,7 +1092,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             1,
             "compaction physically removes exactly the one pruned historical copy, once"
         );
-        let after_release_logical_non_vector = logical_non_vector(&db);
+        let after_release_logical_non_vector = comparable_non_vector(&db);
         assert_eq!(
             before_release_logical_non_vector, after_release_logical_non_vector,
             "releasing the pin and compacting leaves the retained non-vector charge unchanged: \
@@ -1082,7 +1119,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
              already-pruned physical version population"
         );
         assert_eq!(
-            logical_non_vector(&db),
+            comparable_non_vector(&db),
             after_release_logical_non_vector,
             "reopening again after the release-triggered compaction retains the exact same \
              retained non-vector figure"
