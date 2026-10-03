@@ -933,6 +933,8 @@ struct ObserverState {
     shutdown_signals: u64,
     finished_requests: u64,
     active_clock_base_ms: u64,
+    record_budget: bool,
+    blocked_budget_ledger: Vec<contextdb_engine::memory_accounting::BudgetLedgerEntry>,
 }
 
 #[derive(Clone, Default)]
@@ -1099,6 +1101,9 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
         cancellation: OwnerReadCancellation,
     ) {
         let mut state = self.state.0.lock().expect("bounded observer state");
+        if state.record_budget {
+            contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
+        }
         state.next_event = state.next_event.saturating_add(1);
         let operation_event = state.next_event;
         state.records.push(OperationRecord {
@@ -1126,6 +1131,10 @@ impl OwnerBoundedExecutionObserver for ProductionObserver {
             let should_block = state.blocked_operation == Some(state.records[current].operation)
                 && !state.released;
             if should_block {
+                if state.record_budget {
+                    state.blocked_budget_ledger =
+                        contextdb_engine::memory_accounting::take_budget_ledger_for_test();
+                }
                 state.blocked = true;
                 changed.notify_all();
             }
@@ -2935,6 +2944,7 @@ fn eof_hup_reaches_execute_open_and_fetch_production_blockers() {
 #[test]
 fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
     let observer = Arc::new(ProductionObserver::default());
+    observer.state.0.lock().unwrap().record_budget = true;
     let harness = observed_cursor_harness(Arc::clone(&observer));
     let mut original_limits = limits();
     original_limits.result_rows = 4;
@@ -2990,7 +3000,7 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
     );
     assert_eq!(
         during_fetch.accountant_used_bytes,
-        live.accountant_used_bytes
+        live.accountant_used_bytes + 24 + 266 + "cancellation_cursor".len() as u64
     );
     assert_eq!(during_fetch.active_cancellations, 1);
     let status = owner_status(
@@ -2999,17 +3009,42 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
             .expect("status bypasses admission during a blocked cursor fetch"),
     );
     assert_eq!(status.admission.active_readers, 1);
-    assert_eq!(status.memory.used_bytes, live.accountant_used_bytes);
+    assert_eq!(status.memory.used_bytes, during_fetch.accountant_used_bytes);
     observer.cancel_current();
     assert!(observer.current_is_cancelled());
     observer.release_block();
+    let cancelled = cancelled.join().expect("cancelled fetch joins");
     assert!(matches!(
-        cancelled
-            .join()
-            .expect("cancelled fetch joins")
-            .expect_err("cancelled fetch publishes no page"),
+        cancelled.expect_err("cancelled fetch publishes no page"),
         OwnerReadScaffoldError::Database(Error::ReadCancelled)
     ));
+    let ledger = observer
+        .state
+        .0
+        .lock()
+        .unwrap()
+        .blocked_budget_ledger
+        .clone();
+    let source_owners = ledger
+        .iter()
+        .filter(|entry| {
+            entry.what.starts_with("writer_source/")
+                && entry.what != "writer_source/commit_directory"
+        })
+        .map(|entry| (entry.what.as_str(), entry.bytes))
+        .collect::<Vec<_>>();
+    let expected_owners = vec![
+        ("writer_source/store_adapter", 24),
+        ("writer_source/cursor_keys", 266),
+        ("writer_source/cursor_keys", "cancellation_cursor".len()),
+    ];
+    assert_eq!(source_owners, expected_owners);
+    let mut wrong_owner = source_owners.clone();
+    wrong_owner[0].0 = "writer_source/commit_directory";
+    assert_ne!(
+        wrong_owner, expected_owners,
+        "the same bytes under a different owner must fail reconciliation"
+    );
     assert_eq!(observer.cancellation_observed(), 1);
     assert_resources(&harness.service, live);
 
@@ -3021,6 +3056,11 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
         )
         .expect("commit a later row between cancellation and resume");
     let live_after_later_commit = harness.service.resources();
+    let captured_root = harness
+        .database
+        .writer_memory_ownership_receipt_for_test()
+        .captured_root_charge;
+    assert_eq!(captured_root, 264);
     assert_eq!(live_after_later_commit.active_slots, live.active_slots);
     assert_eq!(live_after_later_commit.cursor_count, live.cursor_count);
     assert_eq!(
@@ -3104,9 +3144,17 @@ fn a_cancelled_fetch_is_nonterminal_and_resumes_original_state() {
         buffered_bytes: live_after_later_commit.buffered_bytes,
         active_cancellations: live_after_later_commit.active_cancellations,
         accountant_used_bytes: live_after_later_commit.accountant_used_bytes
-            - live.cursor_retained_bytes,
+            - live.cursor_retained_bytes
+            - captured_root as u64,
     };
     assert_resources(&harness.service, expected_after_exhaustion);
+    assert_eq!(
+        harness
+            .database
+            .writer_memory_ownership_receipt_for_test()
+            .captured_root_charge,
+        0
+    );
     let current = harness
         .database
         .execute(
@@ -3399,6 +3447,16 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
         .run_maintenance_cycle()
         .expect("maintenance and pruning can run while the snapshot pin is live");
     let live_after_writer = harness.service.resources();
+    let held_writer = harness.database.writer_memory_ownership_receipt_for_test();
+    assert_eq!(held_writer.captured_root_charge, 264);
+    assert_eq!(
+        held_writer.reconciliation_gap,
+        live_after_writer.cursor_retained_bytes as i64
+    );
+    assert_eq!(
+        held_writer.named_owner_total as u64 + live_after_writer.cursor_retained_bytes,
+        live_after_writer.accountant_used_bytes
+    );
     assert_eq!(live_after_writer.active_slots, live.active_slots);
     assert_eq!(live_after_writer.cursor_count, live.cursor_count);
     assert_eq!(
@@ -3439,8 +3497,27 @@ fn cursor_snapshot_stays_stable_while_writer_and_maintenance_progress_then_relea
             buffered_bytes: live_after_writer.buffered_bytes,
             active_cancellations: live_after_writer.active_cancellations,
             accountant_used_bytes: live_after_writer.accountant_used_bytes
-                - live.cursor_retained_bytes,
+                - live.cursor_retained_bytes
+                - held_writer.captured_root_charge as u64,
         },
+    );
+
+    let released_writer = harness.database.writer_memory_ownership_receipt_for_test();
+    let reconciles = |receipt: &contextdb_engine::database::WriterMemoryOwnershipReceiptForTest| {
+        receipt.captured_root_charge == 0
+            && receipt.published_root_charge == held_writer.published_root_charge
+            && receipt.storage_maintenance_control_charge
+                == held_writer.storage_maintenance_control_charge
+            && receipt.reconciliation_gap == 0
+            && receipt.named_owner_total as u64 == harness.service.resources().accountant_used_bytes
+    };
+    assert!(reconciles(&released_writer));
+    let mut wrong_owner = released_writer.clone();
+    wrong_owner.captured_root_charge = 264;
+    wrong_owner.published_root_charge -= 264;
+    assert!(
+        !reconciles(&wrong_owner),
+        "relabelled root ownership must fail even with the same total"
     );
 
     let current = harness
