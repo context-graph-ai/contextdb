@@ -497,10 +497,28 @@ impl PagedCachedFile {
 
     // Caller should invalidate all cached pages that are no longer valid
     pub(super) fn resize(&self, len: u64) -> Result {
-        // TODO: be more fine-grained about this invalidation
-        self.invalidate_cache_all();
+        // Only a page that reaches past the new end can be stale; pages wholly
+        // below it keep their bytes, so a truncating compaction step does not
+        // discard (and then re-read) the whole working set.
+        self.invalidate_cache_beyond(len);
 
         self.file.set_len(len)
+    }
+
+    fn invalidate_cache_beyond(&self, len: u64) {
+        for stripe in &self.read_cache {
+            let mut lock = stripe.write().unwrap();
+            loop {
+                let stale = lock
+                    .iter()
+                    .find(|(offset, page)| **offset + page.len() as u64 > len)
+                    .map(|(offset, _)| *offset);
+                let Some(offset) = stale else {
+                    break;
+                };
+                drop(lock.remove(offset));
+            }
+        }
     }
 
     pub(super) fn flush(&self) -> Result {

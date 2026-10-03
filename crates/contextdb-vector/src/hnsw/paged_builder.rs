@@ -127,6 +127,25 @@ impl PagedVectorBatchPlan {
             .and_then(|n| n.checked_add(self.progress_bytes))
             .ok_or_else(workspace_overflow)
     }
+    /// Construction spills its search visited set and priority queue into
+    /// the engine transaction (`PagedVectorTransaction`), so its in-memory
+    /// graph scratch is only the result/selection/pruning/extension window.
+    pub fn construction_workspace_bytes(&self) -> Result<usize> {
+        // Covers both a spilling provider and one whose search scratch stays
+        // in this fixed-capacity workspace.
+        let scratch = PagedGraphWorkspace::exact_allocation_bound(self.scratch_points)
+            .ok_or_else(workspace_overflow)?;
+        scratch
+            .checked_add(
+                self.max_node_bytes
+                    .checked_mul(6)
+                    .ok_or_else(workspace_overflow)?,
+            )
+            .and_then(|n| n.checked_add(self.dirty_page_bytes))
+            .and_then(|n| n.checked_add(self.source_key_bytes.checked_mul(3)?))
+            .and_then(|n| n.checked_add(self.progress_bytes))
+            .ok_or_else(workspace_overflow)
+    }
     fn validate(
         &self,
         policy: PagedGraphPolicy,
@@ -139,9 +158,13 @@ impl PagedVectorBatchPlan {
             VectorQuantization::SQ4 => dimension.div_ceil(2).checked_add(32),
         }
         .ok_or_else(workspace_overflow)?;
+        // Layer zero keeps 2M neighbours and every upper layer M, exactly the
+        // degrees the paged algorithm enforces when it loads a point.
         let minimum_node = policy
             .max_layer
-            .checked_mul(2 * policy.m)
+            .checked_sub(1)
+            .and_then(|upper| upper.checked_mul(policy.m))
+            .and_then(|n| n.checked_add(2 * policy.m))
             .and_then(|n| n.checked_mul(std::mem::size_of::<hnsw_rs::paged::PagedEdge>()))
             .and_then(|n| {
                 n.checked_add(
@@ -238,6 +261,11 @@ pub trait PagedVectorTransaction: PagedVectorReader {
     fn visit_search_scratch(&mut self, id: PointId) -> Result<bool>;
     fn push_search_candidate(&mut self, edge: hnsw_rs::paged::PagedEdge) -> Result<()>;
     fn pop_search_candidate(&mut self) -> Result<Option<hnsw_rs::paged::PagedEdge>>;
+    /// False keeps the search visited set and priority queue inside the
+    /// batch's fixed-capacity workspace instead of the four calls above.
+    fn spills_search_scratch(&self) -> bool {
+        true
+    }
 }
 
 /// Exactly one persistence entry per insertion batch. The callback runs inside
@@ -349,16 +377,28 @@ impl PagedPointStorage<f32> for PointAdapter<'_> {
         self.transaction.before_visit()
     }
     fn begin_search_scratch(&mut self) -> Result<()> {
+        if !self.transaction.spills_search_scratch() {
+            return Ok(());
+        }
         self.transaction.begin_search_scratch()
     }
     fn visit_search_scratch(&mut self, id: PointId) -> Result<Option<bool>> {
+        if !self.transaction.spills_search_scratch() {
+            return Ok(None);
+        }
         self.transaction.visit_search_scratch(id).map(Some)
     }
     fn push_search_candidate(&mut self, edge: hnsw_rs::paged::PagedEdge) -> Result<bool> {
+        if !self.transaction.spills_search_scratch() {
+            return Ok(false);
+        }
         self.transaction.push_search_candidate(edge)?;
         Ok(true)
     }
     fn pop_search_candidate(&mut self) -> Result<Option<Option<hnsw_rs::paged::PagedEdge>>> {
+        if !self.transaction.spills_search_scratch() {
+            return Ok(None);
+        }
         self.transaction.pop_search_candidate().map(Some)
     }
 }
@@ -403,16 +443,28 @@ impl PagedPointStorage<u8> for PointAdapter<'_> {
         self.transaction.before_visit()
     }
     fn begin_search_scratch(&mut self) -> Result<()> {
+        if !self.transaction.spills_search_scratch() {
+            return Ok(());
+        }
         self.transaction.begin_search_scratch()
     }
     fn visit_search_scratch(&mut self, id: PointId) -> Result<Option<bool>> {
+        if !self.transaction.spills_search_scratch() {
+            return Ok(None);
+        }
         self.transaction.visit_search_scratch(id).map(Some)
     }
     fn push_search_candidate(&mut self, edge: hnsw_rs::paged::PagedEdge) -> Result<bool> {
+        if !self.transaction.spills_search_scratch() {
+            return Ok(false);
+        }
         self.transaction.push_search_candidate(edge)?;
         Ok(true)
     }
     fn pop_search_candidate(&mut self) -> Result<Option<Option<hnsw_rs::paged::PagedEdge>>> {
+        if !self.transaction.spills_search_scratch() {
+            return Ok(None);
+        }
         self.transaction.pop_search_candidate().map(Some)
     }
 }
@@ -656,6 +708,24 @@ impl PagedVectorTail {
             "reduce the insertion batch or release idle serving pages",
         )
     }
+    fn reserve_construction(
+        &self,
+        plan: PagedVectorBatchPlan,
+        operation: &str,
+    ) -> Result<VectorWorkspaceReservation> {
+        plan.validate(
+            graph_policy(self.policy, self.quantization),
+            self.dimension,
+            self.quantization,
+        )?;
+        VectorWorkspaceReservation::try_new(
+            Arc::clone(&self.accountant),
+            Arc::clone(&self.live_workspace),
+            plan.construction_workspace_bytes()?,
+            operation,
+            "reduce the insertion batch or release idle serving pages",
+        )
+    }
     /// Inserts the supplied finite row batch. The engine's persistence callback
     /// must include its row publication in this same transaction. On failure,
     /// both the durable state and this handle retain the previous progress.
@@ -670,7 +740,7 @@ impl PagedVectorTail {
                 "paged vector append exceeds its admitted batch".into(),
             ));
         }
-        let _reservation = self.reserve(plan, "append_paged_vector_tail")?;
+        let _reservation = self.reserve_construction(plan, "append_paged_vector_tail")?;
         let previous = self.progress.as_ref().clone();
         let retained_bound = root_control_head()
             .checked_add(plan.progress_bytes)
@@ -687,7 +757,7 @@ impl PagedVectorTail {
             }
             invoked = true;
             let mut next = previous.clone();
-            let mut workspace = PagedGraphWorkspace::new(plan.scratch_points);
+            let mut workspace = PagedGraphWorkspace::new_lazy(plan.scratch_points);
             let mut adapter = PointAdapter {
                 transaction,
                 writes: 0,
@@ -1519,7 +1589,7 @@ impl PagedGenerationBuilder {
         let _reservation = VectorWorkspaceReservation::try_new(
             Arc::clone(&self.accountant),
             Arc::clone(&self.live_workspace),
-            plan.workspace_bytes()?,
+            plan.construction_workspace_bytes()?,
             "advance_paged_vector_generation",
             "reduce batch size or release idle serving pages",
         )?;
@@ -1569,7 +1639,7 @@ impl PagedGenerationBuilder {
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<PagedVectorProgress> {
         let mut next = previous.clone();
-        let mut workspace = PagedGraphWorkspace::new(plan.scratch_points);
+        let mut workspace = PagedGraphWorkspace::new_lazy(plan.scratch_points);
         let mut writes = 0;
         for _ in 0..plan.max_points {
             checkpoint()?;
