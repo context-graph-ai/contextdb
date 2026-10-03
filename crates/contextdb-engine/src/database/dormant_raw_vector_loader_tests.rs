@@ -181,7 +181,7 @@ fn streamed_unknown_membership_keeps_lifecycle_validation_and_release() {
         deleted_tx: None,
     };
     persistence
-        .append_vector_partition_memberships_batch(&[unknown.clone()])
+        .append_vector_partition_memberships_batch(std::slice::from_ref(&unknown))
         .unwrap();
     let loaded = loader
         .load(&directory)

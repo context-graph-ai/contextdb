@@ -1896,7 +1896,11 @@ fn ssh_c1_alter_drop_column_cascade_cleans_storage() {
         db.close().unwrap();
         drop(db);
         let before_entries = durable_entries(&path);
-        assert_eq!(before_entries, ([6, 6], [6, 6]), "both declared indexes have all six durable postings");
+        assert_eq!(
+            before_entries,
+            ([6, 6], [6, 6]),
+            "both declared indexes have all six durable postings"
+        );
         let before = before_entries.0.into_iter().sum::<u64>();
         let db = Database::open(&path).unwrap();
         exec(&db, "ALTER TABLE t DROP COLUMN col CASCADE");
@@ -1904,7 +1908,11 @@ fn ssh_c1_alter_drop_column_cascade_cleans_storage() {
         db.close().unwrap();
         drop(db);
         let after_entries = durable_entries(&path);
-        assert_eq!(after_entries, ([0, 0], [0, 0]), "cascade removes physical and current postings for both dropped indexes");
+        assert_eq!(
+            after_entries,
+            ([0, 0], [0, 0]),
+            "cascade removes physical and current postings for both dropped indexes"
+        );
         let after = after_entries.0.into_iter().sum::<u64>();
         assert!(after < before);
         assert!(!rendered.contains("idx_a"));

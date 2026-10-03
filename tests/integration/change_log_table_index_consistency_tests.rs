@@ -287,13 +287,18 @@ fn the_index_matches_the_change_log_after_a_scoped_cleanup_pass() {
     // before asserting the final history coordinates.
     let mut drained = false;
     for _ in 0..16 {
-        let batch = db.compact_currency_versions().expect("drain finite cleanup batch");
+        let batch = db
+            .compact_currency_versions()
+            .expect("drain finite cleanup batch");
         if batch.pruned_versions == 0 {
             drained = true;
             break;
         }
     }
-    assert!(drained, "the finite fixture must finish cleanup within sixteen batches");
+    assert!(
+        drained,
+        "the finite fixture must finish cleanup within sixteen batches"
+    );
     assert_durable_history(
         &db,
         "work_capabilities",
