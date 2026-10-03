@@ -896,7 +896,14 @@ fn historical_vector_directory_count(db: &Database) -> usize {
 fn historical_vector_placement_survives_pruning_and_reconstruction_until_versions_reclaim() {
     let directory = tempfile::tempdir().expect("temporary history directory");
     let path = directory.path().join("vector-history.redb");
-    let db = Database::open(&path).expect("open the history store");
+    let accountant = Arc::new(contextdb_engine::memory_accounting::MemoryAccountant::no_limit());
+    let baseline = accountant.usage().used;
+    let db = Database::open_with_config(
+        &path,
+        Arc::new(contextdb_engine::plugin::CorePlugin),
+        accountant.clone(),
+    )
+    .expect("open the history store with the caller accountant");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
         "CREATE TABLE historical_grouping (id INT PRIMARY KEY, kind TEXT NOT NULL, \
@@ -1031,8 +1038,8 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
     assert_eq!(grouping.row_directory_lookups.load(Ordering::SeqCst), 1);
     assert_eq!(
         grouping.snapshot_visibility_probes.load(Ordering::SeqCst),
-        2,
-        "the row directory checks the current partition and then the old visible partition"
+        1,
+        "the durable membership route checks only the selected snapshot-visible placement"
     );
     assert_eq!(grouping.placements.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -1054,7 +1061,17 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
         .expect("close with the deferred historical versions still durable");
     drop(db);
 
-    let db = Database::open(&path).expect("reopen deferred vector history");
+    assert_eq!(
+        accountant.usage().used,
+        baseline,
+        "dropping the first history image releases every body-cache owner"
+    );
+    let db = Database::open_with_config(
+        &path,
+        Arc::new(contextdb_engine::plugin::CorePlugin),
+        accountant.clone(),
+    )
+    .expect("reopen deferred vector history with the same caller accountant");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     assert_eq!(
         db.__physical_version_count_for_test("historical_grouping"),
@@ -1088,8 +1105,8 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
         reconstructed_grouping
             .snapshot_visibility_probes
             .load(Ordering::SeqCst),
-        2,
-        "reconstructed history finds the old directory after rejecting the new one"
+        1,
+        "the reconstructed durable route selects the old snapshot-visible placement directly"
     );
     assert_eq!(reconstructed_grouping.placements.load(Ordering::SeqCst), 1);
 
@@ -1133,9 +1150,32 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
         "current-only cleanup leaves only the two current partitioned vector identities"
     );
     let after_release_prune = db.vector_memory_ownership_receipt_for_test();
-    assert!(
-        after_release_prune.raw_reverse_directory < before_release_prune.raw_reverse_directory,
-        "reclaim removes the obsolete reverse-directory identities"
+    eprintln!(
+        "HISTORICAL_CACHE_OWNERS before={before_release_prune:?} after={after_release_prune:?}"
+    );
+    assert_eq!(before_release_prune.raw_vector_bodies, 0);
+    assert_eq!(after_release_prune.raw_vector_bodies, 0);
+    assert_eq!(before_release_prune.raw_reverse_directory, 0);
+    assert_eq!(after_release_prune.raw_reverse_directory, 0);
+    assert_eq!(
+        before_release_prune.partition_vectors - after_release_prune.partition_vectors,
+        2560,
+        "reclaim releases the two obsolete durable partition registry owners"
+    );
+    assert_eq!(
+        before_release_prune.typed_partition_keys - after_release_prune.typed_partition_keys,
+        48,
+        "reclaim releases the two obsolete typed-key owners"
+    );
+    assert_eq!(
+        before_release_prune.retained_total - after_release_prune.retained_total,
+        2608,
+        "the retained-owner release is exactly registry plus typed keys"
+    );
+    assert_eq!(
+        before_release_prune.accountant_total - after_release_prune.accountant_total,
+        2608,
+        "the caller accountant releases the same owners exactly once"
     );
     assert!(
         after_release_prune.retained_total <= before_release_prune.retained_total,
@@ -1158,6 +1198,14 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
         historical_partition_rows(&db, None, 2),
         vec![vec![Value::Int64(1)]]
     );
+    db.close().expect("close the reclaimed historical store");
+    drop(db);
+    assert_eq!(
+        accountant.usage().used,
+        baseline,
+        "final history-image drop releases the retained body and header owners exactly once"
+    );
+    assert_eq!(accountant.underflow_count_for_test(), 0);
 }
 
 #[test]
