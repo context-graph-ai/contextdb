@@ -203,14 +203,14 @@ fn a_row_deleted_through_the_row_api_takes_its_vectors_with_it() {
              {before}"
         );
     }
-    assert!(
+    assert_eq!(
         database
             .accountant()
             .usage()
             .used
-            .saturating_sub(database.__durable_writer_charged_bytes_for_test())
-            < held_before,
-        "and the store releases what the deleted row's vectors were costing it"
+            .saturating_sub(database.__durable_writer_charged_bytes_for_test()),
+        held_before,
+        "closed vector bodies stay charged for snapshot readers; durable membership has no resident reverse directory to release"
     );
 
     // The row that was not deleted is untouched.
