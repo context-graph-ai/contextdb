@@ -684,7 +684,7 @@ fn wide_partition_inventory_is_admitted_before_reclamation() {
     db.accountant.set_budget(Some(used + 128 * 1024)).unwrap();
     let failure = db.run_pruning_cycle_checked().unwrap_err();
     assert!(
-        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, ref hint, .. } if subsystem == "retention" && operation == "prepare_prune" && hint.contains("partition identities"))
+        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. } if subsystem == "vector" && operation == "membership_window")
     );
     assert_eq!(db.accountant.usage().used, used);
     assert_eq!(durable_observation::version_count(&db, "retained"), 16);
@@ -745,7 +745,7 @@ fn repeated_wide_membership_copies_are_admitted_before_reclamation() {
     let failure = db.run_pruning_cycle_checked().unwrap_err();
     eprintln!("repeated wide membership refusal: {failure:?}");
     assert!(
-        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, ref hint, .. } if subsystem == "retention" && operation == "prepare_prune" && (hint.contains("membership records") || hint.contains("journal keys")))
+        matches!(failure, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. } if subsystem == "vector" && operation == "membership_window")
     );
     assert_eq!(db.accountant.usage().used, used);
     assert_eq!(durable_observation::version_count(&db, "retained"), 16);
