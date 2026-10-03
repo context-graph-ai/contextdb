@@ -75228,6 +75228,41 @@ mod currency_version_compaction_tests {
             .count()
     }
 
+    fn durable_physical_versions(db: &Database, table: &str) -> usize {
+        db.__physical_version_count_for_test(table)
+    }
+
+    fn durable_change_log_row_inserts(db: &Database, table: &str) -> usize {
+        db.change_log_since(Lsn(0)).expect("read durable history").iter()
+            .filter(|entry| matches!(entry, ChangeLogEntry::RowInsert { table: owner, .. } if owner == table))
+            .count()
+    }
+
+    fn drain_currency(db: &Database) -> (u64, u64) {
+        let mut versions = 0;
+        let mut history = 0;
+        for _ in 0..1024 {
+            let batch = db
+                .compact_currency_versions()
+                .expect("one finite currency batch");
+            versions += batch.pruned_versions;
+            history += batch.pruned_change_log_entries;
+            // A finite pass may advance a different cohort without pruning.
+            // Completion is this fixture's exact durable end state.
+            if durable_physical_versions(db, "work_capabilities") == 1
+                && durable_change_log_row_inserts(db, "work_capabilities") == 1
+                && db
+                    .change_log_since(Lsn(0))
+                    .expect("read drained history")
+                    .len()
+                    <= 2
+            {
+                return (versions, history);
+            }
+        }
+        panic!("the finite ledger fixture did not drain within1024batches");
+    }
+
     fn current_advertised_at(db: &Database) -> i64 {
         let result = db
             .execute(
@@ -75284,36 +75319,36 @@ mod currency_version_compaction_tests {
         }
 
         // The defect: one logical row, N physical versions, N change-log entries.
-        assert_eq!(physical_versions(&db, "work_capabilities"), N as usize);
-        assert_eq!(change_log_row_inserts(&db, "work_capabilities"), N as usize);
+        assert_eq!(durable_physical_versions(&db, "work_capabilities"), N as usize);
+        assert_eq!(durable_change_log_row_inserts(&db, "work_capabilities"), N as usize);
 
-        let report = db.compact_currency_versions().expect("compact");
-        assert_eq!(report.pruned_versions, (N - 1) as u64);
+        let (pruned_versions, pruned_history) = drain_currency(&db);
+        assert_eq!(pruned_versions, (N - 1) as u64);
         // Each ON-CONFLICT update writes both a RowInsert (new version) and a
         // RowDelete (old version), so at least the N-1 superseded inserts plus
         // their deletes are dropped in lockstep.
         assert!(
-            report.pruned_change_log_entries >= (N - 1) as u64,
+            pruned_history >= (N - 1) as u64,
             "at least the superseded versions' change-log entries must be dropped in \
              lockstep; got {}",
-            report.pruned_change_log_entries
+            pruned_history
         );
 
         // Bounded: one live version, one surviving RowInsert, tiny total log.
         assert_eq!(
-            physical_versions(&db, "work_capabilities"),
+            durable_physical_versions(&db, "work_capabilities"),
             1,
             "compaction must collapse a logical row to its single current version"
         );
         assert_eq!(
-            change_log_row_inserts(&db, "work_capabilities"),
+            durable_change_log_row_inserts(&db, "work_capabilities"),
             1,
             "the superseded versions' change-log entries must be dropped in lockstep"
         );
         assert!(
-            db.change_log.read().len() <= 2,
+            db.change_log_since(Lsn(0)).unwrap().len() <= 2,
             "only the keeper commit's entries survive; got {}",
-            db.change_log.read().len()
+            db.change_log_since(Lsn(0)).unwrap().len()
         );
         // Correctness preserved: the surviving row is the CURRENT one.
         assert_eq!(current_advertised_at(&db), N);
@@ -75348,11 +75383,11 @@ mod currency_version_compaction_tests {
                 )
                 .expect("advertise");
             }
-            db.compact_currency_versions().expect("compact");
+            drain_currency(&db);
         }
         // Reopen from disk.
         let db = Database::open(&path).expect("reopen");
-        assert_eq!(physical_versions(&db, "work_capabilities"), 1);
+        assert_eq!(durable_physical_versions(&db, "work_capabilities"), 1);
         assert_eq!(current_advertised_at(&db), 80);
         assert_eq!(
             capability_changes(&db, Lsn(0)),
