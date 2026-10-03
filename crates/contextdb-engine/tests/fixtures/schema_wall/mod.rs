@@ -523,6 +523,7 @@ pub fn is_data_table(table: &str) -> bool {
         table,
         "config"
             | "change_log"
+            | "change_log_by_table"
             | "ddl_log"
             | "commit_index"
             | "metadata"
@@ -631,6 +632,15 @@ pub fn assert_affected_only(
         index_artifact_writes <= affected.len() as u64 * 8,
         "physical index work exceeded the affected schema closure: {observation:?}"
     );
+    let rewritten_row_routes = observation.artifact_writes.iter()
+        .filter_map(|(event, _)| {
+            let owner = event.table.strip_prefix("rel_")?;
+            if event.operation != TableWriteOperationForTest::Insert || event.key.len() != 24 {
+                return None;
+            }
+            let row = u64::from_be_bytes(event.key[..8].try_into().unwrap());
+            Some((owner.to_owned(), row))
+        }).collect::<BTreeSet<_>>();
     let mut contact_versions = 0;
     let mut contact_directory_installs = 0;
     for (event, count) in &observation.artifact_writes {
@@ -647,6 +657,58 @@ pub fn assert_affected_only(
         } else {
             &event.table
         };
+        if table == "writer_recovery" {
+            if event.table == "__redb_user_table_directory" {
+                assert_eq!(event.operation, TableWriteOperationForTest::DirectoryInsert);
+                // Each of the three fixed controls opens and updates the table root.
+                assert!(*count <= 3 * (1 + contact_exchanges));
+            } else {
+                assert_eq!(event.operation, TableWriteOperationForTest::Insert);
+                assert!(matches!(event.key.as_slice(), b"bounds" | b"commit_directory_root" | b"row_heads_root"),
+                    "unexpected recovery control coordinate {event:?}");
+                assert!(*count <= 1 + contact_exchanges);
+            }
+            continue;
+        }
+        if table == "writer_row_heads" {
+            if event.table == "__redb_user_table_directory" {
+                assert_eq!(event.operation, TableWriteOperationForTest::DirectoryInsert);
+                assert!(*count <= 1 + observation.durable_rows_rewritten as u64 * 2 + contact_exchanges * 2);
+            } else {
+                assert_eq!(event.operation, TableWriteOperationForTest::Insert);
+                let owner_len = u64::from_le_bytes(event.key[..8].try_into().unwrap()) as usize;
+                assert_eq!(event.key.len(), owner_len + 24);
+                let owner = std::str::from_utf8(&event.key[8..8 + owner_len]).unwrap();
+                assert!(affected.contains(owner) || owner == "work_node_contacts", "unaffected row-head owner {event:?}");
+                assert_eq!(u64::from_le_bytes(event.key[8 + owner_len..16 + owner_len].try_into().unwrap()), 8);
+                let row_id = u64::from_le_bytes(event.key[16 + owner_len..].try_into().unwrap());
+                assert!(rewritten_row_routes.contains(&(owner.to_owned(), row_id)),
+                    "row-head route must match an actual affected relational rewrite {event:?}");
+                assert_eq!(event.value_bytes, 56);
+                assert!(*count <= 2 + contact_exchanges * 2);
+            }
+            continue;
+        }
+        if table == "change_log_by_table" {
+            if event.table != "__redb_user_table_directory" {
+                let end = event
+                    .key
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .expect("table-selected history key has an owner delimiter");
+                let owner = std::str::from_utf8(&event.key[..end]).unwrap();
+                assert!(
+                    affected.contains(owner) || owner == "work_node_contacts",
+                    "unrelated table-selected history write {event:?}"
+                );
+                assert_eq!(
+                    event.key.len(),
+                    end + 1 + 16,
+                    "table-selected history carries an exact LSN/ordinal coordinate"
+                );
+            }
+            continue;
+        }
         if table == CONTACT_TABLE {
             match event.operation {
                 TableWriteOperationForTest::Insert if event.table == CONTACT_TABLE => {
@@ -683,6 +745,29 @@ pub fn assert_affected_only(
             "an unanticipated durable artifact cannot be omitted from the affected-set proof: {event:?}"
         );
     }
+    let row_head_writes = observation.artifact_writes.iter()
+        .filter(|(event, _)| event.table == "writer_row_heads")
+        .map(|(_, count)| *count).sum::<u64>();
+    assert!(row_head_writes <= observation.durable_rows_rewritten as u64 * 2 + contact_exchanges * 2,
+        "row-head publication exceeds actual affected mutations: {observation:?}");
+    let recovery_writes = observation.artifact_writes.iter()
+        .filter(|(event, _)| event.table == "writer_recovery")
+        .map(|(_, count)| *count).sum::<u64>();
+    assert!(recovery_writes <= 3 * (1 + contact_exchanges));
+    let table_history_writes = observation
+        .artifact_writes
+        .iter()
+        .filter(|(event, _)| {
+            event.table == "change_log_by_table"
+                || (event.table == "__redb_user_table_directory"
+                    && event.key == b"change_log_by_table")
+        })
+        .map(|(_, count)| *count)
+        .sum::<u64>();
+    assert!(
+        table_history_writes <= affected.len() as u64 * 2 + contact_exchanges * 4 + 1,
+        "derived history work must stay inside the affected set, never replay unrelated history: {observation:?}"
+    );
     assert!(
         contact_versions == contact_exchanges.saturating_mul(2),
         "each authenticated exchange has exactly its old and new contact versions: observed={contact_versions} exchanges={contact_exchanges}"
