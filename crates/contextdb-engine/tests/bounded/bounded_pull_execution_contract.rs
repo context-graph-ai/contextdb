@@ -1023,13 +1023,16 @@ fn assert_scoped_candidate_limits(
         shared_work_limit,
     );
 
-    let source_peak = profile
+    // The work-refusal probe above warms durable pages. Price the memory
+    // refusal in that same state, rather than using the earlier cold profile.
+    let memory_profile = bounded_success(db, &request(sql, params.clone(), roomy_limits(), clock));
+    let source_peak = memory_profile
         .telemetry
         .source_peak_temporary_bytes
         .get(&source)
         .copied()
         .unwrap_or_default();
-    let access_peak = profile
+    let access_peak = memory_profile
         .telemetry
         .source_peak_temporary_bytes
         .get(&bounded::TestWorkSource::AccessControl)
