@@ -50,15 +50,17 @@ impl PersistentCompositeStore {
         received_schema_stages: ReceivedSchemaStageRegistry,
         local_schema_stages: LocalSchemaStageRegistry,
     ) -> Result<Self> {
-        let source_memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+        // Like the initial published root, startup charges this fixed control
+        // without refusing open under a smaller persisted limit. Subsequent
+        // commit admission still sees every retained byte.
+        let source_bytes = std::mem::size_of::<
+            parking_lot::Mutex<std::sync::Weak<crate::persistence::WriterSnapshot>>,
+        >();
+        inner.accountant.charge_retained(source_bytes);
+        let source_memory = crate::memory_accounting::OwnedMemoryReservation::from_admitted(
             inner.accountant.clone(),
-            std::mem::size_of::<
-                parking_lot::Mutex<std::sync::Weak<crate::persistence::WriterSnapshot>>,
-            >(),
-            "writer_source",
-            "commit_root_reference",
-            "Raise MEMORY_LIMIT to retain commit source control.",
-        )?;
+            source_bytes,
+        );
         Ok(Self {
             inner,
             persistence,

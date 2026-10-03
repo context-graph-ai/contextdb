@@ -125,6 +125,11 @@ impl PreparedWriterErasure {
 
 impl RedbPersistence {
     /// Startup alone resolves metadata from disk, outside publication locks.
+    /// The captured schema is charged, not admitted: a limit is persisted
+    /// with the store, so refusing the open on it would brick a store whose
+    /// operator once declared a limit below this floor, with no way back in
+    /// to raise it. The limit sees the bytes, and the ordinary typed refusal
+    /// fires on the next admission (the same rule as the writer page cache).
     fn prepared_writer_schema(&self) -> Result<Arc<WriterSchema>> {
         if let Some(schema) = self.writer_schema.lock().as_ref().cloned() {
             return Ok(schema);
@@ -132,13 +137,11 @@ impl RedbPersistence {
         let accountant = self
             .proof_accountant()
             .ok_or_else(|| Error::Other("writer schema requires its accountant".into()))?;
-        let mut memory = OwnedMemoryReservation::try_new_for(
-            accountant.clone(),
-            std::mem::size_of::<WriterSchema>(),
-            "writer_source",
-            "captured_schema",
-            HINT,
-        )?;
+        let charge = |bytes: usize| {
+            accountant.charge_retained(bytes);
+            OwnedMemoryReservation::from_admitted(accountant.clone(), bytes)
+        };
+        let memory = charge(std::mem::size_of::<WriterSchema>());
         let tables = self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             let table = match read.open_table(META_TABLE) {
@@ -156,30 +159,17 @@ impl RedbPersistence {
                     .value()
                     .strip_prefix("table:")
                     .ok_or_else(|| Error::Other("invalid schema key".into()))?;
-                let scratch = OwnedMemoryReservation::try_new_for(
-                    accountant.clone(),
-                    value.value().len().saturating_mul(16).saturating_add(4096),
-                    "writer_source",
-                    "schema_decode",
-                    HINT,
-                )?;
+                let scratch = charge(value.value().len().saturating_mul(16).saturating_add(4096));
                 let (meta, legacy) = Self::decode_table_meta_versioned(value.value())?;
                 if legacy {
                     return Err(Error::Other("unsupported table metadata layout".into()));
                 }
-                memory.try_grow_for(
-                    name.len().saturating_add(128),
-                    "writer_source",
-                    "captured_schema",
-                    HINT,
-                )?;
-                let body_memory = OwnedMemoryReservation::try_new_for(
-                    accountant.clone(),
-                    meta.metadata_bytes().saturating_add(64),
-                    "writer_source",
-                    "captured_schema",
-                    HINT,
-                )?;
+                // The table's directory entry and its body are one owner.
+                let body_memory = charge(
+                    meta.metadata_bytes()
+                        .saturating_add(64)
+                        .saturating_add(name.len().saturating_add(128)),
+                );
                 tables.insert(
                     name.to_owned(),
                     Arc::new(WriterTableMeta {
@@ -365,7 +355,15 @@ impl RedbPersistence {
         snapshot: SnapshotId,
         lsn: Lsn,
     ) -> Result<Arc<WriterSnapshot>> {
-        let control = self.reserve_writer_snapshot()?;
+        // Open charges its first root like the captured schema: a persisted
+        // limit below this floor must not make the store unopenable.
+        let _schema = self.prepared_writer_schema()?;
+        let accountant = self.proof_accountant().ok_or_else(|| {
+            Error::Other("writer source requires the attached memory accountant".into())
+        })?;
+        let bytes = std::mem::size_of::<WriterSnapshot>() + 56;
+        accountant.charge_retained(bytes);
+        let control = OwnedMemoryReservation::from_admitted(accountant, bytes);
         self.prepare_writer_snapshot(control, snapshot, lsn)
     }
 

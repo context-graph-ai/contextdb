@@ -7739,7 +7739,12 @@ impl PublicationInterruptionWatch {
 }
 
 /// Physical relocation changes the durable root while preserving its logical
-/// pair. Retire the writer's own predecessor before beginning another batch.
+/// pair. The batch holds only its own bounded storage write transaction, so a
+/// foreground commit prepares under the commit boundary and queues at the
+/// storage writer rather than behind the whole batch. The relocated root is
+/// then published under the commit boundary, retiring the writer's own
+/// predecessor before another batch begins. A commit that lands between the
+/// batch and that publication already published a root that contains it.
 fn publish_storage_compaction_batch(
     manager: &Arc<TransactionManager<DynStore>>,
     persistence: &Arc<RedbPersistence>,
@@ -7747,31 +7752,32 @@ fn publish_storage_compaction_batch(
     interrupted: &Arc<AtomicBool>,
     fragmentation: f64,
 ) -> Result<(redb::CompactionProgress, Option<u64>)> {
+    let watch = PublicationInterruptionWatch::arm(interrupted);
+    let progress = match persistence.compact_incremental(accountant.clone(), fragmentation) {
+        Ok(progress) => progress,
+        Err(error) => {
+            // Page admission and reader-presence refusal happen before
+            // the relocation transaction commits.
+            // Other storage errors may have crossed its durable boundary.
+            if matches!(
+                error,
+                Error::MemoryBudgetExceeded { .. } | Error::ReaderCoordinationUnavailable { .. }
+            ) {
+                watch.completed();
+            }
+            return Err(error);
+        }
+    };
+    // Relocation preserves every logical row, so the previously published
+    // root stays a correct view of the same pair; a refused successor
+    // admission leaves it serving and is reported, never an interruption.
+    watch.completed();
     manager.with_maintenance_publication(|publication| {
         publication.reserve()?;
-        let watch = PublicationInterruptionWatch::arm(interrupted);
-        let result = persistence.compact_incremental(accountant.clone(), fragmentation);
-        match result {
-            Ok(progress) => {
-                publication.complete();
-                watch.completed();
-                Ok(progress)
-            }
-            Err(error) => {
-                // Page admission and reader-presence refusal happen before
-                // the relocation transaction commits.
-                // Other storage errors may have crossed its durable boundary.
-                if matches!(
-                    error,
-                    Error::MemoryBudgetExceeded { .. }
-                        | Error::ReaderCoordinationUnavailable { .. }
-                ) {
-                    watch.completed();
-                }
-                Err(error)
-            }
-        }
-    })
+        publication.complete();
+        Ok(())
+    })?;
+    Ok(progress)
 }
 
 impl Drop for PublicationInterruptionWatch {
@@ -17041,9 +17047,12 @@ impl MaintenanceContext {
                     RetentionPreparation::Expiry,
                 )?;
                 let protected = fk_protected_prune_candidates(&metas, &frontier, &candidates)?;
+                let cohort = frontier
+                    .cohort_progress(|table, key| protected.contains_physical(table, key))?;
                 self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
                     ws.config_writes
                         .extend(frontier.retention_progress().iter().cloned());
+                    ws.config_writes.extend(cohort);
                     let mut expired_nodes = HashSet::new();
                     for table in metas.keys() {
                         if metas
@@ -54738,6 +54747,9 @@ impl Database {
                 && historical.event_bus == snapshot.event_bus
                 && historical.trigger == snapshot.trigger
             {
+                if self.has_received_ddl_arrivals()? {
+                    self.refuse_unattributed_received_history(Lsn(0))?;
+                }
                 changes.ddl = history_ddl;
                 changes.ddl_lsn = history_lsn;
                 let source = DdlProvenanceSource::historical(&changes);
@@ -54912,6 +54924,12 @@ impl Database {
             && snapshot_schema_lsn > since_lsn
             && !snapshot_ddl.is_empty()
             && self.has_received_ddl_arrivals()?;
+        if complete_history
+            && snapshot_schema_lsn > since_lsn
+            && self.has_received_ddl_arrivals()?
+        {
+            self.refuse_unattributed_received_history(since_lsn)?;
+        }
         let ddl_lsn = if complete_history {
             let (lsns, changes): (Vec<_>, Vec<_>) = history
                 .into_iter()
@@ -54943,6 +54961,30 @@ impl Database {
             DdlProvenanceSource::synthetic_snapshot(&changes)
         };
         Ok((changes, source))
+    }
+
+    /// Serving the durable declaration history in place of a snapshot keeps
+    /// every received occurrence exactly as authored, so each one in the
+    /// served range must still carry its author's signed identity. Without
+    /// it the extraction refuses, naming the table, exactly as
+    /// [`Self::received_schema_as_authored`] does; it never serves received
+    /// schema unattributed.
+    fn refuse_unattributed_received_history(&self, since_lsn: Lsn) -> Result<()> {
+        self.visit_received_ddl_arrivals(|key, arrival| {
+            if key.0 <= since_lsn || arrival.author.is_some() {
+                return Ok(());
+            }
+            let table = self
+                .recorded_ddl_generation_sidecar(key.0, key.1)?
+                .and_then(|sidecar| sidecar.table)
+                .unwrap_or_else(|| format!("received at local LSN {}", key.0.0));
+            Err(Error::ReceivedSchemaAuthorshipUnavailable {
+                table,
+                reason: "this node no longer holds the author's signed identity for the \
+                         declaration it received"
+                    .to_string(),
+            })
+        })
     }
 
     /// The schema a persisted-state extraction serves when this node holds
@@ -60014,11 +60056,13 @@ impl Database {
     #[doc(hidden)]
     pub fn published_state_snapshot_for_test(&self) -> PublishedStateSnapshotForTest {
         let table_names = self.relational_store.table_names();
+        // A durable writer's declaration history lives only in its published
+        // root; the in-memory log is the memory store's.
         let ddl_changes = self
-            .ddl_log
-            .read()
-            .iter()
-            .map(|(_, change)| change.clone())
+            .ddl_log_entries_since_unlocked(Lsn(0))
+            .expect("published declaration history")
+            .into_iter()
+            .map(|(_, change)| change)
             .collect();
         let (event_type_names, sink_names, route_names) =
             self.published_definition_names_for_test();
@@ -61158,6 +61202,9 @@ impl Database {
     // Use authenticated arrival provenance to distinguish this
     // node's own declaration from policy it merely adopted and relays.
     fn locally_declared_custody_policy(&self, table: &str) -> Result<bool> {
+        if let Some(root) = self.writer_read_root()? {
+            return self.durable_locally_declared_custody_policy(&root, table);
+        }
         let mut ordinals = HashMap::<Lsn, u32>::new();
         let history = self.checked_ddl_entries_since(Lsn(0))?;
         for (lsn, change) in &history {
@@ -61200,6 +61247,96 @@ impl Database {
                     composite_unique,
                 ),
                 _ => continue,
+            };
+            if name != table {
+                continue;
+            }
+            let m = rough_sync_table_meta(
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            );
+            if m.sync_direction.is_some()
+                || m.conflict_policy.is_some()
+                || m.immutable
+                || m.default_ttl_seconds.is_some()
+                || m.history_policy.is_some()
+                || m.delivery_manifest_tables.is_some()
+                || m.edge_discard.is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// A durable writer selects this table's declaration occurrences from the
+    /// small per-occurrence generation records (each names its table) and
+    /// decodes only those occurrences' log positions. Unrelated declarations
+    /// -- other tables, event routes with large filters -- are never read.
+    fn durable_locally_declared_custody_policy(
+        &self,
+        root: &Arc<crate::persistence::WriterSnapshot>,
+        table: &str,
+    ) -> Result<bool> {
+        const PREFIX: &str = "sync_ddl_generation.v1.";
+        let mut sidecars = root.config_cursor(PREFIX)?;
+        while let Some(window) = sidecars.next(|_, bytes| {
+            RedbPersistence::decode_config_value_exact::<DurableDdlGenerationSidecar>(bytes)
+        })? {
+            if window.value.table.as_deref() != Some(table) {
+                continue;
+            }
+            let (lsn, ordinal) = std::str::from_utf8(window.position())
+                .ok()
+                .and_then(|key| key.strip_prefix(PREFIX))
+                .and_then(|rest| rest.split_once('.'))
+                .and_then(|(lsn, ordinal)| {
+                    Some((Lsn(lsn.parse().ok()?), ordinal.parse::<u32>().ok()?))
+                })
+                .ok_or_else(|| Error::StoreCorrupted {
+                    path: "config".into(),
+                    reason: "declaration generation key does not name one occurrence".into(),
+                })?;
+            if self.with_received_ddl_arrival((lsn, ordinal), |arrival| Ok(arrival.is_some()))? {
+                continue;
+            }
+            let mut occurrences = root.ddl_history_cursor(Lsn(lsn.0.saturating_sub(1)))?;
+            let mut position = 0u32;
+            let mut local = None;
+            while let Some(entry) = occurrences.next_ddl_history()? {
+                if entry.value.0 != lsn {
+                    break;
+                }
+                if position == ordinal {
+                    local = Some(entry);
+                    break;
+                }
+                position += 1;
+            }
+            let Some(local) = local else {
+                continue;
+            };
+            let (DdlChange::CreateTable {
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            }
+            | DdlChange::AlterTable {
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            }) = &local.value.1
+            else {
+                continue;
             };
             if name != table {
                 continue;
@@ -69766,6 +69903,13 @@ impl RetentionCandidates {
     fn is_empty(&self) -> bool {
         self.tables.values().all(HashSet::is_empty)
     }
+    fn contains_physical(&self, table: &str, key: &[u8; 24]) -> bool {
+        let row_id = RowId(u64::from_be_bytes(key[..8].try_into().expect("row id")));
+        let created_tx = TxId(u64::from_be_bytes(key[8..16].try_into().expect("tx")));
+        self.tables
+            .get(table)
+            .is_some_and(|rows| rows.contains(&(row_id, created_tx)))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69871,7 +70015,7 @@ fn prune_expired_rows(
         "prune",
         &mut workspace,
     )?;
-    let retention_progress = frontier.retention_progress().to_vec();
+    let mut retention_progress = frontier.retention_progress().to_vec();
     let durable_source = frontier.is_durable();
     // A stamp further ahead than the tolerance can never age out on this
     // holder's clock, so it would pin its row silently. Count it per table,
@@ -69923,6 +70067,11 @@ fn prune_expired_rows(
     )?;
     let protected_prune_candidates =
         fk_protected_prune_candidates(&metas, &frontier, &prune_candidates)?;
+    retention_progress.extend(
+        frontier.cohort_progress(|table, key| {
+            protected_prune_candidates.contains_physical(table, key)
+        })?,
+    );
     for (table_name, meta) in metas.iter() {
         if meta.default_ttl_seconds.is_none() {
             continue;
@@ -70293,6 +70442,20 @@ fn prune_expired_rows(
     let mut affected_lsns: HashSet<Lsn> = removed_lsn_counts.keys().copied().collect();
     affected_lsns
         .extend(relational_store.reclaimed_retention_expiry_lsns(&pruned_versions_by_table_sets));
+    // A durable writer keeps each expiry identity only in its root. The
+    // expiry commits of the versions pruned here are candidates too; the
+    // root-side coverage check keeps any whose change log still has entries.
+    if let Some(root) = writer_read::durable_root(tx_mgr.capture_published_read().handle)? {
+        for (table_name, versions) in &pruned_versions_by_table_sets {
+            for (row_id, created_tx) in versions {
+                if let Some(identity) = root.config_point::<(String, RowId, TxId, Lsn)>(
+                    &crate::composite_store::retention_expiry_key(table_name, *row_id, *created_tx),
+                )? {
+                    affected_lsns.insert(identity.value.3);
+                }
+            }
+        }
+    }
     let commit_index_candidates = {
         let lsn_refcounts = change_log_lsn_refcounts.read();
         scoped_commit_index_candidates(tx_mgr, &lsn_refcounts, &removed_lsn_counts, &affected_lsns)?
@@ -71624,6 +71787,7 @@ fn retention_prune_candidates(
     preparation: RetentionPreparation,
 ) -> Result<RetentionCandidates> {
     let mut candidates = RetentionCandidates::default();
+    frontier.set_cohort_clock(now, sync_watermark);
     for (table, meta) in metas {
         if meta.default_ttl_seconds.is_none() {
             continue;
@@ -71717,6 +71881,8 @@ fn prune_blocker_for_referenced_parent(
                 continue;
             }
             if child_rows_contain_live_reference(
+                metas,
+                parent_table,
                 child_table,
                 frontier,
                 std::slice::from_ref(&column.name),
@@ -71736,6 +71902,8 @@ fn prune_blocker_for_referenced_parent(
                 continue;
             }
             if child_rows_contain_live_reference(
+                metas,
+                parent_table,
                 child_table,
                 frontier,
                 &fk.child_columns,
@@ -71757,7 +71925,10 @@ fn prune_blocker_for_referenced_parent(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn child_rows_contain_live_reference(
+    metas: &HashMap<String, TableMeta>,
+    parent_table: &str,
     child_table: &str,
     frontier: &MaintenanceFrontier<'_>,
     child_columns: &[String],
@@ -71788,6 +71959,9 @@ fn child_rows_contain_live_reference(
                 .zip(parent_columns)
                 .all(|(column, value)| row.values.get(column) == parent.values.get(value))
             && (!candidates.contains(child_table, row) || protected.contains(child_table, row));
+        if found && !candidates.contains(child_table, row) {
+            frontier.note_cohort_blocker(metas, parent_table, parent, child_table, row)?;
+        }
         Ok(!found)
     })?;
     Ok(found)

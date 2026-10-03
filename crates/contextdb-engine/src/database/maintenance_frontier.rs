@@ -14,6 +14,27 @@ pub(super) struct MaintenanceFrontier<'a> {
     retention_windows: HashMap<String, RetentionWindow>,
     retention_progress: Vec<(String, Vec<u8>)>,
     retention_scope: bool,
+    /// Queued identities of an expiring cohort that spans windows: rows the
+    /// previous pass found protected only by an equally expired row outside
+    /// its window. They join this pass's selection so the joint fixed point
+    /// sees the whole cohort at once.
+    retention_cohort: HashMap<String, Vec<[u8; 24]>>,
+    retention_cohort_phase: Option<String>,
+    cohort_discovered: parking_lot::Mutex<Vec<(String, [u8; 24])>>,
+    cohort_clock: parking_lot::Mutex<Option<(Wallclock, Lsn)>>,
+}
+
+/// Rows of one cross-window expiry cohort that a pass carries forward. The
+/// queue is durable beside the window positions; a cohort larger than this
+/// keeps its members protected (never wrongly removed) until it shrinks.
+const RETENTION_COHORT_CAPACITY: usize = 128;
+
+pub(super) fn retention_physical_key(row: &VersionedRow) -> [u8; 24] {
+    let mut key = [0u8; 24];
+    key[..8].copy_from_slice(&row.row_id.0.to_be_bytes());
+    key[8..16].copy_from_slice(&row.created_tx.0.to_be_bytes());
+    key[16..].copy_from_slice(&row.lsn.0.to_be_bytes());
+    key
 }
 
 impl<'a> MaintenanceFrontier<'a> {
@@ -40,6 +61,10 @@ impl<'a> MaintenanceFrontier<'a> {
             retention_windows: HashMap::new(),
             retention_progress: Vec::new(),
             retention_scope: false,
+            retention_cohort: HashMap::new(),
+            retention_cohort_phase: None,
+            cohort_discovered: parking_lot::Mutex::new(Vec::new()),
+            cohort_clock: parking_lot::Mutex::new(None),
         })
     }
 
@@ -56,31 +81,13 @@ impl<'a> MaintenanceFrontier<'a> {
         let (Some(root), Some(source)) = (&self.root, &self.source) else {
             return Ok(self);
         };
-        // A mutually dependent expiry cohort must retain its existing joint
-        // FK fixed point. Independent windows cannot decide that a child in a
-        // later window will disappear; keep that path until its work queue is
-        // durable and resumable as well.
-        if metas
-            .values()
-            .filter(|meta| meta.default_ttl_seconds.is_some())
-            .any(|meta| {
-                meta.columns
-                    .iter()
-                    .filter_map(|column| column.references.as_ref())
-                    .any(|reference| {
-                        metas
-                            .get(&reference.table)
-                            .is_some_and(|parent| parent.default_ttl_seconds.is_some())
-                    })
-                    || meta.composite_foreign_keys.iter().any(|reference| {
-                        metas
-                            .get(&reference.parent_table)
-                            .is_some_and(|parent| parent.default_ttl_seconds.is_some())
-                    })
-            })
-        {
-            return Ok(self);
-        }
+        // Dependent cohorts (a retained child referencing a retained parent)
+        // use the same finite windows. Safety does not depend on the window:
+        // FK protection probes the complete visible child frontier
+        // (`visit_references`), so a parent whose live child lies outside this
+        // window stays protected and is reconsidered when its own window comes
+        // round again, after the child has expired. Within one window the
+        // joint fixed point still lets a parent and its child expire together.
         workspace.try_grow_for(
             1024usize.saturating_add(
                 metas
@@ -93,6 +100,31 @@ impl<'a> MaintenanceFrontier<'a> {
             "selection_continuation",
             "Raise MEMORY_LIMIT to admit retention selection controls.",
         )?;
+        let cohort_key = format!("retention_cohort/{phase}");
+        if let Some(queued) = root.config_point::<Vec<(String, [u8; 24])>>(&cohort_key)? {
+            workspace.try_grow_for(
+                queued
+                    .value
+                    .iter()
+                    .map(|(table, _)| 64 + table.len())
+                    .sum::<usize>(),
+                "retention",
+                "selection_continuation",
+                "Raise MEMORY_LIMIT to admit retention selection controls.",
+            )?;
+            for (table, key) in &queued.value {
+                if metas
+                    .get(table)
+                    .is_some_and(|meta| meta.default_ttl_seconds.is_some())
+                {
+                    self.retention_cohort
+                        .entry(table.clone())
+                        .or_default()
+                        .push(*key);
+                }
+            }
+        }
+        self.retention_cohort_phase = Some(cohort_key);
         let mut tables = metas
             .iter()
             .filter(|(_, meta)| meta.default_ttl_seconds.is_some())
@@ -218,6 +250,103 @@ impl<'a> MaintenanceFrontier<'a> {
 
     pub(super) fn retention_progress(&self) -> &[(String, Vec<u8>)] {
         &self.retention_progress
+    }
+
+    /// The clock the candidate selection judged expiry with; a protecting row
+    /// outside the window is queued only when it is expired by the same rule.
+    pub(super) fn set_cohort_clock(&self, now: Wallclock, sync_watermark: Lsn) {
+        *self.cohort_clock.lock() = Some((now, sync_watermark));
+    }
+
+    /// Called when `parent` (selected) is held back by a live referencing
+    /// `child` that this pass did not select. When the child is itself
+    /// expired, both are queued so a later pass judges them together.
+    pub(super) fn note_cohort_blocker(
+        &self,
+        metas: &HashMap<String, TableMeta>,
+        parent_table: &str,
+        parent: &VersionedRow,
+        child_table: &str,
+        child: &VersionedRow,
+    ) -> Result<()> {
+        if self.retention_cohort_phase.is_none() || self.source.is_none() {
+            return Ok(());
+        }
+        let Some((now, watermark)) = *self.cohort_clock.lock() else {
+            return Ok(());
+        };
+        let Some(meta) = metas
+            .get(child_table)
+            .filter(|meta| meta.default_ttl_seconds.is_some())
+        else {
+            return Ok(());
+        };
+        let arrived_by_sync = matches!(
+            self.sync_source_kind(child_table, child.row_id)?,
+            Some(contextdb_relational::store::SyncSourceKind::Pulled)
+        );
+        if !row_is_prunable(child, meta, now, watermark, arrived_by_sync) {
+            return Ok(());
+        }
+        let mut discovered = self.cohort_discovered.lock();
+        for (table, key) in [
+            (parent_table, retention_physical_key(parent)),
+            (child_table, retention_physical_key(child)),
+        ] {
+            if discovered.len() >= RETENTION_COHORT_CAPACITY {
+                break;
+            }
+            if !discovered
+                .iter()
+                .any(|(known, known_key)| known == table && *known_key == key)
+            {
+                discovered.push((table.to_owned(), key));
+            }
+        }
+        Ok(())
+    }
+
+    /// The durable cohort queue for the next pass: queued members this pass
+    /// still had to protect, then newly discovered cross-window blockers.
+    /// Members that expired, were pruned, or stopped being candidates leave.
+    pub(super) fn cohort_progress(
+        &self,
+        protected: impl Fn(&str, &[u8; 24]) -> bool,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        let Some(key) = &self.retention_cohort_phase else {
+            return Ok(None);
+        };
+        if self.source.is_none() {
+            return Ok(None);
+        }
+        let mut next: Vec<(String, [u8; 24])> = Vec::new();
+        let mut tables = self.retention_cohort.iter().collect::<Vec<_>>();
+        tables.sort_unstable_by_key(|(table, _)| *table);
+        for (table, keys) in tables {
+            for queued in keys {
+                if next.len() < RETENTION_COHORT_CAPACITY && protected(table, queued) {
+                    next.push((table.clone(), *queued));
+                }
+            }
+        }
+        for (table, discovered) in self.cohort_discovered.lock().iter() {
+            if next.len() >= RETENTION_COHORT_CAPACITY {
+                break;
+            }
+            if !next
+                .iter()
+                .any(|(known, known_key)| known == table && known_key == discovered)
+            {
+                next.push((table.clone(), *discovered));
+            }
+        }
+        if next.is_empty() && self.retention_cohort.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((
+            key.clone(),
+            RedbPersistence::encode_config_value(&next)?,
+        )))
     }
 
     pub(super) fn no_future_stamps(&self, table: &str, horizon: u64) -> Result<bool> {
@@ -349,6 +478,22 @@ impl<'a> MaintenanceFrontier<'a> {
             } else {
                 None
             };
+            let in_window = |key: &[u8; 24]| {
+                selected.is_some_and(|window| {
+                    window.through.is_some_and(|through| {
+                        *key <= through && window.after.is_none_or(|after| *key > after)
+                    })
+                })
+            };
+            if selected_only && let Some(queued) = self.retention_cohort.get(table) {
+                for key in queued.iter().filter(|key| !in_window(key)) {
+                    if let Some(window) = source.exact_row(table, key)?
+                        && !visit(window.value())?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
             if selected.is_some_and(|window| window.through.is_none()) {
                 return Ok(());
             }
