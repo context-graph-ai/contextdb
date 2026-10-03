@@ -1250,19 +1250,60 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
     );
     let baseline = db.accountant.usage().used;
     let snapshot_holds = db.snapshot_registry.state.lock().active.len();
-    // The generation's complete admission is below its requirement by one
-    // byte, while its metadata-only inventory can still be inspected.
-    db.accountant
-        .set_budget(Some(baseline + selected.build_phase_bytes() - 1))
+    // Whole-build refusal must yield to a finite paged build when it fits.
+    // Refuse one byte below that finite construction floor, before bodies.
+    let declaration = crate::persistence::vector_paged::PagedDeclaration {
+        dimension: layout.dimension.try_into().unwrap(),
+        quantization: layout.quantization,
+        hnsw_m: policy.hnsw_m.try_into().unwrap(),
+        hnsw_ef_construction: policy.hnsw_ef_construction.try_into().unwrap(),
+        hnsw_ef_search: policy.hnsw_ef_search.try_into().unwrap(),
+        policy_revision: policy.policy_revision,
+    };
+    let finite_floor = vector_paged_build::paged_batch_plan(&declaration)
+        .unwrap()
+        .construction_workspace_bytes()
         .unwrap();
-    let error = db
-        .maintenance_context()
-        .persist_built_vector_partition(&partition)
-        .unwrap_err();
-    assert!(matches!(error, Error::MemoryBudgetExceeded {
+    assert_eq!(
+        finite_floor, 208_224,
+        "the F32/768/M16/EF200 paged construction floor"
+    );
+    assert!(finite_floor < selected.build_phase_bytes());
+    db.accountant
+        .set_budget(Some(baseline + finite_floor - 1))
+        .unwrap();
+    let refuse = || {
+        db.maintenance_context()
+            .persist_built_vector_partition(&partition)
+    };
+    #[cfg(feature = "test-seams")]
+    let result = {
+        let ((result, physical), visits) =
+            VectorStore::observe_generation_source_visits_for_test(|| {
+                crate::writer_query_test_seams::observe(refuse)
+            });
+        assert_eq!(
+            visits.entry_bodies_copied, 0,
+            "refusal precedes resident vector-entry body copies"
+        );
+        assert!(
+            !physical.physical_sources.iter().flatten().any(
+                |(family, _)| *family == crate::writer_query_test_seams::PhysicalFamily::Vector
+            ),
+            "refusal precedes durable vector-body source calls: {physical:?}"
+        );
+        result
+    };
+    #[cfg(not(feature = "test-seams"))]
+    let result = refuse();
+    let error = result.unwrap_err();
+    assert!(
+        matches!(&error, Error::MemoryBudgetExceeded {
         subsystem, operation, requested_bytes, available_bytes, ..
     } if subsystem == "vector_index" && operation == "prepare_vector_generation"
-        && requested_bytes == available_bytes + 1));
+        && *requested_bytes == finite_floor && *available_bytes == finite_floor - 1),
+        "finite construction floor={finite_floor}; refusal={error:?}"
+    );
     assert_eq!(db.accountant.usage().used, baseline);
     assert_eq!(
         db.snapshot_registry.state.lock().active.len(),
