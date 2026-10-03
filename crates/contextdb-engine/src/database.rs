@@ -34112,9 +34112,9 @@ impl Database {
                     continue;
                 };
                 let meta = self.table_meta(&row.table);
-                self.visit_authoritative_row_versions(|table, current| {
-                    if table == row.table
-                        && matches!(self.relational_sync_source_at_read_root(table, current.row_id)?.1,
+                let table = row.table.as_str();
+                self.visit_row_versions_for_natural_key(table, &row.natural_key, |current| {
+                    if matches!(self.relational_sync_source_at_read_root(table, current.row_id)?.1,
                             Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending))
                         && self.sync_incoming_row_matches_committed(&row.values, current, table, meta.as_ref())? {
                         entries.push((table.to_owned(), current.row_id, arrival));

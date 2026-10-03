@@ -1625,3 +1625,93 @@ impl Database {
         Ok(entries)
     }
 }
+
+impl Database {
+    /// Every retained version of the rows that have carried one natural key
+    /// in one table. A confirmed echo refreshes only those versions, so it
+    /// seeks the key's postings instead of decoding every table once for each
+    /// arriving row. A table with no index over exactly the key's columns
+    /// streams that table alone.
+    pub(super) fn visit_row_versions_for_natural_key(
+        &self,
+        table: &str,
+        key: &NaturalKey,
+        mut visit: impl FnMut(&VersionedRow) -> Result<()>,
+    ) -> Result<()> {
+        use contextdb_relational::source::RelationalReadSource;
+        let Some(root) = self.writer_read_root()? else {
+            if let Some(rows) = self.relational_store.tables.read().get(table) {
+                for row in rows {
+                    visit(row)?;
+                }
+            }
+            return Ok(());
+        };
+        let Some(meta) = root.borrow_captured_table_meta(table) else {
+            return Ok(());
+        };
+        let columns = key.key_columns();
+        let values = key.key_values();
+        let index = meta
+            .indexes
+            .iter()
+            .find(|index| {
+                index.columns.len() == columns.len()
+                    && index
+                        .columns
+                        .iter()
+                        .zip(&columns)
+                        .all(|((have, _), want)| have == want)
+            })
+            .cloned();
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new(root)?;
+        let Some(index) = index else {
+            let mut rows = source.row_cursor(
+                table,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+                false,
+            )?;
+            while let Some(row) = rows.next_window()? {
+                visit(row.value())?;
+            }
+            return Ok(());
+        };
+        let mut memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            values
+                .iter()
+                .map(Value::estimated_bytes)
+                .sum::<usize>()
+                .saturating_mul(8)
+                .saturating_add(256),
+            "writer_source",
+            "echo_identity",
+            "Raise MEMORY_LIMIT to reconcile this row identity.",
+        )?;
+        let tuple = index_key_from_values(&index.columns, &values);
+        // The history family holds a posting for every retained version, so
+        // a row whose visible version has since moved off this key is still
+        // found by the version that carried it.
+        let mut postings = source.exact_index_cursor(table, &index.name, false, &tuple)?;
+        let mut seen = HashSet::new();
+        while let Some(posting) = postings.next_window()? {
+            let id = posting.value().entry.row_id;
+            if seen.contains(&id) {
+                continue;
+            }
+            memory.try_grow_for(
+                std::mem::size_of::<RowId>().saturating_mul(4),
+                "writer_source",
+                "echo_identity",
+                "Raise MEMORY_LIMIT to reconcile this row identity.",
+            )?;
+            seen.insert(id);
+            let mut versions = source.row_id_cursor(table, id, source.snapshot())?;
+            while let Some(row) = versions.next_window()? {
+                visit(row.value())?;
+            }
+        }
+        Ok(())
+    }
+}
