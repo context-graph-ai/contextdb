@@ -70,6 +70,8 @@ mod uncapped_graph_read_charges_the_frontier_it_resolves;
 #[cfg(unix)]
 #[path = "engine_seams/writable_open_of_a_corrupt_file_names_the_next_step.rs"]
 mod writable_open_of_a_corrupt_file_names_the_next_step;
+#[path = "engine_seams/writer_checkpoint_receipts_follow_commits_and_close.rs"]
+mod writer_checkpoint_receipts_follow_commits_and_close;
 
 #[path = "engine_seams/what_each_declared_index_costs_one_event_append.rs"]
 mod what_each_declared_index_costs_one_event_append;
