@@ -36,6 +36,14 @@ impl bounded::ExecutionProbe for StatementPause {
     fn cancellation_observed(&self, _: u64) {}
 }
 
+// Release a captured statement even if cache displacement or writer checks panic.
+struct StatementRelease(Arc<Barrier>);
+impl Drop for StatementRelease {
+    fn drop(&mut self) {
+        self.0.wait();
+    }
+}
+
 #[test]
 fn writer_reader_root_survives_commit_eviction_and_cleanup() {
     for boundary in [
@@ -53,12 +61,13 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     let database = Database::open_with_options(
         &path,
         DatabaseOpenOptions {
+            memory_limit: Some(64 * 1024 * 1024),
             maintenance_policy: MaintenancePolicy::CallerDriven,
             ..Default::default()
         },
     )
     .unwrap();
-    database.execute("CREATE TABLE reader_items (id INTEGER PRIMARY KEY, unique_key TEXT UNIQUE, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 8, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST", &HashMap::new()).unwrap();
+    database.execute("CREATE TABLE reader_items (id INTEGER PRIMARY KEY, unique_key TEXT UNIQUE, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 8, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST", &HashMap::new()).unwrap();
     let old_vectors = [
         vec![1.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0],
@@ -67,30 +76,34 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     for (offset, vector) in old_vectors.iter().enumerate() {
         database
             .execute(
-                "INSERT INTO reader_items VALUES ($id, $key, $vector)",
+                "INSERT INTO reader_items VALUES ($id, $key, $body, $vector)",
                 &HashMap::from([
                     ("id".to_owned(), Value::Int64(offset as i64 + 1)),
                     ("key".to_owned(), Value::Text(format!("old-{}", offset + 1))),
+                    ("body".to_owned(), Value::Text("b".repeat(64 * 1024))),
                     ("vector".to_owned(), Value::Vector(vector.clone())),
                 ]),
             )
             .unwrap();
-    }
-    // Unrelated, wide scalar rows force real leaves below the relation root.
-    // NULL embeddings preserve the three-point maintained-vector fixture.
-    for id in 1000..1128 {
-        database
-            .execute(
-                "INSERT INTO reader_items VALUES ($id, $key, NULL)",
-                &HashMap::from([
-                    ("id".to_owned(), Value::Int64(id)),
-                    (
-                        "key".to_owned(),
-                        Value::Text(format!("filler-{id}-{}", "x".repeat(1024))),
-                    ),
-                ]),
-            )
-            .unwrap();
+        // Spread the three answer identities across the physical row tree,
+        // beyond the cursor's first/pending leaf. The same 128 scalar filler
+        // rows have NULL embeddings and keep the vector answer set unchanged.
+        if offset < 2 {
+            for id in 1000 + offset as i64 * 64..1064 + offset as i64 * 64 {
+                database
+                    .execute(
+                        "INSERT INTO reader_items VALUES ($id, $key, NULL, NULL)",
+                        &HashMap::from([
+                            ("id".to_owned(), Value::Int64(id)),
+                            (
+                                "key".to_owned(),
+                                Value::Text(format!("filler-{id}-{}", "x".repeat(1024))),
+                            ),
+                        ]),
+                    )
+                    .unwrap();
+            }
+        }
     }
     for _ in 0..8 {
         database.run_maintenance_cycle().unwrap();
@@ -101,14 +114,21 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             &HashMap::new(),
         )
         .unwrap();
-    for id in 0..96 {
+    // Pressure many times the entire cache share, across all second-chance stripes.
+    for batch in 0..16 {
+        let mut params = HashMap::from([("body".to_owned(), Value::Text("p".repeat(128 * 1024)))]);
+        let values = (0..64)
+            .map(|offset| {
+                let name = format!("id{offset}");
+                params.insert(name.clone(), Value::Int64(batch * 64 + offset));
+                format!("(${name},$body)")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         database
             .execute(
-                "INSERT INTO displacement VALUES ($id,$body)",
-                &HashMap::from([
-                    ("id".into(), Value::Int64(id)),
-                    ("body".into(), Value::Text("p".repeat(128 * 1024))),
-                ]),
+                &format!("INSERT INTO displacement VALUES {values}"),
+                &params,
             )
             .unwrap();
     }
@@ -118,6 +138,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         Database::open_with_options(
             &path,
             DatabaseOpenOptions {
+                memory_limit: Some(64 * 1024 * 1024),
                 maintenance_policy: MaintenancePolicy::CallerDriven,
                 ..Default::default()
             },
@@ -143,13 +164,12 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         "SELECT id, unique_key, embedding FROM reader_items WHERE id <= 3 ORDER BY id";
     let displace = || {
         let before = database.__writer_cache_stats_for_test().unwrap();
-        for id in 0..96 {
-            drop(
-                database
-                    .__hold_row_page_for_test("displacement", id)
-                    .unwrap(),
-            );
-        }
+        // The ordinal seam walks every prior wide leaf; visit the range once.
+        drop(
+            database
+                .__hold_row_page_for_test("displacement", 1023)
+                .unwrap(),
+        );
         let after = database.__writer_cache_stats_for_test().unwrap();
         assert!(
             after.2 > before.2 && after.1 > before.1,
@@ -231,6 +251,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             observe_query(|| bounded::execute(&database, &request))
         });
         statement_started.recv().unwrap();
+        let release_statement = StatementRelease(statement_release.clone());
         let writer = scope.spawn(|| {
             let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
             let tx = database.begin_or_panic();
@@ -282,7 +303,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
                 &VectorPartitionKey::default(),
             );
         let cleanup = database.compact_currency_versions();
-        statement_release.wait();
+        drop(release_statement);
         let statement = statement.join().unwrap();
         assert_eq!(
             captured_before_read, old_snapshot,
@@ -345,9 +366,10 @@ fn reader_at_boundary(boundary: CommitBoundary) {
                 .then_some(*identity)
         })
         .expect("successor statement must observe its own actual physical page root");
+    // Only the three answer rows have vectors; the maintained vector route excludes NULLs.
     let (_, indexed_work) = observe_target("reader_items", || {
         for (offset, vector) in old_vectors.iter().enumerate() {
-            assert_eq!(database.execute_at_snapshot("SELECT id FROM reader_items WHERE embedding IS NOT NULL ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+            assert_eq!(database.execute_at_snapshot("SELECT id FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
                 &HashMap::from([("q".into(),Value::Vector(vector.clone()))]),old_snapshot).unwrap().rows,
                 vec![vec![Value::Int64(offset as i64 + 1)]], "old reader traverses its maintained vector generation");
         }
@@ -355,7 +377,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     let (_, indexed_transaction_work) = observe_target("reader_items", || {
         for (offset, vector) in old_vectors.iter().enumerate() {
             assert_eq!(database.execute_in_tx(transaction,
-                "SELECT id FROM reader_items WHERE embedding IS NOT NULL ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+                "SELECT id FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
                 &HashMap::from([("q".into(), Value::Vector(vector.clone()))])).unwrap().rows,
                 vec![vec![Value::Int64(offset as i64 + 1)]]);
         }
@@ -374,6 +396,10 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             > 0,
         "the continuation itself keeps its retired native root alive"
     );
+    // The intervening vector checks project these same old rows and warm
+    // their pages again. Displace after those checks, immediately before
+    // testing continuation reloads from the last holder of the old root.
+    displace();
     let mut has_more = opened.first_page.has_more;
     let mut continued = opened.first_page.rows;
     let mut continuation_sources = Vec::new();
