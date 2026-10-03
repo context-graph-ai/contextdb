@@ -74201,6 +74201,7 @@ fn has_exact_column_type(meta: &TableMeta, name: &str, column_type: &ColumnType)
 
 #[cfg(test)]
 mod retention_prune_persistence_tests {
+    include!("database/durable_test_observations.rs");
     use super::*;
     use tempfile::TempDir;
 
@@ -75505,6 +75506,7 @@ mod stale_staged_delete_tests {
 
 #[cfg(test)]
 mod checkpoint_export_body_tests {
+    include!("database/durable_test_observations.rs");
     use super::*;
     use crate::Database;
     use contextdb_core::Value;
