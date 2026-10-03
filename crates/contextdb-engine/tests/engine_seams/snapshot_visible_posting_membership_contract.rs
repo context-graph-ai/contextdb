@@ -574,14 +574,21 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         "MEMBERSHIP_CALIBRATION first budget={} owners={:?}",
         first_budget, first_owners
     );
-    assert_eq!(first_budget, 13481, "exact current owner envelope");
+    assert_eq!(
+        first_owners.reconciliation_gap, 0,
+        "every retained owner is named"
+    );
+    assert_eq!(
+        first_budget, first_owners.named_owner_total,
+        "the exact budget equals the independently summed current owners"
+    );
     db.accountant().set_budget(Some(first_budget)).unwrap();
     let result = db.commit(tx);
     assert_source_refusal(
         result
             .as_ref()
             .expect_err("source admission must refuse before publication"),
-        13481,
+        first_owners.named_owner_total,
     );
     db.accountant().set_budget(None).unwrap();
     let _ = db.rollback(tx);
@@ -632,15 +639,16 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         &HashMap::new(),
     )
     .unwrap();
-    assert!(db
-        .guard_row_conditions_in_tx(
+    assert!(
+        db.guard_row_conditions_in_tx(
             tx,
             "guarded_row",
             "id",
             &Value::Int64(7),
             &[("active".to_owned(), Value::Bool(true))],
         )
-        .unwrap());
+        .unwrap()
+    );
     let mixed_budget = db.accountant().usage().used;
     let mixed_owners = db.writer_memory_ownership_receipt_for_test();
     assert_eq!(
@@ -652,14 +660,21 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         "MEMBERSHIP_CALIBRATION mixed budget={} owners={:?}",
         mixed_budget, mixed_owners
     );
-    assert_eq!(mixed_budget, 12418, "exact current owner envelope");
+    assert_eq!(
+        mixed_owners.reconciliation_gap, 0,
+        "every retained owner is named"
+    );
+    assert_eq!(
+        mixed_budget, mixed_owners.named_owner_total,
+        "the exact budget equals the independently summed current owners"
+    );
     db.accountant().set_budget(Some(mixed_budget)).unwrap();
     let mixed_result = db.commit(tx);
     assert_source_refusal(
         mixed_result
             .as_ref()
             .expect_err("source admission must refuse before publication"),
-        12418,
+        mixed_owners.named_owner_total,
     );
     db.accountant().set_budget(None).unwrap();
     let _ = db.rollback(tx);
