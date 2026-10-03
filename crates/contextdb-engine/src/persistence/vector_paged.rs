@@ -1719,7 +1719,7 @@ impl RedbPersistence {
         let capture: PagedRootCapture = Arc::new(move || {
             let root = capture()?;
             let read = root.owner_read();
-            Ok((read, root as Arc<dyn std::any::Any + Send + Sync>))
+            Ok((read?, root as Arc<dyn std::any::Any + Send + Sync>))
         });
         let _ = self.paged_root_capture.set(capture);
     }
