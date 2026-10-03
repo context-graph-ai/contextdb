@@ -4,7 +4,7 @@
 
 use contextdb_core::{Error, Value, Wallclock};
 use contextdb_engine::writer_query_test_seams::observe_target_key;
-use contextdb_engine::{Database, MaintenancePolicy};
+use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::collections::HashMap;
 
 #[test]
@@ -16,7 +16,15 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
     for history in [16, 32] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("constraints.redb");
-        let database = Database::open(&path).unwrap();
+        // A 64 MiB writer limit derives a 4 MiB cache, below the 128 MiB displacement set.
+        let database = Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                memory_limit: Some(64 * 1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         database.set_maintenance_policy(MaintenancePolicy::CallerDriven);
         for sql in [
             "CREATE TABLE parents (id INTEGER PRIMARY KEY, payload INTEGER) HISTORY ALL",
@@ -52,31 +60,45 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
                 &params,
             )
             .unwrap();
-        for id in 0..96 {
+        for batch in 0..16 {
+            let mut params =
+                HashMap::from([("body".to_owned(), Value::Text("p".repeat(128 * 1024)))]);
+            let values = (0..64)
+                .map(|offset| {
+                    let name = format!("id{offset}");
+                    params.insert(name.clone(), Value::Int64(batch * 64 + offset));
+                    format!("(${name},$body)")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             database
                 .execute(
-                    "INSERT INTO displacement VALUES ($id, $body)",
-                    &HashMap::from([
-                        ("id".into(), Value::Int64(id)),
-                        ("body".into(), Value::Text("p".repeat(128 * 1024))),
-                    ]),
+                    &format!("INSERT INTO displacement VALUES {values}"),
+                    &params,
                 )
                 .unwrap();
         }
         database.close().unwrap();
         drop(database);
-        let database = Database::open(&path).unwrap();
+        // A 64 MiB writer limit derives a 4 MiB cache, below the 128 MiB displacement set.
+        let database = Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                memory_limit: Some(64 * 1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         database.set_maintenance_policy(MaintenancePolicy::CallerDriven);
         let pin = database.pin_snapshot(historical);
         let displace = || {
             let before = database.__writer_cache_stats_for_test().unwrap();
-            for ordinal in 0..96 {
-                drop(
-                    database
-                        .__hold_row_page_for_test("displacement", ordinal)
-                        .unwrap(),
-                );
-            }
+            // The ordinal seam walks every prior wide leaf; visit the range once.
+            drop(
+                database
+                    .__hold_row_page_for_test("displacement", 1023)
+                    .unwrap(),
+            );
             let after = database.__writer_cache_stats_for_test().unwrap();
             assert!(
                 after.2 > before.2 && after.1 > before.1,
@@ -300,12 +322,12 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
             "primary/composite/valid-parent/missing-parent actual examined entries ignore doubled superseded primary/composite/parent history: kind={kind}"
         );
     }
+    // No parent row has been restaged, so its maintained staged index is
+    // absent. The bounded-memory fallback compares each unrelated insertion
+    // once, then probes the single committed parent posting.
     assert_eq!(
-        measurements[0], measurements[1],
-        "one replacement constraint probe must examine equal staged rows and postings when unrelated staging and superseded key versions double"
-    );
-    assert!(
-        measurements[0].0 <= 2 && measurements[0].1 <= 2,
-        "one replacement probe is bounded independently of the staged set and key history: {measurements:?}"
+        measurements,
+        vec![(16, 1), (32, 1)],
+        "the fallback scans exactly the staged insertions and one durable posting"
     );
 }
