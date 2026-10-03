@@ -1868,21 +1868,48 @@ fn ssh_c2_mixed_paradigm_failed_commit_atomic() {
 
 #[test]
 fn ssh_c1_alter_drop_column_cascade_cleans_storage() {
+    fn durable_entries(path: &std::path::Path) -> ([u64; 2], [u64; 2]) {
+        use redb::{ReadableDatabase, ReadableTableMetadata, TableHandle};
+        let store = redb::ReadOnlyDatabase::open(path).unwrap();
+        let read = store.begin_read().unwrap();
+        let mut physical = [0; 2];
+        let mut current = [0; 2];
+        for (ordinal, index) in ["idx_a", "idx_ab"].iter().enumerate() {
+            let route = format!("t\0{index}");
+            let name = format!("__rel_index_{}", blake3::hash(route.as_bytes()).to_hex());
+            for handle in read.list_tables().unwrap() {
+                if handle.name() == name {
+                    physical[ordinal] = read.open_untyped_table(handle).unwrap().len().unwrap();
+                } else if handle.name() == format!("{name}_current") {
+                    current[ordinal] = read.open_untyped_table(handle).unwrap().len().unwrap();
+                }
+            }
+        }
+        (physical, current)
+    }
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("drop_column.redb");
     {
         let db = Database::open(&path).unwrap();
         seed_t_for_identity(&db);
         exec(&db, "CREATE INDEX idx_ab ON t (col, col2)");
-        let before = db.__introspect_indexes_total_entries();
+        db.close().unwrap();
+        drop(db);
+        let before_entries = durable_entries(&path);
+        assert_eq!(before_entries, ([6, 6], [6, 6]), "both declared indexes have all six durable postings");
+        let before = before_entries.0.into_iter().sum::<u64>();
+        let db = Database::open(&path).unwrap();
         exec(&db, "ALTER TABLE t DROP COLUMN col CASCADE");
-        let after = db.__introspect_indexes_total_entries();
         let rendered = render_table_meta("t", &db.table_meta("t").unwrap());
+        db.close().unwrap();
+        drop(db);
+        let after_entries = durable_entries(&path);
+        assert_eq!(after_entries, ([0, 0], [0, 0]), "cascade removes physical and current postings for both dropped indexes");
+        let after = after_entries.0.into_iter().sum::<u64>();
         assert!(after < before);
         assert!(!rendered.contains("idx_a"));
         assert!(!rendered.contains("idx_ab"));
         assert!(!rendered.contains(" col "));
-        db.close().unwrap();
     }
     let reopened = Database::open(&path).unwrap();
     let rendered = render_table_meta("t", &reopened.table_meta("t").unwrap());
