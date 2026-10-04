@@ -2574,6 +2574,9 @@ fn durable_purge_and_compaction_fault_journeys_reconcile_to_a_fresh_control() {
     let control = open_with_accountant(&control_path, control_accountant.clone());
     let control_receipt = receipt!(&control);
     let control_writer_retention = control.__durable_writer_charged_bytes_for_test();
+    let control_owners = control.writer_memory_ownership_receipt_for_test();
+    let control_maintenance = control_owners.storage_maintenance_control_charge;
+    assert_eq!(control_owners.reconciliation_gap, 0);
     assert_exact_reconciliation!(
         &control,
         control_accountant,
@@ -2595,13 +2598,19 @@ fn durable_purge_and_compaction_fault_journeys_reconcile_to_a_fresh_control() {
         reopened.__physical_version_count_for_test("purge_items") > control_physical_versions,
         "the reopened HISTORY ALL store still physically holds bravo's superseded history"
     );
+    let reopened_owners = reopened.writer_memory_ownership_receipt_for_test();
+    assert_eq!(reopened_owners.reconciliation_gap, 0);
+    eprintln!("purge restart ownership: control={control_owners:?}; reopened={reopened_owners:?}");
     assert_eq!(
-        receipt!(&reopened)
-            .non_vector_total
-            .saturating_sub(reopened.__durable_writer_charged_bytes_for_test()),
+        logical_non_vector(&reopened)
+            .checked_sub(reopened_owners.storage_maintenance_control_charge)
+            .unwrap(),
         control_receipt
             .non_vector_total
-            .saturating_sub(control_writer_retention),
+            .checked_sub(control_writer_retention)
+            .unwrap()
+            .checked_sub(control_maintenance)
+            .unwrap(),
         "reopen's logical non-vector charge equals the fresh control without needing a \
          compaction loop -- the retained history's bytes were already released at the \
          commit that superseded or deleted them, so reopen does not re-charge history \
@@ -2634,11 +2643,20 @@ fn durable_purge_and_compaction_fault_journeys_reconcile_to_a_fresh_control() {
         "once the retained history is physically pruned, vector ownership matches the control"
     );
     assert_eq!(
-        logical_non_vector(&reopened),
+        logical_non_vector(&reopened)
+            .checked_sub(
+                reopened
+                    .writer_memory_ownership_receipt_for_test()
+                    .storage_maintenance_control_charge
+            )
+            .unwrap(),
         control_receipt
             .non_vector_total
-            .saturating_sub(control_writer_retention),
-        "after compaction, retained non-vector state matches the fresh control"
+            .checked_sub(control_writer_retention)
+            .unwrap()
+            .checked_sub(control_maintenance)
+            .unwrap(),
+        "after compaction, logical row/schema ownership matches the fresh control while real finite maintenance controls remain independently charged"
     );
     assert_exact_reconciliation!(
         &reopened,
