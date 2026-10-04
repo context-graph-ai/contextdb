@@ -304,13 +304,32 @@ fn automatic_storage_memory_refusal_keeps_the_store_usable() {
     // the real vector inventory, and the captured published root.
     let allowance = 8_027 + 16_512 + 264;
     db.set_memory_limit(Some(used + allowance)).unwrap();
-    let error = db.run_maintenance_cycle().unwrap_err();
+    // A budgeted batch may fit the small directory before it reaches a
+    // payload extent. Drive finite batches until an actual page cannot fit.
+    let mut refusal = None;
+    for _ in 0..256 {
+        let before = db.__storage_compaction_progress_for_test();
+        match db.run_maintenance_cycle() {
+            Ok(report) => assert!(report.compaction.ran),
+            Err(error) => {
+                assert_eq!(
+                    db.__storage_compaction_progress_for_test(),
+                    before,
+                    "a refused batch must not advance its published continuation"
+                );
+                refusal = Some(error);
+                break;
+            }
+        }
+    }
+    let error = refusal.expect("a payload relocation exceeds this tight budget");
+    eprintln!("budgeted storage refusal: {error:?}");
     assert!(
         matches!(error, contextdb_core::Error::MemoryBudgetExceeded {
-            ref subsystem, ref operation, requested_bytes: 65_536,
+            ref subsystem, ref operation, requested_bytes,
             available_bytes, budget_limit_bytes, ..
-        } if subsystem == "storage_compaction" && operation == "page_paths"
-            && available_bytes == allowance - 264
+        } if subsystem == "storage_compaction" && operation == "relocate_pages"
+            && requested_bytes > available_bytes
             && budget_limit_bytes == used + allowance),
         "typed compaction refusal: {error:?}"
     );
@@ -319,7 +338,6 @@ fn automatic_storage_memory_refusal_keeps_the_store_usable() {
         1,
         "the healthy currency-cleanup sibling completes before closing compaction reports its typed deferral"
     );
-    assert!(!db.__storage_compaction_progress_for_test().0);
     db.set_memory_limit(None).unwrap();
     db.execute(
         "INSERT INTO recordings VALUES (1, 'later')",
