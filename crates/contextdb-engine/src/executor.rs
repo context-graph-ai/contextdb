@@ -885,7 +885,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         edge_types: Option<&[EdgeType]>,
         tx: Option<TxId>,
         before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         entry_read: &mut dyn FnMut(),
@@ -904,7 +904,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, BoundedExecutionError>;
@@ -915,7 +915,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         cursor: &mut contextdb_graph::mem::BoundedBfsCursor,
         before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_path_element: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
         staged_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
@@ -964,13 +964,15 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         start_alias: &str,
     ) -> Result<GraphStartResolution>;
 
-    fn graph_filter_matches_bindings(
+    #[allow(clippy::too_many_arguments)]
+    fn graph_filter_matches_bindings_with_work(
         &self,
         filter: &Expr,
         params: &HashMap<String, Value>,
         tx: Option<TxId>,
         snapshot: SnapshotId,
         bindings: &HashMap<String, uuid::Uuid>,
+        work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
     ) -> Result<bool>;
 
     fn coerce_into_column(
@@ -2002,7 +2004,7 @@ impl ReadExecutionTarget for Database {
         edge_types: Option<&[EdgeType]>,
         tx: Option<TxId>,
         before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         entry_read: &mut dyn FnMut(),
@@ -2032,7 +2034,7 @@ impl ReadExecutionTarget for Database {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, BoundedExecutionError>
@@ -2057,7 +2059,7 @@ impl ReadExecutionTarget for Database {
         cursor: &mut contextdb_graph::mem::BoundedBfsCursor,
         before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_path_element: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
         staged_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
@@ -2113,15 +2115,16 @@ impl ReadExecutionTarget for Database {
         resolve_graph_start_nodes_from_filter(self, filter, params, tx, snapshot, start_alias)
     }
 
-    fn graph_filter_matches_bindings(
+    fn graph_filter_matches_bindings_with_work(
         &self,
         filter: &Expr,
         params: &HashMap<String, Value>,
         tx: Option<TxId>,
         snapshot: SnapshotId,
         bindings: &HashMap<String, uuid::Uuid>,
+        work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
     ) -> Result<bool> {
-        graph_filter_matches_bindings(self, filter, params, tx, snapshot, bindings)
+        graph_filter_matches_bindings_with_work(self, filter, params, tx, snapshot, bindings, work)
     }
 
     fn coerce_into_column(
@@ -14776,6 +14779,30 @@ fn resolve_graph_target_id_residual(
     Ok(None)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum GraphPredicateWork {
+    Checkpoint,
+    ReserveValues(usize),
+    ReserveRows(usize),
+    AccessRow(usize),
+    ReleaseRows,
+}
+
+struct GraphValueCache<'a> {
+    values: HashMap<(uuid::Uuid, String), Vec<Value>>,
+    memory: crate::memory_accounting::OwnedMemoryReservation,
+    work: &'a mut dyn FnMut(GraphPredicateWork) -> Result<()>,
+}
+impl<'a> GraphValueCache<'a> {
+    fn new(db: &Database, work: &'a mut dyn FnMut(GraphPredicateWork) -> Result<()>) -> Self {
+        Self {
+            values: HashMap::new(),
+            memory: db.graph_predicate_memory(),
+            work,
+        }
+    }
+}
+
 fn filter_graph_frontier(
     db: &Database,
     frontier: Vec<GraphFrontierRow>,
@@ -14789,8 +14816,9 @@ fn filter_graph_frontier(
     };
 
     let mut filtered = Vec::with_capacity(frontier.len());
-    let mut cache = HashMap::new();
     for (bindings, current, depth) in frontier {
+        let mut noop = |_| Ok(());
+        let mut cache = GraphValueCache::new(db, &mut noop);
         if graph_eval_bool_expr(db, filter, params, tx, snapshot, &bindings, &mut cache)?
             .unwrap_or(false)
         {
@@ -14808,7 +14836,22 @@ fn graph_filter_matches_bindings(
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
 ) -> Result<bool> {
-    let mut cache = HashMap::new();
+    graph_filter_matches_bindings_with_work(db, filter, params, tx, snapshot, bindings, &mut |_| {
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_filter_matches_bindings_with_work(
+    db: &Database,
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+    bindings: &HashMap<String, uuid::Uuid>,
+    work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
+) -> Result<bool> {
+    let mut cache = GraphValueCache::new(db, work);
     Ok(
         graph_eval_bool_expr(db, filter, params, tx, snapshot, bindings, &mut cache)?
             .unwrap_or(false),
@@ -14822,8 +14865,9 @@ fn graph_eval_bool_expr(
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
-    cache: &mut HashMap<(uuid::Uuid, String), Vec<Value>>,
+    cache: &mut GraphValueCache<'_>,
 ) -> Result<Option<bool>> {
+    (cache.work)(GraphPredicateWork::Checkpoint)?;
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
@@ -14940,8 +14984,9 @@ fn graph_eval_values(
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
-    cache: &mut HashMap<(uuid::Uuid, String), Vec<Value>>,
+    cache: &mut GraphValueCache<'_>,
 ) -> Result<Vec<Value>> {
+    (cache.work)(GraphPredicateWork::Checkpoint)?;
     match expr {
         Expr::Literal(_) | Expr::Parameter(_) => Ok(vec![resolve_expr(expr, params)?]),
         Expr::Column(column) => graph_column_values(db, column, tx, snapshot, bindings, cache),
@@ -15006,7 +15051,7 @@ fn graph_column_values(
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
     bindings: &HashMap<String, uuid::Uuid>,
-    cache: &mut HashMap<(uuid::Uuid, String), Vec<Value>>,
+    cache: &mut GraphValueCache<'_>,
 ) -> Result<Vec<Value>> {
     if let Some(alias) = column.table.as_ref() {
         let Some(node) = bindings.get(alias) else {
@@ -15042,24 +15087,31 @@ fn graph_node_column_values(
     column: &str,
     tx: Option<TxId>,
     snapshot: contextdb_core::SnapshotId,
-    cache: &mut HashMap<(uuid::Uuid, String), Vec<Value>>,
+    cache: &mut GraphValueCache<'_>,
 ) -> Result<Vec<Value>> {
     if column == "id" {
         return Ok(vec![Value::Uuid(node)]);
     }
 
     let key = (node, column.to_string());
-    if let Some(values) = cache.get(&key) {
+    if let Some(values) = cache.values.get(&key) {
         return Ok(values.clone());
     }
 
-    let values = db.readable_graph_node_column_values(tx, node, column, snapshot)?;
+    let values = db.readable_graph_node_column_values_within(
+        tx,
+        node,
+        column,
+        snapshot,
+        cache.work,
+        &mut cache.memory,
+    )?;
     let values = if values.is_empty() {
         vec![Value::Null]
     } else {
         values
     };
-    cache.insert(key, values.clone());
+    cache.values.insert(key, values.clone());
     Ok(values)
 }
 
@@ -19593,7 +19645,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         edge_types: Option<&[EdgeType]>,
         tx: Option<TxId>,
         before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         entry_read: &mut dyn FnMut(),
@@ -19622,7 +19674,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, BoundedExecutionError>
@@ -19646,7 +19698,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         cursor: &mut contextdb_graph::mem::BoundedBfsCursor,
         before_edge: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
         before_path_element: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
-        before_access: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
+        before_access: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         before_retain: &mut dyn FnMut(usize) -> std::result::Result<(), BoundedExecutionError>,
         release_retained: &mut dyn FnMut(usize),
         staged_touch: &mut dyn FnMut() -> std::result::Result<(), BoundedExecutionError>,
@@ -19703,16 +19755,17 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             .resolve_graph_start_nodes_from_filter(filter, params, tx, snapshot, start_alias)
     }
 
-    fn graph_filter_matches_bindings(
+    fn graph_filter_matches_bindings_with_work(
         &self,
         filter: &Expr,
         params: &HashMap<String, Value>,
         tx: Option<TxId>,
         snapshot: SnapshotId,
         bindings: &HashMap<String, uuid::Uuid>,
+        work: &mut dyn FnMut(GraphPredicateWork) -> Result<()>,
     ) -> Result<bool> {
         self.store
-            .graph_filter_matches_bindings(filter, params, tx, snapshot, bindings)
+            .graph_filter_matches_bindings_with_work(filter, params, tx, snapshot, bindings, work)
     }
 
     fn coerce_into_column(

@@ -1351,7 +1351,7 @@ impl SyncClient {
         let since = self.push_watermark.load(Ordering::SeqCst);
         let (changes, _, ddl_provenance_source) =
             self.db.checked_changes_since_with_arrivals(since)?;
-        let history = self.db.try_sync_direction_history()?;
+        let history = self.db.try_sync_direction_history_for_changes(&changes)?;
         let changes = changes
             .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
         let reupload_epoch = self.destination_reupload_epoch()?;
@@ -2357,7 +2357,7 @@ impl SyncClient {
         refuse_keyless_tables_with_no_identity_fallback(&self.db, &HashMap::new())?;
         let (changeset, _, ddl_provenance_source) =
             self.db.checked_changes_since_with_arrivals(since)?;
-        let history = self.db.try_sync_direction_history()?;
+        let history = self.db.try_sync_direction_history_for_changes(&changeset)?;
         let changeset = changeset
             .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
         let changeset = self.db.filter_outbound_received_ddl(
@@ -2595,7 +2595,7 @@ impl SyncClient {
             // Taken BEFORE the send, so the success path and the lost-ack
             // reconciliation below report the same transmitted set. Recomputing
             // them separately on each path is how the two would drift.
-            let arrivals = self.db.sync_arrivals_for_changes(&batch);
+            let arrivals = self.db.sync_arrivals_for_changes(&batch)?;
             let lineages = if batch.rows.is_empty() {
                 HashMap::new()
             } else {
@@ -3687,7 +3687,15 @@ impl SyncClient {
             let applied_page = self
                 .db
                 .with_authoritative_hub_received_apply(&authenticated_hub, |db| {
-            let mut directions = db.latest_declared_table_directions()?;
+            let mut directions = db.declared_directions_for_tables(
+                std::iter::once(&changes)
+                    .chain(dependency_units.iter().map(|(_, changes, _, _, _)| changes))
+                    .flat_map(|changes| {
+                        changes.rows.iter().map(|row| row.table.as_str())
+                            .chain(changes.vectors.iter().map(|vector| vector.index.table.as_str()))
+                            .chain(changes.ddl.iter().filter_map(Database::ddl_affected_table))
+                    }),
+            )?;
             let mut table_generations = HashMap::new();
             let mut prepared_dependency_units = Vec::new();
             let mut policy_projection = contextdb_engine::database::PullPolicyProjection::default();
@@ -4304,21 +4312,27 @@ fn checked_drop_rows_that_arrived_by_sync_after(
     // tombstone. Suppressing only the tombstone would re-offer that stale
     // history as a live row, so suppress the complete natural-key history
     // while the current delete marker is known to have arrived by sync.
-    let synced_delete_keys = changes
-        .rows
-        .iter()
-        .filter(|row| {
-            row.deleted
-                && db.row_change_arrived_by_sync(row)
-                && reupload_through.is_none_or(|through| row.lsn > through)
-        })
-        .map(|row| (row.table.clone(), format!("{:?}", row.natural_key.pairs())))
-        .collect::<std::collections::HashSet<_>>();
-    changes.rows.retain(|row| {
-        !synced_delete_keys.contains(&(row.table.clone(), format!("{:?}", row.natural_key.pairs())))
-            && (!db.row_change_arrived_by_sync(row)
+    let mut synced_delete_keys = std::collections::HashSet::new();
+    for row in &changes.rows {
+        if row.deleted
+            && db.checked_row_change_arrived_by_sync(row)?
+            && reupload_through.is_none_or(|through| row.lsn > through)
+        {
+            synced_delete_keys
+                .insert((row.table.clone(), format!("{:?}", row.natural_key.pairs())));
+        }
+    }
+    let mut rows = Vec::with_capacity(changes.rows.len());
+    for row in std::mem::take(&mut changes.rows) {
+        if !synced_delete_keys
+            .contains(&(row.table.clone(), format!("{:?}", row.natural_key.pairs())))
+            && (!db.checked_row_change_arrived_by_sync(&row)?
                 || reupload_through.is_some_and(|through| row.lsn <= through))
-    });
+        {
+            rows.push(row);
+        }
+    }
+    changes.rows = rows;
     let mut vectors = Vec::with_capacity(changes.vectors.len());
     for vector in std::mem::take(&mut changes.vectors) {
         if !db.checked_vector_change_arrived_by_sync(&vector)?

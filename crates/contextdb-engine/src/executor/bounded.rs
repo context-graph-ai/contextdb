@@ -1121,6 +1121,27 @@ impl<'a> ReservedBytes<'a> {
         Self { context, bytes }
     }
 
+    /// One authorization call holds only its largest inspected row, with
+    /// cleanup on success, refusal and cancellation through this guard.
+    fn charge_access_row(
+        &mut self,
+        bytes: usize,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        self.context.charge(
+            BoundedWorkSource::AccessControl,
+            BoundedSourceTouch::AccessRow,
+        )?;
+        let extra = bytes.saturating_sub(self.bytes);
+        if extra != 0 {
+            self.context
+                .reserve(BoundedWorkSource::AccessControl, extra)?;
+            self.bytes += extra;
+        }
+        self.context
+            .attribute_live_memory(BoundedWorkSource::AccessControl);
+        Ok(())
+    }
+
     /// Give the bytes back where an accounting underflow can still be
     /// reported as the request's own failure.
     fn release(mut self) -> std::result::Result<(), BoundedExecutionError> {
@@ -5593,28 +5614,24 @@ impl GraphState {
             })?;
             let edge_types =
                 (!first_step.edge_types.is_empty()).then_some(first_step.edge_types.as_slice());
-            let edge = db.bounded_graph_edge_next(
-                source,
-                edge_types,
-                context.transaction(),
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::GraphTraversal,
-                        BoundedSourceTouch::GraphEdge,
-                    )
-                },
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::AccessControl,
-                        BoundedSourceTouch::AccessRow,
-                    )?;
-                    context.attribute_live_memory(BoundedWorkSource::AccessControl);
-                    Ok(())
-                },
-                &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
-                &mut |bytes| context.release(bytes),
-                &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
-            )?;
+            let edge = {
+                let mut access_memory = ReservedBytes::new(context, 0);
+                db.bounded_graph_edge_next(
+                    source,
+                    edge_types,
+                    context.transaction(),
+                    &mut || {
+                        context.charge(
+                            BoundedWorkSource::GraphTraversal,
+                            BoundedSourceTouch::GraphEdge,
+                        )
+                    },
+                    &mut |bytes| access_memory.charge_access_row(bytes),
+                    &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
+                    &mut |bytes| context.release(bytes),
+                    &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
+                )
+            }?;
             let Some(edge) = edge else {
                 let source = self.edge_source.take().ok_or_else(|| {
                     Error::Other("bounded graph lost its exhausted edge source".to_string())
@@ -5775,11 +5792,15 @@ impl GraphState {
                 self.row_memory
                     .give_back(planned_binding_bytes - actual_binding_bytes)?;
             }
+            let mut predicate_bytes = 0usize;
+            let mut predicate_row_bytes = 0usize;
+            let mut predicate_access_bytes = 0usize;
+            let mut predicate_failure = None;
             let matches = self
                 .filter
                 .as_ref()
                 .map(|filter| {
-                    db.graph_filter_matches_bindings(
+                    db.graph_filter_matches_bindings_with_work(
                         filter,
                         &self.params,
                         // The reader's own transaction: a WHERE on node
@@ -5791,9 +5812,63 @@ impl GraphState {
                         context.transaction(),
                         self.snapshot,
                         &bindings,
+                        &mut |work| {
+                            let result = match work {
+                                GraphPredicateWork::Checkpoint => context.charge(
+                                    BoundedWorkSource::GraphTraversal,
+                                    BoundedSourceTouch::AccessRow,
+                                ),
+                                GraphPredicateWork::AccessRow(bytes) => context
+                                    .charge(
+                                        BoundedWorkSource::AccessControl,
+                                        BoundedSourceTouch::AccessRow,
+                                    )
+                                    .and_then(|()| {
+                                        let extra = bytes.saturating_sub(predicate_access_bytes);
+                                        context.reserve(BoundedWorkSource::AccessControl, extra)?;
+                                        predicate_access_bytes = predicate_access_bytes.max(bytes);
+                                        predicate_bytes = predicate_bytes.saturating_add(extra);
+                                        predicate_row_bytes =
+                                            predicate_row_bytes.saturating_add(extra);
+                                        Ok(())
+                                    }),
+                                GraphPredicateWork::ReserveValues(bytes)
+                                | GraphPredicateWork::ReserveRows(bytes) => {
+                                    let result =
+                                        context.reserve(BoundedWorkSource::GraphTraversal, bytes);
+                                    if result.is_ok() {
+                                        predicate_bytes = predicate_bytes.saturating_add(bytes);
+                                        if matches!(work, GraphPredicateWork::ReserveRows(_)) {
+                                            predicate_row_bytes =
+                                                predicate_row_bytes.saturating_add(bytes);
+                                        }
+                                    }
+                                    result
+                                }
+                                GraphPredicateWork::ReleaseRows => {
+                                    let result = context.release(predicate_row_bytes);
+                                    if result.is_ok() {
+                                        predicate_bytes -= predicate_row_bytes;
+                                        predicate_row_bytes = 0;
+                                        predicate_access_bytes = 0;
+                                    }
+                                    result
+                                }
+                            };
+                            if let Err(error) = result {
+                                predicate_failure = Some(error);
+                                return Err(Error::ReadCancelled);
+                            }
+                            Ok(())
+                        },
                     )
                 })
                 .transpose();
+            context.release(predicate_bytes)?;
+            if let Some(error) = predicate_failure {
+                self.row_memory.give_back(actual_binding_bytes)?;
+                return Err(error);
+            }
             let matches = match matches {
                 Ok(Some(matches)) => matches,
                 Ok(None) => true,
@@ -5905,25 +5980,21 @@ impl GraphState {
         } else {
             step.direction
         };
-        let cursor = db.bounded_graph_bfs_cursor(
-            context.transaction(),
-            path.node,
-            edge_types,
-            direction,
-            step.min_depth,
-            step.max_depth,
-            self.snapshot,
-            &mut || {
-                context.charge(
-                    BoundedWorkSource::AccessControl,
-                    BoundedSourceTouch::AccessRow,
-                )?;
-                context.attribute_live_memory(BoundedWorkSource::AccessControl);
-                Ok(())
-            },
-            &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
-            &mut |bytes| context.release_parked(bytes),
-        )?;
+        let cursor = {
+            let mut access_memory = ReservedBytes::new(context, 0);
+            db.bounded_graph_bfs_cursor(
+                context.transaction(),
+                path.node,
+                edge_types,
+                direction,
+                step.min_depth,
+                step.max_depth,
+                self.snapshot,
+                &mut |bytes| access_memory.charge_access_row(bytes),
+                &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
+                &mut |bytes| context.release_parked(bytes),
+            )
+        }?;
         let Some(cursor) = cursor else {
             context.release(path.retained_bytes)?;
             return Ok(());
@@ -5979,44 +6050,40 @@ impl GraphState {
             let active = self.active.as_mut().ok_or_else(|| {
                 Error::Other("bounded graph lost its active continuation".to_string())
             })?;
-            let next = db.bounded_graph_bfs_next(
-                &mut active.cursor,
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::GraphTraversal,
-                        BoundedSourceTouch::GraphEdge,
-                    )
-                },
-                // A path clone is traversal work, not an edge touch, so it is
-                // charged without a source touch and `rows_examined` keeps its
-                // meaning.
-                &mut || context.charge_operator(BoundedWorkSource::GraphTraversal),
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::AccessControl,
-                        BoundedSourceTouch::AccessRow,
-                    )?;
-                    context.attribute_live_memory(BoundedWorkSource::AccessControl);
-                    Ok(())
-                },
-                &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
-                &mut |bytes| context.release_parked(bytes),
-                // Stepping over one staged edge is a source touch like reading
-                // one committed adjacency entry, and the one name copied out of
-                // the transaction is reserved on the same channel that releases
-                // it.
-                &mut || {
-                    context.charge(
-                        BoundedWorkSource::GraphTraversal,
-                        BoundedSourceTouch::GraphEdge,
-                    )
-                },
-                &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
-                &mut |bytes| context.release_parked(bytes),
-                &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
-                self.visited_cap,
-                context.transaction(),
-            );
+            let next = {
+                let mut access_memory = ReservedBytes::new(context, 0);
+                db.bounded_graph_bfs_next(
+                    &mut active.cursor,
+                    &mut || {
+                        context.charge(
+                            BoundedWorkSource::GraphTraversal,
+                            BoundedSourceTouch::GraphEdge,
+                        )
+                    },
+                    // A path clone is traversal work, not an edge touch, so it is
+                    // charged without a source touch and `rows_examined` keeps its
+                    // meaning.
+                    &mut || context.charge_operator(BoundedWorkSource::GraphTraversal),
+                    &mut |bytes| access_memory.charge_access_row(bytes),
+                    &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
+                    &mut |bytes| context.release_parked(bytes),
+                    // Stepping over one staged edge is a source touch like reading
+                    // one committed adjacency entry, and the one name copied out of
+                    // the transaction is reserved on the same channel that releases
+                    // it.
+                    &mut || {
+                        context.charge(
+                            BoundedWorkSource::GraphTraversal,
+                            BoundedSourceTouch::GraphEdge,
+                        )
+                    },
+                    &mut |bytes| context.reserve(BoundedWorkSource::GraphTraversal, bytes),
+                    &mut |bytes| context.release_parked(bytes),
+                    &mut || context.note_touch(BoundedSourceTouch::AdjacencyEntry),
+                    self.visited_cap,
+                    context.transaction(),
+                )
+            };
             // A continuation that is abandoned keeps its charge until the
             // caller gives it back, so a refusal or cancellation from the
             // traversal has to dispose of the cursor before it propagates.
@@ -6310,11 +6377,15 @@ impl GraphState {
                 planned_binding_bytes,
                 actual_binding_bytes,
             )?;
+            let mut predicate_bytes = 0usize;
+            let mut predicate_row_bytes = 0usize;
+            let mut predicate_access_bytes = 0usize;
+            let mut predicate_failure = None;
             let matches = self
                 .filter
                 .as_ref()
                 .map(|filter| {
-                    db.graph_filter_matches_bindings(
+                    db.graph_filter_matches_bindings_with_work(
                         filter,
                         &self.params,
                         // The reader's own transaction: a WHERE on node
@@ -6326,9 +6397,63 @@ impl GraphState {
                         context.transaction(),
                         self.snapshot,
                         &bindings,
+                        &mut |work| {
+                            let result = match work {
+                                GraphPredicateWork::Checkpoint => context.charge(
+                                    BoundedWorkSource::GraphTraversal,
+                                    BoundedSourceTouch::AccessRow,
+                                ),
+                                GraphPredicateWork::AccessRow(bytes) => context
+                                    .charge(
+                                        BoundedWorkSource::AccessControl,
+                                        BoundedSourceTouch::AccessRow,
+                                    )
+                                    .and_then(|()| {
+                                        let extra = bytes.saturating_sub(predicate_access_bytes);
+                                        context.reserve(BoundedWorkSource::AccessControl, extra)?;
+                                        predicate_access_bytes = predicate_access_bytes.max(bytes);
+                                        predicate_bytes = predicate_bytes.saturating_add(extra);
+                                        predicate_row_bytes =
+                                            predicate_row_bytes.saturating_add(extra);
+                                        Ok(())
+                                    }),
+                                GraphPredicateWork::ReserveValues(bytes)
+                                | GraphPredicateWork::ReserveRows(bytes) => {
+                                    let result =
+                                        context.reserve(BoundedWorkSource::GraphTraversal, bytes);
+                                    if result.is_ok() {
+                                        predicate_bytes = predicate_bytes.saturating_add(bytes);
+                                        if matches!(work, GraphPredicateWork::ReserveRows(_)) {
+                                            predicate_row_bytes =
+                                                predicate_row_bytes.saturating_add(bytes);
+                                        }
+                                    }
+                                    result
+                                }
+                                GraphPredicateWork::ReleaseRows => {
+                                    let result = context.release(predicate_row_bytes);
+                                    if result.is_ok() {
+                                        predicate_bytes -= predicate_row_bytes;
+                                        predicate_row_bytes = 0;
+                                        predicate_access_bytes = 0;
+                                    }
+                                    result
+                                }
+                            };
+                            if let Err(error) = result {
+                                predicate_failure = Some(error);
+                                return Err(Error::ReadCancelled);
+                            }
+                            Ok(())
+                        },
                     )
                 })
                 .transpose();
+            context.release(predicate_bytes)?;
+            if let Some(error) = predicate_failure {
+                context.release(actual_binding_bytes)?;
+                return Err(error);
+            }
             let matches = match matches {
                 Ok(Some(matches)) => matches,
                 Ok(None) => true,
@@ -9310,20 +9435,12 @@ fn build_kernel_with_ctes<'plan>(
                                 // executor draws this line for the same
                                 // statement; the kernel asks it the same way.
                                 if let Some(database) = db.as_database_for_subquery_plan() {
+                                    let mut access_memory = ReservedBytes::new(context, 0);
                                     database.bounded_assert_graph_anchor_nodes_readable(
                                         context.transaction(),
                                         &starts,
                                         snapshot,
-                                        |_bytes| {
-                                            context.charge(
-                                                BoundedWorkSource::AccessControl,
-                                                BoundedSourceTouch::AccessRow,
-                                            )?;
-                                            context.attribute_live_memory(
-                                                BoundedWorkSource::AccessControl,
-                                            );
-                                            Ok::<(), BoundedExecutionError>(())
-                                        },
+                                        |bytes| access_memory.charge_access_row(bytes),
                                     )?;
                                 }
                                 predicates_pushed

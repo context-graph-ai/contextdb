@@ -30,6 +30,10 @@ pub struct WriterHistoryWork {
     pub vector_memberships: u64,
     pub commit_bound_keys: u64,
     pub ddl_occurrences: u64,
+    #[cfg(feature = "test-seams")]
+    pub direction_summary_reads: u64,
+    #[cfg(feature = "test-seams")]
+    pub capability_summary_reads: u64,
     pub sidecar_entries: [u64; 8],
     pub sidecar_decodes: [u64; 8],
     pub selection_entries: u64,
@@ -190,6 +194,26 @@ pub(crate) fn note_ddl_occurrence() {
     WORK.with(|slot| {
         if let Some(mut work) = slot.get() {
             work.history.ddl_occurrences += 1;
+            slot.set(Some(work));
+        }
+    });
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) fn note_direction_summary_read() {
+    WORK.with(|slot| {
+        if let Some(mut work) = slot.get() {
+            work.history.direction_summary_reads += 1;
+            slot.set(Some(work));
+        }
+    });
+}
+
+#[cfg(all(feature = "test-seams", feature = "sync-orchestration"))]
+pub(crate) fn note_capability_summary_read() {
+    WORK.with(|slot| {
+        if let Some(mut work) = slot.get() {
+            work.history.capability_summary_reads += 1;
             slot.set(Some(work));
         }
     });

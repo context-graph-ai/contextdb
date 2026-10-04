@@ -1677,7 +1677,7 @@ async fn handle_pull(
     let consumed_hidden_frontier = hidden_scan.as_ref().and_then(|_| changes.max_lsn());
     if let Some(scan) = hidden_scan {
         changes = changes.filter_by_direction_history(
-            &db.try_sync_direction_history()?,
+            &db.try_sync_direction_history_for_changes(&changes)?,
             &[
                 SyncDirection::Push,
                 SyncDirection::Pull,
@@ -1920,7 +1920,7 @@ async fn handle_pull(
     // filtering excludes `SYNC OFF` rows without stranding the edge's pull
     // watermark.
     let changes = changes.filter_by_direction_history(
-        &db.try_sync_direction_history()?,
+        &db.try_sync_direction_history_for_changes(&changes)?,
         &[
             SyncDirection::Push,
             SyncDirection::Pull,

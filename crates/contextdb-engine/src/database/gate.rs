@@ -1126,7 +1126,10 @@ impl Database {
             )?;
         } else if !self.visit_writer_rows_phased::<E>(&acl_ref.ref_table, |grant| match grant {
             None => before_access_row(0),
-            Some(grant) => admit(grant),
+            Some(grant) => {
+                before_access_row(grant.estimated_bytes())?;
+                admit(grant)
+            }
         })? {
             return Err(E::from(Error::Other(
                 "ACL source requested without a captured relational source".to_owned(),
@@ -1248,6 +1251,7 @@ impl Database {
             .transpose()
             .map_err(E::from)?;
         for row_id in &overlay.deleted {
+            before_access_row(0)?;
             let withdrawn_grant = if let Some(source) = &source {
                 let row = contextdb_relational::source::visible_row(
                     source,
@@ -1843,78 +1847,18 @@ impl Database {
         acl_ref: &AclRef,
         snapshot: SnapshotId,
     ) -> Result<Arc<AdmittedAclIds>> {
-        let Some(tx) = tx else {
-            return self.allowed_acl_ids_for_principal(principal, acl_ref, snapshot);
-        };
-        let (kind, principal_id) = match principal {
-            Principal::System => {
-                return Ok(Arc::new(AdmittedAclIds::new(self.accountant.clone())?));
-            }
-            Principal::Agent(id) => ("Agent", id.as_str()),
-            Principal::Human(id) => ("Human", id.as_str()),
-        };
-        let rows = self.acl_grant_rows_in_tx(tx, &acl_ref.ref_table, snapshot)?;
-        let mut allowed = AdmittedAclIds::new(self.accountant.clone())?;
-        for row in rows {
-            if self.grant_row_context_scope_allowed(&acl_ref.ref_table, &row, snapshot)?
-                && row.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
-                && row.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
-                && let Some(Value::Uuid(acl_id)) = row.values.get(&acl_ref.ref_column)
-            {
-                allowed.insert(*acl_id)?;
-            }
-        }
-        Ok(Arc::new(allowed))
-    }
-
-    fn acl_grant_rows_in_tx(
-        &self,
-        tx: TxId,
-        table: &str,
-        snapshot: SnapshotId,
-    ) -> Result<Vec<VersionedRow>> {
-        let mut rows = if self.writer_read_root()?.is_some() {
-            self.committed_rows_at(table, snapshot)?
-        } else {
-            let tables = self.relational_store.tables.read();
-            tables
-                .get(table)
-                .map(|rows| {
-                    rows.iter()
-                        .filter(|row| row.visible_at(snapshot))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        };
-        let committed_row_ids = rows.iter().map(|row| row.row_id).collect::<HashSet<_>>();
-        let deleted_row_ids = self.tx_mgr.with_write_set(tx, |ws| {
-            ws.relational_deletes
-                .iter()
-                .filter(|(delete_table, _, _)| delete_table == table)
-                .map(|(_, row_id, _)| *row_id)
-                .collect::<HashSet<_>>()
-        })?;
-        rows.retain(|row| !deleted_row_ids.contains(&row.row_id));
-
-        self.tx_mgr.with_write_set(tx, |ws| {
-            let mut seen_inserts = HashSet::new();
-            let mut inserts = ws
-                .relational_inserts
-                .iter()
-                .rev()
-                .filter(|(insert_table, row)| {
-                    insert_table == table
-                        && seen_inserts.insert(row.row_id)
-                        && (!deleted_row_ids.contains(&row.row_id)
-                            || committed_row_ids.contains(&row.row_id))
-                })
-                .map(|(_, row)| row.clone())
-                .collect::<Vec<_>>();
-            inserts.reverse();
-            rows.extend(inserts);
-        })?;
-        Ok(rows)
+        let committed = self.allowed_acl_ids_for_principal(principal, acl_ref, snapshot)?;
+        self.bounded_acl_ids_with_transaction(
+            tx,
+            principal,
+            acl_ref,
+            snapshot,
+            committed,
+            &mut |_| {
+                crate::executor::observe_bounded_access_control_row();
+                Ok::<(), Error>(())
+            },
+        )
     }
 
     fn raw_row_by_id_in_tx(
@@ -2250,6 +2194,71 @@ impl Database {
             inserts.reverse();
             rows.extend(inserts);
         })?;
+        Ok(())
+    }
+
+    fn overlay_tx_node_rows_within(
+        &self,
+        tx: TxId,
+        table: &str,
+        node: NodeId,
+        rows: &mut Vec<VersionedRow>,
+        work: &mut dyn FnMut(crate::executor::GraphPredicateWork) -> Result<()>,
+        memory: &mut crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<()> {
+        self.tx_mgr.with_write_set(tx, |ws| {
+            let deletes = ws
+                .relational_deletes
+                .iter()
+                .filter(|(delete_table, _, _)| delete_table == table)
+                .count();
+            let bytes = ws
+                .relational_inserts
+                .iter()
+                .filter(|(insert_table, row)| {
+                    insert_table == table && row.values.get("id") == Some(&Value::Uuid(node))
+                })
+                .fold(
+                    rows.len().saturating_add(deletes).saturating_mul(96),
+                    |bytes, (_, row)| {
+                        bytes.saturating_add(row.estimated_bytes().saturating_add(224))
+                    },
+                );
+            work(crate::executor::GraphPredicateWork::Checkpoint)?;
+            work(crate::executor::GraphPredicateWork::ReserveRows(bytes))?;
+            memory.try_grow_for(
+                bytes,
+                "graph",
+                "predicate_staged_rows",
+                "Raise MEMORY_LIMIT to inspect staged graph metadata.",
+            )?;
+            let committed_row_ids = rows.iter().map(|row| row.row_id).collect::<HashSet<_>>();
+            let deleted_row_ids = ws
+                .relational_deletes
+                .iter()
+                .filter(|(delete_table, _, _)| delete_table == table)
+                .map(|(_, row_id, _)| *row_id)
+                .collect::<HashSet<_>>();
+            rows.retain(|row| !deleted_row_ids.contains(&row.row_id));
+
+            let mut seen_inserts = HashSet::new();
+            let mut inserts = ws
+                .relational_inserts
+                .iter()
+                .rev()
+                .filter(|(insert_table, row)| {
+                    insert_table == table
+                        && row.values.get("id") == Some(&Value::Uuid(node))
+                        && seen_inserts.insert(row.row_id)
+                        && (!deleted_row_ids.contains(&row.row_id)
+                            || committed_row_ids.contains(&row.row_id))
+                })
+                .map(|(_, row)| row.clone())
+                .collect::<Vec<_>>();
+            inserts.reverse();
+            rows.extend(inserts);
+            Ok::<(), Error>(())
+        })??;
         Ok(())
     }
 
@@ -2723,7 +2732,7 @@ impl Database {
         candidate: GraphScanCandidate,
         edge_type: &str,
         snapshot: SnapshotId,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -2761,7 +2770,7 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -2787,7 +2796,7 @@ impl Database {
         tx: Option<TxId>,
         node: NodeId,
         snapshot: SnapshotId,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -2809,7 +2818,7 @@ impl Database {
                 &meta,
                 &row,
                 snapshot,
-                |_bytes| before_access(),
+                &mut *before_access,
             )? {
                 return Ok(false);
             }
@@ -2825,7 +2834,7 @@ impl Database {
         target: NodeId,
         edge_type: &str,
         snapshot: SnapshotId,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -2852,7 +2861,7 @@ impl Database {
                 &meta,
                 &row,
                 snapshot,
-                |_bytes| before_access(),
+                &mut *before_access,
             )? {
                 return Ok(false);
             }
@@ -3222,7 +3231,7 @@ impl Database {
         // it removed are not there to be read.
         tx: Option<TxId>,
         mut before_edge: impl FnMut() -> std::result::Result<(), E>,
-        mut before_access: impl FnMut() -> std::result::Result<(), E>,
+        mut before_access: impl FnMut(usize) -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize) -> std::result::Result<(), E>,
         // One count per adjacency entry this scan reads, the same figure the
@@ -3575,7 +3584,7 @@ impl Database {
             };
             drop(entries_guard);
 
-            before_access()?;
+            before_access(0)?;
             // The inspected anchor installed above already holds this edge's
             // type in memory this read has been charged for, so the decision
             // reads it there instead of taking a second copy of the same text
@@ -3613,7 +3622,7 @@ impl Database {
         edge_types: Option<&[EdgeType]>,
         tx: Option<TxId>,
         before_edge: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         entry_read: &mut impl FnMut(),
@@ -3752,7 +3761,7 @@ impl Database {
         reverse: bool,
         edge_types: Option<&[EdgeType]>,
         tx: Option<TxId>,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     ) -> std::result::Result<Option<CountedGraphScanEdge>, E>
     where
         E: From<Error>,
@@ -3773,7 +3782,7 @@ impl Database {
         if self.access_is_admin() {
             return Ok(Some(oriented));
         }
-        before_access()?;
+        before_access(0)?;
         let allowed = self.bounded_graph_scan_edge_allowed(
             tx,
             GraphScanCandidate {
@@ -3805,7 +3814,7 @@ impl Database {
         staged_count: usize,
         edge_types: Option<&[EdgeType]>,
         before_edge: &mut impl FnMut() -> std::result::Result<(), E>,
-        before_access: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_access: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         entry_read: &mut impl FnMut(),
@@ -3863,7 +3872,7 @@ impl Database {
                 release_retained(name_bytes)?;
                 return Ok(Some(oriented));
             }
-            before_access()?;
+            before_access(0)?;
             let candidate = GraphScanCandidate {
                 start: oriented.0,
                 neighbor: oriented.1,
@@ -3910,7 +3919,7 @@ impl Database {
         min_depth: u32,
         max_depth: u32,
         snapshot: SnapshotId,
-        mut before_access: impl FnMut() -> std::result::Result<(), E>,
+        mut before_access: impl FnMut(usize) -> std::result::Result<(), E>,
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
     ) -> std::result::Result<Option<contextdb_graph::mem::BoundedBfsCursor>, E>
@@ -3919,7 +3928,7 @@ impl Database {
     {
         let gated = !self.access_is_admin();
         if gated {
-            before_access()?;
+            before_access(0)?;
             if !self.bounded_node_read_allowed(tx, start, snapshot, &mut before_access)? {
                 return Ok(None);
             }
@@ -3948,7 +3957,7 @@ impl Database {
         cursor: &mut contextdb_graph::mem::BoundedBfsCursor,
         before_edge: impl FnMut() -> std::result::Result<(), E>,
         before_path_element: impl FnMut() -> std::result::Result<(), E>,
-        mut before_access: impl FnMut() -> std::result::Result<(), E>,
+        mut before_access: impl FnMut(usize) -> std::result::Result<(), E>,
         before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: impl FnMut(usize),
         // The staged source's own accounting: one work charge for every staged
@@ -3997,7 +4006,7 @@ impl Database {
                 if !gated {
                     return Ok(true);
                 }
-                before_access()?;
+                before_access(0)?;
                 self.bounded_graph_neighbor_read_allowed(
                     tx,
                     neighbor,
@@ -4088,13 +4097,16 @@ impl Database {
         Ok(true)
     }
 
-    pub(crate) fn readable_graph_node_column_values(
+    pub(crate) fn readable_graph_node_column_values_within(
         &self,
         tx: Option<TxId>,
         node: NodeId,
         column: &str,
         snapshot: SnapshotId,
+        work: &mut dyn FnMut(crate::executor::GraphPredicateWork) -> Result<()>,
+        memory: &mut crate::memory_accounting::OwnedMemoryReservation,
     ) -> Result<Vec<Value>> {
+        work(crate::executor::GraphPredicateWork::Checkpoint)?;
         if column == "id" {
             return Ok(vec![Value::Uuid(node)]);
         }
@@ -4116,34 +4128,61 @@ impl Database {
             .collect::<Vec<_>>();
         let mut values = Vec::new();
         for (table, has_read_gate) in table_names {
-            let Some(mut table_rows) =
+            work(crate::executor::GraphPredicateWork::Checkpoint)?;
+            let _rows_scope = self.writer_temporary_output_scope()?;
+            let rows = if self.writer_read_root()?.is_some() {
+                self.writer_indexed_rows_for_values_within(
+                    &table, &id_column, &id_value, snapshot, work,
+                )?
+            } else {
                 self.indexed_rows_for_values(&table, &id_column, &id_value, snapshot)?
-            else {
+            };
+            let Some(mut table_rows) = rows else {
                 return Err(Error::Other(format!(
                     "graph node metadata table `{table}` requires an index on id"
                 )));
             };
+            let mut overlay_memory =
+                crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
             if let Some(tx) = tx {
-                self.overlay_tx_node_rows(tx, &table, node, &mut table_rows)?;
+                self.overlay_tx_node_rows_within(
+                    tx,
+                    &table,
+                    node,
+                    &mut table_rows,
+                    work,
+                    &mut overlay_memory,
+                )?;
             }
-            if has_read_gate {
-                let Some(meta) = self.table_meta(&table) else {
+            let meta = has_read_gate.then(|| self.table_meta(&table)).flatten();
+            for row in table_rows {
+                work(crate::executor::GraphPredicateWork::Checkpoint)?;
+                if has_read_gate
+                    && (meta.as_ref().is_none()
+                        || !self.bounded_read_allowed_for_row(
+                            tx,
+                            &table,
+                            meta.as_ref().unwrap(),
+                            &row,
+                            snapshot,
+                            |bytes| work(crate::executor::GraphPredicateWork::AccessRow(bytes)),
+                        )?)
+                {
                     continue;
-                };
-                for row in table_rows {
-                    if self.read_allowed_for_row_in_tx(tx, &table, &meta, &row, snapshot)?
-                        && let Some(value) = row.values.get(column)
-                    {
-                        values.push(value.clone());
-                    }
                 }
-            } else {
-                values.extend(
-                    table_rows
-                        .into_iter()
-                        .filter_map(|row| row.values.get(column).cloned()),
-                );
+                if let Some(value) = row.values.get(column) {
+                    let bytes = 128usize.saturating_add(value.estimated_bytes().saturating_mul(2));
+                    work(crate::executor::GraphPredicateWork::ReserveValues(bytes))?;
+                    memory.try_grow_for(
+                        bytes,
+                        "graph",
+                        "predicate_values",
+                        "Raise MEMORY_LIMIT to evaluate graph metadata.",
+                    )?;
+                    values.push(value.clone());
+                }
             }
+            work(crate::executor::GraphPredicateWork::ReleaseRows)?;
         }
         Ok(values)
     }

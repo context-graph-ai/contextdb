@@ -37,6 +37,16 @@ pub(super) fn retention_physical_key(row: &VersionedRow) -> [u8; 24] {
     key
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct FutureStampScan {
+    declaration: [u8; 32],
+    after: Option<[u8; 24]>,
+    end: Option<[u8; 24]>,
+    horizon: u64,
+    count: u64,
+    completed: u64,
+}
+
 impl<'a> MaintenanceFrontier<'a> {
     /// Mutating maintenance holds the existing commit guard to keep this
     /// canonical frontier and its metadata coherent. The read-only pending
@@ -357,12 +367,101 @@ impl<'a> MaintenanceFrontier<'a> {
         }
     }
 
-    pub(super) fn visit_all(
+    /// A diagnostic has its own finite continuation. Publish only a completed
+    /// recount; partial windows never replace the last complete tally.
+    pub(super) fn future_stamp_count(
         &self,
         table: &str,
-        visit: impl FnMut(&VersionedRow) -> Result<bool>,
-    ) -> Result<()> {
-        self.visit_selected(table, false, visit)
+        meta: &TableMeta,
+        horizon: u64,
+    ) -> Result<(u64, Option<(String, Vec<u8>)>)> {
+        let (Some(root), Some(source)) = (&self.root, &self.source) else {
+            let mut count = 0;
+            self.visit_selected(table, false, |row| {
+                if row.deleted_tx.is_none() && row.created_at.is_some_and(|stamp| stamp.0 > horizon)
+                {
+                    count += 1;
+                }
+                Ok(true)
+            })?;
+            return Ok((count, None));
+        };
+        let key = format!("retention_future/{table}");
+        let declaration = RedbPersistence::currency_cleanup_declaration(meta)?;
+        let saved = root.config_point::<FutureStampScan>(&key)?;
+        let mut scan = saved
+            .as_ref()
+            .filter(|saved| saved.value.declaration == declaration)
+            .map(|saved| saved.value.clone())
+            .unwrap_or(FutureStampScan {
+                declaration,
+                after: None,
+                end: None,
+                horizon,
+                count: 0,
+                completed: 0,
+            });
+        if self.no_future_stamps(table, horizon)? {
+            if saved.is_none() {
+                return Ok((0, None));
+            }
+            scan.after = None;
+            scan.end = None;
+            scan.count = 0;
+            scan.completed = 0;
+        } else {
+            if scan.after.is_none() {
+                scan.horizon = horizon;
+                scan.count = 0;
+                let mut tail =
+                    source.row_cursor(table, Bound::Unbounded, Bound::Unbounded, true)?;
+                let tail = tail.next_window()?;
+                #[cfg(feature = "test-seams")]
+                if tail.is_some() {
+                    resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+                }
+                scan.end = tail.map(|window| retention_physical_key(window.value()));
+            }
+            let mut cursor = source.row_cursor(
+                table,
+                scan.after
+                    .as_ref()
+                    .map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_slice())),
+                scan.end
+                    .as_ref()
+                    .map_or(Bound::Unbounded, |key| Bound::Included(key.as_slice())),
+                false,
+            )?;
+            let mut complete = scan.end.is_none();
+            for _ in 0..32 {
+                let Some(window) = cursor.next_window()? else {
+                    complete = true;
+                    break;
+                };
+                #[cfg(feature = "test-seams")]
+                resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
+                let row = window.value();
+                if row.deleted_tx.is_none()
+                    && row.created_at.is_some_and(|stamp| stamp.0 > scan.horizon)
+                {
+                    scan.count = scan.count.saturating_add(1);
+                }
+                scan.after = Some(retention_physical_key(row));
+                if scan.after == scan.end {
+                    complete = true;
+                    break;
+                }
+            }
+            if complete {
+                scan.completed = scan.count;
+                scan.after = None;
+                scan.end = None;
+            }
+        }
+        Ok((
+            scan.completed,
+            Some((key, RedbPersistence::encode_config_value(&scan)?)),
+        ))
     }
 
     pub(super) fn cleanup_rotation(&self) -> Result<Option<[u8; 32]>> {

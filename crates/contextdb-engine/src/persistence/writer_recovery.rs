@@ -251,7 +251,7 @@ impl RedbPersistence {
                             let empty_before = counts
                                 .get(key.as_str())
                                 .map_err(Self::storage_error)?
-                                .is_some_and(|value| value.value() == 0u64.to_be_bytes());
+                                .is_none_or(|value| value.value() == 0u64.to_be_bytes());
                             if !empty_before {
                                 continue;
                             }

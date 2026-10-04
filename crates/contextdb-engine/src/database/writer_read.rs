@@ -2,6 +2,62 @@
 //! the same database retain that root; another database gets its own scope.
 use super::*;
 use crate::persistence::WriterSnapshot;
+/// A declaration answer releases its charge with the answer, including while
+/// consumed by an owning iterator, rather than with the statement root.
+pub(super) struct DdlHistory {
+    pub(super) entries: Vec<(Lsn, DdlChange)>,
+    pub(super) memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
+}
+impl From<Vec<(Lsn, DdlChange)>> for DdlHistory {
+    fn from(entries: Vec<(Lsn, DdlChange)>) -> Self {
+        Self {
+            entries,
+            memory: None,
+        }
+    }
+}
+impl std::ops::Deref for DdlHistory {
+    type Target = Vec<(Lsn, DdlChange)>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+impl std::ops::DerefMut for DdlHistory {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+pub(super) struct DdlHistoryIntoIter {
+    entries: std::vec::IntoIter<(Lsn, DdlChange)>,
+    _memory: Option<crate::memory_accounting::OwnedMemoryReservation>,
+}
+impl Iterator for DdlHistoryIntoIter {
+    type Item = (Lsn, DdlChange);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+impl IntoIterator for DdlHistory {
+    type Item = (Lsn, DdlChange);
+    type IntoIter = DdlHistoryIntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        DdlHistoryIntoIter {
+            entries: self.entries.into_iter(),
+            _memory: self.memory,
+        }
+    }
+}
+impl<'a> IntoIterator for &'a DdlHistory {
+    type Item = &'a (Lsn, DdlChange);
+    type IntoIter = std::slice::Iter<'a, (Lsn, DdlChange)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
 type OutputOwners =
     std::rc::Rc<std::cell::RefCell<Vec<crate::memory_accounting::OwnedMemoryReservation>>>;
 type ScopedRoot = (usize, Arc<WriterSnapshot>, OutputOwners);
@@ -238,10 +294,26 @@ impl Database {
         values: &[Value],
         snapshot: SnapshotId,
     ) -> Result<Option<Vec<VersionedRow>>> {
-        use contextdb_relational::source::{
-            RelationalIndexRange, RelationalReadSource, visible_row,
-        };
+        self.writer_indexed_rows_for_values_within(
+            table,
+            columns,
+            values,
+            snapshot,
+            &mut |_| Ok(()),
+        )
+    }
+
+    pub(super) fn writer_indexed_rows_for_values_within(
+        &self,
+        table: &str,
+        columns: &[String],
+        values: &[Value],
+        snapshot: SnapshotId,
+        work: &mut dyn FnMut(crate::executor::GraphPredicateWork) -> Result<()>,
+    ) -> Result<Option<Vec<VersionedRow>>> {
+        use contextdb_relational::source::{RelationalIndexRange, RelationalReadSource};
         use std::ops::Bound;
+        work(crate::executor::GraphPredicateWork::Checkpoint)?;
         let Some(root) = self.writer_read_root()? else {
             return Ok(None);
         };
@@ -294,7 +366,9 @@ impl Database {
         let mut rows = Vec::new();
         let mut output =
             crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
-        while let Some(posting) = cursor.next_window()? {
+        while let Some(posting) = next_window_with_work(&mut *cursor, &mut || {
+            work(crate::executor::GraphPredicateWork::Checkpoint)
+        })? {
             let posting = posting.value();
             if !posting.key.starts_with(&key) {
                 break;
@@ -309,9 +383,15 @@ impl Database {
                 "Raise MEMORY_LIMIT to inspect these metadata rows.",
             )?;
             seen.insert(posting.entry.row_id);
-            if let Some(row) = visible_row(&source, table, posting.entry.row_id, snapshot)? {
+            if let Some(row) =
+                visible_row_with_work(&source, table, posting.entry.row_id, snapshot, &mut || {
+                    work(crate::executor::GraphPredicateWork::Checkpoint)
+                })?
+            {
+                let bytes = row.value().estimated_bytes().saturating_add(128);
+                work(crate::executor::GraphPredicateWork::ReserveRows(bytes))?;
                 output.try_grow_for(
-                    row.value().estimated_bytes().saturating_add(128),
+                    bytes,
                     "writer_source",
                     "metadata_output",
                     "Raise MEMORY_LIMIT to return these metadata rows.",
@@ -562,6 +642,27 @@ impl Database {
     }
     pub(super) fn writer_read_scope(&self) -> Result<WriterReadScope> {
         Ok(self.enter_writer_read(self.writer_read_root()?))
+    }
+
+    /// Predicate rows are temporary even when their statement retains its root.
+    pub(crate) fn writer_temporary_output_scope(&self) -> Result<WriterReadScope> {
+        let next = self.writer_read_root()?.map(|root| {
+            (
+                Arc::as_ptr(&self.tx_mgr) as usize,
+                root,
+                OutputOwners::default(),
+            )
+        });
+        let prior = ROOT.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), next));
+        Ok(WriterReadScope {
+            prior,
+            _same_thread: std::marker::PhantomData,
+        })
+    }
+    pub(crate) fn graph_predicate_memory(
+        &self,
+    ) -> crate::memory_accounting::OwnedMemoryReservation {
+        crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone())
     }
 
     pub(crate) fn retain_writer_output(
@@ -1466,6 +1567,59 @@ impl contextdb_graph::source::GraphReadSource for ScopedGraphSource {
             crate::persistence::writer_adapters::WriterGraphSnapshot::new(root)?,
         ))
     }
+}
+
+/// Probe only the selected endpoints. Reverse probes skip versions already
+/// visited by a selected source, preserving one visit per physical version.
+pub(super) fn visit_graph_versions_for_nodes(
+    store: &GraphStore,
+    root: Option<Arc<WriterSnapshot>>,
+    nodes: &HashSet<NodeId>,
+    mut visit: impl FnMut(&AdjEntry) -> Result<()>,
+) -> Result<()> {
+    for node in nodes {
+        for reverse in [false, true] {
+            let mut consume = |edge: &AdjEntry| -> Result<()> {
+                #[cfg(feature = "test-seams")]
+                resident_history_test_seams::note(|work| work.graph_keys_examined += 1);
+                if !reverse || !nodes.contains(&edge.source) {
+                    visit(edge)?;
+                }
+                Ok(())
+            };
+            if let Some(root) = &root {
+                let lower = node.as_bytes().to_vec();
+                let upper = node
+                    .as_u128()
+                    .checked_add(1)
+                    .map(|next| next.to_be_bytes().to_vec());
+                let mut cursor = root.cursor(
+                    if reverse { "graph_rev" } else { "graph_fwd" },
+                    crate::persistence::writer_source::WriterCursorFamily::Bytes,
+                    std::ops::Bound::Included(lower.as_slice()),
+                    upper.as_ref().map_or(std::ops::Bound::Unbounded, |upper| {
+                        std::ops::Bound::Excluded(upper.as_slice())
+                    }),
+                    false,
+                )?;
+                while let Some(window) = cursor.next_edge()? {
+                    consume(&window.value)?;
+                }
+            } else {
+                let adjacency = if reverse {
+                    &store.reverse_adj
+                } else {
+                    &store.forward_adj
+                };
+                if let Some(edges) = adjacency.read().get(node) {
+                    for edge in edges {
+                        consume(edge)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn visit_graph_versions(

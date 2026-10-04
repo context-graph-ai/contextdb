@@ -12314,7 +12314,7 @@ struct DatabaseOperationGuard<'a> {
     // Local/received DDL already owns the write side before entering here, so
     // this re-entrant read acquisition never attempts a read-to-write upgrade.
     _schema_publication: Option<SchemaPublicationGuard<'a>>,
-    _writer_read: writer_read::WriterReadScope,
+    _writer_read: Option<writer_read::WriterReadScope>,
 }
 
 #[derive(Default)]
@@ -12891,6 +12891,9 @@ impl DatabaseOperationGuard<'_> {
     /// candidate is being built.
     fn release_schema_publication_for_online_maintenance(&mut self) {
         self._schema_publication.take();
+        // Passes capture their own finite source; the cycle must not keep its
+        // opening storage root alive through closing physical reclamation.
+        self._writer_read.take();
     }
 }
 
@@ -17425,9 +17428,10 @@ impl MaintenanceContext {
                             Ok(true)
                         })?;
                     }
-                    writer_read::visit_graph_versions(
+                    writer_read::visit_graph_versions_for_nodes(
                         &self.graph,
                         writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?,
+                        &expired_nodes,
                         |entry| {
                             if entry.deleted_tx.is_none()
                                 && (expired_nodes.contains(&entry.source)
@@ -26846,6 +26850,14 @@ impl Database {
     /// use their relational provenance sidecar; deletes use their current
     /// tombstone marker or the durable accepted ancestry of a received delete.
     pub fn row_change_arrived_by_sync(&self, row: &RowChange) -> bool {
+        self.checked_row_change_arrived_by_sync(row)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "row provenance lookup failed");
+                false
+            })
+    }
+
+    pub(crate) fn checked_row_change_arrived_by_sync(&self, row: &RowChange) -> Result<bool> {
         let _operation = self.assert_open_operation();
         if !row.deleted {
             // The sidecar describes the row's CURRENT version, so it can only
@@ -26859,19 +26871,23 @@ impl Database {
             // strands that vector at a peer which never received the row it
             // belongs to.
             let snapshot = self.snapshot_for_read();
-            return self
-                .visible_row_by_natural_key(&row.table, &row.natural_key, snapshot, &HashSet::new())
-                .ok()
-                .flatten()
-                .is_some_and(|current| {
-                    current.lsn == row.lsn
-                        && matches!(
-                            self.relational_sync_source_at_read_root(&row.table, current.row_id)
-                                .ok()
-                                .and_then(|(_, kind)| kind),
-                            Some(contextdb_relational::store::SyncSourceKind::Pulled)
-                        )
-                });
+            let current = self.visible_row_by_natural_key(
+                &row.table,
+                &row.natural_key,
+                snapshot,
+                &HashSet::new(),
+            )?;
+            let Some(current) = current else {
+                return Ok(false);
+            };
+            if current.lsn != row.lsn {
+                return Ok(false);
+            }
+            return Ok(matches!(
+                self.relational_sync_source_at_read_root(&row.table, current.row_id)?
+                    .1,
+                Some(contextdb_relational::store::SyncSourceKind::Pulled)
+            ));
         }
         if self
             .sync_tombstone_arrivals
@@ -26885,19 +26901,14 @@ impl Database {
                     || marker.delete_lsn == SYNC_SOURCE_LSN_OWN_COMMIT)
             })
         {
-            return true;
+            return Ok(true);
         }
         // Reopen does not restore the session's arrival-order guard. The
         // received delete's durable lineage still identifies its exact local
         // occurrence, so its old row history must not become pending work.
-        let Ok(generation) = self.durable_lineage_table_generation(&row.table) else {
-            return false;
-        };
+        let generation = self.durable_lineage_table_generation(&row.table)?;
         let key = Self::durable_lineage_config_key(&row.table, &row.natural_key, generation);
-        let record = self
-            .load_lineage_record(&self.lineage_state_lock.lock(), &key)
-            .ok()
-            .flatten();
+        let record = self.load_lineage_record(&self.lineage_state_lock.lock(), &key)?;
         let received_delete = record.is_some_and(|record| {
             record.table == row.table
                 && record.natural_key == row.natural_key
@@ -26909,15 +26920,17 @@ impl Database {
         });
         // A new same-key row retires the old session marker; an older durable
         // delete must not hide that local work.
-        received_delete
-            && self
-                .visible_row_by_natural_key(
-                    &row.table,
-                    &row.natural_key,
-                    self.snapshot_for_read(),
-                    &HashSet::new(),
-                )
-                .is_ok_and(|current| current.is_none())
+        if !received_delete {
+            return Ok(false);
+        }
+        Ok(self
+            .visible_row_by_natural_key(
+                &row.table,
+                &row.natural_key,
+                self.snapshot_for_read(),
+                &HashSet::new(),
+            )?
+            .is_none())
     }
 
     fn graph_arrival_config_key(record: &DurableGraphArrival) -> Result<String> {
@@ -27018,24 +27031,22 @@ impl Database {
     ) -> Result<bool> {
         let _operation = self.assert_open_operation();
         if !vector.vector.is_empty() {
-            return Ok(self
-                .row_visible_at_snapshot(
-                    &vector.index.table,
-                    vector.row_id,
-                    self.snapshot_for_read(),
-                )
-                .is_some_and(|row| {
-                    row.lsn == vector.lsn
-                        && matches!(
-                            self.relational_sync_source_at_read_root(
-                                &vector.index.table,
-                                vector.row_id
-                            )
-                            .ok()
-                            .and_then(|(_, kind)| kind),
-                            Some(contextdb_relational::store::SyncSourceKind::Pulled)
-                        )
-                }));
+            let current = self.committed_row_at(
+                &vector.index.table,
+                vector.row_id,
+                self.snapshot_for_read(),
+            )?;
+            let Some(row) = current else {
+                return Ok(false);
+            };
+            if row.lsn != vector.lsn {
+                return Ok(false);
+            }
+            return Ok(matches!(
+                self.relational_sync_source_at_read_root(&vector.index.table, vector.row_id)?
+                    .1,
+                Some(contextdb_relational::store::SyncSourceKind::Pulled)
+            ));
         }
         Ok(self
             .find_history_change(vector.lsn, vector.lsn, |entry| {
@@ -32147,7 +32158,7 @@ impl Database {
         Ok(())
     }
 
-    fn ddl_affected_table(ddl: &DdlChange) -> Option<&str> {
+    pub(crate) fn ddl_affected_table(ddl: &DdlChange) -> Option<&str> {
         match ddl {
             DdlChange::CreateTable { name, .. }
             | DdlChange::DropTable { name }
@@ -33165,6 +33176,9 @@ impl Database {
         &self,
         table: &str,
     ) -> Result<BTreeSet<crate::sync_types::SchemaSyncCapability>> {
+        if let Some(root) = self.writer_read_root()? {
+            return RedbPersistence::authored_capabilities_in_read(&root, table);
+        }
         let mut capabilities = BTreeSet::new();
         for (_, ddl) in self.checked_ddl_entries_since(Lsn(0))?.iter() {
             if let DdlChange::CreateTable {
@@ -34387,7 +34401,11 @@ impl Database {
     ) -> Result<T> {
         let _schema_publication =
             self.enter_apply_changes_schema_publication_gate("sync pull apply")?;
-        let _operation = self.open_operation_after_public_tx_control_wait("sync pull apply")?;
+        let mut operation = self.open_operation_after_public_tx_control_wait("sync pull apply")?;
+        // The page may commit several received units. Each unit/helper reads
+        // its current published source instead of the page's opening root.
+        // Destination, lifecycle and schema-publication guards remain held.
+        drop(operation._writer_read.take());
         let established = self.retention_sync_peer.lock();
         self.ensure_authoritative_hub_locked(hub_node_id, &established)?;
         effect(self)
@@ -49074,7 +49092,11 @@ impl Database {
     /// A reopen failure preserves the durable file and returns the existing
     /// `StoreHandleRecycleFailed` error. Memory databases have no file to compact.
     pub fn compact_now(&self) -> Result<CompactionReport> {
-        let _operation = self.assert_open_operation();
+        let mut operation = self.assert_open_operation();
+        // Relocation captures each finite storage batch itself. The public
+        // operation's opening read root would retain the pages it reclaims.
+        // Keep lifecycle/schema guards and roots owned by actual readers.
+        drop(operation._writer_read.take());
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(CompactionReport::default());
         };
@@ -51428,7 +51450,7 @@ impl Database {
                 db_id,
                 _lock: None,
                 _schema_publication: None,
-                _writer_read: self.writer_read_scope()?,
+                _writer_read: Some(self.writer_read_scope()?),
             });
         }
 
@@ -51447,7 +51469,7 @@ impl Database {
             db_id,
             _lock: Some(lock),
             _schema_publication: Some(schema_publication),
-            _writer_read: self.writer_read_scope()?,
+            _writer_read: Some(self.writer_read_scope()?),
         })
     }
 
@@ -54579,6 +54601,52 @@ impl Database {
     /// must not compare those LSNs with this database's history. A DROP leaves
     /// the last declaration intact here: the local policy still decides
     /// whether remote work for that former generation may be applied.
+    pub(crate) fn declared_directions_for_tables<'a>(
+        &self,
+        tables: impl Iterator<Item = &'a str>,
+    ) -> Result<HashMap<String, SyncDirection>> {
+        let Some(root) = self.writer_read_root()? else {
+            return self.latest_declared_table_directions();
+        };
+        let mut directions = HashMap::new();
+        for table in tables {
+            if !directions.contains_key(table)
+                && let Some(direction) =
+                    RedbPersistence::declared_direction_in_read(&root, table, None)?
+            {
+                directions.insert(table.to_string(), direction);
+            }
+        }
+        Ok(directions)
+    }
+
+    pub(crate) fn try_sync_direction_history_for_changes(
+        &self,
+        changes: &ChangeSet,
+    ) -> Result<SyncDirectionHistory> {
+        let Some(root) = self.writer_read_root()? else {
+            return self.try_sync_direction_history();
+        };
+        let mut history = SyncDirectionHistory::default();
+        let positions = changes
+            .rows
+            .iter()
+            .map(|row| (row.table.as_str(), row.lsn))
+            .chain(
+                changes
+                    .vectors
+                    .iter()
+                    .map(|vector| (vector.index.table.as_str(), vector.lsn)),
+            )
+            .collect::<BTreeSet<_>>();
+        for (table, lsn) in positions {
+            let direction = RedbPersistence::declared_direction_in_read(&root, table, Some(lsn))?
+                .unwrap_or(SyncDirection::Both);
+            history.record_create(table.to_string(), lsn, direction);
+        }
+        Ok(history)
+    }
+
     pub(crate) fn latest_declared_table_directions(
         &self,
     ) -> Result<HashMap<String, SyncDirection>> {
@@ -54662,17 +54730,17 @@ impl Database {
             .expect("fixture declaration history")
     }
 
-    fn checked_ddl_entries_since(&self, since: Lsn) -> Result<Vec<(Lsn, DdlChange)>> {
+    fn checked_ddl_entries_since(&self, since: Lsn) -> Result<writer_read::DdlHistory> {
         self.ddl_log_entries_since_unlocked(since)
     }
 
-    fn durable_ddl_entries_since(&self, since: Lsn) -> Result<Vec<(Lsn, DdlChange)>> {
+    fn durable_ddl_entries_since(&self, since: Lsn) -> Result<writer_read::DdlHistory> {
         let (_, root) = self.capture_writer_statement()?;
         let root = root.ok_or_else(|| {
             Error::Other("durable declaration history requires a captured writer source".into())
         })?;
         if since >= root.lsn {
-            return Ok(Vec::new());
+            return Ok(Vec::new().into());
         }
         let mut cursor = root.ddl_history_cursor(since)?;
         let mut output =
@@ -54687,8 +54755,10 @@ impl Database {
             )?;
             entries.push(window.value);
         }
-        self.retain_writer_output(output);
-        Ok(entries)
+        Ok(writer_read::DdlHistory {
+            entries,
+            memory: Some(output),
+        })
     }
 
     fn ddl_log_since_unlocked(&self, since_lsn: Lsn) -> Result<Vec<DdlChange>> {
@@ -54699,7 +54769,7 @@ impl Database {
             .collect())
     }
 
-    fn ddl_log_entries_since_unlocked(&self, since_lsn: Lsn) -> Result<Vec<(Lsn, DdlChange)>> {
+    fn ddl_log_entries_since_unlocked(&self, since_lsn: Lsn) -> Result<writer_read::DdlHistory> {
         if self.persistence.is_some() {
             return self.durable_ddl_entries_since(since_lsn);
         }
@@ -54710,7 +54780,7 @@ impl Database {
             .cloned()
             .collect::<Vec<_>>();
         entries.sort_by_key(|(lsn, _)| *lsn);
-        Ok(entries)
+        Ok(entries.into())
     }
 
     /// Read one immutable persisted-log occurrence. Received-arrival digests
@@ -58085,8 +58155,16 @@ impl Database {
             if let (_, Some(root)) = self.capture_writer_statement()? {
                 let mut changes = root.change_log_cursor(Lsn(0), root.lsn)?;
                 let first_change = changes.next_change()?.map(|window| window.value.lsn());
-                let mut ddl = root.ddl_history_cursor(Lsn(0))?;
-                let first_ddl = ddl.next_ddl_history()?.map(|window| window.value.0);
+                // A covered data-log frontier already proves the combined
+                // history covers this watermark. Only a gap needs the DDL
+                // head; that check needs its position, not its schema payload.
+                let first_ddl =
+                    if first_change.is_none_or(|lsn| lsn.0 > since_lsn.0.saturating_add(1)) {
+                        let mut ddl = root.ddl_history_cursor(Lsn(0))?;
+                        ddl.next_ddl_position()?.map(|window| window.value)
+                    } else {
+                        None
+                    };
                 (
                     first_change,
                     first_change.is_none(),
@@ -58162,7 +58240,7 @@ impl Database {
             let ddl = if projection.ddl {
                 self.ddl_log_entries_since_unlocked(since_lsn)?
             } else {
-                Vec::new()
+                Vec::new().into()
             };
             let changes = self.change_log_since_unlocked(since_lsn)?;
             Ok((ddl, changes))
@@ -58752,7 +58830,7 @@ impl Database {
         let snapshot = self.snapshot();
         let confirmed_snapshot = self.snapshot_at(confirmed_frontier);
         let no_deleted = HashSet::new();
-        let history = self.try_sync_direction_history()?;
+        let history = self.try_sync_direction_history_for_changes(&changes)?;
         let roots = changes
             .rows
             .iter()
@@ -59276,7 +59354,12 @@ impl Database {
     ) -> (ChangeSet, HashMap<Lsn, Option<Lsn>>) {
         let _schema_publication = self.enter_schema_publication_gate(false);
         let changes = self.changes_since_under_schema_gate(since_lsn);
-        let arrivals = self.sync_arrivals_for_changes(&changes);
+        let arrivals = self
+            .sync_arrivals_for_changes(&changes)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "sync arrival inspection failed");
+                HashMap::new()
+            });
         (changes, arrivals)
     }
 
@@ -59294,16 +59377,15 @@ impl Database {
         let pending = self.durable_pending_deletes_since(since_lsn)?;
         let (base, provenance_source) = self.changes_since_base(since_lsn)?;
         let changes = Self::reconcile_durable_pending_deletes(base, pending);
-        let arrivals = self.sync_arrivals_for_changes(&changes);
+        let arrivals = self.sync_arrivals_for_changes(&changes)?;
         Ok((changes, arrivals, provenance_source))
     }
 
     pub(crate) fn sync_arrivals_for_changes(
         &self,
         changes: &ChangeSet,
-    ) -> HashMap<Lsn, Option<Lsn>> {
+    ) -> Result<HashMap<Lsn, Option<Lsn>>> {
         self.sync_arrivals_for_changes_within(changes, &|| Ok(()))
-            .expect("an unconditional checkpoint never refuses")
     }
 
     /// [`Self::sync_arrivals_for_changes`] with a checkpoint between rows.
@@ -59340,9 +59422,7 @@ impl Database {
                     &row.natural_key,
                     snapshot,
                     &empty_skip_deleted,
-                )
-                .ok()
-                .flatten()
+                )?
                 .map(|versioned| {
                     self.relational_sync_source_at_read_root(&row.table, versioned.row_id)
                 })
@@ -59420,11 +59500,11 @@ impl Database {
     /// Return the durable raw DDL history rather than the ephemeral in-memory
     /// log when this database has persistence. A forced log gap must not turn
     /// old received schema into unprovable synthetic output after a move.
-    pub(crate) fn durable_ddl_history_for_provenance(&self) -> Result<Vec<(Lsn, DdlChange)>> {
+    fn durable_ddl_history_for_provenance(&self) -> Result<writer_read::DdlHistory> {
         if self.persistence.is_some() {
             self.durable_ddl_entries_since(Lsn(0))
         } else {
-            Ok(self.ddl_log.read().clone())
+            Ok(self.ddl_log.read().clone().into())
         }
     }
 
@@ -70414,22 +70494,13 @@ fn prune_expired_rows(
         if meta.default_ttl_seconds.is_none() {
             continue;
         }
-        if frontier.no_future_stamps(table_name, skew_horizon)? {
-            continue;
+        let (table_future_rows, progress) =
+            frontier.future_stamp_count(table_name, meta, skew_horizon)?;
+        if let Some(progress) = progress {
+            retention_progress.push(progress);
         }
-        let mut table_has_future_dated = false;
-        frontier.visit_all(table_name, |row| {
-            #[cfg(feature = "test-seams")]
-            resident_history_test_seams::note(|work| work.retention_keys_examined += 1);
-            if row.deleted_tx.is_none()
-                && row.created_at.is_some_and(|stamp| stamp.0 > skew_horizon)
-            {
-                future_dated_rows = future_dated_rows.saturating_add(1);
-                table_has_future_dated = true;
-            }
-            Ok(true)
-        })?;
-        if table_has_future_dated {
+        future_dated_rows = future_dated_rows.saturating_add(table_future_rows);
+        if table_future_rows > 0 {
             workspace.try_grow_for(
                 256usize.saturating_add(table_name.len().saturating_mul(2)),
                 "retention",
@@ -70707,29 +70778,34 @@ fn prune_expired_rows(
     let graph_root = writer_read::durable_root(tx_mgr.capture_published_read().handle)?;
     let mut removed_edges = Vec::new();
     if !reclaimable_edge_nodes.is_empty() {
-        writer_read::visit_graph_versions(graph_store, graph_root.clone(), |entry| {
-            if !edge_is_reclaimable(entry) {
-                return Ok(());
-            }
-            workspace.try_grow_for(
-                1024usize.saturating_add(entry.edge_type.len().saturating_mul(4)),
-                "retention",
-                "prepare_prune",
-                "Raise MEMORY_LIMIT to admit the retention edge identities.",
-            )?;
-            // Persistence removes by identity; properties are not needed and
-            // must never be cloned just to delete the edge that owns them.
-            removed_edges.push(AdjEntry {
-                source: entry.source,
-                target: entry.target,
-                edge_type: entry.edge_type.clone(),
-                properties: HashMap::new(),
-                created_tx: entry.created_tx,
-                deleted_tx: entry.deleted_tx,
-                lsn: entry.lsn,
-            });
-            Ok(())
-        })?;
+        writer_read::visit_graph_versions_for_nodes(
+            graph_store,
+            graph_root.clone(),
+            &reclaimable_edge_nodes,
+            |entry| {
+                if !edge_is_reclaimable(entry) {
+                    return Ok(());
+                }
+                workspace.try_grow_for(
+                    1024usize.saturating_add(entry.edge_type.len().saturating_mul(4)),
+                    "retention",
+                    "prepare_prune",
+                    "Raise MEMORY_LIMIT to admit the retention edge identities.",
+                )?;
+                // Persistence removes by identity; properties are not needed and
+                // must never be cloned just to delete the edge that owns them.
+                removed_edges.push(AdjEntry {
+                    source: entry.source,
+                    target: entry.target,
+                    edge_type: entry.edge_type.clone(),
+                    properties: HashMap::new(),
+                    created_tx: entry.created_tx,
+                    deleted_tx: entry.deleted_tx,
+                    lsn: entry.lsn,
+                });
+                Ok(())
+            },
+        )?;
     }
 
     if !removed_edges.is_empty() {
@@ -70739,55 +70815,65 @@ fn prune_expired_rows(
             .iter()
             .map(|entry| (entry.source, entry.edge_type.as_str(), entry.target))
             .collect::<HashSet<_>>();
-        writer_read::visit_graph_versions(graph_store, graph_root.clone(), |entry| {
-            if edge_is_reclaimable(entry)
-                || !identities.contains(&(entry.source, entry.edge_type.as_str(), entry.target))
-            {
-                return Ok(());
-            }
-            workspace.try_grow_for(
-                entry.estimated_bytes().saturating_mul(8),
-                "retention",
-                "prepare_prune",
-                "Raise MEMORY_LIMIT to repair retained edge identities.",
-            )?;
-            Ok(())
-        })?;
+        writer_read::visit_graph_versions_for_nodes(
+            graph_store,
+            graph_root.clone(),
+            &reclaimable_edge_nodes,
+            |entry| {
+                if edge_is_reclaimable(entry)
+                    || !identities.contains(&(entry.source, entry.edge_type.as_str(), entry.target))
+                {
+                    return Ok(());
+                }
+                workspace.try_grow_for(
+                    entry.estimated_bytes().saturating_mul(8),
+                    "retention",
+                    "prepare_prune",
+                    "Raise MEMORY_LIMIT to repair retained edge identities.",
+                )?;
+                Ok(())
+            },
+        )?;
     }
 
     let mut deferred_edge_nodes = HashSet::new();
     let mut deferred_edge_memory =
         crate::memory_accounting::OwnedMemoryReservation::new(ctx.accountant.clone());
     {
-        writer_read::visit_graph_versions(graph_store, graph_root.clone(), |entry| {
-            if edge_is_reclaimable(entry) {
-                return Ok(());
-            }
-            for node in [entry.source, entry.target]
-                .into_iter()
-                .filter(|node| reclaimable_edge_nodes.contains(node))
-            {
-                if deferred_edge_nodes.contains(&node) {
-                    continue;
+        writer_read::visit_graph_versions_for_nodes(
+            graph_store,
+            graph_root.clone(),
+            &reclaimable_edge_nodes,
+            |entry| {
+                if edge_is_reclaimable(entry) {
+                    return Ok(());
                 }
-                // The request holds the serialization/B-tree copies; the next
-                // published carry state retains its own hash-bucket charge.
-                workspace.try_grow_for(
-                    128,
-                    "retention",
-                    "prepare_prune",
-                    "Raise MEMORY_LIMIT to encode reader-deferred retention identities.",
-                )?;
-                deferred_edge_memory.try_grow_for(
-                    128,
-                    "retention",
-                    "prepare_prune",
-                    "Raise MEMORY_LIMIT to retain reader-deferred retention identities.",
-                )?;
-                deferred_edge_nodes.insert(node);
-            }
-            Ok(())
-        })?;
+                for node in [entry.source, entry.target]
+                    .into_iter()
+                    .filter(|node| reclaimable_edge_nodes.contains(node))
+                {
+                    if deferred_edge_nodes.contains(&node) {
+                        continue;
+                    }
+                    // The request holds the serialization/B-tree copies; the next
+                    // published carry state retains its own hash-bucket charge.
+                    workspace.try_grow_for(
+                        128,
+                        "retention",
+                        "prepare_prune",
+                        "Raise MEMORY_LIMIT to encode reader-deferred retention identities.",
+                    )?;
+                    deferred_edge_memory.try_grow_for(
+                        128,
+                        "retention",
+                        "prepare_prune",
+                        "Raise MEMORY_LIMIT to retain reader-deferred retention identities.",
+                    )?;
+                    deferred_edge_nodes.insert(node);
+                }
+                Ok(())
+            },
+        )?;
     }
 
     // Bounded to the tables THIS pass touches, never the whole change log
@@ -73712,7 +73798,7 @@ fn merge_sync_alter_existing_column(current: &mut ColumnDef, incoming: ColumnDef
 /// clause at all. Matched on the rendered constraint text because that is the
 /// shape table DDL travels in; the local doors read the same words off the
 /// parsed statement.
-fn constraint_declares_sync_direction(constraint: &str) -> Option<SyncDirection> {
+pub(crate) fn constraint_declares_sync_direction(constraint: &str) -> Option<SyncDirection> {
     let upper = constraint.to_ascii_uppercase();
     let normalized = upper.split_whitespace().collect::<Vec<_>>().join(" ");
     [
@@ -74224,7 +74310,7 @@ fn rough_sync_table_meta(
 /// still matched the substring check, silently latching an attribute the
 /// arriving DDL never actually declared. Applies to any table, reserved or
 /// not.
-fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
+pub(crate) fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
     let sql = format!("CREATE TABLE __rough_sync_column_shape ({name} {ty})");
     if let Ok(Statement::CreateTable(table)) = contextdb_parser::parse(&sql)
         && let Some(ast_column) = table.columns.into_iter().next()

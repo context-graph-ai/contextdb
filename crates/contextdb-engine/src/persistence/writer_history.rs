@@ -190,6 +190,8 @@ impl super::writer_source::WriterReadCursor {
         encoded_kind: u8,
     ) -> Result<Option<super::writer_source::WriterWindow<(Lsn, Option<DdlChange>)>>> {
         self.next(|key, value| {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_ddl_occurrence();
             let key = std::str::from_utf8(key)
                 .map_err(|_| Error::Other("invalid declaration log key".into()))?;
             let lsn = RedbPersistence::ddl_lsn_from_key(key)?;
@@ -215,6 +217,8 @@ impl super::writer_source::WriterReadCursor {
         &mut self,
     ) -> Result<Option<super::writer_source::WriterWindow<Lsn>>> {
         self.next(|key, _| {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_ddl_occurrence();
             let key = std::str::from_utf8(key)
                 .map_err(|_| Error::Other("invalid declaration log key".into()))?;
             RedbPersistence::ddl_lsn_from_key(key)
@@ -225,6 +229,8 @@ impl super::writer_source::WriterReadCursor {
         &mut self,
     ) -> Result<Option<super::writer_source::WriterWindow<(Lsn, DdlChange)>>> {
         self.next(|key, value| {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_ddl_occurrence();
             let key = std::str::from_utf8(key)
                 .map_err(|_| Error::Other("invalid declaration log key".into()))?;
             let lsn = key

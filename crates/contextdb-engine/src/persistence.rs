@@ -19,6 +19,7 @@ mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
 pub(crate) mod writer_cleanup_progress;
 mod writer_commit_directory;
+mod writer_ddl_summary;
 mod writer_export;
 mod writer_file;
 mod writer_history;
@@ -21431,6 +21432,7 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?;
                     for (index, change) in ddl_entries.iter().enumerate() {
                         let key = Self::ddl_log_key_for_index(lsn, index, ddl_entries.len());
+                        Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
                         let encoded = Self::encode(change)?;
                         ddl_table
                             .insert(key.as_str(), encoded.as_slice())
@@ -22054,6 +22056,7 @@ impl RedbPersistence {
                 for (lsn, ddl) in grouped {
                     for (index, change) in ddl.iter().enumerate() {
                         let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                        Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
                         let encoded = Self::encode(*change)?;
                         ddl_table
                             .insert(key.as_str(), encoded.as_slice())
@@ -22651,6 +22654,7 @@ impl RedbPersistence {
                 for (lsn, changes) in grouped {
                     for (index, change) in changes.iter().enumerate() {
                         let key = Self::ddl_log_key_for_index(lsn, index, changes.len());
+                        Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
                         let encoded = Self::encode(*change)?;
                         ddl.insert(key.as_str(), encoded.as_slice())
                             .map_err(Self::storage_error)?;
@@ -22870,6 +22874,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 for (index, change) in stage.ddl.iter().enumerate() {
                     let key = Self::ddl_log_key_for_index(lsn, index, stage.ddl.len());
+                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
                     let encoded = Self::encode(change)?;
                     ddl_table
                         .insert(key.as_str(), encoded.as_slice())
@@ -23025,6 +23030,7 @@ impl RedbPersistence {
                     .open_table(DDL_LOG_TABLE)
                     .map_err(Self::storage_error)?;
                 let key = Self::ddl_log_key(lsn);
+                Self::append_ddl_summary_in_write(&write_txn, &key, ddl)?;
                 let encoded = Self::encode(ddl)?;
                 ddl_table
                     .insert(key.as_str(), encoded.as_slice())
@@ -23233,6 +23239,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 for (index, change) in ddl.iter().enumerate() {
                     let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
                     let encoded = Self::encode(change)?;
                     ddl_table
                         .insert(key.as_str(), encoded.as_slice())
@@ -23617,6 +23624,7 @@ impl RedbPersistence {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             let key = Self::ddl_log_key(lsn);
+            Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
             let encoded = Self::encode(change)?;
             {
                 let mut table = write_txn
@@ -23846,6 +23854,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 for (index, change) in ddl.iter().enumerate() {
                     let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
                     let encoded = Self::encode(change)?;
                     ddl_table
                         .insert(key.as_str(), encoded.as_slice())
@@ -24000,6 +24009,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 for (index, change) in ddl.iter().enumerate() {
                     let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
                     let encoded = Self::encode(change)?;
                     ddl_table
                         .insert(key.as_str(), encoded.as_slice())
@@ -24416,6 +24426,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 for (index, change) in ddl.iter().enumerate() {
                     let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
                     let encoded = Self::encode(change)?;
                     ddl_table
                         .insert(key.as_str(), encoded.as_slice())
@@ -31429,6 +31440,18 @@ impl RedbPersistence {
             state.2 = fragmentation_ratio;
         }
         let checkpoint_accountant = accountant.clone();
+        // Fund only the paths this batch can retain. Leave at least half the
+        // currently available budget for actual page buffers and checkpoint
+        // controls; a small declaration advances through fewer pages instead
+        // of paying the maximum batch's path reservation up front.
+        const PATH_BYTES_PER_PAGE: usize = 1024;
+        let maximum =
+            accountant
+                .usage()
+                .available
+                .map_or(STORAGE_MAINTENANCE_PAGE_BATCH, |available| {
+                    (available / 2 / PATH_BYTES_PER_PAGE).clamp(1, STORAGE_MAINTENANCE_PAGE_BATCH)
+                });
         let workspace = Arc::new(parking_lot::Mutex::new(
             crate::memory_accounting::OwnedMemoryReservation::new(accountant),
         ));
@@ -31436,7 +31459,7 @@ impl RedbPersistence {
         // file size. Source and destination page buffers are admitted below
         // using their actual allocation sizes, including oversized values.
         workspace.lock().try_grow_for(
-            64 * 1024,
+            maximum * PATH_BYTES_PER_PAGE,
             "storage_compaction",
             "page_paths",
             "Raise MEMORY_LIMIT to admit a storage maintenance batch.",
@@ -31468,7 +31491,7 @@ impl RedbPersistence {
         let result = redb::with_read_memory_admission(admission.clone(), || {
             txn.compact_step_with_cursor_hook(
                 &mut state.0,
-                STORAGE_MAINTENANCE_PAGE_BATCH,
+                maximum,
                 |bytes| {
                     #[cfg(test)]
                     COMPACTION_BATCH_OBSERVER.with(|slot| {
@@ -32416,6 +32439,7 @@ impl RedbPersistence {
                     let count = end - start;
                     for (offset, (_, change)) in entries[start..end].iter().enumerate() {
                         let key = Self::ddl_log_key_for_index(lsn, offset, count);
+                        Self::append_ddl_summary_in_write(&write_txn, &key, change)?;
                         let encoded = Self::encode(change)?;
                         ddl_table
                             .insert(key.as_str(), encoded.as_slice())
