@@ -507,7 +507,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         cancelled_cursor.cursor.continuation_bytes().unwrap().total > 0,
         "cancellable cursor owns real continuation scratch"
     );
-    // Publish a third root so cancellation can release the successor's last
+    // Retire the successor so terminal cursor close can release its last
     // native owner without asserting database-wide absence of live readers.
     database
         .execute(
@@ -524,19 +524,113 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     );
     let cancellation = contextdb_engine::OwnerReadCancellation::new();
     cancellation.cancel();
-    assert!(cancelled_cursor.cursor.fetch(None, cancellation).is_err());
+    let retained_bytes = cancelled_cursor.cursor.continuation_bytes().unwrap().total;
+    let retained_native = database
+        .__native_read_transaction_count_for_test(successor_physical.transaction_id)
+        .unwrap();
+    let (cancelled, cancelled_fetch_work) = observe_target("reader_items", || {
+        cancelled_cursor.cursor.fetch(None, cancellation)
+    });
+    assert!(matches!(cancelled, Err(bounded::TestError::Cancelled)));
+    assert_eq!(cancelled_fetch_work.physical_source_calls, 0);
+    assert_eq!(
+        cancelled_cursor.cursor.continuation_bytes().unwrap().total,
+        retained_bytes
+    );
+    assert_eq!(
+        database
+            .__native_read_transaction_count_for_test(successor_physical.transaction_id)
+            .unwrap(),
+        retained_native,
+        "request cancellation retains the cursor's actual storage root"
+    );
+    let resumed = cancelled_cursor
+        .cursor
+        .fetch(None, Default::default())
+        .unwrap()
+        .page;
+    assert_eq!(resumed.rows, vec![expected_new[1].clone()]);
+    assert!(
+        resumed.has_more,
+        "the same cursor remains suspended after resuming its cancelled fetch"
+    );
+    assert!(cancelled_cursor.cursor.continuation_bytes().unwrap().total > 0);
+    cancelled_cursor.cursor.close().unwrap();
     assert_eq!(
         database
             .__native_read_transaction_count_for_test(successor_physical.transaction_id)
             .unwrap(),
         0,
-        "cancellation releases the actual retired native transaction without dropping the cursor object"
+        "terminal close releases the actual retired native transaction without dropping the cursor object"
     );
     assert_eq!(
         cancelled_cursor.cursor.continuation_bytes().unwrap().total,
         0,
-        "cancellation releases continuation scratch while the cursor object survives"
+        "terminal close releases continuation scratch while the cursor object survives"
     );
+    let refusal_clock = Arc::new(ManualDeadlineClock::at(0));
+    let refusal_request = bounded::BoundedReadRequest::new(
+        successor_sql,
+        HashMap::new(),
+        ReadLimits {
+            cursor_idle_ms: 10,
+            cursor_lifetime_ms: 100,
+            ..limits
+        },
+        refusal_clock.clone(),
+    );
+    let (refused_cursor, refusal_work) = observe_target("reader_items", || {
+        bounded::open_cursor(database.clone(), &refusal_request)
+    });
+    let refusal_physical = refusal_work
+        .physical_sources
+        .iter()
+        .flatten()
+        .next()
+        .unwrap()
+        .1;
+    let mut refused_cursor = refused_cursor.unwrap();
+    assert!(refused_cursor.first_page.has_more);
+    assert!(refused_cursor.cursor.continuation_bytes().unwrap().total > 0);
+    database
+        .execute(
+            "UPDATE displacement SET body = 'refusal root' WHERE id = 1",
+            &HashMap::new(),
+        )
+        .unwrap();
+    assert!(
+        database
+            .__native_read_transaction_count_for_test(refusal_physical.transaction_id)
+            .unwrap()
+            > 0
+    );
+    refusal_clock.advance_to(11);
+    let error = refused_cursor
+        .cursor
+        .fetch(None, Default::default())
+        .err()
+        .expect("idle expiry is a terminal typed refusal");
+    let bounded::TestError::Refused(refusal) = error else {
+        panic!("expected typed idle expiry, got {error:?}")
+    };
+    assert_eq!(
+        refusal.kind(),
+        contextdb_core::read_contract::ReadFailureKind::CursorExpired
+    );
+    assert_eq!(
+        refusal.detail(),
+        &contextdb_core::read_contract::ReadFailureDetail::CursorExpired {
+            expiry: contextdb_core::read_contract::CursorExpiryKind::Idle,
+        }
+    );
+    assert_eq!(
+        database
+            .__native_read_transaction_count_for_test(refusal_physical.transaction_id)
+            .unwrap(),
+        0,
+        "typed terminal refusal releases the retired root while the cursor object survives"
+    );
+    assert_eq!(refused_cursor.cursor.continuation_bytes().unwrap().total, 0);
     assert_eq!(
         database
             .vector_memory_ownership_receipt_for_test()
