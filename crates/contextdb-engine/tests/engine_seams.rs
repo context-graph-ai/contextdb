@@ -122,3 +122,12 @@ mod writer_reader_root_survives_commit_eviction_and_cleanup;
 
 #[path = "engine_seams/resident_history_support.rs"]
 mod resident_history_support;
+
+#[path = "engine_seams/retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_grow.rs"]
+mod retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_grow;
+
+#[path = "engine_seams/bounded_graph_where_charge_is_independent_of_rejected_candidates.rs"]
+mod bounded_graph_where_charge_is_independent_of_rejected_candidates;
+
+#[path = "engine_seams/outbound_sync_refuses_typed_when_provenance_sidecar_read_fails.rs"]
+mod outbound_sync_refuses_typed_when_provenance_sidecar_read_fails;
