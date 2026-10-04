@@ -198,7 +198,17 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         );
         source.accountant().reset_high_water_for_test();
         let baseline = source.accountant().usage().used;
+        contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
         let ((result, reads), work) = summaries(|| history(|| runtime.block_on(client.push())));
+        let ledger = contextdb_engine::memory_accounting::take_budget_ledger_for_test();
+        let mut named = std::collections::BTreeMap::<String, (usize, usize, usize)>::new();
+        for entry in &ledger {
+            let sample = named.entry(entry.what.clone()).or_default();
+            sample.0 += 1;
+            sample.1 += entry.bytes;
+            sample.2 = sample.2.max(entry.used_after);
+        }
+        eprintln!("settled push allocation ledger occurrences={occurrences} actual={named:?}");
         let result = result.unwrap();
         let peak = source
             .accountant()
