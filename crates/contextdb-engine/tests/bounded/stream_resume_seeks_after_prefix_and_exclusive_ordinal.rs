@@ -6,6 +6,7 @@
 use contextdb_core::{Value, Wallclock};
 use contextdb_engine::Database;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 #[test]
 fn stream_resume_seeks_after_prefix_and_exclusive_ordinal() {
@@ -100,5 +101,178 @@ fn stream_resume_seeks_after_prefix_and_exclusive_ordinal() {
         measurements[0],
         vec![2, 2],
         "only the fixed two-row pending window may be examined"
+    );
+    consumer_declarations_seek_to_the_pending_batch();
+}
+
+// Exercise the consumer's complete key declarations and its batch-claim SQL,
+// including the unbound source_sequence before ordinal in the cursor index.
+fn consumer_declarations_seek_to_the_pending_batch() {
+    let mut measurements = Vec::new();
+    for completed in [10_i64, 2_010] {
+        let database = Database::open_memory();
+        for ddl in [
+            "CREATE TABLE contexts (id UUID PRIMARY KEY)",
+            "CREATE TABLE event_search_generations (id UUID PRIMARY KEY, context_id UUID NOT NULL, UNIQUE (context_id, id))",
+            "CREATE TABLE events (id UUID PRIMARY KEY, context_id UUID NOT NULL, UNIQUE (context_id, id))",
+            "CREATE TABLE event_interpretation_values (context_id UUID NOT NULL, generation_id UUID NOT NULL, event_id UUID NOT NULL, PRIMARY KEY (context_id, generation_id, event_id), UNIQUE (context_id, generation_id, event_id))",
+            "CREATE TABLE event_search_source_events (membership_id UUID NOT NULL UNIQUE, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), ordinal INTEGER NOT NULL, event_id UUID NOT NULL REFERENCES events(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, source_sequence INTEGER NOT NULL, effective_interpretation_generation_id UUID, captured_source_sha256 TEXT NOT NULL, effective_source_sha256 TEXT NOT NULL, PRIMARY KEY (context_id, generation_id, ordinal), UNIQUE (context_id, generation_id, event_id), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id), FOREIGN KEY (context_id, effective_interpretation_generation_id, event_id) REFERENCES event_interpretation_values(context_id, generation_id, event_id)) IMMUTABLE SYNC OFF",
+            "CREATE INDEX idx_event_search_source_events_generation ON event_search_source_events (generation_id, context_id, ordinal)",
+            "CREATE INDEX idx_event_search_source_events_cursor_range ON event_search_source_events (context_id, generation_id, connector_id, source_instance_ref, source_sequence, ordinal)",
+        ] {
+            database.execute(ddl, &HashMap::new()).unwrap();
+        }
+        let context = Uuid::from_u128(7);
+        let generation = Uuid::from_u128(11);
+        let neighbour_context = Uuid::from_u128(8);
+        let neighbour_generation = Uuid::from_u128(12);
+        let transaction = database.begin_or_panic();
+        for (context, generation) in [
+            (context, generation),
+            (neighbour_context, neighbour_generation),
+        ] {
+            database
+                .execute_in_tx(
+                    transaction,
+                    "INSERT INTO contexts VALUES ($context)",
+                    &HashMap::from([("context".into(), Value::Uuid(context))]),
+                )
+                .unwrap();
+            database
+                .execute_in_tx(
+                    transaction,
+                    "INSERT INTO event_search_generations VALUES ($generation,$context)",
+                    &HashMap::from([
+                        ("context".into(), Value::Uuid(context)),
+                        ("generation".into(), Value::Uuid(generation)),
+                    ]),
+                )
+                .unwrap();
+        }
+        let insert = |id: u128,
+                      context: Uuid,
+                      generation: Uuid,
+                      connector: &str,
+                      source: &str,
+                      session: &str,
+                      ordinal: i64,
+                      sequence: i64| {
+            let event = Uuid::from_u128(id);
+            database
+                .execute_in_tx(
+                    transaction,
+                    "INSERT INTO events VALUES ($event,$context)",
+                    &HashMap::from([
+                        ("event".into(), Value::Uuid(event)),
+                        ("context".into(), Value::Uuid(context)),
+                    ]),
+                )
+                .unwrap();
+            database.execute_in_tx(transaction,
+                "INSERT INTO event_search_source_events VALUES ($membership,$context,$generation,$ordinal,$event,$connector,$source,$session,$sequence,NULL,'captured','effective')",
+                &HashMap::from([
+                    ("membership".into(), Value::Uuid(Uuid::from_u128(id + 10_000_000))),
+                    ("context".into(), Value::Uuid(context)),
+                    ("generation".into(), Value::Uuid(generation)),
+                    ("ordinal".into(), Value::Int64(ordinal)),
+                    ("event".into(), Value::Uuid(event)),
+                    ("connector".into(), Value::Text(connector.into())),
+                    ("source".into(), Value::Text(source.into())),
+                    ("session".into(), Value::Text(session.into())),
+                    ("sequence".into(), Value::Int64(sequence)),
+                ])).unwrap();
+        };
+        let mut id = 100_u128;
+        for (stream, (row_context, row_generation, connector, source, session)) in [
+            (context, generation, "connector", "source", "selected"),
+            (context, generation, "connector", "source", "neighbour"),
+            (context, generation, "connector", "other-source", "selected"),
+            (context, generation, "other-connector", "source", "selected"),
+            (
+                neighbour_context,
+                neighbour_generation,
+                "connector",
+                "source",
+                "selected",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for offset in 0..completed {
+                let ordinal = if stream == 0 {
+                    100_000 - completed + offset
+                } else {
+                    stream as i64 * 1_000_000 + offset
+                };
+                insert(
+                    id,
+                    row_context,
+                    row_generation,
+                    connector,
+                    source,
+                    session,
+                    ordinal,
+                    offset + 1,
+                );
+                id += 1;
+            }
+        }
+        for offset in 0..4_i64 {
+            insert(
+                1_000_000 + offset as u128,
+                context,
+                generation,
+                "connector",
+                "source",
+                "selected",
+                100_000 + offset,
+                100_000 + offset + 1,
+            );
+        }
+        database.commit(transaction).unwrap();
+        let result = database.execute(
+            "SELECT membership_id, ordinal, event_id, connector_id, source_instance_ref, session_ref, source_sequence, effective_interpretation_generation_id, captured_source_sha256, effective_source_sha256 FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND ordinal >= $start_ordinal ORDER BY ordinal ASC LIMIT 2",
+            &HashMap::from([
+                ("context_id".into(),Value::Uuid(context)),
+                ("generation_id".into(),Value::Uuid(generation)),
+                ("connector_id".into(),Value::Text("connector".into())),
+                ("source".into(),Value::Text("source".into())),
+                ("session".into(),Value::Text("selected".into())),
+                ("start_ordinal".into(),Value::Int64(100_000)),
+            ])).unwrap();
+        let expected = (0..2_i64)
+            .map(|offset| {
+                vec![
+                    Value::Uuid(Uuid::from_u128(11_000_000 + offset as u128)),
+                    Value::Int64(100_000 + offset),
+                    Value::Uuid(Uuid::from_u128(1_000_000 + offset as u128)),
+                    Value::Text("connector".into()),
+                    Value::Text("source".into()),
+                    Value::Text("selected".into()),
+                    Value::Int64(100_000 + offset + 1),
+                    Value::Null,
+                    Value::Text("captured".into()),
+                    Value::Text("effective".into()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result.rows, expected,
+            "the batch claim returns only its ordered pending session tail"
+        );
+        eprintln!(
+            "consumer batch claim completed={completed} index={:?} sort_elided={} rows_examined={}",
+            result.trace.index_used, result.trace.sort_elided, result.trace.rows_examined
+        );
+        measurements.push(result.trace.rows_examined);
+    }
+    assert_eq!(
+        measurements[0], measurements[1],
+        "the declared consumer batch claim must not examine completed entries or neighbouring sessions as the completed prefix grows: {measurements:?}"
+    );
+    assert_eq!(
+        measurements[0], 2,
+        "only the fixed pending batch may be examined"
     );
 }
