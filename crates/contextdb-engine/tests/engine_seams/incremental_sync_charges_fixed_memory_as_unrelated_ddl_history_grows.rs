@@ -141,6 +141,16 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         );
         runtime.block_on(client.push()).unwrap();
         runtime.block_on(client.pull_default()).unwrap();
+        // Pull installs received schema after the first push's watermark.
+        // Settle that bootstrap before measuring a fixed data-only delta.
+        sql(
+            &source,
+            "UPDATE notes SET body = 'bootstrap-settled' WHERE id = 1",
+        );
+        sql(&source, "UPDATE notes SET body = 'bootstrap' WHERE id = 1");
+        let settled_frontier = source.current_lsn();
+        runtime.block_on(client.push()).unwrap();
+        assert!(client.push_watermark() >= settled_frontier);
         assert_eq!(
             ids(&hub, "reincarnated"),
             vec![vec![Value::Int64(40)]],
