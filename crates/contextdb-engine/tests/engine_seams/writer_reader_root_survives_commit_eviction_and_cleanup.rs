@@ -387,6 +387,17 @@ fn reader_at_boundary(boundary: CommitBoundary) {
                 .then_some(*identity)
         })
         .expect("successor statement must observe its own actual physical page root");
+    let graph_route = contextdb_vector::VectorPartitionRef::new(
+        VectorIndexRef::new("reader_items", "embedding"),
+        VectorPartitionKey::default(),
+    );
+    assert!(
+        database
+            .vector_store_for_test()
+            .evict_resident_partition_generation(&graph_route, true),
+        "the writer-preloaded sealed base must actually be evicted through its durable descriptor"
+    );
+    displace();
     // Only the three answer rows have vectors; the maintained vector route excludes NULLs.
     let (_, indexed_transaction_work) = observe_target("reader_items", || {
         for (offset, vector) in old_vectors.iter().enumerate() {
@@ -396,6 +407,20 @@ fn reader_at_boundary(boundary: CommitBoundary) {
                 vec![vec![Value::Int64(offset as i64 + 1)]]);
         }
     });
+    assert!(
+        indexed_transaction_work.target_backend_bytes[PhysicalFamily::Graph as usize] > 0,
+        "the captured indexed read must reload sealed Graph pages after real eviction: {indexed_transaction_work:?}"
+    );
+    assert!(
+        indexed_transaction_work
+            .physical_sources
+            .iter()
+            .flatten()
+            .any(|(family, root)| {
+                *family == PhysicalFamily::Graph && *root == original_physical
+            }),
+        "the evicted sealed graph reload must use the captured native root: {indexed_transaction_work:?}"
+    );
     let (_, indexed_work) = observe_target("reader_items", || {
         for (offset, vector) in old_vectors.iter().enumerate() {
             assert_eq!(database.execute_at_snapshot("SELECT id FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
