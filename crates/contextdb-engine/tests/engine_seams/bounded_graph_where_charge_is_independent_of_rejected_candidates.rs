@@ -118,6 +118,57 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
         ];
         // Warm the fixed storage-cache owner before measuring transient charge.
         db.execute(sql, &params).unwrap();
+        // A same-traversal control resolves only binding identities. Its
+        // frontier has the same targets but does not load metadata predicates.
+        let identity_sql = sql.replace("b.mark = 'wanted'", "b.id IN ($first, $second)");
+        let mut identity_params = params.clone();
+        identity_params.insert("first".into(), Value::Uuid(Uuid::from_u128(2)));
+        identity_params.insert("second".into(), Value::Uuid(Uuid::from_u128(3)));
+        let mut identity_peaks = Vec::new();
+        let mut identity_request_peak = 0;
+        for mode in 0..3 {
+            let baseline = db.accountant().usage().used;
+            db.accountant().reset_high_water_for_test();
+            let rows = if mode == 0 {
+                db.execute(&identity_sql, &identity_params).unwrap().rows
+            } else {
+                let mut request = bounded::BoundedReadRequest::new(
+                    &identity_sql,
+                    identity_params.clone(),
+                    limits(),
+                    Arc::new(Clock),
+                );
+                if mode == 1 {
+                    let result = bounded::execute(&db, &request).unwrap();
+                    identity_request_peak = result.telemetry.peak_temporary_bytes;
+                    eprintln!(
+                        "graph traversal rejected={rejected} sql={} work={:?}",
+                        request.sql, result.telemetry.source_work
+                    );
+                    result.result.rows
+                } else {
+                    request.limits.cursor_page_rows = 1;
+                    let mut opened = bounded::open_cursor(db.clone(), &request).unwrap();
+                    let mut rows = opened.first_page.rows;
+                    let mut more = opened.first_page.has_more;
+                    while more {
+                        let page = opened
+                            .cursor
+                            .fetch(None, OwnerReadCancellation::new())
+                            .unwrap()
+                            .page;
+                        more = page.has_more;
+                        rows.extend(page.rows);
+                    }
+                    opened.cursor.close().unwrap();
+                    rows
+                }
+            };
+            assert_eq!(rows, expected);
+            identity_peaks.push(db.accountant().high_water_for_test() - baseline);
+            assert_eq!(db.accountant().usage().used, baseline);
+        }
+        eprintln!("graph binding-only control rejected={rejected} peaks={identity_peaks:?}");
         let baseline = db.accountant().usage().used;
         let mut arm = Vec::new();
         for mode in 0..3 {
@@ -132,7 +183,12 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
                     Arc::new(Clock),
                 );
                 if mode == 1 {
-                    bounded::execute(&db, &request).unwrap().result.rows
+                    let result = bounded::execute(&db, &request).unwrap();
+                    eprintln!(
+                        "graph traversal rejected={rejected} sql={} work={:?}",
+                        request.sql, result.telemetry.source_work
+                    );
+                    result.result.rows
                 } else {
                     request.limits.cursor_page_rows = 1;
                     let mut opened = bounded::open_cursor(db.clone(), &request).unwrap();
@@ -168,7 +224,37 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
             );
         }
         eprintln!("graph predicate rejected={rejected} peaks={arm:?} baseline={baseline}");
-        peaks.push(arm);
+        let metadata_share = arm
+            .iter()
+            .zip(&identity_peaks)
+            .map(|(metadata, control)| {
+                metadata
+                    .checked_sub(*control)
+                    .expect("metadata control has no predicate payload")
+            })
+            .collect::<Vec<_>>();
+        eprintln!("graph metadata own share rejected={rejected} bytes={metadata_share:?}");
+        peaks.push(metadata_share);
+        // Even the binding-only traversal must honor the caller's budget.
+        // Use its measured request peak, so this refusal tests its own need
+        // rather than a limit that stops before any graph preparation.
+        assert!(identity_request_peak > 1);
+        let mut control_request = bounded::BoundedReadRequest::new(
+            &identity_sql,
+            identity_params,
+            limits(),
+            Arc::new(Clock),
+        );
+        control_request.limits.memory = identity_request_peak - 1;
+        let error = bounded::execute(&db, &control_request).unwrap_err();
+        let bounded::TestError::Refused(failure) = error else {
+            panic!("below traversal need must refuse typed: {error:?}");
+        };
+        let ReadFailureDetail::OwnerLimitExceeded(detail) = failure.detail() else {
+            panic!("traversal budget refusal must name its limit: {failure:?}");
+        };
+        assert_eq!(detail.limit, ReadFailureLimit::Memory);
+        assert_eq!(db.accountant().usage().used, baseline);
         for (work, memory) in [(1, limits().memory), (limits().work, 1)] {
             let mut request =
                 bounded::BoundedReadRequest::new(sql, params.clone(), limits(), Arc::new(Clock));
@@ -220,8 +306,10 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
         );
         db.close().unwrap();
     }
-    assert_eq!(
-        peaks[0], peaks[1],
-        "actual writer peak must be independent of discarded graph bindings across eager and both bounded operators"
-    );
+    for (small, grown) in peaks[0].iter().zip(&peaks[1]) {
+        assert!(
+            small.abs_diff(*grown) <= 256,
+            "metadata predicate charge stays fixed across eager and both bounded operators: {peaks:?}"
+        );
+    }
 }

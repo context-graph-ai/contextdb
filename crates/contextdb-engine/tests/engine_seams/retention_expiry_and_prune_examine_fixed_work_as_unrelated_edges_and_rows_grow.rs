@@ -133,6 +133,13 @@ fn retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_gro
                 db.close().unwrap();
                 drop(db);
                 let db = open(&path);
+                // This fixture has no foreign-key dependency chain. Each
+                // phase admits one candidate window, scans it for candidates,
+                // performs at most one protection pass, and mutates it. The
+                // aggregate also includes two frozen-tail probes and two row
+                // lifetime probes for the one selected node. Future recount
+                // adds its independent 32-row window and frozen-tail probe.
+                let cycle_bound = 4 * (128 + 32) + 2 + 2 + if future { 32 + 1 } else { 0 };
                 let (report, work) = observe(|| db.run_pruning_cycle_checked());
                 let mut report = report.unwrap();
                 eprintln!(
@@ -140,7 +147,7 @@ fn retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_gro
                 );
                 first_cycles.push((work.retention_keys_examined, work.graph_keys_examined));
                 assert!(
-                    work.retention_keys_examined > 0 && work.retention_keys_examined <= 512,
+                    work.retention_keys_examined > 0 && work.retention_keys_examined <= cycle_bound,
                     "actual finite work: {work:?}"
                 );
                 if expire {
@@ -165,7 +172,7 @@ fn retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_gro
                         "retention unrelated={unrelated} expire={expire} future={future} later_cycle={cycle} work={work:?}"
                     );
                     assert!(
-                        work.retention_keys_examined <= 512,
+                        work.retention_keys_examined <= cycle_bound,
                         "finite resumed work: {work:?}"
                     );
                 }
