@@ -622,56 +622,86 @@ fn m11_set_above_startup_ceiling_rejected() {
 #[test]
 fn m12_open_with_config_wires_accountant() {
     const NAME: &str = "a long enough string to exceed sixty four bytes of budget for sure";
+    use contextdb_engine::memory_accounting::{
+        take_budget_ledger_for_test, watch_budget_ledger_for_test,
+    };
+
+    // Profile the same logical keys and persisted time as the refusal arm:
+    // different identities can take different paths through the proof tree.
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let row = make_params(vec![
+        ("id", Value::Uuid(Uuid::from_u128(12))),
+        ("name", Value::Text(NAME.to_owned())),
+    ]);
     let tmp = tempfile::TempDir::new().unwrap();
     let reserve = |limit| {
         contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(limit))
     };
-    let mut profile_limit = MEASUREMENT_BUDGET;
-    let mut final_profile = None;
-    for attempt in 0..16 {
-        let measured = Arc::new(MemoryAccountant::with_budget(profile_limit));
-        let profile = Database::open_with_config(
-            tmp.path().join(format!("m12-profile-{attempt}.db")),
-            Arc::new(contextdb_engine::plugin::CorePlugin),
-            measured.clone(),
-        )
-        .unwrap();
-        measured.reset_high_water_for_test();
-        profile.execute(ITEMS_SCHEMA, &empty()).unwrap();
-        let ddl_peak = measured.high_water_for_test();
-        let schema_bytes = measured.usage().used;
-        measured.reset_high_water_for_test();
-        profile.execute(ITEMS_INSERT, &items_row(NAME)).unwrap();
-        let row_peak = measured.high_water_for_test();
-        eprintln!(
-            "m12 profile_limit={profile_limit} reserve={} schema={schema_bytes} ddl_peak={ddl_peak} row_peak={row_peak}",
-            reserve(profile_limit)
-        );
-        profile.close().unwrap();
-        if row_peak == profile_limit {
-            // If subtracting one also reduces the reserve, subtract one more
-            // so the actual operation still sees exactly one byte too little.
-            let mut limit = row_peak - 1;
-            if reserve(limit) < reserve(profile_limit) {
-                limit -= 1;
-            }
-            final_profile = Some((
-                limit,
-                schema_bytes - reserve(profile_limit) + reserve(limit),
-                ddl_peak - reserve(profile_limit) + reserve(limit),
-            ));
+    let measured = Arc::new(MemoryAccountant::with_budget(MEASUREMENT_BUDGET));
+    let profile = Database::open_with_config(
+        tmp.path().join("m12-profile.db"),
+        Arc::new(contextdb_engine::plugin::CorePlugin),
+        measured.clone(),
+    )
+    .unwrap();
+    measured.reset_high_water_for_test();
+    profile.execute(ITEMS_SCHEMA, &empty()).unwrap();
+    let measured_ddl_peak = measured.high_water_for_test();
+    let measured_schema = measured.usage().used;
+    measured.reset_high_water_for_test();
+    watch_budget_ledger_for_test();
+    profile.execute(ITEMS_INSERT, &row).unwrap();
+    let ledger = take_budget_ledger_for_test();
+    let row_peak = measured.high_water_for_test();
+    let position = ledger
+        .iter()
+        .position(|entry| {
+            entry.what == "content_identity/maintain_committed_proof"
+                && entry.bytes == 248
+                && entry.used_after == row_peak
+        })
+        .unwrap_or_else(|| panic!("the measured peak must belong to the proof owner: {ledger:?}"));
+    let owner = &ledger[position];
+    // Only the startup cache reserve depends on the configured limit. Solve
+    // that dependency from the funded admission, without running fresh,
+    // differently shaped writes at progressively underfunded limits.
+    let measured_reserve = reserve(MEASUREMENT_BUDGET);
+    let owner_without_reserve = owner.used_after - measured_reserve;
+    let mut real_budget = owner.used_after - 1;
+    let mut fixed_point = false;
+    for _ in 0..16 {
+        let next = owner_without_reserve + reserve(real_budget) - 1;
+        eprintln!("m12 reserve fixed point limit={real_budget} next={next}");
+        if next == real_budget {
+            fixed_point = true;
             break;
         }
-        assert!(
-            row_peak < profile_limit,
-            "the funded admission profile stays inside its startup ceiling"
-        );
-        profile_limit = row_peak;
+        assert!(next < real_budget);
+        real_budget = next;
     }
-    let (real_budget, schema_bytes, ddl_peak) =
-        final_profile.expect("the bounded cache share reaches its exact fixed point");
+    assert!(
+        fixed_point,
+        "the bounded cache share reaches its exact fixed point"
+    );
+    let adjusted = |bytes| bytes - measured_reserve + reserve(real_budget);
+    let schema_bytes = adjusted(measured_schema);
+    let ddl_peak = adjusted(measured_ddl_peak);
     assert!(ddl_peak <= real_budget);
-    eprintln!("m12 refusal limit={real_budget} schema={schema_bytes} ddl_peak={ddl_peak}");
+    assert_eq!(adjusted(owner.used_after), real_budget + 1);
+    assert!(
+        ledger[..position]
+            .iter()
+            .all(|entry| adjusted(entry.used_after) <= real_budget),
+        "every prior real owner fits before the proof admission: {ledger:?}"
+    );
+    eprintln!(
+        "m12 funded reserve={measured_reserve} schema={measured_schema} ddl_peak={measured_ddl_peak} row_peak={row_peak} owner={owner:?}"
+    );
+    eprintln!(
+        "m12 refusal limit={real_budget} reserve={} schema={schema_bytes} ddl_peak={ddl_peak}",
+        reserve(real_budget)
+    );
+    profile.close().unwrap();
 
     let accountant = Arc::new(MemoryAccountant::with_budget(real_budget));
     let db = Database::open_with_config(
@@ -682,8 +712,13 @@ fn m12_open_with_config_wires_accountant() {
     .unwrap();
     db.execute(ITEMS_SCHEMA, &empty()).unwrap();
     assert_eq!(accountant.usage().used, schema_bytes);
+    assert_eq!(accountant.usage().limit, Some(real_budget));
+    assert_eq!(accountant.usage().startup_ceiling, Some(real_budget));
     let before = accountant.usage().used;
-    let error = db.execute(ITEMS_INSERT, &items_row(NAME)).unwrap_err();
+    watch_budget_ledger_for_test();
+    let error = db.execute(ITEMS_INSERT, &row).unwrap_err();
+    let refusal_ledger = take_budget_ledger_for_test();
+    eprintln!("m12 refusal ledger={refusal_ledger:?}");
     let attributed = |error: &Error| {
         matches!(error, Error::MemoryBudgetExceeded {
         subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
@@ -718,7 +753,13 @@ fn m12_open_with_config_wires_accountant() {
             .len(),
         0
     );
-    db.execute(ITEMS_INSERT, &items_row("ok")).unwrap();
+    let retry = make_params(vec![
+        ("id", Value::Uuid(Uuid::from_u128(12))),
+        ("name", Value::Text("ok".to_owned())),
+    ]);
+    db.execute(ITEMS_INSERT, &retry).unwrap();
+    assert_eq!(accountant.usage().limit, Some(real_budget));
+    assert_eq!(accountant.usage().startup_ceiling, Some(real_budget));
     db.close().unwrap();
     let reader = contextdb_engine::ReadSession::open(tmp.path().join("m12.db")).unwrap();
     assert_eq!(
