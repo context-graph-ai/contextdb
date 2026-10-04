@@ -388,19 +388,19 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         })
         .expect("successor statement must observe its own actual physical page root");
     // Only the three answer rows have vectors; the maintained vector route excludes NULLs.
-    let (_, indexed_work) = observe_target("reader_items", || {
-        for (offset, vector) in old_vectors.iter().enumerate() {
-            assert_eq!(database.execute_at_snapshot("SELECT id FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-                &HashMap::from([("q".into(),Value::Vector(vector.clone()))]),old_snapshot).unwrap().rows,
-                vec![vec![Value::Int64(offset as i64 + 1)]], "old reader traverses its maintained vector generation");
-        }
-    });
     let (_, indexed_transaction_work) = observe_target("reader_items", || {
         for (offset, vector) in old_vectors.iter().enumerate() {
             assert_eq!(database.execute_in_tx(transaction,
                 "SELECT id FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
                 &HashMap::from([("q".into(), Value::Vector(vector.clone()))])).unwrap().rows,
                 vec![vec![Value::Int64(offset as i64 + 1)]]);
+        }
+    });
+    let (_, indexed_work) = observe_target("reader_items", || {
+        for (offset, vector) in old_vectors.iter().enumerate() {
+            assert_eq!(database.execute_at_snapshot("SELECT id FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+                &HashMap::from([("q".into(),Value::Vector(vector.clone()))]),old_snapshot).unwrap().rows,
+                vec![vec![Value::Int64(offset as i64 + 1)]], "old reader traverses its maintained vector generation");
         }
     });
     assert_ne!(
