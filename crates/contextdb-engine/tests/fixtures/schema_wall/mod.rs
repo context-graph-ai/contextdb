@@ -600,6 +600,40 @@ pub fn assert_affected_only(
         observation.durable_table_names.is_subset(affected),
         "unrelated relational rewrites: {observation:?}"
     );
+    // These reductions are committed atomically with the declarations they
+    // summarize. They remain actual affected work, bounded by that DDL unit.
+    let declaration_writes: u64 = observation
+        .artifact_writes
+        .iter()
+        .filter(|(event, _)| {
+            event.table == "ddl_log" && event.operation == TableWriteOperationForTest::Insert
+        })
+        .map(|(_, count)| *count)
+        .sum();
+    for summary in ["ddl_directions_by_table", "ddl_capabilities_by_table"] {
+        let writes: u64 = observation
+            .artifact_writes
+            .iter()
+            .filter(|(event, _)| event.table == summary)
+            .map(|(_, count)| *count)
+            .sum();
+        let directory_writes: u64 = observation
+            .artifact_writes
+            .iter()
+            .filter(|(event, _)| {
+                event.table == "__redb_user_table_directory" && event.key == summary.as_bytes()
+            })
+            .map(|(_, count)| *count)
+            .sum();
+        assert!(
+            writes <= declaration_writes,
+            "summary work exceeds actual declaration unit: {summary} {observation:?}"
+        );
+        assert!(
+            directory_writes <= declaration_writes,
+            "summary directory work exceeds actual declaration unit: {summary} {observation:?}"
+        );
+    }
     let identity_writes = observation
         .artifact_writes
         .iter()
@@ -660,6 +694,57 @@ pub fn assert_affected_only(
         } else {
             &event.table
         };
+        if matches!(
+            table,
+            "ddl_directions_by_table" | "ddl_capabilities_by_table"
+        ) {
+            if event.table == "__redb_user_table_directory" {
+                assert_eq!(event.operation, TableWriteOperationForTest::DirectoryInsert);
+                assert!(
+                    observation
+                        .artifact_writes
+                        .iter()
+                        .any(|(write, _)| write.table == table
+                            && write.operation == TableWriteOperationForTest::Insert),
+                    "declaration summary directory requires an actual affected summary insert: {event:?}"
+                );
+            } else {
+                assert_eq!(event.operation, TableWriteOperationForTest::Insert);
+                let key = std::str::from_utf8(&event.key).unwrap();
+                let owner = if table == "ddl_capabilities_by_table" {
+                    key.to_owned()
+                } else {
+                    let (hex_owner, lsn) = key
+                        .split_once(':')
+                        .expect("direction has owner and local LSN");
+                    assert_eq!(lsn.len(), 20, "exact local declaration LSN: {event:?}");
+                    assert!(lsn.bytes().all(|byte| byte.is_ascii_digit()));
+                    lsn.parse::<u64>().expect("local LSN fits u64");
+                    assert!(!hex_owner.is_empty() && hex_owner.len().is_multiple_of(2));
+                    assert!(
+                        hex_owner
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    );
+                    let owner = (0..hex_owner.len())
+                        .step_by(2)
+                        .map(|position| {
+                            u8::from_str_radix(&hex_owner[position..position + 2], 16).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    String::from_utf8(owner).expect("direction owner is a UTF-8 table name")
+                };
+                assert!(
+                    affected.contains(&owner),
+                    "unrelated declaration summary owner {event:?}"
+                );
+                assert!(
+                    event.value_bytes > 0,
+                    "summary insert retains its actual reduction payload"
+                );
+            }
+            continue;
+        }
         if table == "writer_recovery" {
             if event.table == "__redb_user_table_directory" {
                 assert_eq!(event.operation, TableWriteOperationForTest::DirectoryInsert);
