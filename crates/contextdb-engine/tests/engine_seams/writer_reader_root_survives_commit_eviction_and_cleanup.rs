@@ -269,7 +269,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     let commit_resume = Arc::new(Mutex::new(commit_resume));
     let waits = Arc::new(AtomicU64::new(0));
     let during_clock = Arc::new(ManualDeadlineClock::at(0));
-    let (statement, during, during_work, evicted, cleanup) = std::thread::scope(|scope| {
+    let (statement, during, during_work, cleanup) = std::thread::scope(|scope| {
         let statement = scope.spawn(|| {
             let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
             let mut request =
@@ -323,12 +323,6 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         commit_release.send(()).unwrap();
         writer.join().unwrap();
         displace();
-        let evicted = database
-            .vector_store_for_test()
-            .evict_raw_partition_for_test(
-                &VectorIndexRef::new("reader_items", "embedding"),
-                &VectorPartitionKey::default(),
-            );
         let cleanup = database.compact_currency_versions();
         drop(release_statement);
         let statement = statement.join().unwrap();
@@ -336,7 +330,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             captured_before_read, old_snapshot,
             "a paused commit has not replaced the published transaction root"
         );
-        (statement, during, during_work, evicted, cleanup)
+        (statement, during, during_work, cleanup)
     });
     cleanup.unwrap();
     assert_eq!(
@@ -414,6 +408,23 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         "the successor has a different real storage transaction/root"
     );
     // Leave the cursor as the final holder of the retired original root.
+    // Exercise the indexed partition on the captured old root before requiring
+    // a real resident-partition eviction ahead of the next pull.
+    eprintln!(
+        "indexed old-root raw eviction premise: owners={:?} activity={:?} indexed_sources={indexed_transaction_work:?}",
+        database.writer_memory_ownership_receipt_for_test().vector,
+        database.__vector_passive_activity_counters_for_test(),
+    );
+    let evicted = database
+        .vector_store_for_test()
+        .evict_raw_partition_for_test(
+            &VectorIndexRef::new("reader_items", "embedding"),
+            &VectorPartitionKey::default(),
+        );
+    assert!(
+        evicted,
+        "the indexed old-root read must load a raw partition that is actually evicted before continuation reload"
+    );
     database.rollback(transaction).unwrap();
     drop(pinned);
     assert!(
@@ -643,10 +654,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         released_cleanup.pruned_versions > 0,
         "cleanup actually reclaims eligible superseded versions after the final reader releases"
     );
-    assert!(
-        evicted,
-        "the fixture must exercise a real raw-vector eviction and reload"
-    );
+
     assert_eq!(
         waits.load(Ordering::SeqCst),
         0,
