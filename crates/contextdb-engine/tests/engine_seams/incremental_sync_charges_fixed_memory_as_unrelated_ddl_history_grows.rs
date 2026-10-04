@@ -215,6 +215,20 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
             .high_water_for_test()
             .checked_sub(baseline)
             .unwrap();
+        let source_peak = baseline + peak;
+        let peak_positions = ledger
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| (entry.used_after == source_peak).then_some(position))
+            .collect::<Vec<_>>();
+        for position in peak_positions {
+            let first = position.saturating_sub(8);
+            let last = (position + 9).min(ledger.len());
+            eprintln!(
+                "settled source peak occurrences={occurrences} target={source_peak} position={position} actual={:?}",
+                &ledger[first..last]
+            );
+        }
         eprintln!(
             "ddl occurrences={occurrences} push_peak={peak} baseline={baseline} summary={work:?} history={reads:?}"
         );
