@@ -33330,8 +33330,13 @@ impl Database {
         dependency_complete: bool,
         table_generations: &HashMap<String, u64>,
     ) -> Result<AcceptedDeleteSuppression> {
+        // A preceding unit can publish while the reply retains its admission
+        // root. Classify accepted lineage at one current committed frontier,
+        // pairing its logical snapshot with the durable source it describes.
+        let published = self.tx_mgr.capture_published_read();
+        let snapshot = published.snapshot;
+        let _writer_read = self.enter_writer_read(writer_read::durable_root(published.handle)?);
         let (_catalog_charge, projected_meta) = self.projected_sync_table_meta(&changes)?;
-        let snapshot = self.snapshot();
         let skip_deleted = HashSet::new();
         let mut retained_rows = Vec::with_capacity(changes.rows.len());
         let mut suppressed_vector_indexes = HashSet::new();
@@ -34209,7 +34214,11 @@ impl Database {
             return Ok(());
         }
         self.tx_mgr.with_maintenance_publication(|publication| {
-            let snapshot = self.snapshot();
+            // Reply effects classify current rows at one committed publication,
+            // pairing its logical snapshot with the durable root it describes.
+            let published = self.tx_mgr.capture_published_read();
+            let snapshot = published.snapshot;
+            let _writer_read = self.enter_writer_read(writer_read::durable_root(published.handle)?);
             let no_deleted = HashSet::new();
             let context = TerminalRefusalPullContext {
                 tenant_id: tenant_id.clone(), hub_node_id: hub_node_id.to_string(), generation: 0,

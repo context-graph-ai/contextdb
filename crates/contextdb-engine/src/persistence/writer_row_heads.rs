@@ -196,6 +196,15 @@ impl RedbPersistence {
         }
         let name = Self::rel_table_name(table);
         let relation: TableDefinition<&[u8], &[u8]> = TableDefinition::new(name.as_str());
+        // The head binding is metadata; validating its physical body reads
+        // relational pages and belongs to the row family's backend work.
+        #[cfg(feature = "test-seams")]
+        root.note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
+        #[cfg(feature = "test-seams")]
+        let _body_reads = crate::writer_query_test_seams::physical_operation(
+            crate::writer_query_test_seams::PhysicalFamily::Row,
+            table,
+        );
         if read
             .open_table(relation)
             .map_err(Self::storage_error)?
