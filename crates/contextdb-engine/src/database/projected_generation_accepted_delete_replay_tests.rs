@@ -190,3 +190,132 @@ fn reject_dependency_complete_accepted_lineage_replays_against_generation_projec
         "the refusal must state benign convergence, not just that it terminated: {message}"
     );
 }
+
+#[test]
+fn durable_accepted_delete_classification_restores_the_retained_reader_root() {
+    let directory = tempfile::tempdir().expect("temporary durable receiver");
+    let receiver = Database::open_with_options(
+        directory.path().join("accepted-delete-root.redb"),
+        DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        },
+    )
+    .expect("open durable receiver");
+    let empty = HashMap::new();
+    receiver
+        .execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT) HISTORY CURRENT ONLY SYNC OFF",
+            &empty,
+        )
+        .unwrap();
+    receiver
+        .execute("INSERT INTO events VALUES (1, 'original')", &empty)
+        .unwrap();
+    let captured = receiver.tx_mgr.capture_published_read();
+    let snapshot = captured.snapshot;
+    let root = writer_read::durable_root(captured.handle).unwrap().unwrap();
+    let physical = root.storage_identity();
+    let tenant = TenantId::from("durable-projected-generation");
+    let identity = FabricIdentity::generate();
+    let key = NaturalKey::single("id".to_string(), Value::Int64(1));
+    let row = live_row(key.clone(), Lsn(19));
+    let lineage = authenticated_lineage(&tenant, &key, 13, &identity);
+    let lineages = vec![(TABLE.to_string(), key.clone(), row.lsn, lineage.clone())];
+    receiver
+        .execute("DELETE FROM events WHERE id = 1", &empty)
+        .unwrap();
+    accepted_delete_record(&receiver, &key, &lineage);
+    receiver
+        .execute("INSERT INTO events VALUES (2, 'following')", &empty)
+        .unwrap();
+    receiver.compact_currency_versions().unwrap();
+    assert!(receiver.snapshot().0 > snapshot.0);
+    assert_ne!(
+        receiver
+            .writer_read_root()
+            .unwrap()
+            .unwrap()
+            .storage_identity(),
+        physical
+    );
+    let scope = receiver.enter_writer_read(Some(root.clone()));
+    let suppressed = receiver
+        .drop_accepted_lineage_replays_against_generation_projection(
+            &tenant,
+            ChangeSet {
+                rows: vec![row.clone()],
+                ..ChangeSet::default()
+            },
+            &lineages,
+            &projected_generations(),
+        )
+        .expect("classify at the current durable frontier while the reply retains its old root");
+    assert!(suppressed.changes.rows.is_empty());
+    assert!(suppressed.suppressed_live_replay);
+    assert_eq!(
+        receiver
+            .writer_read_root()
+            .unwrap()
+            .unwrap()
+            .storage_identity(),
+        physical
+    );
+    let error = receiver
+        .reject_dependency_complete_accepted_lineage_replays_against_generation_projection(
+            &tenant,
+            ChangeSet {
+                rows: vec![row.clone()],
+                ..ChangeSet::default()
+            },
+            &lineages,
+            &projected_generations(),
+        )
+        .err()
+        .expect("dependency-complete replay remains a typed refusal");
+    assert!(matches!(error, Error::SyncReplayOfAcceptedDelete { .. }));
+    assert_eq!(
+        receiver
+            .execute_at_snapshot("SELECT id, body FROM events ORDER BY id", &empty, snapshot)
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(1), Value::Text("original".to_string())]],
+        "classification restores the external reader's original durable view"
+    );
+    drop(scope);
+    receiver
+        .execute("INSERT INTO events VALUES (1, 'fresh')", &empty)
+        .unwrap();
+    let scope = receiver.enter_writer_read(Some(root.clone()));
+    let error = receiver
+        .drop_accepted_lineage_replays_against_generation_projection(
+            &tenant,
+            ChangeSet {
+                rows: vec![row],
+                ..ChangeSet::default()
+            },
+            &lineages,
+            &projected_generations(),
+        )
+        .err()
+        .expect("a genuinely fresh same-key current row rejects terminated-lineage replay");
+    assert!(
+        matches!(error, Error::SyncError(message) if message.contains("fresh same-key row is visible"))
+    );
+    assert_eq!(
+        receiver
+            .execute_at_snapshot("SELECT body FROM events WHERE id = 1", &empty, snapshot)
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("original".to_string())]]
+    );
+    drop(scope);
+    drop(root);
+    assert_eq!(
+        receiver
+            .__native_read_transaction_count_for_test(physical.transaction_id)
+            .unwrap(),
+        0
+    );
+    receiver.close().unwrap();
+}
