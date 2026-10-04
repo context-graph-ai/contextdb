@@ -351,14 +351,27 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
         assert_eq!(int(&indexes, index, "stalled_partitions"), 0);
         assert_eq!(text(&indexes, index, "broad_route_reason"), "none");
         assert_eq!(text(&indexes, index, "broad_route_recovery_action"), "none");
+        // Fund the measured healthy preparation peak. Closing retains only
+        // 264 of those 6,153 bytes, then admits two 1,024-byte paths; the
+        // remaining 3,841 bytes cannot admit a real 4,224-byte payload.
+        let replacement_limit = db.memory_limit();
+        let closing_limit = db.accountant().usage().used + 6_153;
+        db.set_memory_limit(Some(closing_limit))
+            .expect("fund healthy preparation below the closing payload admission");
         let error = db
             .run_maintenance_cycle()
             .expect_err("closing compaction reports its typed resource deferral");
+        eprintln!("policy closing limit={closing_limit} error={error:?}");
+        db.set_memory_limit(replacement_limit)
+            .expect("restore the replacement-build budget for the next policy change");
         assert!(
             matches!(
                 error,
-                contextdb_core::Error::MemoryBudgetExceeded { .. }
-                    | contextdb_core::Error::DiskBudgetExceeded { .. }
+                contextdb_core::Error::MemoryBudgetExceeded {
+                    ref subsystem, ref operation, requested_bytes: 4_224,
+                    available_bytes, budget_limit_bytes, ..
+                } if subsystem == "storage_compaction" && operation == "relocate_pages"
+                    && available_bytes < 4_224 && budget_limit_bytes == closing_limit
             ),
             "closing compaction resource refusal: {error:?}"
         );
