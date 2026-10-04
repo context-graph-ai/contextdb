@@ -31,6 +31,7 @@ struct ReleaseOnceOutcome {
     second_charge: usize,
     removed_count: usize,
     accountant_released: usize,
+    staged_controls_released: usize,
 }
 
 impl ReleaseOnceOutcome {
@@ -38,7 +39,7 @@ impl ReleaseOnceOutcome {
         self.first_charge == admitted
             && self.second_charge == 0
             && self.removed_count == 1
-            && self.accountant_released == admitted
+            && self.accountant_released == admitted + self.staged_controls_released
     }
 }
 
@@ -113,7 +114,19 @@ fn passage_writer_residency_has_named_owners_at_one_thousand_rows() {
         }
         let owners = db.writer_memory_ownership_receipt_for_test();
         eprintln!("E20_PASSAGE rows={} owners={owners:?}", first + 100);
-        assert_eq!(owners.current_row_versions, first + 102);
+        assert_eq!(
+            db.execute("SELECT COUNT(*) FROM event_search_passages", &empty)
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int64((first + 100) as i64)]],
+            "the complete committed passage population is read from the durable store"
+        );
+        assert_eq!(owners.current_row_versions, 0);
+        assert_eq!(owners.current_row_values, 0);
+        assert_eq!(owners.current_row_index_postings, 0);
+        assert_eq!(owners.current_membership_charge, 0);
+        assert_eq!(owners.staged_row_versions, 0);
+        assert_eq!(owners.staged_row_admissions, 0);
         assert_eq!(owners.reconciliation_gap, 0);
         assert_eq!(
             owners.current_membership_by_table.values().sum::<usize>(),
@@ -121,7 +134,15 @@ fn passage_writer_residency_has_named_owners_at_one_thousand_rows() {
         );
     }
     let final_owners = db.writer_memory_ownership_receipt_for_test();
-    assert_eq!(final_owners.current_row_versions, ROWS + 2);
+    assert_eq!(final_owners.current_row_versions, 0);
+    for table in ["contexts", "event_search_generations"] {
+        assert_eq!(
+            db.execute(&format!("SELECT COUNT(*) FROM {table}"), &empty)
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int64(1)]],
+        );
+    }
     db.close().unwrap();
 }
 
@@ -247,7 +268,20 @@ fn repeated_sql_updates_release_superseded_staged_row_charges() {
     }
     db.commit(tx).unwrap();
     let owners = db.writer_memory_ownership_receipt_for_test();
-    assert_eq!(owners.current_row_versions, 1);
+    assert_eq!(owners.current_row_versions, 0);
+    assert_eq!(owners.staged_row_versions, 0);
+    assert_eq!(owners.staged_row_admissions, 0);
+    assert_eq!(owners.staged_index_postings, 0);
+    assert_eq!(
+        db.execute(
+            "SELECT counter FROM generation WHERE id = $id",
+            &HashMap::from([("id".into(), Value::Uuid(id)),])
+        )
+        .unwrap()
+        .rows,
+        vec![vec![Value::Int64(3)]],
+        "the committed durable row retains the last replacement"
+    );
     assert_eq!(owners.reconciliation_gap, 0);
     db.close().unwrap();
 }
@@ -267,7 +301,11 @@ fn concurrent_deletes_retire_one_staged_admission() {
     assert_eq!(split_lock.0.first_charge, split_lock.1);
     assert_eq!(split_lock.0.second_charge, split_lock.1);
     assert_eq!(split_lock.0.removed_count, 1);
-    assert_eq!(split_lock.0.accountant_released, 2 * split_lock.1);
+    assert_eq!(
+        split_lock.0.accountant_released,
+        2 * split_lock.1 + split_lock.0.staged_controls_released,
+        "the bad path releases the same admission twice, in addition to its real declaration retirement"
+    );
 }
 
 fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOnceOutcome, usize) {
@@ -380,7 +418,21 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
         second_charge,
         removed_count: before.staged_row_versions - after.staged_row_versions,
         accountant_released: before.vector.accountant_total - after.vector.accountant_total,
+        staged_controls_released: before
+            .staged_index_postings
+            .checked_sub(after.staged_index_postings)
+            .unwrap(),
     };
+    assert_eq!(before.table_metadata, after.table_metadata);
+    assert_eq!(
+        before.named_owner_total - after.named_owner_total,
+        admitted + outcome.staged_controls_released,
+        "named owners lose one admission and the actual staged declaration controls"
+    );
+    eprintln!(
+        "staged retirement: mode={mode:?} admission={admitted} controls={} accountant_release={}",
+        outcome.staged_controls_released, outcome.accountant_released
+    );
     if mode == StagedDeleteRaceModeForTest::Repaired {
         assert_eq!(after.reconciliation_gap, 0);
         assert_eq!(db.writer_memory_underflow_count_for_test(), 0);
@@ -389,10 +441,25 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
     }
     db.rollback(tx).unwrap();
     let rolled_back = db.writer_memory_ownership_receipt_for_test();
+    eprintln!("staged delete rollback: before={after:?}; after={rolled_back:?}");
+    assert!(after.staged_index_postings > 0);
     assert_eq!(
-        rolled_back.vector.accountant_total,
-        after.vector.accountant_total
+        after
+            .vector
+            .accountant_total
+            .checked_sub(rolled_back.vector.accountant_total),
+        Some(after.staged_index_postings),
+        "rollback releases the actual remaining staged declaration controls"
     );
+    assert_eq!(
+        after.named_owner_total - rolled_back.named_owner_total,
+        after.staged_index_postings
+    );
+    assert_eq!(rolled_back.staged_row_versions, 0);
+    assert_eq!(rolled_back.staged_row_admissions, 0);
+    assert_eq!(rolled_back.staged_index_postings, 0);
+    assert_eq!(after.active_transactions, 1);
+    assert_eq!(rolled_back.active_transactions, 0);
     assert_eq!(rolled_back.reconciliation_gap, after.reconciliation_gap);
     if mode == StagedDeleteRaceModeForTest::Repaired {
         assert_eq!(db.writer_memory_underflow_count_for_test(), 0);
