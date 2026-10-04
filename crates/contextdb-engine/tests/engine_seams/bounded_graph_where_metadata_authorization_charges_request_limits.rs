@@ -72,6 +72,9 @@ fn seed(path: &Path, unrelated: u128) {
     // A wide ignored field puts grant scratch above graph preparation; only
     // this one entitlement belongs to the reader at either population size.
     grant(&db, 99_999, READER, 7, 32_768);
+    // The traversal anchor keeps an independent entitlement while target
+    // grants are withdrawn and staged inside the reader transaction.
+    grant(&db, 99_998, READER, 9, 32);
     for id in 1..=4 {
         db.execute(
             "INSERT INTO nodes VALUES ($id,'wanted',$acl,'fixed')",
@@ -79,7 +82,13 @@ fn seed(path: &Path, unrelated: u128) {
                 ("id".into(), Value::Uuid(Uuid::from_u128(id))),
                 (
                     "acl".into(),
-                    Value::Uuid(Uuid::from_u128(if id == 4 { 8 } else { 7 })),
+                    Value::Uuid(Uuid::from_u128(if id == 1 {
+                        9
+                    } else if id == 4 {
+                        8
+                    } else {
+                        7
+                    })),
                 ),
             ]),
         )
@@ -190,7 +199,25 @@ fn run(
         let fetched = opened.cursor.fetch(None, OwnerReadCancellation::new())?;
         more = fetched.page.has_more;
         rows.extend(fetched.page.rows);
-        telemetry = fetched.telemetry;
+        // Each fetch reports that request's own work. Preserve the opening
+        // grant lookup when a final empty page performs no authorization work.
+        let page = fetched.telemetry;
+        telemetry.work_units += page.work_units;
+        telemetry.encoded_bytes += page.encoded_bytes;
+        telemetry.peak_temporary_bytes = telemetry
+            .peak_temporary_bytes
+            .max(page.peak_temporary_bytes);
+        telemetry.cancellation_observed |= page.cancellation_observed;
+        for (source, units) in page.source_work {
+            *telemetry.source_work.entry(source).or_default() += units;
+        }
+        for (source, bytes) in page.source_peak_temporary_bytes {
+            let peak = telemetry
+                .source_peak_temporary_bytes
+                .entry(source)
+                .or_default();
+            *peak = (*peak).max(bytes);
+        }
     }
     opened.cursor.close().unwrap();
     Ok((rows, telemetry))
@@ -356,14 +383,15 @@ fn bounded_graph_where_metadata_authorization_charges_request_limits() {
         reader.execute("BEGIN", &HashMap::new()).unwrap();
         grant(&reader, 999_999, READER, 8, 32_768);
         let staged_expected = vec![vec![Value::Uuid(Uuid::from_u128(4))]];
-        // The source node carries the withdrawn entitlement. Staging it under
-        // the new entitlement keeps traversal itself visible in this control.
+        // Stage wide metadata on the source while the committed entitlement
+        // permits this reader's write. Node 4 remains the committed denial
+        // control; the staged grant changes read visibility, not write policy.
         reader
             .execute(
-                "UPDATE nodes SET acl_id = $acl WHERE id = $source",
+                "UPDATE nodes SET unused = $body WHERE id = $id",
                 &HashMap::from([
-                    ("acl".into(), Value::Uuid(Uuid::from_u128(8))),
-                    ("source".into(), Value::Uuid(Uuid::from_u128(1))),
+                    ("body".into(), Value::Text("m".repeat(32768))),
+                    ("id".into(), Value::Uuid(Uuid::from_u128(1))),
                 ]),
             )
             .unwrap();
@@ -371,15 +399,6 @@ fn bounded_graph_where_metadata_authorization_charges_request_limits() {
             .execute(
                 "DELETE FROM acl_grants WHERE id = $id",
                 &HashMap::from([("id".into(), Value::Uuid(Uuid::from_u128(99_999)))]),
-            )
-            .unwrap();
-        reader
-            .execute(
-                "UPDATE nodes SET unused = $body WHERE id = $id",
-                &HashMap::from([
-                    ("body".into(), Value::Text("m".repeat(32768))),
-                    ("id".into(), Value::Uuid(Uuid::from_u128(4))),
-                ]),
             )
             .unwrap();
         assert_eq!(
