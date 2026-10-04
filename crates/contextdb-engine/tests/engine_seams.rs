@@ -131,3 +131,9 @@ mod bounded_graph_where_charge_is_independent_of_rejected_candidates;
 
 #[path = "engine_seams/outbound_sync_refuses_typed_when_provenance_sidecar_read_fails.rs"]
 mod outbound_sync_refuses_typed_when_provenance_sidecar_read_fails;
+
+#[path = "engine_seams/incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows.rs"]
+mod incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows;
+
+#[path = "engine_seams/bounded_graph_where_metadata_authorization_charges_request_limits.rs"]
+mod bounded_graph_where_metadata_authorization_charges_request_limits;
