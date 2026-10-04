@@ -162,15 +162,42 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     let sql = "SELECT id, unique_key, embedding FROM reader_items WHERE unique_key >= 'old-' ORDER BY unique_key";
     let successor_sql =
         "SELECT id, unique_key, embedding FROM reader_items WHERE id <= 3 ORDER BY id";
+    let cache_share = contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(
+        Some(64 * 1024 * 1024),
+    );
+    assert_eq!(
+        database
+            .writer_memory_ownership_receipt_for_test()
+            .persistence_cache,
+        cache_share,
+        "the reopened writer owns the cache share derived from its declared memory limit"
+    );
     let displace = || {
         let before = database.__writer_cache_stats_for_test().unwrap();
-        // The ordinal seam walks every prior wide leaf; visit the range once.
-        drop(
-            database
-                .__hold_row_page_for_test("displacement", 1023)
-                .unwrap(),
-        );
+        let backend_bytes = Arc::new(AtomicU64::new(0));
+        let counted = backend_bytes.clone();
+        let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
+            counted.fetch_add(bytes as u64, Ordering::Relaxed);
+        }));
+        // Read actual wide values, not just the keys on the path to the last
+        // ordinal. These 64 bodies alone exceed the declared page-cache share.
+        for ordinal in 0..64 {
+            let page = database
+                .__hold_row_page_for_test("displacement", ordinal)
+                .unwrap();
+            assert!(page.value().len() >= 128 * 1024);
+            drop(page);
+        }
+        drop(observation);
+        let pressure_bytes = backend_bytes.load(Ordering::Relaxed);
         let after = database.__writer_cache_stats_for_test().unwrap();
+        eprintln!(
+            "reader displacement: memory_limit=67108864 cache_share={cache_share} actual_backend_bytes={pressure_bytes} before={before:?} after={after:?}"
+        );
+        assert!(
+            pressure_bytes > cache_share as u64,
+            "actual backend pressure must exceed this writer's declared cache share: bytes={pressure_bytes}; share={cache_share}"
+        );
         assert!(
             after.2 > before.2 && after.1 > before.1,
             "reader displacement must cause actual cache misses and evictions: before={before:?}; after={after:?}"
@@ -408,9 +435,23 @@ fn reader_at_boundary(boundary: CommitBoundary) {
             break;
         }
         displace();
+        let cache_before_pull = database.__writer_cache_stats_for_test().unwrap();
+        // Family operations install nested observers. This outer scope counts
+        // backend reads that happen outside those attributed operations.
+        let pull_backend_bytes = Arc::new(AtomicU64::new(0));
+        let counted = pull_backend_bytes.clone();
+        let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
+            counted.fetch_add(bytes as u64, Ordering::Relaxed);
+        }));
         let (page, sources) = observe_target("reader_items", || {
             opened.cursor.fetch(None, Default::default())
         });
+        drop(observation);
+        eprintln!(
+            "retained cursor pull: backend_bytes_outside_family_observers={} cache_before={cache_before_pull:?} cache_after={:?} sources={sources:?}",
+            pull_backend_bytes.load(Ordering::Relaxed),
+            database.__writer_cache_stats_for_test().unwrap(),
+        );
         let page = page.unwrap().page;
         has_more = page.has_more;
         continued.extend(page.rows);
