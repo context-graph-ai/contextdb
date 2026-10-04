@@ -254,16 +254,25 @@ pub(super) fn install_paged_root_capture(
     tx_mgr: &Arc<TransactionManager<DynStore>>,
 ) {
     let manager = Arc::downgrade(tx_mgr);
-    persistence.set_paged_root_capture(Arc::new(move || {
-        let manager = manager
-            .upgrade()
-            .ok_or_else(|| Error::Other("paged vector reader outlived its writer".into()))?;
-        if let Some(root) = writer_read::scoped_root_for_manager(&manager) {
-            return Ok(root);
-        }
-        writer_read::durable_root(manager.capture_published_read().handle)?
-            .ok_or_else(|| Error::Other("writer has no durable published root".into()))
-    }));
+    let scoped_manager = manager.clone();
+    persistence.set_paged_root_capture(
+        Arc::new(move || {
+            let manager = manager
+                .upgrade()
+                .ok_or_else(|| Error::Other("paged vector reader outlived its writer".into()))?;
+            if let Some(root) = writer_read::scoped_root_for_manager(&manager) {
+                return Ok(root);
+            }
+            writer_read::durable_root(manager.capture_published_read().handle)?
+                .ok_or_else(|| Error::Other("writer has no durable published root".into()))
+        }),
+        Arc::new(move || {
+            let manager = scoped_manager
+                .upgrade()
+                .ok_or_else(|| Error::Other("vector reader outlived its writer".into()))?;
+            Ok(writer_read::scoped_root_for_manager(&manager))
+        }),
+    );
 }
 
 impl MaintenanceContext {

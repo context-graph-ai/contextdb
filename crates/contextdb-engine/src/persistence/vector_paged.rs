@@ -741,6 +741,11 @@ pub(crate) type PagedRootCapture = Arc<
         + Sync,
 >;
 
+/// Only an active serving operation supplies this root. Maintenance may read
+/// immutable candidate records before the next serving root is published.
+pub(crate) type ScopedWriterRootCapture =
+    Arc<dyn Fn() -> Result<Option<Arc<WriterSnapshot>>> + Send + Sync>;
+
 /// Envelope format of a sealed change generation (`HnswIndex` durable codec).
 pub(crate) const VECTOR_GRAPH_ENVELOPE_FORMAT_VERSION: u16 = 1;
 
@@ -1715,7 +1720,9 @@ impl RedbPersistence {
     pub(crate) fn set_paged_root_capture(
         &self,
         capture: Arc<dyn Fn() -> Result<Arc<WriterSnapshot>> + Send + Sync>,
+        scoped_capture: ScopedWriterRootCapture,
     ) {
+        let _ = self.scoped_vector_root_capture.set(scoped_capture);
         let capture: PagedRootCapture = Arc::new(move || {
             let root = capture()?;
             let read = root.owner_read();

@@ -5206,14 +5206,21 @@ impl WritableRawVectorBodyScan {
             crate::writer_query_test_seams::PhysicalFamily::Vector,
             &self._transaction,
         );
-        let stored = vectors
-            .get(key.as_slice())
-            .map_err(RedbPersistence::storage_error)?
-            .ok_or_else(|| {
-                source.vector_partition_corruption(
-                    "a raw-vector candidate identity has no durable body",
-                )
-            })?;
+        let stored = {
+            #[cfg(feature = "test-seams")]
+            let _body_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Vector,
+                &index.table,
+            );
+            vectors
+                .get(key.as_slice())
+                .map_err(RedbPersistence::storage_error)?
+                .ok_or_else(|| {
+                    source.vector_partition_corruption(
+                        "a raw-vector candidate identity has no durable body",
+                    )
+                })?
+        };
         let mut entry = RedbPersistence::decode_vector_entry(stored.value()).map_err(|error| {
             source.vector_partition_corruption(format!(
                 "a raw-vector candidate body cannot be decoded: {error}"
@@ -16853,6 +16860,7 @@ pub struct RedbPersistence {
     paged_publications: parking_lot::Mutex<HashMap<Vec<u8>, vector_paged::PagedPublication>>,
     /// Captures the writer's published root for paged generation readers.
     paged_root_capture: std::sync::OnceLock<vector_paged::PagedRootCapture>,
+    scoped_vector_root_capture: std::sync::OnceLock<vector_paged::ScopedWriterRootCapture>,
 }
 pub(crate) struct RawSyncApplyStateDigest {
     pub(crate) digest: String,
@@ -17331,8 +17339,14 @@ struct RetainedVectorGraphPages {
 
 impl ReadOnlyVectorGraphPageSource for RetainedVectorGraphPageSource {
     fn reader(&self) -> Result<Box<dyn ReadOnlyVectorGraphPageReader>> {
+        let transaction = self.source.begin_read()?;
+        #[cfg(feature = "test-seams")]
+        crate::writer_query_test_seams::note_physical_source(
+            crate::writer_query_test_seams::PhysicalFamily::Graph,
+            &transaction,
+        );
         Ok(Box::new(RetainedVectorGraphPageReader {
-            transaction: self.source.begin_read()?,
+            transaction,
             key: Arc::clone(&self.key),
             is_base: self.is_base,
             graph_offset: self.graph_offset,
@@ -17385,6 +17399,20 @@ impl ReadOnlyVectorGraphPageReader for RetainedVectorGraphPageReader {
                 "saved graph page range exceeds its generation".to_string(),
             ));
         }
+        #[cfg(feature = "test-seams")]
+        let _graph_reads = {
+            // This key was constructed from the validated generation route.
+            let table_len = usize::try_from(u64::from_be_bytes(
+                self.key[..8].try_into().expect("generation key component"),
+            ))
+            .expect("generation table length fits its owned key");
+            let table = std::str::from_utf8(&self.key[8..8 + table_len])
+                .expect("generation table key was constructed from UTF-8");
+            crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                table,
+            )
+        };
         if let Some(paged) = &self.paged {
             if len == 0 {
                 return Ok(Vec::new());
@@ -17641,6 +17669,16 @@ impl ReadOnlyVectorGenerationSource {
             generation_id,
         );
         self.with_read(|read| {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_physical_source(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                read,
+            );
+            #[cfg(feature = "test-seams")]
+            let _graph_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                &index.table,
+            );
             let table = read
                 .open_table(VECTOR_PARTITION_BASE_GENERATION_TABLE)
                 .map_err(|error| {
@@ -17727,6 +17765,16 @@ impl ReadOnlyVectorGenerationSource {
             change_generation_id,
         );
         self.with_read(|read| {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_physical_source(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                read,
+            );
+            #[cfg(feature = "test-seams")]
+            let _graph_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                &index.table,
+            );
             let table = read
                 .open_table(VECTOR_PARTITION_CHANGE_GENERATION_TABLE)
                 .map_err(|error| {
@@ -17820,6 +17868,16 @@ impl ReadOnlyVectorGenerationSource {
             generation_id,
         );
         self.with_read(|read| {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_physical_source(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                read,
+            );
+            #[cfg(feature = "test-seams")]
+            let _graph_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                &index.table,
+            );
             let table = read
                 .open_table(VECTOR_PARTITION_BASE_GENERATION_TABLE)
                 .map_err(|error| {
@@ -17861,6 +17919,16 @@ impl ReadOnlyVectorGenerationSource {
             change_generation_id,
         );
         self.with_read(|read| {
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_physical_source(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                read,
+            );
+            #[cfg(feature = "test-seams")]
+            let _graph_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                &index.table,
+            );
             let base_key = RedbPersistence::vector_partition_base_generation_key_from_parts(
                 index,
                 partition_key,
@@ -19216,6 +19284,7 @@ impl RedbPersistence {
             used_legacy_table_meta_layout: AtomicBool::new(false),
             paged_publications: Default::default(),
             paged_root_capture: std::sync::OnceLock::new(),
+            scoped_vector_root_capture: std::sync::OnceLock::new(),
         })
     }
 
@@ -19283,6 +19352,7 @@ impl RedbPersistence {
                         used_legacy_table_meta_layout: AtomicBool::new(false),
                         paged_publications: Default::default(),
                         paged_root_capture: std::sync::OnceLock::new(),
+                        scoped_vector_root_capture: std::sync::OnceLock::new(),
                     })
                 }
                 Err(err) => {
@@ -19469,6 +19539,7 @@ impl RedbPersistence {
                     used_legacy_table_meta_layout: AtomicBool::new(false),
                     paged_publications: Default::default(),
                     paged_root_capture: std::sync::OnceLock::new(),
+                    scoped_vector_root_capture: std::sync::OnceLock::new(),
                 };
                 persistence.recover_authoritative_purge_publication()?;
                 persistence.truncate_uncommitted_commit_index_tail()?;
@@ -25764,7 +25835,10 @@ impl RedbPersistence {
         })
     }
 
-    pub(crate) fn open_raw_vector_body_scan(self: &Arc<Self>) -> Result<WritableRawVectorBodyScan> {
+    pub(crate) fn open_raw_vector_body_scan(
+        self: &Arc<Self>,
+        index: &VectorIndexRef,
+    ) -> Result<WritableRawVectorBodyScan> {
         self.with_db(|db| {
             let (transaction, root) = match self.paged_root_capture.get() {
                 Some(capture) => {
@@ -25781,10 +25855,24 @@ impl RedbPersistence {
                 Err(redb::TableError::TableDoesNotExist(_)) => None,
                 Err(error) => return Err(Self::storage_error(error)),
             };
-            let vectors = match transaction.open_table(VECTORS_TABLE) {
-                Ok(table) => Some(table),
-                Err(redb::TableError::TableDoesNotExist(_)) => None,
-                Err(error) => return Err(Self::storage_error(error)),
+            let vectors = {
+                #[cfg(feature = "test-seams")]
+                crate::writer_query_test_seams::note_physical_source(
+                    crate::writer_query_test_seams::PhysicalFamily::Vector,
+                    &transaction,
+                );
+                #[cfg(feature = "test-seams")]
+                let _body_reads = crate::writer_query_test_seams::physical_operation(
+                    crate::writer_query_test_seams::PhysicalFamily::Vector,
+                    &index.table,
+                );
+                #[cfg(not(feature = "test-seams"))]
+                let _ = index;
+                match transaction.open_table(VECTORS_TABLE) {
+                    Ok(table) => Some(table),
+                    Err(redb::TableError::TableDoesNotExist(_)) => None,
+                    Err(error) => return Err(Self::storage_error(error)),
+                }
             };
             let verifier = content_identity::ContentIdentityReadVerifier::open(
                 &transaction,
@@ -25818,7 +25906,7 @@ impl RedbPersistence {
         expected_dimension: usize,
         quantization: VectorQuantization,
     ) -> Result<VectorEntry> {
-        self.open_raw_vector_body_scan()?.read_partition_body(
+        self.open_raw_vector_body_scan(index)?.read_partition_body(
             index,
             partition_key,
             identity,
@@ -26957,7 +27045,26 @@ impl RedbPersistence {
         change: Option<u64>,
     ) -> Result<usize> {
         self.with_db(|db| {
-            let read = db.begin_read().map_err(Self::storage_error)?;
+            let root = self
+                .scoped_vector_root_capture
+                .get()
+                .map(|capture| capture())
+                .transpose()?
+                .flatten();
+            let read = match &root {
+                Some(root) => root.owner_read()?,
+                None => Arc::new(db.begin_read().map_err(Self::storage_error)?),
+            };
+            #[cfg(feature = "test-seams")]
+            crate::writer_query_test_seams::note_physical_source(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                &read,
+            );
+            #[cfg(feature = "test-seams")]
+            let _graph_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                &index.table,
+            );
             Self::generation_record_bytes_in_read(&read, index, key, base, change)
         })
     }
@@ -27009,6 +27116,11 @@ impl RedbPersistence {
             partition_key,
             generation_id,
             None,
+            self.scoped_vector_root_capture
+                .get()
+                .map(|capture| capture())
+                .transpose()?
+                .flatten(),
         )
     }
 
@@ -27024,6 +27136,7 @@ impl RedbPersistence {
             partition_key,
             generation_id,
             Some(expected_graph_bytes),
+            None,
         )
     }
 
@@ -27033,6 +27146,7 @@ impl RedbPersistence {
         partition_key: &VectorPartitionKey,
         generation_id: u64,
         expected_graph_bytes: Option<u64>,
+        root: Option<Arc<WriterSnapshot>>,
     ) -> Result<VectorPartitionBaseGenerationRecord> {
         let key = Self::vector_partition_base_generation_key_from_parts(
             index,
@@ -27040,9 +27154,21 @@ impl RedbPersistence {
             generation_id,
         );
         self.with_db(|db| {
-            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            // Keep the operation's captured root and its lease throughout decoding.
+            let read_txn = match &root {
+                Some(root) => root.owner_read()?,
+                None => Arc::new(db.begin_read().map_err(Self::storage_error)?),
+            };
             #[cfg(feature = "test-seams")]
-            crate::writer_query_test_seams::note_physical_source(crate::writer_query_test_seams::PhysicalFamily::Graph, &read_txn);
+            crate::writer_query_test_seams::note_physical_source(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                &read_txn,
+            );
+            #[cfg(feature = "test-seams")]
+            let _graph_reads = crate::writer_query_test_seams::physical_operation(
+                crate::writer_query_test_seams::PhysicalFamily::Graph,
+                &index.table,
+            );
 
             let table = read_txn
                 .open_byte_table_bounded(VECTOR_PARTITION_BASE_GENERATION_TABLE)

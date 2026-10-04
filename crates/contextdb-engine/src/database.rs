@@ -14861,9 +14861,9 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
             DurableRawVectorSource::CommittedImage(source) => {
                 Ok(Some(Box::new(source.open_raw_vector_body_scan()?)))
             }
-            DurableRawVectorSource::Writable(persistence) => {
-                Ok(Some(Box::new(persistence.open_raw_vector_body_scan()?)))
-            }
+            DurableRawVectorSource::Writable(persistence) => Ok(Some(Box::new(
+                persistence.open_raw_vector_body_scan(&self.partition.index)?,
+            ))),
         }
     }
 
@@ -17103,6 +17103,7 @@ impl MaintenanceContext {
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
     ) -> Result<()> {
+        let _publication_read = writer_read::suspend_root_for_manager(&self.tx_mgr);
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
         };
