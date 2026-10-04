@@ -408,22 +408,54 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         "the successor has a different real storage transaction/root"
     );
     // Leave the cursor as the final holder of the retired original root.
-    // Exercise the indexed partition on the captured old root before requiring
-    // a real resident-partition eviction ahead of the next pull.
-    eprintln!(
-        "indexed old-root raw eviction premise: owners={:?} activity={:?} indexed_sources={indexed_transaction_work:?}",
-        database.writer_memory_ownership_receipt_for_test().vector,
-        database.__vector_passive_activity_counters_for_test(),
+    // Raw vectors are served by durable point loads, never a whole partition
+    // cache. Require the next indexed pull to reload them after real pressure.
+    assert_eq!(
+        database
+            .__vector_passive_activity_counters_for_test()
+            .raw_partition_loads,
+        0
     );
-    let evicted = database
-        .vector_store_for_test()
-        .evict_raw_partition_for_test(
-            &VectorIndexRef::new("reader_items", "embedding"),
-            &VectorPartitionKey::default(),
-        );
+    displace();
+    let (raw_reload, raw_reload_work) = observe_target("reader_items", || {
+        database.execute_in_tx(transaction,
+            "SELECT id, unique_key, embedding FROM reader_items ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+            &HashMap::from([("q".into(), Value::Vector(old_vectors[1].clone()))]))
+    });
+    assert_eq!(
+        raw_reload.unwrap().rows,
+        vec![expected_old[1].clone()],
+        "the next indexed pull reloads the same old vector answer"
+    );
+    let raw_activity = database.__vector_passive_activity_counters_for_test();
+    assert_eq!(
+        raw_activity.raw_partition_loads, 0,
+        "durable raw vector point loads never hydrate a whole partition"
+    );
     assert!(
-        evicted,
-        "the indexed old-root read must load a raw partition that is actually evicted before continuation reload"
+        raw_reload_work
+            .physical_sources
+            .iter()
+            .flatten()
+            .any(|(family, root)| {
+                *family == PhysicalFamily::Vector && *root == original_physical
+            }),
+        "raw vector reads use the captured native root: {raw_reload_work:?}"
+    );
+    assert!(
+        raw_reload_work
+            .physical_sources
+            .iter()
+            .flatten()
+            .all(|(_, root)| *root == original_physical)
+    );
+    eprintln!(
+        "durable vector reload: owners={:?} activity={raw_activity:?} sources={raw_reload_work:?}",
+        database.writer_memory_ownership_receipt_for_test().vector
+    );
+    assert!(
+        raw_reload_work.target_backend_bytes[PhysicalFamily::Vector as usize] > 0,
+        "the next indexed pull must reload encoded Vector pages at the captured root after cache displacement: {raw_reload_work:?}"
     );
     database.rollback(transaction).unwrap();
     drop(pinned);
@@ -668,6 +700,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         ("active statement", statement.1),
         ("read during durability window", during_work),
         ("captured transaction", transaction_work),
+        ("durable vector reload", raw_reload_work),
         ("initial transaction", initial_transaction_work),
         (
             "captured transaction maintained generation",
