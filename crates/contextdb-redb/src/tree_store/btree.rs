@@ -36,6 +36,102 @@ pub(super) fn page_checksum<T: Page>(
     }
 }
 
+/// Locate a fixed-key byte value without loading its payload. Allocator bitmap
+/// sources use this descriptor only while their saved tree is protected.
+pub(crate) fn fixed_key_value_location<K: Key>(
+    root: Option<BtreeHeader>,
+    mem: &TransactionalMemory,
+    hint: PageHint,
+    key: &K::SelfType<'_>,
+) -> Result<Option<(PageNumber, std::ops::Range<usize>)>> {
+    let Some(mut header) = root else {
+        return Ok(None);
+    };
+    let width = K::fixed_width().ok_or_else(|| {
+        crate::StorageError::Corrupted("windowed allocator lookup requires fixed keys".into())
+    })?;
+    let query = K::as_bytes(key);
+    let corrupt = || crate::StorageError::Corrupted("invalid windowed allocator node".into());
+    let mut ancestors = Vec::new();
+    loop {
+        if ancestors.contains(&header.root) {
+            return Err(corrupt());
+        }
+        let prefix = mem.get_page_window(header.root, 0..4, hint)?;
+        let count = usize::from(u16::from_le_bytes(prefix[2..4].try_into().unwrap()));
+        if count == 0 {
+            return Err(corrupt());
+        }
+        if prefix[0] == LEAF && !hint.verifies_path() {
+            // Fixed keys follow the value-end offsets. No selected or unrelated
+            // allocator payload enters the page cache during navigation.
+            let keys_start = 4 + count * 4;
+            let values_start = keys_start + count * width;
+            let extent = header
+                .root
+                .page_size_bytes(mem.get_page_size().try_into().unwrap())
+                as usize;
+            if values_start > extent {
+                return Err(corrupt());
+            }
+            let mut low = 0;
+            let mut high = count;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let offset = keys_start + mid * width;
+                let stored = mem.get_page_window(header.root, offset..offset + width, hint)?;
+                match K::compare(query.as_ref(), &stored) {
+                    std::cmp::Ordering::Less => high = mid,
+                    std::cmp::Ordering::Greater => low = mid + 1,
+                    std::cmp::Ordering::Equal => {
+                        let field = 4 + mid * 4;
+                        let offsets = mem.get_page_window(
+                            header.root,
+                            field.saturating_sub(4).max(4)..field + 4,
+                            hint,
+                        )?;
+                        let end =
+                            u32::from_le_bytes(offsets[offsets.len() - 4..].try_into().unwrap())
+                                as usize;
+                        let start = if mid == 0 {
+                            values_start
+                        } else {
+                            u32::from_le_bytes(offsets[..4].try_into().unwrap()) as usize
+                        };
+                        if start < values_start || end < start || end > extent {
+                            return Err(corrupt());
+                        }
+                        return Ok(Some((header.root, start..end)));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+        let page = mem.get_page(header.root, hint)?;
+        if hint.verifies_path() && page_checksum(&page, Some(width), None)? != header.checksum {
+            return Err(crate::StorageError::Corrupted(
+                "allocator source checksum failed".into(),
+            ));
+        }
+        match page.memory()[0] {
+            LEAF => {
+                let leaf = LeafAccessor::new(page.memory(), Some(width), None);
+                return Ok(leaf.find_key::<K>(query.as_ref()).map(|index| {
+                    let (start, end) = leaf.value_range(index).unwrap();
+                    (header.root, start..end)
+                }));
+            }
+            BRANCH => {
+                ancestors.push(header.root);
+                let branch = BranchAccessor::new(&page, Some(width));
+                let (index, child) = branch.child_for_key::<K>(query.as_ref());
+                header = BtreeHeader::new(child, branch.child_checksum(index).unwrap(), 0);
+            }
+            _ => return Err(corrupt()),
+        }
+    }
+}
+
 pub(crate) struct BtreeStats {
     pub(crate) tree_height: u32,
     pub(crate) leaf_pages: u64,

@@ -1,8 +1,6 @@
 use crate::ScratchBackend;
-use crate::db::TransactionGuard;
 use crate::transaction_tracker::TransactionId;
 use crate::transactions::{AllocatorStateKey, AllocatorStateTree, AllocatorStateTreeMut};
-use crate::tree_store::btree::Btree;
 use crate::tree_store::btree_base::{BtreeHeader, Checksum};
 use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
 use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
@@ -29,106 +27,110 @@ use std::sync::Arc;
 use std::sync::Arc as StdArc;
 use std::sync::Mutex;
 
-fn saved_u32(bytes: &[u8], offset: usize) -> io::Result<usize> {
-    let word = bytes.get(offset..offset + 4).ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            "truncated allocator bitmap metadata",
-        )
-    })?;
-    Ok(u32::from_le_bytes(word.try_into().unwrap()) as usize)
+struct SavedAllocatorValue<'a> {
+    mem: &'a TransactionalMemory,
+    page: PageNumber,
+    range: std::ops::Range<usize>,
+    hint: PageHint,
 }
-
-fn saved_bitmap_window(
-    data: &[u8],
-    order: u8,
-    height: u8,
-    page: u32,
-    out: &mut [u8; 4096],
-) -> io::Result<()> {
-    out.fill(0xFF);
-    let max_order = *data
-        .first()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "empty allocator region"))?;
-    if order > max_order {
-        return Ok(());
+impl SavedAllocatorValue<'_> {
+    fn read(&self, start: usize, out: &mut [u8]) -> io::Result<()> {
+        let end = start
+            .checked_add(out.len())
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "allocator offset overflow"))?;
+        if end > self.range.len() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "truncated allocator bitmap",
+            ));
+        }
+        let data = self
+            .mem
+            .get_page_window(
+                self.page,
+                self.range.start + start..self.range.start + end,
+                self.hint,
+            )
+            .map_err(io::Error::other)?;
+        out.copy_from_slice(&data);
+        Ok(())
     }
-    let headers_end = 8 + (usize::from(max_order) + 1) * 4;
-    let order_start = if order == 0 {
-        headers_end
-    } else {
-        saved_u32(data, 8 + (usize::from(order) - 1) * 4)?
-    };
-    let order_end = saved_u32(data, 8 + usize::from(order) * 4)?;
-    let bitmap = data
-        .get(order_start..order_end)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid allocator order offsets"))?;
-    saved_bitmap_layer_window(bitmap, height, page, out)
-}
-
-fn saved_tracker_window(
-    data: &[u8],
-    order: u8,
-    height: u8,
-    page: u32,
-    out: &mut [u8; 4096],
-) -> io::Result<()> {
-    let orders = saved_u32(data, 0)?;
-    if orders != usize::from(MAX_MAX_PAGE_ORDER) + 1 || usize::from(order) >= orders {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "invalid saved region tracker orders",
-        ));
+    fn u32(&self, offset: usize) -> io::Result<usize> {
+        let mut word = [0; 4];
+        self.read(offset, &mut word)?;
+        Ok(u32::from_le_bytes(word) as usize)
     }
-    let mut start = 4 + orders * 4;
-    for preceding in 0..usize::from(order) {
-        start = start
-            .checked_add(saved_u32(data, 4 + preceding * 4)?)
-            .ok_or_else(|| {
-                io::Error::new(ErrorKind::InvalidData, "region tracker offset overflow")
-            })?;
+    fn bitmap_window(
+        &self,
+        region: Option<u32>,
+        order: u8,
+        height: u8,
+        page: u32,
+        out: &mut [u8; 4096],
+    ) -> io::Result<()> {
+        out.fill(0xFF);
+        let invalid = || io::Error::new(ErrorKind::InvalidData, "invalid allocator bitmap offsets");
+        let (start, end) = if region.is_some() {
+            let mut max_order = [0];
+            self.read(0, &mut max_order)?;
+            if max_order[0] > MAX_MAX_PAGE_ORDER {
+                return Err(invalid());
+            }
+            if order > max_order[0] {
+                return Ok(());
+            }
+            let start = if order == 0 {
+                8 + (usize::from(max_order[0]) + 1) * 4
+            } else {
+                self.u32(8 + (usize::from(order) - 1) * 4)?
+            };
+            (start, self.u32(8 + usize::from(order) * 4)?)
+        } else {
+            let orders = self.u32(0)?;
+            if orders != usize::from(MAX_MAX_PAGE_ORDER) + 1 || usize::from(order) >= orders {
+                return Err(invalid());
+            }
+            // Order lengths are fixed-size geometry, not bitmap payload.
+            let mut lengths = [0; 84];
+            self.read(4, &mut lengths)?;
+            let mut start = 4 + orders * 4;
+            for field in lengths.chunks_exact(4).take(usize::from(order)) {
+                start = start
+                    .checked_add(u32::from_le_bytes(field.try_into().unwrap()) as usize)
+                    .ok_or_else(invalid)?;
+            }
+            let field = usize::from(order) * 4;
+            let len = u32::from_le_bytes(lengths[field..field + 4].try_into().unwrap()) as usize;
+            (start, start.checked_add(len).ok_or_else(invalid)?)
+        };
+        if start > end || end > self.range.len() {
+            return Err(invalid());
+        }
+        let count = self.u32(start)?;
+        if count == 0 || count > 4 || 4 + count * 4 > end - start {
+            return Err(invalid());
+        }
+        if usize::from(height) >= count {
+            return Ok(());
+        }
+        let layer_start = if height == 0 {
+            4 + count * 4
+        } else {
+            self.u32(start + 4 + (usize::from(height) - 1) * 4)?
+        };
+        let layer_end = self.u32(start + 4 + usize::from(height) * 4)?;
+        if layer_start > layer_end || layer_end > end - start || layer_end - layer_start < 4 {
+            return Err(invalid());
+        }
+        let words_start = start + layer_start + 4;
+        let words_len = layer_end - layer_start - 4;
+        let offset = page as usize * out.len();
+        if offset < words_len {
+            let len = (words_len - offset).min(out.len());
+            self.read(words_start + offset, &mut out[..len])?;
+        }
+        Ok(())
     }
-    let end = start
-        .checked_add(saved_u32(data, 4 + usize::from(order) * 4)?)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "region tracker offset overflow"))?;
-    let bitmap = data.get(start..end).ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            "invalid region tracker bitmap offsets",
-        )
-    })?;
-    out.fill(0xFF);
-    saved_bitmap_layer_window(bitmap, height, page, out)
-}
-
-fn saved_bitmap_layer_window(
-    bitmap: &[u8],
-    height: u8,
-    page: u32,
-    out: &mut [u8; 4096],
-) -> io::Result<()> {
-    let count = saved_u32(bitmap, 0)?;
-    if usize::from(height) >= count {
-        return Ok(());
-    }
-    let layer_start = if height == 0 {
-        4 + count * 4
-    } else {
-        saved_u32(bitmap, 4 + (usize::from(height) - 1) * 4)?
-    };
-    let layer_end = saved_u32(bitmap, 4 + usize::from(height) * 4)?;
-    let layer = bitmap
-        .get(layer_start..layer_end)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid allocator layer offsets"))?;
-    let words = layer
-        .get(4..)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "truncated allocator layer"))?;
-    let start = page as usize * out.len();
-    if let Some(fragment) = words.get(start..) {
-        let count = fragment.len().min(out.len());
-        out[..count].copy_from_slice(&fragment[..count]);
-    }
-    Ok(())
 }
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -735,16 +737,14 @@ impl TransactionalMemory {
                     let mem = mem.upgrade().ok_or_else(|| {
                         io::Error::new(ErrorKind::BrokenPipe, "allocator source database closed")
                     })?;
-                    let source_tree = Btree::<AllocatorStateKey, &'static [u8]>::new(
-                        root,
-                        hint,
-                        StdArc::new(TransactionGuard::fake()),
-                        mem,
-                    )
-                    .map_err(io::Error::other)?;
                     let key =
                         region.map_or(AllocatorStateKey::RegionTracker, AllocatorStateKey::Region);
-                    let Some(saved) = source_tree.get(&key).map_err(io::Error::other)? else {
+                    let Some((page_number, range)) =
+                        crate::tree_store::btree::fixed_key_value_location::<AllocatorStateKey>(
+                            root, &mem, hint, &key,
+                        )
+                        .map_err(io::Error::other)?
+                    else {
                         if region.is_none() {
                             return Err(io::Error::new(
                                 ErrorKind::InvalidData,
@@ -753,10 +753,13 @@ impl TransactionalMemory {
                         }
                         return Ok(false);
                     };
-                    match region {
-                        Some(_) => saved_bitmap_window(saved.value(), order, height, page, out)?,
-                        None => saved_tracker_window(saved.value(), order, height, page, out)?,
+                    SavedAllocatorValue {
+                        mem: &mem,
+                        page: page_number,
+                        range,
+                        hint,
                     }
+                    .bitmap_window(region, order, height, page, out)?;
                     Ok(true)
                 });
             // Saved tracker words remain in the durable source and share
@@ -1040,7 +1043,6 @@ impl TransactionalMemory {
         })
     }
 
-    #[cfg(feature = "contextdb-internal")]
     pub(crate) fn get_page_window(
         &self,
         page: PageNumber,

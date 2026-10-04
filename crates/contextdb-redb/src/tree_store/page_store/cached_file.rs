@@ -671,7 +671,6 @@ impl PagedCachedFile {
 
     // A reject-only window never enters the full-page cache. Its admission
     // remains owned until the window is released, including cached sources.
-    #[cfg(feature = "contextdb-internal")]
     pub(super) fn read_window(
         &self,
         offset: u64,
