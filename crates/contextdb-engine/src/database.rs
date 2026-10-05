@@ -75154,7 +75154,7 @@ mod retention_prune_persistence_tests {
         let snapshot = db.snapshot();
 
         db.persistence.as_ref().unwrap().close();
-        let pruned = db.run_pruning_cycle();
+        let pruned = db.run_pruning_cycle().unwrap();
 
         assert_eq!(
             pruned, 0,

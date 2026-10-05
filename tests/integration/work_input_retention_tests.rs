@@ -70,7 +70,7 @@ fn a_never_claimed_jobs_input_copies_age_out_under_the_declared_window() {
 
     // Advance past the declared 7-day window; nobody ever claimed the job.
     mock_now.fetch_add(SEVEN_DAYS_MS + 60_000, AtomicOrdering::SeqCst);
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     assert!(
         pruned > 0,
         "the aged-out input row must be pruned by the shipped retention pass"

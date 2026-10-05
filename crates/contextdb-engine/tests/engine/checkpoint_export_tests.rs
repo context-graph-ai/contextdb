@@ -674,7 +674,7 @@ fn ce10_retention_metadata_round_trip_artifact_prunes_after_ttl() {
 
     // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
     mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
-    let pruned = artifact.run_pruning_cycle();
+    let pruned = artifact.run_pruning_cycle().unwrap();
     assert!(
         pruned > 0,
         "RETAIN metadata must survive export: artifact pruning must delete the expired row, pruned {pruned}"
@@ -726,7 +726,7 @@ fn ce11_expired_unpruned_row_exported_and_source_pruning_resumes() {
     src.export_snapshot(&dest).unwrap();
 
     // Positive arm: retention on the source works right after export.
-    let pruned = src.run_pruning_cycle();
+    let pruned = src.run_pruning_cycle().unwrap();
     assert!(
         pruned > 0,
         "source pruning must resume after export, pruned {pruned}"

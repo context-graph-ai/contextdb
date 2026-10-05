@@ -5973,7 +5973,7 @@ fn integrity_03_retain_pruning_releases_memory() {
     assert!(used_after_insert > baseline);
 
     std::thread::sleep(Duration::from_millis(1100));
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     assert_eq!(pruned, 1, "expired row must be pruned");
 
     let used_after_prune = accountant.usage().used;

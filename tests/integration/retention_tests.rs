@@ -64,7 +64,7 @@ fn r01_basic_age_pruning() {
     db.execute("INSERT INTO obs (id, data) VALUES (3, 'young')", &p())
         .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "pruning must delete expired rows");
     assert_eq!(row_count(&db, "obs"), 1, "only the young row survives");
@@ -104,7 +104,7 @@ fn r02_short_ttl_prunes_old_not_new() {
     db.execute("INSERT INTO obs (id, data) VALUES (2, 'new')", &p())
         .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     assert!(pruned > 0, "at least the old row must be pruned");
     assert_eq!(row_count(&db, "obs"), 1, "only the new row survives");
 
@@ -183,7 +183,7 @@ fn r04_sync_safe_synced_rows_pruned() {
 
     // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
     mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "synced expired row must be pruned");
     assert_eq!(row_count(&db, "obs"), 0);
@@ -215,7 +215,7 @@ fn r05_expires_column_per_row_override() {
     )
     .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "past-expiry row must be pruned");
     assert_eq!(row_count(&db, "obs"), 1, "only future row survives");
@@ -245,7 +245,7 @@ fn r05b_pruning_expired_history_keeps_newer_live_version() {
     )
     .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     assert_eq!(pruned, 1, "only the expired historical version is pruned");
     assert_eq!(row_count(&db, "obs"), 1, "newer live version must survive");
 
@@ -326,7 +326,7 @@ fn r07_null_expires_uses_default_ttl() {
 
     // Advance 3 s past the row's stamped time — beyond the 2 s table TTL.
     mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "NULL expires row must be pruned by table TTL");
     assert_eq!(row_count(&db, "obs"), 0);
@@ -369,7 +369,7 @@ fn r08_alter_table_set_retain() {
     db.execute("INSERT INTO obs (id, data) VALUES (2, 'young')", &p())
         .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(
         pruned > 0,
@@ -463,7 +463,7 @@ fn r10_alter_table_set_retain_sync_safe() {
 
     // Now sync and prune
     db.set_sync_watermark(Lsn(u64::MAX));
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "synced expired row must be pruned");
     assert_eq!(row_count(&db, "obs"), 0);
@@ -931,7 +931,7 @@ fn r21_in_memory_retention_works() {
     db.execute("INSERT INTO obs (id, data) VALUES (2, 'young')", &p())
         .unwrap();
 
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
 
     assert!(pruned > 0, "in-memory DB must support pruning");
     assert_eq!(row_count(&db, "obs"), 1, "only the young row survives");
@@ -1230,7 +1230,7 @@ fn r28_concurrent_prune_and_insert() {
     });
 
     // Run pruning concurrently
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     // A concurrent registered statement can still own the expired versions.
     // New statements must see expiry immediately; reclamation follows release.
     assert_eq!(
@@ -1241,7 +1241,7 @@ fn r28_concurrent_prune_and_insert() {
         0
     );
     inserter.join().expect("inserter thread must not panic");
-    let reclaimed_after_release = db.run_pruning_cycle();
+    let reclaimed_after_release = db.run_pruning_cycle().unwrap();
     assert!(
         pruned + reclaimed_after_release > 0,
         "old rows must be reclaimed after the concurrent statement releases its snapshot"
@@ -1416,7 +1416,7 @@ fn mr2_graph_edge_cleanup_after_prune_reopen() {
 
         // Advance 2 s past the nodes' stamped time — beyond the 1 s TTL.
         mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
-        let pruned = db.run_pruning_cycle();
+        let pruned = db.run_pruning_cycle().unwrap();
         assert!(pruned > 0, "nodes must be pruned");
 
         // In-memory edges must be removed.
@@ -1483,7 +1483,7 @@ fn mr3_lsn_stamped_and_sync_safe_pruning() {
     // Set watermark high enough that the row's LSN is below it.
     // This means the row has been synced → eligible for pruning.
     db.set_sync_watermark(Lsn(u64::MAX));
-    let pruned = db.run_pruning_cycle();
+    let pruned = db.run_pruning_cycle().unwrap();
     assert!(pruned > 0, "row must be pruned when watermark > lsn");
     assert_eq!(row_count(&db, "obs"), 0);
 }
@@ -2132,7 +2132,7 @@ fn mr5_persistence_round_trip_with_pruning() {
 
         // Advance 2 s past the rows' stamped time — beyond the 1 s TTL.
         mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
-        let pruned = db.run_pruning_cycle();
+        let pruned = db.run_pruning_cycle().unwrap();
         assert!(pruned > 0, "rows must be pruned");
         assert_eq!(row_count(&db, "obs"), 0, "all rows must be pruned");
     }

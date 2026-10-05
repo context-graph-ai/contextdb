@@ -1918,7 +1918,7 @@ fn cfk_retention_eviction_of_parent_with_children_rejects() {
     assert_eq!(persisted_row_count(&checked_path, "parent"), 1);
     assert_eq!(persisted_row_count(&checked_path, "child"), 1);
     assert_eq!(
-        legacy.run_pruning_cycle(),
+        legacy.run_pruning_cycle().unwrap(),
         0,
         "compatibility pruning path must count only actual prunes"
     );
