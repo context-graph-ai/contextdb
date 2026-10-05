@@ -84,6 +84,7 @@ fn durable_generation_id(db: &Database, scope: Uuid) -> Option<u64> {
 fn graph_available(db: &Database, scope: Uuid) -> bool {
     db.vector_store_for_test()
         .partition_info(&index(), &partition(scope))
+        .unwrap()
         .is_some_and(|info| info.graph_available)
 }
 

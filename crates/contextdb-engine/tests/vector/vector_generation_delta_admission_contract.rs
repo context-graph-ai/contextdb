@@ -151,6 +151,7 @@ fn small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retri
     let info = db
         .vector_store_for_test()
         .partition_info(&route().index, &route().partition_key)
+        .unwrap()
         .unwrap();
     assert_eq!(info.live_rows, BASE_ROWS + DELTA_ROWS);
     assert_eq!(info.retained_rows, 0);

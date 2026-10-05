@@ -230,6 +230,7 @@ fn delete_after_reopen_tombstones_the_dormant_vector_and_keeps_the_other_partiti
         assert!(
             db.vector_store_for_test()
                 .partition_info(&index(), &partition(ALPHA_SCOPE))
+                .unwrap()
                 .is_none_or(|info| info.live_rows == 0),
             "the accepted delete removes alpha from live vector membership"
         );

@@ -322,6 +322,7 @@ fn in_memory_maintenance_honours_declared_consolidation_thresholds() {
     let first_generation = db
         .vector_store_for_test()
         .partition_info(&target_index(), &target_key())
+        .unwrap()
         .expect("the maintained partition is inspectable")
         .base_generation
         .expect("the initial in-memory build has a generation identity");
@@ -339,6 +340,7 @@ fn in_memory_maintenance_honours_declared_consolidation_thresholds() {
     assert_eq!(
         db.vector_store_for_test()
             .partition_info(&target_index(), &target_key())
+            .unwrap()
             .unwrap()
             .base_generation,
         Some(first_generation)
@@ -359,6 +361,7 @@ fn in_memory_maintenance_honours_declared_consolidation_thresholds() {
     let consolidated = db
         .vector_store_for_test()
         .partition_info(&target_index(), &target_key())
+        .unwrap()
         .unwrap();
     assert!(consolidated.base_generation.unwrap() > first_generation);
     assert_eq!(
@@ -441,6 +444,7 @@ fn durable_build_admits_before_loading_and_reports_completed_work() {
         let info = db
             .vector_store_for_test()
             .partition_info(&partition(0).index, &partition(0).partition_key)
+            .unwrap()
             .unwrap();
         pause.release();
         let result = worker.join().unwrap();
@@ -559,6 +563,7 @@ fn failed_partition_does_not_starve_actual_work_and_reports_active_progress() {
         let info = db
             .vector_store_for_test()
             .partition_info(&partition(1).index, &partition(1).partition_key)
+            .unwrap()
             .unwrap();
         pause.release();
         worker.join().unwrap().unwrap();
@@ -708,6 +713,7 @@ fn delta_replay_and_generation_compaction_report_actual_work() {
             .vector_store_for_test()
             .partition_info(&partition(0).index, &partition(0).partition_key)
             .unwrap()
+            .unwrap()
             .maintenance_progress;
         pause.release();
         worker.join().unwrap().unwrap();
@@ -791,6 +797,7 @@ fn pending_cleanup_route(
     assert_eq!(
         db.vector_store_for_test()
             .partition_info(&cleanup_route.index, &cleanup_route.partition_key)
+            .unwrap()
             .and_then(|partition| partition.maintenance_failure_details),
         Some(interrupted_details),
         "the actual cleanup route retains the same safe detail for inspection"
@@ -874,6 +881,7 @@ fn refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition() {
     let retained_cleanup_failure = db
         .vector_store_for_test()
         .partition_info(&cleanup_route.index, &cleanup_route.partition_key)
+        .unwrap()
         .and_then(|partition| partition.maintenance_failure_details)
         .expect("the refusing cleanup route retains an inspectable detail");
     assert_eq!(retained_cleanup_failure.failure, cleanup_failure.failure);
@@ -894,6 +902,7 @@ fn refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition() {
                     &partition(healthy_scope).index,
                     &partition(healthy_scope).partition_key,
                 )
+                .unwrap()
                 .unwrap()
                 .maintenance_failure_details
                 .is_none(),
@@ -1060,6 +1069,7 @@ fn refused_cleanup_keeps_serving_under_writes_and_publishes_when_memory_returns(
         assert_eq!(
             db.vector_store_for_test()
                 .partition_info(&route.index, &route.partition_key)
+                .unwrap()
                 .and_then(|partition| partition.maintenance_failure_details),
             Some(details),
             "the refusing route retains the same detail for inspection"
@@ -1119,6 +1129,7 @@ fn refused_cleanup_keeps_serving_under_writes_and_publishes_when_memory_returns(
     assert!(
         db.vector_store_for_test()
             .partition_info(&route.index, &route.partition_key)
+            .unwrap()
             .unwrap()
             .maintenance_failure_details
             .is_none()

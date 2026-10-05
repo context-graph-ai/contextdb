@@ -552,6 +552,7 @@ fn assert_stopped_maintenance_is_pending(db: &Database, partition: &VectorPartit
     let info = db
         .vector_store_for_test()
         .partition_info(&partition.index, &partition.partition_key)
+        .unwrap()
         .unwrap();
     assert_eq!(info.maintenance_failure, None);
     assert!(info.maintenance_progress.is_none());

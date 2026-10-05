@@ -1866,11 +1866,13 @@ fn selected_index_row_pruning_preserves_unrelated_resident_generation_and_indexe
     assert_eq!(answers_before.len(), 4);
     assert_eq!(answers_before[0].0, RowId(1));
 
-    let released = store.prune_row_ids_in_indexes(
-        &[RowId(1)].into_iter().collect(),
-        std::slice::from_ref(&a),
-        accountant.as_ref(),
-    );
+    let released = store
+        .prune_row_ids_in_indexes(
+            &[RowId(1)].into_iter().collect(),
+            std::slice::from_ref(&a),
+            accountant.as_ref(),
+        )
+        .unwrap();
     accountant.release(released);
 
     assert_eq!(vector_count_for(&store, &a), 3);
@@ -1919,7 +1921,9 @@ fn prune_row_ids_deterministically_blocks_concurrent_per_ref_insert_then_complet
     let store_prune = store.clone();
     let accountant_prune = accountant.clone();
     thread::spawn(move || {
-        let pruned = store_prune.prune_row_ids(&prune_rows, accountant_prune.as_ref());
+        let pruned = store_prune
+            .prune_row_ids(&prune_rows, accountant_prune.as_ref())
+            .unwrap();
         done_prune_tx.send(pruned).unwrap();
     });
     assert!(bulk_pause.wait_until_reached(TEST_TIMEOUT));
@@ -2021,7 +2025,9 @@ fn bulk_pause_blocks_unrelated_lazy_hnsw_build_then_build_completes() {
     let store_bulk = store.clone();
     let accountant_bulk = accountant.clone();
     thread::spawn(move || {
-        store_bulk.prune_row_ids(&prune_rows, accountant_bulk.as_ref());
+        store_bulk
+            .prune_row_ids(&prune_rows, accountant_bulk.as_ref())
+            .unwrap();
         done_bulk_tx.send(()).unwrap();
     });
     assert!(bulk_pause.wait_until_reached(TEST_TIMEOUT));

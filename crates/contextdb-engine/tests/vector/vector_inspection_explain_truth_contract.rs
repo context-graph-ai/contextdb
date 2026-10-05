@@ -239,6 +239,7 @@ fn failed_maintenance_memory_admission_stays_inspectable_until_limit_raise_recov
     let inspected = db
         .vector_store_for_test()
         .partition_info(&alpha_route.index, &alpha_route.partition_key)
+        .unwrap()
         .and_then(|partition| partition.maintenance_failure_details)
         .expect("Rust partition inspection retains the same safe failure detail");
     assert_eq!(inspected, reported);
@@ -424,6 +425,7 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
                 &VectorIndexRef::new("policy_failure_docs", "embedding"),
                 &partition_key,
             )
+            .unwrap()
             .and_then(|info| info.maintenance_failure),
         None,
         "an obsolete refusal cannot reappear when later changes become eligible"

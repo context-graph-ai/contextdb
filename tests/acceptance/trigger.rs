@@ -258,6 +258,7 @@ fn hnsw_baseline_failure(
     let Some(info) = db
         .vector_store_for_test()
         .partition_info(&index, &VectorPartitionKey::unpartitioned())
+        .expect("partition metadata inspection must succeed")
     else {
         return Some(format!(
             "{label} maintained vector partition is missing for {index:?}"
@@ -432,6 +433,7 @@ fn warm_hnsw_fixture(
     let info = db
         .vector_store_for_test()
         .partition_info(&index, &VectorPartitionKey::unpartitioned())
+        .expect("partition metadata inspection must succeed")
         .expect("fixture must publish a maintained vector partition");
     assert_eq!(
         info.live_rows, expected_rows,

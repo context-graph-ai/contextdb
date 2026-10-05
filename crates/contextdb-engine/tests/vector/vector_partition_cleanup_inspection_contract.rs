@@ -510,6 +510,7 @@ fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
         let info = db
             .vector_store_for_test()
             .partition_info(&index, &key)
+            .unwrap()
             .expect("the live partition keeps its inspection state");
         assert!(
             info.graph_available,

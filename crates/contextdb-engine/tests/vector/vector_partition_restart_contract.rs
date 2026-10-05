@@ -82,6 +82,7 @@ fn partition(scope: Uuid) -> VectorPartitionKey {
 fn graph_available(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
     db.vector_store_for_test()
         .partition_info(index, &partition(scope))
+        .unwrap()
         .map(|info| info.graph_available)
         .unwrap_or(false)
 }

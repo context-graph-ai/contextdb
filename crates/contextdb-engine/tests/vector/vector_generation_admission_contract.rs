@@ -191,6 +191,7 @@ fn assert_published(db: &Database, report: contextdb_engine::MaintenanceReport) 
     let partition = db
         .vector_store_for_test()
         .partition_info(&route().index, &route().partition_key)
+        .unwrap()
         .unwrap();
     assert!(partition.graph_available);
     assert_eq!(partition.pending_inserts, 0);
@@ -278,6 +279,7 @@ fn retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph()
     let info = db
         .vector_store_for_test()
         .partition_info(&route().index, &route().partition_key)
+        .unwrap()
         .unwrap();
     assert_eq!(info.live_rows, 6300);
     assert_eq!(info.retained_rows, 6700);

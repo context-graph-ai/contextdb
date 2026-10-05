@@ -949,6 +949,7 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
     let first = database
         .vector_store_for_test()
         .partition_info(&route.index, &route.partition_key)
+        .unwrap()
         .unwrap();
     eprintln!("native initial owners={owners}, first={first:?}");
     assert!(
@@ -965,6 +966,7 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
         let info = database
             .vector_store_for_test()
             .partition_info(&route.index, &route.partition_key)
+            .unwrap()
             .unwrap();
         if info.graph_available && info.maintenance_progress.is_none() {
             break;
@@ -974,6 +976,7 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
     let published = database
         .vector_store_for_test()
         .partition_info(&route.index, &route.partition_key)
+        .unwrap()
         .unwrap();
     assert!(
         published.graph_available && published.maintenance_progress.is_none(),
@@ -1027,7 +1030,8 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
         "native reopened info={:?}, generations={:?}, paged_storage={}",
         database
             .vector_store_for_test()
-            .partition_info(&route.index, &route.partition_key),
+            .partition_info(&route.index, &route.partition_key)
+            .unwrap(),
         database
             .vector_store_for_test()
             .partition_graph_generation_status(&route),

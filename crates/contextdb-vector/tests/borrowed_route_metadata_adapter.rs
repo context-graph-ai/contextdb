@@ -282,11 +282,13 @@ fn removed_and_recreated_partition_rejects_the_old_state_in_the_same_column() {
         )])
         .unwrap();
     let sampled = store.partition_state(&index, &key).unwrap();
-    store.prune_row_ids_in_indexes(
-        &HashSet::from([RowId(1)]),
-        std::slice::from_ref(&index),
-        &Budget::default(),
-    );
+    store
+        .prune_row_ids_in_indexes(
+            &HashSet::from([RowId(1)]),
+            std::slice::from_ref(&index),
+            &Budget::default(),
+        )
+        .unwrap();
     assert!(store.try_partition_state(&index, &key).is_none());
     assert!(!store.apply_partition_source_maintenance_metadata(
         &index,

@@ -495,6 +495,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         assert!(
             db.vector_store
                 .partition_info(&route(0).index, &route(0).partition_key)
+                .unwrap()
                 .is_none()
         );
         assert_eq!(
@@ -625,6 +626,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         assert!(
             db.vector_store
                 .partition_info(&route(0).index, &route(0).partition_key)
+                .unwrap()
                 .is_none(),
             "durable publication does not fabricate an empty resident state"
         );
@@ -913,6 +915,7 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
         let retirement_candidate = db
             .vector_store
             .partition_info(&route(2).index, &route(2).partition_key)
+            .unwrap()
             .expect("scope 2 is an active retirement candidate before refusal");
         assert_eq!(retirement_candidate.live_rows, 0);
         assert!(retirement_candidate.retained_rows >= 176);

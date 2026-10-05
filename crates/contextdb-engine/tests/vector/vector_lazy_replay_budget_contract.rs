@@ -92,6 +92,7 @@ fn partition_ref() -> VectorPartitionRef {
 fn graph_ready(db: &Database) -> bool {
     db.vector_store_for_test()
         .partition_info(&index(), &partition())
+        .unwrap()
         .is_some_and(|info| info.graph_available)
 }
 

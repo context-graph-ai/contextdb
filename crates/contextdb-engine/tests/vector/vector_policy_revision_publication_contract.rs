@@ -707,6 +707,7 @@ fn registered_layout_checks_every_authored_policy_member_and_revision_before_ins
             store
                 .partition_info(&index(), &partition().partition_key)
                 .unwrap()
+                .unwrap()
                 .live_rows,
             3
         );

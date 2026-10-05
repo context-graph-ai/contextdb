@@ -200,6 +200,7 @@ fn insert_route(db: &Database, scope: Uuid, first_id: u128, axis: usize) {
 fn graph_ready(db: &Database, scope: Uuid) -> bool {
     db.vector_store_for_test()
         .partition_info(&index(), &partition(scope))
+        .unwrap()
         .is_some_and(|info| info.graph_available)
 }
 
@@ -1114,6 +1115,7 @@ fn caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart
         let progress = db
             .vector_store_for_test()
             .partition_info(&route(alpha).index, &route(alpha).partition_key)
+            .unwrap()
             .unwrap()
             .maintenance_progress;
         pause.release();

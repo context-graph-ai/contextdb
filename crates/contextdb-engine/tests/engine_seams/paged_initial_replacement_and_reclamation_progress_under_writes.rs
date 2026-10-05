@@ -113,6 +113,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         .vector_store_for_test()
         .partition_info(&route.index, &route.partition_key)
         .unwrap()
+        .unwrap()
         .maintenance_progress;
     assert!(
         committed.is_some_and(|progress| progress.vectors_done > 0 && progress.vectors_done < ROWS),
@@ -143,6 +144,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     let restored = db
         .vector_store_for_test()
         .partition_info(&route.index, &route.partition_key)
+        .unwrap()
         .unwrap()
         .maintenance_progress;
     assert_eq!(
@@ -205,6 +207,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         .vector_store_for_test()
         .partition_info(&route.index, &route.partition_key)
         .unwrap()
+        .unwrap()
         .maintenance_progress
         .unwrap();
     assert!(
@@ -229,6 +232,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         !db.vector_store_for_test()
             .partition_info(&route.index, &route.partition_key)
             .unwrap()
+            .unwrap()
             .graph_available,
         "cancellation publishes no partial graph"
     );
@@ -245,6 +249,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     let resume = db
         .vector_store_for_test()
         .partition_info(&route.index, &route.partition_key)
+        .unwrap()
         .unwrap()
         .maintenance_progress;
     db.set_memory_limit(Some(limit)).unwrap();
@@ -277,11 +282,13 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
                 .vector_store_for_test()
                 .partition_info(&route.index, &route.partition_key)
                 .unwrap()
+                .unwrap()
                 .graph_available;
         }
         if let Some(progress) = db
             .vector_store_for_test()
             .partition_info(&route.index, &route.partition_key)
+            .unwrap()
             .unwrap()
             .maintenance_progress
         {
@@ -328,6 +335,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     let info = db
         .vector_store_for_test()
         .partition_info(&route.index, &route.partition_key)
+        .unwrap()
         .unwrap();
     eprintln!(
         "restart progress={resume:?}; workspace_peak={workspace_peak}; finite cycles:\n{}",
@@ -373,6 +381,7 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     let replacement = db
         .vector_store_for_test()
         .partition_info(&route.index, &route.partition_key)
+        .unwrap()
         .unwrap();
     assert!(
         replacement.base_generation > generation,
@@ -533,6 +542,7 @@ fn current_only_maintenance_crash_cuts() {
         let restored = db
             .vector_store_for_test()
             .partition_info(&route.index, &route.partition_key)
+            .unwrap()
             .unwrap();
         assert_eq!(
             restored.graph_available,
@@ -573,6 +583,7 @@ fn current_only_maintenance_crash_cuts() {
         assert!(
             db.vector_store_for_test()
                 .partition_info(&route.index, &route.partition_key)
+                .unwrap()
                 .unwrap()
                 .graph_available
         );

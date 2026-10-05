@@ -115,6 +115,7 @@ fn drive_maintenance(db: &Database, table: &str, scope: &str) {
         if db
             .vector_store_for_test()
             .partition_info(&index, &partition)
+            .unwrap()
             .is_some_and(|info| info.graph_available)
         {
             return;
@@ -2826,6 +2827,7 @@ fn retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_
                 &VectorIndexRef::new("passages", "embedding"),
                 &VectorPartitionKey::unpartitioned()
             )
+            .unwrap()
             .unwrap()
             .graph_available
     );

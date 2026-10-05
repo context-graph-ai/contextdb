@@ -299,6 +299,7 @@ fn drive_until_indexed(db: &Database, scope: Uuid) {
         if db
             .vector_store_for_test()
             .partition_info(&index(), &partition(scope))
+            .unwrap()
             .is_some_and(|info| info.graph_available)
         {
             return;
@@ -557,6 +558,7 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
         if db
             .vector_store_for_test()
             .partition_info(&order_index, &VectorPartitionKey::unpartitioned())
+            .unwrap()
             .is_some_and(|info| info.graph_available)
         {
             break;
@@ -567,6 +569,7 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
     assert!(
         db.vector_store_for_test()
             .partition_info(&order_index, &VectorPartitionKey::unpartitioned())
+            .unwrap()
             .is_some_and(|info| info.graph_available),
         "the tie fixture has a maintained committed route before staging its delta"
     );

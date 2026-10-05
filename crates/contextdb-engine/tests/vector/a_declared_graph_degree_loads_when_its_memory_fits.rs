@@ -141,6 +141,7 @@ fn seed(path: &std::path::Path, declared: &str) -> Vec<Vec<Uuid>> {
     let ready = || {
         db.vector_store_for_test()
             .partition_info(&index(), &partition())
+            .unwrap()
             .is_some_and(|info| info.graph_available)
     };
     for _ in 0..MAX_MAINTENANCE_CYCLES {

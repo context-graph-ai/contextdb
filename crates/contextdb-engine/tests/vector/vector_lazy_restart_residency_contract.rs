@@ -97,6 +97,7 @@ fn graph_status(
 fn graph_ready(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
     db.vector_store_for_test()
         .partition_info(index, &partition(scope))
+        .unwrap()
         .is_some_and(|info| info.graph_available)
 }
 

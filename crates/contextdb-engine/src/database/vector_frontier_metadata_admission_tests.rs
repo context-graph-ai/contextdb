@@ -371,6 +371,7 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
         db.vector_store
             .partition_info(&partition.index, &partition.partition_key)
             .unwrap()
+            .unwrap()
             .maintenance_failure_details,
         Some(details)
     );
