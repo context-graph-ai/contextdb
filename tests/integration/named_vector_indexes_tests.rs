@@ -2370,7 +2370,9 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
 
     // Advance 1.5 s past the row's stamped time — beyond the 1 s TTL.
     mock_now.fetch_add(1_500, AtomicOrdering::SeqCst);
-    receiver.run_pruning_cycle();
+    receiver
+        .run_pruning_cycle()
+        .expect("prune receiver before repopulating the registered index");
 
     // The index is REGISTERED (DDL didn't change) but vector_count is 0. A push from a writer with a
     // VectorChange for that index must apply, not return UnknownVectorIndex.
@@ -3111,7 +3113,8 @@ fn nv_retain_prunes_every_vector_index_for_expired_row() {
 
     // Advance 1.5 s past the row's stamped time — beyond the 1 s TTL.
     mock_now.fetch_add(1_500, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle(); // returns u64 (count pruned); no Result, so no .expect()
+    db.run_pruning_cycle()
+        .expect("prune expired row from every vector index");
 
     // Both indexes must drop the expired row — not just the first registered.
     let text_hits = db

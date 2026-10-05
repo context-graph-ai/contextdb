@@ -104,7 +104,8 @@ fn reading_an_expired_jobs_input_returns_a_typed_refusal_not_empty_bytes() {
     submit_job(&db, &spec, &[b"payload bytes".as_slice()]).expect("submit");
 
     mock_now.fetch_add(SEVEN_DAYS_MS + 60_000, AtomicOrdering::SeqCst);
-    db.run_pruning_cycle();
+    db.run_pruning_cycle()
+        .expect("prune expired job inputs before checking the typed read refusal");
     assert_eq!(
         work_inputs_row_count(&db, "job-expired"),
         0,
@@ -204,7 +205,8 @@ fn an_ordinary_incremental_pull_does_not_resurrect_an_expired_input_row() {
 
     // The edge expires its OWN copy locally.
     mock_now.fetch_add(SEVEN_DAYS_MS + 60_000, AtomicOrdering::SeqCst);
-    edge.run_pruning_cycle();
+    edge.run_pruning_cycle()
+        .expect("prune the edge input before the incremental pull");
     assert_eq!(
         work_inputs_row_count(&edge, "job-pushed"),
         0,
