@@ -75147,18 +75147,18 @@ mod retention_prune_persistence_tests {
     }
 
     #[test]
-    fn compatibility_prune_keeps_memory_when_persistence_fails() {
+    fn pruning_reports_failure_and_keeps_memory() {
         let (db, _clock, path) = db_with_expired_row();
         let before = durable_observation::rows(&db, "obs");
         assert_eq!(before.len(), 1);
         let snapshot = db.snapshot();
 
         db.persistence.as_ref().unwrap().close();
-        let pruned = db.run_pruning_cycle().unwrap();
+        let err = db.run_pruning_cycle().unwrap_err();
 
-        assert_eq!(
-            pruned, 0,
-            "compatibility pruning cannot surface errors and must report no durable prune"
+        assert!(
+            matches!(&err, Error::Other(detail) if detail == "database persistence is closed"),
+            "pruning must surface the closed persistence error; got {err:?}"
         );
         drop(db);
         let reopened = Database::open(&path).unwrap();
