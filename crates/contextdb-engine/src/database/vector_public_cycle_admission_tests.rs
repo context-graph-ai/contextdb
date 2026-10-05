@@ -228,7 +228,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owner.db");
     let copy = directory.path().join("cold.db");
-    let mut db = Database::open(&path).unwrap();
+    let db = Database::open(&path).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute("CREATE TABLE items (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(3) PARTITION_KEY (scope) MAX_PARTITIONS 3 SEARCH_MODE INDEXED HNSW (M = 4, EF_CONSTRUCTION = 64))", &HashMap::new()).unwrap();
     for scope in 0..2 {
@@ -266,6 +266,26 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         )
         .unwrap();
     }
+    if matches!(kind, UnknownCatalog::Incomplete) {
+        db.execute(
+            "CREATE TABLE cold_catalog_pressure (id INT PRIMARY KEY, body TEXT) SYNC OFF",
+            &HashMap::new(),
+        )
+        .unwrap();
+        for id in 0..128 {
+            db.execute(
+                "INSERT INTO cold_catalog_pressure VALUES ($id, $body)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    (
+                        "body".into(),
+                        Value::Text(format!("{id}:{}", "p".repeat(64 * 1024))),
+                    ),
+                ]),
+            )
+            .unwrap();
+        }
+    }
     db.export_snapshot(&copy).unwrap();
     let persistence = RedbPersistence::open_with_cache(&copy, 0).unwrap();
     let definitions = [
@@ -277,43 +297,84 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         MEMBERSHIPS,
         TableDefinition::new("vector_entries"),
         TableDefinition::new("vector_open_directory"),
+        TableDefinition::new("vector_membership_summary_pages"),
+        TableDefinition::new("vector_membership_source_pages"),
+        TableDefinition::new("vector_membership_reverse_pages"),
     ];
-    let mut catalog_bytes = Vec::new();
-    for (ordinal, definition) in definitions.into_iter().enumerate() {
-        let records = db
-            .persistence
-            .as_ref()
-            .unwrap()
-            .with_db(|source| {
-                let read = source.begin_read().unwrap();
-                let table = read.open_table(definition).unwrap();
-                Ok(table
+    let relations = db
+        .persistence
+        .as_ref()
+        .unwrap()
+        .with_db(|source| {
+            let read = source.begin_read().unwrap();
+            Ok(definitions
+                .into_iter()
+                .map(|definition| {
+                    let table = read.open_table(definition).unwrap();
+                    let records = table
+                        .iter()
+                        .unwrap()
+                        .map(|record| {
+                            let (key, value) = record.unwrap();
+                            (key.value().to_vec(), value.value().to_vec())
+                        })
+                        .collect::<Vec<_>>();
+                    (definition, records)
+                })
+                .collect::<Vec<_>>())
+        })
+        .unwrap();
+    let catalog_bytes = relations[0].1[0].1.clone();
+    persistence
+        .with_db(|destination| {
+            let write = destination.begin_write().unwrap();
+            for (definition, records) in &relations {
+                let mut table = write.open_table(*definition).unwrap();
+                // Replace every coupled relation in one publication, including
+                // lifecycle keys introduced only by the snapshot exporter.
+                let previous = table
                     .iter()
                     .unwrap()
-                    .map(|record| {
-                        let (key, value) = record.unwrap();
-                        (key.value().to_vec(), value.value().to_vec())
-                    })
-                    .collect::<Vec<_>>())
-            })
-            .unwrap();
-        if ordinal == 0 {
-            catalog_bytes = records[0].1.clone();
-        }
-        persistence
-            .with_db(|destination| {
-                let write = destination.begin_write().unwrap();
-                {
-                    let mut table = write.open_table(definition).unwrap();
-                    for (key, value) in &records {
-                        table.insert(key.as_slice(), value.as_slice()).unwrap();
-                    }
+                    .map(|record| record.unwrap().0.value().to_vec())
+                    .collect::<Vec<_>>();
+                for key in previous {
+                    table.remove(key.as_slice()).unwrap();
                 }
-                write.commit().unwrap();
-                Ok(())
-            })
-            .unwrap();
-    }
+                for (key, value) in records {
+                    table.insert(key.as_slice(), value.as_slice()).unwrap();
+                }
+            }
+            for (definition, key) in [
+                (
+                    TableDefinition::<&[u8], &[u8]>::new("vector_membership_source_pages"),
+                    "vector_membership_source_pages_root_v1",
+                ),
+                (
+                    TableDefinition::<&[u8], &[u8]>::new("vector_membership_reverse_pages"),
+                    "vector_membership_reverse_pages_root_v1",
+                ),
+                (
+                    TableDefinition::<&[u8], &[u8]>::new("vector_membership_summary_pages"),
+                    "vector_membership_summary_pages_root_v1",
+                ),
+            ] {
+                let fingerprint = write
+                    .table_root_fingerprint(definition)
+                    .unwrap()
+                    .unwrap_or([0; 32]);
+                write
+                    .open_table(TableDefinition::<&str, &[u8]>::new(
+                        "__content_identity_metadata",
+                    ))
+                    .unwrap()
+                    .insert(key, fingerprint.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            Ok(())
+        })
+        .unwrap();
+    drop(relations);
     let unknown_key: &[u8] = if before { b"" } else { b"\xff" };
     let unknown_bytes = match kind {
         UnknownCatalog::Giant | UnknownCatalog::DurableOnly => vec![0xff; MALFORMED_METADATA_BYTES],
@@ -327,23 +388,87 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
             bytes
         }
     };
-    persistence
-        .with_db(|destination| {
-            let write = destination.begin_write().unwrap();
-            write
-                .open_table(CATALOGS)
-                .unwrap()
-                .insert(unknown_key, unknown_bytes.as_slice())
-                .unwrap();
-            write.commit().unwrap();
-            Ok(())
-        })
-        .unwrap();
+    // Miskey tests introduce corruption after restoring the healthy serving
+    // state; reopening an already miskeyed store can quarantine it first.
+    if !matches!(kind, UnknownCatalog::Miskey) {
+        persistence
+            .with_db(|destination| {
+                let write = destination.begin_write().unwrap();
+                write
+                    .open_table(CATALOGS)
+                    .unwrap()
+                    .insert(unknown_key, unknown_bytes.as_slice())
+                    .unwrap();
+                write.commit().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    }
     persistence.close();
     drop(persistence);
-    let persistence = Arc::new(RedbPersistence::open_with_cache(&copy, 0).unwrap());
-    persistence.attach_memory_accountant(Arc::clone(&db.accountant));
-    let original = db.persistence.replace(Arc::clone(&persistence)).unwrap();
+    // Reopen one writer so its publisher, catalog and all lazy sources own
+    // the same prepared store. The declared share is smaller than the malformed
+    // extent, preserving a cold physical admission on the observed cycle.
+    db.close().unwrap();
+    drop(db);
+    let accountant = Arc::new(MemoryAccountant::no_limit());
+    accountant.set_budget(Some(64 * 1024 * 1024)).unwrap();
+    let db = Database::open_with_config(&copy, Arc::new(CorePlugin), accountant).unwrap();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    if !matches!(kind, UnknownCatalog::DurableOnly) {
+        assert!(
+            db.vector_store
+                .preload_dormant_partition_generation(&route(0), true)
+                .unwrap(),
+            "the serving base is resident before the admission cycle"
+        );
+        assert_eq!(
+            db.vector_store.partition_graph_generation_status(&route(0)),
+            Some(serving),
+            "normal reopen and preload restore the original serving premise"
+        );
+    }
+    assert!(
+        crate::persistence::redb_writer_cache_bytes_for_limit(Some(64 * 1024 * 1024))
+            < MALFORMED_METADATA_BYTES
+    );
+    let persistence = Arc::clone(db.persistence.as_ref().unwrap());
+    if matches!(kind, UnknownCatalog::Miskey) {
+        persistence
+            .with_db(|destination| {
+                let write = destination.begin_write().unwrap();
+                write
+                    .open_table(CATALOGS)
+                    .unwrap()
+                    .insert(unknown_key, unknown_bytes.as_slice())
+                    .unwrap();
+                write.commit().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    }
+    if matches!(kind, UnknownCatalog::Incomplete) {
+        let before = db.__writer_cache_stats_for_test().unwrap();
+        let declared_share =
+            crate::persistence::redb_writer_cache_bytes_for_limit(Some(64 * 1024 * 1024));
+        assert!(128 * 64 * 1024 > declared_share);
+        for id in 0..128 {
+            assert_eq!(
+                db.execute(
+                    &format!("SELECT body FROM cold_catalog_pressure WHERE id = {id}"),
+                    &HashMap::new()
+                )
+                .unwrap()
+                .rows,
+                vec![vec![Value::Text(format!("{id}:{}", "p".repeat(64 * 1024)))]]
+            );
+        }
+        let after = db.__writer_cache_stats_for_test().unwrap();
+        assert!(
+            after.1 > before.1 && after.2 > before.2,
+            "the real engine path displaces catalog pages before the incomplete inventory: {before:?} -> {after:?}"
+        );
+    }
     let headroom = if matches!(kind, UnknownCatalog::Incomplete) {
         4096
     } else {
@@ -565,7 +690,6 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         drop(observation);
     }
     db.close().unwrap();
-    drop(original);
 }
 
 #[test]
