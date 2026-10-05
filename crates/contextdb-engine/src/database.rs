@@ -15106,9 +15106,10 @@ fn durable_raw_vector_partitions(
 /// and one partition factory per vector column, and one forward source per
 /// partition with a maintained summary. Registration reads only those
 /// summary records; no membership record is enumerated and no directory is
-/// retained. Every later operation reads the writer's current root.
+/// retained. Every later operation reads its captured writer root.
 fn register_dormant_raw_vector_partitions(
     vector: &VectorStore,
+    manager: &Arc<TransactionManager<DynStore>>,
     persistence: &Arc<RedbPersistence>,
     accountant: &Arc<MemoryAccountant>,
 ) -> Result<()> {
@@ -15130,7 +15131,17 @@ fn register_dormant_raw_vector_partitions(
             },
         )
     };
+    let published_root: crate::persistence::vector_membership_source::PublishedMembershipRoot = {
+        let manager = Arc::downgrade(manager);
+        Arc::new(move || {
+            let manager = manager
+                .upgrade()
+                .ok_or_else(|| Error::Other("writer publication is unavailable".into()))?;
+            writer_read::durable_root(manager.capture_published_read().handle)
+        })
+    };
     let columns = Arc::new(DurableColumnSourceFactory {
+        published_root: published_root.clone(),
         persistence: persistence.clone(),
         accountant: accountant.clone(),
         loader: loader_for.clone(),
@@ -15173,6 +15184,7 @@ fn register_dormant_raw_vector_partitions(
                 partition.clone(),
                 summary,
                 accountant.clone(),
+                published_root.clone(),
             ),
             loader_for(&partition, &info.layout),
         )?;
@@ -16334,16 +16346,10 @@ fn register_loaded_dormant_vector_generations(
             // partition no longer owns an indexed route.
             continue;
         }
-        if vector
-            .partition_info(&catalog.index, &catalog.partition_key)
-            .is_none()
-        {
+        let Some(info) = vector.try_partition_info(&catalog.index, &catalog.partition_key)? else {
             continue;
-        }
-        let live_rows = vector
-            .partition_info(&catalog.index, &catalog.partition_key)
-            .map(|info| info.live_rows)
-            .unwrap_or(0);
+        };
+        let live_rows = info.live_rows;
         if catalog.base.generation_id == 0
             || catalog.base.resident_bytes == 0
             || catalog.base.durable_bytes == 0
@@ -16530,9 +16536,9 @@ fn vector_partition_routes(vector: &VectorStore) -> Result<Vec<VectorPartitionRe
     for index in vector.index_layout_infos() {
         routes.extend(
             vector
-                .partition_infos(&index.index)?
+                .partition_keys(&index.index)?
                 .into_iter()
-                .map(|partition| partition.partition),
+                .map(|key| VectorPartitionRef::new(index.index.clone(), key)),
         );
     }
     Ok(routes)
@@ -17106,6 +17112,22 @@ impl MaintenanceContext {
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
     ) -> Result<()> {
+        self.tx_mgr.with_maintenance_publication(|publication| {
+            // The catalog and pending summary are already durable. New reads
+            // must capture that committed storage version before using the
+            // replacement generation; existing readers retain their root.
+            publication.reserve()?;
+            publication.complete();
+            Ok(())
+        })?;
+        // Registration, graph loading and eviction run outside the commit gate.
+        self.install_published_vector_catalog_at_boundary(catalog)
+    }
+
+    fn install_published_vector_catalog_at_boundary(
+        &self,
+        catalog: &VectorPartitionGenerationCatalogRecord,
+    ) -> Result<()> {
         let _publication_read = writer_read::suspend_root_for_manager(&self.tx_mgr);
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
@@ -17123,9 +17145,8 @@ impl MaintenanceContext {
         let layout = self.vector.index_layout(&catalog.index)?;
         let live_rows = self
             .vector
-            .partition_info(&catalog.index, &catalog.partition_key)
-            .map(|info| info.live_rows)
-            .unwrap_or(0);
+            .try_partition_state(&catalog.index, &catalog.partition_key)
+            .map_or(0, |state| state.vector_count());
         let base_resident_bytes = DurableVectorGenerationLoader::descriptor_usize(
             catalog.base.resident_bytes,
             "published base generation resident byte declaration",
@@ -17829,22 +17850,18 @@ impl MaintenanceContext {
         }
         loop {
             let layout = self.vector.index_layout(&partition.index)?;
-            let live_vectors = self
+            let info = self
                 .vector
-                .partition_info(&partition.index, &partition.partition_key)
-                .map(|info| info.live_rows)
-                .unwrap_or(0);
+                .try_partition_info(&partition.index, &partition.partition_key)?;
+            let live_vectors = info.as_ref().map_or(0, |info| info.live_rows);
             let policy = layout.resolve_policy(live_vectors, 1);
-            let topology_replacement = self
-                .vector
-                .partition_info(&partition.index, &partition.partition_key)
-                .is_some_and(|info| {
-                    info.graph_available
-                        && info.serving_policy.is_none_or(|serving| {
-                            serving.hnsw_m != policy.hnsw_m
-                                || serving.hnsw_ef_construction != policy.hnsw_ef_construction
-                        })
-                });
+            let topology_replacement = info.as_ref().is_some_and(|info| {
+                info.graph_available
+                    && info.serving_policy.is_none_or(|serving| {
+                        serving.hnsw_m != policy.hnsw_m
+                            || serving.hnsw_ef_construction != policy.hnsw_ef_construction
+                    })
+            });
             let partition_state_present = self
                 .vector
                 .partition_graph_generation_status(partition)
@@ -18111,19 +18128,19 @@ impl MaintenanceContext {
                     } else {
                         "compacting"
                     };
-                    let reason = quarantine.map(|reason| reason.as_str()).unwrap_or_else(|| {
-                        if current.is_none() {
-                            "initial_build"
-                        } else if self
-                            .vector
-                            .partition_info(&partition.index, &partition.partition_key)
-                            .is_some_and(|info| info.tombstones != 0)
-                        {
-                            "tombstones"
-                        } else {
-                            "new_changes"
-                        }
-                    });
+                    let reason = if let Some(reason) = quarantine {
+                        reason.as_str()
+                    } else if current.is_none() {
+                        "initial_build"
+                    } else if self
+                        .vector
+                        .try_partition_info(&partition.index, &partition.partition_key)?
+                        .is_some_and(|info| info.tombstones != 0)
+                    {
+                        "tombstones"
+                    } else {
+                        "new_changes"
+                    };
                     let progress = partition_state_present
                         .then(|| {
                             self.vector.begin_partition_maintenance_progress(
@@ -18568,18 +18585,20 @@ impl MaintenanceContext {
                             return Ok(false);
                         }
                         self.admit_generation_disk(prepared.write_reservation_bytes())?;
-                        persistence
+                        let published_pending = persistence
                             .publish_prepared_vector_partition_generation_candidate(&prepared)?;
+                        #[cfg(not(feature = "test-seams"))]
+                        let _ = published_pending;
                         #[cfg(feature = "test-seams")]
                         crate::writer_commit_test_seams::reached(crate::writer_commit_test_seams::CommitBoundary::GenerationAfterRedb);
                         #[cfg(feature = "test-seams")]
-                        if partition_state_present {
+                        if partition_state_present && let Some(published_pending) = published_pending {
                             self.vector.observe_durable_base_publication(
                                 partition,
                                 candidate.catalog.base.generation_id,
                                 candidate.catalog.base.covered_tx,
-                                candidate.catalog.base.covered_lsn,
-                            )?;
+                                published_pending,
+                            );
                         }
                         Ok(true)
                     },
@@ -18784,8 +18803,15 @@ impl MaintenanceContext {
         // route itself; the snapshot guard independently protects old graphs.
         let mut cycle_failures = self.reclaim_snapshot_free_vector_graphs()?;
         match self.reclaim_paged_vector_storage() {
-            Ok(()) | Err(Error::MemoryBudgetExceeded { .. }) => {}
-            Err(error) => return Err(error),
+            Ok(()) => {}
+            Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
+                return Err(error);
+            }
+            Err(error) => {
+                cycle_failures
+                    .first
+                    .get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
+            }
         }
         // Idempotent T2 retry never clears or rebuilds a healthy route. Newer
         // journal suffix records remain outside each catalog's covered LSN. A
@@ -18795,6 +18821,7 @@ impl MaintenanceContext {
             first_failure_details: cleanup_retry_failure,
             failed_partitions: cleanup_retry_failed_partitions,
         } = self.retry_vector_journal_truncations()?;
+        cycle_failures.first = cycle_failures.first.or(cleanup_retry_failure);
         let pruning = self.run_pruning()?;
         let pruned_trigger_audit_rows = self.run_trigger_audit_retention()?;
         let currency = self.run_currency(gate)?;
@@ -18821,7 +18848,7 @@ impl MaintenanceContext {
                 // committed store still saw `initial_build`.
                 let mut built_partitions = 0usize;
                 let mut built_indexes = HashSet::new();
-                let mut first_failure_details = cleanup_retry_failure.or(cycle_failures.first);
+                let mut first_failure_details = cycle_failures.first;
                 for partition in pending_vector_partitions
                     .iter()
                     .map(|candidate| &candidate.partition)
@@ -18868,9 +18895,7 @@ impl MaintenanceContext {
                 report
             } else if self.persistence.is_some() {
                 let mut report = self.vector.hnsw_maintenance_status();
-                let first_failure_details = cleanup_retry_failure
-                    .or(cycle_failures.first)
-                    .or(report.first_failure_details);
+                let first_failure_details = cycle_failures.first.or(report.first_failure_details);
                 report.first_failure = first_failure_details.map(|details| details.failure);
                 report.first_failure_details = first_failure_details;
                 report
@@ -18884,17 +18909,17 @@ impl MaintenanceContext {
         // chain. Reclaim only after publication, under the registry's removal
         // guard, so active readers keep that route and unselected generations
         // do not linger until another maintenance wake.
-        cycle_failures.first = cycle_failures
-            .first
+        vector.first_failure_details = cycle_failures.first.or(vector.first_failure_details);
+        vector.first_failure_details = vector
+            .first_failure_details
             .or(self.reclaim_snapshot_free_vector_graphs()?.first);
         // Retirement is independent of whether another partition had work,
         // but follows this wake's durable generation publications. That lets
         // a delete-only route first represent and truncate its final journal
         // prefix, then releases it even while a sibling keeps producing work.
-        cycle_failures.first = cycle_failures
-            .first
+        vector.first_failure_details = vector
+            .first_failure_details
             .or(self.retire_snapshot_free_vector_partitions()?.first);
-        vector.first_failure_details = vector.first_failure_details.or(cycle_failures.first);
         vector.first_failure = vector.first_failure_details.map(|details| details.failure);
         // The rare, interval-gated automatic compaction path -- see
         // `maybe_auto_compact`'s own doc comment. Runs LAST, after every
@@ -21063,7 +21088,6 @@ impl Database {
         let vector = Arc::new(VectorStore::new(hnsw.clone()));
         register_vector_layouts(&vector, &all_meta)?;
         let loaded_ddl_log = Vec::new();
-        register_dormant_raw_vector_partitions(&vector, &persistence, &accountant)?;
         // The loaders registered here and the handle built below share ONE cell,
         // so a partition faulted in after `SET VECTOR_SERVING_CACHE` sizes from
         // the value in force then rather than the one read at open.
@@ -21072,12 +21096,6 @@ impl Database {
                 .load_config_value::<u64>(VECTOR_SERVING_CACHE_CONFIG_KEY)?
                 .unwrap_or(0),
         ));
-        register_dormant_vector_generations(
-            &vector,
-            &persistence,
-            &accountant,
-            DeclaredServingCache::Live(vector_serving_cache_cell.clone()),
-        )?;
 
         let loaded_change_log = Vec::new();
         // Recovery uses durable end keys and maintained identity floors. It
@@ -21147,6 +21165,14 @@ impl Database {
             Some(initial_root),
         ));
         graph_source.bind(&tx_mgr);
+        register_dormant_raw_vector_partitions(&vector, &tx_mgr, &persistence, &accountant)?;
+        // Generation registration needs the maintained raw partition states.
+        register_dormant_vector_generations(
+            &vector,
+            &persistence,
+            &accountant,
+            DeclaredServingCache::Live(vector_serving_cache_cell.clone()),
+        )?;
         let blob_repository = BlobRepository::shared(persistence.clone());
 
         let db = Self::build_db(
@@ -23558,10 +23584,10 @@ impl Database {
         };
         keys.sort();
         keys.dedup();
-        Ok(keys
-            .into_iter()
-            .filter_map(|key| self.vector_store.partition_info(index, &key))
-            .collect())
+        keys.into_iter()
+            .map(|key| self.vector_store.try_partition_info(index, &key))
+            .collect::<Result<Vec<_>>>()
+            .map(|infos| infos.into_iter().flatten().collect())
     }
 
     /// One entry per selected partition with visible vectors, keys redacted.
@@ -29856,6 +29882,13 @@ impl Database {
                     replace_graph: false,
                     affected_graph_edge_types: HashSet::new(),
                     replace_vectors: false,
+                    vector_image_memory: crate::read_image_memory::ImageMemory::charging_for(
+                        self.accountant.clone(),
+                        "sync",
+                        "prepare_vector_partition_image",
+                        STAGE_RECEIVED_UNIT_COPY_HINT,
+                    ),
+                    retired_vector_construction: Mutex::new(Vec::new()),
                     table_meta: HashMap::new(),
                     row_changed_tables: HashSet::new(),
                     rows: HashMap::new(),
@@ -30642,6 +30675,13 @@ impl Database {
             replace_graph: copy_graph,
             affected_graph_edge_types: affected_graph_edge_types.clone(),
             replace_vectors: copy_vectors,
+            vector_image_memory: crate::read_image_memory::ImageMemory::charging_for(
+                self.accountant.clone(),
+                "sync",
+                "prepare_vector_partition_image",
+                STAGE_RECEIVED_UNIT_COPY_HINT,
+            ),
+            retired_vector_construction: Mutex::new(Vec::new()),
             table_meta: semantic
                 .tables
                 .iter()
@@ -30967,6 +31007,21 @@ impl Database {
                 &stage.affected_tables,
                 self.accountant.clone(),
             );
+        }
+        // The replacement registry has retired the old in-process builders.
+        // Only successfully committed cancellation receipts release their holds;
+        // surviving restart records retain the original fixed snapshot floor.
+        for (partition, _memory) in stage
+            .durable_projection
+            .retired_vector_construction
+            .lock()
+            .drain(..)
+        {
+            self.vector_store.forget_partition_paged_build(&partition);
+            self.vector_store
+                .clear_partition_paged_build_progress(&partition);
+            self.snapshot_registry
+                .release_construction_floor(&partition);
         }
         if awaits_vector_image {
             self.received_vector_image_pending
@@ -47828,6 +47883,20 @@ impl Database {
         })
     }
 
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn __with_vector_pending_summary_read_failure_for_test<R>(
+        &self,
+        action: impl FnOnce() -> R,
+    ) -> R {
+        crate::persistence::vector_membership_source::with_pending_summary_failure_for_test(
+            self.persistence
+                .as_ref()
+                .map(|source| Arc::as_ptr(source) as usize),
+            action,
+        )
+    }
+
     pub(crate) fn bounded_vector_visit_visible_ids<E>(
         &self,
         index: &VectorIndexRef,
@@ -49018,17 +49087,10 @@ impl Database {
         })
     }
 
-    /// Run one pruning cycle. Called by the maintenance loop or manually.
-    pub fn run_pruning_cycle(&self) -> u64 {
-        let _operation = self.assert_open_operation();
-        let _guard = self.pruning_guard.lock();
-        match self.maintenance_context().run_pruning() {
-            Ok(report) => report.pruned_rows,
-            Err(err) => {
-                log_pruning_error(&err);
-                0
-            }
-        }
+    /// Run one pruning cycle and return the pruned row count or typed refusal.
+    pub fn run_pruning_cycle(&self) -> Result<u64> {
+        self.run_pruning_cycle_checked()
+            .map(|report| report.pruned_rows)
     }
 
     /// Run one declared-retention pruning cycle and return its report or error.
@@ -67355,7 +67417,7 @@ impl Database {
             // per-insert admission come back for this release.
             let accounted_bytes = self
                 .vector_store
-                .prune_superseded_versions(&received_image_superseded_vectors);
+                .prune_superseded_versions(&received_image_superseded_vectors)?;
             self.accountant.release(accounted_bytes);
             let replaced_indexes = received_image_superseded_vectors
                 .iter()
@@ -71035,7 +71097,7 @@ fn prune_expired_rows(
             &fully_pruned_row_ids,
             &removed_vector_indexes,
             accountant,
-        )
+        )?
     };
 
     for (catalog, _) in &generation_cleanup {
@@ -72009,7 +72071,7 @@ fn compact_currency_versions_inner(
     // body from its own record inside the prune; what comes back here is
     // only the bytes a state without an accountant still leaves charged to
     // the per-insert admission, which this pass is the one release for.
-    let released_vector_bytes = vector_store.prune_superseded_versions(&released_vectors);
+    let released_vector_bytes = vector_store.prune_superseded_versions(&released_vectors)?;
     for (catalog, _) in &generation_cleanup {
         vector_store.reclaim_snapshot_free_partition_graph_generations(
             &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()),

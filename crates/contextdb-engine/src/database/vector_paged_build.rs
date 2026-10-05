@@ -220,7 +220,7 @@ impl Database {
             let registered = self.vector_store.contains_index(&partition.index)
                 && self
                     .vector_store
-                    .partition_info(&partition.index, &partition.partition_key)
+                    .try_partition_info(&partition.index, &partition.partition_key)?
                     .is_some();
             if !registered {
                 // The route no longer exists; nothing can publish this build.
@@ -321,7 +321,7 @@ impl MaintenanceContext {
             let layout = self.vector.index_layout(&partition.index)?;
             let live = self
                 .vector
-                .partition_info(&partition.index, &partition.partition_key)
+                .try_partition_info(&partition.index, &partition.partition_key)?
                 .map(|info| info.live_rows)
                 .unwrap_or(0);
             let declaration = declaration_for(&layout, &layout.resolve_policy(live.max(1), 1))?;
@@ -448,7 +448,7 @@ impl MaintenanceContext {
     ) -> Result<bool> {
         let Some(info) = self
             .vector
-            .partition_info(&partition.index, &partition.partition_key)
+            .try_partition_info(&partition.index, &partition.partition_key)?
         else {
             return Ok(false);
         };
@@ -479,7 +479,7 @@ impl MaintenanceContext {
     fn whole_build_fits(&self, partition: &VectorPartitionRef) -> Result<bool> {
         let Some(info) = self
             .vector
-            .partition_info(&partition.index, &partition.partition_key)
+            .try_partition_info(&partition.index, &partition.partition_key)?
         else {
             return Ok(true);
         };
@@ -512,7 +512,7 @@ impl MaintenanceContext {
     ) -> Result<Option<PagedBuildRecord>> {
         let Some(info) = self
             .vector
-            .partition_info(&partition.index, &partition.partition_key)
+            .try_partition_info(&partition.index, &partition.partition_key)?
         else {
             return Ok(None);
         };
@@ -661,11 +661,15 @@ impl MaintenanceContext {
         };
         let prepared = persistence.prepare_vector_partition_generation_candidate(&candidate)?;
         self.admit_generation_disk(prepared.write_reservation_bytes())?;
+        #[cfg(feature = "test-seams")]
+        let published_pending = Arc::new(parking_lot::Mutex::new(None));
         persistence.stage_paged_publication(
             partition,
             PagedPublication {
                 prepared,
                 previous_generation_id: record.previous_generation_id,
+                #[cfg(feature = "test-seams")]
+                published_pending: Arc::clone(&published_pending),
             },
         );
         let mut checkpoint = || self.build_checkpoint();
@@ -684,12 +688,14 @@ impl MaintenanceContext {
         self.snapshot_registry.release_construction_floor(partition);
         self.vector.clear_partition_paged_build_progress(partition);
         #[cfg(feature = "test-seams")]
-        self.vector.observe_durable_base_publication(
-            partition,
-            progress.generation_id,
-            progress.frontier_tx,
-            progress.frontier_lsn,
-        )?;
+        if let Some(pending) = published_pending.lock().take() {
+            self.vector.observe_durable_base_publication(
+                partition,
+                progress.generation_id,
+                progress.frontier_tx,
+                pending,
+            );
+        }
         let published_catalog = candidate.catalog;
         drop(candidate.base);
         let mut workspace = self.vector.reserve_workspace(
@@ -740,14 +746,20 @@ impl MaintenanceContext {
         if !persistence.has_paged_cleanup()? {
             return Ok(());
         }
-        let _workspace = self.vector.reserve_workspace(
+        let mut workspace = self.vector.reserve_workspace(
             self.accountant.clone(),
-            PAGED_CLEANUP_KEYS.saturating_mul(128),
+            0,
             "reclaim_paged_vector_generation",
             "Raise MEMORY_LIMIT before reclaiming retired vector pages.",
         )?;
         self.build_checkpoint()?;
-        persistence.paged_cleanup_step(PAGED_CLEANUP_KEYS)?;
+        persistence.paged_cleanup_step(PAGED_CLEANUP_KEYS, |bytes| {
+            workspace.resize(
+                bytes,
+                "reclaim_paged_vector_generation",
+                "Raise MEMORY_LIMIT before reclaiming retired vector pages.",
+            )
+        })?;
         Ok(())
     }
 }

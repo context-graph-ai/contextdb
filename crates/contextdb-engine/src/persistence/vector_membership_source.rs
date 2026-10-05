@@ -9,13 +9,33 @@
 use super::*;
 use crate::memory_accounting::{MemoryAccountant, OwnedMemoryReservation};
 use contextdb_vector::store::{
-    DormantRawVectorLoader, DormantVectorLoadRequest, RawVectorMembershipCursor,
-    RawVectorMembershipSource, RawVectorMembershipSummary, RawVectorReverseMembershipCursor,
-    RawVectorReverseMembershipSource,
+    DormantRawVectorLoader, DormantVectorLoadRequest, RawVectorInspectionSnapshot,
+    RawVectorMembershipCursor, RawVectorMembershipSource, RawVectorMembershipSummary,
+    RawVectorReverseMembershipCursor, RawVectorReverseMembershipSource,
 };
 use std::ops::Bound;
 
 const HINT: &str = "Raise MEMORY_LIMIT to read this vector membership window.";
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static PENDING_SUMMARY_FAILURE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) fn with_pending_summary_failure_for_test<R>(
+    persistence: Option<usize>,
+    action: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PENDING_SUMMARY_FAILURE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(PENDING_SUMMARY_FAILURE.with(|slot| slot.replace(persistence)));
+    action()
+}
 
 fn damage(reason: &str) -> Error {
     Error::StoreCorrupted {
@@ -35,17 +55,20 @@ struct MembershipRoot {
 impl MembershipRoot {
     fn capture(persistence: &RedbPersistence) -> Result<Self> {
         if let Ok(capture) = persistence.paged_root_capture() {
-            let (read, handle) = capture()?;
+            let (read, handle) =
+                capture().map_err(vector_membership_pages::typed_metadata_error)?;
             let writer = handle
                 .downcast::<WriterSnapshot>()
-                .map_err(|_| Error::Other("writer root capture returned another owner".into()))?;
+                .map_err(|_| damage("writer root capture returned another owner"))?;
             return Ok(Self {
                 read,
                 writer: Some(writer),
             });
         }
-        let read =
-            persistence.with_db(|db| db.begin_read().map_err(RedbPersistence::storage_error))?;
+        let read = persistence.with_db(|db| {
+            db.begin_read()
+                .map_err(vector_membership_pages::metadata_error)
+        })?;
         Ok(Self {
             read: Arc::new(read),
             writer: None,
@@ -69,20 +92,7 @@ fn read_summary(
     read: &redb::ReadTransaction,
     partition: &VectorPartitionRef,
 ) -> Result<RawVectorMembershipSummary> {
-    let prefix =
-        RedbPersistence::vector_partition_prefix(&partition.index, &partition.partition_key);
-    let summary = match read.open_table(vector_membership_pages::SUMMARY) {
-        Ok(table) => table
-            .get(prefix.as_slice())
-            .map_err(RedbPersistence::storage_error)?
-            .map(|value| vector_membership_pages::decode_summary(&prefix, value.value()))
-            .transpose()?
-            .unwrap_or_default(),
-        Err(redb::TableError::TableDoesNotExist(_)) => {
-            vector_membership_pages::MembershipSummary::default()
-        }
-        Err(error) => return Err(RedbPersistence::storage_error(error)),
-    };
+    let summary = vector_membership_pages::read_partition_summary(read, partition)?;
     summary_counts(&summary)
 }
 
@@ -148,9 +158,13 @@ fn decode_forward(
     Ok(record)
 }
 
+pub(crate) type PublishedMembershipRoot =
+    Arc<dyn Fn() -> Result<Option<Arc<WriterSnapshot>>> + Send + Sync>;
+
 /// One partition's membership directory, read from the forward membership
 /// table at each operation's captured root.
 pub(crate) struct DurableMembershipSource {
+    published_root: PublishedMembershipRoot,
     persistence: Arc<RedbPersistence>,
     partition: VectorPartitionRef,
     summary: RawVectorMembershipSummary,
@@ -163,13 +177,57 @@ impl DurableMembershipSource {
         partition: VectorPartitionRef,
         summary: RawVectorMembershipSummary,
         accountant: Arc<MemoryAccountant>,
+        published_root: PublishedMembershipRoot,
     ) -> Arc<Self> {
         Arc::new(Self {
+            published_root,
             persistence,
             partition,
             summary,
             accountant,
         })
+    }
+
+    // Compare physical user-tree headers, independent of logical TxId and
+    // of the Arc wrapper used to materialize a retained root.
+    fn captured_catalog_required(&self, root: &MembershipRoot) -> Result<bool> {
+        let Some(captured) = &root.writer else {
+            return Ok(false);
+        };
+        let published = (self.published_root)()?
+            .ok_or_else(|| damage("writer publication has no durable root"))?;
+        Ok(captured.storage_identity().user_root != published.storage_identity().user_root)
+    }
+
+    fn catalog_frontier(&self, root: &MembershipRoot) -> Result<Option<TxId>> {
+        let generations = self.catalog_generations(root)?;
+        Ok(generations.map(|(base, change)| change.unwrap_or(base).covered_tx))
+    }
+
+    fn catalog_generations(
+        &self,
+        root: &MembershipRoot,
+    ) -> Result<
+        Option<(
+            VectorPartitionGenerationDescriptor,
+            Option<VectorPartitionGenerationDescriptor>,
+        )>,
+    > {
+        match self
+            .persistence
+            .vector_partition_generation_descriptors_in_read(
+                &root.read,
+                &self.partition.index,
+                &self.partition.partition_key,
+            )
+            .map_err(vector_membership_pages::typed_metadata_error)
+        {
+            Ok(generations) => Ok(generations),
+            // Catalog damage belongs to its route. The caller has already
+            // authenticated the membership summary at this captured root.
+            Err(Error::StoreCorrupted { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn window_bytes(&self) -> usize {
@@ -181,6 +239,86 @@ impl DurableMembershipSource {
             .saturating_add(self.partition.partition_key.estimated_bytes())
             .saturating_mul(32)
             .saturating_add(4096)
+    }
+
+    fn read_pending_metadata(
+        &self,
+        root: &MembershipRoot,
+    ) -> Result<vector_membership_pages::MembershipSummary> {
+        root.check_scope(&self.partition.index.table)?;
+        #[cfg(feature = "test-seams")]
+        crate::database::resident_history_test_seams::note(|work| work.pending_summary_reads += 1);
+        #[cfg(feature = "test-seams")]
+        if PENDING_SUMMARY_FAILURE.with(|slot| slot.get())
+            == Some(Arc::as_ptr(&self.persistence) as usize)
+        {
+            return Err(damage("injected pending summary metadata read failure"));
+        }
+        let summary = vector_membership_pages::read_partition_summary(&root.read, &self.partition)?;
+        Ok(summary)
+    }
+
+    fn pending_metadata_window(&self) -> Result<OwnedMemoryReservation> {
+        OwnedMemoryReservation::try_new_for(
+            self.accountant.clone(),
+            self.partition
+                .index
+                .table
+                .len()
+                .saturating_add(self.partition.index.column.len())
+                .saturating_add(self.partition.partition_key.estimated_bytes())
+                .saturating_add(24)
+                .saturating_mul(2)
+                .saturating_add(512),
+            "vector",
+            "pending_metadata",
+            HINT,
+        )
+    }
+
+    fn pending_counts_for(
+        summary: &vector_membership_pages::MembershipSummary,
+        covered: Option<TxId>,
+    ) -> Result<(usize, usize)> {
+        // The requested frontier must be represented at this exact root.
+        let counts = match covered {
+            None => &summary.pending,
+            Some(frontier) => std::iter::once(&summary.pending)
+                .chain(summary.base_pending.iter())
+                .chain(summary.candidate_pending.iter())
+                .find(|counts| counts.covered_tx == frontier)
+                .ok_or_else(|| damage("pending summary disagrees with serving frontier"))?,
+        };
+        Ok((
+            usize::try_from(counts.pending_inserts)
+                .map_err(|_| damage("pending insert count overflow"))?,
+            usize::try_from(counts.tombstones)
+                .map_err(|_| damage("pending tombstone count overflow"))?,
+        ))
+    }
+
+    fn read_pending_counts(
+        &self,
+        covered: Option<TxId>,
+        capture: impl FnOnce() -> Result<MembershipRoot>,
+    ) -> Result<Option<(usize, usize)>> {
+        let _window = self.pending_metadata_window()?;
+        let root = capture()?;
+        let summary = self.read_pending_metadata(&root)?;
+        let covered = if self.captured_catalog_required(&root)? {
+            let frontier = self
+                .catalog_frontier(&root)?
+                .unwrap_or(summary.pending.covered_tx);
+            if summary.pending.covered_tx != frontier {
+                return Err(damage(
+                    "pending summary disagrees with captured catalog frontier",
+                ));
+            }
+            Some(frontier)
+        } else {
+            covered
+        };
+        Self::pending_counts_for(&summary, covered).map(Some)
     }
 
     fn cursor(&self, row: Option<RowId>) -> Result<MembershipCursor> {
@@ -225,7 +363,7 @@ impl DurableMembershipSource {
         let table = match root.read.open_table(VECTOR_PARTITION_JOURNAL_TABLE) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-            Err(error) => return Err(RedbPersistence::storage_error(error)),
+            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
         };
         let prefix = RedbPersistence::vector_partition_prefix(
             &self.partition.index,
@@ -237,9 +375,9 @@ impl DurableMembershipSource {
         let upper = end.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
         for item in table
             .range::<&[u8]>((Bound::Included(lower.as_slice()), upper))
-            .map_err(RedbPersistence::storage_error)?
+            .map_err(vector_membership_pages::metadata_error)?
         {
-            let (key, value) = item.map_err(RedbPersistence::storage_error)?;
+            let (key, value) = item.map_err(vector_membership_pages::metadata_error)?;
             let record: VectorPartitionJournalRecord =
                 self.persistence.decode_expected_vector_partition_metadata(
                     VectorPartitionRecordKind::Journal,
@@ -322,7 +460,7 @@ impl MembershipCursor {
                     self.done = true;
                     return Ok(None);
                 }
-                Err(error) => return Err(RedbPersistence::storage_error(error)),
+                Err(error) => return Err(vector_membership_pages::metadata_error(error)),
             };
             let end = writer_source::prefix_end(&self.prefix);
             let upper = end.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
@@ -331,7 +469,7 @@ impl MembershipCursor {
             self.range = Some(
                 table
                     .range::<&[u8]>((Bound::Included(self.prefix.as_slice()), upper))
-                    .map_err(RedbPersistence::storage_error)?,
+                    .map_err(vector_membership_pages::metadata_error)?,
             );
         }
         let item = self
@@ -340,7 +478,7 @@ impl MembershipCursor {
             .expect("membership range is open")
             .next()
             .transpose()
-            .map_err(RedbPersistence::storage_error)?;
+            .map_err(vector_membership_pages::metadata_error)?;
         let Some((key, value)) = item else {
             if self.expected.is_some_and(|expected| expected != self.seen) {
                 return Err(damage(
@@ -387,6 +525,7 @@ impl RawVectorMembershipSource for DurableMembershipSource {
             VectorPartitionRef::new(index.clone(), self.partition.partition_key.clone()),
             self.summary,
             self.accountant.clone(),
+            self.published_root.clone(),
         ))
     }
 
@@ -398,9 +537,10 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         // Called after a removal the store did not publish itself (cleanup,
         // retention, purge), which commits before the writer republishes its
         // root: read the latest committed summary.
-        let read = self
-            .persistence
-            .with_db(|db| db.begin_read().map_err(RedbPersistence::storage_error))?;
+        let read = self.persistence.with_db(|db| {
+            db.begin_read()
+                .map_err(vector_membership_pages::metadata_error)
+        })?;
         read_summary(&read, &self.partition)
     }
 
@@ -502,21 +642,74 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         failed.map_or(Ok(true), Err)
     }
 
-    fn pending_after(&self, covered_lsn: Lsn) -> Result<Option<(usize, usize)>> {
-        let (mut opened, mut closed_after, mut tombstones) = (0usize, 0usize, 0usize);
-        self.journal_suffix(covered_lsn, &mut |change| {
-            match change {
-                VectorPartitionJournalChange::Upsert(_) => opened += 1,
-                VectorPartitionJournalChange::Tombstone(tombstone) => {
-                    tombstones += 1;
-                    if tombstone.membership.vector_lsn > covered_lsn {
-                        closed_after += 1;
-                    }
+    fn has_durable_pending_counts(&self) -> bool {
+        true
+    }
+
+    fn pending_counts(&self, covered: Option<TxId>) -> Result<Option<(usize, usize)>> {
+        self.read_pending_counts(covered, || MembershipRoot::capture(&self.persistence))
+    }
+
+    fn inspection_snapshot(
+        &self,
+        serving_covered: Option<TxId>,
+    ) -> Result<Option<RawVectorInspectionSnapshot>> {
+        let _window = self.pending_metadata_window()?;
+        let root = MembershipRoot::capture(&self.persistence)?;
+        let summary = self.read_pending_metadata(&root)?;
+        let generations = self.catalog_generations(&root)?;
+        let (base, change) = generations.map_or((None, None), |(base, change)| {
+            let identity = |generation: VectorPartitionGenerationDescriptor| {
+                contextdb_vector::store::VectorGraphGeneration {
+                    generation_id: generation.generation_id,
+                    covered_tx: generation.covered_tx,
+                    covered_lsn: generation.covered_lsn,
+                    durable_bytes: generation.durable_bytes,
+                    policy_revision: generation.policy_revision,
+                    hnsw_m: generation.hnsw_m,
+                    hnsw_ef_construction: generation.hnsw_ef_construction,
                 }
-            }
-            true
-        })?;
-        Ok(Some((opened.saturating_sub(closed_after), tombstones)))
+            };
+            (Some(identity(base)), change.map(identity))
+        });
+        let covered = change
+            .or(base)
+            .map_or(summary.pending.covered_tx, |generation| {
+                generation.covered_tx
+            });
+        // Serving metadata and counters are committed together. A candidate
+        // matching some other frontier cannot authenticate this catalog.
+        if summary.pending.covered_tx != covered {
+            return Err(damage(
+                "pending summary disagrees with captured catalog frontier",
+            ));
+        }
+        let captured_catalog = self.captured_catalog_required(&root)?;
+        let frontier = if captured_catalog || generations.is_none() {
+            covered
+        } else {
+            serving_covered.unwrap_or(covered)
+        };
+        let (pending_inserts, tombstones) = Self::pending_counts_for(&summary, Some(frontier))?;
+        Ok(Some(RawVectorInspectionSnapshot {
+            captured_catalog,
+            summary: summary_counts(&summary)?,
+            base,
+            change,
+            pending_inserts,
+            tombstones,
+            #[cfg(feature = "test-seams")]
+            base_pending: {
+                let frontier = base.map_or(TxId(0), |generation| generation.covered_tx);
+                [
+                    &summary.pending,
+                    summary.base_pending.as_ref().unwrap_or(&summary.pending),
+                ]
+                .into_iter()
+                .find(|counts| counts.covered_tx == frontier)
+                .map(|counts| (counts.pending_inserts as usize, counts.tombstones as usize))
+            },
+        }))
     }
 
     fn visit_identities(
@@ -636,7 +829,7 @@ impl ReverseCursor {
                 self.done = true;
                 return Ok(None);
             }
-            Err(error) => return Err(RedbPersistence::storage_error(error)),
+            Err(error) => return Err(vector_membership_pages::metadata_error(error)),
         };
         let lower = Bound::Included(self.prefix.as_slice());
         let end = writer_source::prefix_end(&self.prefix);
@@ -647,10 +840,10 @@ impl ReverseCursor {
             .map_or(Bound::Unbounded, Bound::Excluded);
         let item = table
             .range::<&[u8]>((lower, upper))
-            .map_err(RedbPersistence::storage_error)?
+            .map_err(vector_membership_pages::metadata_error)?
             .next_back()
             .transpose()
-            .map_err(RedbPersistence::storage_error)?;
+            .map_err(vector_membership_pages::metadata_error)?;
         let Some((key, value)) = item else {
             self.done = true;
             return Ok(None);
@@ -736,6 +929,7 @@ impl RawVectorReverseMembershipSource for DurableReverseMembershipSource {
 
 /// Creates the durable source pair for a partition first written after open.
 pub(crate) struct DurablePartitionSourceFactory {
+    pub(crate) published_root: PublishedMembershipRoot,
     pub(crate) persistence: Arc<RedbPersistence>,
     pub(crate) accountant: Arc<MemoryAccountant>,
     pub(crate) loader:
@@ -756,6 +950,7 @@ impl contextdb_vector::store::DurableRawPartitionFactory for DurablePartitionSou
                 partition.clone(),
                 RawVectorMembershipSummary::default(),
                 self.accountant.clone(),
+                self.published_root.clone(),
             ),
             (self.loader)(partition),
         )
@@ -774,6 +969,7 @@ pub(crate) type DurableLoaderBuilder = Arc<
 
 /// Creates the durable sources of a vector column declared after open.
 pub(crate) struct DurableColumnSourceFactory {
+    pub(crate) published_root: PublishedMembershipRoot,
     pub(crate) persistence: Arc<RedbPersistence>,
     pub(crate) accountant: Arc<MemoryAccountant>,
     pub(crate) loader: DurableLoaderBuilder,
@@ -797,6 +993,7 @@ impl DurableColumnSourceFactory {
                 self.accountant.clone(),
             ),
             Arc::new(DurablePartitionSourceFactory {
+                published_root: self.published_root.clone(),
                 persistence: self.persistence.clone(),
                 accountant: self.accountant.clone(),
                 loader: Arc::new(move |partition: &VectorPartitionRef| loader(partition, &layout)),
@@ -826,6 +1023,7 @@ impl RedbPersistence {
     ) -> Result<Vec<(VectorPartitionRef, RawVectorMembershipSummary)>> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
+            vector_membership_pages::validate_in_read(&read)?;
             let summaries = match read.open_table(vector_membership_pages::SUMMARY) {
                 Ok(table) => table,
                 Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),

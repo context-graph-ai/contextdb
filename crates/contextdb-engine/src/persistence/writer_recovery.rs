@@ -229,6 +229,7 @@ impl RedbPersistence {
         write: &redb::WriteTransaction,
         ws: Option<&WriteSet>,
     ) -> Result<()> {
+        vector_membership_pages::write_fingerprints(write)?;
         {
             let mut clocks = write
                 .open_table(RETENTION_CLOCK_BOUNDS)

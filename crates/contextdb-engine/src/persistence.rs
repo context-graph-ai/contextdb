@@ -9309,6 +9309,106 @@ impl<'de> Deserialize<'de> for InspectedVectorPartitionComponents {
     }
 }
 
+/// Validate sequence elements without reserving from a durable size hint.
+/// The count is actual consumed elements, never the advertised length.
+struct InspectedSequence<T> {
+    count: usize,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for InspectedSequence<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct SequenceVisitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for SequenceVisitor<T> {
+            type Value = InspectedSequence<T>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a complete persisted sequence")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut count = 0usize;
+                while sequence.next_element::<T>()?.is_some() {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        serde::de::Error::custom("persisted sequence element count overflow")
+                    })?;
+                }
+                Ok(InspectedSequence {
+                    count,
+                    marker: std::marker::PhantomData,
+                })
+            }
+        }
+        deserializer.deserialize_seq(SequenceVisitor(std::marker::PhantomData))
+    }
+}
+
+/// Positional inspection forms of the canonical persisted vector. All route
+/// strings borrow the authenticated input; payload sequences never reserve.
+#[allow(dead_code)]
+#[derive(Deserialize)]
+enum InspectedPersistedVector {
+    F32(InspectedSequence<f32>),
+    SQ8 {
+        min: f32,
+        max: f32,
+        len: u32,
+        payload: InspectedSequence<u8>,
+    },
+    SQ4 {
+        min: f32,
+        max: f32,
+        len: u32,
+        payload: InspectedSequence<u8>,
+    },
+}
+
+fn prevalidate_persisted_vector_entry(bytes: &[u8], dimension: usize) -> Result<()> {
+    type Entry<'a> = (
+        &'a str,
+        &'a str,
+        RowId,
+        InspectedPersistedVector,
+        TxId,
+        Option<TxId>,
+        Lsn,
+    );
+    let ((_, _, _, vector, _, _, _), consumed) = bincode::serde::borrow_decode_from_slice::<
+        Entry<'_>,
+        _,
+    >(bytes, bincode::config::standard())
+    .map_err(|_| vector_paged::corruption("fixed vector body cannot be decoded"))?;
+    if consumed != bytes.len() {
+        return Err(vector_paged::corruption(
+            "fixed vector body has trailing bytes",
+        ));
+    }
+    let valid_dimension = match vector {
+        InspectedPersistedVector::F32(values) => values.count == dimension,
+        InspectedPersistedVector::SQ8 { len, payload, .. } => {
+            len as usize == dimension && payload.count == dimension
+        }
+        InspectedPersistedVector::SQ4 { len, payload, .. } => {
+            len as usize == dimension && payload.count == dimension.div_ceil(2)
+        }
+    };
+    if !valid_dimension {
+        return Err(vector_paged::corruption(
+            "fixed vector body has an invalid payload dimension",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_image_vector_entry(bytes: &[u8], dimension: usize) -> Result<PersistedVectorEntry> {
+    prevalidate_persisted_vector_entry(bytes, dimension)?;
+    RedbPersistence::decode_exact(bytes)
+        .map_err(|_| vector_paged::corruption("fixed vector body cannot be decoded"))
+}
+
 fn inspect_vector_partition_metadata_route(payload: &[u8]) -> std::result::Result<usize, String> {
     // Struct/tuple field boundaries have no framing in the existing bincode
     // format: index.table, index.column, then the partition's component Vec.
@@ -9328,10 +9428,63 @@ fn prevalidate_vector_partition_metadata_routes(
             | VectorPartitionRecordKind::Journal
             | VectorPartitionRecordKind::Tombstone
             | VectorPartitionRecordKind::GenerationCatalog
+            | VectorPartitionRecordKind::GraphPageManifest
+            | VectorPartitionRecordKind::BaseGeneration
+            | VectorPartitionRecordKind::ChangeGeneration
     ) {
         return Ok(());
     }
     let route_end = inspect_vector_partition_metadata_route(payload)?;
+    if matches!(
+        kind,
+        VectorPartitionRecordKind::BaseGeneration | VectorPartitionRecordKind::ChangeGeneration
+    ) {
+        type Graph<'a> = (&'a [u8], [u8; 32]);
+        type BaseTail<'a> = (
+            u64,
+            TxId,
+            Lsn,
+            TxId,
+            Lsn,
+            u32,
+            VectorQuantization,
+            u16,
+            u16,
+            Graph<'a>,
+            [u8; 32],
+        );
+        type ChangeTail<'a> = (
+            u64,
+            u64,
+            TxId,
+            Lsn,
+            TxId,
+            Lsn,
+            u32,
+            VectorQuantization,
+            u16,
+            u16,
+            Graph<'a>,
+        );
+        let tail = &payload[route_end..];
+        let consumed = if kind == VectorPartitionRecordKind::BaseGeneration {
+            bincode::serde::borrow_decode_from_slice::<BaseTail<'_>, _>(
+                tail,
+                bincode::config::standard(),
+            )
+            .map(|(_, consumed)| consumed)
+        } else {
+            bincode::serde::borrow_decode_from_slice::<ChangeTail<'_>, _>(
+                tail,
+                bincode::config::standard(),
+            )
+            .map(|(_, consumed)| consumed)
+        }
+        .map_err(|_| "generation graph payload is truncated or invalid".to_owned())?;
+        if consumed != tail.len() {
+            return Err("generation graph payload has trailing bytes".to_owned());
+        }
+    }
     if kind == VectorPartitionRecordKind::Journal {
         let ((_, _, variant), fixed_bytes): ((Lsn, u64, u32), usize) =
             bincode::serde::decode_from_slice(&payload[route_end..], bincode::config::standard())
@@ -18258,6 +18411,9 @@ pub(crate) struct VectorPartitionVersionSelector {
 
 trait VectorPartitionRecordIndex {
     fn vector_partition_record_index(&self) -> &VectorIndexRef;
+    fn native_paged_graph(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl VectorPartitionRecordIndex for VectorPartitionMembershipRecord {
@@ -18279,10 +18435,18 @@ impl VectorPartitionRecordIndex for VectorPartitionBaseGenerationRecord {
     fn vector_partition_record_index(&self) -> &VectorIndexRef {
         &self.index
     }
+    fn native_paged_graph(&self) -> Option<&[u8]> {
+        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION)
+            .then_some(self.graph.bytes.as_slice())
+    }
 }
 impl VectorPartitionRecordIndex for VectorPartitionChangeGenerationRecord {
     fn vector_partition_record_index(&self) -> &VectorIndexRef {
         &self.index
+    }
+    fn native_paged_graph(&self) -> Option<&[u8]> {
+        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION)
+            .then_some(self.graph.bytes.as_slice())
     }
 }
 impl VectorPartitionRecordIndex for VectorPartitionGenerationCatalogRecord {
@@ -18337,6 +18501,16 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     pub(crate) replace_graph: bool,
     pub(crate) affected_graph_edge_types: HashSet<String>,
     pub(crate) replace_vectors: bool,
+    /// Independent writer-owned scratch for the derived complete metadata image.
+    /// Payload-copy charges have already transferred to their own destinations.
+    pub(crate) vector_image_memory: Arc<crate::read_image_memory::ImageMemory>,
+    /// Transaction-local cancellation receipts, consumed only after durability.
+    pub(crate) retired_vector_construction: parking_lot::Mutex<
+        Vec<(
+            VectorPartitionRef,
+            Option<crate::memory_accounting::OwnedMemoryReservation>,
+        )>,
+    >,
     pub(crate) table_meta: HashMap<String, TableMeta>,
     /// Tables whose arriving unit changes row membership or row values. An
     /// unchanged index declaration over unchanged rows keeps its durable image.
@@ -20100,6 +20274,59 @@ impl RedbPersistence {
         stage: &ReceivedSchemaPersistenceProjection,
         publication_lsn: Lsn,
     ) -> Result<CompleteVectorPartitionImage> {
+        // Price every possible row/vector pairing while borrowing the accepted
+        // image. No route, dictionary or cloned record exists before admission.
+        // The bound includes all simultaneously held route copies, geometric
+        // collection growth and temporary canonical key encodings.
+        let mut bytes = 0usize;
+        let record_slots = std::mem::size_of::<VectorPartitionMembershipRecord>()
+            .saturating_mul(4)
+            .saturating_add(std::mem::size_of::<VectorPartitionJournalRecord>().saturating_mul(8))
+            .saturating_add(std::mem::size_of::<VectorPartitionTombstoneRecord>().saturating_mul(4))
+            .saturating_add(1024);
+        for vector in &stage.vectors {
+            let declaration = stage.table_meta.get(&vector.index.table).and_then(|meta| {
+                meta.columns
+                    .iter()
+                    .find(|column| column.name == vector.index.column)
+            });
+            if let Some(rows) = stage.rows.get(&vector.index.table) {
+                for row in rows.iter().filter(|row| row.row_id == vector.row_id) {
+                    let partition_bytes = declaration
+                        .and_then(|column| column.partition_key_columns.as_ref())
+                        .map_or(0usize, |columns| {
+                            columns.iter().fold(0usize, |bytes, column| {
+                                bytes
+                                    .saturating_add(
+                                        std::mem::size_of::<VectorPartitionComponent>()
+                                            .saturating_mul(2)
+                                            .saturating_add(16),
+                                    )
+                                    .saturating_add(
+                                        row.values
+                                            .get(column)
+                                            .map_or(0, |value| value.estimated_bytes()),
+                                    )
+                            })
+                        });
+                    let route_bytes = vector
+                        .index
+                        .table
+                        .len()
+                        .saturating_add(vector.index.column.len())
+                        .saturating_add(partition_bytes)
+                        .saturating_add(128);
+                    bytes = bytes
+                        .saturating_add(record_slots)
+                        .saturating_add(route_bytes.saturating_mul(16));
+                }
+            }
+        }
+        if !stage.vectors.is_empty() {
+            // The smallest Vec/HashMap allocations still have spare slots.
+            bytes = bytes.saturating_add(record_slots.saturating_mul(4));
+        }
+        stage.vector_image_memory.reserve(bytes)?;
         let mut memberships_by_key = BTreeMap::<Vec<u8>, VectorPartitionMembershipRecord>::new();
         let mut occupied = HashMap::<VectorIndexRef, HashSet<VectorPartitionKey>>::new();
         let mut caps = HashMap::<VectorIndexRef, Option<u32>>::new();
@@ -20234,6 +20461,7 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         image: &CompleteVectorPartitionImage,
         affected_tables: &HashSet<String>,
+        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
     ) -> Result<()> {
         let matches = |index: &VectorIndexRef| affected_tables.contains(&index.table);
         self.remove_vector_partition_records_matching_in_write::<VectorPartitionMembershipRecord>(
@@ -20272,7 +20500,22 @@ impl RedbPersistence {
             VectorPartitionRecordKind::GenerationCatalog,
             &matches,
         )?;
-        self.remove_vector_partition_graph_pages_matching_in_write(write_txn, &matches)?;
+        self.remove_vector_partition_graph_pages_matching_in_write(
+            write_txn,
+            Some(accountant.clone()),
+            &matches,
+        )?;
+        for table in affected_tables {
+            vector_membership_pages::remove_routes_matching(
+                write_txn,
+                table,
+                None,
+                self.proof_accountant(),
+            )?;
+        }
+        // Seed surviving fixed frontiers before replaying membership transitions,
+        // so the rebuilt candidate counts include exactly post-frontier changes.
+        self.seed_paged_image_frontiers_in_write(write_txn, affected_tables, accountant)?;
         if !image.memberships.is_empty() {
             let mut table = write_txn
                 .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
@@ -21887,6 +22130,12 @@ impl RedbPersistence {
                     meta_table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
+                    vector_membership_pages::ensure_declared_routes(
+                        &write_txn,
+                        table,
+                        meta,
+                        self.proof_accountant(),
+                    )?;
                 }
             }
 
@@ -22021,6 +22270,15 @@ impl RedbPersistence {
             }
 
             if stage.replace_vectors {
+                // Authenticate the old fixed inputs while their raw bodies and
+                // source companions still belong to the committed image.
+                let previous = db.begin_read().map_err(Self::storage_error)?;
+                self.reconcile_paged_builds_for_image_in_write(
+                    &write_txn,
+                    partition_image.as_ref().expect("prepared vector image"),
+                    &previous,
+                    stage,
+                )?;
                 self.remove_vector_entries_matching_in_write(&write_txn, &|index| {
                     stage.affected_tables.contains(&index.table)
                 })?;
@@ -22042,7 +22300,16 @@ impl RedbPersistence {
                     &write_txn,
                     partition_image.as_ref().expect("prepared vector image"),
                     &stage.affected_tables,
+                    Arc::clone(&stage.vector_image_memory.accountant),
                 )?;
+                for (table, meta) in &stage.table_meta {
+                    vector_membership_pages::ensure_declared_routes(
+                        &write_txn,
+                        table,
+                        meta,
+                        self.proof_accountant(),
+                    )?;
+                }
             }
 
             {
@@ -22824,6 +23091,12 @@ impl RedbPersistence {
                     meta_table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
+                    vector_membership_pages::ensure_declared_routes(
+                        &write_txn,
+                        table,
+                        meta,
+                        self.proof_accountant(),
+                    )?;
                 }
             }
 
@@ -22955,6 +23228,12 @@ impl RedbPersistence {
                 meta_table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
+                vector_membership_pages::ensure_declared_routes(
+                    &write_txn,
+                    name,
+                    meta,
+                    self.proof_accountant(),
+                )?;
             }
             Self::rebuild_relational_indexes_in_write(
                 &write_txn,
@@ -23002,6 +23281,12 @@ impl RedbPersistence {
                 meta_table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
+                vector_membership_pages::ensure_declared_routes(
+                    &write_txn,
+                    name,
+                    meta,
+                    self.proof_accountant(),
+                )?;
             }
             Self::rebuild_relational_indexes_in_write(
                 &write_txn,
@@ -23927,6 +24212,8 @@ impl RedbPersistence {
             }));
             self.remove_vector_partition_records_matching_all_in_write(
                 &write_txn,
+                name,
+                None,
                 &|index: &VectorIndexRef| index.table == name,
             )?;
             self.remove_vector_entries_matching_in_write(&write_txn, &|index| index.table == name)?;
@@ -24324,6 +24611,8 @@ impl RedbPersistence {
             if !dropped_vector_columns.is_empty() {
                 self.remove_vector_partition_records_matching_all_in_write(
                     &write_txn,
+                    name,
+                    Some(&dropped_vector_columns),
                     &|index: &VectorIndexRef| {
                         index.table == name && dropped_vector_columns.contains(&index.column)
                     },
@@ -24345,6 +24634,12 @@ impl RedbPersistence {
                 meta_table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
+                vector_membership_pages::ensure_declared_routes(
+                    &write_txn,
+                    name,
+                    meta,
+                    self.proof_accountant(),
+                )?;
             }
             {
                 let table_name = Self::rel_table_name(name);
@@ -26189,42 +26484,57 @@ impl RedbPersistence {
             Option<VectorPartitionGenerationDescriptor>,
         )>,
     > {
-        let key = Self::vector_partition_catalog_key_from_parts(index, partition_key);
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
-            let table =
-                match read.open_byte_table_bounded(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
-                    Ok(table) => table,
-                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                    Err(error) => return Err(Self::storage_error(error)),
-                };
-            let Some(value) = table
-                .get_bounded(key.as_slice())
-                .map_err(Self::storage_error)?
-            else {
-                return Ok(None);
-            };
-            let payload = vector_partition_expected_metadata_payload(
-                VectorPartitionRecordKind::GenerationCatalog,
-                value.value(),
-                index,
-                partition_key,
-            )
-            .map_err(|reason| self.vector_partition_corruption(reason))?;
-            let route_end = vector_partition_expected_route_prefix(payload, index, partition_key)
-                .map_err(|reason| self.vector_partition_corruption(reason))?;
-            // The descriptor suffix contains only fixed scalars. Pricing a
-            // frontier must not clone its route or allocate a graph body.
-            let (base, change, _, _): (
-                VectorPartitionGenerationDescriptor,
-                Option<VectorPartitionGenerationDescriptor>,
-                TxId,
-                Lsn,
-            ) = Self::decode_exact(&payload[route_end..]).map_err(|error| {
-                self.vector_partition_corruption(format!("payload decode failed: {error}"))
-            })?;
-            Ok(Some((base, change)))
+            self.vector_partition_generation_descriptors_in_read(&read, index, partition_key)
         })
+    }
+
+    /// The fixed catalog suffix at an already-authorized root. No fresh read,
+    /// owned route decode, catalog scan or graph body load is performed.
+    pub(super) fn vector_partition_generation_descriptors_in_read(
+        &self,
+        read: &redb::ReadTransaction,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+    ) -> Result<
+        Option<(
+            VectorPartitionGenerationDescriptor,
+            Option<VectorPartitionGenerationDescriptor>,
+        )>,
+    > {
+        let key = Self::vector_partition_catalog_key_from_parts(index, partition_key);
+        let table = match read.open_byte_table_bounded(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(Self::storage_error(error)),
+        };
+        let Some(value) = table
+            .get_bounded(key.as_slice())
+            .map_err(Self::storage_error)?
+        else {
+            return Ok(None);
+        };
+        let payload = vector_partition_expected_metadata_payload(
+            VectorPartitionRecordKind::GenerationCatalog,
+            value.value(),
+            index,
+            partition_key,
+        )
+        .map_err(|reason| self.vector_partition_corruption(reason))?;
+        let route_end = vector_partition_expected_route_prefix(payload, index, partition_key)
+            .map_err(|reason| self.vector_partition_corruption(reason))?;
+        // The descriptor suffix contains only fixed scalars. Pricing a
+        // frontier must not clone its route or allocate a graph body.
+        let (base, change, _, _): (
+            VectorPartitionGenerationDescriptor,
+            Option<VectorPartitionGenerationDescriptor>,
+            TxId,
+            Lsn,
+        ) = Self::decode_exact(&payload[route_end..]).map_err(|error| {
+            self.vector_partition_corruption(format!("payload decode failed: {error}"))
+        })?;
+        Ok(Some((base, change)))
     }
 
     /// Read one lightweight catalog pointer without touching graph bodies or
@@ -26988,6 +27298,10 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
                 .remove(key.as_slice())
                 .map_err(Self::storage_error)?;
+            vector_membership_pages::reset_pending_frontier(
+                write,
+                &VectorPartitionRef::new(catalog.index.clone(), catalog.partition_key.clone()),
+            )?;
         }
         Ok((reclaimed, bytes))
     }
@@ -27600,13 +27914,13 @@ impl RedbPersistence {
     pub(crate) fn publish_prepared_vector_partition_generation_candidate(
         &self,
         prepared: &PreencodedVectorPartitionGenerationCandidate,
-    ) -> Result<()> {
+    ) -> Result<Option<(usize, usize)>> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             self.insert_preencoded_vector_partition_generation_objects_in_write(
                 &write_txn, prepared,
             )?;
-            self.publish_preencoded_vector_partition_generation_catalog_in_write(
+            let pending = self.publish_preencoded_vector_partition_generation_catalog_in_write(
                 &write_txn, prepared,
             )?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
@@ -27614,7 +27928,8 @@ impl RedbPersistence {
             crate::writer_commit_test_seams::reached(
                 crate::writer_commit_test_seams::CommitBoundary::GenerationBeforeRedb,
             );
-            write_txn.commit().map_err(Self::storage_error)
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(pending)
         })
     }
 
@@ -28652,7 +28967,7 @@ impl RedbPersistence {
         &self,
         write_txn: &redb::WriteTransaction,
         prepared: &PreencodedVectorPartitionGenerationCandidate,
-    ) -> Result<()> {
+    ) -> Result<Option<(usize, usize)>> {
         let mut catalogs = write_txn
             .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
             .map_err(Self::storage_error)?;
@@ -28680,7 +28995,16 @@ impl RedbPersistence {
                 prepared.catalog_bytes.as_slice(),
             )
             .map_err(Self::storage_error)?;
-        Ok(())
+        let catalog: VectorPartitionGenerationCatalogRecord = self.decode_vector_partition_record(
+            VectorPartitionRecordKind::GenerationCatalog,
+            &prepared.catalog_bytes,
+        )?;
+        vector_membership_pages::publish_pending_frontier(
+            write_txn,
+            &prepared.catalog_route,
+            catalog.change.unwrap_or(catalog.base).covered_tx,
+            catalog.change.map(|_| catalog.base.covered_tx),
+        )
     }
 
     /// Resolve every durable row-version pairing for the selected vector
@@ -30649,6 +30973,19 @@ impl RedbPersistence {
             )?;
         }
         for prepared in prepared_vector_generations {
+            // Purge builds its replacement from the current survivors while
+            // holding the commit gate. Capture that frontier in this same
+            // erasure transaction before publishing the replacement catalog.
+            let catalog: VectorPartitionGenerationCatalogRecord = self
+                .decode_vector_partition_record(
+                    VectorPartitionRecordKind::GenerationCatalog,
+                    &prepared.catalog_bytes,
+                )?;
+            vector_membership_pages::begin_pending_frontier(
+                write_txn,
+                &prepared.catalog_route,
+                catalog.change.unwrap_or(catalog.base).covered_tx,
+            )?;
             self.publish_preencoded_vector_partition_generation_catalog_in_write(
                 write_txn, prepared,
             )?;
@@ -34073,17 +34410,38 @@ impl RedbPersistence {
     ) -> Result<(usize, u64)> {
         let mut removed = 0usize;
         let mut bytes = 0u64;
+        let mut cursor = None::<Vec<u8>>;
         match write_txn.open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE) {
             Ok(mut pages) => loop {
                 let next = {
-                    let mut entries = pages.range(root_key..).map_err(Self::storage_error)?;
-                    match entries.next() {
-                        Some(Ok((key, value))) if key.value().starts_with(root_key) => {
-                            Some((key.value().to_vec(), value.value().len() as u64))
+                    let lower = cursor
+                        .as_ref()
+                        .map_or(std::ops::Bound::Included(root_key), |key| {
+                            std::ops::Bound::Excluded(key.as_slice())
+                        });
+                    let mut next = None;
+                    for entry in pages
+                        .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+                        .map_err(Self::storage_error)?
+                    {
+                        let (key, value) = entry.map_err(Self::storage_error)?;
+                        let key = key.value();
+                        if !key.starts_with(root_key) {
+                            break;
                         }
-                        Some(Ok(_)) | None => None,
-                        Some(Err(error)) => return Err(Self::storage_error(error)),
+                        // An ordinary base root can prefix another generation's
+                        // root. Only this manifest and its four-byte ordinal
+                        // children belong to this removal; leave other roots
+                        // intact for their caller's manifest authentication.
+                        if key.len() == root_key.len()
+                            || key.len().checked_sub(root_key.len())
+                                == Some(VECTOR_PARTITION_GRAPH_PAGE_KEY_SUFFIX_BYTES)
+                        {
+                            next = Some((key.to_vec(), value.value().len() as u64));
+                            break;
+                        }
                     }
+                    next
                 };
                 let Some((key, value_bytes)) = next else {
                     break;
@@ -34091,6 +34449,7 @@ impl RedbPersistence {
                 bytes = bytes.saturating_add(value_bytes);
                 pages.remove(key.as_slice()).map_err(Self::storage_error)?;
                 removed = removed.saturating_add(1);
+                cursor = Some(key);
             },
             Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(Self::storage_error(error)),
@@ -34098,32 +34457,82 @@ impl RedbPersistence {
         Ok((removed, bytes))
     }
 
-    fn remove_vector_partition_graph_page_prefix_in_write(
+    fn remove_vector_partition_graph_pages_for_partition_in_write(
+        &self,
         write_txn: &redb::WriteTransaction,
-        prefix: &[u8],
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
     ) -> Result<()> {
-        for definition in [VECTOR_PARTITION_GRAPH_PAGE_TABLE] {
-            let mut table = match write_txn.open_table(definition) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => continue,
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            loop {
-                let next = {
-                    let mut entries = table.range(prefix..).map_err(Self::storage_error)?;
-                    match entries.next() {
-                        Some(Ok((key, _))) if key.value().starts_with(prefix) => {
-                            Some(key.value().to_vec())
-                        }
-                        Some(Ok(_)) | None => None,
-                        Some(Err(error)) => return Err(Self::storage_error(error)),
+        let mut cursor = None::<(
+            Vec<u8>,
+            Option<crate::memory_accounting::OwnedMemoryReservation>,
+        )>;
+        loop {
+            let next = {
+                let table = match write_txn.open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE) {
+                    Ok(table) => table,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                    Err(error) => return Err(Self::storage_error(error)),
+                };
+                let lower = cursor
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, |(key, _)| {
+                        std::ops::Bound::Excluded(key.as_slice())
+                    });
+                let mut next = None;
+                for entry in table
+                    .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+                    .map_err(Self::storage_error)?
+                {
+                    let (key, value) = entry.map_err(Self::storage_error)?;
+                    if Self::is_vector_partition_graph_page_record_key(key.value()) {
+                        continue;
                     }
-                };
-                let Some(key) = next else {
+                    // Admit the one manifest, derived identity and cursor before
+                    // allocating. Physical graph bodies are never copied here.
+                    let memory = self
+                        .proof_accountant()
+                        .map(|accountant| {
+                            crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                                accountant,
+                                key.value()
+                                    .len()
+                                    .saturating_add(value.value().len())
+                                    .saturating_mul(64)
+                                    .saturating_add(8192),
+                                "vector",
+                                "authoritative_purge_graph_pages",
+                                "Raise MEMORY_LIMIT to erase vector graph pages.",
+                            )
+                        })
+                        .transpose()?;
+                    let manifest: VectorPartitionGraphPageManifestRecord = self
+                        .decode_vector_partition_record(
+                            VectorPartitionRecordKind::GraphPageManifest,
+                            value.value(),
+                        )?;
+                    let root = self.authenticated_vector_partition_graph_manifest_root(
+                        key.value(),
+                        &manifest,
+                        "authoritative purge graph page manifest key disagrees with its payload",
+                    )?;
+                    let selected =
+                        manifest.index == *index && manifest.partition_key == *partition_key;
+                    next = Some((root, selected, memory));
                     break;
-                };
-                table.remove(key.as_slice()).map_err(Self::storage_error)?;
+                }
+                next
+            };
+            let Some((root, selected, memory)) = next else {
+                break;
+            };
+            if selected {
+                Self::remove_vector_partition_graph_page_root_in_write(write_txn, &root)?;
             }
+            // Hold the admitted cursor through the next seek. The enclosing
+            // purge transaction also owns membership and catalog removal: any
+            // manifest refusal aborts all durable effects together.
+            cursor = Some((root, memory));
         }
         Ok(())
     }
@@ -34355,8 +34764,15 @@ impl RedbPersistence {
                 .remove(old_key.as_slice())
                 .map_err(Self::storage_error)?;
             if kind == VectorPartitionRecordKind::Membership {
-                self.write_open_directory_entry(write_txn, &old_key, None)?;
-                self.write_open_directory_entry(write_txn, &new_key, Some(&bytes))?;
+                self.write_open_directory_entry_with_pending_transition(
+                    write_txn, &old_key, None, false,
+                )?;
+                self.write_open_directory_entry_with_pending_transition(
+                    write_txn,
+                    &new_key,
+                    Some(&bytes),
+                    false,
+                )?;
             }
         }
         Ok(())
@@ -34467,9 +34883,11 @@ impl RedbPersistence {
         // before rewriting the complete generation records; the renamed root
         // remains a valid explicit complete-record fallback until its writer
         // next publishes a materialized generation.
-        self.remove_vector_partition_graph_pages_matching_in_write(write_txn, &|index| {
-            index == from
-        })?;
+        self.remove_vector_partition_graph_pages_matching_in_write(
+            write_txn,
+            self.proof_accountant(),
+            &|index| index == from,
+        )?;
         self.rename_vector_partition_records_in_write::<VectorPartitionMembershipRecord>(
             write_txn,
             VECTOR_PARTITION_MEMBERSHIP_TABLE,
@@ -34478,6 +34896,12 @@ impl RedbPersistence {
             to,
             |record, to| record.index = to.clone(),
             Self::vector_partition_membership_key,
+        )?;
+        vector_membership_pages::rename_pending_routes(
+            write_txn,
+            from,
+            to,
+            self.proof_accountant(),
         )?;
         self.rename_vector_partition_records_in_write::<VectorPartitionTombstoneRecord>(
             write_txn,
@@ -34540,9 +34964,15 @@ impl RedbPersistence {
     fn remove_vector_partition_records_matching_all_in_write(
         &self,
         write_txn: &redb::WriteTransaction,
+        table: &str,
+        columns: Option<&HashSet<String>>,
         matches: &impl Fn(&VectorIndexRef) -> bool,
     ) -> Result<()> {
-        self.remove_vector_partition_graph_pages_matching_in_write(write_txn, matches)?;
+        self.remove_vector_partition_graph_pages_matching_in_write(
+            write_txn,
+            self.proof_accountant(),
+            matches,
+        )?;
         self.remove_vector_partition_records_matching_in_write::<VectorPartitionMembershipRecord>(
             write_txn,
             VECTOR_PARTITION_MEMBERSHIP_TABLE,
@@ -34570,39 +35000,163 @@ impl RedbPersistence {
         self.remove_vector_partition_records_matching_in_write::<VectorPartitionGenerationCatalogRecord>(
             write_txn, VECTOR_PARTITION_GENERATION_CATALOG_TABLE, VectorPartitionRecordKind::GenerationCatalog, matches,
         )?;
+        if let Some(columns) = columns {
+            for column in columns {
+                vector_membership_pages::remove_routes_matching(
+                    write_txn,
+                    table,
+                    Some(column),
+                    self.proof_accountant(),
+                )?;
+            }
+        } else {
+            vector_membership_pages::remove_routes_matching(
+                write_txn,
+                table,
+                None,
+                self.proof_accountant(),
+            )?;
+        }
         Self::ensure_open_vector_directory_in_write(write_txn)
+    }
+
+    // Physical pages share the manifest table but append an ordinal to a root.
+    // Recognize only the two generation suffixes and the compact-root namespace;
+    // every other key must still pass the typed manifest decoder.
+    fn is_vector_partition_graph_page_record_key(key: &[u8]) -> bool {
+        if key.starts_with(&[0xff, b'V', b'G']) {
+            return key.len() == 40 && matches!(key[3], 0xb0 | 0xc0);
+        }
+        let mut remaining = key;
+        for _ in 0..3 {
+            let Some(length_bytes) = remaining.get(..8) else {
+                return false;
+            };
+            let Ok(length) = usize::try_from(u64::from_be_bytes(
+                length_bytes
+                    .try_into()
+                    .expect("eight-byte component length"),
+            )) else {
+                return false;
+            };
+            let Some(component_end) = 8usize.checked_add(length) else {
+                return false;
+            };
+            let Some(suffix) = remaining.get(component_end..) else {
+                return false;
+            };
+            remaining = suffix;
+        }
+        (remaining.len() == 13 && remaining[8] == 0xb0)
+            || (remaining.len() == 21 && remaining[16] == 0xc0)
+    }
+
+    // Call only after admitting the manifest and producer-key scratch. The
+    // envelope authenticates the value; this binds it to its physical root.
+    fn authenticated_vector_partition_graph_manifest_root(
+        &self,
+        physical_key: &[u8],
+        manifest: &VectorPartitionGraphPageManifestRecord,
+        corruption_reason: &str,
+    ) -> Result<Vec<u8>> {
+        let generation_key = if manifest.is_base {
+            Self::vector_partition_base_generation_key_from_parts(
+                &manifest.index,
+                &manifest.partition_key,
+                manifest.generation_id,
+            )
+        } else {
+            Self::vector_partition_change_generation_key_from_parts(
+                &manifest.index,
+                &manifest.partition_key,
+                manifest.base_generation_id,
+                manifest.generation_id,
+            )
+        };
+        let root = Self::vector_partition_graph_page_root_key(&generation_key, manifest.is_base);
+        if root.as_slice() != physical_key
+            || (manifest.is_base && manifest.base_generation_id != manifest.generation_id)
+        {
+            return Err(self.vector_partition_corruption(corruption_reason));
+        }
+        Ok(root)
     }
 
     fn remove_vector_partition_graph_pages_matching_in_write(
         &self,
         write_txn: &redb::WriteTransaction,
+        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
         matches: &impl Fn(&VectorIndexRef) -> bool,
     ) -> Result<()> {
-        let roots = {
-            let table = match write_txn.open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-                Err(error) => return Err(Self::storage_error(error)),
-            };
-            let mut roots = Vec::new();
-            for entry in table.iter().map_err(Self::storage_error)? {
-                let (key, value) = entry.map_err(Self::storage_error)?;
-                let Ok(manifest) = self
-                    .decode_vector_partition_record::<VectorPartitionGraphPageManifestRecord>(
-                        VectorPartitionRecordKind::GraphPageManifest,
-                        value.value(),
-                    )
-                else {
-                    continue;
+        let mut cursor = None::<(Vec<u8>, crate::memory_accounting::OwnedMemoryReservation)>;
+        loop {
+            let next = {
+                let table = match write_txn.open_table(VECTOR_PARTITION_GRAPH_PAGE_TABLE) {
+                    Ok(table) => table,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                    Err(error) => return Err(Self::storage_error(error)),
                 };
-                if matches(&manifest.index) {
-                    roots.push(key.value().to_vec());
+                let lower = cursor
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, |(key, _)| {
+                        std::ops::Bound::Excluded(key.as_slice())
+                    });
+                let mut next = None;
+                for entry in table
+                    .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+                    .map_err(Self::storage_error)?
+                {
+                    let (key, value) = entry.map_err(Self::storage_error)?;
+                    if Self::is_vector_partition_graph_page_record_key(key.value()) {
+                        continue;
+                    }
+                    let owner = accountant.as_ref().ok_or_else(|| {
+                        Error::Other(
+                            "graph manifest cleanup requires its writer memory accountant".into(),
+                        )
+                    })?;
+                    // One decoded route, producer key, physical root and page
+                    // deletion cursors, plus the preceding seek cursor. Price
+                    // the borrowed value even for a 36-byte compact root.
+                    let memory = crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                        Arc::clone(owner),
+                        key.value()
+                            .len()
+                            .saturating_add(value.value().len())
+                            .saturating_mul(64)
+                            .saturating_add(8192),
+                        "vector",
+                        "matching_graph_pages",
+                        "Raise MEMORY_LIMIT to remove vector graph pages.",
+                    )?;
+                    let manifest: VectorPartitionGraphPageManifestRecord = self
+                        .decode_vector_partition_record(
+                            VectorPartitionRecordKind::GraphPageManifest,
+                            value.value(),
+                        )?;
+                    // Authenticate every manifest before selection, including
+                    // unrelated routes: a corrupt value cannot authorize erasure.
+                    let root = self.authenticated_vector_partition_graph_manifest_root(
+                        key.value(),
+                        &manifest,
+                        "graph page manifest key disagrees with its payload",
+                    )?;
+                    let selected = matches(&manifest.index);
+                    next = Some((root, selected, memory));
+                    break;
                 }
+                next
+            };
+            let Some((root, selected, memory)) = next else {
+                break;
+            };
+            if selected {
+                Self::remove_vector_partition_graph_page_root_in_write(write_txn, &root)?;
             }
-            roots
-        };
-        for root in roots {
-            Self::remove_vector_partition_graph_page_root_in_write(write_txn, &root)?;
+            // Reservation also funds the exact-root remover's key copies and
+            // remains held until the next admitted root replaces this cursor.
+            // Any refusal escapes the enclosing write transaction uncommitted.
+            cursor = Some((root, memory));
         }
         Ok(())
     }
@@ -34797,7 +35351,11 @@ impl RedbPersistence {
             // Erasure covers native paged generations and unpublished paged
             // builds too: their pages hold copies of the erased vectors.
             self.erase_partition_paged_storage_in_write(write_txn, &prefix)?;
-            Self::remove_vector_partition_graph_page_prefix_in_write(write_txn, &prefix)?;
+            self.remove_vector_partition_graph_pages_for_partition_in_write(
+                write_txn,
+                &index,
+                &partition_key,
+            )?;
             self.remove_vector_partition_prefix_records_in_write::<
                 VectorPartitionBaseGenerationRecord,
             >(
@@ -34825,6 +35383,10 @@ impl RedbPersistence {
                 &prefix,
                 Self::vector_partition_catalog_key,
             )?;
+            vector_membership_pages::reset_pending_frontier(
+                write_txn,
+                &VectorPartitionRef::new(index, partition_key),
+            )?;
         }
         Ok(())
     }
@@ -34844,19 +35406,45 @@ impl RedbPersistence {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Err(error) => return Err(Self::storage_error(error)),
         };
-        let mut keys = Vec::new();
-        for entry in table.iter().map_err(Self::storage_error)? {
-            let (key, value) = entry.map_err(Self::storage_error)?;
-            let record: T = self.decode_vector_partition_record(kind, value.value())?;
+        let mut cursor = None::<(
+            Vec<u8>,
+            Option<crate::memory_accounting::OwnedMemoryReservation>,
+        )>;
+        loop {
+            let next = {
+                let lower = cursor
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, |(key, _)| {
+                        std::ops::Bound::Excluded(key.as_slice())
+                    });
+                let mut entries = table
+                    .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+                    .map_err(Self::storage_error)?;
+                entries
+                    .next()
+                    .transpose()
+                    .map_err(Self::storage_error)?
+                    .map(|(key, value)| -> Result<_> {
+                        let memory =
+                            self.admit_vector_image_build_route(key.value(), value.value().len())?;
+                        let record: T = self.decode_vector_partition_record(kind, value.value())?;
+                        Ok((key.value().to_vec(), record, memory))
+                    })
+                    .transpose()?
+            };
+            let Some((key, record, memory)) = next else {
+                break;
+            };
             if matches(record.vector_partition_record_index()) {
-                keys.push(key.value().to_vec());
+                if let Some(meta) = record.native_paged_graph() {
+                    Self::queue_paged_generation_cleanup_in_write(write_txn, meta)?;
+                }
+                table.remove(key.as_slice()).map_err(Self::storage_error)?;
+                if kind == VectorPartitionRecordKind::Membership {
+                    self.write_open_directory_entry(write_txn, &key, None)?;
+                }
             }
-        }
-        for key in keys {
-            table.remove(key.as_slice()).map_err(Self::storage_error)?;
-            if kind == VectorPartitionRecordKind::Membership {
-                self.write_open_directory_entry(write_txn, &key, None)?;
-            }
+            cursor = Some((key, memory));
         }
         Ok(())
     }
@@ -35048,11 +35636,22 @@ impl RedbPersistence {
         key: &[u8],
         membership: Option<&[u8]>,
     ) -> Result<()> {
+        self.write_open_directory_entry_with_pending_transition(write_txn, key, membership, true)
+    }
+
+    fn write_open_directory_entry_with_pending_transition(
+        &self,
+        write_txn: &redb::WriteTransaction,
+        key: &[u8],
+        membership: Option<&[u8]>,
+        pending_transition: bool,
+    ) -> Result<()> {
         vector_membership_pages::publish_membership(
             write_txn,
             key,
             membership,
             self.proof_accountant(),
+            pending_transition,
         )?;
         let mut directory = write_txn
             .open_table(VECTOR_OPEN_DIRECTORY_TABLE)
@@ -35358,18 +35957,45 @@ impl RedbPersistence {
             VECTOR_OPEN_DIRECTORY_COMMITMENT_KEY,
             &[0_u8; 40],
         )?;
-        let memberships = match write_txn.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                return vector_membership_pages::write_fingerprints(write_txn);
+        match write_txn.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE) {
+            Ok(memberships) => {
+                for entry in memberships.iter().map_err(Self::storage_error)? {
+                    let (key, value) = entry.map_err(Self::storage_error)?;
+                    self.write_open_directory_entry(write_txn, key.value(), Some(value.value()))?;
+                }
             }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(Self::storage_error(error)),
-        };
-        for entry in memberships.iter().map_err(Self::storage_error)? {
-            let (key, value) = entry.map_err(Self::storage_error)?;
-            self.write_open_directory_entry(write_txn, key.value(), Some(value.value()))?;
         }
-        drop(memberships);
+        let meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(Self::storage_error)?;
+        for entry in meta.iter().map_err(Self::storage_error)? {
+            let (key, value) = entry.map_err(Self::storage_error)?;
+            let Some(table) = key.value().strip_prefix("table:") else {
+                continue;
+            };
+            let _memory = self
+                .proof_accountant()
+                .map(|accountant| {
+                    crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                        accountant,
+                        value.value().len().saturating_mul(16).saturating_add(4096),
+                        "vector",
+                        "rebuild_membership_summary",
+                        "Raise MEMORY_LIMIT to rebuild this vector membership route.",
+                    )
+                })
+                .transpose()?;
+            let (declaration, _) = Self::decode_table_meta_versioned(value.value())?;
+            vector_membership_pages::ensure_declared_routes(
+                write_txn,
+                table,
+                &declaration,
+                self.proof_accountant(),
+            )?;
+        }
+        drop(meta);
         vector_membership_pages::write_fingerprints(write_txn)
     }
 

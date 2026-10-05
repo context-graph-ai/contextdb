@@ -311,6 +311,8 @@ pub enum Error {
     },
     #[error("corrupt store at {path}: {reason}")]
     StoreCorrupted { path: String, reason: String },
+    #[error("vector metadata I/O failed during {operation}: {reason}")]
+    VectorMetadataIo { operation: String, reason: String },
     #[error(
         "no store at {path}: this open was asked to change a store that already exists, so it created nothing — point it at an existing store, or open it with the creating disposition if a new one is wanted"
     )]

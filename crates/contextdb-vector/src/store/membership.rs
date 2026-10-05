@@ -1,7 +1,7 @@
 //! Durable raw membership access. Implementations own the pinned storage read,
 //! authenticate each record when used, and reuse one admitted decode window.
 //! No decoded directory is retained by the vector store.
-use super::{DormantVectorLoadRequest, RawVectorDirectoryEntry};
+use super::{DormantVectorLoadRequest, RawVectorDirectoryEntry, VectorGraphGeneration};
 use contextdb_core::{
     Error, Lsn, Result, RowId, SnapshotId, TxId, VectorIndexRef, VectorPartitionKey,
 };
@@ -14,6 +14,23 @@ pub struct RawVectorMembershipSummary {
     pub entries: usize,
     pub live_entries: usize,
     pub max_tx: TxId,
+}
+
+/// Fixed inspection metadata authenticated at one captured operation root.
+/// Resident cache charges remain separate from this durable publication view.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawVectorInspectionSnapshot {
+    /// The captured physical root differs from the current writer publication.
+    /// Its catalog descriptors and counts must remain paired.
+    pub captured_catalog: bool,
+    pub summary: RawVectorMembershipSummary,
+    pub base: Option<VectorGraphGeneration>,
+    pub change: Option<VectorGraphGeneration>,
+    pub pending_inserts: usize,
+    pub tombstones: usize,
+    #[cfg(feature = "test-seams")]
+    pub base_pending: Option<(usize, usize)>,
 }
 
 /// One membership change of a durable LSN-ordered change suffix.
@@ -101,6 +118,30 @@ pub trait RawVectorMembershipSource: Send + Sync {
         lsn: Lsn,
         before_read: &mut dyn FnMut() -> bool,
     ) -> Result<Option<RawVectorDirectoryEntry>>;
+
+    /// Whether commits already maintain authoritative pending summaries in
+    /// durable metadata. Such sources need no resident membership event log.
+    fn has_durable_pending_counts(&self) -> bool {
+        false
+    }
+
+    /// Fixed durable metadata for the published serving frontier. No journal,
+    /// directory or body reads are permitted; failure must reach inspection.
+    fn pending_counts(&self, covered: Option<TxId>) -> Result<Option<(usize, usize)>> {
+        let _ = covered;
+        Ok(None)
+    }
+
+    /// Return counts and catalog metadata from one authorized operation root.
+    /// When installation was refused, count against the actual serving frontier.
+    /// Sources without a durable catalog keep the resident path.
+    fn inspection_snapshot(
+        &self,
+        serving_covered: Option<TxId>,
+    ) -> Result<Option<RawVectorInspectionSnapshot>> {
+        let _ = serving_covered;
+        Ok(None)
+    }
 
     /// Live memberships published after `covered_lsn` and memberships closed
     /// after it, counted from a durable LSN-ordered change suffix without

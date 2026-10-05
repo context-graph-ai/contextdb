@@ -827,11 +827,27 @@ impl MaintenanceContext {
                 // Source views are gone before ordinary route helpers acquire
                 // their bulk/partition registry guards.
                 for (route, source_position, route_heap, fixed, mut workspace) in sampled_routes {
-                    let Some(mut info) = self
+                    let mut info = match self
                         .vector
-                        .partition_info(&route.index, &route.partition_key)
-                    else {
-                        continue;
+                        .try_partition_info(&route.index, &route.partition_key)
+                    {
+                        Ok(Some(info)) => info,
+                        Ok(None) => continue,
+                        Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            let mut details = VectorMaintenanceFailureDetails::from_error(&error);
+                            if matches!(error, Error::MemoryBudgetExceeded { .. }) {
+                                // Candidate inspection is required generation preparation;
+                                // retain the source refusal and normalize only its report.
+                                details.operation = PREPARE;
+                            }
+                            phase.failures.first.get_or_insert(details);
+                            phase.sources[source_position].failure = Some(details);
+                            phase.sources[source_position].failed = true;
+                            continue;
+                        }
                     };
                     info.quarantine_reason = phase.sources[source_position].quarantine;
                     let fresh = phase.sources[source_position]

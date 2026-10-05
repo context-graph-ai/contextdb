@@ -47,7 +47,7 @@ const CANONICAL_BYTES: usize = 32;
 /// Physical source companion suffix width (`vector_membership_pages::source_key`).
 const SOURCE_SUFFIX_BYTES: usize = 24;
 
-fn corruption(reason: impl Into<String>) -> Error {
+pub(super) fn corruption(reason: impl Into<String>) -> Error {
     Error::StoreCorrupted {
         path: "vector_paged_generation_pages".into(),
         reason: reason.into(),
@@ -110,6 +110,48 @@ struct ProgressRecord {
     encoded_points: u64,
     encoding_digest: u64,
     cleanup_cursor: Option<Vec<u8>>,
+}
+
+/// The graph state contains only scalars, a fixed layer-count array and an
+/// optional fixed PointId. The two progress cursors are the only variable
+/// fields. Inspect the complete positional record without allocating either.
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct InspectedProgressRecord {
+    generation_id: u64,
+    declaration_digest: u64,
+    frontier_tx: u64,
+    frontier_lsn: u64,
+    graph: PagedGraphState,
+    last_source_key: Option<InspectedSequence<u8>>,
+    total_points: u64,
+    phase: u8,
+    encoding_cursor: Option<(u8, i32)>,
+    encoding_bytes: u64,
+    encoded_points: u64,
+    encoding_digest: u64,
+    cleanup_cursor: Option<InspectedSequence<u8>>,
+}
+
+fn decode_image_build_record(payload: &[u8]) -> Result<PagedBuildRecord> {
+    type Record = (
+        u64,
+        u64,
+        PagedBuildReason,
+        PagedDeclaration,
+        InspectedProgressRecord,
+    );
+    let (_, consumed) =
+        bincode::serde::borrow_decode_from_slice::<Record, _>(payload, bincode::config::standard())
+            .map_err(|_| corruption("paged build record cannot be decoded"))?;
+    if consumed != payload.len() {
+        return Err(corruption("paged build record has trailing bytes"));
+    }
+    // Callers hold the actual operation's encoded-byte reservation through all
+    // uses of the owned record. Complete inspection proves each allocation hint
+    // has its elements in that already admitted input before serde can reserve.
+    RedbPersistence::decode_exact(payload)
+        .map_err(|_| corruption("paged build record cannot be decoded"))
 }
 
 fn phase_code(phase: PagedVectorPhase) -> u8 {
@@ -209,6 +251,13 @@ pub(crate) struct PagedGenerationMeta {
 
 impl PagedGenerationMeta {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        type Meta = ([u8; 8], u64, PagedDeclaration, InspectedProgressRecord);
+        let (_, consumed) =
+            bincode::serde::borrow_decode_from_slice::<Meta, _>(bytes, bincode::config::standard())
+                .map_err(|_| corruption("paged generation metadata cannot be decoded"))?;
+        if consumed != bytes.len() {
+            return Err(corruption("paged generation metadata has trailing bytes"));
+        }
         let meta: Self = RedbPersistence::decode_exact(bytes)
             .map_err(|_| corruption("paged generation metadata cannot be decoded"))?;
         if meta.magic != META_MAGIC {
@@ -729,6 +778,8 @@ pub(crate) struct PagedBuildHooks {
 pub(crate) struct PagedPublication {
     pub(crate) prepared: PreencodedVectorPartitionGenerationCandidate,
     pub(crate) previous_generation_id: u64,
+    #[cfg(feature = "test-seams")]
+    pub(crate) published_pending: Arc<parking_lot::Mutex<Option<(usize, usize)>>>,
 }
 
 /// One captured storage root plus the owner that keeps it readable: the
@@ -899,9 +950,15 @@ impl PagedGenerationPersistence for NativePagedGeneration {
                     )?;
                     let next = batch(&mut transaction)?;
                     let published = transaction.published;
+                    #[cfg(feature = "test-seams")]
+                    let pending = transaction.published_pending;
                     transaction.finish()?;
+                    #[cfg(feature = "test-seams")]
+                    let published = (published, pending);
                     (next, published)
                 };
+                #[cfg(feature = "test-seams")]
+                let (published, pending) = published;
                 if published != (next.phase == PagedVectorPhase::Published) {
                     return Err(Error::Other(
                         "paged publication and its successor record disagree".into(),
@@ -938,6 +995,10 @@ impl PagedGenerationPersistence for NativePagedGeneration {
                     );
                 }
                 write.commit().map_err(RedbPersistence::storage_error)?;
+                #[cfg(feature = "test-seams")]
+                if let Some(publication) = &publication {
+                    *publication.published_pending.lock() = pending;
+                }
                 committed = Some(next);
                 Ok(())
             })
@@ -966,6 +1027,8 @@ struct NativeBatch<'t> {
     hooks: &'t PagedBuildHooks,
     publication: Option<&'t PagedPublication>,
     published: bool,
+    #[cfg(feature = "test-seams")]
+    published_pending: Option<(usize, usize)>,
     inserted: usize,
 }
 
@@ -1015,6 +1078,8 @@ impl<'t> NativeBatch<'t> {
             hooks,
             publication,
             published: false,
+            #[cfg(feature = "test-seams")]
+            published_pending: None,
             inserted: 0,
         })
     }
@@ -1508,11 +1573,18 @@ impl PagedGenerationTransaction for NativeBatch<'_> {
                 self.write,
                 &publication.prepared,
             )?;
-        self.persistence
+        let pending = self
+            .persistence
             .publish_preencoded_vector_partition_generation_catalog_in_write(
                 self.write,
                 &publication.prepared,
             )?;
+        #[cfg(feature = "test-seams")]
+        {
+            self.published_pending = pending;
+        }
+        #[cfg(not(feature = "test-seams"))]
+        let _ = pending;
         self.published = true;
         Ok(())
     }
@@ -1539,6 +1611,24 @@ fn reclaim_storage_keys(
     after: Option<&[u8]>,
     max_keys: usize,
 ) -> Result<PagedVectorReclamation> {
+    reclaim_storage_keys_with_admission(pages, storage, after, max_keys, &mut |_| Ok(()))
+}
+
+/// Admit the cursor and the old/new seek keys before copying them. The page
+/// cache separately owns the storage pages retained by each short seek.
+fn reclaim_storage_keys_with_admission(
+    pages: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    storage: &[u8; 8],
+    after: Option<&[u8]>,
+    max_keys: usize,
+    admit: &mut dyn FnMut(usize) -> Result<()>,
+) -> Result<PagedVectorReclamation> {
+    admit(
+        after
+            .map_or(0, <[u8]>::len)
+            .saturating_add(storage.len())
+            .saturating_add(3 * std::mem::size_of::<Vec<u8>>()),
+    )?;
     let upper = writer_source::prefix_end(storage)
         .ok_or_else(|| corruption("paged storage identity has no successor"))?;
     let mut removed = 0usize;
@@ -1553,13 +1643,18 @@ fn reclaim_storage_keys(
                 .range::<&[u8]>((lower, Bound::Excluded(upper.as_slice())))
                 .map_err(RedbPersistence::storage_error)?;
             match range.next() {
-                Some(entry) => Some(
-                    entry
-                        .map_err(RedbPersistence::storage_error)?
-                        .0
-                        .value()
-                        .to_vec(),
-                ),
+                Some(entry) => {
+                    let (key, _) = entry.map_err(RedbPersistence::storage_error)?;
+                    admit(
+                        after
+                            .map_or(0, <[u8]>::len)
+                            .saturating_add(last.as_ref().map_or(0, Vec::capacity))
+                            .saturating_add(key.value().len())
+                            .saturating_add(upper.capacity())
+                            .saturating_add(3 * std::mem::size_of::<Vec<u8>>()),
+                    )?;
+                    Some(key.value().to_vec())
+                }
                 None => None,
             }
         };
@@ -1804,6 +1899,365 @@ impl RedbPersistence {
         })
     }
 
+    /// Reconcile fixed construction inputs before replacing a received image.
+    /// The admitted image is already owned by this writer; each durable route
+    /// owns only one control record and one authenticated source lookup at a time.
+    pub(super) fn reconcile_paged_builds_for_image_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        image: &CompleteVectorPartitionImage,
+        previous: &redb::ReadTransaction,
+        stage: &ReceivedSchemaPersistenceProjection,
+    ) -> Result<()> {
+        let affected_tables = &stage.affected_tables;
+        let table_meta = &stage.table_meta;
+        let retired = &stage.retired_vector_construction;
+        let raw = match previous.open_byte_table_bounded(VECTORS_TABLE) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(Self::storage_error(error)),
+        };
+        let verifier = content_identity::ContentIdentityReadVerifier::open(
+            previous,
+            &self.path,
+            Some(stage.vector_image_memory.accountant.clone()),
+        )?;
+        let mut proof = content_identity::ReadAuthenticationNodes::new(
+            RAW_VECTOR_BODY_SCAN_PROOF_BYTES,
+            Some(stage.vector_image_memory.accountant.clone()),
+        );
+        for table in affected_tables {
+            let _prefix_memory = Self::admit_vector_image_build_route_with_owner(
+                Some(stage.vector_image_memory.accountant.clone()),
+                table.as_bytes(),
+                0,
+            )?;
+            let mut prefix = Vec::new();
+            Self::append_partition_key_component(&mut prefix, table.as_bytes());
+            let mut builds = write.open_table(BUILDS).map_err(Self::storage_error)?;
+            let source = write
+                .open_table(vector_membership_pages::SOURCE)
+                .map_err(vector_membership_pages::metadata_error)?;
+            let catalogs = write
+                .open_table(VECTOR_PARTITION_GENERATION_CATALOG_TABLE)
+                .map_err(Self::storage_error)?;
+            let mut cursor = None::<(
+                Vec<u8>,
+                Option<crate::memory_accounting::OwnedMemoryReservation>,
+            )>;
+            loop {
+                let next = {
+                    let start = cursor
+                        .as_ref()
+                        .map_or(Bound::Included(prefix.as_slice()), |(key, _)| {
+                            Bound::Excluded(key.as_slice())
+                        });
+                    let mut entries = builds
+                        .range::<&[u8]>((start, Bound::Unbounded))
+                        .map_err(Self::storage_error)?;
+                    entries
+                        .next()
+                        .transpose()
+                        .map_err(Self::storage_error)?
+                        .filter(|(key, _)| key.value().starts_with(&prefix))
+                        .map(|(key, value)| -> Result<_> {
+                            let memory = Self::admit_vector_image_build_route_with_owner(
+                                Some(stage.vector_image_memory.accountant.clone()),
+                                key.value(),
+                                value.value().len(),
+                            )?;
+                            let record: PagedBuildRecord =
+                                decode_image_build_record(open_value(key.value(), value.value())?)?;
+                            Ok((key.value().to_vec(), record, memory))
+                        })
+                        .transpose()?
+                };
+                let Some((key, record, memory)) = next else {
+                    break;
+                };
+                let partition = vector_membership_pages::partition_from_prefix(&key)?;
+                let progress = record.progress()?;
+                let mut surviving = 0usize;
+                let declaration_survives = table_meta
+                    .get(&partition.index.table)
+                    .and_then(|meta| {
+                        meta.columns
+                            .iter()
+                            .find(|column| column.name == partition.index.column)
+                    })
+                    .is_some_and(|column| {
+                        column.column_type
+                            == ColumnType::Vector(record.declaration.dimension as usize)
+                            && column.quantization == record.declaration.quantization
+                    });
+                let mut valid = declaration_survives
+                    && record.previous_generation_id == 0
+                    && catalogs
+                        .get_bounded(key.as_slice())
+                        .map_err(Self::storage_error)?
+                        .is_none();
+                if valid {
+                    for member in image.memberships.iter().filter(|member| {
+                        member.index == partition.index
+                            && member.partition_key == partition.partition_key
+                            && member.visible_from <= progress.frontier_tx
+                            && member.deleted_tx.is_none_or(|tx| tx > progress.frontier_tx)
+                    }) {
+                        let source_key = vector_membership_pages::source_key(member);
+                        let previous = source
+                            .get_bounded(source_key.as_slice())
+                            .map_err(vector_membership_pages::metadata_error)?
+                            .map(|value| {
+                                let memory = Self::admit_vector_image_build_route_with_owner(
+                                    Some(stage.vector_image_memory.accountant.clone()),
+                                    &source_key,
+                                    value.value().len(),
+                                )?;
+                                Ok::<_, Error>((
+                                    vector_membership_pages::decode_source_member(
+                                        &source_key,
+                                        value.value(),
+                                    )?,
+                                    memory,
+                                ))
+                            })
+                            .transpose()?;
+                        let Some((previous, _old_member_memory)) = previous else {
+                            valid = false;
+                            break;
+                        };
+                        if previous.visible_from != member.visible_from
+                            || previous.deleted_tx != member.deleted_tx
+                            || previous.visible_from > progress.frontier_tx
+                            || previous
+                                .deleted_tx
+                                .is_some_and(|tx| tx <= progress.frontier_tx)
+                        {
+                            valid = false;
+                            break;
+                        }
+                        let Some(next_body) = stage.vectors.iter().find(|entry| {
+                            entry.index == member.index
+                                && entry.row_id == member.row_id
+                                && entry.created_tx == member.vector_created_tx
+                                && entry.lsn == member.vector_lsn
+                        }) else {
+                            valid = false;
+                            break;
+                        };
+                        // One exact old body, authenticated against the committed
+                        // version commitment, and one accepted-image commitment.
+                        // Refusal aborts; only a proven changed input cancels.
+                        let body_memory = crate::read_image_memory::ImageMemory::charging_for(
+                            stage.vector_image_memory.accountant.clone(),
+                            "sync",
+                            "compare_vector_image_input",
+                            "Raise MEMORY_LIMIT to authenticate this fixed vector input.",
+                        );
+                        body_memory.reserve(
+                            next_body
+                                .index
+                                .table
+                                .len()
+                                .saturating_add(next_body.index.column.len())
+                                .saturating_add(64),
+                        )?;
+                        let body_key = Self::vector_key(next_body);
+                        let Some(raw) = raw.as_ref() else {
+                            valid = false;
+                            break;
+                        };
+                        let Some(stored) = raw
+                            .get_bounded(body_key.as_slice())
+                            .map_err(Self::storage_error)?
+                        else {
+                            valid = false;
+                            break;
+                        };
+                        body_memory.reserve(
+                            stored
+                                .value()
+                                .len()
+                                .saturating_mul(64)
+                                .saturating_add(next_body.vector.len().saturating_mul(32))
+                                .saturating_add(8192),
+                        )?;
+                        self.validate_raw_vector_entry_encoded_width(
+                            stored.value(),
+                            &member.index,
+                            record.declaration.dimension as usize,
+                        )?;
+                        let old = decode_image_vector_entry(
+                            stored.value(),
+                            record.declaration.dimension as usize,
+                        )?;
+                        if old.index != member.index
+                            || old.row_id != member.row_id
+                            || old.created_tx != member.vector_created_tx
+                            || old.lsn != member.vector_lsn
+                            || old.vector.quantization() != record.declaration.quantization
+                        {
+                            return Err(corruption(
+                                "fixed vector body differs from its source identity",
+                            ));
+                        }
+                        let old_values = old.vector.to_f32();
+                        let old_commitment =
+                            content_identity::decoded_vector_version_value_mutation(
+                                &old.index,
+                                old.row_id,
+                                old.created_tx,
+                                old.lsn,
+                                &old_values,
+                                record.declaration.quantization,
+                            );
+                        verifier.verify_with_nodes(&mut proof, &old_commitment)?;
+                        let next_commitment = content_identity::vector_version_mutation(
+                            next_body,
+                            record.declaration.quantization,
+                        );
+                        if old_commitment.logical_value != next_commitment.logical_value {
+                            valid = false;
+                            break;
+                        }
+                        surviving = surviving
+                            .checked_add(1)
+                            .ok_or_else(|| corruption("paged image input count overflow"))?;
+                    }
+                    valid &= surviving == progress.total_points;
+                }
+                let cursor_memory = Self::admit_vector_image_build_route_with_owner(
+                    Some(stage.vector_image_memory.accountant.clone()),
+                    &key,
+                    0,
+                )?;
+                if !valid {
+                    // Removing the predecessor catalog invalidates replacement
+                    // builds. Lost fixed inputs invalidate initial builds too.
+                    // Use the same finite cleanup queue as ordinary abandonment.
+                    builds.remove(key.as_slice()).map_err(Self::storage_error)?;
+                    write
+                        .open_table(CLEANUP)
+                        .map_err(Self::storage_error)?
+                        .insert(record.storage_id, [].as_slice())
+                        .map_err(Self::storage_error)?;
+                    write
+                        .open_table(FLOORS)
+                        .map_err(Self::storage_error)?
+                        .remove(key.as_slice())
+                        .map_err(Self::storage_error)?;
+                    retired.lock().push((partition, memory));
+                }
+                cursor = Some((key, cursor_memory));
+            }
+            // Whole-build candidates belong to the replaced registry image.
+            let mut floors = write.open_table(FLOORS).map_err(Self::storage_error)?;
+            loop {
+                let next = floors
+                    .range(prefix.as_slice()..)
+                    .map_err(Self::storage_error)?
+                    .next()
+                    .transpose()
+                    .map_err(Self::storage_error)?
+                    .filter(|(key, _)| key.value().starts_with(&prefix))
+                    .map(|(key, _)| -> Result<_> {
+                        let memory = Self::admit_vector_image_build_route_with_owner(
+                            Some(stage.vector_image_memory.accountant.clone()),
+                            key.value(),
+                            0,
+                        )?;
+                        Ok((key.value().to_vec(), memory))
+                    })
+                    .transpose()?;
+                let Some((key, memory)) = next else {
+                    break;
+                };
+                let partition = vector_membership_pages::partition_from_prefix(&key)?;
+                floors.remove(key.as_slice()).map_err(Self::storage_error)?;
+                if builds
+                    .get_bounded(key.as_slice())
+                    .map_err(Self::storage_error)?
+                    .is_none()
+                {
+                    retired.lock().push((partition, memory));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn admit_vector_image_build_route(
+        &self,
+        key: &[u8],
+        stored_bytes: usize,
+    ) -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
+        Self::admit_vector_image_build_route_with_owner(self.proof_accountant(), key, stored_bytes)
+    }
+
+    fn admit_vector_image_build_route_with_owner(
+        accountant: Option<Arc<crate::memory_accounting::MemoryAccountant>>,
+        key: &[u8],
+        stored_bytes: usize,
+    ) -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
+        if stored_bytes != 0 && accountant.is_none() {
+            return Err(corruption(
+                "vector image record has no operation memory owner",
+            ));
+        }
+        accountant
+            .map(|accountant| {
+                crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                    accountant,
+                    key.len()
+                        .saturating_add(stored_bytes)
+                        .saturating_mul(64)
+                        .saturating_add(8192),
+                    "vector",
+                    "replace_vector_image_build",
+                    "Raise MEMORY_LIMIT to reconcile vector construction with this image.",
+                )
+            })
+            .transpose()
+    }
+
+    pub(super) fn seed_paged_image_frontiers_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        affected_tables: &HashSet<String>,
+        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+    ) -> Result<()> {
+        let builds = write.open_table(BUILDS).map_err(Self::storage_error)?;
+        for table in affected_tables {
+            let _prefix_memory = Self::admit_vector_image_build_route_with_owner(
+                Some(accountant.clone()),
+                table.as_bytes(),
+                0,
+            )?;
+            let mut prefix = Vec::new();
+            Self::append_partition_key_component(&mut prefix, table.as_bytes());
+            for entry in builds
+                .prefix_bounded(prefix.as_slice())
+                .map_err(Self::storage_error)?
+            {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                let _memory = Self::admit_vector_image_build_route_with_owner(
+                    Some(accountant.clone()),
+                    key.value(),
+                    value.value().len(),
+                )?;
+                let record: PagedBuildRecord =
+                    decode_image_build_record(open_value(key.value(), value.value())?)?;
+                let partition = vector_membership_pages::partition_from_prefix(key.value())?;
+                vector_membership_pages::begin_pending_frontier(
+                    write,
+                    &partition,
+                    record.progress()?.frontier_tx,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Live membership count of one partition, from its maintained summary.
     /// Called under the engine commit gate, so it is the frontier's count.
     pub(crate) fn vector_partition_live_membership_count(
@@ -1857,6 +2311,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 next
             };
+            vector_membership_pages::begin_pending_frontier(&write, partition, frontier_tx)?;
             let record = PagedBuildRecord {
                 storage_id,
                 previous_generation_id,
@@ -1930,7 +2385,11 @@ impl RedbPersistence {
 
     /// One finite cleanup transaction: remove at most `max_keys` pages of the
     /// first queued storage identity. Returns the number of pages removed.
-    pub(crate) fn paged_cleanup_step(&self, max_keys: usize) -> Result<usize> {
+    pub(crate) fn paged_cleanup_step(
+        &self,
+        max_keys: usize,
+        mut admit: impl FnMut(usize) -> Result<()>,
+    ) -> Result<usize> {
         self.with_db(|db| {
             let write = db.begin_write().map_err(Self::storage_error)?;
             let removed = {
@@ -1941,17 +2400,27 @@ impl RedbPersistence {
                 let Some((storage_id, cursor)) = cleanup
                     .first()
                     .map_err(Self::storage_error)?
-                    .map(|(key, value)| (key.value(), value.value().to_vec()))
+                    .map(|(key, value)| {
+                        admit(
+                            value
+                                .value()
+                                .len()
+                                .saturating_add(3 * std::mem::size_of::<Vec<u8>>()),
+                        )?;
+                        Ok::<_, Error>((key.value(), value.value().to_vec()))
+                    })
+                    .transpose()?
                 else {
                     return Ok(0);
                 };
                 let mut pages = write.open_table(PAGES).map_err(Self::storage_error)?;
                 let storage = storage_prefix(storage_id);
-                let result = reclaim_storage_keys(
+                let result = reclaim_storage_keys_with_admission(
                     &mut pages,
                     &storage,
                     (!cursor.is_empty()).then_some(cursor.as_slice()),
                     max_keys,
+                    &mut admit,
                 )?;
                 if result.complete {
                     cleanup.remove(storage_id).map_err(Self::storage_error)?;
@@ -2056,6 +2525,7 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
                 .insert(key.as_slice(), frontier.0)
                 .map_err(Self::storage_error)?;
+            vector_membership_pages::begin_pending_frontier(&write, partition, frontier)?;
             Self::write_writer_recovery_bounds_in_write(&write, None)?;
             write.commit().map_err(Self::storage_error)
         })

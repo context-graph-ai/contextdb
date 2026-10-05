@@ -235,7 +235,9 @@ fn shared_cross_partition_body_survives_source_removal_and_final_external_holder
             .payload_identity()
     );
     drop(source_state);
-    let released = store.prune_row_ids(&HashSet::from([RowId(1)]), budget.as_ref());
+    let released = store
+        .prune_row_ids(&HashSet::from([RowId(1)]), budget.as_ref())
+        .unwrap();
     budget.release(released);
     assert_eq!(
         store.memory_ownership_snapshot_for_test().raw_vector_bodies,
@@ -1205,12 +1207,16 @@ fn prove_owned_source_copy_and_pruning(quantization: VectorQuantization) {
         store.raw_payload_header_bytes.load(Ordering::SeqCst),
         header_bytes
     );
-    let released = store.prune_row_ids(&HashSet::from([RowId(1)]), budget.as_ref());
+    let released = store
+        .prune_row_ids(&HashSet::from([RowId(1)]), budget.as_ref())
+        .unwrap();
     budget.release(released);
     assert_eq!(store.raw_payload_bytes.load(Ordering::SeqCst), body_bytes);
     assert_eq!(state.vectors.read().owned_payload_bytes, 0);
     let held = state.stored_by_row_id(RowId(3)).unwrap();
-    let released = store.prune_row_ids(&HashSet::from([RowId(2), RowId(3)]), budget.as_ref());
+    let released = store
+        .prune_row_ids(&HashSet::from([RowId(2), RowId(3)]), budget.as_ref())
+        .unwrap();
     budget.release(released);
     assert_eq!(state.entry_count(), 0);
     assert_eq!(store.raw_payload_bytes.load(Ordering::SeqCst), body_bytes);

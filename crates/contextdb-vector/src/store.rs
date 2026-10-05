@@ -2,9 +2,9 @@ mod membership;
 use membership::with_membership_read;
 #[doc(hidden)]
 pub use membership::{
-    LazyRawVectorMembershipSource, RawVectorMembershipCursor, RawVectorMembershipFactory,
-    RawVectorMembershipSource, RawVectorMembershipSummary, RawVectorReverseMembershipCursor,
-    RawVectorReverseMembershipSource, RawVectorSuffixChange,
+    LazyRawVectorMembershipSource, RawVectorInspectionSnapshot, RawVectorMembershipCursor,
+    RawVectorMembershipFactory, RawVectorMembershipSource, RawVectorMembershipSummary,
+    RawVectorReverseMembershipCursor, RawVectorReverseMembershipSource, RawVectorSuffixChange,
 };
 
 use crate::hnsw::ServingPages;
@@ -2189,14 +2189,14 @@ impl IndexState {
     }
 
     /// Whether any retained membership of this durable partition is visible
-    /// to one of `snapshots`. Streams the durable directory once; a read that
-    /// cannot complete answers `true`, keeping the partition.
-    fn durable_visible_at_any(&self, snapshots: &[SnapshotId]) -> bool {
+    /// to one of `snapshots`. Streams the durable directory once; an incomplete
+    /// read refuses the preparation before any partition is retired.
+    fn durable_visible_at_any(&self, snapshots: &[SnapshotId]) -> Result<bool> {
         let Some(source) = self.durable_membership_source() else {
-            return true;
+            return Ok(true);
         };
         if snapshots.is_empty() {
-            return false;
+            return Ok(false);
         }
         let scan = || -> Result<bool> {
             let mut cursor = source.open(&mut |_| true)?;
@@ -2210,12 +2210,20 @@ impl IndexState {
             }
             Ok(false)
         };
-        scan().unwrap_or(true)
+        scan()
     }
 
     /// Keep the pending-work log and any cached frontier count current with
     /// one published batch.
     fn apply_durable_pending_events(&self, events: &[DurableMembershipEvent]) {
+        if self
+            .durable_membership_source()
+            .is_some_and(|source| source.has_durable_pending_counts())
+        {
+            // The commit updated fixed durable counters. Retaining a second
+            // resident suffix would grow with writes outside the cache share.
+            return;
+        }
         let mut log = self.durable_pending.lock();
         if let Some(counts) = log.cached.as_mut() {
             Self::count_pending_events(counts, events);
@@ -2259,29 +2267,33 @@ impl IndexState {
         counts.tombstones = tombstones;
     }
 
-    /// Pending inserts and tombstones of a durable partition after `covered`.
-    /// With no covered frontier every live row is pending and every closed
-    /// one a tombstone; a frontier at or after the log floor is counted from
-    /// the log; an older one is counted once by a stream of the durable
-    /// directory. A stream that cannot complete reports every live row.
+    /// Pending work is authoritative fixed metadata for writable durable
+    /// sources. Storage-neutral sources may answer from their bounded log;
+    /// an unavailable frontier refuses rather than walking memberships.
     fn durable_pending_counts(
         &self,
         covered: Option<TxId>,
         covered_lsn: Option<Lsn>,
-    ) -> (usize, usize) {
+    ) -> Result<(usize, usize)> {
+        if let Some(source) = self.durable_membership_source()
+            && let Some(counts) = source.pending_counts(covered)?
+        {
+            return Ok(counts);
+        }
+        let _ = covered_lsn;
         let Some(frontier) = covered else {
             let counts = *self.durable_counts.lock();
-            return (
+            return Ok((
                 counts.live_entries,
                 counts.entries.saturating_sub(counts.live_entries),
-            );
+            ));
         };
         {
             let mut log = self.durable_pending.lock();
             if let Some(counts) = log.cached
                 && counts.covered == covered
             {
-                return (counts.pending_inserts, counts.tombstones);
+                return Ok((counts.pending_inserts, counts.tombstones));
             }
             if frontier >= log.floor {
                 let mut counts = DurablePendingCounts {
@@ -2295,69 +2307,32 @@ impl IndexState {
                 log.events.retain(|event| event.relevant_after(frontier));
                 log.floor = frontier;
                 log.cached = Some(counts);
-                return (counts.pending_inserts, counts.tombstones);
+                return Ok((counts.pending_inserts, counts.tombstones));
             }
         }
-        let Some(source) = self.durable_membership_source() else {
-            return (0, 0);
-        };
-        if let Some(covered_lsn) = covered_lsn
-            && let Ok(Some((pending_inserts, tombstones))) = source.pending_after(covered_lsn)
-        {
-            self.durable_pending.lock().cached = Some(DurablePendingCounts {
-                covered,
-                pending_inserts,
-                tombstones,
-            });
-            return (pending_inserts, tombstones);
-        }
-        let scan = || -> Result<(usize, usize)> {
-            let mut pending = 0usize;
-            let mut tombstones = 0usize;
-            let mut cursor = source.open(&mut |_| true)?;
-            while let Some(entry) = cursor.next(&mut |_| true)? {
-                match entry.deleted_tx {
-                    None if entry.created_tx > frontier => pending += 1,
-                    Some(deleted) if deleted > frontier => tombstones += 1,
-                    _ => {}
-                }
-            }
-            Ok((pending, tombstones))
-        };
-        match scan() {
-            Ok((pending_inserts, tombstones)) => {
-                self.durable_pending.lock().cached = Some(DurablePendingCounts {
-                    covered,
-                    pending_inserts,
-                    tombstones,
-                });
-                (pending_inserts, tombstones)
-            }
-            Err(_) => (self.vector_count(), 0),
-        }
+        Err(Error::StoreCorrupted {
+            path: "vector pending metadata".into(),
+            reason: "pending metadata does not represent the serving frontier".into(),
+        })
     }
 
-    /// Re-read this durable partition's counts from the current root after a
-    /// removal published elsewhere. A failed read keeps the cached counts.
-    fn refresh_durable_counts(&self) {
+    /// Refresh the durable counts after a removal published elsewhere.
+    /// A refusal reaches the caller before any directory pruning begins.
+    fn refresh_durable_counts(&self) -> Result<()> {
         let Some(source) = self.durable_membership_source() else {
-            return;
+            return Ok(());
         };
-        let Ok(summary) = source.current_summary() else {
-            return;
-        };
+        let summary = source.current_summary()?;
         let previous = std::mem::replace(&mut *self.durable_counts.lock(), summary);
         if previous == summary {
-            return;
+            return Ok(());
         }
-        // A removal published elsewhere is not in the body cache; drop it.
         self.evict_raw_vectors();
-        // A removal published elsewhere changes pending work too: count the
-        // next frontier from the durable directory again.
         let mut log = self.durable_pending.lock();
         log.cached = None;
         log.events = Vec::new();
         log.floor = TxId(u64::MAX);
+        Ok(())
     }
 
     /// Every visibility interval of a durable partition, streamed.
@@ -9339,24 +9314,24 @@ impl VectorStore {
         partition_key: &VectorPartitionKey,
         state: &Arc<IndexState>,
         layout: &VectorIndexLayout,
-    ) -> Option<(ResolvedVectorPolicy, &'static str)> {
+    ) -> Result<Option<(ResolvedVectorPolicy, &'static str)>> {
         if state.paged_storage.load(Ordering::SeqCst) {
-            return None;
+            return Ok(None);
         }
-        let info = Self::partition_info_snapshot(index, partition_key, state, layout);
+        let info = Self::partition_info_snapshot(index, partition_key, state, layout)?;
         let need = layout.maintenance_need(&info);
         if let Some((sample_tx, _)) = state.sampled_maintenance_frontier() {
-            let need = need?;
-            let sampled_count = state
-                .sampled_visible_count(SnapshotId(sample_tx.0))
-                .unwrap_or_else(|_| state.vector_count());
+            let Some(need) = need else {
+                return Ok(None);
+            };
+            let sampled_count = state.sampled_visible_count(SnapshotId(sample_tx.0))?;
             let policy = layout.resolve_policy(sampled_count, 1);
-            return Some((policy, need.build_reason()));
+            return Ok(Some((policy, need.build_reason())));
         }
         if state.vector_count() == 0 {
-            return None;
+            return Ok(None);
         }
-        need.map(|need| (info.desired_policy, need.build_reason()))
+        Ok(need.map(|need| (info.desired_policy, need.build_reason())))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9402,7 +9377,7 @@ impl VectorStore {
                         &partition.partition_key,
                         &state,
                         &layout,
-                    ) else {
+                    )? else {
                         return Ok(None);
                     };
                     checkpoint()?;
@@ -10018,14 +9993,28 @@ impl VectorStore {
     ) -> Result<VectorMaintenanceReport> {
         let indexes = Self::sorted_refs(self.registry.read().keys().cloned());
         let mut pending = Vec::new();
+        let mut first_failure_details = None;
         for index in &indexes {
             if let Some(column) = self.try_column(index) {
                 for (key, state) in column.partition_snapshots() {
                     let layout = column.layout();
-                    if state.paged_builder.lock().active()
-                        || Self::in_memory_maintenance_request(index, &key, &state, &layout)
-                            .is_some()
-                    {
+                    let needed = if state.paged_builder.lock().active() {
+                        true
+                    } else {
+                        match Self::in_memory_maintenance_request(index, &key, &state, &layout) {
+                            Ok(request) => request.is_some(),
+                            Err(error @ (Error::ReadCancelled | Error::PublicationInterrupted)) => {
+                                return Err(error);
+                            }
+                            Err(error) => {
+                                let details = VectorMaintenanceFailureDetails::from_error(&error);
+                                state.record_maintenance_failure(details);
+                                first_failure_details.get_or_insert(details);
+                                continue;
+                            }
+                        }
+                    };
+                    if needed {
                         pending.push(VectorPartitionRef::new(index.clone(), key));
                     }
                 }
@@ -10043,7 +10032,6 @@ impl VectorStore {
 
         let mut built_partitions = 0usize;
         let mut built_indexes = HashSet::new();
-        let mut first_failure_details = None;
         for partition in pending {
             let paged_step = if let Some(state) =
                 self.try_partition_state(&partition.index, &partition.partition_key)
@@ -10481,27 +10469,27 @@ impl VectorStore {
                 Arc::ptr_eq(column, &changed_column) && column.layout() == layout
             });
             if !still_current {
-                return;
+                return Ok(());
             }
             for (partition_key, state) in changed_column.maintained_partition_snapshots() {
-                self.with_partition_maintenance(&index, &partition_key, || {
+                self.with_partition_maintenance(&index, &partition_key, || -> Result<()> {
                     let Some(failure) = state.maintenance_failure_details() else {
-                        return;
+                        return Ok(());
                     };
                     debug_assert!(
                         !HELD_BULK_WRITE_LOCKS
                             .with(|held| held.borrow().contains(&self.id)),
                         "declaration failure recheck cannot inspect raw vector directories under the store-wide write gate"
                     );
-                    let info =
-                        Self::partition_info_snapshot(&index, &partition_key, &state, &layout);
+                    let info = Self::partition_info_snapshot(&index, &partition_key, &state, &layout)?;
                     if layout.maintenance_need(&info).is_none() {
                         state.clear_maintenance_failure_if(failure);
                     }
-                });
+                    Ok(())
+                })?;
             }
-        });
-        Ok(())
+            Ok(())
+        })
     }
 
     fn validate_layout(index: &VectorIndexRef, layout: &VectorIndexLayout) -> Result<()> {
@@ -10776,56 +10764,60 @@ impl VectorStore {
                         .map(|key| VectorPartitionRef::new(index.clone(), key))
                 })
                 .collect::<HashSet<_>>();
-            source_candidates.retain(|partition| {
-                let Some(column) = self.try_column(&partition.index) else {
-                    return false;
-                };
-                if !column.layout().is_partitioned() {
-                    return false;
-                }
-                let Some(state) = column.partition_state(&partition.partition_key) else {
-                    return false;
-                };
-                let changed_by_batch = candidate_partitions.contains(partition);
-                let projected_is_empty = if changed_by_batch {
-                    projected
-                        .get(&partition.index)
-                        .and_then(|states| states.get(&partition.partition_key))
-                        .is_some_and(|state| state.live_count() == 0)
-                } else {
-                    state.vector_count() == 0
-                };
-                if !projected_is_empty {
-                    return false;
-                }
-                if !changed_by_batch {
-                    let layout = column.layout();
-                    let info = Self::partition_info_snapshot(
-                        &partition.index,
-                        &partition.partition_key,
-                        &state,
-                        &layout,
-                    );
-                    if info.pending_inserts != 0
-                        || info.tombstones != 0
-                        || info.quarantine_reason.is_some()
-                    {
-                        // The cap-time sweep has no authority to discard an
-                        // untouched route's pending durability or repair work.
-                        return false;
+            for partition in source_candidates.drain() {
+                let selected = (|| -> Result<bool> {
+                    let Some(column) = self.try_column(&partition.index) else {
+                        return Ok(false);
+                    };
+                    if !column.layout().is_partitioned() {
+                        return Ok(false);
                     }
+                    let Some(state) = column.partition_state(&partition.partition_key) else {
+                        return Ok(false);
+                    };
+                    let changed_by_batch = candidate_partitions.contains(&partition);
+                    let projected_is_empty = if changed_by_batch {
+                        projected
+                            .get(&partition.index)
+                            .and_then(|states| states.get(&partition.partition_key))
+                            .is_some_and(|state| state.live_count() == 0)
+                    } else {
+                        state.vector_count() == 0
+                    };
+                    if !projected_is_empty {
+                        return Ok(false);
+                    }
+                    if !changed_by_batch {
+                        let layout = column.layout();
+                        let info = Self::partition_info_snapshot(
+                            &partition.index,
+                            &partition.partition_key,
+                            &state,
+                            &layout,
+                        )?;
+                        if info.pending_inserts != 0
+                            || info.tombstones != 0
+                            || info.quarantine_reason.is_some()
+                        {
+                            // The cap-time sweep has no authority to discard an
+                            // untouched route's pending durability or repair work.
+                            return Ok(false);
+                        }
+                    }
+                    if state.is_durable() {
+                        return Ok(!state.durable_visible_at_any(registered_snapshots)?);
+                    }
+                    Ok(!state.raw_directory.read().iter().any(|entry| {
+                        registered_snapshots.iter().any(|snapshot| {
+                            entry.created_tx.0 <= snapshot.0
+                                && entry.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+                        })
+                    }))
+                })()?;
+                if selected {
+                    effective_reclaimable_partitions.insert(partition);
                 }
-                if state.is_durable() {
-                    return !state.durable_visible_at_any(registered_snapshots);
-                }
-                !state.raw_directory.read().iter().any(|entry| {
-                    registered_snapshots.iter().any(|snapshot| {
-                        entry.created_tx.0 <= snapshot.0
-                            && entry.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
-                    })
-                })
-            });
-            effective_reclaimable_partitions.extend(source_candidates);
+            }
         }
 
         for partition in &effective_reclaimable_partitions {
@@ -12094,16 +12086,28 @@ impl VectorStore {
         &self,
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
-    ) -> Option<VectorPartitionInfo> {
+    ) -> Result<Option<VectorPartitionInfo>> {
+        self.try_partition_info(index, partition_key)
+    }
+    #[doc(hidden)]
+    pub fn try_partition_info(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+    ) -> Result<Option<VectorPartitionInfo>> {
         self.with_bulk_read(|| {
-            let column = self.try_column(index)?;
+            let Some(column) = self.try_column(index) else {
+                return Ok(None);
+            };
             if column.partition_is_historical_only(partition_key) {
-                return None;
+                return Ok(None);
             }
-            column.partition_state(partition_key).map(|state| {
-                let layout = column.layout();
-                Self::partition_info_snapshot(index, partition_key, &state, &layout)
-            })
+            column
+                .partition_state(partition_key)
+                .map(|state| {
+                    Self::partition_info_snapshot(index, partition_key, &state, &column.layout())
+                })
+                .transpose()
         })
     }
 
@@ -12112,7 +12116,79 @@ impl VectorStore {
         partition_key: &VectorPartitionKey,
         state: &Arc<IndexState>,
         layout: &VectorIndexLayout,
-    ) -> VectorPartitionInfo {
+    ) -> Result<VectorPartitionInfo> {
+        let generations = state.graph_generation_status();
+        let serving_base = generations.base.or(generations.dormant_base);
+        let serving_change = generations.change.or(generations.dormant_change);
+        let serving_covered = serving_change
+            .or(serving_base)
+            .map(|generation| generation.covered_tx);
+        if let Some(source) = state.durable_membership_source()
+            && let Some(mut snapshot) = source.inspection_snapshot(serving_covered)?
+        {
+            #[cfg(feature = "test-seams")]
+            if !snapshot.captured_catalog
+                && serving_base.is_none_or(|base| {
+                    snapshot
+                        .base
+                        .is_some_and(|saved| base.covered_tx == saved.covered_tx)
+                })
+                && let Some((inserts, tombstones)) = snapshot.base_pending
+            {
+                // Initialize observation from metadata the real inspection
+                // already authenticated. Registration performs no extra read.
+                let mut backlog = state.base_backlog.lock();
+                if backlog.generation == 0 {
+                    backlog.generation = snapshot.base.map_or(0, |base| base.generation_id);
+                    backlog.covered_tx = snapshot.base.map_or(0, |base| base.covered_tx.0);
+                    backlog.pending = crate::observations::VectorBacklog {
+                        inserts,
+                        tombstones,
+                    };
+                    backlog.record_high_water();
+                }
+            }
+            if !snapshot.captured_catalog && serving_base.is_some() {
+                snapshot.base = serving_base;
+                snapshot.change = serving_change;
+            }
+            let live_rows = snapshot.summary.live_entries;
+            let retained_rows = snapshot.summary.entries.saturating_sub(live_rows);
+            let bytes = state
+                .byte_count()
+                .saturating_add(partition_key.estimated_bytes());
+            let charged_vector_bytes = state.raw_payload_bytes();
+            let durable_vector_bytes = snapshot.summary.entries.saturating_mul(
+                crate::quantized::stored_vector_resident_bytes(state.dimension, state.quantization),
+            );
+            let mut info = Self::partition_info_from_counts(
+                index,
+                partition_key,
+                state,
+                layout,
+                (live_rows, retained_rows, bytes),
+                (
+                    snapshot.base,
+                    snapshot.change,
+                    snapshot.base.map(|generation| generation.generation_id),
+                    snapshot.base.map(|generation| generation.covered_tx),
+                ),
+                (
+                    snapshot.pending_inserts,
+                    snapshot.tombstones,
+                    durable_vector_bytes,
+                    charged_vector_bytes,
+                    bytes.saturating_sub(charged_vector_bytes),
+                ),
+            );
+            info.graph_available = snapshot.base.is_some() && info.quarantine_reason.is_none();
+            info.serving_policy = snapshot.base.map(|generation| VectorServingPolicy {
+                hnsw_m: generation.hnsw_m as usize,
+                hnsw_ef_construction: generation.hnsw_ef_construction as usize,
+                policy_revision: generation.policy_revision,
+            });
+            return Ok(info);
+        }
         let live_rows = state.vector_count();
         let retained_rows = state.entry_count().saturating_sub(live_rows);
         let bytes = state
@@ -12138,7 +12214,7 @@ impl VectorStore {
         if state.is_durable() {
             let covered_lsn = change.or(base).map(|generation| generation.covered_lsn);
             let (pending_inserts, tombstones) =
-                state.durable_pending_counts(covered_tx, covered_lsn);
+                state.durable_pending_counts(covered_tx, covered_lsn)?;
             let durable_vector_bytes =
                 state
                     .entry_count()
@@ -12146,7 +12222,7 @@ impl VectorStore {
                         state.dimension,
                         state.quantization,
                     ));
-            return Self::partition_info_from_counts(
+            return Ok(Self::partition_info_from_counts(
                 index,
                 partition_key,
                 state,
@@ -12160,7 +12236,7 @@ impl VectorStore {
                     charged_vector_bytes,
                     charged_index_bytes,
                 ),
-            );
+            ));
         }
         let directory = state.raw_directory.read();
         #[cfg(test)]
@@ -12194,7 +12270,7 @@ impl VectorStore {
             0
         };
         drop(directory);
-        Self::partition_info_from_counts(
+        Ok(Self::partition_info_from_counts(
             index,
             partition_key,
             state,
@@ -12208,7 +12284,7 @@ impl VectorStore {
                 charged_vector_bytes,
                 charged_index_bytes,
             ),
-        )
+        ))
     }
 
     #[allow(clippy::type_complexity)]
@@ -12272,14 +12348,14 @@ impl VectorStore {
                 .ok_or_else(|| Error::UnknownVectorIndex {
                     index: index.clone(),
                 })?;
-            Ok(column
+            column
                 .maintained_partition_snapshots()
                 .into_iter()
                 .map(|(key, state)| {
                     let layout = column.layout();
                     Self::partition_info_snapshot(index, &key, &state, &layout)
                 })
-                .collect())
+                .collect()
         })
     }
 
@@ -14182,8 +14258,15 @@ impl VectorStore {
         row_ids: &HashSet<RowId>,
         indexes: &[VectorIndexRef],
         accountant: &dyn MemoryBudget,
-    ) -> usize {
+    ) -> Result<usize> {
         self.with_bulk_maintenance(|| {
+            for index in indexes {
+                if let Some(column) = self.try_column(index) {
+                    for (_, state) in column.partition_snapshots() {
+                        state.refresh_durable_counts()?;
+                    }
+                }
+            }
             let sampled = self.directory_bytes_before_reclamation(indexes);
             let mut released = 0usize;
             for index in indexes {
@@ -14200,7 +14283,6 @@ impl VectorStore {
                                 }));
                         }
                         state.clear_hnsw(accountant);
-                        state.refresh_durable_counts();
                     }
                 }
                 if column.layout.read().is_partitioned() {
@@ -14219,11 +14301,15 @@ impl VectorStore {
                     .retain(|row, _| !row_ids.contains(row));
             }
             self.reconcile_directory_accounting_for_indexes(&sampled);
-            released
+            Ok(released)
         })
     }
 
-    pub fn prune_row_ids(&self, row_ids: &HashSet<RowId>, accountant: &dyn MemoryBudget) -> usize {
+    pub fn prune_row_ids(
+        &self,
+        row_ids: &HashSet<RowId>,
+        accountant: &dyn MemoryBudget,
+    ) -> Result<usize> {
         self.with_bulk_maintenance(|| {
             #[cfg(feature = "test-seams")]
             self.pause_registry.maybe_pause(
@@ -14236,6 +14322,13 @@ impl VectorStore {
             // exactly the identity this pass physically removes (entries and
             // emptied partition states), once, and never estimates it
             // elsewhere.
+            for index in &indexes {
+                if let Some(column) = self.try_column(index) {
+                    for (_, state) in column.partition_snapshots() {
+                        state.refresh_durable_counts()?;
+                    }
+                }
+            }
             let sampled = self.directory_bytes_before_reclamation(&indexes);
             for index in &indexes {
                 let Some(column) = self.try_column(index) else {
@@ -14253,13 +14346,12 @@ impl VectorStore {
                             }));
                     }
                     state.clear_hnsw(accountant);
-                    state.refresh_durable_counts();
                 }
                 column.remove_empty_partitioned_states();
                 column.rebuild_current_rows();
             }
             self.reconcile_directory_accounting_for_indexes(&sampled);
-            released
+            Ok(released)
         })
     }
 
@@ -14290,9 +14382,9 @@ impl VectorStore {
     /// accountant (this never releases the reported bytes internally, so a
     /// caller summing several populations into one `accountant.release(...)`
     /// call never double-releases).
-    pub fn prune_superseded_versions(&self, versions: &[VectorVersionIdentity]) -> usize {
+    pub fn prune_superseded_versions(&self, versions: &[VectorVersionIdentity]) -> Result<usize> {
         if versions.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let mut by_index: HashMap<VectorIndexRef, HashSet<(RowId, TxId, Lsn)>> = HashMap::new();
         for identity in versions {
@@ -14306,6 +14398,13 @@ impl VectorStore {
             let indexes = Self::sorted_refs(by_index.keys().cloned());
             // See `prune_row_ids`: sampled before removal so the directory
             // owner returns exactly this pass's own shrinkage.
+            for index in &indexes {
+                if let Some(column) = self.try_column(index) {
+                    for (_, state) in column.partition_snapshots() {
+                        state.refresh_durable_counts()?;
+                    }
+                }
+            }
             let sampled = self.directory_bytes_before_reclamation(&indexes);
             for index in &indexes {
                 let Some(column) = self.try_column(index) else {
@@ -14322,7 +14421,7 @@ impl VectorStore {
                     if state.is_durable() {
                         state.evict_raw_vectors();
                     }
-                    state.refresh_durable_counts();
+
                     if !state.directory_names_any_row(&row_ids) {
                         continue;
                     }
@@ -14334,7 +14433,7 @@ impl VectorStore {
                 column.rebuild_current_rows();
             }
             self.reconcile_directory_accounting_for_indexes(&sampled);
-            released
+            Ok(released)
         })
     }
 
@@ -15003,41 +15102,28 @@ impl VectorStore {
         self.with_partition_maintenance(&partition.index, &partition.partition_key, || {
             let state = self.partition_state(&partition.index, &partition.partition_key)?;
             #[cfg(feature = "test-seams")]
-            if is_base {
+            if is_base && !state.is_durable() {
                 // A reopened process starts observation at its real durable
                 // base. Historical high-water before this process is unknown.
-                let durable_pending = state.is_durable().then(|| {
-                    state.durable_pending_counts(
-                        Some(descriptor.identity.covered_tx),
-                        Some(descriptor.identity.covered_lsn),
-                    )
-                });
                 let directory = state.raw_directory.read();
                 let mut backlog = state.base_backlog.lock();
                 if backlog.generation == 0 {
                     backlog.generation = descriptor.identity.generation_id;
                     backlog.covered_tx = descriptor.identity.covered_tx.0;
-                    backlog.pending = if let Some((inserts, tombstones)) = durable_pending {
-                        crate::observations::VectorBacklog {
-                            inserts,
-                            tombstones,
-                        }
-                    } else {
-                        crate::observations::VectorBacklog {
-                            inserts: directory
-                                .iter()
-                                .filter(|entry| {
-                                    entry.deleted_tx.is_none()
-                                        && entry.created_tx.0 > backlog.covered_tx
-                                })
-                                .count(),
-                            tombstones: directory
-                                .iter()
-                                .filter(|entry| {
-                                    entry.deleted_tx.is_some_and(|tx| tx.0 > backlog.covered_tx)
-                                })
-                                .count(),
-                        }
+                    backlog.pending = crate::observations::VectorBacklog {
+                        inserts: directory
+                            .iter()
+                            .filter(|entry| {
+                                entry.deleted_tx.is_none()
+                                    && entry.created_tx.0 > backlog.covered_tx
+                            })
+                            .count(),
+                        tombstones: directory
+                            .iter()
+                            .filter(|entry| {
+                                entry.deleted_tx.is_some_and(|tx| tx.0 > backlog.covered_tx)
+                            })
+                            .count(),
                     };
                     backlog.record_high_water();
                 }
@@ -15115,27 +15201,21 @@ impl VectorStore {
         partition: &VectorPartitionRef,
         generation: u64,
         covered_tx: TxId,
-        covered_lsn: Lsn,
-    ) -> Result<()> {
-        let state = self.partition_state(&partition.index, &partition.partition_key)?;
+        durable_pending: (usize, usize),
+    ) {
+        let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key)
+        else {
+            return;
+        };
         if state.is_durable() {
-            let prior_covered = {
-                let backlog = state.base_backlog.lock();
-                if backlog.generation == generation {
-                    return Ok(());
-                }
-                backlog.covered_tx
-            };
-            // The pending count before publication is the one commits kept;
-            // the count after is read at the new frontier.
-            let _ = prior_covered;
-            let (inserts, tombstones) =
-                state.durable_pending_counts(Some(covered_tx), Some(covered_lsn));
             let after = crate::observations::VectorBacklog {
-                inserts,
-                tombstones,
+                inserts: durable_pending.0,
+                tombstones: durable_pending.1,
             };
             let mut backlog = state.base_backlog.lock();
+            if backlog.generation == generation {
+                return;
+            }
             backlog.record_high_water();
             let event = crate::observations::VectorBasePublicationEvent {
                 partition: partition.clone(),
@@ -15157,12 +15237,12 @@ impl VectorStore {
             };
             drop(backlog);
             crate::observations::emit(&event);
-            return Ok(());
+            return;
         }
         let directory = state.raw_directory.read();
         let mut backlog = state.base_backlog.lock();
         if backlog.generation == generation {
-            return Ok(());
+            return;
         }
         let count = |covered: u64| crate::observations::VectorBacklog {
             inserts: directory
@@ -15198,7 +15278,6 @@ impl VectorStore {
         drop(backlog);
         drop(directory);
         crate::observations::emit(&event);
-        Ok(())
     }
 
     /// Start the one mutable post-generation tail. An empty graph owns no
@@ -16910,7 +16989,7 @@ mod tests {
             vec![source.clone(), target.clone()]
         );
         assert!(store.partition_is_historical_only(&index, &source));
-        assert!(store.partition_info(&index, &source).is_none());
+        assert!(store.partition_info(&index, &source).unwrap().is_none());
         assert!(
             store
                 .live_entry_for_row_in_partition(&index, &source, RowId(7), SnapshotId(1),)
@@ -16975,7 +17054,9 @@ mod tests {
                 "retiring maintained state must not allocate a duplicate partition key"
             );
 
-            let released = store.prune_row_ids(&HashSet::from([RowId(7)]), accountant.as_ref());
+            let released = store
+                .prune_row_ids(&HashSet::from([RowId(7)]), accountant.as_ref())
+                .unwrap();
             accountant.release(released);
             assert!(
                 accountant.live_bytes() < charged_before_retirement,
@@ -17114,11 +17195,19 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            store.partition_info(&index, &source).unwrap().retained_rows,
+            store
+                .partition_info(&index, &source)
+                .unwrap()
+                .unwrap()
+                .retained_rows,
             1
         );
         assert_eq!(
-            store.partition_info(&index, &target).unwrap().retained_rows,
+            store
+                .partition_info(&index, &target)
+                .unwrap()
+                .unwrap()
+                .retained_rows,
             0
         );
         assert_eq!(store.live_or_retained_partition_count(&index).unwrap(), 2);
@@ -17395,7 +17484,7 @@ mod tests {
             published,
             "ordinary writes overlapping every build attempt cannot prevent maintenance progress"
         );
-        let info = store.partition_info(&index, &key).unwrap();
+        let info = store.partition_info(&index, &key).unwrap().unwrap();
         assert_eq!(info.live_rows, 16 + attempts as usize);
         assert!(
             info.graph_available,
@@ -17505,7 +17594,7 @@ mod tests {
         store
             .register_index_with_layout(index.clone(), disabled.clone())
             .unwrap();
-        let hot_info = store.partition_info(&index, &hot).unwrap();
+        let hot_info = store.partition_info(&index, &hot).unwrap().unwrap();
         assert!(hot_info.graph_available);
         assert_eq!(disabled.maintenance_need(&hot_info), None);
         let disabled_cycle = store
@@ -17531,7 +17620,13 @@ mod tests {
             .unwrap();
         assert_eq!(initial.built_partitions, 1);
         assert_eq!(initial.built_indexes, 1);
-        assert!(store.partition_info(&index, &cold).unwrap().graph_available);
+        assert!(
+            store
+                .partition_info(&index, &cold)
+                .unwrap()
+                .unwrap()
+                .graph_available
+        );
 
         assert!(store.quarantine_partition_route(
             &VectorPartitionRef::new(index.clone(), cold.clone()),
@@ -17558,6 +17653,7 @@ mod tests {
         for key in [&hot, &cold] {
             let serving = store
                 .partition_info(&index, key)
+                .unwrap()
                 .unwrap()
                 .serving_policy
                 .unwrap();
@@ -17899,6 +17995,7 @@ mod tests {
             store
                 .partition_info(&index, &partition_key)
                 .unwrap()
+                .unwrap()
                 .maintenance_failure,
             None,
             "stopping before any failure leaves the initial build pending"
@@ -17958,12 +18055,14 @@ mod tests {
                 store
                     .partition_info(&index, &partition_key)
                     .unwrap()
+                    .unwrap()
                     .maintenance_progress
                     .is_none()
             );
             for _ in 0..2 {
                 let info = store
                     .partition_info(&index, &partition_key)
+                    .unwrap()
                     .expect("the failed partition remains inspectable");
                 let observed = info.maintenance_failure;
                 assert_eq!(observed, Some(failure));
@@ -18005,6 +18104,7 @@ mod tests {
         assert_eq!(
             store
                 .partition_info(&index, &partition_key)
+                .unwrap()
                 .and_then(|info| info.maintenance_failure),
             None,
             "only a successful graph publication clears the retained failure"
