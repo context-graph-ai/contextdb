@@ -87,6 +87,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         unsafe {
             System.dealloc(pointer.sub(offset), allocation);
         }
+        graph_buffer_deallocated(pointer as usize);
     }
 }
 
@@ -599,4 +600,128 @@ fn a_refused_family_reset_changes_no_stored_byte_and_leaves_nothing_admitted() {
     );
     assert_eq!(family_root(&database, selected), before_root);
     assert_eq!(family_node_count(&database, selected), before_nodes);
+}
+
+// Fixed inline address bookkeeping extends the existing allocator oracle.
+// Allocator callbacks do not allocate, borrow heap state, or synthesize frees.
+#[derive(Clone, Copy, Debug)]
+struct ExportIdentitySlot { original: u64, artifact: u64, storage: u64, is_base: bool, digest: [u8; 32], generation_key: [u8; 512], generation_len: usize, root_key: [u8; 512], root_len: usize }
+impl ExportIdentitySlot { const EMPTY: Self = Self { original: 0, artifact: 0, storage: 0, is_base: false, digest: [0; 32], generation_key: [0; 512], generation_len: 0, root_key: [0; 512], root_len: 0 }; }
+#[derive(Clone, Copy, Debug)]
+struct GraphAllocationState {
+    identities: [ExportIdentitySlot; 8],
+    identity_count: usize,
+    pointers: [usize; 8],
+    capacities: [usize; 8],
+    freed: [bool; 8],
+    count: usize,
+    originals: usize,
+    selected_base: usize,
+    selected_change: usize,
+    deallocations: usize,
+    normal: usize,
+    repair: usize,
+    retry: usize,
+    violation: bool,
+    overflow: bool,
+}
+impl GraphAllocationState {
+    const EMPTY: Self = Self { identities: [ExportIdentitySlot::EMPTY; 8], identity_count: 0, pointers: [0; 8], capacities: [0; 8], freed: [false; 8], count: 0,
+        originals: 0, selected_base: 0, selected_change: 0, deallocations: 0,
+        normal: 0, repair: 0, retry: 0, violation: false, overflow: false };
+}
+thread_local! {
+    static GRAPH_ALLOCATIONS: std::cell::Cell<Option<GraphAllocationState>> = const { std::cell::Cell::new(None) };
+}
+fn graph_buffer_deallocated(pointer: usize) {
+    let _ = GRAPH_ALLOCATIONS.try_with(|slot| {
+        if let Some(mut state) = slot.get() {
+            let mut watched = false;
+            for index in 0..state.count {
+                if state.pointers[index] == pointer && !state.freed[index] {
+                    state.freed[index] = true;
+                    watched = true;
+                }
+            }
+            if watched { state.deallocations += 1; }
+            slot.set(Some(state));
+        }
+    });
+}
+pub(crate) struct GraphAllocationGuard(Option<GraphAllocationState>);
+impl Drop for GraphAllocationGuard {
+    fn drop(&mut self) { GRAPH_ALLOCATIONS.with(|slot| slot.set(self.0.take())); }
+}
+pub(crate) fn watch_graph_allocations() -> GraphAllocationGuard {
+    GraphAllocationGuard(GRAPH_ALLOCATIONS.with(|slot| slot.replace(Some(GraphAllocationState::EMPTY))))
+}
+pub(crate) fn graph_workspace_event(event: &crate::vector_observations::VectorGraphWorkspaceEventForTest) {
+    use crate::vector_observations::{VectorGraphWorkspaceEventForTest as Event, VectorGraphBufferKindForTest as Kind};
+    GRAPH_ALLOCATIONS.with(|slot| {
+        let mut state = slot.get().expect("allocator observation scope");
+        match *event {
+            Event::GraphBuffers { kind, pointer, capacity } => {
+                if state.count == state.pointers.len() { state.overflow = true; }
+                else {
+                    state.pointers[state.count] = pointer;
+                    state.capacities[state.count] = capacity;
+                    state.count += 1;
+                }
+                match kind { Kind::OriginalEnvelope => state.originals += 1,
+                    Kind::SelectedBase => state.selected_base += 1,
+                    Kind::SelectedChange => state.selected_change += 1 }
+            }
+            Event::ExportIdentity { original_generation_id, artifact_generation_id, storage_id, is_base, source_digest, generation_key_pointer, generation_key_len, root_key_pointer, root_key_len } => {
+                if state.identity_count == state.identities.len() || generation_key_len > 512 || root_key_len > 512 { state.overflow = true; }
+                else {
+                    let mut identity = ExportIdentitySlot::EMPTY;
+                    identity.original = original_generation_id; identity.artifact = artifact_generation_id; identity.storage = storage_id; identity.is_base = is_base; identity.digest = source_digest;
+                    identity.generation_len = generation_key_len; identity.root_len = root_key_len;
+                    // The producer lends exact key bytes only for this synchronous callback.
+                    unsafe { identity.generation_key[..generation_key_len].copy_from_slice(std::slice::from_raw_parts(generation_key_pointer as *const u8, generation_key_len)); identity.root_key[..root_key_len].copy_from_slice(std::slice::from_raw_parts(root_key_pointer as *const u8, root_key_len)); }
+                    state.identities[state.identity_count] = identity; state.identity_count += 1;
+                }
+            }
+            Event::WorkspaceResize { previous, next, operation } => {
+                if next >= previous { state.violation = true; }
+                if state.freed[..state.count].iter().any(|freed| !freed) { state.violation = true; }
+                match operation { "normal_cleanup" => state.normal += 1,
+                    "repair_cleanup" => state.repair += 1, "retry" => state.retry += 1,
+                    _ => state.violation = true }
+            }
+        }
+        slot.set(Some(state));
+    });
+}
+pub(crate) fn assert_graph_freed_before_workspace_refund(repair: bool) {
+    GRAPH_ALLOCATIONS.with(|slot| {
+        let state = slot.get().expect("allocator observation scope");
+        assert!(!state.overflow, "fixed oracle slots cover this smallest fixture: {state:?}");
+        assert!(state.originals > 0 && state.selected_base > 0, "actual graph addresses observed: {state:?}");
+        assert!(state.capacities[..state.count].iter().all(|capacity| *capacity > 0));
+        assert!(state.deallocations > 0 && state.freed[..state.count].iter().all(|freed| *freed), "actual allocator retirements observed: {state:?}");
+        assert!(if repair { state.repair > 0 } else { state.normal > 0 }, "requested cleanup branch reached its actual refund: {state:?}");
+        assert!(!state.violation, "every actual graph allocation retires BEFORE every reservation decrease: {state:?}");
+    });
+}
+
+pub(crate) fn assert_saved_export_identities(expected: usize) {
+    GRAPH_ALLOCATIONS.with(|slot| {
+        let state = slot.get().expect("identity observation scope");
+        assert_eq!(state.identity_count, expected, "four failed exports and one real successful export");
+        let identities = &state.identities[..state.identity_count];
+        for (attempt, identity) in identities.iter().enumerate() {
+            assert_eq!(identity.artifact, identity.storage);
+            assert!(identity.artifact > identity.original);
+            assert_eq!(identity.original, identities[0].original);
+            assert_eq!(identity.digest, identities[0].digest, "captured producer topology digest stays identical");
+            assert!(identity.is_base && identity.generation_len > 0 && identity.root_len > 0);
+            for previous in &identities[..attempt] {
+                assert!(identity.artifact > previous.artifact);
+                assert_ne!(&identity.generation_key[..identity.generation_len], &previous.generation_key[..previous.generation_len]);
+                assert_ne!(&identity.root_key[..identity.root_len], &previous.root_key[..previous.root_len]);
+            }
+            eprintln!("RUNTIME_PROOF_IDENTITY attempt={} original={} artifact={} storage={} source_digest={:?} generation_key={:?} root_key={:?}", attempt, identity.original, identity.artifact, identity.storage, identity.digest, &identity.generation_key[..identity.generation_len], &identity.root_key[..identity.root_len]);
+        }
+    });
 }
