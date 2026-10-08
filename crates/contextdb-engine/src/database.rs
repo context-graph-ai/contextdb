@@ -377,6 +377,10 @@ mod received_schema_stage_tests {
         ]);
 
         let tx = db.begin().unwrap();
+        let fixture_operation_reader_1 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             db.insert_synced_row_at(
                 tx,
@@ -385,6 +389,7 @@ mod received_schema_stage_tests {
                 legacy_values.clone(),
                 db.snapshot(),
                 None,
+                fixture_operation_reader_1.clone()
             )
             .is_err(),
             "the final synced-row writer must refuse a NULL primary-key member"
@@ -407,6 +412,10 @@ mod received_schema_stage_tests {
             snapshot: db.snapshot(),
             lookup_delta: None,
         };
+        let fixture_operation_reader_2 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             db.upsert_row_in_prepared_write_set(
                 &mut write_set,
@@ -415,6 +424,7 @@ mod received_schema_stage_tests {
                 &existing,
                 next_values,
                 &mut options,
+                fixture_operation_reader_2.clone()
             )
             .is_err(),
             "prepared state propagation must not republish a legacy NULL primary key"
@@ -528,13 +538,32 @@ mod received_schema_stage_tests {
     /// lineage, and the schema provenance for each DDL occurrence.
     fn served_by(sender: &JourneyPeer, since: Lsn) -> crate::protocol::WireChangeSet {
         let tenant = TenantId::from(JOURNEY_TENANT);
+        let fixture_operation_reader_1 = sender
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_1 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_1.clone());
+        let mut fixture_selection_credit_1 =
+            contextdb_core::read_memory::ReadCredit::new(fixture_operation_reader_1.clone());
+
         let (changes, arrivals, source) = sender
             .db
-            .checked_changes_since_with_arrivals(since)
+            .checked_changes_since_with_arrivals(
+                since,
+                &mut fixture_operation_copy_1,
+                fixture_operation_reader_1.clone(),
+                &mut fixture_selection_credit_1,
+            )
             .expect("the sender extracts what it committed");
         let lineages = if changes.rows.is_empty() {
             HashMap::new()
         } else {
+            let fixture_operation_reader_2 = sender
+                .db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             sender
                 .db
                 .outbound_row_lineages(
@@ -543,9 +572,15 @@ mod received_schema_stage_tests {
                     &sender.node_id(),
                     sender.incarnation(),
                     &|bytes| Ok(sender.identity.sign_lineage(bytes)),
+                    fixture_operation_reader_2.clone(),
                 )
                 .expect("the sender attaches each row's signed creator lineage")
         };
+        let fixture_operation_reader_3 = sender
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let provenance = sender
             .db
             .outbound_ddl_provenance(
@@ -555,6 +590,7 @@ mod received_schema_stage_tests {
                 &sender.node_id(),
                 sender.incarnation(),
                 &|bytes| Ok(sender.identity.sign_lineage(bytes)),
+                fixture_operation_reader_3.clone(),
             )
             .expect("the sender attaches each DDL occurrence's signed provenance");
         crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
@@ -597,6 +633,11 @@ mod received_schema_stage_tests {
             .unwrap();
         let refused = pushed_to(&hub, &author, wire.clone());
         assert_eq!(refused.result.conflicts.len(), 1);
+        let fixture_operation_reader_4 = hub
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let (outcomes, _outcome_lease) = hub
             .db
             .refused_schema_unit_outcomes_for_digests(
@@ -605,6 +646,7 @@ mod received_schema_stage_tests {
                 author.incarnation(),
                 &hub.node_id(),
                 &[first_digest],
+                fixture_operation_reader_4.clone(),
             )
             .unwrap();
         assert_eq!(outcomes.len(), 1);
@@ -629,6 +671,11 @@ mod received_schema_stage_tests {
             retried.result.conflicts[0].reason.as_deref(),
             Some(outcomes[0].reason.as_str())
         );
+        let fixture_operation_reader_5 = hub
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert_eq!(
             hub.db
                 .refused_schema_unit_outcomes_for_digests(
@@ -637,6 +684,7 @@ mod received_schema_stage_tests {
                     author.incarnation(),
                     &hub.node_id(),
                     &[first_digest],
+                    fixture_operation_reader_5.clone()
                 )
                 .unwrap()
                 .0,
@@ -652,6 +700,11 @@ mod received_schema_stage_tests {
                 .unwrap(),
             before
         );
+        let fixture_operation_reader_6 = hub
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             hub.db
                 .refused_schema_unit_outcomes_for_digests(
@@ -660,6 +713,7 @@ mod received_schema_stage_tests {
                     Incarnation(123),
                     &hub.node_id(),
                     &[first_digest],
+                    fixture_operation_reader_6.clone()
                 )
                 .unwrap()
                 .0
@@ -711,6 +765,11 @@ mod received_schema_stage_tests {
             .unwrap()])
         .unwrap();
         pushed_to(&hub, &author, later_wire);
+        let fixture_operation_reader_7 = hub
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let (both, _both_lease) = hub
             .db
             .refused_schema_unit_outcomes_for_digests(
@@ -719,6 +778,7 @@ mod received_schema_stage_tests {
                 author.incarnation(),
                 &hub.node_id(),
                 &[first_digest, second_digest],
+                fixture_operation_reader_7.clone(),
             )
             .unwrap();
         assert_eq!(both.len(), 2);
@@ -853,9 +913,22 @@ mod received_schema_stage_tests {
         let hub = hub.reopen();
         assert!(hub.db.policy_held_received_tables().unwrap().is_empty());
         let tenant = TenantId::from(JOURNEY_TENANT);
+        let fixture_operation_reader_8 = hub
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_8 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_8.clone());
+
         let replayed = hub
             .db
-            .replay_released_policy_data(&tenant, &author.node_id(), author.incarnation())
+            .replay_released_policy_data(
+                &tenant,
+                &author.node_id(),
+                author.incarnation(),
+                &mut fixture_operation_copy_8,
+                fixture_operation_reader_8.clone(),
+            )
             .unwrap();
         assert_eq!(replayed.applied_rows, expected_rows);
         assert_eq!(
@@ -875,8 +948,21 @@ mod received_schema_stage_tests {
             .unwrap();
         let before_retry = hub.db.current_lsn();
         let hub = hub.reopen();
+        let fixture_operation_reader_9 = hub
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_9 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_9.clone());
+
         hub.db
-            .replay_released_policy_data(&tenant, &author.node_id(), author.incarnation())
+            .replay_released_policy_data(
+                &tenant,
+                &author.node_id(),
+                author.incarnation(),
+                &mut fixture_operation_copy_9,
+                fixture_operation_reader_9.clone(),
+            )
             .unwrap();
         assert_eq!(hub.db.current_lsn(), before_retry);
         assert_eq!(
@@ -956,6 +1042,11 @@ mod received_schema_stage_tests {
         let changes =
             ChangeSet::try_from(request.changeset).map_err(|error| format!("{error:?}"))?;
         let changes = if let Some(received) = received.as_ref() {
+            let fixture_operation_reader_10 = receiver
+                .db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             receiver
                 .db
                 .validate_incoming_push_lineages_with_received_ddl(
@@ -965,22 +1056,54 @@ mod received_schema_stage_tests {
                     &node,
                     incarnation,
                     received,
+                    fixture_operation_reader_10.clone(),
                 )
                 .map_err(|error| format!("{error:?}"))?;
+            let fixture_operation_reader_11 = receiver
+                .db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             receiver
                 .db
                 .reject_accepted_lineage_replays_with_received_ddl(
-                    &tenant, changes, &lineages, received,
+                    &tenant,
+                    changes,
+                    &lineages,
+                    received,
+                    fixture_operation_reader_11.clone(),
                 )
                 .map_err(|error| format!("{error:?}"))?
         } else {
+            let fixture_operation_reader_12 = receiver
+                .db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             receiver
                 .db
-                .validate_incoming_push_lineages(&tenant, &changes, &lineages, &node, incarnation)
+                .validate_incoming_push_lineages(
+                    &tenant,
+                    &changes,
+                    &lineages,
+                    &node,
+                    incarnation,
+                    fixture_operation_reader_12.clone(),
+                )
                 .map_err(|error| format!("{error:?}"))?;
+            let fixture_operation_reader_13 = receiver
+                .db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             receiver
                 .db
-                .reject_accepted_lineage_replays(&tenant, changes, &lineages)
+                .reject_accepted_lineage_replays(
+                    &tenant,
+                    changes,
+                    &lineages,
+                    fixture_operation_reader_13.clone(),
+                )
                 .map_err(|error| format!("{error:?}"))?
         };
         let receipt = SyncApplyReceipt {
@@ -991,6 +1114,13 @@ mod received_schema_stage_tests {
             dependency_complete,
             hub_contact_ms: None,
         };
+        let fixture_operation_reader_14 = receiver
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_14 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_14.clone());
+
         let result = receiver
             .db
             .apply_authenticated_received_changes_with_outcome(
@@ -1002,6 +1132,8 @@ mod received_schema_stage_tests {
                 &lineages,
                 received.as_ref(),
                 Some(&outcome_key),
+                &mut fixture_operation_copy_14,
+                fixture_operation_reader_14.clone(),
             )
             .map_err(|error| format!("{error:?}"))?;
         Ok(PushedUnit {
@@ -1043,12 +1175,28 @@ mod received_schema_stage_tests {
         let arrivals = crate::protocol::wire_row_arrivals(&wire);
         let lineages = crate::protocol::wire_row_lineages(&wire);
         let changes = ChangeSet::try_from(wire).map_err(|error| format!("{error:?}"))?;
+        let fixture_operation_reader_15 = receiver
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         receiver
             .db
             .validate_received_row_lineages_with_received_ddl(
-                &tenant, &changes, &lineages, &received,
+                &tenant,
+                &changes,
+                &lineages,
+                &received,
+                fixture_operation_reader_15.clone(),
             )
             .map_err(|error| format!("{error:?}"))?;
+        let fixture_operation_reader_16 = receiver
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_16 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_16.clone());
+
         receiver
             .db
             .apply_authenticated_received_changes_with_lineages(
@@ -1060,6 +1208,8 @@ mod received_schema_stage_tests {
                 &lineages,
                 Some(&received),
                 false,
+                &mut fixture_operation_copy_16,
+                fixture_operation_reader_16.clone(),
             )
             .map_err(|error| format!("{error:?}"))?;
         Ok(received)
@@ -1193,7 +1343,10 @@ mod received_schema_stage_tests {
 
         let check = |peer: &JourneyPeer, when: &str| {
             assert_durable_manifest_matches(peer, &received, when);
-            let log = peer.db.changes_since(Lsn(0));
+            let log = peer
+                .db
+                .changes_since(Lsn(0))
+                .expect("read the declared changes");
             let local_lsn = log.ddl_lsn[0];
             assert!(
                 log.ddl_lsn.iter().all(|lsn| *lsn == local_lsn),
@@ -1207,11 +1360,18 @@ mod received_schema_stage_tests {
             );
             for (ordinal, entry) in served.ddl_provenance.iter().enumerate() {
                 let ordinal = ordinal as u32;
+                let fixture_operation_reader_1 = peer
+                    .db
+                    .declared_reader_memory()
+                    .expect("admit the actual fixture reader");
+
                 assert!(
                     peer.db
-                        .with_received_ddl_arrival((local_lsn, ordinal), |arrival| Ok(
-                            arrival.is_some()
-                        ))
+                        .with_received_ddl_arrival(
+                            (local_lsn, ordinal),
+                            |arrival| Ok(arrival.is_some()),
+                            fixture_operation_reader_1.clone()
+                        )
                         .expect("read the durable received occurrence"),
                     "occurrence {ordinal} is recorded as received {when}"
                 );
@@ -1349,15 +1509,26 @@ mod received_schema_stage_tests {
         };
 
         let check = |peer: &Database, when: &str| {
+            let received_schema_read_memory_1 = peer
+                .declared_reader_memory()
+                .expect("admit the received-schema operation reader");
+            let mut received_schema_copy_owner_1 = contextdb_engine::vector_read_memory::admission(
+                received_schema_read_memory_1.clone(),
+            );
+
             peer.commit_received_schema_stage_for_test(
                 &changes,
                 &received,
                 &[],
                 &HashMap::new(),
                 false,
+                &mut received_schema_copy_owner_1,
+                received_schema_read_memory_1,
             )
             .unwrap_or_else(|error| panic!("{when}: the signed drop unit installs: {error:?}"));
-            let log = peer.changes_since(Lsn(0));
+            let log = peer
+                .changes_since(Lsn(0))
+                .expect("read the declared changes");
             assert_eq!(
                 ddl_kinds_and_names(&log.ddl),
                 ddl_kinds_and_names(&ddl),
@@ -1499,7 +1670,10 @@ mod received_schema_stage_tests {
 
     fn receiver_image(receiver: &JourneyPeer, hub: &JourneyPeer) -> ReceiverImage {
         let tenant = TenantId::from(JOURNEY_TENANT);
-        let log = receiver.db.changes_since(Lsn(0));
+        let log = receiver
+            .db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes");
         ReceiverImage {
             lsn: receiver.db.current_lsn(),
             ddl: log.ddl_lsn.into_iter().zip(log.ddl).collect(),
@@ -1584,7 +1758,10 @@ mod received_schema_stage_tests {
         // The refusal is not sticky: the unit the author really signed, as
         // the hub really holds it, installs whole and in the author's order.
         pulled_from(&edge, hub, honest.clone());
-        let log = edge.db.changes_since(Lsn(0));
+        let log = edge
+            .db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes");
         assert_eq!(
             log.ddl
                 .iter()
@@ -1830,9 +2007,17 @@ mod received_schema_stage_tests {
             ((Lsn(5), 1), second),
             ((Lsn(7), 0), later),
         ]);
+        let fixture_operation_reader_17 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
 
         let ordinary = db
-            .filter_outbound_received_ddl(changes.clone(), &source, None)
+            .filter_outbound_received_ddl(
+                changes.clone(),
+                &source,
+                None,
+                fixture_operation_reader_17.clone(),
+            )
             .unwrap();
         assert_eq!(ordinary.ddl, vec![local.clone()]);
         assert_eq!(ordinary.ddl_lsn, vec![Lsn(9)]);
@@ -1843,14 +2028,31 @@ mod received_schema_stage_tests {
             ..ChangeSet::default()
         };
         let held_source = DdlProvenanceSource::historical(&held_changes);
+        let fixture_operation_reader_18 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let destination = db
-            .filter_outbound_received_ddl(held_changes, &held_source, Some(Lsn(5)))
+            .filter_outbound_received_ddl(
+                held_changes,
+                &held_source,
+                Some(Lsn(5)),
+                fixture_operation_reader_18.clone(),
+            )
             .unwrap();
         assert_eq!(destination.ddl, vec![duplicate.clone(), duplicate]);
         assert_eq!(destination.ddl_lsn, vec![Lsn(5), Lsn(5)]);
+        let fixture_operation_reader_19 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
 
         let error = db
-            .filter_outbound_received_ddl(changes, &source, Some(Lsn(5)))
+            .filter_outbound_received_ddl(
+                changes,
+                &source,
+                Some(Lsn(5)),
+                fixture_operation_reader_19.clone(),
+            )
             .expect_err("post-move schema without positive origin evidence must fail closed");
         assert!(
             error
@@ -1873,9 +2075,18 @@ mod received_schema_stage_tests {
         let first = received_arrival(&db, &duplicate, Lsn(5), 0);
         let _second = received_arrival(&db, &duplicate, Lsn(5), 1);
         db.received_ddl_arrivals.write().insert((Lsn(5), 0), first);
+        let fixture_operation_reader_20 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
-            db.filter_outbound_received_ddl(changes.clone(), &source, None)
-                .is_err()
+            db.filter_outbound_received_ddl(
+                changes.clone(),
+                &source,
+                None,
+                fixture_operation_reader_20.clone()
+            )
+            .is_err()
         );
 
         let mut mismatched = received_arrival(&db, &duplicate, Lsn(5), 1);
@@ -1883,9 +2094,18 @@ mod received_schema_stage_tests {
         db.received_ddl_arrivals
             .write()
             .insert((Lsn(5), 1), mismatched);
+        let fixture_operation_reader_21 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
-            db.filter_outbound_received_ddl(changes, &source, None)
-                .is_err()
+            db.filter_outbound_received_ddl(
+                changes,
+                &source,
+                None,
+                fixture_operation_reader_21.clone()
+            )
+            .is_err()
         );
     }
 
@@ -1911,12 +2131,20 @@ mod received_schema_stage_tests {
         db.received_ddl_arrivals
             .write()
             .insert((Lsn(5), 0), arrival);
+        let fixture_operation_reader_22 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
 
         assert!(
-            db.filter_outbound_received_ddl(changes, &source, None)
-                .unwrap()
-                .ddl
-                .is_empty()
+            db.filter_outbound_received_ddl(
+                changes,
+                &source,
+                None,
+                fixture_operation_reader_22.clone()
+            )
+            .unwrap()
+            .ddl
+            .is_empty()
         );
     }
 
@@ -1953,6 +2181,10 @@ mod received_schema_stage_tests {
         let filtered = crate::sync_server::without_hub_local_bookkeeping(original);
         assert_eq!(filtered.ddl, vec![create_table(), notes]);
         let tenant = TenantId::from("filtered-synthetic-schema");
+        let fixture_operation_reader_23 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let provenance = db
             .outbound_ddl_provenance(
                 &filtered,
@@ -1961,6 +2193,7 @@ mod received_schema_stage_tests {
                 &identity.node_id(),
                 Incarnation(7),
                 &|bytes| Ok(identity.sign_lineage(bytes)),
+                fixture_operation_reader_23.clone(),
             )
             .expect("sign the filtered application schema");
         assert_eq!(
@@ -2009,7 +2242,13 @@ mod received_schema_stage_tests {
     }
 
     fn accepted_delete_record(db: &Database, key: &NaturalKey, root: &str) {
-        let generation = db.durable_lineage_table_generation("events").unwrap();
+        let fixture_operation_reader_3 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
+        let generation = db
+            .durable_lineage_table_generation("events", fixture_operation_reader_3.clone())
+            .unwrap();
         let record = DurableLineageRecord {
             table: "events".to_string(),
             natural_key: key.clone(),
@@ -2144,11 +2383,16 @@ mod received_schema_stage_tests {
         let expected_ddl = changes.ddl.clone();
         let expected_vectors = vec![changes.vectors[1].clone(), changes.vectors[2].clone()];
         let expected_edges = changes.edges.clone();
+        let fixture_operation_reader_24 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let result = db
             .suppress_accepted_lineage_replays(
                 changes,
                 &accepted_delete_lineage(&key, Lsn(5), "root-old"),
                 false,
+                fixture_operation_reader_24.clone(),
             )
             .unwrap();
         assert!(result.suppressed_live_replay);
@@ -2165,6 +2409,10 @@ mod received_schema_stage_tests {
         accepted_delete_record(&db, &key, "root-old");
         let old = accepted_delete_row(key.clone(), Lsn(5), false);
         let old_lineage = accepted_delete_lineage(&key, Lsn(5), "root-old");
+        let fixture_operation_reader_25 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let suppressed = db
             .suppress_accepted_lineage_replays(
                 ChangeSet {
@@ -2173,6 +2421,7 @@ mod received_schema_stage_tests {
                 },
                 &old_lineage,
                 false,
+                fixture_operation_reader_25.clone(),
             )
             .unwrap();
         assert!(suppressed.suppressed_live_replay && suppressed.changes.is_empty());
@@ -2181,6 +2430,10 @@ mod received_schema_stage_tests {
             &HashMap::new(),
         )
         .unwrap();
+        let fixture_operation_reader_26 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             db.suppress_accepted_lineage_replays(
                 ChangeSet {
@@ -2189,6 +2442,7 @@ mod received_schema_stage_tests {
                 },
                 &old_lineage,
                 false,
+                fixture_operation_reader_26.clone()
             )
             .unwrap()
             .suppressed_live_replay
@@ -2198,6 +2452,10 @@ mod received_schema_stage_tests {
             &HashMap::new(),
         )
         .unwrap();
+        let fixture_operation_reader_27 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             db.suppress_accepted_lineage_replays(
                 ChangeSet {
@@ -2205,11 +2463,16 @@ mod received_schema_stage_tests {
                     ..ChangeSet::default()
                 },
                 &old_lineage,
-                false
+                false,
+                fixture_operation_reader_27.clone()
             )
             .is_err()
         );
         let different = accepted_delete_lineage(&key, Lsn(5), "root-fresh");
+        let fixture_operation_reader_28 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let kept = db
             .suppress_accepted_lineage_replays(
                 ChangeSet {
@@ -2218,10 +2481,15 @@ mod received_schema_stage_tests {
                 },
                 &different,
                 false,
+                fixture_operation_reader_28.clone(),
             )
             .unwrap();
         assert_eq!(kept.changes.rows, vec![old.clone()]);
         assert!(!kept.suppressed_live_replay);
+        let fixture_operation_reader_29 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             db.suppress_accepted_lineage_replays(
                 ChangeSet {
@@ -2229,7 +2497,8 @@ mod received_schema_stage_tests {
                     ..ChangeSet::default()
                 },
                 &old_lineage,
-                true
+                true,
+                fixture_operation_reader_29.clone()
             )
             .is_err()
         );
@@ -2242,7 +2511,13 @@ mod received_schema_stage_tests {
         position: u64,
         identity: &crate::identity::FabricIdentity,
     ) -> crate::protocol::WireRowLineage {
-        let generation = db.durable_lineage_table_generation("events").unwrap();
+        let fixture_operation_reader_4 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
+        let generation = db
+            .durable_lineage_table_generation("events", fixture_operation_reader_4.clone())
+            .unwrap();
         let author_node_id = identity.node_id();
         let incarnation = Incarnation(7);
         let lineage_root = format!(
@@ -2334,17 +2609,31 @@ mod received_schema_stage_tests {
             ("events".to_string(), key, Lsn(5), terminated),
             ("events".to_string(), sibling_key, Lsn(5), sibling),
         ];
+        let fixture_operation_reader_30 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             db.reject_dependency_complete_accepted_lineage_replays(
                 &tenant,
                 changes.clone(),
                 &lineages,
+                fixture_operation_reader_30.clone()
             )
             .is_err()
         );
+        let fixture_operation_reader_31 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
-            db.reject_accepted_lineage_replays(&tenant, changes, &lineages)
-                .is_err()
+            db.reject_accepted_lineage_replays(
+                &tenant,
+                changes,
+                &lineages,
+                fixture_operation_reader_31.clone()
+            )
+            .is_err()
         );
     }
 
@@ -2356,9 +2645,19 @@ mod received_schema_stage_tests {
             ddl_lsn: vec![Lsn(41)],
             ..ChangeSet::default()
         };
+        let fixture_operation_reader_1 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_1 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_1.clone());
 
         let units = db
-            .dependency_complete_outbound_units(changes, Lsn(0))
+            .dependency_complete_outbound_units(
+                changes,
+                Lsn(0),
+                &mut fixture_operation_copy_1,
+                fixture_operation_reader_1.clone(),
+            )
             .expect("DDL-only migration is a valid authenticated atomic unit");
         assert_eq!(units.len(), 1);
         assert!(units[0].dependency_complete);
@@ -2392,9 +2691,19 @@ mod received_schema_stage_tests {
             ddl_lsn: vec![Lsn(41)],
             ..ChangeSet::default()
         };
+        let fixture_operation_reader_2 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_2 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
 
         let units = db
-            .dependency_complete_outbound_units(changes, Lsn(0))
+            .dependency_complete_outbound_units(
+                changes,
+                Lsn(0),
+                &mut fixture_operation_copy_2,
+                fixture_operation_reader_2.clone(),
+            )
             .expect("partition the schema migration from ordinary traffic");
         assert_eq!(units.len(), 2);
         assert!(units[0].dependency_complete);
@@ -2427,7 +2736,20 @@ mod received_schema_stage_tests {
             ..ChangeSet::default()
         };
         let before_ddl = db.ddl_log.read().clone();
-        let error = db.prepare_received_schema_stage(Lsn(9), &changes, &received_context(), &[]);
+        let received_schema_read_memory_2 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_2 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_2.clone());
+
+        let error = db.prepare_received_schema_stage(
+            Lsn(9),
+            &changes,
+            &received_context(),
+            &[],
+            &mut received_schema_copy_owner_2,
+            received_schema_read_memory_2,
+        );
 
         assert!(error.is_err());
         assert!(db.received_schema_stages.lock().is_empty());
@@ -2453,10 +2775,22 @@ mod received_schema_stage_tests {
             }],
             ..ChangeSet::default()
         };
+        let received_schema_read_memory_3 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_3 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_3.clone());
 
         assert!(
-            db.prepare_received_schema_stage(Lsn(9), &changes, &received_context(), &[])
-                .is_err()
+            db.prepare_received_schema_stage(
+                Lsn(9),
+                &changes,
+                &received_context(),
+                &[],
+                &mut received_schema_copy_owner_3,
+                received_schema_read_memory_3
+            )
+            .is_err()
         );
         assert_eq!(db.relational_store.next_row_id(), before);
     }
@@ -2489,6 +2823,12 @@ mod received_schema_stage_tests {
             }],
         };
         let key = NaturalKey::single("id".to_string(), Value::Int64(7));
+        let received_schema_read_memory_4 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_4 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_4.clone());
+
         let stage = db
             .prepare_received_schema_stage(
                 Lsn(9),
@@ -2521,6 +2861,8 @@ mod received_schema_stage_tests {
                     Lsn(77),
                     lineage("origin", 501, 3),
                 )],
+                &mut received_schema_copy_owner_4,
+                received_schema_read_memory_4,
             )
             .expect("detached adjudication");
         db.publish_received_schema_stage(stage);
@@ -2535,7 +2877,16 @@ mod received_schema_stage_tests {
             TxId(77),
             "wire LSN is never receiver MVCC identity"
         );
-        let vectors = db.vector_store.all_entries();
+        let vector_fixture_reader_1 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_1 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
+        let vectors = db
+            .vector_store
+            .all_entries(&mut vector_fixture_copy_1)
+            .expect("read or publish the admitted vector fixture");
         assert_eq!(vectors.len(), 1);
         assert_eq!(
             vectors[0].row_id, row.row_id,
@@ -2565,7 +2916,9 @@ mod received_schema_stage_tests {
             deleted_tx: None,
             lsn: Lsn(13),
         };
-        db.vector_store.insert_loaded_vector(old_vector.clone());
+        db.vector_store
+            .insert_loaded_vector(old_vector.clone(), db.accountant.clone())
+            .expect("read or publish the admitted vector fixture");
         let old_edge = AdjEntry {
             source: uuid::Uuid::from_u128(10),
             target: uuid::Uuid::from_u128(11),
@@ -2618,6 +2971,12 @@ mod received_schema_stage_tests {
             }],
         };
         let arrivals = HashMap::new();
+        let received_schema_read_memory_5 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_5 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_5.clone());
+
         let stage = db
             .prepare_received_schema_stage_with_adjudication(
                 Lsn(99),
@@ -2641,6 +3000,8 @@ mod received_schema_stage_tests {
                     unattested_policies: None,
                     receiver_tx: TxId(37),
                 },
+                &mut received_schema_copy_owner_5,
+                received_schema_read_memory_5,
             )
             .unwrap();
         db.publish_received_schema_stage(stage);
@@ -2671,7 +3032,16 @@ mod received_schema_stage_tests {
         assert_eq!(new_edge.lsn, Lsn(99));
         assert_eq!(preserved_edge.created_tx, old_edge.created_tx);
         assert_eq!(preserved_edge.deleted_tx, old_edge.deleted_tx);
-        let vectors = db.vector_store.all_entries();
+        let vector_fixture_reader_3 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_3 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_3.clone());
+
+        let vectors = db
+            .vector_store
+            .all_entries(&mut vector_fixture_copy_3)
+            .expect("read or publish the admitted vector fixture");
         let new_vector = vectors
             .iter()
             .find(|entry| entry.row_id == new_row.row_id)
@@ -2702,14 +3072,19 @@ mod received_schema_stage_tests {
         .unwrap();
         let index = VectorIndexRef::new("events", "embedding");
         let old_row_id = db.relational_store.tables.read()["events"][0].row_id;
-        db.vector_store.insert_loaded_vector(VectorEntry {
-            index: index.clone(),
-            row_id: old_row_id,
-            vector: vec![1.0, 0.0],
-            created_tx: TxId(1),
-            deleted_tx: None,
-            lsn: Lsn(1),
-        });
+        db.vector_store
+            .insert_loaded_vector(
+                VectorEntry {
+                    index: index.clone(),
+                    row_id: old_row_id,
+                    vector: vec![1.0, 0.0],
+                    created_tx: TxId(1),
+                    deleted_tx: None,
+                    lsn: Lsn(1),
+                },
+                db.accountant.clone(),
+            )
+            .expect("read or publish the admitted vector fixture");
         let ddl = vec![
             DdlChange::DropTable {
                 name: "events".to_string(),
@@ -2740,6 +3115,12 @@ mod received_schema_stage_tests {
                 })
                 .collect(),
         };
+        let received_schema_read_memory_6 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_6 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_6.clone());
+
         let stage = db
             .prepare_received_schema_stage(
                 Lsn(9),
@@ -2750,15 +3131,24 @@ mod received_schema_stage_tests {
                 },
                 &received,
                 &[],
+                &mut received_schema_copy_owner_6,
+                received_schema_read_memory_6,
             )
             .expect("drop then create detached projection");
         db.publish_received_schema_stage(stage);
 
         assert!(db.table_meta("events").is_some());
         assert!(db.relational_store.tables.read()["events"].is_empty());
+        let vector_fixture_reader_5 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_5 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_5.clone());
+
         assert!(
             db.vector_store
-                .all_entries()
+                .all_entries(&mut vector_fixture_copy_5)
+                .expect("read or publish the admitted vector fixture")
                 .iter()
                 .all(|entry| entry.index.table != "events")
         );
@@ -2941,19 +3331,46 @@ mod received_schema_stage_tests {
             Lsn(50),
             lineage("origin", 501, 1),
         );
+        let received_schema_read_memory_7 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_7 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_7.clone());
+
         assert!(
-            db.prepare_received_schema_stage(Lsn(9), &changes, &received, &[])
-                .is_err()
+            db.prepare_received_schema_stage(
+                Lsn(9),
+                &changes,
+                &received,
+                &[],
+                &mut received_schema_copy_owner_7,
+                received_schema_read_memory_7
+            )
+            .is_err()
         );
+        let received_schema_read_memory_8 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_8 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_8.clone());
+
         assert!(
             db.prepare_received_schema_stage(
                 Lsn(9),
                 &changes,
                 &received,
                 &[direct.clone(), direct.clone()],
+                &mut received_schema_copy_owner_8,
+                received_schema_read_memory_8
             )
             .is_err()
         );
+        let received_schema_read_memory_9 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_9 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_9.clone());
+
         assert!(
             db.prepare_received_schema_stage(
                 Lsn(9),
@@ -2965,6 +3382,8 @@ mod received_schema_stage_tests {
                     Lsn(50),
                     lineage("origin", 501, 1)
                 )],
+                &mut received_schema_copy_owner_9,
+                received_schema_read_memory_9
             )
             .is_err()
         );
@@ -2979,17 +3398,33 @@ mod received_schema_stage_tests {
         let baseline = accountant.usage().used;
         let index = VectorIndexRef::new("retired", "embedding");
         db.vector_store
-            .register_index(index.clone(), 2, contextdb_core::VectorQuantization::F32);
-        db.vector_store.insert_loaded_vector(VectorEntry {
-            index: index.clone(),
-            row_id: RowId(1),
-            vector: vec![1.0, 0.0],
-            created_tx: TxId(1),
-            deleted_tx: None,
-            lsn: Lsn(1),
-        });
+            .register_index(
+                index.clone(),
+                2,
+                contextdb_core::VectorQuantization::F32,
+                db.accountant.clone(),
+            )
+            .expect("read or publish the admitted vector fixture");
+        db.vector_store
+            .insert_loaded_vector(
+                VectorEntry {
+                    index: index.clone(),
+                    row_id: RowId(1),
+                    vector: vec![1.0, 0.0],
+                    created_tx: TxId(1),
+                    deleted_tx: None,
+                    lsn: Lsn(1),
+                },
+                db.accountant.clone(),
+            )
+            .expect("read or publish the admitted vector fixture");
         let state = db.vector_store.try_state(&index).unwrap();
         state.set_hnsw_bytes(64);
+        let received_schema_read_memory_10 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_10 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_10.clone());
 
         let stage = db
             .prepare_received_schema_stage(
@@ -3002,11 +3437,23 @@ mod received_schema_stage_tests {
                     entries: Vec::new(),
                 },
                 &[],
+                &mut received_schema_copy_owner_10,
+                received_schema_read_memory_10,
             )
             .unwrap();
         db.publish_received_schema_stage(stage);
+        let vector_fixture_reader_8 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_8 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_8.clone());
 
-        assert!(db.vector_store.all_entries().is_empty());
+        assert!(
+            db.vector_store
+                .all_entries(&mut vector_fixture_copy_8)
+                .expect("read or publish the admitted vector fixture")
+                .is_empty()
+        );
         assert_eq!(accountant.usage().used, baseline);
     }
 
@@ -3031,19 +3478,27 @@ mod received_schema_stage_tests {
         };
         db.graph_store.apply_inserts(vec![graph_entry]);
         let vector_index = VectorIndexRef::new("kept", "embedding");
-        db.vector_store.register_index(
-            vector_index.clone(),
-            2,
-            contextdb_core::VectorQuantization::F32,
-        );
-        db.vector_store.insert_loaded_vector(VectorEntry {
-            index: vector_index.clone(),
-            row_id: RowId(1),
-            vector: vec![1.0, 0.0],
-            created_tx: TxId(1),
-            deleted_tx: None,
-            lsn: Lsn(1),
-        });
+        db.vector_store
+            .register_index(
+                vector_index.clone(),
+                2,
+                contextdb_core::VectorQuantization::F32,
+                db.accountant.clone(),
+            )
+            .expect("read or publish the admitted vector fixture");
+        db.vector_store
+            .insert_loaded_vector(
+                VectorEntry {
+                    index: vector_index.clone(),
+                    row_id: RowId(1),
+                    vector: vec![1.0, 0.0],
+                    created_tx: TxId(1),
+                    deleted_tx: None,
+                    lsn: Lsn(1),
+                },
+                db.accountant.clone(),
+            )
+            .expect("read or publish the admitted vector fixture");
 
         let ddl = vec![
             DdlChange::AlterTable {
@@ -3131,6 +3586,12 @@ mod received_schema_stage_tests {
                 },
             ],
         };
+        let received_schema_read_memory_11 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_11 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_11.clone());
+
         let stage = db
             .prepare_received_schema_stage(
                 Lsn(9),
@@ -3150,6 +3611,8 @@ mod received_schema_stage_tests {
                         lineage("original-author-through-relay", 502, 4),
                     ),
                 ],
+                &mut received_schema_copy_owner_11,
+                received_schema_read_memory_11,
             )
             .expect("all fallible preparation completes before publication");
         let direct_identity = sync_identity_key(
@@ -3218,7 +3681,19 @@ mod received_schema_stage_tests {
         assert!(db.table_meta("events").is_none());
         assert_eq!(db.relational_store.tables.read()["kept"].len(), 3);
         assert_eq!(db.graph_store.forward_adj.read().len(), 2);
-        assert_eq!(db.vector_store.all_entries().len(), 3);
+        let vector_fixture_reader_11 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_11 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_11.clone());
+
+        assert_eq!(
+            db.vector_store
+                .all_entries(&mut vector_fixture_copy_11)
+                .expect("read or publish the admitted vector fixture")
+                .len(),
+            3
+        );
         assert!(db.list_triggers().is_empty());
         assert_eq!(
             db.in_memory_table_generations.lock().get("dropped"),
@@ -3333,17 +3808,26 @@ mod received_schema_stage_tests {
                 },
             ],
         };
+        let received_schema_read_memory_12 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_12 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_12.clone());
+
         db.commit_received_schema_stage_for_test(
             &changes,
             &received,
             &row_lineage,
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_12,
+            received_schema_read_memory_12,
         )
         .unwrap();
 
         let commit_lsn = db
             .changes_since(Lsn(0))
+            .expect("read the declared changes")
             .rows
             .iter()
             .map(|row| row.lsn)
@@ -3425,6 +3909,12 @@ mod received_schema_stage_tests {
             Lsn(7),
             lineage("origin", 502, 1),
         )];
+        let received_schema_read_memory_13 = control
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_13 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_13.clone());
+
         control
             .commit_received_schema_stage_for_test(
                 &control_changes,
@@ -3432,6 +3922,8 @@ mod received_schema_stage_tests {
                 &control_lineage,
                 &HashMap::new(),
                 false,
+                &mut received_schema_copy_owner_13,
+                received_schema_read_memory_13,
             )
             .unwrap();
         let control_audit = control
@@ -3513,12 +4005,20 @@ mod received_schema_stage_tests {
 
         let trace = ReceivedSchemaApplyObserverForTest::new();
         let scope = db.observe_received_schema_applies_for_test(&trace);
+        let received_schema_read_memory_14 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_14 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_14.clone());
+
         db.commit_received_schema_stage_for_test(
             &changes,
             &received,
             &row_lineage,
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_14,
+            received_schema_read_memory_14,
         )
         .unwrap();
         drop(scope);
@@ -3545,7 +4045,7 @@ mod received_schema_stage_tests {
             vec![vec![Value::Int64(1)]],
             "the including-sync callback's write actually committed with the received row"
         );
-        let log = db.changes_since(Lsn(0));
+        let log = db.changes_since(Lsn(0)).expect("read the declared changes");
         let commit_lsn = log
             .rows
             .iter()
@@ -3562,12 +4062,20 @@ mod received_schema_stage_tests {
         // discover and copies nothing.
         let trace2 = ReceivedSchemaApplyObserverForTest::new();
         let scope2 = db.observe_received_schema_applies_for_test(&trace2);
+        let received_schema_read_memory_15 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_15 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_15.clone());
+
         db.commit_received_schema_stage_for_test(
             &changes,
             &received,
             &row_lineage,
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_15,
+            received_schema_read_memory_15,
         )
         .unwrap();
         drop(scope2);
@@ -3630,12 +4138,20 @@ mod received_schema_stage_tests {
         let path = tmp.path().join("received-schema-stage.redb");
         let db = Database::open(&path).unwrap();
         let (changes, received, lineages) = received_schema_create_with_row();
+        let received_schema_read_memory_16 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_16 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_16.clone());
+
         db.commit_received_schema_stage_for_test(
             &changes,
             &received,
             &lineages,
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_16,
+            received_schema_read_memory_16,
         )
         .unwrap();
 
@@ -3648,7 +4164,7 @@ mod received_schema_stage_tests {
                 .len(),
             1
         );
-        let immediate_changes = db.changes_since(Lsn(0));
+        let immediate_changes = db.changes_since(Lsn(0)).expect("read the declared changes");
         assert_eq!(immediate_changes.rows.len(), 1);
         let durable_coordinates = |database: &Database, table: &str| {
             let mut coordinates = database
@@ -3685,23 +4201,46 @@ mod received_schema_stage_tests {
             1
         );
         let mut received_occurrences = Vec::new();
-        db.visit_received_ddl_arrivals(|occurrence, _| {
-            received_occurrences.push(occurrence);
-            Ok(())
-        })
+        db.visit_received_ddl_arrivals(
+            |occurrence, _| {
+                received_occurrences.push(occurrence);
+                Ok(())
+            },
+            db.declared_reader_memory()
+                .expect("admit the DDL arrival reader"),
+        )
         .expect("visit durable received schema arrivals");
         assert_eq!(received_occurrences.len(), 1);
         let (received_ddl_lsn, received_ordinal) = received_occurrences[0];
         assert_eq!(received_ordinal, 0);
         assert_eq!(immediate_changes.ddl_lsn, vec![received_ddl_lsn]);
+        let fixture_operation_reader_32 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_32 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_32.clone());
+
         let (pending_before_close, source_before_close) = db
-            .changes_since_base(Lsn(received_ddl_lsn.0.saturating_sub(1)))
+            .changes_since_base(
+                Lsn(received_ddl_lsn.0.saturating_sub(1)),
+                &mut fixture_operation_copy_32,
+                fixture_operation_reader_32.clone(),
+            )
             .expect("materialize received DDL changes before close");
+        let fixture_operation_reader_33 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
-            db.filter_outbound_received_ddl(pending_before_close, &source_before_close, None)
-                .unwrap()
-                .ddl
-                .is_empty()
+            db.filter_outbound_received_ddl(
+                pending_before_close,
+                &source_before_close,
+                None,
+                fixture_operation_reader_33.clone()
+            )
+            .unwrap()
+            .ddl
+            .is_empty()
         );
         db.close().unwrap();
         drop(db);
@@ -3716,7 +4255,9 @@ mod received_schema_stage_tests {
                 .len(),
             1
         );
-        let reopened_changes = reopened.changes_since(Lsn(0));
+        let reopened_changes = reopened
+            .changes_since(Lsn(0))
+            .expect("read the declared changes");
         assert_eq!(reopened_changes.rows, immediate_changes.rows);
         assert_eq!(reopened_changes.ddl, immediate_changes.ddl);
         assert_eq!(reopened_changes.ddl_lsn, immediate_changes.ddl_lsn);
@@ -3729,17 +4270,44 @@ mod received_schema_stage_tests {
                 .count(),
             1
         );
+        let fixture_operation_reader_2 = reopened
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             reopened
-                .with_received_ddl_arrival((received_ddl_lsn, 0), |arrival| Ok(arrival.is_some()))
+                .with_received_ddl_arrival(
+                    (received_ddl_lsn, 0),
+                    |arrival| Ok(arrival.is_some()),
+                    fixture_operation_reader_2.clone()
+                )
                 .expect("read the durable received occurrence after reopen")
         );
+        let fixture_operation_reader_34 = reopened
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_34 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_34.clone());
+
         let (pending_after_reopen, source_after_reopen) = reopened
-            .changes_since_base(Lsn(received_ddl_lsn.0.saturating_sub(1)))
+            .changes_since_base(
+                Lsn(received_ddl_lsn.0.saturating_sub(1)),
+                &mut fixture_operation_copy_34,
+                fixture_operation_reader_34.clone(),
+            )
             .expect("materialize received DDL changes after reopen");
+        let fixture_operation_reader_35 = reopened
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             reopened
-                .filter_outbound_received_ddl(pending_after_reopen, &source_after_reopen, None)
+                .filter_outbound_received_ddl(
+                    pending_after_reopen,
+                    &source_after_reopen,
+                    None,
+                    fixture_operation_reader_35.clone()
+                )
                 .unwrap()
                 .ddl
                 .is_empty()
@@ -3803,13 +4371,19 @@ mod received_schema_stage_tests {
         let db = Database::open_memory();
         let (changes, received, lineages) =
             received_schema_create_vector_table_with_row_and_vector();
+        let received_schema_read_memory_17 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_17 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_17.clone());
+
         db.commit_received_schema_stage_for_test(
             &changes,
             &received,
             &lineages,
             &HashMap::new(),
             false,
-        )
+         &mut received_schema_copy_owner_17, received_schema_read_memory_17)
         .expect(
             "an authenticated unit declaring its own vector table must install schema and vectors together",
         );
@@ -3884,7 +4458,10 @@ mod received_schema_stage_tests {
             Lsn(lsn_before.0 + 1),
             "schema, rows and vectors consumed exactly one commit LSN"
         );
-        let installed = hub.db.changes_since(lsn_before);
+        let installed = hub
+            .db
+            .changes_since(lsn_before)
+            .expect("read the declared changes");
         assert_eq!(
             (
                 installed.ddl.len(),
@@ -4103,7 +4680,9 @@ mod received_schema_stage_tests {
         let forwarded = Database::open_memory();
         forwarded
             .apply_changes(
-                receiver.changes_since(Lsn(0)),
+                receiver
+                    .changes_since(Lsn(0))
+                    .expect("read the declared changes"),
                 &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
             )
             .expect("what the receiver took delivery of forwards to a further peer");
@@ -4276,7 +4855,10 @@ mod received_schema_stage_tests {
         // The durable author identity a peer holds for each schema record, in
         // the order of its DDL log.
         let stored_authors = |peer: &JourneyPeer, when: &str| {
-            let log = peer.db.changes_since(Lsn(0));
+            let log = peer
+                .db
+                .changes_since(Lsn(0))
+                .expect("read the declared changes");
             let mut next_ordinal = HashMap::<Lsn, u32>::new();
             log.ddl_lsn
                 .iter()
@@ -4373,7 +4955,10 @@ mod received_schema_stage_tests {
             // Schema: the author's statements in the author's order, with the
             // author's ordinals and table generations, each bound to a digest
             // that recomputes from the author's own statement.
-            let log = edge.db.changes_since(Lsn(0));
+            let log = edge
+                .db
+                .changes_since(Lsn(0))
+                .expect("read the declared changes");
             assert_eq!(
                 log.ddl.clone(),
                 authored_ddl,
@@ -4513,7 +5098,10 @@ mod received_schema_stage_tests {
         peer: &JourneyPeer,
         when: &str,
     ) -> Vec<Option<crate::protocol::WireDdlAuthor>> {
-        let log = peer.db.changes_since(Lsn(0));
+        let log = peer
+            .db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes");
         let mut next_ordinal = HashMap::<Lsn, u32>::new();
         log.ddl_lsn
             .iter()
@@ -4540,7 +5128,10 @@ mod received_schema_stage_tests {
         when: &str,
     ) {
         let tenant = TenantId::from(JOURNEY_TENANT);
-        let log = holder.db.changes_since(Lsn(0));
+        let log = holder
+            .db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes");
         assert_eq!(
             log.ddl, authored_ddl,
             "the holder's schema is the author's statements in the author's order {when}"
@@ -4706,7 +5297,10 @@ mod received_schema_stage_tests {
     #[cfg(feature = "test-seams")]
     fn force_persisted_state_fallback(peer: &JourneyPeer) {
         // Load the peer's history first so nothing reloads the logs later.
-        let _ = peer.db.changes_since(Lsn(0));
+        let _ = peer
+            .db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes");
         peer.db.__force_sync_log_gap_for_test();
         assert!(
             peer.db.ddl_log.read().is_empty() && peer.db.change_log.read().is_empty(),
@@ -4824,22 +5418,51 @@ mod received_schema_stage_tests {
             .destination_reupload_epoch(&tenant, &new_hub.node_id())
             .expect("read the re-upload epoch")
             .expect("the move left a re-upload owed to the new hub");
+        let fixture_operation_reader_36 = edge
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_36 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_36.clone());
+        let mut fixture_selection_credit_36 =
+            contextdb_core::read_memory::ReadCredit::new(fixture_operation_reader_36.clone());
+
         let (changes, arrivals, source) = edge
             .db
-            .checked_changes_since_with_arrivals(Lsn(0))
+            .checked_changes_since_with_arrivals(
+                Lsn(0),
+                &mut fixture_operation_copy_36,
+                fixture_operation_reader_36.clone(),
+                &mut fixture_selection_credit_36,
+            )
             .expect("the edge extracts its state");
         let changes = changes.filter_by_direction_history(
             &edge.db.sync_direction_history(),
             &[SyncDirection::Push, SyncDirection::Both],
         );
+        let fixture_operation_reader_37 = edge
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let changes = edge
             .db
-            .filter_outbound_received_ddl(changes, &source, Some(through))
+            .filter_outbound_received_ddl(
+                changes,
+                &source,
+                Some(through),
+                fixture_operation_reader_37.clone(),
+            )
             .expect("the re-upload keeps the schema the edge held at the move");
         let changes = edge
             .db
             .append_destination_reupload_deletes(changes, through)
             .expect("the re-upload carries held deletes");
+        let fixture_operation_reader_38 = edge
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let provenance = edge
             .db
             .outbound_ddl_provenance(
@@ -4849,6 +5472,7 @@ mod received_schema_stage_tests {
                 &edge.node_id(),
                 edge.incarnation(),
                 &|bytes| Ok(edge.identity.sign_lineage(bytes)),
+                fixture_operation_reader_38.clone(),
             )
             .expect("the edge attaches each record's provenance");
         let wire = crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
@@ -4896,7 +5520,10 @@ mod received_schema_stage_tests {
         author_pushes_migration(&author, &hub);
 
         // The hub loses the author's signed identity for what it received.
-        let log = hub.db.changes_since(Lsn(0));
+        let log = hub
+            .db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes");
         let mut next_ordinal = HashMap::<Lsn, u32>::new();
         let mut stripped = Vec::new();
         for lsn in &log.ddl_lsn {
@@ -4928,8 +5555,29 @@ mod received_schema_stage_tests {
         let hub = hub.reopen();
         force_persisted_state_fallback(&hub);
         let tenant = TenantId::from(JOURNEY_TENANT);
-        let served = hub.db.checked_changes_since_with_arrivals(Lsn(0)).and_then(
-            |(changes, arrivals, source)| {
+        let fixture_operation_reader_39 = hub
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_39 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_39.clone());
+        let mut fixture_selection_credit_39 =
+            contextdb_core::read_memory::ReadCredit::new(fixture_operation_reader_39.clone());
+
+        let served = hub
+            .db
+            .checked_changes_since_with_arrivals(
+                Lsn(0),
+                &mut fixture_operation_copy_39,
+                fixture_operation_reader_39.clone(),
+                &mut fixture_selection_credit_39,
+            )
+            .and_then(|(changes, arrivals, source)| {
+                let fixture_operation_reader_40 = hub
+                    .db
+                    .declared_reader_memory()
+                    .expect("admit the actual fixture reader");
+
                 let provenance = hub.db.outbound_ddl_provenance(
                     &changes,
                     &source,
@@ -4937,6 +5585,7 @@ mod received_schema_stage_tests {
                     &hub.node_id(),
                     hub.incarnation(),
                     &|bytes| Ok(hub.identity.sign_lineage(bytes)),
+                    fixture_operation_reader_40.clone(),
                 )?;
                 Ok(
                     crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
@@ -4946,8 +5595,7 @@ mod received_schema_stage_tests {
                         provenance,
                     ),
                 )
-            },
-        );
+            });
         let restored = JourneyPeer::open(root.path(), "evidence-restored-edge");
         match served {
             Err(Error::ReceivedSchemaAuthorshipUnavailable { table, .. }) => {
@@ -4970,7 +5618,12 @@ mod received_schema_stage_tests {
             }
         }
         assert!(
-            restored.db.changes_since(Lsn(0)).ddl.is_empty()
+            restored
+                .db
+                .changes_since(Lsn(0))
+                .expect("read the declared changes")
+                .ddl
+                .is_empty()
                 && restored.db.relational_store.table_meta.read().is_empty(),
             "the restoring edge installs nothing"
         );
@@ -5182,6 +5835,12 @@ mod received_schema_stage_tests {
         let drop_change = DdlChange::DropTable {
             name: "retired".to_string(),
         };
+        let received_schema_read_memory_18 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_18 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_18.clone());
+
         db.commit_received_schema_stage_for_test(
             &ChangeSet {
                 ddl: vec![drop_change.clone()],
@@ -5192,6 +5851,8 @@ mod received_schema_stage_tests {
             &[],
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_18,
+            received_schema_read_memory_18,
         )
         .expect("received drop commits one replacement image");
 
@@ -5330,6 +5991,12 @@ mod received_schema_stage_tests {
             )))
         });
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fixture_operation_reader_3 = db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+            let mut fixture_operation_copy_3 =
+                contextdb_engine::vector_read_memory::admission(fixture_operation_reader_3.clone());
+
             db.commit_received_schema_stage(
                 &ChangeSet {
                     ddl: vec![change.clone()],
@@ -5348,8 +6015,10 @@ mod received_schema_stage_tests {
                 Some(&mut prepare),
                 None,
                 None,
-                || Ok(None),
+                |_| Ok(None),
                 || Ok(()),
+                &mut fixture_operation_copy_3,
+                fixture_operation_reader_3.clone(),
             )
         }));
         RECEIVED_UNIT_FAULT.with(|fault| fault.set(None));
@@ -5380,9 +6049,13 @@ mod received_schema_stage_tests {
             reopened.table_meta("events").is_some(),
             "the durable image carried the new table; a reopen serves it"
         );
+        let fixture_operation_reader_5 = reopened
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
             reopened
-                .custody_records()
+                .custody_records(fixture_operation_reader_5.clone())
                 .unwrap()
                 .iter()
                 .all(|record| record.key().unwrap() != policy_key),
@@ -5397,6 +6070,12 @@ mod received_schema_stage_tests {
         let db = Database::open(&path).unwrap();
         let (changes, received, lineages) = received_schema_create_with_row();
         crate::persistence::arm_received_schema_pre_commit_fault_for_test();
+        let received_schema_read_memory_19 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_19 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_19.clone());
+
         assert!(
             db.commit_received_schema_stage_for_test(
                 &changes,
@@ -5404,6 +6083,8 @@ mod received_schema_stage_tests {
                 &lineages,
                 &HashMap::new(),
                 false,
+                &mut received_schema_copy_owner_19,
+                received_schema_read_memory_19
             )
             .is_err()
         );
@@ -5439,7 +6120,7 @@ mod received_schema_stage_tests {
                 .all(|declaration| declaration.name != trigger),
             "{phase}: failed local DDL must not publish a trigger"
         );
-        let changes = db.changes_since(Lsn(0));
+        let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
         assert!(
             changes.ddl.is_empty() && changes.ddl_lsn.is_empty(),
             "{phase}: failed local DDL must not publish an authored schema vector"
@@ -5913,6 +6594,12 @@ mod received_schema_stage_tests {
         let path = tmp.path().join("received-schema-prepare-failure.redb");
         let db = Database::open(&path).unwrap();
         let (changes, received, lineages) = received_schema_create_with_row();
+        let received_schema_read_memory_20 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_20 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_20.clone());
+
         assert!(
             db.commit_received_schema_stage_for_test(
                 &changes,
@@ -5920,6 +6607,8 @@ mod received_schema_stage_tests {
                 &lineages,
                 &HashMap::new(),
                 true,
+                &mut received_schema_copy_owner_20,
+                received_schema_read_memory_20
             )
             .is_err()
         );
@@ -5984,6 +6673,12 @@ mod received_schema_stage_tests {
             }],
             ..ChangeSet::default()
         };
+        let received_schema_read_memory_21 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_21 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_21.clone());
+
         db.commit_received_schema_stage_for_test(
             &changes,
             &received,
@@ -5995,6 +6690,8 @@ mod received_schema_stage_tests {
             )],
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_21,
+            received_schema_read_memory_21,
         )
         .unwrap();
 
@@ -6017,6 +6714,7 @@ mod received_schema_stage_tests {
         assert_ne!(logged_key, old_key);
         assert!(
             db.changes_since(Lsn(0))
+                .expect("read the declared changes")
                 .rows
                 .iter()
                 .any(|row| row.deleted && row.natural_key == target_key)
@@ -6050,6 +6748,7 @@ mod received_schema_stage_tests {
         assert!(
             reopened
                 .changes_since(Lsn(0))
+                .expect("read the declared changes")
                 .rows
                 .iter()
                 .any(|row| row.deleted && row.natural_key == target_key)
@@ -6100,6 +6799,12 @@ mod received_schema_stage_tests {
             lineage("original-author", 501, 3),
         )];
         let arrivals = HashMap::new();
+        let received_schema_read_memory_22 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_22 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_22.clone());
+
         let lower = db
             .prepare_received_schema_stage_with_adjudication(
                 Lsn(90),
@@ -6118,6 +6823,8 @@ mod received_schema_stage_tests {
                     unattested_policies: None,
                     receiver_tx: TxId(37),
                 },
+                &mut received_schema_copy_owner_22,
+                received_schema_read_memory_22,
             )
             .unwrap();
         assert!(
@@ -6134,6 +6841,11 @@ mod received_schema_stage_tests {
             lower.mirrors.receipt_and_applied_watermarks[&tenant_watermark_key],
             Lsn(6)
         );
+        let received_schema_read_memory_23 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_23 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_23.clone());
 
         let higher = db
             .prepare_received_schema_stage_with_adjudication(
@@ -6153,6 +6865,8 @@ mod received_schema_stage_tests {
                     unattested_policies: None,
                     receiver_tx: TxId(38),
                 },
+                &mut received_schema_copy_owner_23,
+                received_schema_read_memory_23,
             )
             .unwrap();
         assert!(
@@ -6263,6 +6977,12 @@ mod received_schema_stage_tests {
         if let DdlChange::AlterTable { constraints, .. } = &mut ddl {
             constraints.push("SYNC CONFLICT KEEP LATEST".to_string());
         }
+        let received_schema_read_memory_24 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_24 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_24.clone());
+
         db.commit_received_schema_stage_for_test(
             &ChangeSet {
                 ddl: vec![ddl.clone()],
@@ -6273,6 +6993,8 @@ mod received_schema_stage_tests {
             &[],
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_24,
+            received_schema_read_memory_24,
         )
         .expect("an authenticated DDL-only alter applies after the file-backed receiver reopens");
         assert_eq!(
@@ -6412,6 +7134,12 @@ mod received_schema_stage_tests {
             ..ChangeSet::default()
         };
         let arrivals = HashMap::from([(Lsn(42), Some(Lsn(2))), (Lsn(43), None)]);
+        let received_schema_read_memory_25 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_25 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_25.clone());
+
         let stage = db
             .prepare_received_schema_stage_with_adjudication(
                 Lsn(99),
@@ -6443,6 +7171,8 @@ mod received_schema_stage_tests {
                     unattested_policies: None,
                     receiver_tx: TxId(37),
                 },
+                &mut received_schema_copy_owner_25,
+                received_schema_read_memory_25,
             )
             .unwrap();
         let tombstone =
@@ -6581,6 +7311,12 @@ mod received_schema_stage_tests {
             ..ChangeSet::default()
         };
         let arrivals = HashMap::new();
+        let received_schema_read_memory_26 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_26 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_26.clone());
+
         assert!(
             db.prepare_received_schema_stage_with_adjudication(
                 Lsn(99),
@@ -6604,6 +7340,8 @@ mod received_schema_stage_tests {
                     unattested_policies: None,
                     receiver_tx: TxId(37),
                 },
+                &mut received_schema_copy_owner_26,
+                received_schema_read_memory_26
             )
             .is_err()
         );
@@ -6612,6 +7350,12 @@ mod received_schema_stage_tests {
                 .read()
                 .contains_key(&matching_marker_key)
         );
+        let received_schema_read_memory_27 = db
+            .declared_reader_memory()
+            .expect("admit the received-schema operation reader");
+        let mut received_schema_copy_owner_27 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_27.clone());
+
         let stage = db
             .prepare_received_schema_stage_with_adjudication(
                 Lsn(99),
@@ -6635,6 +7379,8 @@ mod received_schema_stage_tests {
                     unattested_policies: None,
                     receiver_tx: TxId(37),
                 },
+                &mut received_schema_copy_owner_27,
+                received_schema_read_memory_27,
             )
             .unwrap();
         let inactive = stage
@@ -6705,11 +7451,17 @@ mod persisted_state_snapshot_tests {
             &params,
         )
         .unwrap();
+        let fixture_operation_reader_6 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         db.row_id_for_natural_key_full(
             "events",
             &NaturalKey::single("id".to_string(), Value::Int64(1)),
             db.snapshot_for_read(),
+            fixture_operation_reader_6.clone(),
         )
+        .unwrap()
         .unwrap()
     }
 
@@ -6742,18 +7494,37 @@ mod persisted_state_snapshot_tests {
                 .live_row_by_id("events", old_row_id)
                 .is_none()
         );
+        let fixture_operation_reader_41 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_41 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_41.clone());
+
         assert!(
-            db.full_state_snapshot()
-                .expect("materialize full state")
-                .rows
-                .is_empty()
+            db.full_state_snapshot(
+                &mut fixture_operation_copy_41,
+                fixture_operation_reader_41.clone()
+            )
+            .expect("materialize full state")
+            .rows
+            .is_empty()
         );
+        let fixture_operation_reader_42 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_42 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_42.clone());
+
         assert!(
-            db.persisted_state_since_with_ddl_provenance(Lsn(1))
-                .expect("materialize persisted state")
-                .0
-                .rows
-                .is_empty()
+            db.persisted_state_since_with_ddl_provenance(
+                Lsn(1),
+                &mut fixture_operation_copy_42,
+                fixture_operation_reader_42.clone()
+            )
+            .expect("materialize persisted state")
+            .0
+            .rows
+            .is_empty()
         );
     }
 
@@ -6770,12 +7541,18 @@ mod persisted_state_snapshot_tests {
             &HashMap::new(),
         )
         .unwrap();
+        let fixture_operation_reader_7 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let fresh_row_id = db
             .row_id_for_natural_key_full(
                 "events",
                 &NaturalKey::single("id".to_string(), Value::Int64(1)),
                 db.snapshot_for_read(),
+                fixture_operation_reader_7.clone(),
             )
+            .unwrap()
             .unwrap();
         drop(db);
         let db = Database::open(&path).expect("reopen snapshot fresh-row database");
@@ -6791,14 +7568,33 @@ mod persisted_state_snapshot_tests {
                 .iter()
                 .any(|row| row.row_id == fresh_row_id && row.visible_at(db.snapshot_for_read()))
         );
+        let fixture_operation_reader_43 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_43 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_43.clone());
+
+        let fixture_operation_reader_44 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_44 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_44.clone());
+
         for rows in [
-            db.full_state_snapshot()
-                .expect("materialize full state")
-                .rows,
-            db.persisted_state_since_with_ddl_provenance(Lsn(1))
-                .expect("materialize persisted state")
-                .0
-                .rows,
+            db.full_state_snapshot(
+                &mut fixture_operation_copy_43,
+                fixture_operation_reader_43.clone(),
+            )
+            .expect("materialize full state")
+            .rows,
+            db.persisted_state_since_with_ddl_provenance(
+                Lsn(1),
+                &mut fixture_operation_copy_44,
+                fixture_operation_reader_44.clone(),
+            )
+            .expect("materialize persisted state")
+            .0
+            .rows,
         ] {
             assert_eq!(rows.len(), 1);
             assert_eq!(
@@ -6832,8 +7628,18 @@ mod persisted_state_snapshot_tests {
         drop(db);
 
         let reopened = Database::open(&path).expect("reopen schema pagination database");
+        let fixture_operation_reader_45 = reopened
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_45 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_45.clone());
+
         let (full, full_source) = reopened
-            .persisted_state_since_with_ddl_provenance(Lsn(0))
+            .persisted_state_since_with_ddl_provenance(
+                Lsn(0),
+                &mut fixture_operation_copy_45,
+                fixture_operation_reader_45.clone(),
+            )
             .expect("materialize complete persisted state");
         assert_eq!(full_source.kind, DdlProvenanceKind::Historical);
         assert_eq!(full.ddl.len(), full.ddl_lsn.len());
@@ -6856,9 +7662,18 @@ mod persisted_state_snapshot_tests {
             })
             .expect("complete history records the second table in author order");
         assert!(later_lsn > events_lsn);
+        let fixture_operation_reader_46 = reopened
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_46 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_46.clone());
 
         let (changes, source) = reopened
-            .persisted_state_since_with_ddl_provenance(events_lsn)
+            .persisted_state_since_with_ddl_provenance(
+                events_lsn,
+                &mut fixture_operation_copy_46,
+                fixture_operation_reader_46.clone(),
+            )
             .expect("materialize paged persisted state");
 
         assert_eq!(source.kind, DdlProvenanceKind::Historical);
@@ -6935,23 +7750,52 @@ mod persisted_state_snapshot_tests {
                 .live_row_by_id("events", row_id)
                 .is_some()
         );
+        let fixture_operation_reader_8 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
-            db.visible_row_by_natural_key("events", &natural_key, snapshot, &empty_skip_deleted)
-                .unwrap()
-                .is_none()
+            db.visible_row_by_natural_key(
+                "events",
+                &natural_key,
+                snapshot,
+                &empty_skip_deleted,
+                fixture_operation_reader_8.clone()
+            )
+            .unwrap()
+            .is_none()
         );
+        let fixture_operation_reader_47 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_47 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_47.clone());
+
         assert!(
-            db.full_state_snapshot()
-                .expect("materialize full state")
-                .rows
-                .is_empty()
+            db.full_state_snapshot(
+                &mut fixture_operation_copy_47,
+                fixture_operation_reader_47.clone()
+            )
+            .expect("materialize full state")
+            .rows
+            .is_empty()
         );
+        let fixture_operation_reader_48 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_48 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_48.clone());
+
         assert!(
-            db.persisted_state_since_with_ddl_provenance(Lsn(1))
-                .expect("materialize persisted state")
-                .0
-                .rows
-                .is_empty()
+            db.persisted_state_since_with_ddl_provenance(
+                Lsn(1),
+                &mut fixture_operation_copy_48,
+                fixture_operation_reader_48.clone()
+            )
+            .expect("materialize persisted state")
+            .0
+            .rows
+            .is_empty()
         );
     }
 }
@@ -17868,6 +18712,8 @@ impl MaintenanceContext {
     }
 
     fn build_checkpoint(&self) -> Result<()> {
+        #[cfg(all(test, feature = "test-seams"))]
+        resident_history_test_seams::note_checkpoint();
         #[cfg(feature = "test-seams")]
         resident_history_test_seams::note(|work| {
             work.workspace_peak = work.workspace_peak.max(
@@ -82565,6 +83411,19 @@ mod commit_index_reconstruction_tests {
             .values()
             .flat_map(|entries| entries.iter().cloned())
             .collect::<Vec<_>>();
+        let vector_fixture_parent_12 =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let vector_fixture_reader_12 = vector_fixture_parent_12
+            .child()
+            .expect("admit the declared fixture reader child");
+        let mut vector_fixture_copy_12 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_12.clone());
+
         for entry in graph
             .forward_adj
             .read()
@@ -82573,7 +83432,9 @@ mod commit_index_reconstruction_tests {
         {
             add_entry(entry.lsn, entry.created_tx);
         }
-        let vector_entries = vector.all_entries();
+        let vector_entries = vector
+            .all_entries(&mut vector_fixture_copy_12)
+            .expect("read or publish the admitted vector fixture");
         for entry in &vector_entries {
             add_entry(entry.lsn, entry.created_tx);
         }
@@ -82804,13 +83665,23 @@ mod commit_index_reconstruction_tests {
 
     #[test]
     fn commit_index_matches_naive_for_vector_deletes() {
+        let standalone_retained_writer_1 =
+            std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
+
         use contextdb_core::VectorQuantization;
         // Build a vector store with two tombstoned versions of one (index,row_id)
         // plus a live one, so a VectorDelete must resolve to the max-lsn tombstone
         // below its threshold — exactly as the naive scan does.
         let index = VectorIndexRef::new("t", "vec");
         let vector = VectorStore::default();
-        vector.register_index(index.clone(), 2, VectorQuantization::F32);
+        vector
+            .register_index(
+                index.clone(),
+                2,
+                VectorQuantization::F32,
+                standalone_retained_writer_1.clone(),
+            )
+            .expect("read or publish the admitted vector fixture");
         let entry = |created_tx: u64, deleted_tx: Option<u64>, lsn: Lsn| VectorEntry {
             index: index.clone(),
             row_id: RowId(1),
@@ -82819,9 +83690,24 @@ mod commit_index_reconstruction_tests {
             deleted_tx: deleted_tx.map(TxId),
             lsn,
         };
-        vector.insert_loaded_vector(entry(3, Some(4), Lsn(15)));
-        vector.insert_loaded_vector(entry(20, Some(21), Lsn(30)));
-        vector.insert_loaded_vector(entry(44, None, Lsn(45)));
+        vector
+            .insert_loaded_vector(
+                entry(3, Some(4), Lsn(15)),
+                standalone_retained_writer_1.clone(),
+            )
+            .expect("read or publish the admitted vector fixture");
+        vector
+            .insert_loaded_vector(
+                entry(20, Some(21), Lsn(30)),
+                standalone_retained_writer_1.clone(),
+            )
+            .expect("read or publish the admitted vector fixture");
+        vector
+            .insert_loaded_vector(
+                entry(44, None, Lsn(45)),
+                standalone_retained_writer_1.clone(),
+            )
+            .expect("read or publish the admitted vector fixture");
 
         let relational = relational_with(vec![]);
         let graph = graph_with(vec![]);
@@ -82990,6 +83876,7 @@ mod currency_version_compaction_tests {
     /// changes_since row values for `work_capabilities` only.
     fn capability_changes(db: &Database, since: Lsn) -> Vec<i64> {
         db.changes_since(since)
+            .expect("read the declared changes")
             .rows
             .into_iter()
             .filter(|change| change.table == "work_capabilities")
@@ -83010,6 +83897,196 @@ mod currency_version_compaction_tests {
 
     #[test]
     fn compaction_bounds_versions_and_change_log() {
+        // A refused proof pass publishes no cleanup or progress and can be retried
+        // with its ordinary owner after resource relief.
+        #[cfg(feature = "test-seams")]
+        {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            struct RefuseNextProof;
+            impl RefuseNextProof {
+                fn arm(
+                    owner: &Arc<MemoryAccountant>,
+                    fired: Arc<AtomicBool>,
+                    proof_seen: Arc<AtomicUsize>,
+                    pruning_started: Arc<AtomicBool>,
+                    unique_keys: usize,
+                    grouped_bytes: usize,
+                ) {
+                    let weak = Arc::downgrade(owner);
+                    owner.set_admission_race_hook(Box::new(move || {
+                        let entries = crate::memory_accounting::take_budget_ledger_for_test();
+                        crate::memory_accounting::watch_budget_ledger_for_test();
+                        // The descriptor reservation is immediately before
+                        // prune_currency_scoped, after all cleanup selection reads.
+                        // Discard earlier proof traffic before arming this walk.
+                        let reserved = entries
+                            .iter()
+                            .any(|entry| entry.what == "writer_source/published_root");
+                        if reserved {
+                            pruning_started.store(true, Ordering::SeqCst);
+                        }
+                        let count = entries
+                            .iter()
+                            .filter(|entry| {
+                                !reserved
+                                    && pruning_started.load(Ordering::SeqCst)
+                                    && entry.what == "content_identity/maintain_committed_proof"
+                            })
+                            .count();
+                        let seen = proof_seen.fetch_add(count, Ordering::SeqCst) + count;
+                        let owner = weak.upgrade().unwrap();
+                        if seen == 2 * unique_keys && !fired.swap(true, Ordering::SeqCst) {
+                            // Each unique key has completed its transient validation
+                            // and one AVL-node admission. The next allocation is the
+                            // exact grouped slice sum, with all nodes still live.
+                            // Keep G-1 bytes here: the grouped slices refuse, while
+                            // the retry can still admit its concrete scratch backend.
+                            owner
+                                .set_budget(Some(owner.usage().used + grouped_bytes - 1))
+                                .unwrap();
+                        } else if !fired.load(Ordering::SeqCst) {
+                            Self::arm(
+                                &owner,
+                                fired.clone(),
+                                proof_seen.clone(),
+                                pruning_started.clone(),
+                                unique_keys,
+                                grouped_bytes,
+                            );
+                        }
+                    }));
+                }
+            }
+            let (_tmp, db) = open_ledger();
+            db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+            db.__set_currency_maintenance_interval(Duration::from_secs(3600));
+            for advertised_at in 1..=3 {
+                crate::work_ledger::advertise_capability(
+                    &db,
+                    "node-a",
+                    "example-detector-cpu",
+                    &tags(),
+                    advertised_at,
+                )
+                .unwrap();
+            }
+            let capture = || {
+                let root = writer_read::durable_root(db.tx_mgr.capture_published_read().handle)
+                    .unwrap()
+                    .unwrap();
+                let meta = db
+                    .relational_store
+                    .table_meta
+                    .read()
+                    .get("work_capabilities")
+                    .unwrap()
+                    .clone();
+                let declaration = RedbPersistence::currency_cleanup_declaration(&meta).unwrap();
+                let state =
+                    RedbPersistence::currency_cleanup_progress(&root, "work_capabilities", declaration)
+                        .unwrap();
+                (
+                    state.declaration,
+                    state.through,
+                    state.after_group,
+                    state
+                        .group
+                        .map(|group| (group.row, group.keeper, group.prune_after)),
+                    RedbPersistence::currency_cleanup_rotation(&root).unwrap(),
+                    physical_versions(&db, "work_capabilities"),
+                    change_log_row_inserts(&db, "work_capabilities"),
+                    durable_physical_versions(&db, "work_capabilities"),
+                    durable_change_log_row_inserts(&db, "work_capabilities"),
+                    capability_changes(&db, Lsn(0)),
+                    db.current_lsn(),
+                )
+            };
+            let before = capture();
+            assert_eq!(before.7, 3);
+            // This fixture has one scalar currency key. Select its actual stale
+            // RowInsert LSNs and run the production commit-candidate selection.
+            // The scoped transaction contributes one expiry key per stale row,
+            // one current-row key, and distinct history/commit-index keys.
+            let history = db.change_log_since(Lsn(0)).unwrap();
+            let keeper = history
+                .iter()
+                .filter_map(|entry| match entry {
+                    ChangeLogEntry::RowInsert { table, lsn, .. }
+                        if table == "work_capabilities" => Some(*lsn),
+                    _ => None,
+                })
+                .max()
+                .unwrap();
+            let removed_lsn_counts: HashMap<Lsn, u64> = history
+                .iter()
+                .filter_map(|entry| match entry {
+                    ChangeLogEntry::RowInsert { table, lsn, .. }
+                        if table == "work_capabilities" && *lsn != keeper => Some((*lsn, 1)),
+                    _ => None,
+                })
+                .collect();
+            let affected_lsns = removed_lsn_counts.keys().copied().collect();
+            let commit_keys = scoped_commit_index_candidates(
+                &db.tx_mgr,
+                &db.change_log_lsn_refcounts.read(),
+                &removed_lsn_counts,
+                &affected_lsns,
+            )
+            .unwrap();
+            let stale_keys = removed_lsn_counts.len();
+            let family_counts = [stale_keys, 1, stale_keys + commit_keys.len()];
+            let unique_keys = family_counts.iter().sum::<usize>();
+            let grouped_bytes = family_counts
+                .into_iter()
+                .map(|count| {
+                    std::alloc::Layout::array::<(Vec<u8>, Option<[u8; 32]>)>(count)
+                        .unwrap()
+                        .size()
+                })
+                .sum::<usize>();
+            let original_limit = db.memory_limit();
+            let fired = Arc::new(AtomicBool::new(false));
+            let proof_seen = Arc::new(AtomicUsize::new(0));
+            crate::memory_accounting::watch_budget_ledger_for_test();
+            RefuseNextProof::arm(
+                &db.accountant,
+                fired.clone(),
+                proof_seen.clone(),
+                Arc::new(AtomicBool::new(false)),
+                unique_keys,
+                grouped_bytes,
+            );
+            let refused = db.__compact_currency_versions_for_tables_for_test(
+                &["work_capabilities"],
+                db.declared_reader_memory().unwrap(),
+            );
+            db.accountant.set_admission_race_hook(Box::new(|| {}));
+            let _traffic = crate::memory_accounting::take_budget_ledger_for_test();
+            db.set_memory_limit(original_limit).unwrap();
+            assert!(
+                fired.load(Ordering::SeqCst) && proof_seen.load(Ordering::SeqCst) > 0,
+                "the existing seam must reach actual accounted proof maintenance"
+            );
+            let error = refused.unwrap_err();
+            assert!(
+                matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, .. } if subsystem == "content_identity" && operation == "maintain_committed_proof"),
+                "the original proof memory refusal must escape without successful unaccounted retry: {error:?}"
+            );
+            assert_eq!(
+                capture(),
+                before,
+                "a refused pass changes neither durable progress nor in-memory pruning or exported history"
+            );
+            let retry = db
+                .__compact_currency_versions_for_tables_for_test(
+                    &["work_capabilities"],
+                    db.declared_reader_memory().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(retry.pruned_versions, 2);
+            assert_eq!(durable_physical_versions(&db, "work_capabilities"), 1);
+            assert_eq!(current_advertised_at(&db), 3);
+        }
         let (_tmp, db) = open_ledger();
         // Hold the auto-maintenance tick (60s in production) out of this test: under machine
         // load the 200-upsert setup can outlast one tick, and a mid-setup auto-compaction
@@ -83076,6 +84153,221 @@ mod currency_version_compaction_tests {
 
     #[test]
     fn changes_since_survives_reopen_after_compaction() {
+        // Allowed graph history is complete, or extraction returns the original
+        // metadata read failure after the preceding node histories were admitted.
+        {
+            use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            #[derive(Debug)]
+            struct MetadataOwner {
+                ordinary: Arc<dyn ReadMemoryBudget>,
+                refused: Arc<crate::vector_read_memory::DeclaredReadMemory>,
+                refuse: bool,
+                answer_admissions: Arc<AtomicUsize>,
+                metadata_calls: AtomicUsize,
+                admissions_before_metadata: AtomicUsize,
+                original_error: std::sync::Mutex<Option<String>>,
+            }
+            impl ReadMemoryBudget for MetadataOwner {
+                fn try_reserve(
+                    &self,
+                    bytes: usize,
+                    subsystem: &'static str,
+                    operation: &'static str,
+                    hint: &'static str,
+                ) -> Result<()> {
+                    if operation == "graph_metadata_tables" {
+                        self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+                        self.admissions_before_metadata.fetch_max(
+                            self.answer_admissions.load(Ordering::SeqCst),
+                            Ordering::SeqCst,
+                        );
+                        if self.refuse {
+                            let outcome = self.refused.try_reserve(bytes, subsystem, operation, hint);
+                            if let Err(error) = &outcome {
+                                *self.original_error.lock().unwrap() = Some(format!("{error:?}"));
+                            }
+                            return outcome;
+                        }
+                    }
+                    self.ordinary.try_reserve(bytes, subsystem, operation, hint)
+                }
+                fn release(&self, bytes: usize) {
+                    self.ordinary.release(bytes);
+                }
+            }
+            let mut observations = Vec::new();
+            let mut expected = Vec::new();
+            for deleted in [false, true] {
+                for fault in ["memory", "source", "denied"] {
+                    let mut db = Database::open_memory();
+                    db.execute("CREATE TABLE export_nodes (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, tick INTEGER)", &HashMap::new()).unwrap();
+                    db.execute("CREATE TABLE export_edge_metadata (source_id UUID, target_id UUID, edge_type TEXT, PRIMARY KEY (source_id, target_id, edge_type))", &HashMap::new()).unwrap();
+                    let source = uuid::Uuid::from_u128(1);
+                    let target = uuid::Uuid::from_u128(2);
+                    let context = uuid::Uuid::from_u128(10);
+                    for id in [source, target] {
+                        db.execute(
+                            "INSERT INTO export_nodes VALUES ($id, $context, 0)",
+                            &HashMap::from([
+                                ("id".into(), Value::Uuid(id)),
+                                ("context".into(), Value::Uuid(context)),
+                            ]),
+                        )
+                        .unwrap();
+                    }
+                    db.execute(
+                        "INSERT INTO export_edge_metadata VALUES ($source, $target, 'link')",
+                        &HashMap::from([
+                            ("source".into(), Value::Uuid(source)),
+                            ("target".into(), Value::Uuid(target)),
+                        ]),
+                    )
+                    .unwrap();
+                    let tx = db.begin().unwrap();
+                    db.insert_edge(tx, source, target, "link".into(), HashMap::new())
+                        .unwrap();
+                    db.commit(tx).unwrap();
+                    if !deleted {
+                        let tx = db.begin().unwrap();
+                        db.delete_edge(tx, source, target, "link").unwrap();
+                        db.commit(tx).unwrap();
+                    }
+                    let since = db.current_lsn();
+                    db.execute("UPDATE export_nodes SET tick = 1", &HashMap::new())
+                        .unwrap();
+                    let tx = db.begin().unwrap();
+                    if deleted {
+                        db.delete_edge(tx, source, target, "link").unwrap();
+                    } else {
+                        db.insert_edge(tx, source, target, "link".into(), HashMap::new())
+                            .unwrap();
+                    }
+                    db.commit(tx).unwrap();
+                    db.access.contexts = Some([ContextId::new(context)].into_iter().collect());
+                    let control = db.changes_since(since).unwrap();
+                    assert_eq!(
+                        control
+                            .rows
+                            .iter()
+                            .filter(|row| row.table == "export_nodes")
+                            .count(),
+                        2
+                    );
+                    assert_eq!(control.edges.len(), 1);
+                    assert_eq!(
+                        control.edges[0].properties.get("__deleted"),
+                        deleted.then_some(&Value::Bool(true))
+                    );
+                    if fault == "source" {
+                        // Remove the actual metadata index while preserving the
+                        // committed rows and histories. Its required read now fails.
+                        db.relational_store
+                            .indexes
+                            .write()
+                            .get_mut("export_nodes")
+                            .unwrap()
+                            .clear();
+                    } else if fault == "denied" {
+                        db.access.contexts = Some(
+                            [ContextId::new(uuid::Uuid::from_u128(11))]
+                                .into_iter()
+                                .collect(),
+                        );
+                        assert!(
+                            !db.node_read_allowed(
+                                source,
+                                db.snapshot(),
+                                db.declared_reader_memory().unwrap()
+                            )
+                            .unwrap()
+                        );
+                    }
+                    let source_error = if fault == "source" {
+                        Some(format!(
+                            "{:?}",
+                            db.node_read_allowed(
+                                source,
+                                db.snapshot(),
+                                db.declared_reader_memory().unwrap()
+                            )
+                            .unwrap_err()
+                        ))
+                    } else {
+                        None
+                    };
+                    let answer_admissions = Arc::new(AtomicUsize::new(0));
+                    let ordinary = db.declared_reader_memory().unwrap();
+                    let owner = Arc::new(MetadataOwner {
+                        ordinary: ordinary.clone(),
+                        refused: crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(0),
+                        refuse: fault == "memory",
+                        answer_admissions: answer_admissions.clone(),
+                        metadata_calls: AtomicUsize::new(0),
+                        admissions_before_metadata: AtomicUsize::new(0),
+                        original_error: std::sync::Mutex::new(None),
+                    });
+                    let credit = std::sync::Mutex::new(ReadCredit::new(ordinary));
+                    let admit = |bytes| {
+                        answer_admissions.fetch_add(1, Ordering::SeqCst);
+                        credit.lock().unwrap().try_grow_for(
+                            bytes,
+                            "reader",
+                            "history_answer",
+                            "Reduce the selected history.",
+                        )
+                    };
+                    let projection = ChangeProjection {
+                        checkpoint: &|| Ok(()),
+                        admit: &admit,
+                        bounded: true,
+                        ddl: false,
+                    };
+                    let mut copy = crate::vector_read_memory::admission(owner.clone());
+                    let outcome =
+                        db.changes_since_base_projected(since, &projection, &mut copy, owner.clone());
+                    let original =
+                        source_error.or_else(|| owner.original_error.lock().unwrap().clone());
+                    let expected_outcome = if fault == "denied" {
+                        "denied normally".to_string()
+                    } else {
+                        original
+                            .expect("the real failed metadata read records its original typed error")
+                    };
+                    let observed_outcome = match outcome {
+                        Err(error) => format!("{error:?}"),
+                        Ok((changes, _))
+                            if fault == "denied"
+                                && changes.rows.is_empty()
+                                && changes.edges.is_empty() =>
+                        {
+                            "denied normally".to_string()
+                        }
+                        Ok((changes, _)) => format!(
+                            "successful partial export: nodes={}, edges={}",
+                            changes
+                                .rows
+                                .iter()
+                                .filter(|row| row.table == "export_nodes")
+                                .count(),
+                            changes.edges.len()
+                        ),
+                    };
+                    observations.push((
+                        deleted,
+                        fault,
+                        owner.metadata_calls.load(Ordering::SeqCst) > 0,
+                        fault == "denied"
+                            || owner.admissions_before_metadata.load(Ordering::SeqCst) >= 2,
+                        observed_outcome,
+                    ));
+                    expected.push((deleted, fault, true, true, expected_outcome));
+                }
+            }
+            // Collect both insertions and deletions before checking the matrix so
+            // one failing permission read cannot mask the other export branch.
+            assert_eq!(observations, expected);
+        }
         // The rewritten change log must round-trip through persistence: after a
         // compaction, a reopened ledger must reconstruct the same current truth
         // (proves rewrite_change_log wrote valid keys/ordering and commit-index
@@ -83475,7 +84767,7 @@ mod stale_staged_delete_tests {
         db.execute("DELETE FROM notes WHERE id = $id", &by_id(id))
             .expect("another writer removes the same row first");
 
-        let after_the_real_delete = db.changes_since(Lsn(0));
+        let after_the_real_delete = db.changes_since(Lsn(0)).expect("read the declared changes");
         let deletions_before = after_the_real_delete
             .rows
             .iter()
@@ -83485,7 +84777,7 @@ mod stale_staged_delete_tests {
 
         db.commit(stale).expect("the stale delete commits");
 
-        let after_the_stale_commit = db.changes_since(Lsn(0));
+        let after_the_stale_commit = db.changes_since(Lsn(0)).expect("read the declared changes");
         assert_eq!(
             after_the_stale_commit
                 .rows
@@ -83521,6 +84813,7 @@ mod stale_staged_delete_tests {
         assert_eq!(
             reopened
                 .changes_since(Lsn(0))
+                .expect("read the declared changes")
                 .rows
                 .iter()
                 .filter(|change| change.deleted)
@@ -83787,7 +85080,10 @@ mod table_size_estimate_tests {
 
         crate::persistence::arm_stored_relational_row_bytes_fault_for_test();
         assert!(
-            database.table_size_estimate("notes").is_none(),
+            database
+                .table_size_estimate("notes")
+                .expect("read the actual fixture observation")
+                .is_none(),
             "the answer with nowhere to put a reason says nothing at all rather than \
              a figure that is too small"
         );
@@ -83932,3 +85228,6 @@ mod dormant_raw_vector_loader_tests;
 mod bounded_retention_preparation_tests;
 #[cfg(test)]
 mod generation_route_admission_tests;
+
+#[cfg(all(test, feature = "test-seams"))]
+mod content_size_contract_tests;

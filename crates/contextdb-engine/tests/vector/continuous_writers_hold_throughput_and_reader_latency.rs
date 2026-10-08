@@ -457,7 +457,6 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
     });
     std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap())
         .expect("write the receipt");
-    println!("CONTINUOUS_WRITERS_RECEIPT {}", receipt_path.display());
 
     assert!(
         total_commits >= target_commits,

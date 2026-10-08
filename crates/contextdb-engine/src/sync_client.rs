@@ -5199,20 +5199,35 @@ mod tests {
             response: encode_for_version(PROTOCOL_VERSION, MessageType::PullResponse, &response)
                 .unwrap(),
         });
+        let fixture_client_db = Arc::new(Database::open_memory());
+
         let client = SyncClient::build(
-            Arc::new(Database::open_memory()),
+            fixture_client_db.clone(),
             transport.clone(),
             None,
             "test-hub".to_string(),
             TenantId::from("test-tenant"),
-        );
+            fixture_client_db
+                .declared_reader_memory()
+                .expect("admit the actual client fixture reader"),
+        )
+        .expect("construct the sync fixture client");
         let request = PullRequest {
             since_lsn: Lsn(7),
             max_entries: Some(PULL_PAGE_SIZE),
             schema_recovery: None,
         };
 
-        let page = client.request_pull(request).await.unwrap();
+        let page = client
+            .request_pull(
+                request,
+                client
+                    .db()
+                    .declared_reader_memory()
+                    .expect("admit the pull fixture reader"),
+            )
+            .await
+            .unwrap();
         assert_eq!(page.ordinary, response);
         assert!(page.dependency_units.is_empty());
 
@@ -6086,7 +6101,7 @@ mod tests {
         let move_boundary = db.current_lsn();
         let inherited = drop_rows_that_arrived_by_sync_after(
             &db,
-            db.changes_since(Lsn(0)),
+            db.changes_since(Lsn(0)).expect("read the declared changes"),
             Some(move_boundary),
         );
         assert_eq!(inherited.edges.len(), 1);
@@ -6106,7 +6121,7 @@ mod tests {
         .unwrap();
         let moved = drop_rows_that_arrived_by_sync_after(
             &db,
-            db.changes_since(Lsn(0)),
+            db.changes_since(Lsn(0)).expect("read the declared changes"),
             Some(move_boundary),
         );
         assert!(moved.edges.is_empty());
@@ -6121,7 +6136,10 @@ mod tests {
         )
         .unwrap();
         db.commit(local_reinsert).unwrap();
-        let outbound = drop_rows_that_arrived_by_sync(&db, db.changes_since(Lsn(0)));
+        let outbound = drop_rows_that_arrived_by_sync(
+            &db,
+            db.changes_since(Lsn(0)).expect("read the declared changes"),
+        );
         assert_eq!(outbound.edges.len(), 1);
         assert!(!matches!(
             outbound.edges[0].properties.get("__deleted"),
@@ -6159,7 +6177,9 @@ mod tests {
         source_db.commit(replace).unwrap();
 
         let replacement_lsn = source_db.current_lsn();
-        let raw = source_db.changes_since(Lsn(0));
+        let raw = source_db
+            .changes_since(Lsn(0))
+            .expect("read the declared changes");
         let replacement_entries = raw
             .edges
             .iter()
@@ -6212,7 +6232,9 @@ mod tests {
                     .and_then(|properties| properties.get("generation").cloned()),
                 Some(Value::Int64(2))
             );
-            let received_changes = receiver.changes_since(Lsn(0));
+            let received_changes = receiver
+                .changes_since(Lsn(0))
+                .expect("read the declared changes");
             let pending = drop_rows_that_arrived_by_sync(&receiver, received_changes);
             assert!(pending.edges.is_empty());
         }
@@ -6226,7 +6248,9 @@ mod tests {
                 .and_then(|properties| properties.get("generation").cloned()),
             Some(Value::Int64(2))
         );
-        let reopened_changes = reopened.changes_since(Lsn(0));
+        let reopened_changes = reopened
+            .changes_since(Lsn(0))
+            .expect("read the declared changes");
         let pending = drop_rows_that_arrived_by_sync(&reopened, reopened_changes);
         assert!(pending.edges.is_empty());
     }

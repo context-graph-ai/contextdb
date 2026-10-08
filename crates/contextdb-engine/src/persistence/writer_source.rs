@@ -1846,7 +1846,11 @@ mod tests {
         prepared: parking_lot::Mutex<Option<Arc<WriterSnapshot>>>,
     }
     impl contextdb_tx::WriteSetApplicator for RootApplicator {
-        fn apply(&self, ws: &WriteSet) -> Result<()> {
+        fn apply(
+            &self,
+            ws: &WriteSet,
+            _executing_read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        ) -> Result<()> {
             let reservation = self.store.reserve_writer_snapshot()?;
             self.store.flush_data(ws)?;
             let root = self
@@ -1873,8 +1877,9 @@ mod tests {
 
     #[test]
     fn published_writer_root_stays_old_until_explicit_swap_and_windows_release() {
+        let reader = Arc::new(MemoryAccountant::no_limit());
         let directory = tempfile::tempdir().unwrap();
-        let (store, accountant) = store(&directory.path().join("root.db"));
+        let (store, _accountant) = store(&directory.path().join("root.db"));
         store
             .flush_table_meta("items", &TableMeta::default())
             .unwrap();
@@ -1920,12 +1925,13 @@ mod tests {
         source
             .commit_with_lsn_prepared_and_applied(
                 tx,
+                reader.clone(),
                 |_| Ok(()),
                 |_, _| {
                     // Durability and preparation completed; logical publication has not.
                     assert_eq!(capture().storage_identity(), old_identity);
                     assert!(
-                        old.row_cursor("items", RowId(7))
+                        old.row_cursor(SourceWindowOwner::Read(reader.clone()), "items", RowId(7))
                             .unwrap()
                             .next_row()
                             .unwrap()
@@ -1940,7 +1946,11 @@ mod tests {
                             assert_eq!(captured.storage_identity(), old_identity);
                             assert!(
                                 captured
-                                    .row_cursor("items", RowId(7))?
+                                    .row_cursor(
+                                        SourceWindowOwner::Read(reader.clone()),
+                                        "items",
+                                        RowId(7)
+                                    )?
                                     .next_row()?
                                     .is_none()
                             );
@@ -1954,19 +1964,21 @@ mod tests {
         let current = capture();
         assert_ne!(current.storage_identity(), old_identity);
         assert_eq!((current.snapshot, current.lsn), (SnapshotId(1), Lsn(1)));
-        let baseline = accountant.usage().used;
-        let mut cursor = current.row_cursor("items", RowId(7)).unwrap();
-        let cursor_only = accountant.usage().used;
+        let baseline = reader.usage().used;
+        let mut cursor = current
+            .row_cursor(SourceWindowOwner::Read(reader.clone()), "items", RowId(7))
+            .unwrap();
+        let cursor_only = reader.usage().used;
         let window = cursor.next_row().unwrap().unwrap();
         assert_eq!(window.value, row);
-        assert!(accountant.usage().used > cursor_only);
+        assert!(reader.usage().used > cursor_only);
         drop(window);
         assert!(cursor.next_row().unwrap().is_none());
-        assert_eq!(accountant.usage().used, cursor_only);
+        assert_eq!(reader.usage().used, cursor_only);
         drop(cursor);
-        assert_eq!(accountant.usage().used, baseline);
+        assert_eq!(reader.usage().used, baseline);
         assert!(
-            old.row_cursor("items", RowId(7))
+            old.row_cursor(SourceWindowOwner::Read(reader.clone()), "items", RowId(7))
                 .unwrap()
                 .next_row()
                 .unwrap()
@@ -2031,6 +2043,7 @@ mod tests {
 
     #[test]
     fn current_writer_postings_keep_one_member_after_repeated_key_changes() {
+        let reader = Arc::new(MemoryAccountant::no_limit());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("postings.db");
         {
@@ -2059,6 +2072,7 @@ mod tests {
             .unwrap();
         let mut current = root
             .index_cursor(
+                SourceWindowOwner::Read(reader.clone()),
                 "items",
                 "by_body",
                 true,
@@ -2077,6 +2091,7 @@ mod tests {
         assert!(current.next_index(true).unwrap().is_none());
         let mut historical = root
             .index_cursor(
+                SourceWindowOwner::Read(reader.clone()),
                 "items",
                 "by_body",
                 false,
@@ -2092,6 +2107,7 @@ mod tests {
         assert_eq!(count, 25);
         let mut pk = root
             .index_cursor(
+                SourceWindowOwner::Read(reader.clone()),
                 "items",
                 "__pk_id",
                 true,
@@ -2106,6 +2122,7 @@ mod tests {
 
     #[test]
     fn graph_delete_updates_both_directions_and_preserves_unrelated_edges() {
+        let reader = Arc::new(MemoryAccountant::no_limit());
         let directory = tempfile::tempdir().unwrap();
         let (store, _) = store(&directory.path().join("graph.db"));
         let node = |i| uuid::Uuid::from_u128(i);
@@ -2137,7 +2154,9 @@ mod tests {
             )
             .unwrap();
         for (root, stamp) in [(&before, None), (&after, Some(TxId(3)))] {
-            let mut fwd = root.graph_cursor(node(1), false).unwrap();
+            let mut fwd = root
+                .graph_cursor(SourceWindowOwner::Read(reader.clone()), node(1), false)
+                .unwrap();
             let mut selected = 0;
             while let Some(window) = fwd.next_edge().unwrap() {
                 if window.value.target == node(200) {
@@ -2148,7 +2167,9 @@ mod tests {
                 }
             }
             assert_eq!(selected, 2);
-            let mut rev = root.graph_cursor(node(200), true).unwrap();
+            let mut rev = root
+                .graph_cursor(SourceWindowOwner::Read(reader.clone()), node(200), true)
+                .unwrap();
             let mut count = 0;
             while let Some(window) = rev.next_edge().unwrap() {
                 count += 1;
@@ -2167,6 +2188,7 @@ mod tests {
 
     #[test]
     fn ordered_writer_history_preserves_same_lsn_occurrences_through_rewrite() {
+        let reader = Arc::new(MemoryAccountant::no_limit());
         let directory = tempfile::tempdir().unwrap();
         let (store, _) = store(&directory.path().join("history.db"));
         let entries = vec![
@@ -2187,12 +2209,16 @@ mod tests {
             .initialize_writer_snapshot(SnapshotId(0), Lsn(9))
             .unwrap();
         assert_eq!(old.change_log_occurrences(Lsn(9)).unwrap(), 2);
-        let mut selected = old.table_change_cursor("a", Lsn(9), Lsn(9)).unwrap();
+        let mut selected = old
+            .table_change_cursor(SourceWindowOwner::Read(reader.clone()), "a", Lsn(9), Lsn(9))
+            .unwrap();
         for entry in &entries {
             assert_eq!(&selected.next_table_change().unwrap().unwrap().value, entry);
         }
         assert!(selected.next_table_change().unwrap().is_none());
-        let mut cursor = old.change_log_cursor(Lsn(9), Lsn(9)).unwrap();
+        let mut cursor = old
+            .change_log_cursor(SourceWindowOwner::Read(reader.clone()), Lsn(9), Lsn(9))
+            .unwrap();
         for entry in &entries {
             assert_eq!(&cursor.next_change().unwrap().unwrap().value, entry);
         }
@@ -2207,11 +2233,13 @@ mod tests {
             .unwrap();
         assert_eq!(new.change_log_occurrences(Lsn(9)).unwrap(), 1);
         assert_eq!(old.change_log_occurrences(Lsn(9)).unwrap(), 2);
-        let mut cursor = new.change_log_cursor(Lsn(9), Lsn(9)).unwrap();
+        let mut cursor = new
+            .change_log_cursor(SourceWindowOwner::Read(reader.clone()), Lsn(9), Lsn(9))
+            .unwrap();
         assert_eq!(cursor.next_change().unwrap().unwrap().value, entries[0]);
         assert!(cursor.next_change().unwrap().is_none());
         assert!(
-            old.change_log_cursor(Lsn(9), Lsn(9))
+            old.change_log_cursor(SourceWindowOwner::Read(reader.clone()), Lsn(9), Lsn(9))
                 .unwrap()
                 .next_change()
                 .unwrap()

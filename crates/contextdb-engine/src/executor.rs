@@ -21378,7 +21378,21 @@ mod tests {
             Some("CREATE INDEX readable_vectors_context_idx ON readable_vectors (context)")
         );
         let plan = contextdb_planner::plan(&contextdb_parser::parse(sql).unwrap()).unwrap();
-        let eager = execute_plan(&scoped, &plan, &HashMap::new(), None).unwrap_err();
+        let executor_fixture_reader_1 = scoped
+            .declared_reader_memory()
+            .expect("admit the fixture executor reader");
+        let mut executor_fixture_copy_1 =
+            crate::vector_read_memory::admission(executor_fixture_reader_1.clone());
+
+        let eager = execute_plan(
+            &scoped,
+            &plan,
+            &HashMap::new(),
+            None,
+            &mut executor_fixture_copy_1,
+            executor_fixture_reader_1,
+        )
+        .unwrap_err();
         let pull = scoped.execute(sql, &HashMap::new()).unwrap_err();
         assert!(matches!(
             eager,
@@ -21390,7 +21404,21 @@ mod tests {
             &HashMap::new(),
         )
         .unwrap();
-        let eager = execute_plan(&scoped, &plan, &HashMap::new(), None).unwrap();
+        let executor_fixture_reader_2 = scoped
+            .declared_reader_memory()
+            .expect("admit the fixture executor reader");
+        let mut executor_fixture_copy_2 =
+            crate::vector_read_memory::admission(executor_fixture_reader_2.clone());
+
+        let eager = execute_plan(
+            &scoped,
+            &plan,
+            &HashMap::new(),
+            None,
+            &mut executor_fixture_copy_2,
+            executor_fixture_reader_2,
+        )
+        .unwrap();
         let pull = scoped.execute(sql, &HashMap::new()).unwrap();
         assert_eq!(eager.rows, pull.rows);
         assert_eq!(pull.rows, vec![vec![Value::Int64(1)]]);
@@ -21426,7 +21454,21 @@ mod tests {
         assert_eq!(auto_ready.refusal, None);
         assert_eq!(auto_ready.recovery, None);
         let auto_plan = contextdb_planner::plan(&contextdb_parser::parse(&auto).unwrap()).unwrap();
-        let auto_eager = execute_plan(&scoped, &auto_plan, &HashMap::new(), None).unwrap();
+        let executor_fixture_reader_3 = scoped
+            .declared_reader_memory()
+            .expect("admit the fixture executor reader");
+        let mut executor_fixture_copy_3 =
+            crate::vector_read_memory::admission(executor_fixture_reader_3.clone());
+
+        let auto_eager = execute_plan(
+            &scoped,
+            &auto_plan,
+            &HashMap::new(),
+            None,
+            &mut executor_fixture_copy_3,
+            executor_fixture_reader_3,
+        )
+        .unwrap();
         let auto_pull = scoped.execute(&auto, &HashMap::new()).unwrap();
         assert_eq!(auto_eager.rows, pull.rows);
         assert_eq!(auto_eager.rows, auto_pull.rows);
@@ -21451,7 +21493,21 @@ mod tests {
         assert_eq!(auto_exact.route, Some(VectorSearchRoute::Exact));
         assert_eq!(auto_exact.fallback.as_deref(), Some("filtered_route_exact"));
         assert_eq!(passive(sql).refusal, refused.refusal);
-        let eager = execute_plan(&scoped, &plan, &HashMap::new(), None).unwrap();
+        let executor_fixture_reader_4 = scoped
+            .declared_reader_memory()
+            .expect("admit the fixture executor reader");
+        let mut executor_fixture_copy_4 =
+            crate::vector_read_memory::admission(executor_fixture_reader_4.clone());
+
+        let eager = execute_plan(
+            &scoped,
+            &plan,
+            &HashMap::new(),
+            None,
+            &mut executor_fixture_copy_4,
+            executor_fixture_reader_4,
+        )
+        .unwrap();
         assert!(!scoped.__debug_last_query_vector_used_hnsw_for_test());
         let pull = scoped.execute(&auto, &HashMap::new()).unwrap();
         assert_eq!(eager.rows, pull.rows);
@@ -21531,10 +21587,23 @@ mod tests {
             panic!("expected SELECT");
         };
         let filter = select.body.where_clause.expect("expected WHERE filter");
+        let executor_fixture_reader_5 = db
+            .declared_reader_memory()
+            .expect("admit the fixture executor reader");
+        let mut executor_fixture_copy_5 =
+            crate::vector_read_memory::admission(executor_fixture_reader_5.clone());
 
-        let resolved =
-            resolve_graph_filter_at_snapshot(&db, &filter, &HashMap::new(), None, snapshot, &[])
-                .unwrap();
+        let resolved = resolve_graph_filter_at_snapshot(
+            &db,
+            &filter,
+            &HashMap::new(),
+            None,
+            snapshot,
+            &[],
+            &mut executor_fixture_copy_5,
+            executor_fixture_reader_5,
+        )
+        .unwrap();
         let Expr::InList { list, .. } = resolved else {
             panic!("expected resolved IN list");
         };

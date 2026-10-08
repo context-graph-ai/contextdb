@@ -414,9 +414,14 @@ fn declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor(
             &query,
         )
         .expect("search with the declared breadth");
-    let declared = db
-        .__debug_last_query_vector_trace_for_test()
-        .expect("declared route publishes candidate accounting");
+    let declared = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__debug_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the actual vector route observation")
+    }
+    .expect("declared route publishes candidate accounting");
     assert!(declared.used_hnsw);
     assert_eq!(
         declared.hnsw_candidate_count, 32,
@@ -443,9 +448,14 @@ fn declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor(
         &query,
     )
     .expect("search with the silent compatibility breadth");
-    let silent = db
-        .__debug_last_query_vector_trace_for_test()
-        .expect("silent route publishes candidate accounting");
+    let silent = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__debug_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the actual vector route observation")
+    }
+    .expect("silent route publishes candidate accounting");
     assert!(silent.used_hnsw);
     assert!(
         silent.hnsw_candidate_count >= 100,

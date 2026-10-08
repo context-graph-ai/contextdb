@@ -229,7 +229,14 @@ fn scoped_sync_source(db: &Database, table: &str, row_id: RowId) -> Option<(Lsn,
         .capture_writer_statement()
         .expect("capture durable sidecar root");
     root.expect("file-backed sidecar source")
-        .sync_source(table, row_id)
+        .sync_source(
+            crate::persistence::writer_source::SourceWindowOwner::Read(
+                db.declared_reader_memory()
+                    .expect("admit the durable sidecar reader"),
+            ),
+            table,
+            row_id,
+        )
         .expect("read only this row's durable provenance sidecar")
 }
 
@@ -253,12 +260,23 @@ fn captured(selection: &AuthoritativePurgeSelection, row_id: RowId) -> CapturedL
 
 fn current_row_change(db: &Database, table: &str, key: &NaturalKey) -> RowChange {
     let snapshot = db.snapshot();
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let current_lsn = db
-        .visible_row_by_natural_key(table, key, snapshot, &std::collections::HashSet::new())
+        .visible_row_by_natural_key(
+            table,
+            key,
+            snapshot,
+            &std::collections::HashSet::new(),
+            fixture_operation_reader_1.clone(),
+        )
         .expect("find fixture row by its exact natural key")
         .expect("fixture row remains live while recording acknowledgement")
         .lsn;
     db.changes_since(Lsn(0))
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .filter(|row| {
@@ -302,7 +320,7 @@ fn assert_owned_copies_equal_after_reopen(before: &OwnedCopies, after: &OwnedCop
 
 fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
     let vectors = vector_row_ids(db);
-    let changes = db.changes_since(Lsn(0));
+    let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     let selected_history = changes
         .rows
         .iter()
@@ -331,6 +349,14 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
         })
         .cloned()
         .collect::<Vec<_>>();
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     OwnedCopies {
         selected_live: exact_rows(db, NOTES, fixture.selected, None),
         selected_secondary_index: secondary_index_rows(db, "selected-after-update"),
@@ -411,6 +437,7 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
                     EDGE_TYPE.to_string(),
                 ),
                 |record| Ok(record.cloned()),
+                fixture_operation_reader_1.clone(),
             )
             .expect("read scoped durable graph arrival"),
         survivor_graph_arrival: db
@@ -421,6 +448,7 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
                     EDGE_TYPE.to_string(),
                 ),
                 |record| Ok(record.cloned()),
+                fixture_operation_reader_2.clone(),
             )
             .expect("read scoped durable graph arrival"),
     }
@@ -551,6 +579,10 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
     let fixture_identity = crate::identity::FabricIdentity::generate();
     let fixture_node_id = fixture_identity.node_id();
     let fixture_incarnation = Incarnation(0xb2);
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let bound_lineages = db
         .outbound_row_lineages(
             &ChangeSet {
@@ -561,6 +593,7 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
             &fixture_node_id,
             fixture_incarnation,
             &|bytes| Ok(fixture_identity.sign_lineage(bytes)),
+            fixture_operation_reader_2.clone(),
         )
         .expect("bind exact current fixture rows through outbound lineage");
     let lineage_key = |row: &RowChange| {
@@ -608,18 +641,49 @@ fn finish_fixture(seed: &FixtureSeed, pinned_snapshot: SnapshotId) -> Fixture {
         selected_lineage.author_local_mutation_position < selected_current.lsn,
         "the body-only update retains its original creation root"
     );
+    let fixture_operation_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
 
     let note_selection = db
-        .resolve_authoritative_purge_selection(NOTES, &selected_note_key)
+        .resolve_authoritative_purge_selection(
+            NOTES,
+            &selected_note_key,
+            fixture_operation_reader_3.clone(),
+        )
         .expect("resolve selected note lineage");
+    let fixture_operation_reader_4 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let edge_selection = db
-        .resolve_authoritative_purge_selection(EDGES, &selected_edge_key)
+        .resolve_authoritative_purge_selection(
+            EDGES,
+            &selected_edge_key,
+            fixture_operation_reader_4.clone(),
+        )
         .expect("resolve selected edge lineage separately from notes");
+    let fixture_operation_reader_5 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let survivor_note_selection = db
-        .resolve_authoritative_purge_selection(NOTES, &survivor_note_key)
+        .resolve_authoritative_purge_selection(
+            NOTES,
+            &survivor_note_key,
+            fixture_operation_reader_5.clone(),
+        )
         .expect("resolve survivor note lineage");
+    let fixture_operation_reader_6 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let survivor_edge_selection = db
-        .resolve_authoritative_purge_selection(EDGES, &survivor_edge_key)
+        .resolve_authoritative_purge_selection(
+            EDGES,
+            &survivor_edge_key,
+            fixture_operation_reader_6.clone(),
+        )
         .expect("resolve survivor edge lineage");
     assert_eq!(
         note_selection.lineage_root,
@@ -780,7 +844,7 @@ fn assert_full_selected_absence_after_reopen(
         survivor_secondary_index.index_used.as_deref(),
         Some("notes_body_idx")
     );
-    let reopened_changes = db.changes_since(Lsn(0));
+    let reopened_changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert!(
         reopened_changes.rows.iter().all(|row| {
             row.table != NOTES || row.natural_key != fixture.selected_note.natural_key
@@ -981,10 +1045,20 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         before.graph.survivor_reverse,
         BTreeSet::from([fixture.survivor])
     );
+    let fixture_operation_reader_7 = seed
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_7 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_7.clone());
 
     let note_frontier = seed
         .db
-        .commit_authoritative_purge_kernel(&fixture.note_selection)
+        .commit_authoritative_purge_kernel(
+            &fixture.note_selection,
+            &mut fixture_operation_copy_7,
+            fixture_operation_reader_7.clone(),
+        )
         .expect("commit selected note lineage purge");
     let after_notes = owned_copies(&seed.db, &fixture);
     assert!(after_notes.selected_live.is_empty());
@@ -1101,10 +1175,20 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         after_notes.survivor_note_live_sidecar,
         before.survivor_note_live_sidecar
     );
+    let fixture_operation_reader_8 = seed
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_8 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_8.clone());
 
     let edge_frontier = seed
         .db
-        .commit_authoritative_purge_kernel(&fixture.edge_selection)
+        .commit_authoritative_purge_kernel(
+            &fixture.edge_selection,
+            &mut fixture_operation_copy_8,
+            fixture_operation_reader_8.clone(),
+        )
         .expect("commit selected edge lineage purge separately from notes");
     let after_edges = owned_copies(&seed.db, &fixture);
     assert!(after_edges.selected_edge_live.is_empty());
@@ -1206,9 +1290,20 @@ fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
     let pinned_snapshot = seed.db.snapshot();
     let pinned = seed.db.pin_snapshot(pinned_snapshot);
     let fixture = finish_fixture(&seed, pinned_snapshot);
+    let fixture_operation_reader_9 = seed
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_9 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_9.clone());
+
     let edge_frontier = seed
         .db
-        .commit_authoritative_purge_kernel(&fixture.edge_selection)
+        .commit_authoritative_purge_kernel(
+            &fixture.edge_selection,
+            &mut fixture_operation_copy_9,
+            fixture_operation_reader_9.clone(),
+        )
         .expect("commit edge purge before export captures its snapshot");
     let edge_purged_baseline = owned_copies(&seed.db, &fixture);
     assert!(edge_purged_baseline.selected_edge_live.is_empty());
@@ -1259,9 +1354,20 @@ fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
             pause.wait_until_reached(Duration::from_secs(5)),
             "export must capture its snapshot before the private kernel commits"
         );
+        let fixture_operation_reader_10 = seed
+            .db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_10 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_10.clone());
+
         let note_frontier = seed
             .db
-            .commit_authoritative_purge_kernel(&fixture.note_selection)
+            .commit_authoritative_purge_kernel(
+                &fixture.note_selection,
+                &mut fixture_operation_copy_10,
+                fixture_operation_reader_10.clone(),
+            )
             .expect("commit note purge while export is paused");
         // The export has observed the required ordering. Release it before
         // any assertion that can panic so scoped-thread cleanup cannot strand
@@ -1331,9 +1437,20 @@ fn authoritative_file_purge_kernel_rolls_back_every_owned_copy_on_persistence_fa
     let before = owned_copies(&seed.db, &fixture);
     seed.db
         .arm_authoritative_purge_point_remove_persistence_failure_for_test();
+    let fixture_operation_reader_11 = seed
+        .db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_11 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_11.clone());
+
     assert!(
         seed.db
-            .commit_authoritative_purge_kernel(&fixture.note_selection)
+            .commit_authoritative_purge_kernel(
+                &fixture.note_selection,
+                &mut fixture_operation_copy_11,
+                fixture_operation_reader_11.clone()
+            )
             .is_err(),
         "the staged point-removes must fail before their one Redb commit"
     );
@@ -1345,9 +1462,19 @@ fn authoritative_file_purge_kernel_rolls_back_every_owned_copy_on_persistence_fa
     let after_notes = owned_copies(&reopened_notes, &fixture);
     assert_owned_copies_equal_after_reopen(&before, &after_notes);
     reopened_notes.arm_authoritative_purge_point_remove_persistence_failure_for_test();
+    let fixture_operation_reader_12 = reopened_notes
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_12 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_12.clone());
+
     assert!(
         reopened_notes
-            .commit_authoritative_purge_kernel(&fixture.edge_selection)
+            .commit_authoritative_purge_kernel(
+                &fixture.edge_selection,
+                &mut fixture_operation_copy_12,
+                fixture_operation_reader_12.clone()
+            )
             .is_err(),
         "the graph-owning edge selection must fail before its one Redb commit"
     );

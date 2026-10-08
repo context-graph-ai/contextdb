@@ -403,13 +403,27 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
                 semantic.search_mode = Some(VectorSearchMode::Indexed);
                 db.__reset_last_query_vector_trace_for_test();
                 let embedded = db.semantic_search(semantic.clone()).unwrap();
-                let plain_trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                let plain_trace = {
+                    let seam_read_memory = db
+                        .declared_reader_memory()
+                        .expect("admit the fixture operation reader");
+                    db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                        .expect("read the admitted trace observation")
+                }
+                .unwrap();
                 if selected == 100 && query_id == 0 {
                     for threshold in [0.0, embedded[4].vector_score] {
                         semantic.min_similarity = Some(threshold);
                         db.__reset_last_query_vector_trace_for_test();
                         let filtered = db.semantic_search(semantic.clone()).unwrap();
-                        let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                        let trace = {
+                            let seam_read_memory = db
+                                .declared_reader_memory()
+                                .expect("admit the fixture operation reader");
+                            db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                                .expect("read the admitted trace observation")
+                        }
+                        .unwrap();
                         println!(
                             "minimum_similarity quantization={mode} threshold={threshold} plain_ef={:?} threshold_ef={:?} plain_candidates={} threshold_candidates={}",
                             plain_trace.hnsw_ef_search,
@@ -788,8 +802,17 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
             let cleaned = db.compact_currency_versions().unwrap();
             assert_eq!(cleaned.pruned_versions, 1);
             assert_eq!(cleaned.vector_keys_rewritten, 1);
+            let vector_fixture_reader_1 = db
+                .declared_reader_memory()
+                .expect("admit the vector fixture reader");
+            let mut vector_fixture_copy_1 =
+                contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
             assert_eq!(
-                db.vector_store_for_test().raw_directory_entries().len(),
+                db.vector_store_for_test()
+                    .raw_directory_entries(&mut vector_fixture_copy_1)
+                    .expect("read or publish the admitted vector fixture")
+                    .len(),
                 2,
                 "cleanup must actually leave one version of each row"
             );
@@ -822,13 +845,27 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                     );
                     db.__reset_last_query_vector_trace_for_test();
                     let ordinary = db.execute(&sql, &parameters(&query)).unwrap();
-                    let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                    let trace = {
+                        let seam_read_memory = db
+                            .declared_reader_memory()
+                            .expect("admit the fixture operation reader");
+                        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                            .expect("read the admitted trace observation")
+                    }
+                    .unwrap();
                     assert!(trace.used_hnsw);
                     assert_eq!(trace.supplemented_row_count, 0);
                     assert_eq!(ordinary.rows, expected.rows[..limit]);
                     db.__reset_last_query_vector_trace_for_test();
                     let bounded = bounded_query(&db, &sql, &query);
-                    let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                    let trace = {
+                        let seam_read_memory = db
+                            .declared_reader_memory()
+                            .expect("admit the fixture operation reader");
+                        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                            .expect("read the admitted trace observation")
+                    }
+                    .unwrap();
                     assert!(trace.used_hnsw);
                     assert_eq!(trace.supplemented_row_count, 0);
                     assert_eq!(
@@ -997,7 +1034,14 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                 "{mode} history={} filters before top-k",
                 end - 100
             );
-            let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+            let trace = {
+                let seam_read_memory = db
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                    .expect("read the admitted trace observation")
+            }
+            .unwrap();
             assert_eq!(trace.used_hnsw, mode == "INDEXED");
             assert_eq!(trace.supplemented_row_count, 0);
             if mode == "INDEXED" {
@@ -1021,7 +1065,14 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
             );
             let bounded = bounded::execute(&db, &request).unwrap();
             assert_eq!(bounded.result.rows, exact.rows);
-            let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+            let trace = {
+                let seam_read_memory = db
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                    .expect("read the admitted trace observation")
+            }
+            .unwrap();
             assert_eq!(trace.used_hnsw, mode == "INDEXED");
             assert_eq!(trace.supplemented_row_count, 0);
             assert_eq!(

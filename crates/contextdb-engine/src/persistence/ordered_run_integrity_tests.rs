@@ -44,6 +44,21 @@ fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Res
             .map(|tx| tx.0)
             .unwrap(),
     );
+    let persistence_fixture_parent_1 =
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            load.source
+                .verified_ordered_runs
+                .memory
+                .accountant
+                .usage()
+                .limit
+                .map(|bytes| bytes as u64)
+                .unwrap_or(u64::MAX),
+        );
+    let persistence_fixture_reader_1 = persistence_fixture_parent_1
+        .child()
+        .expect("admit the persistence fixture reader child");
+
     load.source
         .bounded_relational_ordered_next(
             "postings",
@@ -54,6 +69,7 @@ fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Res
             &mut || Ok(()),
             &mut || Ok(()),
             &mut |_| Ok(()),
+            persistence_fixture_reader_1,
         )
         .map(|row| row.map(|row| row.row_id))
 }
@@ -122,6 +138,21 @@ fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
                         .map(|tx| tx.0)
                         .unwrap(),
                 );
+                let persistence_fixture_parent_2 =
+                    crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                        load.source
+                            .verified_ordered_runs
+                            .memory
+                            .accountant
+                            .usage()
+                            .limit
+                            .map(|bytes| bytes as u64)
+                            .unwrap_or(u64::MAX),
+                    );
+                let persistence_fixture_reader_2 = persistence_fixture_parent_2
+                    .child()
+                    .expect("admit the persistence fixture reader child");
+
                 let error = load.source.bounded_visit_verified_ordered_identities(
                     "postings",
                     "by_bucket",
@@ -132,6 +163,7 @@ fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
                         actual.push(id);
                         Err(Error::Other("suspend after delivery".into()))
                     },
+                    persistence_fixture_reader_2,
                 );
                 assert!(error.is_err());
             } else {
@@ -344,6 +376,21 @@ fn the_pinned_working_set_does_not_grow_with_the_range() {
                 .map(|tx| tx.0)
                 .unwrap(),
         );
+        let persistence_fixture_parent_3 =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                load.source
+                    .verified_ordered_runs
+                    .memory
+                    .accountant
+                    .usage()
+                    .limit
+                    .map(|bytes| bytes as u64)
+                    .unwrap_or(u64::MAX),
+            );
+        let persistence_fixture_reader_3 = persistence_fixture_parent_3
+            .child()
+            .expect("admit the persistence fixture reader child");
+
         load.source
             .bounded_relational_ordered_next(
                 "wide",
@@ -354,6 +401,7 @@ fn the_pinned_working_set_does_not_grow_with_the_range() {
                 &mut || Ok(()),
                 &mut || Ok(()),
                 &mut |_| Ok(()),
+                persistence_fixture_reader_3,
             )
             .map(|row| row.map(|row| row.row_id))
     }

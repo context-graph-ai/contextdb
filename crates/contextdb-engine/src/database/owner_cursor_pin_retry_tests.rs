@@ -44,12 +44,17 @@ fn busy_cursor_pin_retries_outside_commit_and_recaptures_the_complete_root() {
                 });
                 let clock: Arc<dyn DeadlineClock> = Arc::new(ManualDeadlineClock::at(0));
                 let budget = ReadRegistrationBudget::new(Arc::clone(&clock), 0, 10_000);
+                let fixture_operation_reader_1 = reader_db
+                    .declared_reader_memory()
+                    .expect("admit the actual fixture reader");
+
                 reader_db
                     .bounded_cursor_snapshot_registration(
                         clock,
                         10_000,
                         &budget,
                         &OwnerReadCancellation::new(),
+                        fixture_operation_reader_1.clone(),
                     )
                     .unwrap()
                     .unwrap()
@@ -115,12 +120,17 @@ fn busy_cursor_pin_cancellation_and_deadline_finish_before_handle_release() {
                     });
                     let clock: Arc<dyn DeadlineClock> = reader_clock;
                     let budget = ReadRegistrationBudget::new(Arc::clone(&clock), 0, 10_000);
+                    let fixture_operation_reader_2 = reader_db
+                        .declared_reader_memory()
+                        .expect("admit the actual fixture reader");
+
                     reader_db
                         .bounded_cursor_snapshot_registration(
                             clock,
                             10_000,
                             &budget,
                             &reader_withdrawn,
+                            fixture_operation_reader_2.clone(),
                         )
                         .map(|pin| pin.is_some())
                 });

@@ -908,7 +908,9 @@ fn seed_fixture_from_seed(
     let cursor_columns = cursor_result.columns;
     let cursor_rows = cursor_result.rows;
 
-    let (changes, arrivals) = db.changes_since_with_arrivals(Lsn(0));
+    let (changes, arrivals) = db
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     let changes_state = DirectChangeState {
         current_lsn: db.current_lsn(),
         committed_watermark: db.committed_watermark(),
@@ -1512,11 +1514,22 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
     assert_eq!(pages.len(), fixture.cursor_rows.len());
     for (ordinal, page) in pages.iter().enumerate() {
         assert_eq!(page.page.columns, fixture.cursor_columns);
-        assert_eq!(page.page.rows, vec![fixture.cursor_rows[ordinal].clone()]);
+        assert_eq!(&*page.page.rows, &[fixture.cursor_rows[ordinal].clone()]);
         assert_eq!(page.page.has_more, ordinal + 1 < fixture.cursor_rows.len());
         assert_eq!(
             page.canonical_bytes,
-            encode_cursor_page(&page.page).expect("shared encoder supplies cursor bytes")
+            encode_cursor_page(
+                &page
+                    .page
+                    .try_clone(
+                        reader
+                            .request_read_memory_for_test()
+                            .expect("admit the fixture page copy reader")
+                    )
+                    .expect("share the admitted private page")
+                    .into_public()
+            )
+            .expect("shared encoder supplies cursor bytes")
         );
     }
     let snapshot = pages[0].snapshot;
@@ -1542,7 +1555,7 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
     pages
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 struct ReadEvidence {
     queries: Vec<(Vec<u8>, DirectSnapshot)>,
     metadata: Vec<DirectMetadataResponse>,
@@ -3867,7 +3880,7 @@ fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() 
         .cursor
         .fetch(Some(one))
         .expect("cancelled cursor resumes");
-    assert_eq!(resumed.page.rows, vec![fixture.cursor_rows[1].clone()]);
+    assert_eq!(&*resumed.page.rows, &[fixture.cursor_rows[1].clone()]);
     opened.cursor.close().expect("close resumed cursor");
     assert_cursor_resources_released(&witness);
 }
@@ -4144,7 +4157,7 @@ fn manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources(
         .cursor
         .fetch(Some(one))
         .expect("activity refreshes idle deadline");
-    assert_eq!(active_page.page.rows, vec![fixture.cursor_rows[1].clone()]);
+    assert_eq!(&*active_page.page.rows, &[fixture.cursor_rows[1].clone()]);
     assert_cursor_resources_retained(&witness);
     clock.advance(5);
     let failure = match opened.cursor.fetch(Some(one)) {
@@ -4362,8 +4375,20 @@ fn a_row_with_no_embedding_keeps_the_store_directly_readable() {
         Some(&Value::Vector(store.embedding.clone())),
         "the neighbouring embedding is unchanged"
     );
-    let content = committed_content_for_test(&store.path)
-        .unwrap_or_else(|error| panic!("inspect committed F32 vectors: {error}"));
+    let content = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(&store.path, operation_read_memory, declared_read_memory)
+    }
+    .unwrap_or_else(|error| panic!("inspect committed F32 vectors: {error}"));
     assert_eq!(
         content
             .vectors
@@ -4621,8 +4646,20 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
                 "every row of a required {word} column is served the embedding it promises: {other:?}"
             ),
         }
-        let content = committed_content_for_test(&store.path)
-            .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
+        let content = {
+            let declared_read_memory =
+                contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    contextdb_engine::OwnerReadConfig::default()
+                        .limits
+                        .limits
+                        .memory,
+                );
+            let operation_read_memory = declared_read_memory
+                .child()
+                .expect("admit the committed-content observation owner");
+            committed_content_for_test(&store.path, operation_read_memory, declared_read_memory)
+        }
+        .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
         let embedded_row =
             stored_row_by_identity(&content.relational_rows, &store.table, store.embedded_id);
         let absent_row =
@@ -4820,8 +4857,20 @@ fn a_nullable_quantized_column_with_no_embedding_stays_directly_readable() {
             Some(&Value::Vector(quantized.clone())),
             "the neighbouring embedding is served unchanged"
         );
-        let content = committed_content_for_test(&store.path)
-            .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
+        let content = {
+            let declared_read_memory =
+                contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    contextdb_engine::OwnerReadConfig::default()
+                        .limits
+                        .limits
+                        .memory,
+                );
+            let operation_read_memory = declared_read_memory
+                .child()
+                .expect("admit the committed-content observation owner");
+            committed_content_for_test(&store.path, operation_read_memory, declared_read_memory)
+        }
+        .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
         let embedded_row =
             stored_row_by_identity(&content.relational_rows, &store.table, store.embedded_id);
         let vectors = vectors_for_column(&content.vectors, &store.table, &store.column);

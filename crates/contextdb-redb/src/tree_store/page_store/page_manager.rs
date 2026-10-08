@@ -1598,4 +1598,103 @@ mod test {
         let mut db = Database::open(tmpfile).unwrap();
         assert!(db.check_integrity().unwrap());
     }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn read_reference_tracker_releases_all_history_after_the_last_reference() {
+        use crate::tree_store::Page;
+        use crate::tree_store::page_store::base::PageHint;
+
+        let tmpfile = crate::create_tempfile();
+        let db = Database::create(&tmpfile).unwrap();
+        let mem = db.get_memory();
+        assert!(mem.read_page_ref_counts.lock().unwrap().is_empty());
+        for _ in 0..32 {
+            let first = mem.allocate_lowest(mem.get_page_size()).unwrap();
+            let first_number = first.get_page_number();
+            drop(first);
+            let second = mem.allocate_lowest(mem.get_page_size()).unwrap();
+            let second_number = second.get_page_number();
+            drop(second);
+            assert_ne!(first_number, second_number);
+
+            let first = mem.get_page(first_number, PageHint::Clean).unwrap();
+            let first_clone = first.clone();
+            let second = mem.get_page(second_number, PageHint::Clean).unwrap();
+            {
+                let refs = mem.read_page_ref_counts.lock().unwrap();
+                assert_eq!(refs.len(), 2);
+                assert_eq!(refs.get(&first_number), Some(&2));
+                assert_eq!(refs.get(&second_number), Some(&1));
+            }
+            drop(first);
+            assert_eq!(
+                mem.read_page_ref_counts.lock().unwrap().get(&first_number),
+                Some(&1)
+            );
+            drop(first_clone);
+            {
+                let refs = mem.read_page_ref_counts.lock().unwrap();
+                assert_eq!(refs.len(), 1);
+                assert!(!refs.contains_key(&first_number));
+                assert_eq!(refs.get(&second_number), Some(&1));
+            }
+            drop(second);
+            let refs = mem.read_page_ref_counts.lock().unwrap();
+            assert!(
+                refs.is_empty(),
+                "no historical page number survives its last reference"
+            );
+            assert_eq!(
+                refs.capacity(),
+                0,
+                "no historical bucket allocation survives an empty tracker"
+            );
+        }
+    }
+    #[test]
+    fn committed_write_buffer_releases_all_map_capacity_even_at_zero_cache_cap() {
+        use crate::{ReadableDatabase, ReadableTable};
+        for cap in [0, 4096, 4 * 1024 * 1024] {
+            let tmpfile = crate::create_tempfile();
+            let db = Database::builder()
+                .set_cache_size(cap)
+                .create(tmpfile.path())
+                .unwrap();
+            let mem = db.get_memory();
+            let index_bytes = mem.storage.index_bytes();
+            let definition: TableDefinition<u64, &[u8]> =
+                TableDefinition::new("commit_index_probe");
+            for round in 0..2_u64 {
+                let transaction = db.begin_write().unwrap();
+                {
+                    let mut table = transaction.open_table(definition).unwrap();
+                    for key in 0..16_u64 {
+                        let bytes = [round as u8; 512];
+                        table.insert(&key, bytes.as_slice()).unwrap();
+                    }
+                }
+                transaction.commit().unwrap();
+                assert_eq!(mem.storage.write_map_for_test(), (0, 0));
+                assert_eq!(mem.storage.index_bytes(), index_bytes);
+                {
+                    let read = db.begin_read().unwrap();
+                    let table = read.open_table(definition).unwrap();
+                    for key in 0..16_u64 {
+                        assert_eq!(
+                            table.get(&key).unwrap().unwrap().value(),
+                            &[round as u8; 512]
+                        );
+                    }
+                }
+                assert_eq!(mem.storage.write_map_for_test(), (0, 0));
+                #[cfg(debug_assertions)]
+                {
+                    let refs = mem.read_page_ref_counts.lock().unwrap();
+                    assert!(refs.is_empty());
+                    assert_eq!(refs.capacity(), 0);
+                }
+            }
+        }
+    }
 }

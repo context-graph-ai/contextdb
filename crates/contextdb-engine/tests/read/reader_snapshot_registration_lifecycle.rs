@@ -416,7 +416,6 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         }));
     }
     assert!(refused_file_bytes <= limit);
-    eprintln!("allocator refusal={refusal:?}");
     assert_eq!(
         writer
             .__projected_disk_growth_bytes_for_test()
@@ -450,11 +449,6 @@ fn projected_allocator_growth_respects_disk_limit_with_a_live_retained_reader() 
         .div_ceil(64)
         + 2;
     for pass in 0..passes {
-        eprintln!(
-            "deferred-free pass={pass} retained={:?} backlog={:?}",
-            writer.__external_snapshot_retention_for_test().unwrap(),
-            writer.__deferred_free_backlog_for_test().unwrap()
-        );
         writer
             .__commit_storage_transaction_for_test()
             .expect("finite deferred-free pass fits the unchanged disk ceiling");

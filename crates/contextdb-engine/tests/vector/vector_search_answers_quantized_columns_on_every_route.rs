@@ -245,12 +245,14 @@ fn a_cursor_answers_the_quantized_columns_a_search_projects() {
             rows.extend(page.rows.iter().cloned());
             more = page.has_more;
         }
-        QueryResult {
-            columns,
-            rows,
-            rows_affected: 0,
-            trace: traced.trace,
-            cascade: None,
+        {
+            let mut result = QueryResult::empty();
+            result.columns = columns;
+            result.rows = rows;
+            result.rows_affected = 0;
+            result.trace = traced.trace;
+            result.cascade = None;
+            result
         }
     });
     database.close().expect("the writer closes cleanly");

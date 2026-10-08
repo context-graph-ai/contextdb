@@ -49,7 +49,8 @@ async fn serve(
             tenant.clone(),
             node,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -83,6 +84,7 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         .build()
         .unwrap();
     let mut peaks = Vec::new();
+    let mut bootstrap_push_peaks = Vec::new();
     let mut payloads = Vec::new();
     for occurrences in [32, 256] {
         let directory = tempfile::tempdir().unwrap();
@@ -138,18 +140,27 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
             broker.client_as(&source_identity.node_id()),
             tenant.clone(),
             source_identity.clone(),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         runtime.block_on(client.push()).unwrap();
         runtime.block_on(client.pull_default()).unwrap();
         // Pull installs received schema after the first push's watermark.
-        // Settle that bootstrap before measuring a fixed data-only delta.
+        // Measure the first post-pull push separately, then the later data-only delta.
         sql(
             &source,
             "UPDATE notes SET body = 'bootstrap-settled' WHERE id = 1",
         );
         sql(&source, "UPDATE notes SET body = 'bootstrap' WHERE id = 1");
         let settled_frontier = source.current_lsn();
+        source.accountant().reset_high_water_for_test();
+        let bootstrap_baseline = source.accountant().usage().used;
         runtime.block_on(client.push()).unwrap();
+        let bootstrap_peak = source
+            .accountant()
+            .high_water_for_test()
+            .checked_sub(bootstrap_baseline)
+            .unwrap();
+        bootstrap_push_peaks.push(bootstrap_peak);
         assert!(client.push_watermark() >= settled_frontier);
         assert_eq!(
             ids(&hub, "reincarnated"),
@@ -178,7 +189,8 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
             broker.client_as(&source_identity.node_id()),
             tenant.clone(),
             source_identity.clone(),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         client.set_peer_vector_schema_support_for_test(false);
         sql(&source, "INSERT INTO notes VALUES (2,'fixed-delta')");
         sql(&source, "INSERT INTO held VALUES (99,7)");
@@ -186,7 +198,6 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         // not be walked even though an actual earlier schema bootstrap did.
         let ((pending, reads), work) = summaries(|| history(|| client.pending_push_change_count()));
         assert_eq!(pending.unwrap(), 2);
-        eprintln!("ddl occurrences={occurrences} reduction={work:?} history={reads:?}");
         assert_eq!(
             work.direction_summary_reads, 2,
             "one predecessor lookup for each distinct table/LSN"
@@ -208,7 +219,6 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
             sample.1 += entry.bytes;
             sample.2 = sample.2.max(entry.used_after);
         }
-        eprintln!("settled push allocation ledger occurrences={occurrences} actual={named:?}");
         let result = result.unwrap();
         let peak = source
             .accountant()
@@ -224,14 +234,7 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         for position in peak_positions {
             let first = position.saturating_sub(8);
             let last = (position + 9).min(ledger.len());
-            eprintln!(
-                "settled source peak occurrences={occurrences} target={source_peak} position={position} actual={:?}",
-                &ledger[first..last]
-            );
         }
-        eprintln!(
-            "ddl occurrences={occurrences} push_peak={peak} baseline={baseline} summary={work:?} history={reads:?}"
-        );
         assert_eq!(
             work.capability_summary_reads, 2,
             "one capability point read for each changed table, including sticky held vocabulary"
@@ -282,7 +285,8 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
             broker.client_as(&source_identity.node_id()),
             tenant.clone(),
             source_identity,
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         assert!(
             client
                 .schema_sync_holdbacks()
@@ -306,6 +310,10 @@ fn incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows() {
         source.close().unwrap();
         hub.close().unwrap();
     }
+    assert_eq!(
+        bootstrap_push_peaks[0], bootstrap_push_peaks[1],
+        "the first authenticated push after bootstrap pull has a fixed measured memory window despite unrelated declaration growth"
+    );
     assert_eq!(
         payloads[0], payloads[1],
         "unrelated immutable declarations cannot change the fixed authenticated payload"

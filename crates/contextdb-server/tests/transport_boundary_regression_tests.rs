@@ -88,7 +88,8 @@ async fn push_does_not_retry_incomplete_reply() {
         transport.clone(),
         contextdb_core::TenantId::from("push-incomplete-reply"),
         Arc::new(FabricIdentity::generate()),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = client.push().await;
 
     assert!(
@@ -197,7 +198,8 @@ async fn valid_server_error_surfaces_directly_without_lost_ack_reconciliation() 
         transport.clone(),
         contextdb_core::TenantId::from("push-terminal-error"),
         Arc::new(FabricIdentity::generate()),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = client.push().await;
 
     assert!(
@@ -359,7 +361,8 @@ async fn push_retry_unsafe_transport_falls_back_to_one_single_attempt() {
         transport.clone(),
         contextdb_core::TenantId::from("push-retry-unsafe"),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     client
         .push()
         .await
@@ -427,7 +430,8 @@ async fn pull_does_not_retry_no_responder() {
         transport.clone(),
         contextdb_core::TenantId::from("pull-no-responder"),
         Arc::new(FabricIdentity::generate()),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = client.pull_default().await;
 
     assert!(
@@ -561,7 +565,8 @@ async fn server_run_until_returns_after_accepted_push_apply_finishes() {
         contextdb_core::TenantId::from("apply-drain"),
         node_id,
         identity,
-    );
+    )
+    .expect("construct SyncServer fixture");
 
     // The exact lost-wakeup requires a scheduler interleaving inside wait_idle,
     // so this bounded test guards the observable contract: after the transport

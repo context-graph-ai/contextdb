@@ -1414,7 +1414,9 @@ fn t5_17_context_scoped_sink_without_principal_does_not_bypass_acl() {
 fn t5_18_event_bus_ddl_full_snapshot_recreates_working_route_on_peer() {
     let source = Database::open_memory();
     declare_inv_schema(&source);
-    let changes = source.changes_since(Lsn(0));
+    let changes = source
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert!(
         changes.ddl.iter().any(
             |ddl| matches!(ddl, DdlChange::CreateEventType { name, .. } if name == "inv_match")
@@ -1468,7 +1470,9 @@ fn t5_18_event_bus_ddl_full_snapshot_recreates_working_route_on_peer() {
 fn t5_19_event_bus_direction_filter_preserves_authenticated_schema_vector() {
     let source = Database::open_memory();
     declare_inv_schema(&source);
-    let changes = source.changes_since(Lsn(0));
+    let changes = source
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
 
     let filtered_out = changes.filter_by_direction(
         &HashMap::from([("invalidations".to_string(), SyncDirection::None)]),
@@ -1591,7 +1595,7 @@ fn t5_21_full_snapshot_omits_event_bus_ddl_for_dropped_source_table() {
     let db = Database::open_memory();
     declare_inv_schema(&db);
     db.execute("DROP TABLE invalidations", &empty()).unwrap();
-    let changes = db.changes_since(Lsn(0));
+    let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     let peer = Database::open_memory();
     peer.apply_changes(
         changes,
@@ -1847,7 +1851,9 @@ fn t5_27_standalone_sink_survives_sync_snapshot_without_route() {
         .unwrap();
     let peer = Database::open_memory();
     peer.apply_changes(
-        source.changes_since(Lsn(0)),
+        source
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .unwrap();

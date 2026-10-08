@@ -90,15 +90,20 @@ fn received(author: &Database, changes: &ChangeSet) -> Vec<WireDdlProvenance> {
     static AUTHOR: std::sync::OnceLock<contextdb_engine::identity::FabricIdentity> =
         std::sync::OnceLock::new();
     let identity = AUTHOR.get_or_init(contextdb_engine::identity::FabricIdentity::generate);
-    author
-        .outbound_ddl_provenance_for_test(
+    {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             changes,
             &TenantId::from(TENANT),
             &identity.node_id(),
             SOURCE_INCARNATION,
             &|bytes| Ok(identity.sign_for_test(bytes)),
+            seam_read_memory,
         )
-        .expect("the authoring store produces canonical DDL provenance for this schema unit")
+    }
+    .expect("the authoring store produces canonical DDL provenance for this schema unit")
 }
 
 fn apply_received(
@@ -112,15 +117,23 @@ fn apply_received(
         .expect("signed received schema has an author")
         .node_id
         .clone();
-    receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             changes,
             provenance,
             TenantId::from(TENANT),
             &source,
             SOURCE_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .map(|_| ())
+    }
+    .map(|_| ())
 }
 
 struct Paths {
@@ -156,7 +169,9 @@ fn prepared() -> (Paths, DropFrontiers) {
             .unwrap_or_else(|error| panic!("author `{ddl}`: {error}"));
     }
     author.commit(tx).expect("commit the authored schema");
-    let schema = author.changes_since(Lsn(0));
+    let schema = author
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(schema.ddl.len(), 3, "one authored schema unit");
     let provenance = received(&author, &schema);
     apply_received(&receiver, schema, provenance).expect("the receiver installs the schema");
@@ -167,7 +182,9 @@ fn prepared() -> (Paths, DropFrontiers) {
     insert_widget(&author, 0xa1, "synced-one", [1.0, 0.0]);
     insert_widget(&author, 0xa2, "synced-two", [0.0, 1.0]);
     insert_link(&author, 0xa3, 0xa1, 0xa2);
-    let rows = author.changes_since(after_schema);
+    let rows = author
+        .changes_since(after_schema)
+        .expect("read the declared changes");
     assert!(
         !rows.rows.is_empty() && !rows.vectors.is_empty(),
         "the pulled unit carries rows and vectors"
@@ -199,7 +216,20 @@ fn prepared() -> (Paths, DropFrontiers) {
     execute(&author, "DROP TABLE widget_links", empty());
     author.close().expect("release the authoring store");
 
-    let content = committed_content_for_test(&receiver_path).expect("inspect the receiver");
+    let content = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(&receiver_path, operation_read_memory, declared_read_memory)
+    }
+    .expect("inspect the receiver");
     assert!(
         content
             .relational_rows
@@ -249,7 +279,9 @@ struct DropFrontiers {
 /// The authored schema statements committed after `after` and at or before
 /// `through`, as the one schema unit a source sends for them.
 fn authored_unit(author: &Database, after: Lsn, through: Option<Lsn>) -> ChangeSet {
-    let mut changes = author.changes_since(after);
+    let mut changes = author
+        .changes_since(after)
+        .expect("read the declared changes");
     let (ddl_lsn, ddl): (Vec<_>, Vec<_>) = changes
         .ddl_lsn
         .iter()
@@ -305,7 +337,20 @@ fn families(digest: &DirectTypedImageDigest) -> [(&'static str, [u8; 32]); 11] {
 /// Recompute every family root from the committed store and require the
 /// maintained roots, and the root a reader authenticates, to equal them.
 fn assert_identity_describes_the_store(path: &Path, phase: &str) -> CommittedContentForTest {
-    let content = committed_content_for_test(path).expect("inspect the committed store");
+    let content = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(path, operation_read_memory, declared_read_memory)
+    }
+    .expect("inspect the committed store");
     let expected = independent_typed_digest(&content);
     let stale = families(&content.maintained_digest)
         .into_iter()
@@ -403,7 +448,9 @@ fn a_received_drop_retires_rows_provenance_vectors_and_links_from_the_identity()
     let author = Database::open(&paths.author).expect("reopen the authoring store");
     let before_recreate = author.current_lsn();
     execute(&author, WIDGETS, empty());
-    let recreate = author.changes_since(before_recreate);
+    let recreate = author
+        .changes_since(before_recreate)
+        .expect("read the declared changes");
     let provenance = received(&author, &recreate);
     author.close().expect("release the authoring store");
     let receiver = Database::open(&paths.receiver).expect("reopen to receive the recreate");
@@ -439,7 +486,20 @@ fn a_received_drop_whose_durable_commit_fails_leaves_the_old_identity_and_store(
     // reader contract, which runs under this lock.
     let _serial = crate::direct_file_reader_contract_tests::serialise_direct_file_test();
     let (paths, frontiers) = prepared();
-    let before = committed_content_for_test(&paths.receiver).expect("inspect the receiver");
+    let before = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(&paths.receiver, operation_read_memory, declared_read_memory)
+    }
+    .expect("inspect the receiver");
     let [(changes, provenance), _] = drop_units(&paths.author, frontiers);
     let receiver = Database::open(&paths.receiver).expect("reopen to receive the drop");
     receiver.fail_next_received_schema_durable_commit_for_test();
@@ -553,7 +613,20 @@ impl Drop for CrashChild {
 
 fn crash_at(boundary: CrashBoundary) {
     let (paths, frontiers) = prepared();
-    let before = committed_content_for_test(&paths.receiver).expect("inspect the receiver");
+    let before = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(&paths.receiver, operation_read_memory, declared_read_memory)
+    }
+    .expect("inspect the receiver");
     let mut command = Command::new(std::env::current_exe().expect("locate this test binary"));
     command
         .arg("--exact")
@@ -610,9 +683,21 @@ fn crash_at(boundary: CrashBoundary) {
     }
     restart(&paths.receiver);
     assert_eq!(
-        committed_content_for_test(&paths.receiver)
-            .expect("inspect the reopened receiver")
-            .maintained_digest,
+        {
+            let declared_read_memory =
+                contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    contextdb_engine::OwnerReadConfig::default()
+                        .limits
+                        .limits
+                        .memory,
+                );
+            let operation_read_memory = declared_read_memory
+                .child()
+                .expect("admit the committed-content observation owner");
+            committed_content_for_test(&paths.receiver, operation_read_memory, declared_read_memory)
+        }
+        .expect("inspect the reopened receiver")
+        .maintained_digest,
         recovered.maintained_digest,
         "reopening after recovery changes nothing"
     );

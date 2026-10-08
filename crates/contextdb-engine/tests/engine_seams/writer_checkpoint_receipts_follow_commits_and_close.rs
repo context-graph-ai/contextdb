@@ -152,6 +152,12 @@ fn check_owners(receipt: &Json) {
             "raw_vector_bodies",
             "raw_reverse_directory",
             "partition_vectors",
+            "vector_partition_controls",
+            "source_metadata",
+            "reader_source_metadata",
+            "reader_last_query_trace",
+            "reader_child_controls",
+            "reader_parent_total",
             "base_graph",
             "change_graph",
             "mutable_tail",
@@ -163,6 +169,32 @@ fn check_owners(receipt: &Json) {
             "accountant_total",
         ],
     );
+    let retained_fields = [
+        "raw_vector_bodies",
+        "raw_reverse_directory",
+        "partition_vectors",
+        "vector_partition_controls",
+        "base_graph",
+        "change_graph",
+        "mutable_tail",
+        "typed_partition_keys",
+        "retired_pinned_graph_bytes",
+        "source_metadata",
+    ];
+    let retained_sum = retained_fields
+        .iter()
+        .map(|field| vector[*field].as_u64().unwrap())
+        .sum::<u64>();
+    assert_eq!(retained_sum, vector["retained_total"].as_u64().unwrap());
+    let reader_sum = [
+        "reader_source_metadata",
+        "reader_child_controls",
+        "reader_last_query_trace",
+    ]
+    .iter()
+    .map(|field| vector[*field].as_u64().unwrap())
+    .sum::<u64>();
+    assert_eq!(reader_sum, vector["reader_parent_total"].as_u64().unwrap());
     require_unsigned_fields(
         &receipt["relational_inventory"],
         &[
@@ -219,7 +251,6 @@ fn writer_checkpoint_receipts_follow_commits_and_close() {
     let enabled = tempfile::tempdir().unwrap();
     let manifest = run_child(enabled.path(), true);
     let text = std::fs::read_to_string(enabled.path().join("receipts.jsonl")).unwrap();
-    println!("writer checkpoint manifest: {manifest}\nwriter checkpoint JSONL:\n{text}");
     assert!(
         text.ends_with('\n'),
         "each checkpoint is a complete JSONL record"
@@ -268,7 +299,6 @@ fn writer_checkpoint_receipts_follow_commits_and_close() {
     );
     let absent = tempfile::tempdir().unwrap();
     let control = run_child(absent.path(), false);
-    println!("absent-env writer manifest: {control}");
     assert!(!absent.path().join("receipts.jsonl").exists());
     assert_eq!(control["commits"], manifest["commits"]);
     assert_eq!(control["final_lsn"], manifest["final_lsn"]);

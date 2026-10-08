@@ -18,7 +18,11 @@ use contextdb_engine::local_transport::{
 };
 use contextdb_engine::owner_read::{OwnerClient, OwnerReadScaffoldError};
 use contextdb_engine::persistence::read_persistence_test_scaffold::inspect_companion_record_for_test;
-use contextdb_engine::read_contract::decode_cursor_page;
+#[path = "../owner_cursor_test_support.rs"]
+#[allow(dead_code)]
+mod owner_cursor_test_support;
+use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
+
 use contextdb_engine::{Database, DatabaseOpenOptions};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;

@@ -51,7 +51,10 @@ fn assert_absent(db: &Database, phase: &str) {
         "{phase}: rollback must not publish the trigger"
     );
     assert!(
-        db.changes_since(Lsn(0)).ddl.is_empty(),
+        db.changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .ddl
+            .is_empty(),
         "{phase}: rollback must not publish a partial authored migration"
     );
 }
@@ -76,7 +79,7 @@ fn assert_complete(db: &Database, phase: &str) {
         "{phase}: commit must publish the trigger with the rest of the schema"
     );
 
-    let changes = db.changes_since(Lsn(0));
+    let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert_eq!(
         changes.ddl.len(),
         STARTUP_SCHEMA.len(),
@@ -312,7 +315,10 @@ mod support;
 #[test]
 fn the_whole_startup_schema_installs_in_one_transaction() {
     let expected = support::reference(support::pinned::LOCAL);
-    let authored = expected.changes_since(Lsn(0)).ddl;
+    let authored = expected
+        .changes_since(Lsn(0))
+        .expect("read the declared changes")
+        .ddl;
     assert_eq!(authored.len(), support::pinned::LOCAL.len());
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("complete-cg-startup.db");
@@ -364,13 +370,19 @@ async fn the_complete_pinned_startup_reaches_a_second_edge_in_author_order() {
     let second_before = second.current_lsn();
     support::install(&source, support::pinned::LOCAL);
     support::initialize_fixture_callbacks(&source);
-    let authored = source.changes_since(source_before).ddl;
+    let authored = source
+        .changes_since(source_before)
+        .expect("read the declared changes")
+        .ddl;
     assert_eq!(authored.len(), support::pinned::LOCAL.len());
     support::assert_one_ordered_unit(&source, source_before, &authored);
     a.push()
         .await
         .expect("push the complete authenticated source migration");
-    let source_lsn = source.changes_since(source_before).ddl_lsn[0];
+    let source_lsn = source
+        .changes_since(source_before)
+        .expect("read the declared changes")
+        .ddl_lsn[0];
     assert!(
         support::assert_authored_wire(
             &hub.broker,
@@ -398,15 +410,26 @@ async fn the_complete_pinned_startup_reaches_a_second_edge_in_author_order() {
         support::assert_schema_contains(db, &expected);
         support::assert_contains_one_ordered_unit(db, before, &authored, phase);
     }
-    let before = second.changes_since(second_before);
+    let before = second
+        .changes_since(second_before)
+        .expect("read the declared changes");
     a.push().await.expect("repeat source sync");
     b.pull_default().await.expect("repeat receiver sync");
     assert_eq!(
-        second.changes_since(second_before).ddl,
+        second
+            .changes_since(second_before)
+            .expect("read the declared changes")
+            .ddl,
         before.ddl,
         "retry adds no duplicate prefix"
     );
-    assert_eq!(second.changes_since(second_before).ddl_lsn, before.ddl_lsn);
+    assert_eq!(
+        second
+            .changes_since(second_before)
+            .expect("read the declared changes")
+            .ddl_lsn,
+        before.ddl_lsn
+    );
     drop(a);
     drop(b);
     hub.stop().await;
@@ -422,7 +445,14 @@ fn the_complete_bound_tenant_startup_stages_without_rewriting_its_declarations()
     let expected = support::reference(support::pinned::TENANT_HUB);
     support::install(&db, support::pinned::TENANT_HUB);
     support::assert_full_schema(&db, &expected);
-    support::assert_one_ordered_unit(&db, Lsn(0), &expected.changes_since(Lsn(0)).ddl);
+    support::assert_one_ordered_unit(
+        &db,
+        Lsn(0),
+        &expected
+            .changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .ddl,
+    );
     db.close().unwrap();
 }
 
@@ -542,7 +572,10 @@ mod source_crash {
             support::assert_one_ordered_unit(
                 &reopened,
                 Lsn(0),
-                &expected.changes_since(Lsn(0)).ddl,
+                &expected
+                    .changes_since(Lsn(0))
+                    .expect("read the declared changes")
+                    .ddl,
             );
             assert_ne!(
                 after, before,
@@ -560,6 +593,7 @@ mod source_crash {
                 Lsn(0),
                 &support::reference(support::pinned::LOCAL)
                     .changes_since(Lsn(0))
+                    .expect("read the declared changes")
                     .ddl,
             );
         }

@@ -507,9 +507,14 @@ fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
     for (id, scope, query) in expected {
         let key = VectorPartitionKey::from_values(&[Value::Text(scope.to_owned())])
             .expect("scope has a canonical partition key");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let info = db
             .vector_store_for_test()
-            .partition_info(&index, &key)
+            .partition_info(&index, &key, &mut partition_observation_owner_1)
             .unwrap()
             .expect("the live partition keeps its inspection state");
         assert!(

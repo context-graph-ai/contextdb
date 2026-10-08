@@ -1485,7 +1485,11 @@ fn hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop() {
         })
         .expect("sealed source observer wraps a real prebuilt HNSW search");
     let trace = db
-        .__debug_last_query_vector_trace_for_test()
+        .__debug_last_query_vector_trace_for_test(
+            db.declared_reader_memory()
+                .expect("admit the trace observation reader"),
+        )
+        .expect("admit the trace observation copy")
         .expect("observed HNSW query publishes its trace");
     let observed_events = observer.events.load(Ordering::SeqCst);
     assert!(trace.used_hnsw);
@@ -1687,10 +1691,6 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
         .load(Ordering::SeqCst);
     let accountant_peak = profile_probe.peak_temporary_accounted_bytes();
     assert!(accountant_peak >= exact_memory);
-    eprintln!(
-        "{} request_owned_peak={exact_memory} accountant_peak={accountant_peak}",
-        case.name
-    );
     let source_items = profile_probe.source_items(case.touch);
     assert!(exact_work > 0, "{} performs real charged work", case.name);
     assert!(
@@ -1733,7 +1733,12 @@ fn assert_exact_n_and_n_minus_one_matrix_case(
         );
         let trace = case
             .db
-            .__debug_last_query_vector_trace_for_test()
+            .__debug_last_query_vector_trace_for_test(
+                case.db
+                    .declared_reader_memory()
+                    .expect("admit the trace observation reader"),
+            )
+            .expect("admit the trace observation copy")
             .expect("the HNSW source publishes its ordinary debug trace");
         assert!(
             source_items >= trace.hnsw_candidate_count as u64,
@@ -1968,7 +1973,11 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
         .expect("prebuild persistent HNSW state outside the bounded request");
     assert!(db.__debug_last_query_vector_used_hnsw_for_test());
     let hnsw_trace = db
-        .__debug_last_query_vector_trace_for_test()
+        .__debug_last_query_vector_trace_for_test(
+            db.declared_reader_memory()
+                .expect("admit the trace observation reader"),
+        )
+        .expect("admit the trace observation copy")
         .expect("the ordinary prebuild publishes the graph it actually searched");
     assert_eq!(hnsw_trace.index, matrix_hnsw_index);
     assert!(hnsw_trace.used_hnsw);
@@ -2097,9 +2106,17 @@ fn mostly_invisible_vector_history_is_charged_at_direct_and_cursor_boundaries() 
         )
         .expect("append a real superseding vector version");
     }
+    let mut vector_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the vector observation reader"),
+    );
+
     assert_eq!(
         db.vector_store_for_test()
-            .entries_for_index(&VectorIndexRef::new("mostly_dead_vectors", "embedding"))
+            .entries_for_index(
+                &VectorIndexRef::new("mostly_dead_vectors", "embedding"),
+                &mut vector_observation_owner_1
+            )
             .expect("inspect the physical vector history")
             .len(),
         STORED_VERSIONS as usize,

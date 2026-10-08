@@ -274,7 +274,15 @@ fn t18_05_cron_callback_stamped_txid_matches_commit_event_lsn_resolution() {
     .unwrap();
     let receiver = db.subscribe();
     std::thread::sleep(Duration::from_millis(600));
-    let fires = db.cron_run_due_now_for_test().unwrap();
+    let fires = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    }
+    .unwrap();
     assert_eq!(fires, 1);
     let event = receiver
         .recv_timeout(Duration::from_secs(2))

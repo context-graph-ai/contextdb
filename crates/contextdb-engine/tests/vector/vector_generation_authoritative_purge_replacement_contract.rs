@@ -82,8 +82,17 @@ fn durable_generation_id(db: &Database, scope: Uuid) -> Option<u64> {
 }
 
 fn graph_available(db: &Database, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(&index(), &partition(scope))
+        .partition_info(
+            &index(),
+            &partition(scope),
+            &mut partition_observation_owner_1,
+        )
         .unwrap()
         .is_some_and(|info| info.graph_available)
 }
@@ -224,7 +233,8 @@ async fn build_quantized_erasure_fixture(
             TenantId::from(ERASURE_TENANT),
             hub_node,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -242,10 +252,17 @@ async fn build_quantized_erasure_fixture(
         broker.client_as(&node_id),
         TenantId::from(ERASURE_TENANT),
         identity,
-    );
-    within(client.__seed_application_table_policy_binding_for_test(erasure_policy()))
-        .await
-        .expect("bind both edge declarations to the authoritative hub policy");
+    )
+    .expect("construct the authenticated sync endpoint");
+    within(
+        client.__seed_application_table_policy_binding_for_test(
+            erasure_policy(),
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind both edge declarations to the authoritative hub policy");
     create_erasure_tables(&edge);
 
     let selected_tx = edge.begin().expect("begin the selected custody unit");
@@ -280,6 +297,8 @@ async fn build_quantized_erasure_fixture(
                 root_key: erasure_key(selected_root),
                 members: vec![],
             },
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .expect("register the selected row's durable custody manifest");
     edge.commit(selected_tx)
@@ -320,25 +339,35 @@ async fn build_quantized_erasure_fixture(
                 root_key: erasure_key(surviving_root),
                 members: vec![],
             },
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .expect("register the surviving root's explicit empty member set");
     edge.commit(survivor_tx)
         .expect("commit the surviving rows and custody manifest together");
 
-    within(client.__seed_delivery_outcome_for_test(
-        "erasure_roots",
-        &erasure_key(selected_root),
-        DeliveryOutcomeKind::Accepted,
-        None,
-    ))
+    within(
+        client.__seed_delivery_outcome_for_test(
+            "erasure_roots",
+            &erasure_key(selected_root),
+            DeliveryOutcomeKind::Accepted,
+            None,
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .expect("materialize and answer the selected unit through the custody fixture seam");
-    within(client.__seed_delivery_outcome_for_test(
-        "erasure_roots",
-        &erasure_key(surviving_root),
-        DeliveryOutcomeKind::Accepted,
-        None,
-    ))
+    within(
+        client.__seed_delivery_outcome_for_test(
+            "erasure_roots",
+            &erasure_key(surviving_root),
+            DeliveryOutcomeKind::Accepted,
+            None,
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .expect("materialize and answer the surviving unit through the custody fixture seam");
 
@@ -434,9 +463,16 @@ fn erasure_state(db: &Database, scope: Uuid, selected_root: Uuid) -> ErasureStat
         )
         .expect("read all vector-owner rows")
         .rows;
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     let mut vector_directory = db
         .vector_store_for_test()
-        .raw_directory_entries()
+        .raw_directory_entries(&mut vector_fixture_copy_1)
+        .expect("read or publish the admitted vector fixture")
         .into_iter()
         .filter(|(index, _)| index.table == "erasure_vectors")
         .map(|(index, entry)| format!("{}:{entry:?}", index.column))
@@ -763,7 +799,16 @@ fn partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route
             Some(replacement_generation),
             "the first query consumes the prepared generation instead of rebuilding it"
         );
-        let layout = db.vector_store_for_test().index_layout(&index()).unwrap();
+        let vector_fixture_reader_2 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_2 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
+
+        let layout = db
+            .vector_store_for_test()
+            .index_layout(&index(), &mut vector_fixture_copy_2)
+            .unwrap();
         let desired = layout.resolve_policy(7, 2);
         let disclosure = db
             .execute(

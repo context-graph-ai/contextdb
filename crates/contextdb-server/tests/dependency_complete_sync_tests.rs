@@ -94,11 +94,10 @@ async fn start_hub(root: &Path) -> Hub {
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open hub database"));
     declare_tables(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(TENANT),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -135,7 +134,8 @@ async fn reopen_edge_before_sync(
     drop(client);
     drop(db);
     let reopened = Arc::new(Database::open(edge_path).expect("reopen edge database"));
-    let client = SyncClient::new(reopened.clone(), dial_spec, TenantId::from(TENANT));
+    let client = SyncClient::new(reopened.clone(), dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     (reopened, client)
 }
 
@@ -157,7 +157,8 @@ async fn assert_final_dependency_state(reopen_before_sync: bool) {
     insert_child(&edge, child_id, parent_id, "child");
     update_parent(&edge, parent_id, "parent-v2");
 
-    let mut client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT));
+    let mut client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     if reopen_before_sync {
         (edge, client) = reopen_edge_before_sync(edge, client, &edge_path, &dial_spec).await;
     }
@@ -190,7 +191,10 @@ async fn assert_final_dependency_state(reopen_before_sync: bool) {
         "sync preserves the child's original timestamp"
     );
 
-    let landed = hub.db.changes_since(hub_before);
+    let landed = hub
+        .db
+        .changes_since(hub_before)
+        .expect("read changes_since fixture");
     let dependency_lsns = landed
         .rows
         .iter()
@@ -248,7 +252,8 @@ async fn assert_invalid_child_refuses_connected_parent(reopen_before_sync: bool)
     insert_child(&edge, conflicting_child, parent_id, "conflicting-child");
     update_parent(&edge, parent_id, "parent-v2");
 
-    let mut client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT));
+    let mut client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     if reopen_before_sync {
         let (_reopened, reopened_client) =
             reopen_edge_before_sync(edge, client, &edge_path, &dial_spec).await;

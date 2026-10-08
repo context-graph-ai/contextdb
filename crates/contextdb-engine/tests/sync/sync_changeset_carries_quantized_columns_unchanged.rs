@@ -236,7 +236,9 @@ fn the_incremental_changeset_carries_both_quantized_columns() {
 
     // Straight after the inserts the change log still covers the watermark,
     // so this is the incremental path.
-    let changes = database.changes_since(Lsn(0));
+    let changes = database
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     assert_changeset_is_unchanged(&changes, "incremental");
     database.close().expect("the sender closes cleanly");
 }
@@ -250,7 +252,9 @@ fn the_full_snapshot_changeset_carries_both_quantized_columns() {
     // A reopened store has no change log, and a watermark of zero asks for
     // everything, which is the full-snapshot path.
     let reopened = Database::open(&path).expect("reopen the sending store");
-    let changes = reopened.changes_since(Lsn(0));
+    let changes = reopened
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     assert_changeset_is_unchanged(&changes, "full snapshot");
     reopened.close().expect("the sender closes cleanly");
 }
@@ -264,7 +268,9 @@ fn the_persisted_delta_changeset_carries_both_quantized_columns() {
     // A reopened store asked for changes since a watermark above zero takes
     // the persisted-delta path rather than the snapshot one.
     let reopened = Database::open(&path).expect("reopen the sending store");
-    let changes = reopened.changes_since(Lsn(1));
+    let changes = reopened
+        .changes_since(Lsn(1))
+        .expect("read or construct the declared fixture result");
     assert_changeset_is_unchanged(&changes, "persisted delta");
     reopened.close().expect("the sender closes cleanly");
 }
@@ -274,7 +280,9 @@ fn a_peer_applying_the_changeset_answers_the_same_vectors() {
     let directory = tempfile::TempDir::new().expect("task-scoped quantized-sync directory");
     let sender_path = directory.path().join("sender.db");
     let sender = create_store(&sender_path);
-    let changes = sender.changes_since(Lsn(0));
+    let changes = sender
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     let sender_indexes = sender
         .read_session(ReadLimits::default())
         .expect("open a reading view of the sender")

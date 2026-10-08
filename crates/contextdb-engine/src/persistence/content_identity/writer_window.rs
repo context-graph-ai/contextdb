@@ -2114,3 +2114,358 @@ pub(super) fn update_family_consuming_keys(
     observe_proof_memory(scratch._charge.bytes, 0);
     Ok(result)
 }
+
+#[cfg(test)]
+#[test]
+fn cached_original_guards_preserve_admission_and_authenticate_fresh_loads() {
+    // This private row observes the real owners; stack handles have no heap quote.
+    fn with_window<R>(
+        table: &redb::Table<'_, &'static [u8], &'static [u8]>,
+        family: LogicalFamily,
+        inputs: EntryEdits,
+        admission: &mut ProofAdmission,
+        f: impl FnOnce(&mut Window<'_, '_, '_>) -> Result<R>,
+    ) -> Result<R> {
+        let scratch = Scratch::open(admission)?;
+        let ledger = Ledger {
+            live: Cell::new(0),
+            base: admission.held.checked_add(scratch._charge.bytes).unwrap(),
+            caller_peak: &admission.peak,
+        };
+        let workspace = Workspace {
+            admission: RefCell::new(ProofAdmission {
+                accountant: admission.accountant.clone().or_else(|| admission.scratch_accountant.clone()),
+                reclaim: admission.reclaim.clone(),
+                charge_fixed_refusal_control: admission.charge_fixed_refusal_control,
+                scratch_owner: admission.scratch_owner.clone(),
+                scratch_accountant: admission.scratch_accountant.clone(),
+                held: 0,
+                peak: Cell::new(0),
+            }),
+            ledger: &ledger,
+        };
+        let mut window = Window::open(table, family, inputs, scratch, &workspace);
+        let result = f(&mut window);
+        drop(window);
+        assert_eq!(ledger.live.get(), 0, "every detached workspace lease releases at teardown");
+        result
+    }
+    fn array_bytes<T>(array: &OwnedArray<'_, T>) -> usize {
+        let bytes = std::alloc::Layout::array::<T>(array.entries.len()).unwrap().size();
+        assert_eq!(array._charge.charge.bytes, bytes, "each real array has its exact Layout lease");
+        bytes
+    }
+    fn resident(window: &Window<'_, '_, '_>, accountant: &crate::memory_accounting::MemoryAccountant, baseline: usize) -> usize {
+        let mut bytes = 0;
+        if let Some(slots) = &window.slots {
+            bytes += array_bytes(slots);
+            for slot in &slots.entries {
+                if let Some(node) = slot.borrow().as_ref() {
+                    assert!(!node.guard.value().is_empty());
+                    let pages = node.guard.retained_page_bytes();
+                    assert_eq!(node._page_charge.charge.bytes, pages, "the AccessGuard owns its actual backing pages");
+                    bytes += pages + array_bytes(&node.entries);
+                }
+            }
+        }
+        if let Some(path) = &window.path { bytes += array_bytes(path); }
+        if let Some(builder) = &window.builder { bytes += array_bytes(builder); }
+        assert_eq!(window.workspace.ledger.live.get(), bytes, "live ledger equals simultaneous detached heap/page leases");
+        assert_eq!(accountant.usage().used - baseline, window.scratch._charge.bytes + bytes, "scratch plus live owners account for all funded bytes, with no stack charge");
+        assert!(window.workspace.ledger.caller_peak.get() >= window.workspace.ledger.base + bytes);
+        bytes
+    }
+    fn locator(id: [u8; 32], hash: [u8; 32]) -> Locator {
+        Locator { kind: 1, id, hash, start: 0, len: 1 }
+    }
+    fn auth_counts(scope: &crate::read_work_probe::ReadWorkObservationScope) -> (usize, usize) {
+        let counters = scope.counters();
+        (counters.proof_nodes_read as usize, counters.proof_nodes_hashed as usize)
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let database = ProofFixtureDatabase::create(directory.path().join("guard-modes.redb")).unwrap();
+    let family = LogicalFamily::Configuration;
+    let mutations = (0..4).map(|id| ContentIdentityMutation::put(family,
+        [vec![HASHED_KEY_TAG], format!("{id:02}{}", "k".repeat(70 * 1024)).into_bytes()].concat(), b"initial".to_vec())).collect::<Vec<_>>();
+    let write = database.begin_write().unwrap();
+    RedbPersistence::initialize_content_identity_in_write(&write).unwrap();
+    // Encode the durable fixture before any Window admission is exercised.
+    // The ordinary node/root encoders keep the decisive mutant in the row's own lease oracle.
+    let fixture_entries = mutations.iter().map(|mutation| PageEntry {
+        key: mutation.logical_key.clone(),
+        value_hash: *blake3::hash(mutation.logical_value.as_ref().unwrap()).as_bytes(),
+    }).collect::<Vec<_>>();
+    let fixture_hash = node_hash(family, 0, &fixture_entries);
+    let fixture_id = chunk_id(0, &fixture_entries.last().unwrap().key);
+    let fixture_bytes = encode_node(&Node { level: 0, entries: fixture_entries, subtree_hash: fixture_hash });
+    let other_entries = vec![PageEntry { key: [vec![HASHED_KEY_TAG], b"guard replacement".to_vec()].concat(), value_hash: [7; 32] }];
+    let other_id = chunk_id(0, &other_entries[0].key);
+    let other_hash = node_hash(family, 0, &other_entries);
+    let other_bytes = encode_node(&Node { level: 0, entries: other_entries, subtree_hash: other_hash });
+    assert_ne!(other_id, fixture_id, "replacement uses a genuinely different original");
+    {
+        let mut table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        for mutation in &mutations {
+            let reference = encoded_key(0, &mutation.logical_key);
+            let stored = node_storage_key(family, &key_hash(&reference));
+            let mut blob = vec![0];
+            blob.extend_from_slice(&mutation.logical_key);
+            table.insert(stored.as_slice(), blob.as_slice()).unwrap();
+        }
+        let stored = node_storage_key(family, &fixture_id);
+        table.insert(stored.as_slice(), fixture_bytes.as_slice()).unwrap();
+        let stored = node_storage_key(family, &other_id);
+        table.insert(stored.as_slice(), other_bytes.as_slice()).unwrap();
+    }
+    {
+        let mut roots = write.open_table(CONTENT_IDENTITY_ROOTS_TABLE).unwrap();
+        let mut published = { let guard = roots.get(family as u8).unwrap().unwrap();
+            decode_published_root(family, guard.value()).unwrap() };
+        published.identity.root = Some(fixture_id);
+        published.identity.hash = fixture_hash;
+        let bytes = encode_published_root(&published);
+        roots.insert(family as u8, bytes.as_slice()).unwrap();
+    }
+    write.commit().unwrap();
+
+    // N/2N inputs share the same authenticated durable height and node/page shape.
+    // Only the workspace controls are population-independent; inputs keep their own charges.
+    let mut controls = Vec::new();
+    for count in [2_usize, 4] {
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(256 * 1024 * 1024));
+        let mut admission = database.admission(Some(Arc::clone(&accountant)));
+        let inputs: EntryEdits = mutations.iter().take(count).map(|mutation|
+            (mutation.logical_key.clone(), Some(*blake3::hash(mutation.logical_value.as_ref().unwrap()).as_bytes()))).collect();
+        let input_bytes = std::alloc::Layout::array::<(Vec<u8>, Option<[u8; 32]>)>(inputs.capacity()).unwrap().size()
+            + inputs.iter().map(|(key, _)| key.capacity()).sum::<usize>();
+        admission.admit(input_bytes).unwrap();
+        let baseline = accountant.usage().used;
+        let write = database.begin_write().unwrap();
+        let root = { let roots = write.open_table(CONTENT_IDENTITY_ROOTS_TABLE).unwrap();
+            decode_root(family, roots.get(family as u8).unwrap().unwrap().value()).unwrap() };
+        let table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+        with_window(&table, family, inputs, &mut admission, |window| {
+            assert_eq!(window.workspace.ledger.live.get(), 0);
+            assert_eq!(accountant.usage().used - baseline, window.scratch._charge.bytes, "opening stack controls allocates no window heap");
+            let height = window.initialize(&root)?;
+            let slots = window.slots.as_ref().unwrap();
+            let path = window.path.as_ref().unwrap();
+            assert_eq!(slots.entries.len(), height as usize + 3);
+            assert_eq!(path.entries.len(), height as usize + 1);
+            controls.push((height, array_bytes(slots), array_bytes(path)));
+            resident(window, &accountant, baseline);
+            window.grow_builder(1000)?;
+            let prior = window.builder.as_ref().unwrap().entries.len();
+            let before = window.workspace.ledger.live.get();
+            window.grow_builder(prior + 1)?;
+            let next = window.builder.as_ref().unwrap().entries.len();
+            assert!(window.workspace.ledger.caller_peak.get() >= window.workspace.ledger.base + before + next,
+                "builder growth admits the entire new buffer while the old buffer remains live");
+            resident(window, &accountant, baseline);
+            Ok(())
+        }).unwrap();
+        assert_eq!(accountant.usage().used, baseline);
+        admission.release(input_bytes);
+        assert_eq!(accountant.usage().used, 0);
+    }
+    assert_eq!(controls[0], controls[1], "at fixed authenticated H, N/2N use identical exact slot/path layouts");
+
+    for mode in 0..3 {
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(if mode == 2 { 1 } else { 256 * 1024 * 1024 }));
+        if mode == 2 { accountant.charge_retained(1); }
+        let baseline = accountant.usage().used;
+        let mut admission = match mode {
+            0 => database.admission(Some(Arc::clone(&accountant))),
+            1 => { let mut admission = database.admission(None); admission.scratch_accountant = Some(Arc::clone(&accountant)); admission },
+            _ => ProofAdmission::fixed_refusal_control(Some(Arc::clone(&accountant))).with_scratch_owner(Some(Arc::downgrade(&database.owner))),
+        };
+        let write = database.begin_write().unwrap();
+        let root = { let roots = write.open_table(CONTENT_IDENTITY_ROOTS_TABLE).unwrap();
+            decode_root(family, roots.get(family as u8).unwrap().unwrap().value()).unwrap() };
+        let id = root.root.unwrap();
+        {
+            let table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+            with_window(&table, family, Vec::new(), &mut admission, |window| {
+                let scope = crate::read_work_probe::ReadWorkObservationScope::enter(crate::read_work_probe::ReadWorkPhase::Commit);
+                window.initialize(&root)?;
+                resident(window, &accountant, baseline);
+                let before = auth_counts(&scope);
+                let used = accountant.usage().used;
+                window.with_locator(locator(id, root.hash), |bytes| {
+                    assert_eq!(bytes, &[NODE_VERSION]);
+                    assert!(window.slots.as_ref().unwrap().entries[0].try_borrow_mut().is_err(), "callback physically borrows its AccessGuard owner");
+                    assert_eq!(accountant.usage().used, used);
+                    Ok(())
+                })?;
+                window.with_locator(locator(id, root.hash), |_| Ok(()))?;
+                assert_eq!(auth_counts(&scope), before, "same id+expected cache hits perform no read or authentication");
+                assert_eq!(accountant.usage().used, used);
+
+                // Borrowed operands survive the real cached replacement path.
+                window.current.set(None);
+                window.path_len = 0;
+                window.cache_next.set(0);
+                let held = window.slots.as_ref().unwrap().entries[0].borrow();
+                let replacement = window.cached(other_id, other_hash)?;
+                assert_ne!(replacement, 0, "cached cannot evict the actively borrowed guard");
+                let retained = held.as_ref().unwrap();
+                assert_eq!((retained.id, retained.hash), (id, root.hash), "replacement preserves the retained slot's original authority");
+                assert!(!retained.guard.value().is_empty());
+                let loaded = window.slots.as_ref().unwrap().entries[replacement].borrow();
+                assert_eq!((loaded.as_ref().unwrap().id, loaded.as_ref().unwrap().hash), (other_id, other_hash));
+                drop(loaded);
+                drop(held);
+                resident(window, &accountant, baseline);
+                let release = { let slot = window.slots.as_ref().unwrap().entries[0].borrow();
+                    let node = slot.as_ref().unwrap(); node.guard.retained_page_bytes() + array_bytes(&node.entries) };
+                let used = accountant.usage().used;
+                let removed = window.slots.as_ref().unwrap().entries[0].borrow_mut().take();
+                drop(removed);
+                assert_eq!(used - accountant.usage().used, release, "dropping concrete guard plus descriptors releases exactly their leases");
+                resident(window, &accountant, baseline);
+
+                // Clear the distinct replacement, then reacquire through production cached.
+                let removed = window.slots.as_ref().unwrap().entries[replacement].borrow_mut().take();
+                drop(removed);
+                let before = auth_counts(&scope);
+                window.cache_next.set(0);
+                window.with_locator(locator(id, root.hash), |_| Ok(()))?;
+                assert_eq!(auth_counts(&scope), (before.0 + 1, before.1 + 1));
+                resident(window, &accountant, baseline);
+                let mut wrong = root.hash; wrong[0] ^= 1;
+                window.cache_next.set(0);
+                let before = auth_counts(&scope);
+                let error = window.with_locator(locator(id, wrong), |_| Ok(())).unwrap_err();
+                assert!(matches!(error, Error::Other(ref message) if message.contains("disagrees with committed parent")));
+                assert_eq!(auth_counts(&scope), (before.0 + 1, before.1 + 1), "wrong expected reloads and authenticates, never reuses good cache authority");
+                assert!(window.slots.as_ref().unwrap().entries[0].borrow().is_none(), "real eviction releases before failed replacement");
+                resident(window, &accountant, baseline);
+
+                // Authoritative wide bytes are owned and charged inside the callback.
+                let reference = encoded_key(0, &mutations[0].logical_key);
+                let before = accountant.usage().used;
+                let stored = node_storage_key(family, &key_hash(&reference));
+                let pages = { let guard = table.get(stored.as_slice()).unwrap().unwrap(); guard.retained_page_bytes() };
+                window.with_referenced(&reference, |bytes| {
+                    assert_eq!(bytes, mutations[0].logical_key.as_slice());
+                    assert_eq!(accountant.usage().used - before, pages);
+                    window.with_referenced(&reference, |_| {
+                        assert_eq!(accountant.usage().used - before, 2 * pages);
+                        Ok(())
+                    })
+                })?;
+                assert_eq!(accountant.usage().used, before);
+                resident(window, &accountant, baseline);
+                Ok(())
+            }).unwrap();
+        }
+        assert_eq!(accountant.usage().used, baseline, "normal, cleanup, and fixed-refusal owners all release scratch and workspace");
+        if mode == 2 {
+            let value = b"refused";
+            write.open_table(super::super::CONFIG_TABLE).unwrap().insert("guard_refusal", value.as_slice()).unwrap();
+            RedbPersistence::apply_content_identity_mutations_in_write(&write, &config_mutations("guard_refusal", Some(value)), &mut admission).unwrap();
+            drop(admission);
+            write.commit().unwrap();
+            let read = database.begin_read().unwrap();
+            let config = read.open_table(super::super::CONFIG_TABLE).unwrap();
+            assert_eq!(config.get("guard_refusal").unwrap().unwrap().value(), value.as_slice());
+            assert_eq!(accountant.usage().used, baseline);
+            accountant.release(1);
+        } else { drop(admission); drop(write); }
+        assert_eq!(accountant.usage().used, 0);
+    }
+
+    // The production family commit retains the same receipt and releases its owners.
+    {
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(256 * 1024 * 1024));
+        let mut admission = database.admission(Some(Arc::clone(&accountant)));
+        let write = database.begin_write().unwrap();
+        let changes = mutations.iter().map(|mutation| ContentIdentityMutation::put(family, mutation.logical_key.clone(), b"updated".to_vec())).collect::<Vec<_>>();
+        RedbPersistence::apply_content_identity_mutations_in_write(&write, &changes, &mut admission).unwrap();
+        assert!(admission.peak() > 0);
+        drop(admission);
+        assert_eq!(accountant.usage().used, 0);
+        write.commit().unwrap();
+    }
+
+    // No guard or verification result survives a Window lifetime/table mutation.
+    let write = database.begin_write().unwrap();
+    let root = { let roots = write.open_table(CONTENT_IDENTITY_ROOTS_TABLE).unwrap();
+        decode_root(family, roots.get(family as u8).unwrap().unwrap().value()).unwrap() };
+    let id = root.root.unwrap();
+    let stored = node_storage_key(family, &id);
+    let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(256 * 1024 * 1024));
+    let mut admission = database.admission(Some(Arc::clone(&accountant)));
+    let mut table = write.open_table(CONTENT_IDENTITY_NODES_TABLE).unwrap();
+    let original = table.get(stored.as_slice()).unwrap().unwrap().value().to_vec();
+    with_window(&table, family, Vec::new(), &mut admission, |window| { window.initialize(&root)?; window.with_locator(locator(id, root.hash), |_| Ok(())) }).unwrap();
+    assert_eq!(accountant.usage().used, 0);
+    let mut damaged = original.clone();
+    let at = damaged.len() - 33; damaged[at] ^= 1;
+    table.insert(stored.as_slice(), damaged.as_slice()).unwrap();
+    let error = with_window(&table, family, Vec::new(), &mut admission, |window| window.initialize(&root)).unwrap_err();
+    assert!(matches!(error, Error::Other(ref message) if message.contains("does not authenticate its contents")));
+    assert_eq!(accountant.usage().used, 0);
+
+    let mut replacement = decode_node(family, &original).unwrap();
+    replacement.entries[0].value_hash[0] ^= 1;
+    replacement.subtree_hash = node_hash(family, replacement.level, &replacement.entries);
+    let bytes = encode_node(&replacement);
+    table.insert(stored.as_slice(), bytes.as_slice()).unwrap();
+    let error = with_window(&table, family, Vec::new(), &mut admission, |window| window.initialize(&root)).unwrap_err();
+    assert!(matches!(error, Error::Other(ref message) if message.contains("disagrees with committed parent")));
+    let changed_root = FamilyRoot { hash: replacement.subtree_hash, ..root.clone() };
+    with_window(&table, family, Vec::new(), &mut admission, |window| { window.initialize(&changed_root)?; resident(window, &accountant, 0); Ok(()) }).unwrap();
+    assert_eq!(accountant.usage().used, 0);
+    let mut wrong_id = id; wrong_id[1] ^= 1;
+    let wrong_stored = node_storage_key(family, &wrong_id);
+    table.insert(wrong_stored.as_slice(), bytes.as_slice()).unwrap();
+    let wrong_root = FamilyRoot { root: Some(wrong_id), ..changed_root.clone() };
+    let error = with_window(&table, family, Vec::new(), &mut admission, |window| window.initialize(&wrong_root)).unwrap_err();
+    assert!(matches!(error, Error::Other(ref message) if message.contains("id disagrees with its separator")));
+    assert_eq!(accountant.usage().used, 0);
+
+    // Correctly hashed malformed order/cut fixtures reach canonical checks.
+    for entries in [
+        vec![PageEntry { key: vec![HASHED_KEY_TAG, b'b'], value_hash: [1; 32] }, PageEntry { key: vec![HASHED_KEY_TAG, b'a'], value_hash: [2; 32] }],
+        vec![PageEntry { key: [vec![HASHED_KEY_TAG], vec![b'a'; TARGET_NODE_ENTRY_BYTES * 2]].concat(), value_hash: [1; 32] }, PageEntry { key: vec![HASHED_KEY_TAG, b'z'], value_hash: [2; 32] }],
+    ] {
+        let hash = node_hash(family, 0, &entries);
+        let fixture_id = chunk_id(0, &entries.last().unwrap().key);
+        let bytes = encode_node(&Node { level: 0, entries, subtree_hash: hash });
+        let stored = node_storage_key(family, &fixture_id);
+        table.insert(stored.as_slice(), bytes.as_slice()).unwrap();
+        let fixture_root = FamilyRoot { root: Some(fixture_id), hash, open_config_root: None };
+        let error = with_window(&table, family, Vec::new(), &mut admission, |window| window.initialize(&fixture_root)).unwrap_err();
+        assert!(matches!(error, Error::Other(ref message) if message.contains("not strictly ordered") || message.contains("crosses a canonical boundary")));
+        assert_eq!(accountant.usage().used, 0);
+    }
+    // Reference-key order needs authoritative wide comparisons after body hashing.
+    let mut reversed = decode_node(family, &fixture_bytes).unwrap();
+    reversed.entries.reverse();
+    reversed.subtree_hash = node_hash(family, reversed.level, &reversed.entries);
+    let reversed_id = chunk_id(reversed.level, &reversed.entries.last().unwrap().key);
+    let reversed_stored = node_storage_key(family, &reversed_id);
+    let reversed_bytes = encode_node(&reversed);
+    table.insert(reversed_stored.as_slice(), reversed_bytes.as_slice()).unwrap();
+    let reversed_root = FamilyRoot { root: Some(reversed_id), hash: reversed.subtree_hash, open_config_root: None };
+    let error = with_window(&table, family, Vec::new(), &mut admission, |window| window.initialize(&reversed_root)).unwrap_err();
+    assert!(matches!(error, Error::Other(ref message) if message.contains("internal separator order is invalid")));
+    assert_eq!(accountant.usage().used, 0);
+    // Changed, absent, and wrong-hash wide blobs refuse under fresh physical owners.
+    table.insert(stored.as_slice(), original.as_slice()).unwrap();
+    let reference = encoded_key(0, &mutations[0].logical_key);
+    let wide_stored = node_storage_key(family, &key_hash(&reference));
+    let wide = table.get(wide_stored.as_slice()).unwrap().unwrap().value().to_vec();
+    for variant in 0..3 {
+        if variant == 1 { table.remove(wide_stored.as_slice()).unwrap(); }
+        else { let mut damaged = wide.clone(); if variant == 0 { damaged[0] ^= 1; } else { damaged[1] ^= 1; }
+            table.insert(wide_stored.as_slice(), damaged.as_slice()).unwrap(); }
+        let error = with_window(&table, family, Vec::new(), &mut admission, |window| {
+            window.initialize(&root)?;
+            window.with_referenced::<()>(&reference, |_| panic!("invalid authoritative wide bytes must never reach the callback"))
+        }).unwrap_err();
+        assert!(matches!(error, Error::Other(ref message) if message.contains("separator key is damaged") || message.contains("separator key is missing")));
+        assert_eq!(accountant.usage().used, 0);
+    }
+}

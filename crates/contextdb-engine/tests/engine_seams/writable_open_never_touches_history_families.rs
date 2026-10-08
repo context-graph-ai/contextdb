@@ -153,11 +153,16 @@ fn writable_open_never_touches_history_families() {
             "the next writer never reuses a committed transaction identity"
         );
         database.rollback(tx).unwrap();
+        let received_schema_read_memory_1 = database
+            .declared_reader_memory()
+            .expect("admit the sync observation reader");
+
         assert!(
             database
                 .has_terminal_refusal_markers_for_test(
                     &TenantId::from("resident-fixture"),
-                    "fixture-hub"
+                    "fixture-hub",
+                    received_schema_read_memory_1
                 )
                 .unwrap(),
             "point-read terminal refusal evidence remains available after open"
@@ -287,7 +292,9 @@ fn prepare_sidecars(path: &Path, n: usize) {
     }
     let db = Arc::new(open(path, Some(64 * 1024 * 1024)));
     db.apply_changes(
-        source.changes_since(Lsn(0)),
+        source
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
     .unwrap();
@@ -303,7 +310,9 @@ fn prepare_sidecars(path: &Path, n: usize) {
         exec(&source, &format!("DELETE FROM payloads WHERE id = {id}"));
     }
     db.apply_changes(
-        source.changes_since(received_source_lsn),
+        source
+            .changes_since(received_source_lsn)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
     .unwrap();
@@ -318,7 +327,9 @@ fn prepare_sidecars(path: &Path, n: usize) {
         exec(&source, &ddl);
     }
     db.apply_changes(
-        source.changes_since(ddl_since),
+        source
+            .changes_since(ddl_since)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
     .unwrap();
@@ -334,6 +345,7 @@ fn prepare_sidecars(path: &Path, n: usize) {
     }
     let refused = db
         .changes_since(Lsn(0))
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .filter(|row| row.table == "refused_items" && !row.deleted)
@@ -350,9 +362,17 @@ fn prepare_sidecars(path: &Path, n: usize) {
         Lsn(900_000),
     )
     .unwrap();
+    let received_schema_read_memory_2 = db
+        .declared_reader_memory()
+        .expect("admit the sync observation reader");
+
     assert!(
-        db.has_terminal_refusal_markers_for_test(&tenant, "fixture-hub")
-            .unwrap()
+        db.has_terminal_refusal_markers_for_test(
+            &tenant,
+            "fixture-hub",
+            received_schema_read_memory_2
+        )
+        .unwrap()
     );
 
     // A retained old frontier keeps real, durable expiry identities after
@@ -423,7 +443,8 @@ fn populate_authenticated_rows(receiver: &Arc<Database>, n: usize) {
                 tenant.clone(),
                 hub_node.clone(),
                 hub_identity,
-            ),
+            )
+            .expect("construct the authenticated sync endpoint"),
         );
         let stop = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
@@ -441,7 +462,8 @@ fn populate_authenticated_rows(receiver: &Arc<Database>, n: usize) {
             broker.client_as(&identity.node_id()),
             tenant,
             identity,
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         client.push().await.unwrap();
         task.abort();
         let _ = task.await;

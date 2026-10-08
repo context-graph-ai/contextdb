@@ -41,7 +41,8 @@ pub fn start_hub(
             contextdb_core::TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -69,7 +70,8 @@ pub fn edge_with_identity(
         broker.client_as(&node_id),
         contextdb_core::TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client)
 }
 

@@ -1,10 +1,10 @@
 #![allow(dead_code)] // Existing compatibility and test seam shape.
 use super::maintained_search;
 use contextdb_core::Value;
+use contextdb_engine::database::VectorSearchTraceObservation;
 use contextdb_engine::{
     Database, MaintenancePolicy, QueryResult, VectorSearchResidual, VectorSearchRoute,
 };
-use contextdb_vector::VectorSearchDebugTrace;
 use contextdb_vector::hnsw::{
     HnswCandidateDistanceEvent, HnswCandidateObserver, with_hnsw_candidate_observer,
 };
@@ -42,7 +42,7 @@ struct ScoredQuery {
     result: QueryResult,
     graph_scores: u64,
     native_scores: u64,
-    debug: VectorSearchDebugTrace,
+    debug: VectorSearchTraceObservation,
 }
 
 impl ScoredQuery {
@@ -64,9 +64,14 @@ fn execute_and_count_scoring(
             db.execute(sql, query).unwrap()
         })
     });
-    let debug = db
-        .__take_last_query_vector_trace_for_test()
-        .expect("every vector query publishes its real route receipt");
+    let debug = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .expect("every vector query publishes its real route receipt");
     let graph_scores = graph_scores.0.load(Ordering::SeqCst);
     let native_scores = native_scores.0.load(Ordering::SeqCst);
     assert!(

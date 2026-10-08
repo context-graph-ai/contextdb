@@ -79,12 +79,24 @@ fn read_committed_history(path: &std::path::Path) {
 }
 
 fn kept_rows(path: &std::path::Path) -> usize {
-    committed_content_for_test(path)
-        .expect("the committed store authenticates against its own root")
-        .relational_rows
-        .iter()
-        .filter(|row| row.table == "kept")
-        .count()
+    {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(path, operation_read_memory, declared_read_memory)
+    }
+    .expect("the committed store authenticates against its own root")
+    .relational_rows
+    .iter()
+    .filter(|row| row.table == "kept")
+    .count()
 }
 
 #[test]

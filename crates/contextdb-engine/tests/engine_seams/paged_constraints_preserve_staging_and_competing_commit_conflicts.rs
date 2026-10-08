@@ -322,12 +322,12 @@ fn paged_constraints_preserve_staging_and_competing_commit_conflicts() {
             "primary/composite/valid-parent/missing-parent actual examined entries ignore doubled superseded primary/composite/parent history: kind={kind}"
         );
     }
-    // No parent row has been restaged, so its maintained staged index is
-    // absent. The bounded-memory fallback compares each unrelated insertion
-    // once, then probes the single committed parent posting.
     assert_eq!(
-        measurements,
-        vec![(16, 1), (32, 1)],
-        "the fallback scans exactly the staged insertions and one durable posting"
+        measurements[0], measurements[1],
+        "one replacement constraint probe must examine equal staged rows and postings when unrelated staging and superseded key versions double"
+    );
+    assert!(
+        measurements[0].0 <= 2 && measurements[0].1 <= 2,
+        "one replacement probe is bounded independently of the staged set and key history: {measurements:?}"
     );
 }

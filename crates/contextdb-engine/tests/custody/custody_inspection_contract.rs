@@ -156,11 +156,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
         .expect("bind the authoritative hub endpoint");
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open the hub store"));
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct the authenticated sync endpoint"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -211,7 +210,8 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     within(
         client.__seed_application_table_policy_binding_for_test(
             ApplicationTablePolicyExpectation::new()
@@ -219,6 +219,8 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
                 .expect("the root expectation is written in the declaration's clause words")
                 .expect_table("record_parts", MEMBER_CLAUSES)
                 .expect("the member expectation is written in the declaration's clause words"),
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
         ),
     )
     .await
@@ -251,16 +253,22 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
                 ),
                 members: Vec::new(),
             },
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .expect("canonical empty-member source registration");
     edge.commit(tx).expect("commit the unit");
 
-    within(client.__seed_delivery_outcome_for_test(
-        "records",
-        &contextdb_engine::sync_types::NaturalKey::single("id".into(), Value::Uuid(root_key)),
-        contextdb_engine::DeliveryOutcomeKind::Accepted,
-        None,
-    ))
+    within(
+        client.__seed_delivery_outcome_for_test(
+            "records",
+            &contextdb_engine::sync_types::NaturalKey::single("id".into(), Value::Uuid(root_key)),
+            contextdb_engine::DeliveryOutcomeKind::Accepted,
+            None,
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .expect("canonical committed outcome before inspection");
 
@@ -276,7 +284,8 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
             &root.path().join("refused.db.fabric-identity.key"),
         ),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     within(
         refused_client.__seed_application_table_policy_binding_for_test(
             ApplicationTablePolicyExpectation::new()
@@ -284,6 +293,9 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
                 .unwrap()
                 .expect_table("record_parts", MEMBER_CLAUSES)
                 .unwrap(),
+            refused
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
         ),
     )
     .await
@@ -308,15 +320,23 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
                 root_key: key.clone(),
                 members: Vec::new(),
             },
+            refused
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .unwrap();
     refused.commit(tx).unwrap();
-    within(refused_client.__seed_delivery_outcome_for_test(
-        "records",
-        &key,
-        contextdb_engine::DeliveryOutcomeKind::Refused,
-        Some("keep_first_refused"),
-    ))
+    within(
+        refused_client.__seed_delivery_outcome_for_test(
+            "records",
+            &key,
+            contextdb_engine::DeliveryOutcomeKind::Refused,
+            Some("keep_first_refused"),
+            refused
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .expect("a genuine conflicting incumbent produces the refusal fixture");
     // Observe the real persisted terminal through the existing read adapter,

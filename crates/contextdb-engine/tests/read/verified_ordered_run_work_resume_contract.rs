@@ -769,7 +769,19 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
         |cursors: &mut Vec<contextdb_engine::direct_file_reader::test_seams::DirectCursorOpen>| {
             let mut collected = cursors
                 .iter()
-                .map(|opened| opened.first_page.page.rows.clone())
+                .map(|opened| {
+                    opened
+                        .first_page
+                        .page
+                        .try_clone(
+                            reader
+                                .request_read_memory_for_test()
+                                .expect("admit the fixture page copy reader"),
+                        )
+                        .expect("share the admitted first page")
+                        .into_public()
+                        .rows
+                })
                 .collect::<Vec<_>>();
             let mut more = cursors
                 .iter()
@@ -784,8 +796,9 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
                         .cursor
                         .fetch(Some(page))
                         .expect("a cursor continues after its window is evicted");
-                    collected[index].extend(fetched.page.rows.clone());
-                    more[index] = fetched.page.has_more;
+                    let terminal = fetched.page.into_public();
+                    collected[index].extend(terminal.rows);
+                    more[index] = terminal.has_more;
                 }
             }
             collected

@@ -95,8 +95,13 @@ fn graph_status(
 }
 
 fn graph_ready(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(index, &partition(scope))
+        .partition_info(index, &partition(scope), &mut partition_observation_owner_1)
         .unwrap()
         .is_some_and(|info| info.graph_available)
 }
@@ -215,9 +220,14 @@ fn reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_r
         vec![Uuid::from_u128(0x100_000)],
         "the production SQL route selects alpha through its maintained index"
     );
-    let alpha_trace = db
-        .__take_last_query_vector_trace_for_test()
-        .expect("the selected indexed route publishes its trace");
+    let alpha_trace = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .expect("the selected indexed route publishes its trace");
     assert!(
         alpha_trace.used_hnsw,
         "the selected answer stays on the maintained indexed route"
@@ -325,9 +335,14 @@ fn reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_r
         vec![Uuid::from_u128(0x300_000)],
         "pressure reclaims the least-recently-used bravo graph and admits charlie"
     );
-    let pressure_trace = db
-        .__take_last_query_vector_trace_for_test()
-        .expect("the selected indexed route publishes its trace");
+    let pressure_trace = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .expect("the selected indexed route publishes its trace");
     assert!(
         pressure_trace.used_hnsw,
         "the bounded answer stays on the maintained indexed route"

@@ -496,12 +496,17 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
     let key_bytes = 70 * 1024;
     let (wide, wide_records) = committed(&root.path().join("wide-key-pool.db"), 8, key_bytes);
 
+    let unwatched = take_resolved_key_copy_observations_for_test();
+    assert!(unwatched.is_empty(), "ordinary unobserved walks record no key-copy events");
+    assert_eq!(unwatched.capacity(), 0, "the default-disabled recorder owns no backing buffer");
+    drop(unwatched);
+
     // (a) The current pool is smaller than one referenced key; remaining
     // session memory is enough. The walk succeeds and the accountant has
     // already admitted the key by the time the copy is made.
     {
         let budget = accountant(8 * 1024 * 1024);
-        watch_resolved_key_copies_for_test();
+        let _resolved_key_watch = watch_resolved_key_copies_for_test();
         let growth = Arc::new(PoolGrowth {
             accountant: Arc::clone(&budget),
             ceiling: 8 * 1024 * 1024,
@@ -538,12 +543,17 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
         );
     }
 
+    let released = take_resolved_key_copy_observations_for_test();
+    assert!(released.is_empty(), "ending the successful watch disables and clears events");
+    assert_eq!(released.capacity(), 0, "ending the watch releases every backing-buffer byte");
+    drop(released);
+
     // (b) Remaining session memory cannot hold the referenced key. The typed
     // refusal arrives before any copy, and the accountant never observes one.
     {
         let budget = accountant(8 * 1024);
         let baseline = budget.admitted_bytes_for_test();
-        watch_resolved_key_copies_for_test();
+        let _resolved_key_watch = watch_resolved_key_copies_for_test();
         let proof = ProofMemory::admitted(Some(Arc::clone(&budget)), 8 * 1024 * 1024);
         let refused = scan(&wide, &proof);
         assert!(
@@ -565,6 +575,10 @@ fn a_tight_reader_admits_every_transient_and_returns_all_of_it() {
         drop(proof);
         assert_eq!(budget.usage().used, 0, "the refused walk holds nothing");
     }
+    let released = take_resolved_key_copy_observations_for_test();
+    assert!(released.is_empty(), "ending the refusal watch disables and clears events");
+    assert_eq!(released.capacity(), 0, "refused walks release the watch backing buffer too");
+
 }
 
 /// Every writer record lives in the reusable admitted window. Refusing

@@ -187,7 +187,8 @@ fn an_ordinary_incremental_pull_does_not_resurrect_an_expired_input_row() {
     let hub = Database::open_memory();
     install_work_ledger_schema(&hub).expect("install on hub");
     hub.apply_changes(
-        edge.changes_since(contextdb_core::Lsn(0)),
+        edge.changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .expect("hub receives the pushed job and its inputs");
@@ -223,7 +224,8 @@ fn an_ordinary_incremental_pull_does_not_resurrect_an_expired_input_row() {
     // An ORDINARY incremental pull -- from the edge's own recorded
     // watermark, never `Lsn(0)` -- must not resurrect the expired row.
     edge.apply_changes(
-        hub.changes_since(hub_watermark_after_convergence),
+        hub.changes_since(hub_watermark_after_convergence)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .expect("an ordinary incremental pull must apply without erroring");

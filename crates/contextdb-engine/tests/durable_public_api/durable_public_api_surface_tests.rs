@@ -578,6 +578,19 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         .iter()
         .find(|method| method.sig.ident == "new")
         .expect("safe SyncServer::new constructor remains public");
+    let explicit_server_new = server
+        .iter()
+        .find(|method| method.sig.ident == "new_with_read_budget_provider")
+        .expect("the server host constructor accepts its declared request provider");
+    let safe_client_new = client
+        .iter()
+        .find(|method| method.sig.ident == "new")
+        .expect("safe SyncClient::new constructor remains public");
+    let explicit_client_new = client
+        .iter()
+        .find(|method| method.sig.ident == "new_with_read_memory")
+        .expect("the client host constructor accepts its executing read owner");
+    assert_embedder_read_owner_facades(&root);
     assert_eq!(
         database_names,
         frozen_names(include_str!("../fixtures/public_api_database_names.txt")),
@@ -631,8 +644,29 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
         !method_mentions(safe_server_new, "ConflictPolicies")
             && !method_mentions(safe_server_new, "ConflictPolicy")
             && !method_mentions(safe_server_new, "ServerTransport")
+            && !method_mentions(safe_server_new, "ReadRequestBudgetProvider")
+            && method_mentions(safe_server_new, "Result")
             && safe_server_new.sig.inputs.len() == 3,
         "SyncServer::new must remain the typed production constructor without policy or arbitrary transport arguments"
+    );
+
+    assert!(
+        method_mentions(explicit_server_new, "ReadRequestBudgetProvider")
+            && method_mentions(explicit_server_new, "Result")
+            && !method_mentions(explicit_server_new, "ConflictPolicies")
+            && !method_mentions(explicit_server_new, "ConflictPolicy")
+            && !method_mentions(explicit_server_new, "ServerTransport")
+            && explicit_server_new.sig.inputs.len() == 4,
+        "the explicit server constructor requires a request provider without arbitration or transport injection"
+    );
+    assert!(
+        !method_mentions(safe_client_new, "ReadMemoryBudget")
+            && method_mentions(safe_client_new, "Result")
+            && safe_client_new.sig.inputs.len() == 3
+            && method_mentions(explicit_client_new, "ReadMemoryBudget")
+            && method_mentions(explicit_client_new, "Result")
+            && explicit_client_new.sig.inputs.len() == 4,
+        "the client keeps its original constructor inputs and requires a read owner only on the host variant"
     );
     for forbidden_reexport in [
         "pub use sync_types::*",
@@ -645,4 +679,95 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
             "role-relative arbitration types must not remain reachable through public reexports: {forbidden_reexport}"
         );
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ReadOwnerFacade {
+    source: String,
+    name: String,
+    inputs: String,
+    explicit: String,
+    budget: String,
+    top_level: bool,
+}
+
+fn public_declaration_inputs(source: &str, name: &str, top_level: bool) -> String {
+    let mut start = None;
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let declaration = if top_level { line } else { line.trim_start() };
+        for prefix in [format!("pub fn {name}"), format!("pub async fn {name}")] {
+            if let Some(suffix) = declaration.strip_prefix(&prefix) {
+                if suffix.starts_with('(') || suffix.starts_with('<') {
+                    let parenthesis = line.find('(').expect("function input list");
+                    start = Some(offset + parenthesis + 1);
+                    break;
+                }
+            }
+        }
+        if start.is_some() {
+            break;
+        }
+        offset += line.len();
+    }
+    let start = start.unwrap_or_else(|| panic!("public declaration {name} is absent"));
+    let mut depth = 1;
+    for (offset, character) in source[start..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            let inputs: String = source[start..start + offset]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            return inputs.trim_end_matches(',').to_owned();
+        }
+    }
+    panic!("public declaration {name} has no closing input list")
+}
+
+fn assert_embedder_read_owner_facades(root: &Path) {
+    let facades: Vec<ReadOwnerFacade> = serde_json::from_str(include_str!(
+        "../fixtures/public_api_read_owner_facades.json"
+    ))
+    .expect("parse declared embedder inputs");
+    assert_eq!(facades.len(), 50);
+    for facade in facades {
+        let source =
+            std::fs::read_to_string(root.join(&facade.source)).expect("read facade source");
+        syn::parse_file(&source).expect("facade declarations parse");
+        assert_eq!(
+            public_declaration_inputs(&source, &facade.name, facade.top_level),
+            facade.inputs,
+            "{}::{} must keep its original embedder inputs",
+            facade.source,
+            facade.name,
+        );
+        let explicit = public_declaration_inputs(&source, &facade.explicit, facade.top_level);
+        assert!(
+            explicit.contains(&facade.budget),
+            "{}::{} requires the host's declared read capability",
+            facade.source,
+            facade.explicit,
+        );
+    }
+}
+
+// Acceptance: embedders construct QueryResult using its five existing public fields.
+#[test]
+fn external_embedder_query_result_literal_keeps_its_five_public_fields() {
+    let result = contextdb_engine::QueryResult {
+        columns: vec!["id".to_owned()],
+        rows: vec![vec![contextdb_core::Value::Int64(7)]],
+        rows_affected: 0,
+        trace: contextdb_engine::QueryTrace::default(),
+        cascade: None,
+    };
+    assert_eq!(result.columns, vec!["id"]);
+    assert_eq!(result.rows, vec![vec![contextdb_core::Value::Int64(7)]]);
+    assert_eq!(result.rows_affected, 0);
+    assert!(result.cascade.is_none());
 }

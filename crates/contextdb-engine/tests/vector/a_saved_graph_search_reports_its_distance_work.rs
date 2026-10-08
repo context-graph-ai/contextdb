@@ -149,9 +149,15 @@ fn seed(path: &std::path::Path, runtime: &std::path::Path) -> Observed {
         admin
             .run_maintenance_cycle()
             .expect("advance deterministic maintenance");
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            admin
+                .declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let ready = admin
             .vector_store_for_test()
-            .partition_infos(&index)
+            .partition_infos(&index, &mut partition_observation_owner_1)
             .expect("inspect partition readiness");
         if ready.len() == 1 && ready.iter().all(|partition| partition.graph_available) {
             let (sql, params) = statement("INDEXED");

@@ -211,6 +211,12 @@ fn apply_received(
     received: &crate::protocol::ReceivedDdlContext,
     lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
 ) -> Result<crate::protocol::WireApplyResult> {
+    let received_schema_read_memory_1 = db
+        .declared_reader_memory()
+        .expect("admit the received-schema operation reader");
+    let mut received_schema_copy_owner_1 =
+        contextdb_engine::vector_read_memory::admission(received_schema_read_memory_1.clone());
+
     db.commit_received_schema_stage_with_receipt_for_test(
         changes,
         received,
@@ -218,6 +224,8 @@ fn apply_received(
         &HashMap::new(),
         Some(receipt()),
         false,
+        &mut received_schema_copy_owner_1,
+        received_schema_read_memory_1,
     )
 }
 
@@ -227,7 +235,10 @@ fn snapshot(db: &Database) -> RetrySnapshot {
     RetrySnapshot {
         schema: format!("{:?}", db.table_meta("retry_notes")),
         rows: format!("{:?}", db.relational_store.tables.read().get("retry_notes")),
-        changes: format!("{:?}", db.changes_since(Lsn(0))),
+        changes: format!(
+            "{:?}",
+            db.changes_since(Lsn(0)).expect("read the declared changes")
+        ),
         current_lsn: db.current_lsn(),
         config,
         durable_queue: format!(
@@ -254,7 +265,10 @@ fn memory_snapshot(db: &Database) -> MemoryRetrySnapshot {
     MemoryRetrySnapshot {
         schema: format!("{:?}", db.table_meta("retry_notes")),
         rows: format!("{:?}", db.relational_store.tables.read().get("retry_notes")),
-        changes: format!("{:?}", db.changes_since(Lsn(0))),
+        changes: format!(
+            "{:?}",
+            db.changes_since(Lsn(0)).expect("read the declared changes")
+        ),
         current_lsn: db.current_lsn(),
         live_queue: format!("{:?}", db.sink_queue_entries_for_test("retry_archive")),
         triggers: format!("{:?}", db.list_triggers()),
@@ -277,12 +291,16 @@ fn reopen_if_requested(db: Database, path: &std::path::Path, reopen: bool) -> Da
 
 fn assert_structured_received_schema_has_no_pending_ddl(db: &Database) {
     let mut trigger_arrivals = Vec::new();
-    db.visit_received_ddl_arrivals(|occurrence, _| {
-        if occurrence.1 == 3 {
-            trigger_arrivals.push(occurrence);
-        }
-        Ok(())
-    })
+    db.visit_received_ddl_arrivals(
+        |occurrence, _| {
+            if occurrence.1 == 3 {
+                trigger_arrivals.push(occurrence);
+            }
+            Ok(())
+        },
+        db.declared_reader_memory()
+            .expect("admit the DDL arrival reader"),
+    )
     .expect("visit durable received occurrences");
     assert_eq!(
         trigger_arrivals.len(),
@@ -290,20 +308,42 @@ fn assert_structured_received_schema_has_no_pending_ddl(db: &Database) {
         "the INCLUDING SYNC trigger keeps one source-order ordinal three"
     );
     let trigger_arrival = trigger_arrivals[0];
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(matches!(
-        db.raw_ddl_log_occurrence(trigger_arrival.0, trigger_arrival.1)
+        db.raw_ddl_log_occurrence(trigger_arrival.0, trigger_arrival.1, fixture_operation_reader_1.clone())
             .unwrap(),
         DdlChange::CreateTriggerIncludingSync { ref name, ref table, ref on_events }
             if name == "retry_note_audit"
                 && table == "retry_notes"
                 && on_events == &vec!["INSERT".to_string()]
     ));
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_2 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
 
     let (pending, provenance) = db
-        .changes_since_base(Lsn(0))
+        .changes_since_base(
+            Lsn(0),
+            &mut fixture_operation_copy_2,
+            fixture_operation_reader_2.clone(),
+        )
         .expect("received-schema outbound extraction must read its durable vector directory");
+    let fixture_operation_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let outbound = db
-        .filter_outbound_received_ddl(pending, &provenance, None)
+        .filter_outbound_received_ddl(
+            pending,
+            &provenance,
+            None,
+            fixture_operation_reader_3.clone(),
+        )
         .expect("received structured DDL must bind its local durable occurrence");
     assert!(outbound.ddl.is_empty());
 
@@ -321,7 +361,7 @@ fn assert_structured_received_schema_has_no_pending_ddl(db: &Database) {
     );
     assert!(meta.columns.iter().any(|column| column.name == "content"));
 
-    let visible = db.changes_since(Lsn(0));
+    let visible = db.changes_since(Lsn(0)).expect("read the declared changes");
     for ddl in visible.ddl.iter().filter(|ddl| {
         matches!(
             ddl,

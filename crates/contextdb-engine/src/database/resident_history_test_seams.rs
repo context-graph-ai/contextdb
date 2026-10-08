@@ -473,3 +473,33 @@ pub fn observe_source_unit_credit_for_test(
         },
     )
 }
+
+#[cfg(test)]
+std::thread_local! {
+    static CHECKPOINT_OBSERVER: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(super) fn with_checkpoint_observer<T>(
+    observer: Arc<dyn Fn() + Send + Sync>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    // Extend the existing observation surface at the production cancellation checkpoint.
+    struct Restore(Option<Arc<dyn Fn() + Send + Sync>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHECKPOINT_OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(CHECKPOINT_OBSERVER.with(|slot| slot.replace(Some(observer))));
+    operation()
+}
+
+#[cfg(test)]
+pub(super) fn note_checkpoint() {
+    let observer = CHECKPOINT_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer();
+    }
+}

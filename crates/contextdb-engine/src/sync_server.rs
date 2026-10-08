@@ -3127,8 +3127,10 @@ mod tests {
     #[tokio::test]
     async fn identical_pushes_from_distinct_authenticated_edges_deliver_independently() {
         let tasks = Arc::new(ApplyTracker::new());
+        let db = Arc::new(Database::open_memory());
         let state = Arc::new(PushHandlerState {
-            db: Arc::new(Database::open_memory()),
+            read_budget_provider: db.declared_read_request_provider(),
+            db,
             local_node_id: Some("1".repeat(64)),
             receipts: Arc::new(TransferLedger::new()),
             tenant_id: TenantId::from("independent-edges"),

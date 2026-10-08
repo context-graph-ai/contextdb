@@ -14,8 +14,13 @@ mod durable_observation {
 
     pub(super) fn version_count(db: &Database, table: &str) -> usize {
         let root = root(db);
+        let source_fixture_reader_1 = db
+            .declared_reader_memory()
+            .expect("admit the source fixture reader");
+
         let mut cursor = root
             .cursor(
+                crate::persistence::writer_source::SourceWindowOwner::Read(source_fixture_reader_1),
                 &RedbPersistence::rel_table_name(table),
                 WriterCursorFamily::Bytes,
                 Bound::Unbounded,
@@ -33,8 +38,13 @@ mod durable_observation {
 
     pub(super) fn rows(db: &Database, table: &str) -> Vec<VersionedRow> {
         let root = root(db);
+        let source_fixture_reader_2 = db
+            .declared_reader_memory()
+            .expect("admit the source fixture reader");
+
         let mut cursor = root
             .cursor(
+                crate::persistence::writer_source::SourceWindowOwner::Read(source_fixture_reader_2),
                 &RedbPersistence::rel_table_name(table),
                 WriterCursorFamily::Bytes,
                 Bound::Unbounded,
@@ -51,7 +61,17 @@ mod durable_observation {
 
     pub(super) fn changes(db: &Database) -> Vec<ChangeLogEntry> {
         let root = root(db);
-        let mut cursor = root.change_log_cursor(Lsn(0), db.current_lsn()).unwrap();
+        let source_fixture_reader_3 = db
+            .declared_reader_memory()
+            .expect("admit the source fixture reader");
+
+        let mut cursor = root
+            .change_log_cursor(
+                crate::persistence::writer_source::SourceWindowOwner::Read(source_fixture_reader_3),
+                Lsn(0),
+                db.current_lsn(),
+            )
+            .unwrap();
         let mut changes = Vec::new();
         while let Some(window) = cursor.next_change().unwrap() {
             changes.push(window.value.clone());
@@ -61,8 +81,17 @@ mod durable_observation {
 
     pub(super) fn table_index(db: &Database, table: &str) -> Vec<(Lsn, RowId)> {
         let root = root(db);
+        let source_fixture_reader_4 = db
+            .declared_reader_memory()
+            .expect("admit the source fixture reader");
+
         let mut cursor = root
-            .table_change_cursor(table, Lsn(0), db.current_lsn())
+            .table_change_cursor(
+                crate::persistence::writer_source::SourceWindowOwner::Read(source_fixture_reader_4),
+                table,
+                Lsn(0),
+                db.current_lsn(),
+            )
             .unwrap();
         let mut index = Vec::new();
         while let Some(window) = cursor.next_table_change().unwrap() {

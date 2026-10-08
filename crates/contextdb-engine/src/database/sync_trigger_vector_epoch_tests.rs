@@ -99,7 +99,13 @@ fn incoming_unit(with_outcome: bool) -> (ChangeSet, Uuid, Uuid) {
             .expect("author the trigger-bearing outcome");
     }
     source.commit(tx).expect("commit the source transaction");
-    (source.changes_since(before), digest_id, outcome_id)
+    (
+        source
+            .changes_since(before)
+            .expect("read the declared changes"),
+        digest_id,
+        outcome_id,
+    )
 }
 
 fn live_vector_count(db: &Database) -> usize {

@@ -142,7 +142,8 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
             TenantId::from(TENANT),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -157,7 +158,8 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
         broker.client_as(&edge_node_id),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
 
     client
         .pull_default()

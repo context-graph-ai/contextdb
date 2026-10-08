@@ -20,7 +20,8 @@ async fn start_server(db: Arc<Database>, fabric: &InProcessBroker, tenant: &str)
             contextdb_core::TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -47,6 +48,7 @@ fn sync_client(db: Arc<Database>, fabric: &InProcessBroker, tenant: &str) -> Syn
         contextdb_core::TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 async fn stop_server(server: RunningServer) {
@@ -1225,6 +1227,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from("foo.bar"),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "dot in tenant_id must panic");
 
@@ -1234,6 +1237,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from("foo*"),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "wildcard in tenant_id must panic");
 
@@ -1243,6 +1247,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from("foo>"),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "multi-level route wildcard must panic");
 
@@ -1252,6 +1257,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from(""),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "empty tenant_id must panic");
 
@@ -1261,6 +1267,7 @@ async fn a11_tenant_id_validation() {
             fabric.client_as("tenant-validation-edge"),
             contextdb_core::TenantId::from("foo bar"),
         )
+        .expect("construct SyncClient fixture")
     }));
     assert!(r.is_err(), "space in tenant_id must panic");
 
@@ -1271,6 +1278,7 @@ async fn a11_tenant_id_validation() {
             fabric.server_as("tenant-validation-hub"),
             contextdb_core::TenantId::from("foo.bar"),
         )
+        .expect("construct SyncServer fixture")
     }));
     assert!(r.is_err(), "SyncServer must also reject dots");
 
@@ -1279,17 +1287,20 @@ async fn a11_tenant_id_validation() {
         db.clone(),
         fabric.client_as("tenant-validation-edge"),
         contextdb_core::TenantId::from("valid-tenant"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     SyncClient::with_authenticated_transport_for_test(
         db.clone(),
         fabric.client_as("tenant-validation-edge"),
         contextdb_core::TenantId::from("tenant_123"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     SyncClient::with_authenticated_transport_for_test(
         db.clone(),
         fabric.client_as("tenant-validation-edge"),
         contextdb_core::TenantId::from("MyTenant"),
-    );
+    )
+    .expect("construct SyncClient fixture");
 }
 
 // A13: Pull pagination fetches all pages (exact test code from plan)

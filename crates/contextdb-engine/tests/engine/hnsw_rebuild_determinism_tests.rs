@@ -175,7 +175,10 @@ fn assert_public_hnsw_trace(
     context: &str,
 ) {
     let trace = db
-        .__debug_last_query_vector_trace_for_test()
+        .__debug_last_query_vector_trace_for_test(
+            db.declared_reader_memory().expect("admit the trace reader"),
+        )
+        .expect("read the admitted trace observation")
         .unwrap_or_else(|| panic!("{context}: missing public query_vector debug trace"));
     assert!(
         db.__debug_last_query_vector_used_hnsw_for_test(),

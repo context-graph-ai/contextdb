@@ -57,7 +57,7 @@ impl Hub {
             db.execute(ddl, &HashMap::new())
                 .map_err(|_| "cannot declare policy verifier hub table".to_string())?;
         }
-        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant));
+        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant)).map_err(|e| format!("cannot construct smoke server: {e}"))?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
@@ -120,7 +120,7 @@ fn open_edge(
         db.clone(),
         &peer_dial_spec(ticket, &identity),
         TenantId::from(tenant),
-    );
+    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
     Ok(Edge {
         db,
         client,
@@ -227,15 +227,24 @@ fn inspect_delete_obligation(
         .map_err(|_| "cannot open delete-obligation database".to_string())?;
     db.export_snapshot(artifact)
         .map_err(|_| "cannot export delete-obligation snapshot".to_string())?;
+    let inspection_memory = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        db.owner_read_config().limits.limits.memory,
+    );
+    let inspection_read = inspection_memory
+        .child()
+        .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
     db.close()
         .map_err(|_| "cannot close delete-obligation database".to_string())?;
-    let inspector = SnapshotInspector::open(artifact)
+    let inspector = SnapshotInspector::open(artifact, inspection_read, inspection_memory.clone())
         .map_err(|_| "cannot open delete-obligation snapshot".to_string())?;
     let report = inspector
         .inspect_key(
             "notes",
             &NaturalKey::single("id".to_string(), Value::Uuid(id)),
             &[],
+            inspection_memory
+                .child()
+                .map_err(|e| format!("cannot admit smoke key inspection: {e}"))?,
         )
         .map_err(|_| "cannot inspect delete-obligation snapshot".to_string())?;
     inspector
@@ -296,12 +305,12 @@ async fn run_two_way(root: &Path, cli: &Path) -> Result<(), String> {
         winner.db.clone(),
         &peer_dial_spec(&hub.ticket, &winner.identity),
         TenantId::from(tenant),
-    );
+    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
     let loser_client = SyncClient::new(
         loser.db.clone(),
         &peer_dial_spec(&hub.ticket, &loser.identity),
         TenantId::from(tenant),
-    );
+    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
     let refusal = loser_client
         .push()
         .await

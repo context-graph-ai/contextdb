@@ -367,7 +367,8 @@ pub(crate) async fn push_change_through_server(
         db,
         &dial_spec,
         contextdb_core::TenantId::from(tenant_id),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.push().await.expect("push change through server");
 }
 
@@ -414,7 +415,8 @@ pub(crate) async fn push_many_changes_through_server(
         db,
         &dial_spec,
         contextdb_core::TenantId::from(tenant_id),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let push_task = tokio::spawn(async move { client.push().await });
 
     if let Some(started) = started {

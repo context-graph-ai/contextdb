@@ -19,6 +19,7 @@
 //! same as any other ratchet raise.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
@@ -470,6 +471,288 @@ fn test_estate_audit_no_new_sleeps_or_raw_clock_reads() {
     assert!(
         violations.is_empty(),
         "test-estate audit violations:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Default-tier test count per workspace crate: every `#[test]` and
+/// `#[tokio::test]` attribute in a module Cargo compiles for that crate's
+/// targets (`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`, `tests/*.rs` and each
+/// `[[test]]` path, following `mod name;` and `#[path]`), minus tests behind
+/// a feature in `OUTSIDE_DEFAULT_TIER_FEATURES` or `#[ignore]`. A macro that expands one
+/// written attribute into several tests counts once, and a source file no
+/// module declares counts zero. The workspace-root `tests/` tree builds as
+/// `contextdb-engine` targets. The count must equal its entry: a new test
+/// raises it only as an approved exception that names the criterion it
+/// proves; a merged or removed test lowers it in the same change.
+const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
+    ("contextdb-core", 86, RSN_TEST_COUNT),
+    ("contextdb-tx", 19, RSN_TEST_COUNT),
+    ("contextdb-relational", 10, RSN_TEST_COUNT),
+    ("contextdb-graph", 10, RSN_TEST_COUNT),
+    ("contextdb-hnsw", 21, RSN_TEST_COUNT),
+    ("contextdb-vector", 192, RSN_TEST_COUNT),
+    ("contextdb-parser", 131, RSN_TEST_COUNT),
+    ("contextdb-planner", 10, RSN_TEST_COUNT),
+    ("contextdb-engine", 4386, RSN_TEST_COUNT),
+    ("contextdb-server", 421, RSN_TEST_COUNT),
+    ("contextdb-cli", 270, RSN_TEST_COUNT),
+];
+
+/// Reason shared by every default-tier count entry.
+const RSN_TEST_COUNT: &str = "default-tier test budget; one proof per acceptance criterion, \
+     a second test for one criterion only with a recorded reason";
+
+/// Features the default tier never enables. `test-seams` is not listed: the
+/// CLI's dev-dependencies unify it into every default-tier test build.
+const OUTSIDE_DEFAULT_TIER_FEATURES: &[&str] = &["nightly-tests", "mdns"];
+
+/// Whether a raw `#[cfg(...)]` / `#![cfg(...)]` attribute line requires a
+/// feature the default tier never enables, or a release build (the default
+/// tier is a debug build).
+fn gated_outside_default_tier(attribute: &str) -> bool {
+    attribute == "#[cfg(not(debug_assertions))]"
+        || (attribute.starts_with("#[cfg(") || attribute.starts_with("#![cfg("))
+            && !attribute.contains("not(")
+            && OUTSIDE_DEFAULT_TIER_FEATURES
+                .iter()
+                .any(|feature| attribute.contains(&format!("feature = \"{feature}\"")))
+}
+
+fn is_attribute_line(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("#[") || line.ends_with(")]") || line.ends_with(',')
+}
+
+/// Indexes of the attribute lines written directly above line `index`,
+/// nearest first. Comments are already blanked, so blank lines are skipped.
+fn attributes_above(lines: &[&str], index: usize) -> Vec<usize> {
+    let mut group = Vec::new();
+    for above in (0..index).rev() {
+        if lines[above].trim().is_empty() {
+            continue;
+        }
+        if !is_attribute_line(lines[above]) {
+            break;
+        }
+        group.push(above);
+    }
+    group
+}
+
+fn is_fn_signature(line: &str) -> bool {
+    let line = line.strip_prefix("pub ").unwrap_or(line);
+    let line = line.strip_prefix("async ").unwrap_or(line);
+    line.starts_with("fn ")
+}
+
+/// Default-tier test attributes in one module file. `code` is `source` with
+/// comments and literals blanked (same line numbers): structure is read from
+/// `code`, attribute contents from `source`.
+fn default_tier_tests_in(source: &str, code: &str) -> usize {
+    let raw: Vec<&str> = source.lines().collect();
+    let lines: Vec<&str> = code.lines().collect();
+    let mut count = 0;
+    for (index, line) in lines.iter().enumerate() {
+        let line = line.trim();
+        if line != "#[test]" && !line.starts_with("#[tokio::test") {
+            continue;
+        }
+        let below = (index + 1..lines.len())
+            .take_while(|&after| !is_fn_signature(lines[after].trim()))
+            .map(|after| raw[after].trim());
+        let excluded = attributes_above(&lines, index)
+            .into_iter()
+            .map(|above| raw[above].trim())
+            .chain(below)
+            .any(|attribute| {
+                gated_outside_default_tier(attribute) || attribute.starts_with("#[ignore")
+            });
+        if !excluded {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Child module files a module file declares with `mod name;`, skipping
+/// declarations gated outside the default tier. `source` and its mask `code` share
+/// line numbers; a `#[path]` value is read from `source`.
+fn declared_modules(file: &Path, source: &str, code: &str, is_root: bool) -> Vec<PathBuf> {
+    let directory = file.parent().expect("a module file has a directory");
+    let owner_directory = if is_root || file.file_name().is_some_and(|name| name == "mod.rs") {
+        directory.to_path_buf()
+    } else {
+        directory.join(file.file_stem().expect("a module file has a stem"))
+    };
+    let raw: Vec<&str> = source.lines().collect();
+    let lines: Vec<&str> = code.lines().collect();
+    let mut modules = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let declaration = line.trim();
+        let declaration = ["pub(crate) ", "pub(super) ", "pub "]
+            .iter()
+            .find_map(|visibility| declaration.strip_prefix(visibility))
+            .unwrap_or(declaration);
+        let Some(name) = declaration
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.strip_suffix(';'))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        let attributes = attributes_above(&lines, index);
+        if attributes
+            .iter()
+            .any(|&above| gated_outside_default_tier(raw[above].trim()))
+        {
+            continue;
+        }
+        let explicit = attributes.iter().find_map(|&above| {
+            let attribute = raw[above].trim();
+            attribute
+                .strip_prefix("#[path = \"")
+                .and_then(|rest| rest.strip_suffix("\"]"))
+        });
+        if let Some(path) = explicit {
+            modules.push(directory.join(path));
+            continue;
+        }
+        if let Some(found) = [
+            owner_directory.join(format!("{name}.rs")),
+            owner_directory.join(name).join("mod.rs"),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        {
+            modules.push(found);
+        }
+    }
+    modules
+}
+
+/// Every target root Cargo builds for one workspace member's default tier.
+fn crate_target_roots(crate_directory: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = ["src/lib.rs", "src/main.rs"]
+        .iter()
+        .map(|relative| crate_directory.join(relative))
+        .filter(|path| path.exists())
+        .collect();
+    let rust_files_in = |directory: PathBuf| {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+            .collect();
+        files.sort();
+        files
+    };
+    roots.extend(rust_files_in(crate_directory.join("src/bin")));
+    let manifest: toml::Value = toml::from_str(
+        &std::fs::read_to_string(crate_directory.join("Cargo.toml")).expect("crate manifest"),
+    )
+    .expect("crate manifest parses");
+    let autotests = manifest
+        .get("package")
+        .and_then(|package| package.get("autotests"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+    if autotests {
+        roots.extend(rust_files_in(crate_directory.join("tests")));
+    }
+    for target in manifest
+        .get("test")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(path) = target.get("path").and_then(toml::Value::as_str) {
+            roots.push(crate_directory.join(path));
+        }
+    }
+    roots
+}
+
+fn default_tier_tests_in_crate(crate_directory: &Path) -> usize {
+    let mut visited = std::collections::BTreeSet::new();
+    let mut pending: Vec<(PathBuf, bool)> = crate_target_roots(crate_directory)
+        .into_iter()
+        .map(|root| (root, true))
+        .collect();
+    let mut count = 0;
+    while let Some((file, is_root)) = pending.pop() {
+        let Ok(canonical) = file.canonicalize() else {
+            continue;
+        };
+        if !visited.insert(canonical.clone()) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&canonical).expect("module source");
+        if source.lines().any(|line| {
+            line.trim().starts_with("#![cfg(") && gated_outside_default_tier(line.trim())
+        }) {
+            continue;
+        }
+        let code = audit_support::rust_scope_text(&source);
+        count += default_tier_tests_in(&source, &code);
+        pending.extend(
+            declared_modules(&canonical, &source, &code, is_root)
+                .into_iter()
+                .map(|module| (module, false)),
+        );
+    }
+    count
+}
+
+#[test]
+fn test_estate_default_tier_test_count_matches_its_ratchet() {
+    let root = workspace_root();
+    let manifest: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest"),
+    )
+    .expect("workspace manifest parses");
+    let members: Vec<&str> = manifest["workspace"]["members"]
+        .as_array()
+        .expect("workspace members")
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect();
+    let ratchet: BTreeMap<&str, usize> = DEFAULT_TIER_TEST_RATCHET
+        .iter()
+        .map(|(name, count, _)| (*name, *count))
+        .collect();
+    let mut violations = assert_reasons_present(DEFAULT_TIER_TEST_RATCHET);
+    for member in &members {
+        let name = member
+            .rsplit('/')
+            .next()
+            .expect("member path names a crate");
+        let count = default_tier_tests_in_crate(&root.join(member));
+        match ratchet.get(name) {
+            None => violations.push(format!(
+                "{name}: {count} default-tier test(s) and no ratchet entry; add one with its reason"
+            )),
+            Some(&allowed) if count > allowed => violations.push(format!(
+                "{name}: {count} default-tier tests, ratchet allows {allowed} — make the new \
+                 proof a row of the mapped test, or record the approved exception"
+            )),
+            Some(&allowed) if count < allowed => violations.push(format!(
+                "{name}: {count} default-tier tests, ratchet still says {allowed} — lower the \
+                 entry to {count}"
+            )),
+            Some(_) => {}
+        }
+    }
+    for (name, _, _) in DEFAULT_TIER_TEST_RATCHET {
+        if !members.iter().any(|member| member.ends_with(name)) {
+            violations.push(format!("{name}: ratchet entry names no workspace member"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "default-tier test count violations:\n{}",
         violations.join("\n")
     );
 }

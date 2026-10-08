@@ -40,7 +40,8 @@ async fn start_server(
             contextdb_core::TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let flag = shutdown.clone();
@@ -65,6 +66,7 @@ fn edge_client(db: Arc<Database>, fabric: &InProcessBroker, tenant: &str) -> Syn
         contextdb_core::TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 async fn stop_server(server_gen: ServerGen) {

@@ -15,6 +15,7 @@ fn newest_event_merges_staged_order_without_sort() {
     let context = stream_id(1);
     let stream = stream_id(2);
     let mut observed = Vec::new();
+    let mut deleted_only = Vec::new();
     for committed in [SMALL_STREAM_ROWS, LARGE_STREAM_ROWS] {
         let database = new_database();
         seed_stream(&database, context, stream, committed);
@@ -77,6 +78,43 @@ fn newest_event_merges_staged_order_without_sort() {
             "concurrent committed lookup",
         );
         database.rollback(tx).unwrap();
+        let deleted = database.begin_or_panic();
+        database
+            .execute_in_tx(
+                deleted,
+                "DELETE FROM events WHERE id = $id",
+                &params([("id", Value::Uuid(event_id(stream, committed - 1)))]),
+            )
+            .unwrap();
+        let (answer, work) = observe(|| {
+            database
+                .execute_in_tx(
+                    deleted,
+                    newest_sql(),
+                    &params([
+                        ("context_id", Value::Uuid(context)),
+                        ("connector_id", Value::Text(CONNECTOR_ID.to_owned())),
+                        ("source_instance_ref", Value::Text(stream.to_string())),
+                    ]),
+                )
+                .unwrap()
+        });
+        asserted_newest(
+            &database,
+            &answer,
+            committed - 2,
+            "delete-only staged lookup",
+        );
+        assert!(answer.trace.sort_elided);
+        assert_eq!(work.staged_sort_calls, 0);
+        deleted_only.push(answer.trace.rows_examined);
+        asserted_newest(
+            &database,
+            &newest(&database, context, stream),
+            committed - 1,
+            "the staged deletion remains private",
+        );
+        database.rollback(deleted).unwrap();
         observed.push((
             outside.trace.rows_examined,
             inside.trace.rows_examined,
@@ -91,6 +129,10 @@ fn newest_event_merges_staged_order_without_sort() {
     assert_eq!(
         observed[0].1, observed[1].1,
         "staged lookup ignores stream depth and neighbours"
+    );
+    assert_eq!(
+        deleted_only[0], deleted_only[1],
+        "delete-only newest lookup ignores doubled completed history"
     );
     for (_, _, outside, inside) in observed {
         assert_eq!(

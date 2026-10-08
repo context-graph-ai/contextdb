@@ -1968,9 +1968,6 @@ mod tests {
                     table.get_bounded(b"key").unwrap().unwrap().value(),
                     b"original"
                 );
-                eprintln!(
-                    "production lookup: one Cached computation, repeated memo hits; corrupt/new expected checksum refused on memo hit"
-                );
             }
             // Restore this task-created store before redb close housekeeping.
             disk.write_all_at(&page.memory()[start..start + 1], offset + start as u64)

@@ -64,7 +64,8 @@ fn start_hub_ddl(broker: &InProcessBroker, ddl: &str) -> Hub {
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -83,7 +84,8 @@ fn start_hub_db(broker: &InProcessBroker, identity: Arc<FabricIdentity>, db: Arc
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -107,7 +109,8 @@ fn edge_ddl(broker: &InProcessBroker, _role: &str, ddl: &str) -> (Arc<Database>,
         broker.client_as(&node_id),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client)
 }
 

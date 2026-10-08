@@ -162,16 +162,23 @@ fn a_received_table_alter_does_not_clone_unrelated_event_metadata_before_admissi
             &HashMap::new(),
         )
         .expect("author reshapes one table");
-    let unit = author.changes_since(before_alter);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_alter)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &tenant,
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("author signs the one-table schema unit");
+    }
+    .expect("author signs the one-table schema unit");
     author.close().expect("close the author");
 
     let mut peaks = [0_i64; 2];
@@ -235,12 +242,19 @@ fn a_received_table_alter_does_not_clone_unrelated_event_metadata_before_admissi
             .set_memory_limit(Some(settled))
             .expect("bound the received migration at the settled bill");
         let (refusal, refused_peak) = measure_thread_peak(|| {
+            let seam_read_memory = receiver
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
             receiver.apply_received_schema_for_test(
                 unit.clone(),
                 provenance.clone(),
                 tenant.clone(),
                 HELD_SOURCE,
                 HELD_INCARNATION,
+                &mut seam_copy_owner,
+                seam_read_memory,
             )
         });
         let refusal = refusal.expect_err("the table copy must be refused at the settled bill");
@@ -266,12 +280,19 @@ fn a_received_table_alter_does_not_clone_unrelated_event_metadata_before_admissi
             .set_memory_limit(None)
             .expect("lift the limit for the same authenticated unit");
         let (applied, peak) = measure_thread_peak(|| {
+            let seam_read_memory = receiver
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
             receiver.apply_received_schema_for_test(
                 unit.clone(),
                 provenance.clone(),
                 tenant.clone(),
                 HELD_SOURCE,
                 HELD_INCARNATION,
+                &mut seam_copy_owner,
+                seam_read_memory,
             )
         });
         applied.expect("the received one-table ALTER installs with room");
@@ -339,6 +360,42 @@ const EVENT_INSERT: &str = "INSERT INTO events (id, context_id, connector_id, ad
     ($id, $context_id, 'claude-code', 'v1', 'v1', $source, $session, $key, $position, $seq, \
     $hash, 1, $hash, $occurred_at, 'agent', 'message', 'primary', NULL, $text, $payload, \
     $anchors, $remainder, 'complete')";
+
+/// The refusal names the sync subsystem, the refused operation and its exact
+/// shortfall; the same refusal relabelled to another subsystem does not match.
+fn assert_sync_refusal_attributed(
+    error: &Error,
+    expected_operation: &str,
+    requested: usize,
+    available: usize,
+    limit: usize,
+) {
+    let attributed = |error: &Error| {
+        matches!(error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
+        if subsystem == "sync" && operation == expected_operation
+            && *requested_bytes == requested && *available_bytes == available && *budget_limit_bytes == limit)
+    };
+    assert!(attributed(error), "{error:?}");
+    if let Error::MemoryBudgetExceeded {
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+        ..
+    } = error
+    {
+        assert!(!attributed(&Error::MemoryBudgetExceeded {
+            subsystem: "relational_index".to_owned(),
+            operation: operation.clone(),
+            requested_bytes: *requested_bytes,
+            available_bytes: *available_bytes,
+            budget_limit_bytes: *budget_limit_bytes,
+            hint: hint.clone()
+        }));
+    }
+}
 
 fn context_uuid() -> uuid::Uuid {
     uuid::Uuid::from_u128(0xc0de_0000_0000_0000_0000_0000_0000_0001)
@@ -849,7 +906,10 @@ fn every_charge_a_row_takes_comes_back_when_the_row_does() {
         assert_eq!(values[0], Value::Uuid(event_uuid(row)));
         assert_eq!(values[4], Value::Int64(row as i64));
     }
-    let populated = db.table_size_estimate("notes").unwrap();
+    let populated = db
+        .table_size_estimate("notes")
+        .expect("read the actual fixture observation")
+        .unwrap();
     assert_eq!(populated.row_count, ROWS as u64);
     assert!(populated.estimated_live_bytes >= (ROWS * 256) as u64);
 
@@ -857,7 +917,13 @@ fn every_charge_a_row_takes_comes_back_when_the_row_does() {
         .expect("delete every note");
     let emptied = settled_receipt();
     assert_eq!(emptied.table_metadata, empty.table_metadata);
-    assert_eq!(db.table_size_estimate("notes").unwrap().row_count, 0);
+    assert_eq!(
+        db.table_size_estimate("notes")
+            .expect("read the actual fixture observation")
+            .unwrap()
+            .row_count,
+        0
+    );
     assert!(
         db.execute("SELECT id FROM notes", &HashMap::new())
             .unwrap()
@@ -895,11 +961,11 @@ fn every_charge_a_row_takes_comes_back_when_the_row_does() {
         "rollback releases every admitted owner exactly"
     );
     assert_eq!(
-        db.table_size_estimate("notes").unwrap().row_count,
+        db.table_size_estimate("notes")
+            .expect("read the actual fixture observation")
+            .unwrap()
+            .row_count,
         ROWS as u64
-    );
-    eprintln!(
-        "row ownership empty={empty:?} full={full:?} emptied={emptied:?} refilled={refilled:?}"
     );
     db.close().expect("close the store");
 }
@@ -1721,9 +1787,6 @@ fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
         settled,
         "pricing releases its private catalog"
     );
-    eprintln!(
-        "schema group price={priced} retained_index={one_index} admission={admission:?} limit={limit}"
-    );
     db.set_memory_limit(Some(limit)).unwrap();
     let before_refusal = db.current_lsn();
     assert!(
@@ -1904,11 +1967,7 @@ fn a_received_unit_priced_far_too_low_is_refused_not_installed_past_the_limit() 
         .find(|entry| entry.what == "sync/received_schema_unit")
         .expect("the funded profile reserves its schema unit");
     let preparation_controls = admission.used_after - before_probe - admission.bytes;
-    let retained = accountant.usage().used - before_probe;
     let real = accountant.high_water_for_test() - before_probe;
-    eprintln!(
-        "received index retained={retained} installation_peak={real} preparation_controls={preparation_controls} admission={admission:?}"
-    );
     db.execute("DROP INDEX sizing_probe ON wide", &HashMap::new())
         .unwrap();
     db.set_memory_limit(None).unwrap();
@@ -1953,32 +2012,7 @@ fn a_received_unit_priced_far_too_low_is_refused_not_installed_past_the_limit() 
             .any(|entry| entry.what == "sync/received_schema_unit" && entry.bytes == priced),
         "the unit must actually be admitted before the refused installation: {actual_ledger:?}; {error:?}"
     );
-    eprintln!("received schema refusal={error:?}");
-    let attributed = |error: &Error| {
-        matches!(error, Error::MemoryBudgetExceeded {
-        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
-        if subsystem == "sync" && operation == "stage_received_catalog_dependencies"
-            && *requested_bytes == 768 && *available_bytes == 0 && *budget_limit_bytes == limit)
-    };
-    assert!(attributed(&error), "{error:?}");
-    if let Error::MemoryBudgetExceeded {
-        operation,
-        requested_bytes,
-        available_bytes,
-        budget_limit_bytes,
-        hint,
-        ..
-    } = &error
-    {
-        assert!(!attributed(&Error::MemoryBudgetExceeded {
-            subsystem: "relational_index".to_owned(),
-            operation: operation.clone(),
-            requested_bytes: *requested_bytes,
-            available_bytes: *available_bytes,
-            budget_limit_bytes: *budget_limit_bytes,
-            hint: hint.clone()
-        }));
-    }
+    assert_sync_refusal_attributed(&error, "stage_received_catalog_dependencies", 768, 0, limit);
     assert!(
         db.table_meta("wide")
             .expect("the table is still declared")
@@ -2034,7 +2068,9 @@ fn a_received_alter_priced_far_too_low_leaves_the_old_shape_the_log_and_the_rest
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
     assert!(
         unit.ddl
             .iter()
@@ -2358,17 +2394,24 @@ fn a_received_index_the_declared_limit_can_hold_is_installed_rather_than_parked(
             &HashMap::new(),
         )
         .expect("author declares the index the receiver will be sent");
-    let unit = author.changes_since(before_unit);
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
     assert_eq!(unit.ddl.len(), 1, "the unit is the one index");
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
 
     // What taking delivery of that unit really costs a receiver, measured on an
     // identical store with no limit at all. The price the receiver puts on the
@@ -2391,15 +2434,23 @@ fn a_received_index_the_declared_limit_can_hold_is_installed_rather_than_parked(
             .expect("the unlimited receiver stores one label row");
     }
     let before_apply = unlimited_accountant.usage().used;
-    unlimited
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = unlimited
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        unlimited.apply_received_schema_for_test(
             unit.clone(),
             provenance.clone(),
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("a receiver with no limit takes the unit");
+    }
+    .expect("a receiver with no limit takes the unit");
     // At its WIDEST point, not at what it settles to: taking delivery holds more
     // while it runs than it keeps, and a limit has to cover the wider figure or
     // the apply is refused part way through for a reason that has nothing to do
@@ -2434,15 +2485,23 @@ fn a_received_index_the_declared_limit_can_hold_is_installed_rather_than_parked(
         .set_memory_limit(Some(limit))
         .expect("declare a limit with room for the arriving unit");
 
-    receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             unit,
             provenance,
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("an index the declared limit can hold must install, not be parked in a hold");
+    }
+    .expect("an index the declared limit can hold must install, not be parked in a hold");
     assert!(
         receiver
             .table_meta("labels")
@@ -2502,16 +2561,23 @@ fn a_received_unit_that_installed_is_reported_applied_even_when_its_hold_will_no
             )
             .expect("author declares one of the unit's indexes");
     }
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
 
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let receiver = Database::open_with_config(
@@ -2546,15 +2612,23 @@ fn a_received_unit_that_installed_is_reported_applied_even_when_its_hold_will_no
         .set_memory_limit(Some(tight))
         .expect("declare a limit with room for two of the three indexes");
 
-    receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             unit.clone(),
             provenance.clone(),
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect_err("the unit does not fit yet, so it is refused and held");
+    }
+    .expect_err("the unit does not fit yet, so it is refused and held");
     assert_eq!(
         receiver
             .memory_held_received_schema_units(&tenant)
@@ -2577,13 +2651,22 @@ fn a_received_unit_that_installed_is_reported_applied_even_when_its_hold_will_no
         .set_memory_limit(Some(retry_limit))
         .expect("raise the limit above what the held unit needs to arrive and to install");
     Database::refuse_memory_schema_holdback_writes_for_test(true);
-    let applied = receiver.apply_received_schema_for_test(
-        unit.clone(),
-        provenance.clone(),
-        tenant.clone(),
-        HELD_SOURCE,
-        HELD_INCARNATION,
-    );
+    let applied = {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit.clone(),
+            provenance.clone(),
+            tenant.clone(),
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    };
     Database::refuse_memory_schema_holdback_writes_for_test(false);
     applied.expect(
         "the unit is committed and durable, so its author is told it landed -- a hold record that \
@@ -2611,15 +2694,23 @@ fn a_received_unit_that_installed_is_reported_applied_even_when_its_hold_will_no
         1,
         "the hold outlived the apply, because clearing it was best effort"
     );
-    receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             unit,
             provenance,
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("the next delivery for that table is not queued behind the stale hold");
+    }
+    .expect("the next delivery for that table is not queued behind the stale hold");
     assert!(
         receiver
             .memory_held_received_schema_units(&tenant)
@@ -2683,32 +2774,46 @@ fn held_table_budget_control(root: &std::path::Path, include_other: bool) -> Hel
             )
             .expect("author declares one of the unit's indexes");
     }
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
 
     let before_later = author.current_lsn();
     author
         .execute("CREATE INDEX group_four ON notes (kind)", &HashMap::new())
         .expect("author declares a LATER index on the same table");
-    let later_unit = author.changes_since(before_later);
+    let later_unit = author
+        .changes_since(before_later)
+        .expect("read the declared changes");
     assert_eq!(later_unit.ddl.len(), 1, "the later unit is the one index");
-    let later_provenance = author
-        .outbound_ddl_provenance_for_test(
+    let later_provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &later_unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs the later unit");
+    }
+    .expect("the author signs the later unit");
 
     let receiver_path = root.join("receiver.db");
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -2752,17 +2857,23 @@ fn held_table_budget_control(root: &std::path::Path, include_other: bool) -> Hel
         .set_memory_limit(Some(tight))
         .expect("declare a limit with room for two of the three indexes");
 
-    receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             unit.clone(),
             provenance.clone(),
             contextdb_core::TenantId::from(HELD_TENANT),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect_err(
-            "a limit with room for two of three indexes refuses the unit that declares three",
-        );
+    }
+    .expect_err("a limit with room for two of three indexes refuses the unit that declares three");
 
     HeldTablePair {
         author,
@@ -2798,37 +2909,50 @@ fn measured_held_retry_room(include_later: bool, include_other: bool, other_only
             .author
             .execute("CREATE INDEX other_label ON other (label)", &HashMap::new())
             .unwrap();
-        let unit = control.author.changes_since(position);
-        let provenance = control
+        let unit = control
             .author
-            .outbound_ddl_provenance_for_test(
+            .changes_since(position)
+            .expect("read the declared changes");
+        let provenance = {
+            let seam_read_memory = control
+                .author
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            control.author.outbound_ddl_provenance_for_test(
                 &unit,
                 &contextdb_core::TenantId::from(HELD_TENANT),
                 &fixture_schema_author().node_id(),
                 HELD_INCARNATION,
                 &fixture_signer(),
+                seam_read_memory,
             )
-            .unwrap();
+        }
+        .unwrap();
         contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
         let baseline = accountant.usage().used;
-        control
-            .receiver
-            .apply_received_schema_for_test(
+        {
+            let seam_read_memory = control
+                .receiver
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            control.receiver.apply_received_schema_for_test(
                 unit,
                 provenance,
                 contextdb_core::TenantId::from(HELD_TENANT),
                 HELD_SOURCE,
                 HELD_INCARNATION,
+                &mut seam_copy_owner,
+                seam_read_memory,
             )
-            .expect("the unrelated control unit installs while notes is held");
+        }
+        .expect("the unrelated control unit installs while notes is held");
         let ledger = contextdb_engine::memory_accounting::take_budget_ledger_for_test();
         if other_only {
             let peak = ledger.iter().map(|entry| entry.used_after).max().unwrap();
             let room = peak.checked_sub(baseline).unwrap();
             assert!(room > 0);
-            eprintln!(
-                "HELD_OTHER_OWNERS baseline={baseline} peak={peak} room={room} ledger={ledger:?}"
-            );
             control.receiver.close().unwrap();
             control.author.close().unwrap();
             drop(control);
@@ -2839,27 +2963,43 @@ fn measured_held_retry_room(include_later: bool, include_other: bool, other_only
     }
     let baseline = accountant.usage().used;
     contextdb_engine::memory_accounting::watch_budget_ledger_for_test();
-    control
-        .receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = control
+            .receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        control.receiver.apply_received_schema_for_test(
             control.unit.clone(),
             control.provenance.clone(),
             contextdb_core::TenantId::from(HELD_TENANT),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("the matching held control installs its first unit");
+    }
+    .expect("the matching held control installs its first unit");
     if include_later {
-        control
-            .receiver
-            .apply_received_schema_for_test(
+        {
+            let seam_read_memory = control
+                .receiver
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            control.receiver.apply_received_schema_for_test(
                 control.later_unit.clone(),
                 control.later_provenance.clone(),
                 contextdb_core::TenantId::from(HELD_TENANT),
                 HELD_SOURCE,
                 HELD_INCARNATION,
+                &mut seam_copy_owner,
+                seam_read_memory,
             )
-            .expect("the matching control installs the later unit");
+        }
+        .expect("the matching control installs the later unit");
     }
     let ledger = contextdb_engine::memory_accounting::take_budget_ledger_for_test();
     let peak = ledger.iter().map(|entry| entry.used_after).max().unwrap();
@@ -2873,9 +3013,6 @@ fn measured_held_retry_room(include_later: bool, include_other: bool, other_only
             .writer_memory_ownership_receipt_for_test()
             .reconciliation_gap,
         0
-    );
-    eprintln!(
-        "HELD_RETRY_OWNERS later={include_later} baseline={baseline} peak={peak} room={room} ledger={ledger:?}"
     );
     control.receiver.close().unwrap();
     control.author.close().unwrap();
@@ -2906,16 +3043,24 @@ fn a_later_unit_for_a_held_table_waits_until_the_held_one_lands() {
     let held = a_receiver_holding_a_table_back_for_memory(root.path());
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
 
-    let refusal = held
-        .receiver
-        .apply_received_schema_for_test(
+    let refusal = {
+        let seam_read_memory = held
+            .receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        held.receiver.apply_received_schema_for_test(
             held.later_unit.clone(),
             held.later_provenance.clone(),
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect_err("a later unit for a held table must wait, not skip ahead of the held one");
+    }
+    .expect_err("a later unit for a held table must wait, not skip ahead of the held one");
     assert_eq!(
         holdback_refusal_operation(&refusal),
         "received_schema_memory_holdback",
@@ -2942,15 +3087,24 @@ fn a_later_unit_for_a_held_table_waits_until_the_held_one_lands() {
     held.receiver
         .set_memory_limit(Some(retry_limit))
         .expect("raise the limit above what the held unit and the one behind it need");
-    held.receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = held
+            .receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        held.receiver.apply_received_schema_for_test(
             held.unit,
             held.provenance,
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("the held unit applies once memory allows");
+    }
+    .expect("the held unit applies once memory allows");
     assert!(
         held.receiver
             .memory_held_received_schema_units(&tenant)
@@ -2958,15 +3112,24 @@ fn a_later_unit_for_a_held_table_waits_until_the_held_one_lands() {
             .is_empty(),
         "the hold is released by the unit it was holding"
     );
-    held.receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = held
+            .receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        held.receiver.apply_received_schema_for_test(
             held.later_unit,
             held.later_provenance,
             tenant,
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("and the later unit, no longer behind a hold, applies");
+    }
+    .expect("and the later unit, no longer behind a hold, applies");
     assert!(
         held.receiver
             .table_meta("notes")
@@ -3015,15 +3178,23 @@ fn a_memory_hold_on_a_table_survives_the_receiver_closing_and_reopening() {
         "the hold is read back from disk unchanged: peer, table, position and bytes"
     );
 
-    let refusal = reopened
-        .apply_received_schema_for_test(
+    let refusal = {
+        let seam_read_memory = reopened
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        reopened.apply_received_schema_for_test(
             held.later_unit,
             held.later_provenance,
             tenant,
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect_err("a restarted receiver still queues a later unit behind the hold it read back");
+    }
+    .expect_err("a restarted receiver still queues a later unit behind the hold it read back");
     assert_eq!(
         holdback_refusal_operation(&refusal),
         "received_schema_memory_holdback",
@@ -3080,37 +3251,51 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
             )
             .expect("author declares one of the unit's indexes");
     }
-    let notes_unit = author.changes_since(before_notes_unit);
+    let notes_unit = author
+        .changes_since(before_notes_unit)
+        .expect("read the declared changes");
     assert_eq!(
         notes_unit.ddl.len(),
         3,
         "the notes unit is the three indexes"
     );
-    let notes_provenance = author
-        .outbound_ddl_provenance_for_test(
+    let notes_provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &notes_unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
 
     let before_other_unit = author.current_lsn();
     author
         .execute("CREATE INDEX other_label ON other (label)", &HashMap::new())
         .expect("author declares the unrelated table's index");
-    let other_unit = author.changes_since(before_other_unit);
+    let other_unit = author
+        .changes_since(before_other_unit)
+        .expect("read the declared changes");
     assert_eq!(other_unit.ddl.len(), 1);
-    let other_provenance = author
-        .outbound_ddl_provenance_for_test(
+    let other_provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &other_unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs the unrelated unit");
+    }
+    .expect("the author signs the unrelated unit");
 
     // The RECEIVER: same two tables, same rows, and a limit with room for two of
     // the three arriving indexes.
@@ -3153,17 +3338,23 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
         .set_memory_limit(Some(tight))
         .expect("declare a limit with room for two of the three indexes");
 
-    let refusal = receiver
-        .apply_received_schema_for_test(
+    let refusal = {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             notes_unit.clone(),
             notes_provenance.clone(),
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect_err(
-            "a limit with room for two of three indexes refuses the unit that declares three",
-        );
+    }
+    .expect_err("a limit with room for two of three indexes refuses the unit that declares three");
     assert!(matches!(refusal, Error::MemoryBudgetExceeded { .. }));
     assert!(
         receiver
@@ -3190,15 +3381,23 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
             accountant.usage().used + measured_held_retry_room(false, true, true),
         ))
         .expect("fund the unrelated unit's exact successful owners while notes stays held");
-    receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             other_unit,
             other_provenance,
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("a held table does not stop another table's schema from arriving");
+    }
+    .expect("a held table does not stop another table's schema from arriving");
     assert!(
         receiver
             .table_meta("other")
@@ -3227,15 +3426,23 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
             accountant.usage().used + measured_held_retry_room(false, true, false),
         ))
         .expect("raise the limit above what the held unit needs to arrive and to install");
-    receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             notes_unit,
             notes_provenance,
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("the held unit applies once memory allows: a refusal is never permanent");
+    }
+    .expect("the held unit applies once memory allows: a refusal is never permanent");
     assert!(
         receiver
             .memory_held_received_schema_units(&tenant)
@@ -3313,16 +3520,23 @@ fn taking_delivery_of_a_received_unit_is_charged_to_the_receivers_declared_limit
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -3346,10 +3560,10 @@ fn taking_delivery_of_a_received_unit_is_charged_to_the_receivers_declared_limit
     }
     let selected = receiver
         .table_size_estimate("wide")
+        .expect("read the actual fixture observation")
         .expect("durable live content is measurable");
     assert_eq!(selected.row_count, ROWS as u64);
     let live_content_bytes = usize::try_from(selected.estimated_live_bytes).unwrap();
-    eprintln!("received schema rows={ROWS} durable_live_bytes={live_content_bytes}");
     assert!(
         live_content_bytes > 64 * 1024,
         "the fixture must hold enough rows for the copy to be worth bounding; {live_content_bytes} B"
@@ -3357,18 +3571,25 @@ fn taking_delivery_of_a_received_unit_is_charged_to_the_receivers_declared_limit
 
     let before_apply = accountant.usage().used;
     accountant.reset_high_water_for_test();
-    receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             unit,
             provenance,
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("a receiver with no declared limit takes the unit");
+    }
+    .expect("a receiver with no declared limit takes the unit");
     let widest = accountant.high_water_for_test() - before_apply;
 
-    eprintln!("received schema before={before_apply} admitted_peak_growth={widest}");
     assert!(
         widest >= live_content_bytes,
         "taking delivery copies all {ROWS} rows into a private working image, so the receiver's \
@@ -3412,16 +3633,23 @@ fn an_oversized_received_units_row_copy_is_refused_before_it_is_allocated() {
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -3445,10 +3673,10 @@ fn an_oversized_received_units_row_copy_is_refused_before_it_is_allocated() {
     }
     let selected = receiver
         .table_size_estimate("wide")
+        .expect("read the actual fixture observation")
         .expect("durable live content is measurable");
     assert_eq!(selected.row_count, ROWS as u64);
     let live_content_bytes = usize::try_from(selected.estimated_live_bytes).unwrap();
-    eprintln!("received schema rows={ROWS} durable_live_bytes={live_content_bytes}");
     assert!(
         live_content_bytes > 1024 * 1024,
         "the fixture must hold a copy worth bounding, well over any per-row overshoot; \
@@ -3465,41 +3693,30 @@ fn an_oversized_received_units_row_copy_is_refused_before_it_is_allocated() {
 
     restart_peak();
     let start_live = live_bytes();
-    let error = receiver
-        .apply_received_schema_for_test(
+    let error = {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             unit.clone(),
             provenance.clone(),
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect_err("a copy this far over the limit must be refused, not installed past it");
-    eprintln!("received schema refusal={error:?}");
-    let attributed = |error: &Error| {
-        matches!(error, Error::MemoryBudgetExceeded {
-        subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, .. }
-        if subsystem == "sync" && operation == "stage_received_unit_vector_image"
-            && *requested_bytes == 6541952 && *available_bytes == 8780 && *budget_limit_bytes == limit)
-    };
-    assert!(attributed(&error), "{error:?}");
-    if let Error::MemoryBudgetExceeded {
-        operation,
-        requested_bytes,
-        available_bytes,
-        budget_limit_bytes,
-        hint,
-        ..
-    } = &error
-    {
-        assert!(!attributed(&Error::MemoryBudgetExceeded {
-            subsystem: "relational_index".to_owned(),
-            operation: operation.clone(),
-            requested_bytes: *requested_bytes,
-            available_bytes: *available_bytes,
-            budget_limit_bytes: *budget_limit_bytes,
-            hint: hint.clone()
-        }));
     }
+    .expect_err("a copy this far over the limit must be refused, not installed past it");
+    assert_sync_refusal_attributed(
+        &error,
+        "stage_received_unit_vector_image",
+        6541952,
+        8780,
+        limit,
+    );
 
     let peak_growth = peak_growth_since(start_live);
     assert!(
@@ -3522,9 +3739,23 @@ fn an_oversized_received_units_row_copy_is_refused_before_it_is_allocated() {
     receiver
         .set_memory_limit(None)
         .expect("clear the limit so the retried unit is judged on room alone");
-    receiver
-        .apply_received_schema_for_test(unit, provenance, tenant, HELD_SOURCE, HELD_INCARNATION)
-        .expect("a receiver with room now takes the unit it had refused for memory");
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit,
+            provenance,
+            tenant,
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
+    .expect("a receiver with room now takes the unit it had refused for memory");
     assert!(
         receiver
             .table_meta("wide")
@@ -3701,16 +3932,23 @@ fn a_refused_delivery_leaves_the_receivers_memory_bill_exactly_as_it_was() {
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -3757,12 +3995,19 @@ fn a_refused_delivery_leaves_the_receivers_memory_bill_exactly_as_it_was() {
             fault,
         );
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let seam_read_memory = receiver
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
             receiver.apply_received_schema_for_test(
                 unit.clone(),
                 provenance.clone(),
                 tenant.clone(),
                 HELD_SOURCE,
                 HELD_INCARNATION,
+                &mut seam_copy_owner,
+                seam_read_memory,
             )
         }));
         match fault {
@@ -3811,15 +4056,23 @@ fn a_refused_delivery_leaves_the_receivers_memory_bill_exactly_as_it_was() {
     receiver
         .set_memory_limit(Some(start))
         .expect("declare a limit at exactly what the store is charged for");
-    let refused = receiver
-        .apply_received_schema_for_test(
+    let refused = {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             unit.clone(),
             provenance.clone(),
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect_err("a limit with no room at all must refuse the unit");
+    }
+    .expect_err("a limit with no room at all must refuse the unit");
     assert!(
         matches!(refused, Error::MemoryBudgetExceeded { .. }),
         "the refusal must be the typed memory one, not {refused:?}"
@@ -3854,16 +4107,23 @@ fn a_panic_between_staging_and_the_durable_commit_leaves_no_stage_behind() {
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -3895,12 +4155,19 @@ fn a_panic_between_staging_and_the_durable_commit_leaves_no_stage_behind() {
         contextdb_engine::ReceivedUnitCopyFault::Unwind,
     );
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
         receiver.apply_received_schema_for_test(
             unit.clone(),
             provenance.clone(),
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
     }));
     assert!(
@@ -3923,9 +4190,23 @@ fn a_panic_between_staging_and_the_durable_commit_leaves_no_stage_behind() {
 
     // And the receiver still takes the unit afterwards, which is what the
     // stage-and-lease cleanup is for: a held queue-mutation lease would stop it.
-    receiver
-        .apply_received_schema_for_test(unit, provenance, tenant, HELD_SOURCE, HELD_INCARNATION)
-        .expect("a receiver that cleaned up after the unwind still takes the unit");
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit,
+            provenance,
+            tenant,
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
+    .expect("a receiver that cleaned up after the unwind still takes the unit");
     assert!(
         receiver
             .table_meta("wide")
@@ -3965,16 +4246,23 @@ fn a_panic_immediately_before_the_durable_commit_leaves_no_stage_behind() {
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -4000,12 +4288,19 @@ fn a_panic_immediately_before_the_durable_commit_leaves_no_stage_behind() {
         contextdb_engine::ReceivedUnitCopyFault::Unwind,
     );
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
         receiver.apply_received_schema_for_test(
             unit.clone(),
             provenance.clone(),
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
     }));
     assert!(
@@ -4033,9 +4328,23 @@ fn a_panic_immediately_before_the_durable_commit_leaves_no_stage_behind() {
         "nothing durable existed yet, so the OLD complete state is what survives"
     );
 
-    receiver
-        .apply_received_schema_for_test(unit, provenance, tenant, HELD_SOURCE, HELD_INCARNATION)
-        .expect("a receiver that cleaned up after the unwind still takes the unit");
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit,
+            provenance,
+            tenant,
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
+    .expect("a receiver that cleaned up after the unwind still takes the unit");
     assert!(
         receiver
             .table_meta("wide")
@@ -4109,16 +4418,23 @@ fn a_panic_after_the_durable_commit_before_publication_is_recovered_by_restart()
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let receiver_path = root.path().join("postcommit-receiver.db");
@@ -4138,12 +4454,19 @@ fn a_panic_after_the_durable_commit_before_publication_is_recovered_by_restart()
         contextdb_engine::ReceivedUnitCopyFault::Unwind,
     );
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
         receiver.apply_received_schema_for_test(
             unit,
             provenance,
             tenant,
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
     }));
     assert!(
@@ -4205,16 +4528,23 @@ fn a_panic_between_publication_components_is_recovered_by_restart() {
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let receiver_path = root.path().join("midpublish-receiver.db");
@@ -4234,12 +4564,19 @@ fn a_panic_between_publication_components_is_recovered_by_restart() {
         contextdb_engine::ReceivedUnitCopyFault::Unwind,
     );
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
         receiver.apply_received_schema_for_test(
             unit,
             provenance,
             tenant,
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
     }));
     assert!(
@@ -4341,16 +4678,23 @@ fn a_received_schema_crash_child() {
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let receiver_path = root.path().join("crash-receiver.db");
@@ -4372,13 +4716,22 @@ fn a_received_schema_crash_child() {
         crash_child_fault_point_from_env(&fault_point),
         contextdb_engine::ReceivedUnitCopyFault::Abort,
     );
-    let _ = receiver.apply_received_schema_for_test(
-        unit,
-        provenance,
-        tenant,
-        HELD_SOURCE,
-        HELD_INCARNATION,
-    );
+    let _ = {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit,
+            provenance,
+            tenant,
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    };
     panic!("the armed fault must abort the process before apply ever returns");
 }
 
@@ -4549,7 +4902,9 @@ fn add_then_drop_column_history_answer_keeps_the_authored_order_after_a_change_l
 
     let root = tempfile::tempdir().expect("task-scoped schema fixture");
     let author = author_add_then_drop_column(&root.path().join("author.db"));
-    let direct = author.changes_since(contextdb_core::Lsn(0));
+    let direct = author
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(
         direct.ddl.len(),
         3,
@@ -4560,7 +4915,11 @@ fn add_then_drop_column_history_answer_keeps_the_authored_order_after_a_change_l
     let listener = UnixListener::bind(&socket).expect("listen for persisted-state extraction");
     author.arm_persisted_state_schema_frontier_pause_for_test(socket);
     let fallback = std::thread::scope(|scope| {
-        let extraction = scope.spawn(|| author.changes_since(contextdb_core::Lsn(0)));
+        let extraction = scope.spawn(|| {
+            author
+                .changes_since(contextdb_core::Lsn(0))
+                .expect("read the declared changes")
+        });
         let (mut stream, _) = listener
             .accept()
             .expect("extraction reaches persisted state");
@@ -4589,28 +4948,49 @@ fn add_then_drop_column_history_answer_keeps_the_authored_order_after_a_change_l
 fn received_add_then_drop_column_installs_the_authors_final_schema() {
     let root = tempfile::tempdir().expect("task-scoped schema fixture");
     let author = author_add_then_drop_column(&root.path().join("author.db"));
-    let unit = author.changes_since(contextdb_core::Lsn(0));
+    let unit = author
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(
         unit.ddl.len(),
         3,
         "the authored unit contains all three statements"
     );
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &tenant,
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs the complete schema unit");
+    }
+    .expect("the author signs the complete schema unit");
     let receiver =
         Database::open(root.path().join("receiver.db")).expect("open a fresh schema receiver");
     receiver.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    receiver
-        .apply_received_schema_for_test(unit, provenance, tenant, HELD_SOURCE, HELD_INCARNATION)
-        .expect("the complete authored schema unit installs");
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit,
+            provenance,
+            tenant,
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
+    .expect("the complete authored schema unit installs");
     let installed = receiver
         .table_meta("replayed")
         .expect("the receiver installs the table");
@@ -4661,25 +5041,40 @@ fn a_received_drop_column_and_rename_column_install_whole_and_survive_restart() 
     author
         .execute("ALTER TABLE wide DROP COLUMN extra", &HashMap::new())
         .expect("author drops the column");
-    let drop_unit = author.changes_since(before_drop);
-    let drop_provenance = author
-        .outbound_ddl_provenance_for_test(
+    let drop_unit = author
+        .changes_since(before_drop)
+        .expect("read the declared changes");
+    let drop_provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &drop_unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs the drop unit");
-    receiver
-        .apply_received_schema_for_test(
+    }
+    .expect("the author signs the drop unit");
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             drop_unit,
             drop_provenance,
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("a drop-column unit installs whole");
+    }
+    .expect("a drop-column unit installs whole");
     {
         let meta = receiver
             .table_meta("wide")
@@ -4698,25 +5093,40 @@ fn a_received_drop_column_and_rename_column_install_whole_and_survive_restart() 
             &HashMap::new(),
         )
         .expect("author renames the column");
-    let rename_unit = author.changes_since(before_rename);
-    let rename_provenance = author
-        .outbound_ddl_provenance_for_test(
+    let rename_unit = author
+        .changes_since(before_rename)
+        .expect("read the declared changes");
+    let rename_provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &rename_unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs the rename unit");
-    receiver
-        .apply_received_schema_for_test(
+    }
+    .expect("the author signs the rename unit");
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             rename_unit,
             rename_provenance,
             tenant,
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("a rename-column unit installs whole");
+    }
+    .expect("a rename-column unit installs whole");
     author.close().expect("close the author");
 
     let assert_shape = |db: &Database, when: &str| {
@@ -4785,24 +5195,37 @@ fn rename_evidence_peer(path: &std::path::Path, shape: &str, value: Option<&str>
 
 /// Delivers `unit` (signed by `from`) to `to`, as `sender`.
 fn deliver_rename_evidence_unit(from: &Database, unit: ChangeSet, to: &Database, sender: &str) {
-    let provenance = from
-        .outbound_ddl_provenance_for_test(
+    let provenance = {
+        let seam_read_memory = from
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        from.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(RENAME_EVIDENCE_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the sender carries the unit's signed provenance");
-    let applied = to
-        .apply_received_schema_for_test(
+    }
+    .expect("the sender carries the unit's signed provenance");
+    let applied = {
+        let seam_read_memory = to
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        to.apply_received_schema_for_test(
             unit,
             provenance,
             contextdb_core::TenantId::from(RENAME_EVIDENCE_TENANT),
             sender,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("the authenticated schema unit installs whole");
+    }
+    .expect("the authenticated schema unit installs whole");
     assert!(
         applied.conflicts.is_empty(),
         "the unit is delivered, not refused: {:?}",
@@ -4910,7 +5333,9 @@ fn rename_evidence_journey(
             .execute(step, &HashMap::new())
             .unwrap_or_else(|error| panic!("{label}: author runs `{step}`: {error:?}"));
     }
-    let unit = author.changes_since(before_unit);
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
     let before_receipt = receiver.current_lsn();
     deliver_rename_evidence_unit(&author, unit, &receiver, RENAME_EVIDENCE_AUTHOR);
     author.close().expect("close the author");
@@ -4933,7 +5358,9 @@ fn rename_evidence_journey(
         &format!("{label}: on the receiver after restart"),
     );
 
-    let forwarded = restarted.changes_since(before_receipt);
+    let forwarded = restarted
+        .changes_since(before_receipt)
+        .expect("read the declared changes");
     assert!(
         !forwarded.ddl.is_empty(),
         "{label}: the receiver has the received schema change to forward"
@@ -5022,16 +5449,23 @@ fn a_duplicate_delivery_after_restart_replays_the_stored_result_and_applies_noth
             &HashMap::new(),
         )
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let receiver_path = root.path().join("dup-receiver.db");
@@ -5041,22 +5475,44 @@ fn a_duplicate_delivery_after_restart_replays_the_stored_result_and_applies_noth
         .execute(WIDE_DDL, &HashMap::new())
         .expect("receiver declares the wide table");
 
-    let first = receiver
-        .apply_received_schema_for_test(
+    let first = {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             unit.clone(),
             provenance.clone(),
             tenant.clone(),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("the first delivery installs");
+    }
+    .expect("the first delivery installs");
     receiver.close().expect("close the receiver");
 
     let restarted = Database::open(&receiver_path).expect("reopen the receiver");
     restarted.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    let second = restarted
-        .apply_received_schema_for_test(unit, provenance, tenant, HELD_SOURCE, HELD_INCARNATION)
-        .expect("a duplicate delivery after restart must not be refused, just replayed");
+    let second = {
+        let seam_read_memory = restarted
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        restarted.apply_received_schema_for_test(
+            unit,
+            provenance,
+            tenant,
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
+    .expect("a duplicate delivery after restart must not be refused, just replayed");
 
     assert_eq!(
         first.new_lsn, second.new_lsn,
@@ -5123,7 +5579,9 @@ fn a_unit_with_no_provenance_installs_whole_or_not_at_all() {
             &HashMap::new(),
         )
         .expect("author reshapes the table in the same unit");
-    let unit = author.changes_since(before_unit);
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
     assert_eq!(
         unit.ddl.len(),
         2,
@@ -5274,16 +5732,23 @@ fn a_receiver_that_prices_a_unit_as_fitting_but_cannot_copy_it(
         author
             .execute(sql, &HashMap::new())
             .expect("author reshapes");
-        let unit = author.changes_since(before);
-        let provenance = author
-            .outbound_ddl_provenance_for_test(
+        let unit = author
+            .changes_since(before)
+            .expect("read the declared changes");
+        let provenance = {
+            let seam_read_memory = author
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            author.outbound_ddl_provenance_for_test(
                 &unit,
                 &contextdb_core::TenantId::from(HELD_TENANT),
                 &fixture_schema_author().node_id(),
                 HELD_INCARNATION,
                 &fixture_signer(),
+                seam_read_memory,
             )
-            .expect("the author signs its own schema unit");
+        }
+        .expect("the author signs its own schema unit");
         (unit, provenance)
     };
     let held = unit_for("ALTER TABLE wide ADD COLUMN extra TEXT");
@@ -5312,6 +5777,7 @@ fn a_receiver_that_prices_a_unit_as_fitting_but_cannot_copy_it(
     }
     let selected = receiver
         .table_size_estimate("wide")
+        .expect("read the actual fixture observation")
         .expect("the captured durable table exposes its live row footprint");
     assert_eq!(selected.row_count, ROWS as u64);
     assert!(
@@ -5341,15 +5807,23 @@ fn deliver(
     ),
 ) -> contextdb_core::Result<()> {
     match door {
-        ReceivedDoor::Authenticated => receiver
-            .apply_received_schema_for_test(
+        ReceivedDoor::Authenticated => {
+            let seam_read_memory = receiver
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            receiver.apply_received_schema_for_test(
                 unit.0.clone(),
                 unit.1.clone(),
                 contextdb_core::TenantId::from(HELD_TENANT),
                 HELD_SOURCE,
                 HELD_INCARNATION,
+                &mut seam_copy_owner,
+                seam_read_memory,
             )
-            .map(|_| ()),
+        }
+        .map(|_| ()),
         ReceivedDoor::Unattested => receiver
             .apply_changes(
                 unit.0.clone(),
@@ -5486,16 +5960,23 @@ fn an_indexed_table_pair(
     author
         .execute("ALTER TABLE wide ADD COLUMN extra TEXT", &HashMap::new())
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -5561,13 +6042,22 @@ fn probe_copy_stop_unchecked(
         contextdb_engine::ReceivedUnitFaultPoint::AfterWorkingCopy,
         contextdb_engine::ReceivedUnitCopyFault::Error,
     );
-    let outcome = receiver.apply_received_schema_for_test(
-        unit.clone(),
-        provenance.to_vec(),
-        contextdb_core::TenantId::from(HELD_TENANT),
-        HELD_SOURCE,
-        HELD_INCARNATION,
-    );
+    let outcome = {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit.clone(),
+            provenance.to_vec(),
+            contextdb_core::TenantId::from(HELD_TENANT),
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    };
     Database::disarm_received_unit_fault_for_test();
     match outcome {
         Err(Error::MemoryBudgetExceeded {
@@ -5653,15 +6143,23 @@ fn a_refused_index_rebuild_returns_the_rows_charge(resident: bool) {
     receiver
         .set_memory_limit(Some(high + 1024 * 1024))
         .expect("declare room for the unit");
-    receiver
-        .apply_received_schema_for_test(
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
             unit,
             provenance,
             contextdb_core::TenantId::from(HELD_TENANT),
             HELD_SOURCE,
             HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
         )
-        .expect("a delivery with room installs after the refusals");
+    }
+    .expect("a delivery with room installs after the refusals");
     assert!(
         receiver
             .table_meta("wide")
@@ -5770,16 +6268,23 @@ fn a_vector_copy_is_admitted_before_it_is_allocated(resident: bool, saved: bool)
             &HashMap::new(),
         )
         .expect("author reshapes docs");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let receiver_path = root.path().join("vector-receiver.db");
@@ -5896,9 +6401,23 @@ fn a_vector_copy_is_admitted_before_it_is_allocated(resident: bool, saved: bool)
 
     // With room, the same delivery installs.
     receiver.set_memory_limit(None).expect("clear the limit");
-    receiver
-        .apply_received_schema_for_test(unit, provenance, tenant, HELD_SOURCE, HELD_INCARNATION)
-        .expect("a delivery with room installs after the refusals");
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit,
+            provenance,
+            tenant,
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
+    .expect("a delivery with room installs after the refusals");
     assert!(
         receiver
             .table_meta("docs")
@@ -5955,16 +6474,23 @@ fn a_file_backed_receiver_obtains_memory_before_loading_the_table_it_copies() {
     author
         .execute("ALTER TABLE wide ADD COLUMN extra TEXT", &HashMap::new())
         .expect("author reshapes the table");
-    let unit = author.changes_since(before_unit);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let unit = author
+        .changes_since(before_unit)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &unit,
             &contextdb_core::TenantId::from(HELD_TENANT),
             &fixture_schema_author().node_id(),
             HELD_INCARNATION,
             &fixture_signer(),
+            seam_read_memory,
         )
-        .expect("the author signs its own schema unit");
+    }
+    .expect("the author signs its own schema unit");
     author.close().expect("close the author");
 
     let receiver_path = root.path().join("paged-receiver.db");
@@ -6051,9 +6577,23 @@ fn a_file_backed_receiver_obtains_memory_before_loading_the_table_it_copies() {
     );
 
     receiver.set_memory_limit(None).expect("clear the limit");
-    receiver
-        .apply_received_schema_for_test(unit, provenance, tenant, HELD_SOURCE, HELD_INCARNATION)
-        .expect("a delivery with room installs after the refusals");
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit,
+            provenance,
+            tenant,
+            HELD_SOURCE,
+            HELD_INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
+    .expect("a delivery with room installs after the refusals");
     assert!(
         receiver
             .table_meta("wide")
@@ -6118,15 +6658,21 @@ impl SchemaPeer {
     /// it authored the schema, and the author's unchanged when it is
     /// forwarding schema it received.
     fn outbound(&self, unit: &ChangeSet) -> Vec<contextdb_engine::protocol::WireDdlProvenance> {
-        self.db
-            .outbound_ddl_provenance_for_test(
+        {
+            let seam_read_memory = self
+                .db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            self.db.outbound_ddl_provenance_for_test(
                 unit,
                 &contextdb_core::TenantId::from(AUTHORED_SCHEMA_TENANT),
                 &self.node_id(),
                 AUTHORED_SCHEMA_INCARNATION,
                 &|bytes| Ok(self.identity.sign_for_test(bytes)),
+                seam_read_memory,
             )
-            .expect("the sender carries the unit's provenance")
+        }
+        .expect("the sender carries the unit's provenance")
     }
 
     fn reopen(self) -> Self {
@@ -6147,15 +6693,24 @@ impl SchemaPeer {
         provenance: Vec<contextdb_engine::protocol::WireDdlProvenance>,
         sender: &str,
     ) -> contextdb_core::Result<()> {
-        self.db
-            .apply_received_schema_for_test(
+        {
+            let seam_read_memory = self
+                .db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            self.db.apply_received_schema_for_test(
                 unit,
                 provenance,
                 contextdb_core::TenantId::from(AUTHORED_SCHEMA_TENANT),
                 sender,
                 AUTHORED_SCHEMA_INCARNATION,
+                &mut seam_copy_owner,
+                seam_read_memory,
             )
-            .map(|_| ())
+        }
+        .map(|_| ())
     }
 
     fn holds_column(&self, column: &str) -> bool {
@@ -6175,7 +6730,10 @@ fn authored_schema_unit(author: &SchemaPeer, statement: &str) -> ChangeSet {
         .db
         .execute(statement, &HashMap::new())
         .expect("the author reshapes its own table");
-    author.db.changes_since(before)
+    author
+        .db
+        .changes_since(before)
+        .expect("read the declared changes")
 }
 
 #[test]
@@ -6196,7 +6754,10 @@ fn an_edge_refuses_schema_a_hub_forwards_under_another_authors_name() {
         .expect("the hub takes the author's own signed unit");
 
     // The hub forwards what it received, but names a different author for it.
-    let forwarded = hub.db.changes_since(hub_before);
+    let forwarded = hub
+        .db
+        .changes_since(hub_before)
+        .expect("read the declared changes");
     assert!(
         !forwarded.ddl.is_empty(),
         "the hub has the received schema change to forward"
@@ -6313,7 +6874,10 @@ fn an_authors_signature_travels_two_hops_a_restart_and_a_third_peer() {
     let hub_before = hub.db.current_lsn();
     hub.take(unit, provenance, &author.node_id())
         .expect("the hub takes the author's signed unit");
-    let forwarded = hub.db.changes_since(hub_before);
+    let forwarded = hub
+        .db
+        .changes_since(hub_before)
+        .expect("read the declared changes");
     let forwarded_provenance = hub.outbound(&forwarded);
     assert_eq!(
         forwarded_provenance[0]
@@ -6341,7 +6905,10 @@ fn an_authors_signature_travels_two_hops_a_restart_and_a_third_peer() {
 
     // Hop two: the restarted edge serves it on to a fourth peer, still under
     // the author's name and still with the author's own signature.
-    let onward = edge.db.changes_since(edge_before);
+    let onward = edge
+        .db
+        .changes_since(edge_before)
+        .expect("read the declared changes");
     assert!(
         !onward.ddl.is_empty(),
         "the restarted edge has the received change to serve on"

@@ -134,7 +134,8 @@ async fn start_hub_without_policy_seeding(
             TenantId::from(tenant),
             node_id.clone(),
             identity.clone(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -164,7 +165,8 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> (S
         broker.client_as(&node_id),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     (client, node_id)
 }
 
@@ -399,6 +401,10 @@ fn seed_committed_manifest(
                     .map(|member| (MEMBER_TABLE, root_key(*member)))
                     .collect(),
             },
+            client
+                .db()
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
         )
         .expect("install a signed manifested-unit prerequisite");
 }
@@ -644,9 +650,16 @@ async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_id
     let edge_incarnation = edge_db
         .sync_incarnation(&TenantId::from(tenant))
         .expect("read the edge's durable life");
-    within(edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .expect("bind before writing");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind before writing");
     create_core_tables(&edge_db);
 
     let root_id = Uuid::from_u128(0x5101_0000_0000_0000_0000_0000_0000_0001);
@@ -667,7 +680,13 @@ async fn every_applied_unit_records_exactly_one_durable_outcome_bound_to_both_id
     // before arming the storage fault. Send only this prepared unit to the real public handler;
     // SyncClient::push's earlier bind/status/preparation writes cannot consume the fault.
     let request = edge
-        .__delivery_push_request_for_test(ROOT_TABLE, &root_key(root_id))
+        .__delivery_push_request_for_test(
+            ROOT_TABLE,
+            &root_key(root_id),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        )
         .unwrap();
     let source_digest = request.changeset.manifests[0]
         .unit_digest_for_test()
@@ -879,9 +898,16 @@ async fn an_identical_repush_is_equivalent_a_differing_digest_is_refused_with_th
     // The first writer's unit is accepted.
     let first_db = Arc::new(Database::open_memory());
     let (first_edge, first_node_id) = edge_client(&first_db, &broker, tenant);
-    within(first_edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .expect("bind the first writer");
+    within(
+        first_edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            first_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind the first writer");
     create_core_tables(&first_db);
     let tx = stage_unit(
         &first_db,
@@ -895,16 +921,27 @@ async fn an_identical_repush_is_equivalent_a_differing_digest_is_refused_with_th
         .commit(tx)
         .expect("commit rows and delivery metadata atomically");
 
-    within(first_edge.__seed_delivery_outcome_for_test(
-        ROOT_TABLE,
-        &root_key(root_id),
-        DeliveryOutcomeKind::Accepted,
-        None,
-    ))
+    within(
+        first_edge.__seed_delivery_outcome_for_test(
+            ROOT_TABLE,
+            &root_key(root_id),
+            DeliveryOutcomeKind::Accepted,
+            None,
+            first_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .expect("genuine incumbent terminal before equivalence probe");
     let first_digest = first_edge
-        .__delivery_push_request_for_test(ROOT_TABLE, &root_key(root_id))
+        .__delivery_push_request_for_test(
+            ROOT_TABLE,
+            &root_key(root_id),
+            first_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        )
         .unwrap()
         .changeset
         .manifests[0]
@@ -916,9 +953,16 @@ async fn an_identical_repush_is_equivalent_a_differing_digest_is_refused_with_th
     // no conflict.
     let second_db = Arc::new(Database::open_memory());
     let (second_edge, _second_node_id) = edge_client(&second_db, &broker, tenant);
-    within(second_edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .expect("bind the second writer");
+    within(
+        second_edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            second_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind the second writer");
     create_core_tables(&second_db);
     let tx = stage_unit(
         &second_db,
@@ -980,9 +1024,16 @@ async fn an_identical_repush_is_equivalent_a_differing_digest_is_refused_with_th
     // with the complete keep-first diagnostic.
     let third_db = Arc::new(Database::open_memory());
     let (third_edge, _third_node_id) = edge_client(&third_db, &broker, tenant);
-    within(third_edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .expect("bind the third writer");
+    within(
+        third_edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            third_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind the third writer");
     create_core_tables(&third_db);
     let tx = stage_unit(
         &third_db,
@@ -1049,9 +1100,15 @@ async fn an_identical_repush_is_equivalent_a_differing_digest_is_refused_with_th
     ] {
         let db = Arc::new(Database::open_memory());
         let (client, _) = edge_client(&db, &broker, tenant);
-        within(client.__seed_application_table_policy_binding_for_test(core_expectation()))
-            .await
-            .unwrap();
+        within(
+            client.__seed_application_table_policy_binding_for_test(
+                core_expectation(),
+                db.declared_reader_memory()
+                    .expect("admit the fixture client reader"),
+            ),
+        )
+        .await
+        .unwrap();
         create_core_tables(&db);
         let tx = stage_unit(&db, root_id, body, &members).unwrap();
         seed_committed_manifest(
@@ -1131,7 +1188,10 @@ async fn hub_written_incumbents_receive_terminal_outcomes() {
     .unwrap();
     let hub_node = endpoint.node_id();
     let hub_db = Arc::new(Database::open(&hub_path).unwrap());
-    let server = Arc::new(SyncServer::new(hub_db.clone(), &endpoint, tenant.clone()));
+    let server = Arc::new(
+        SyncServer::new(hub_db.clone(), &endpoint, tenant.clone())
+            .expect("construct the authenticated sync endpoint"),
+    );
     for (table, clauses) in [(ROOT_TABLE, ROOT_CLAUSES), (MEMBER_TABLE, MEMBER_CLAUSES)] {
         hub_db
             .execute(
@@ -1188,7 +1248,8 @@ async fn hub_written_incumbents_receive_terminal_outcomes() {
                 &directory.path().join(format!("edge-{index}.key")),
             ),
             tenant.clone(),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         within(client.bind_application_table_policy(core_expectation()))
             .await
             .unwrap();
@@ -1347,10 +1408,18 @@ async fn the_push_response_echoes_outcomes_and_a_lost_acknowledgement_recovers_o
         edge_transport,
         TenantId::from(tenant),
         edge_identity,
-    );
-    within(edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .expect("bind the edge");
+    )
+    .expect("construct the authenticated sync endpoint");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind the edge");
     create_core_tables(&edge_db);
 
     let echoed_root = Uuid::from_u128(0x5301_0000_0000_0000_0000_0000_0000_0001);
@@ -1452,9 +1521,16 @@ async fn the_push_response_echoes_outcomes_and_a_lost_acknowledgement_recovers_o
     // --- Another edge's verdicts are never served to this one. ---
     let other_db = Arc::new(Database::open_memory());
     let (other_edge, _other_node_id) = edge_client(&other_db, &broker, tenant);
-    within(other_edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .expect("bind the other edge");
+    within(
+        other_edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            other_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind the other edge");
     create_core_tables(&other_db);
     let other_root = Uuid::from_u128(0x5301_0000_0000_0000_0000_0000_0000_0021);
     let tx = stage_unit(&other_db, other_root, "root-body", &[])
@@ -1517,10 +1593,18 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
         }),
         TenantId::from(tenant),
         edge_identity,
-    );
-    within(edge.__seed_application_table_policy_binding_for_test(full_expectation()))
-        .await
-        .expect("bind every declared table");
+    )
+    .expect("construct the authenticated sync endpoint");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            full_expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind every declared table");
     create_all_tables(&edge_db);
 
     // A second writer whose unit the hub keeps first, so this edge's same-key
@@ -1529,9 +1613,16 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
     let contested_member = Uuid::from_u128(0x5401_0000_0000_0000_0000_0000_0000_0002);
     let winner_db = Arc::new(Database::open_memory());
     let (winner_edge, _winner_node_id) = edge_client(&winner_db, &broker, tenant);
-    within(winner_edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .expect("bind the winning writer");
+    within(
+        winner_edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            winner_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind the winning writer");
     create_core_tables(&winner_db);
     let tx = stage_unit(
         &winner_db,
@@ -1545,12 +1636,17 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
         .commit(tx)
         .expect("commit rows and delivery metadata atomically");
 
-    within(winner_edge.__seed_delivery_outcome_for_test(
-        ROOT_TABLE,
-        &root_key(contested_root),
-        DeliveryOutcomeKind::Accepted,
-        None,
-    ))
+    within(
+        winner_edge.__seed_delivery_outcome_for_test(
+            ROOT_TABLE,
+            &root_key(contested_root),
+            DeliveryOutcomeKind::Accepted,
+            None,
+            winner_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .unwrap();
 
@@ -1591,12 +1687,17 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
         .commit(tx)
         .expect("commit rows and delivery metadata atomically");
 
-    within(winner_edge.__seed_delivery_outcome_for_test(
-        ROOT_TABLE,
-        &root_key(equivalent_root),
-        DeliveryOutcomeKind::Accepted,
-        None,
-    ))
+    within(
+        winner_edge.__seed_delivery_outcome_for_test(
+            ROOT_TABLE,
+            &root_key(equivalent_root),
+            DeliveryOutcomeKind::Accepted,
+            None,
+            winner_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .unwrap();
     let tx = stage_unit(
@@ -1620,9 +1721,19 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
             Some("keep_first_refused"),
         ),
     ] {
-        within(edge.__seed_delivery_outcome_for_test(ROOT_TABLE, &root_key(root), kind, cause))
-            .await
-            .expect("authentic independently validated status prerequisites");
+        within(
+            edge.__seed_delivery_outcome_for_test(
+                ROOT_TABLE,
+                &root_key(root),
+                kind,
+                cause,
+                edge_db
+                    .declared_reader_memory()
+                    .expect("admit the fixture client reader"),
+            ),
+        )
+        .await
+        .expect("authentic independently validated status prerequisites");
     }
     // The fourth unit's acknowledgement is lost: the hub decided, this edge has
     // no verdict.
@@ -1649,9 +1760,21 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
         .expect("commit rows and delivery metadata atomically");
 
     let mut pending_request = edge
-        .__delivery_push_request_for_test(ROOT_TABLE, &root_key(unanswered_root))
+        .__delivery_push_request_for_test(
+            ROOT_TABLE,
+            &root_key(unanswered_root),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        )
         .unwrap();
-    let ordinary = edge.__ordinary_push_request_for_test().unwrap();
+    let ordinary = edge
+        .__ordinary_push_request_for_test(
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        )
+        .unwrap();
     pending_request.changeset.rows.extend(
         ordinary
             .changeset
@@ -1836,6 +1959,9 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
             root_key: root_key(offline_root),
             members: vec![],
         },
+        edge_db
+            .declared_reader_memory()
+            .expect("admit the fixture client reader"),
     )
     .expect("the switched-off root has an actual committed manifest");
     edge_db.commit(tx).unwrap();
@@ -1892,9 +2018,16 @@ async fn scoped_custody_reads_follow_visible_roots() {
     }
     let hub = start_hub(&broker, tenant, hub_db).await;
     let (edge, _) = edge_client(&edge_db, &broker, tenant);
-    within(edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .unwrap();
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .unwrap();
     let roots = (0..5)
         .map(|i| Uuid::from_u128(0x5420 + i))
         .collect::<Vec<_>>();
@@ -1925,12 +2058,17 @@ async fn scoped_custody_reads_follow_visible_roots() {
         seed_committed_manifest(&edge, tx, *root, &[]);
         edge_db.commit(tx).unwrap();
         if i < 2 {
-            within(edge.__seed_delivery_outcome_for_test(
-                ROOT_TABLE,
-                &root_key(*root),
-                DeliveryOutcomeKind::Accepted,
-                None,
-            ))
+            within(
+                edge.__seed_delivery_outcome_for_test(
+                    ROOT_TABLE,
+                    &root_key(*root),
+                    DeliveryOutcomeKind::Accepted,
+                    None,
+                    edge_db
+                        .declared_reader_memory()
+                        .expect("admit the fixture client reader"),
+                ),
+            )
             .await
             .unwrap();
         }
@@ -1997,9 +2135,16 @@ async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing
     let hub = start_hub(&broker, tenant, hub_db.clone()).await;
     let edge_db = file_backed(directory.path(), "edge.db");
     let (edge, _) = edge_client(&edge_db, &broker, tenant);
-    within(edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .unwrap();
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .unwrap();
     create_core_tables(&edge_db);
     let present = Uuid::new_v4();
     let absent = Uuid::new_v4();
@@ -2196,9 +2341,16 @@ async fn a_refused_unit_is_terminal_the_resend_obligation_ends_status_is_clean_a
 
     let winner_db = Arc::new(Database::open_memory());
     let (winner_edge, _winner_node_id) = edge_client(&winner_db, &broker, tenant);
-    within(winner_edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .expect("bind the winner");
+    within(
+        winner_edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            winner_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind the winner");
     create_core_tables(&winner_db);
     let tx = stage_unit(
         &winner_db,
@@ -2212,20 +2364,32 @@ async fn a_refused_unit_is_terminal_the_resend_obligation_ends_status_is_clean_a
         .commit(tx)
         .expect("commit rows and delivery metadata atomically");
 
-    within(winner_edge.__seed_delivery_outcome_for_test(
-        ROOT_TABLE,
-        &root_key(root_id),
-        DeliveryOutcomeKind::Accepted,
-        None,
-    ))
+    within(
+        winner_edge.__seed_delivery_outcome_for_test(
+            ROOT_TABLE,
+            &root_key(root_id),
+            DeliveryOutcomeKind::Accepted,
+            None,
+            winner_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .unwrap();
 
     let loser_db = Arc::new(Database::open_memory());
     let (loser_edge, _loser_node_id) = edge_client(&loser_db, &broker, tenant);
-    within(loser_edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .expect("bind the loser");
+    within(
+        loser_edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            loser_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .expect("bind the loser");
     create_core_tables(&loser_db);
     let tx = stage_unit(
         &loser_db,
@@ -2331,9 +2495,15 @@ async fn complete_outcome_readback() {
     let hub = start_hub(&broker, tenant, hub_db.clone()).await;
     let db = Arc::new(Database::open_memory());
     let (client, _) = edge_client(&db, &broker, tenant);
-    within(client.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .unwrap();
+    within(
+        client.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            db.declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .unwrap();
     create_core_tables(&db);
     // One source transaction and one actual hub commit place many outcomes at the same position.
     let roots: Vec<_> = (0..503).map(|_| Uuid::new_v4()).collect();
@@ -2352,9 +2522,15 @@ async fn complete_outcome_readback() {
     }
     db.commit(tx).unwrap();
     assert_eq!(
-        within(client.__seed_hub_delivery_batch_for_test(ROOT_TABLE))
-            .await
-            .unwrap(),
+        within(
+            client.__seed_hub_delivery_batch_for_test(
+                ROOT_TABLE,
+                db.declared_reader_memory()
+                    .expect("admit the fixture client reader")
+            )
+        )
+        .await
+        .unwrap(),
         roots.len()
     );
     let before = (hub_db.current_lsn(), whole_unit_rows(&hub_db));
@@ -2541,10 +2717,18 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
         transport,
         TenantId::from(tenant),
         identity,
-    );
-    within(edge.__seed_application_table_policy_binding_for_test(core_expectation()))
-        .await
-        .unwrap();
+    )
+    .expect("construct the authenticated sync endpoint");
+    within(
+        edge.__seed_application_table_policy_binding_for_test(
+            core_expectation(),
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
+    .await
+    .unwrap();
     create_core_tables(&edge_db);
     let ids = (0..72).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
     let old = root.path().join("old.db");
@@ -2660,9 +2844,17 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
         .map(|id| root_key(*id))
         .collect::<Vec<_>>();
     assert_eq!(
-        within(edge.__seed_hub_delivery_roots_for_test(ROOT_TABLE, Some(&recent)))
-            .await
-            .unwrap(),
+        within(
+            edge.__seed_hub_delivery_roots_for_test(
+                ROOT_TABLE,
+                Some(&recent),
+                edge_db
+                    .declared_reader_memory()
+                    .expect("admit the fixture client reader")
+            )
+        )
+        .await
+        .unwrap(),
         70
     );
     // Catch up even the custody count on a different branch;
@@ -2671,12 +2863,17 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
     let tx = stage_unit(&edge_db, extra, "recent", &[]).unwrap();
     seed_committed_manifest(&edge, tx, extra, &[]);
     edge_db.commit(tx).unwrap();
-    within(edge.__seed_hub_delivery_outcome_for_test(
-        ROOT_TABLE,
-        &root_key(extra),
-        DeliveryOutcomeKind::Accepted,
-        None,
-    ))
+    within(
+        edge.__seed_hub_delivery_outcome_for_test(
+            ROOT_TABLE,
+            &root_key(extra),
+            DeliveryOutcomeKind::Accepted,
+            None,
+            edge_db
+                .declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
+    )
     .await
     .unwrap();
     eprintln!("restored image has all recent receipts, but the second retained receipt is lost");

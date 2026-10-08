@@ -340,6 +340,10 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
     std::thread::scope(|scope| {
         let first_db = db.clone();
         let first = scope.spawn(move || {
+            let fixture_operation_reader_1 = first_db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             first_db.delete_relational_row_with_race_hook_for_test(
                 tx,
                 "staged_once",
@@ -355,6 +359,7 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
                     }
                     StagedDeleteRacePointForTest::BeforeRetirement => {}
                 },
+                fixture_operation_reader_1.clone(),
             )
         });
         // The first caller has read admission through the real write set.
@@ -363,6 +368,10 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
         let second_db = db.clone();
         let probe_db = db.clone();
         let second = scope.spawn(move || {
+            let fixture_operation_reader_2 = second_db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             second_db.delete_relational_row_with_race_hook_for_test(
                 tx,
                 "staged_once",
@@ -385,6 +394,7 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
                         }
                     }
                 },
+                fixture_operation_reader_2.clone(),
             )
         });
         let real_lock_held = second_arrived_rx.recv().unwrap();
@@ -429,10 +439,6 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
         admitted + outcome.staged_controls_released,
         "named owners lose one admission and the actual staged declaration controls"
     );
-    eprintln!(
-        "staged retirement: mode={mode:?} admission={admitted} controls={} accountant_release={}",
-        outcome.staged_controls_released, outcome.accountant_released
-    );
     if mode == StagedDeleteRaceModeForTest::Repaired {
         assert_eq!(after.reconciliation_gap, 0);
         assert_eq!(db.writer_memory_underflow_count_for_test(), 0);
@@ -441,7 +447,6 @@ fn run_concurrent_staged_delete(mode: StagedDeleteRaceModeForTest) -> (ReleaseOn
     }
     db.rollback(tx).unwrap();
     let rolled_back = db.writer_memory_ownership_receipt_for_test();
-    eprintln!("staged delete rollback: before={after:?}; after={rolled_back:?}");
     assert!(after.staged_index_postings > 0);
     assert_eq!(
         after
@@ -480,8 +485,17 @@ fn repeated_replacement_rollback_reconciles_every_staged_charge() {
     let mut previous = None;
     for size in [64, 256, 1024, 4096] {
         if let Some(row_id) = previous {
-            db.delete_relational_row_releasing_staged_for_test(tx, "staged_rollback", row_id)
-                .unwrap();
+            let fixture_operation_reader_3 = db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
+            db.delete_relational_row_releasing_staged_for_test(
+                tx,
+                "staged_rollback",
+                row_id,
+                fixture_operation_reader_3.clone(),
+            )
+            .unwrap();
             let retired = db.writer_memory_ownership_receipt_for_test();
             assert_eq!(retired.staged_row_versions, 0);
             assert_eq!(retired.reconciliation_gap, 0);
@@ -535,15 +549,29 @@ fn failed_delete_keeps_the_staged_row_and_its_charge() {
         .unwrap()
         .unwrap();
     let before = db.writer_memory_ownership_receipt_for_test();
+    let fixture_operation_reader_4 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
-        db.delete_relational_row_releasing_staged_for_test(tx, "missing_table", row_id)
-            .is_err()
+        db.delete_relational_row_releasing_staged_for_test(
+            tx,
+            "missing_table",
+            row_id,
+            fixture_operation_reader_4.clone()
+        )
+        .is_err()
     );
+    let fixture_operation_reader_5 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         db.delete_relational_row_releasing_staged_for_test(
             TxId(u64::MAX),
             "staged_failure",
             row_id,
+            fixture_operation_reader_5.clone()
         )
         .is_err()
     );

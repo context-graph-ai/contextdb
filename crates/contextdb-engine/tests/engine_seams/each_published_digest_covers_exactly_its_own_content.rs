@@ -48,9 +48,25 @@ fn moved(before: &DirectTypedImageDigest, after: &DirectTypedImageDigest) -> Vec
 
 /// The identity of the committed image, read back the way a reader reads it.
 fn digest(path: &std::path::Path) -> DirectTypedImageDigest {
-    contextdb_engine::read_content_test_adapter::committed_content_for_test(path)
-        .expect("read the committed image back")
-        .maintained_digest
+    {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        contextdb_engine::read_content_test_adapter::committed_content_for_test(
+            path,
+            operation_read_memory,
+            declared_read_memory,
+        )
+    }
+    .expect("read the committed image back")
+    .maintained_digest
 }
 
 fn execute(db: &Database, sql: &str, params: HashMap<String, Value>) {

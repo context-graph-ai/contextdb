@@ -382,5 +382,4 @@ async fn find_show_status_stay_fast_while_schema_replays() {
     });
     std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap())
         .expect("write the receipt");
-    println!("SCHEMA_OVERLAP_RECEIPT {}", receipt_path.display());
 }

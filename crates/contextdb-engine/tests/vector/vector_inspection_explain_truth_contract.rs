@@ -236,9 +236,18 @@ fn failed_maintenance_memory_admission_stays_inspectable_until_limit_raise_recov
     assert!(reported.requested_bytes.unwrap() > reported.available_bytes.unwrap());
     assert!(reported.recovery_instruction.contains("SET MEMORY_LIMIT"));
     let alpha_route = route(SCOPE_ALPHA);
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let inspected = db
         .vector_store_for_test()
-        .partition_info(&alpha_route.index, &alpha_route.partition_key)
+        .partition_info(
+            &alpha_route.index,
+            &alpha_route.partition_key,
+            &mut partition_observation_owner_1,
+        )
         .unwrap()
         .and_then(|partition| partition.maintenance_failure_details)
         .expect("Rust partition inspection retains the same safe failure detail");
@@ -362,7 +371,6 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
         let error = db
             .run_maintenance_cycle()
             .expect_err("closing compaction reports its typed resource deferral");
-        eprintln!("policy closing limit={closing_limit} error={error:?}");
         db.set_memory_limit(replacement_limit)
             .expect("restore the replacement-build budget for the next policy change");
         assert!(
@@ -419,11 +427,17 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
 
     let partition_key = VectorPartitionKey::from_values(&[Value::Text(POLICY_SCOPE.to_owned())])
         .expect("construct the declared TEXT partition key");
+    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert_eq!(
         db.vector_store_for_test()
             .partition_info(
                 &VectorIndexRef::new("policy_failure_docs", "embedding"),
                 &partition_key,
+                &mut partition_observation_owner_2
             )
             .unwrap()
             .and_then(|info| info.maintenance_failure),
@@ -1002,9 +1016,6 @@ fn inspect_reopened_backlog_without_maintenance(backlog: usize) -> usize {
         activity_before
     );
     let growth = cache_after.3.checked_sub(cache_before.3).unwrap();
-    eprintln!(
-        "pending inspection backlog={backlog} cache={cache_before:?}->{cache_after:?} work={work:?}"
-    );
     db.close().unwrap();
     growth
 }

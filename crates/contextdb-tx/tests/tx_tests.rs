@@ -1,3 +1,5 @@
+#[path = "support/read_memory.rs"]
+mod test_read_memory;
 use contextdb_core::{Error, Lsn, RowId, SnapshotId, TxId, VersionedRow};
 use contextdb_tx::{TransactionManager, WriteSet, WriteSetApplicator};
 use parking_lot::Mutex;
@@ -11,7 +13,11 @@ struct MockStore {
 }
 
 impl WriteSetApplicator for MockStore {
-    fn apply(&self, ws: &WriteSet) -> contextdb_core::Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
         self.applied.lock().push(ws.clone());
         Ok(())
     }
@@ -46,7 +52,11 @@ fn snapshot_advances_on_commit() {
             .push(("items".to_string(), versioned_row(RowId(1), tx)));
     })
     .unwrap();
-    txm.commit(tx).expect("commit should succeed");
+    txm.commit(
+        tx,
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("commit should succeed");
     assert_eq!(txm.snapshot(), SnapshotId::from_tx(tx));
 }
 
@@ -74,14 +84,22 @@ fn commit_updates_watermark() {
             .push(("items".to_string(), versioned_row(RowId(1), t1)));
     })
     .unwrap();
-    txm.commit(t1).expect("first commit should succeed");
+    txm.commit(
+        t1,
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("first commit should succeed");
     assert_eq!(txm.snapshot(), SnapshotId::from_tx(t1));
     txm.with_write_set(t2, |ws| {
         ws.relational_inserts
             .push(("items".to_string(), versioned_row(RowId(2), t2)));
     })
     .unwrap();
-    txm.commit(t2).expect("second commit should succeed");
+    txm.commit(
+        t2,
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("second commit should succeed");
     assert_eq!(txm.snapshot(), SnapshotId::from_tx(t2));
 }
 
@@ -95,7 +113,11 @@ fn empty_commit_does_not_advance_snapshot_or_lsn() {
     let before_snapshot = txm.snapshot();
     let before_lsn = txm.current_lsn();
 
-    txm.commit(tx).expect("empty commit should succeed");
+    txm.commit(
+        tx,
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("empty commit should succeed");
 
     assert_eq!(txm.snapshot(), before_snapshot);
     assert_eq!(txm.current_lsn(), before_lsn);
@@ -109,8 +131,17 @@ fn double_commit_returns_tx_not_found() {
         ..Default::default()
     });
     let tx: TxId = txm.begin();
-    txm.commit(tx).expect("first commit should succeed");
-    let err = txm.commit(tx).expect_err("second commit should fail");
+    txm.commit(
+        tx,
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("first commit should succeed");
+    let err = txm
+        .commit(
+            tx,
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        )
+        .expect_err("second commit should fail");
     assert!(matches!(err, Error::TxNotFound(t) if t == tx));
 }
 
@@ -140,7 +171,11 @@ fn late_lower_tx_is_reassigned_above_watermark() {
             .push(("items".to_string(), versioned_row(RowId(2), t2)));
     })
     .unwrap();
-    txm.commit(t2).expect("higher tx commits first");
+    txm.commit(
+        t2,
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("higher tx commits first");
     assert_eq!(txm.snapshot(), SnapshotId::from_tx(t2));
 
     txm.with_write_set(t1, |ws| {
@@ -148,7 +183,11 @@ fn late_lower_tx_is_reassigned_above_watermark() {
             .push(("items".to_string(), versioned_row(RowId(1), t1)));
     })
     .unwrap();
-    txm.commit(t1).expect("late lower tx still commits");
+    txm.commit(
+        t1,
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+    )
+    .expect("late lower tx still commits");
 
     let applied = txm.store().applied.lock();
     let late_row = &applied[1].relational_inserts[0].1;

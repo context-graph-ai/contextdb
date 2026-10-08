@@ -2476,12 +2476,41 @@ fn f124_bfs_depth_cap_rejection() {
     }
 }
 
-/// GROUP BY standalone rejection: GROUP BY without HAVING must also be rejected.
+/// Grouped counts need a declared maintained key; other grouped aggregates stay refused.
 #[test]
 fn f125_group_by_standalone_rejected() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT, reading REAL) SYNC OFF MAINTAIN COUNT NONE",
+        &empty_params(),
+    ).expect("declare a table without maintained counts");
+    db.execute(
+        "CREATE INDEX t_by_category ON t (category)",
+        &empty_params(),
+    )
+    .expect("declare the group key without a maintained count");
+    let error = db
+        .execute(
+            "SELECT category, COUNT(*) FROM t GROUP BY category",
+            &empty_params(),
+        )
+        .expect_err("an undeclared grouped count is refused by the planner");
     assert!(
-        parse("SELECT category, COUNT(*) FROM t GROUP BY category").is_err(),
-        "GROUP BY should be rejected by the parser"
+        matches!(&error, Error::PlanError(message)
+            if message.starts_with("GROUP BY is not supported for COUNT(*) grouped by")
+                && message.contains("category")
+                && message.contains("ALTER TABLE t SET MAINTAIN COUNT")),
+        "the typed planner refusal names the missing count declaration: {error:?}"
+    );
+    let error = db
+        .execute(
+            "SELECT category, SUM(reading) FROM t GROUP BY category",
+            &empty_params(),
+        )
+        .expect_err("a non-COUNT grouped aggregate remains refused");
+    assert!(
+        matches!(&error, Error::ParseError(message) if message == "GROUP BY is not supported"),
+        "the unsupported grouped aggregate keeps its typed parser refusal: {error:?}"
     );
 }
 

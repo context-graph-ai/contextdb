@@ -81,8 +81,16 @@ fn a_tied_frontier_cannot_hide_a_smaller_row_on_either_reader_route() {
         db.run_maintenance_cycle()
             .expect("advance graph maintenance");
         ["ties_forward", "ties_reverse"].into_iter().all(|table| {
+            let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+                db.declared_reader_memory()
+                    .expect("admit the partition observation reader"),
+            );
+
             db.vector_store_for_test()
-                .partition_infos(&VectorIndexRef::new(table, "embedding"))
+                .partition_infos(
+                    &VectorIndexRef::new(table, "embedding"),
+                    &mut partition_observation_owner_1,
+                )
                 .expect("inspect graph readiness")
                 .iter()
                 .filter(|info| info.graph_available)

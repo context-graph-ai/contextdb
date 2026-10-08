@@ -65,9 +65,18 @@ fn lineages(
     author: &Arc<FabricIdentity>,
     incarnation: Incarnation,
 ) -> HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage> {
-    db.outbound_row_lineages(changes, tenant, &author.node_id(), incarnation, &|bytes| {
-        Ok(author.sign_lineage(bytes))
-    })
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    db.outbound_row_lineages(
+        changes,
+        tenant,
+        &author.node_id(),
+        incarnation,
+        &|bytes| Ok(author.sign_lineage(bytes)),
+        fixture_operation_reader_1.clone(),
+    )
     .expect("committed rows retain authenticated lineage")
 }
 
@@ -101,12 +110,36 @@ fn lineage_entries(
 /// `SyncClient`, which additionally needs a live transport, tenant, and push
 /// watermark this regression has no use for.
 fn outbound_pending_rows(db: &Database) -> Vec<RowChange> {
-    let (changes, _arrivals, provenance) = db.checked_changes_since_with_arrivals(Lsn(0)).unwrap();
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_2 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
+    let mut fixture_selection_credit_2 =
+        contextdb_core::read_memory::ReadCredit::new(fixture_operation_reader_2.clone());
+
+    let (changes, _arrivals, provenance) = db
+        .checked_changes_since_with_arrivals(
+            Lsn(0),
+            &mut fixture_operation_copy_2,
+            fixture_operation_reader_2.clone(),
+            &mut fixture_selection_credit_2,
+        )
+        .unwrap();
     let history = db.sync_direction_history();
     let changes =
         changes.filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
+    let fixture_operation_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let changes = db
-        .filter_outbound_received_ddl(changes, &provenance, None)
+        .filter_outbound_received_ddl(
+            changes,
+            &provenance,
+            None,
+            fixture_operation_reader_3.clone(),
+        )
         .unwrap();
     crate::sync_client::drop_rows_that_arrived_by_sync(db, changes).rows
 }
@@ -138,7 +171,9 @@ fn pulled_row_batch(
         .expect("source database incarnation");
     let before = source.current_lsn();
     insert(&source, id, body);
-    let changes = source.changes_since(before);
+    let changes = source
+        .changes_since(before)
+        .expect("read the declared changes");
     assert_eq!(changes.rows.len(), 1, "one row per pulled batch");
     let signed = lineages(&source, &changes, tenant, &creator, source_incarnation);
     let entries = lineage_entries(&changes, &signed);
@@ -157,6 +192,12 @@ fn identical_pulled_row_clears_local_push_obligation_on_keep_first_table() {
     insert(&db, id, "original");
 
     let (changes, entries) = pulled_row_batch(&root, &tenant, id, "original");
+    let fixture_operation_reader_4 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_4 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_4.clone());
+
     let result = db
         .apply_authenticated_received_changes_with_lineages(
             changes,
@@ -167,6 +208,8 @@ fn identical_pulled_row_clears_local_push_obligation_on_keep_first_table() {
             &entries,
             None,
             false,
+            &mut fixture_operation_copy_4,
+            fixture_operation_reader_4.clone(),
         )
         .expect("an authoritative restatement of an identical row must apply cleanly");
 
@@ -217,6 +260,12 @@ fn divergent_pulled_row_adopts_hub_value_and_reports_the_conflict() {
     // batch with -- `identity()` loads the same keypair back from the
     // shared `root` rather than minting a new one.
     let creator = identity(&root, "creator");
+    let fixture_operation_reader_5 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_5 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_5.clone());
+
     let result = db
         .apply_authenticated_received_changes_with_lineages(
             changes,
@@ -227,6 +276,8 @@ fn divergent_pulled_row_adopts_hub_value_and_reports_the_conflict() {
             &entries,
             None,
             false,
+            &mut fixture_operation_copy_5,
+            fixture_operation_reader_5.clone(),
         )
         .expect(
             "a divergent incoming row under KEEP FIRST is a handled hub adoption, not an error",

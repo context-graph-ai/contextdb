@@ -4,6 +4,10 @@ fn fixture() -> (tempfile::TempDir, RedbPersistence) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("placements.db");
     let db = crate::Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, scope TEXT NOT NULL, embedding VECTOR(2) PARTITION_KEY(scope) MAX_PARTITIONS 2)",
+        &HashMap::new(),
+    ).expect("declare the physical vector fixture table and its maintained totals");
     db.close().unwrap();
     let persistence = RedbPersistence::open(&path).unwrap();
     persistence
@@ -50,6 +54,27 @@ fn decode_catalog(persistence: &RedbPersistence) -> std::result::Result<bool, Lo
             Ok(raw.ready)
         })
         .map_err(read_image_error)
+}
+
+/// Adds a raw body for a row no placement covers and raises the copied
+/// referenced-body count to match, leaving the canonical projection unchanged.
+fn insert_orphan_body_and_compensate_count(write: &redb::WriteTransaction) {
+    let mut bodies = write.open_table(VECTORS_TABLE).unwrap();
+    let key = RedbPersistence::vector_identity_key(
+        &VectorIndexRef::new("items", "embedding"),
+        RowId(2),
+        TxId(1),
+        Lsn(1),
+    );
+    bodies.insert(key.as_slice(), &[0_u8; 8][..]).unwrap();
+    write
+        .open_table(CONTENT_IDENTITY_METADATA_TABLE)
+        .unwrap()
+        .insert(
+            VECTOR_REFERENCED_BODY_COUNT_KEY,
+            2_u64.to_be_bytes().as_slice(),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -139,24 +164,7 @@ fn shared_body_coverage_count_is_bound_to_the_committed_vector_projection() {
     persistence
         .with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
-            {
-                let mut bodies = write.open_table(VECTORS_TABLE).unwrap();
-                let key = RedbPersistence::vector_identity_key(
-                    &VectorIndexRef::new("items", "embedding"),
-                    RowId(2),
-                    TxId(1),
-                    Lsn(1),
-                );
-                bodies.insert(key.as_slice(), &[0_u8; 8][..]).unwrap();
-                write
-                    .open_table(CONTENT_IDENTITY_METADATA_TABLE)
-                    .unwrap()
-                    .insert(
-                        VECTOR_REFERENCED_BODY_COUNT_KEY,
-                        2_u64.to_be_bytes().as_slice(),
-                    )
-                    .unwrap();
-            }
+            insert_orphan_body_and_compensate_count(&write);
             write.commit().map_err(RedbPersistence::storage_error)
         })
         .unwrap();
@@ -176,24 +184,7 @@ fn damaged_body_root_retains_the_physical_orphan_key_check() {
     persistence
         .with_db(|db| {
             let write = db.begin_write().map_err(RedbPersistence::storage_error)?;
-            {
-                let mut bodies = write.open_table(VECTORS_TABLE).unwrap();
-                let key = RedbPersistence::vector_identity_key(
-                    &VectorIndexRef::new("items", "embedding"),
-                    RowId(2),
-                    TxId(1),
-                    Lsn(1),
-                );
-                bodies.insert(key.as_slice(), &[0_u8; 8][..]).unwrap();
-                write
-                    .open_table(CONTENT_IDENTITY_METADATA_TABLE)
-                    .unwrap()
-                    .insert(
-                        VECTOR_REFERENCED_BODY_COUNT_KEY,
-                        2_u64.to_be_bytes().as_slice(),
-                    )
-                    .unwrap();
-            }
+            insert_orphan_body_and_compensate_count(&write);
             // Rebind only the copied completeness count in this adversarial
             // fixture. The old physical body fingerprint remains mismatched.
             RedbPersistence::apply_content_identity_mutations_in_write(

@@ -35,11 +35,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
         .expect("bind file-backed authoritative hub");
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open file-backed hub"));
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -90,7 +89,8 @@ async fn authoritative_purge_reaches_push_only_edge_without_pulling_ordinary_row
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     edge.execute(
         "INSERT INTO push_only_notes (id, body) VALUES ($id, $body)",

@@ -82,8 +82,17 @@ fn current_generation(db: &Database, scope: Uuid) -> VectorGraphGeneration {
 }
 
 fn graph_ready(db: &Database, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(&index(), &partition(scope))
+        .partition_info(
+            &index(),
+            &partition(scope),
+            &mut partition_observation_owner_1,
+        )
         .unwrap()
         .is_some_and(|info| info.graph_available)
 }

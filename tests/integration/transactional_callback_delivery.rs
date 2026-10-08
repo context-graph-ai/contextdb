@@ -644,7 +644,18 @@ fn scheduled_action_identity_survives_drained_queue_and_restart() {
     })
     .unwrap();
     now.store(1_700_000_000_010, Ordering::SeqCst);
-    assert_eq!(db.cron_run_due_now_for_test().unwrap(), 1);
+    assert_eq!(
+        {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        }
+        .unwrap(),
+        1
+    );
     assert_eq!(db.sink_metrics("outgoing").queued, 1);
     let (first_tx, first_rx) = std::sync::mpsc::channel();
     db.register_sink("outgoing", None, move |event| {
@@ -672,7 +683,18 @@ fn scheduled_action_identity_survives_drained_queue_and_restart() {
         })
         .unwrap();
     now.store(1_700_000_000_020, Ordering::SeqCst);
-    assert_eq!(reopened.cron_run_due_now_for_test().unwrap(), 1);
+    assert_eq!(
+        {
+            let seam_read_memory = reopened
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            reopened.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        }
+        .unwrap(),
+        1
+    );
     let pending = reopened.pending_sink_action_ids_for_test("outgoing");
     assert_eq!(
         pending.len(),
@@ -786,7 +808,18 @@ fn full_sink_queue_refuses_scheduled_row_and_delivery_together() {
     })
     .unwrap();
     now.store(1_700_000_000_010, Ordering::SeqCst);
-    assert_eq!(db.cron_run_due_now_for_test().unwrap(), 0);
+    assert_eq!(
+        {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        }
+        .unwrap(),
+        0
+    );
     assert_eq!(
         db.execute("SELECT id FROM scheduled_actions ORDER BY id", &empty())
             .unwrap()

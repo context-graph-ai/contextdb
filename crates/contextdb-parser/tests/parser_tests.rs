@@ -121,7 +121,7 @@ fn anti_tests_rejected_constructs() {
     ));
     assert!(matches!(
         parse("SELECT ROW_NUMBER() OVER (PARTITION BY x) FROM t"),
-        Err(Error::WindowFunctionNotSupported)
+        Err(Error::WindowFunctionNotSupported { .. })
     ));
     assert!(matches!(
         parse("CREATE PROCEDURE p AS SELECT 1"),
@@ -872,17 +872,17 @@ fn rejection_recursive_cte() {
 fn rejection_window_functions() {
     assert!(matches!(
         parse("SELECT ROW_NUMBER() OVER (PARTITION BY x) FROM t"),
-        Err(Error::WindowFunctionNotSupported)
+        Err(Error::WindowFunctionNotSupported { .. })
     ));
     assert!(matches!(
         parse("SELECT id, status, RANK() OVER (ORDER BY confidence DESC) FROM decisions"),
-        Err(Error::WindowFunctionNotSupported)
+        Err(Error::WindowFunctionNotSupported { .. })
     ));
     assert!(matches!(
         parse(
             "SELECT id, SUM(count) OVER (PARTITION BY entity_id ORDER BY created_at) FROM outcomes"
         ),
-        Err(Error::WindowFunctionNotSupported)
+        Err(Error::WindowFunctionNotSupported { .. })
     ));
 }
 

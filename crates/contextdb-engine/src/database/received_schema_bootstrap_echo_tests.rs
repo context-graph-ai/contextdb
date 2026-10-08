@@ -105,6 +105,12 @@ fn apply_full_history(
     changes: &ChangeSet,
     received: &crate::protocol::ReceivedDdlContext,
 ) -> Result<crate::protocol::WireApplyResult> {
+    let received_schema_read_memory_1 = db
+        .declared_reader_memory()
+        .expect("admit the received-schema operation reader");
+    let mut received_schema_copy_owner_1 =
+        contextdb_engine::vector_read_memory::admission(received_schema_read_memory_1.clone());
+
     db.commit_received_schema_stage_with_receipt_for_test(
         changes,
         received,
@@ -112,6 +118,8 @@ fn apply_full_history(
         &HashMap::new(),
         Some(hub_receipt(received)),
         false,
+        &mut received_schema_copy_owner_1,
+        received_schema_read_memory_1,
     )
 }
 
@@ -120,13 +128,37 @@ fn apply_full_history(
 /// network-facing `SyncClient` (which additionally needs a live transport,
 /// tenant, and push watermark this regression has no use for).
 fn outbound_pending_ddl(db: &Database) -> Vec<DdlChange> {
-    let (changes, _arrivals, provenance) = db.checked_changes_since_with_arrivals(Lsn(0)).unwrap();
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_1 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_1.clone());
+    let mut fixture_selection_credit_1 =
+        contextdb_core::read_memory::ReadCredit::new(fixture_operation_reader_1.clone());
+
+    let (changes, _arrivals, provenance) = db
+        .checked_changes_since_with_arrivals(
+            Lsn(0),
+            &mut fixture_operation_copy_1,
+            fixture_operation_reader_1.clone(),
+            &mut fixture_selection_credit_1,
+        )
+        .unwrap();
     let history = db.sync_direction_history();
     let changes =
         changes.filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
-    db.filter_outbound_received_ddl(changes, &provenance, None)
-        .unwrap()
-        .ddl
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    db.filter_outbound_received_ddl(
+        changes,
+        &provenance,
+        None,
+        fixture_operation_reader_2.clone(),
+    )
+    .unwrap()
+    .ddl
 }
 
 fn reopen(db: Database, path: &std::path::Path) -> Database {
@@ -142,7 +174,10 @@ fn locally_bootstrapped_schema_reaches_zero_outbound_after_identical_full_histor
     let db = Database::open(&path).unwrap();
 
     author_local_bootstrap_schema(&db);
-    let local_ddl = db.changes_since(Lsn(0)).ddl;
+    let local_ddl = db
+        .changes_since(Lsn(0))
+        .expect("read the declared changes")
+        .ddl;
     assert_eq!(
         local_ddl.len(),
         4,
@@ -174,7 +209,10 @@ fn divergent_local_schema_stays_pending_after_identical_full_history_pull() {
     let db = Database::open(&path).unwrap();
 
     author_local_bootstrap_schema(&db);
-    let bootstrap_ddl = db.changes_since(Lsn(0)).ddl;
+    let bootstrap_ddl = db
+        .changes_since(Lsn(0))
+        .expect("read the declared changes")
+        .ddl;
 
     db.execute(
         "CREATE TABLE bootstrap_orphan (id INTEGER PRIMARY KEY)",
@@ -232,7 +270,10 @@ fn mixed_local_schema_commit_stays_fully_pending() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let committed_ddl = db.changes_since(Lsn(0)).ddl;
+    let committed_ddl = db
+        .changes_since(Lsn(0))
+        .expect("read the declared changes")
+        .ddl;
     assert_eq!(
         committed_ddl.len(),
         2,
@@ -286,7 +327,11 @@ fn a_hub_serves_the_foreign_keys_and_composite_keys_its_author_wrote() {
             })
             .expect("the authored CREATE TABLE is in schema history")
     };
-    let authored = notes(&db.changes_since(Lsn(0)).ddl);
+    let authored = notes(
+        &db.changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .ddl,
+    );
     assert_eq!(authored.0.len(), 1, "the author wrote one foreign key");
     assert_eq!(authored.0[0].child_column, "owner_id");
     assert_eq!(
@@ -295,6 +340,7 @@ fn a_hub_serves_the_foreign_keys_and_composite_keys_its_author_wrote() {
     );
     let served: Vec<DdlChange> = db
         .changes_since(Lsn(0))
+        .expect("read the declared changes")
         .ddl
         .iter()
         .map(hub_served_shape)
@@ -306,7 +352,11 @@ fn a_hub_serves_the_foreign_keys_and_composite_keys_its_author_wrote() {
     );
     let db = reopen(db, &path);
     assert_eq!(
-        notes(&db.changes_since(Lsn(0)).ddl),
+        notes(
+            &db.changes_since(Lsn(0))
+                .expect("read the declared changes")
+                .ddl
+        ),
         authored,
         "history read back from the store is the authored one"
     );
@@ -334,6 +384,7 @@ fn schema_history_after_reopen_is_the_authored_record_not_current_metadata() {
     .unwrap();
     let created_keys = |db: &Database| {
         db.changes_since(Lsn(0))
+            .expect("read the declared changes")
             .ddl
             .iter()
             .find_map(|change| match change {

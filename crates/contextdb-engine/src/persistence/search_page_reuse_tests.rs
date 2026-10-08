@@ -290,11 +290,27 @@ fn walk_rows(load: &ReadPersistenceLoad) -> Result<usize> {
     let meta = &load.image.table_meta[TABLE];
     let snapshot = snapshot_of(load);
     let mut seen = 0;
-    load.source
-        .bounded_visit_relational_rows::<Error>(TABLE, meta, snapshot, |_| {
+    let declared_reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        load.source
+            .verified_ordered_runs
+            .memory
+            .accountant
+            .usage()
+            .limit
+            .map(|bytes| bytes as u64)
+            .unwrap_or(u64::MAX),
+    );
+    let read_memory = declared_reader.child()?;
+    load.source.bounded_visit_relational_rows::<Error>(
+        TABLE,
+        meta,
+        snapshot,
+        |_| {
             seen += 1;
             Ok(())
-        })?;
+        },
+        read_memory,
+    )?;
     Ok(seen)
 }
 

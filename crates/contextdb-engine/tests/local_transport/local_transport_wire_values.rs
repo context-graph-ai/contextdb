@@ -67,11 +67,6 @@ const CURSOR_IDLE_FAILURE: &[u8] = &[9, 13, 3, 0];
 const CURSOR_LIFETIME_FAILURE: &[u8] = &[9, 13, 3, 1];
 
 const CURSOR_PAGE_BYTES: &[u8] = &[2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1];
-const CURSOR_OPENED_RESPONSE: &[u8] = &[
-    2, 0, 0, 0, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
-    0x44, 0x44, 12, 2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1,
-];
-const CURSOR_PAGE_RESPONSE: &[u8] = &[3, 12, 2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1];
 const TABLE_METADATA_BYTES: &[u8] = &[0, 1, 0, 1, b't', 1, 1, 1, b'n'];
 const TABLE_METADATA_RESPONSE: &[u8] = &[5, 9, 0, 1, 0, 1, b't', 1, 1, 1, b'n'];
 const EVENTS_METADATA_BYTES: &[u8] = &[1, 1, 1, 1, 2, b'o', b'k', 1, 1, 0, 0];
@@ -205,12 +200,13 @@ fn statement(statement: &str, remedy: &str) -> StatementRemedy {
 }
 
 fn query_result() -> QueryResult {
-    QueryResult {
-        columns: ["n", "b", "i", "f", "s", "u", "t", "j", "v", "x"]
+    {
+        let mut query_fixture = QueryResult::empty();
+        query_fixture.columns = ["n", "b", "i", "f", "s", "u", "t", "j", "v", "x"]
             .into_iter()
             .map(str::to_owned)
-            .collect(),
-        rows: vec![vec![
+            .collect();
+        query_fixture.rows = vec![vec![
             Value::Null,
             Value::Bool(true),
             Value::Int64(-7),
@@ -218,12 +214,13 @@ fn query_result() -> QueryResult {
             Value::Text("v".to_owned()),
             Value::Uuid(Uuid::from_bytes([0x55; 16])),
             Value::Timestamp(-2),
-            Value::Json(serde_json::json!({"a": 1})),
+            Value::Json(serde_json::json!({"a": 1}).into()),
             Value::Vector(vec![1.0, -2.0]),
             Value::TxId(TxId(42)),
-        ]],
-        rows_affected: 2,
-        trace: QueryTrace {
+        ]];
+        query_fixture.rows_affected = 2;
+        query_fixture.trace = QueryTrace {
+            groups: Box::default(),
             physical_plan: "P",
             index_used: Some("I".to_owned()),
             predicates_pushed: smallvec::smallvec![std::borrow::Cow::Borrowed("p")],
@@ -236,10 +233,11 @@ fn query_result() -> QueryResult {
             vector_search: None,
             rows_examined: 3,
             maintained_count: None,
-        },
-        cascade: Some(CascadeReport {
+        };
+        query_fixture.cascade = Some(CascadeReport {
             dropped_indexes: vec!["d".to_owned()],
-        }),
+        });
+        query_fixture
     }
 }
 
@@ -252,6 +250,7 @@ fn canonical_query_result() -> CanonicalQueryResult {
         rows: query_result().rows,
         rows_affected: 2,
         trace: CanonicalQueryTrace {
+            groups: Vec::new(),
             physical_plan: "P".to_owned(),
             index_used: Some("I".to_owned()),
             predicates_pushed: vec!["p".to_owned()],
@@ -299,7 +298,7 @@ fn all_ten_value_variants_have_independent_literal_bytes() {
         (Value::Text("v".to_owned()), TEXT_VALUE),
         (Value::Uuid(Uuid::from_bytes([0x55; 16])), UUID_VALUE),
         (Value::Timestamp(-2), TIMESTAMP_VALUE),
-        (Value::Json(serde_json::json!({"a": 1})), JSON_VALUE),
+        (Value::Json(serde_json::json!({"a": 1}).into()), JSON_VALUE),
         (Value::Vector(vec![1.0, -2.0]), VECTOR_VALUE),
         (Value::TxId(TxId(42)), TX_ID_VALUE),
     ];
@@ -342,13 +341,13 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
         &terminal_fixture,
     );
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.columns[0] = "N".to_owned();
     canonical.columns[0] = "N".to_owned();
     assert_query_mutation(result, canonical, 2, b'N');
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.rows[0][1] = Value::Bool(false);
     canonical.rows[0][1] = Value::Bool(false);
@@ -361,20 +360,20 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
         Err(ReadEncodingError::InvalidPayload)
     ));
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.rows[0][2] = Value::Int64(-8);
     canonical.rows[0][2] = Value::Int64(-8);
     assert_query_mutation(result, canonical, 27, 15);
 
     let adjacent_float = f64::from_bits(3.5_f64.to_bits() + 1);
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.rows[0][3] = Value::Float64(adjacent_float);
     canonical.rows[0][3] = Value::Float64(adjacent_float);
     assert_query_mutation(result, canonical, 29, 1);
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.rows[0][4] = Value::Text("w".to_owned());
     canonical.rows[0][4] = Value::Text("w".to_owned());
@@ -382,91 +381,91 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
 
     let mut changed_uuid = [0x55; 16];
     changed_uuid[0] = 0x54;
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.rows[0][5] = Value::Uuid(Uuid::from_bytes(changed_uuid));
     canonical.rows[0][5] = Value::Uuid(Uuid::from_bytes(changed_uuid));
     assert_query_mutation(result, canonical, 42, 0x54);
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.rows[0][6] = Value::Timestamp(-3);
     canonical.rows[0][6] = Value::Timestamp(-3);
     assert_query_mutation(result, canonical, 59, 5);
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
-    result.rows[0][7] = Value::Json(serde_json::json!({"a": 2}));
-    canonical.rows[0][7] = Value::Json(serde_json::json!({"a": 2}));
+    result.rows[0][7] = Value::Json(serde_json::json!({"a": 2}).into());
+    canonical.rows[0][7] = Value::Json(serde_json::json!({"a": 2}).into());
     assert_query_mutation(result, canonical, 67, b'2');
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.rows[0][8] = Value::Vector(vec![0.5, -2.0]);
     canonical.rows[0][8] = Value::Vector(vec![0.5, -2.0]);
     assert_query_mutation(result, canonical, 73, 0);
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.rows[0][9] = Value::TxId(TxId(43));
     canonical.rows[0][9] = Value::TxId(TxId(43));
     assert_query_mutation(result, canonical, 80, 43);
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.rows_affected = 3;
     canonical.rows_affected = 3;
     assert_query_mutation(result, canonical, 81, 3);
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.trace.physical_plan = "Q";
     canonical.trace.physical_plan = "Q".to_owned();
     assert_query_mutation(result, canonical, 83, b'Q');
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.trace.index_used = Some("J".to_owned());
     canonical.trace.index_used = Some("J".to_owned());
     assert_query_mutation(result, canonical, 86, b'J');
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.trace.predicates_pushed[0] = std::borrow::Cow::Borrowed("q");
     canonical.trace.predicates_pushed[0] = "q".to_owned();
     assert_query_mutation(result, canonical, 89, b'q');
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.trace.indexes_considered[0].name = "k".to_owned();
     canonical.trace.indexes_considered[0].name = "k".to_owned();
     assert_query_mutation(result, canonical, 92, b'k');
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.trace.indexes_considered[0].rejected_reason = std::borrow::Cow::Borrowed("s");
     canonical.trace.indexes_considered[0].rejected_reason = "s".to_owned();
     assert_query_mutation(result, canonical, 94, b's');
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.trace.sort_elided = false;
     canonical.trace.sort_elided = false;
     assert_query_mutation(result, canonical, 95, 0);
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.trace.query_vector_source = Some(VectorIndexRef::new("u", "v"));
     canonical.trace.query_vector_source = Some(VectorIndexRef::new("u", "v"));
     assert_query_mutation(result, canonical, 98, b'u');
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.trace.query_vector_source = Some(VectorIndexRef::new("t", "w"));
     canonical.trace.query_vector_source = Some(VectorIndexRef::new("t", "w"));
     assert_query_mutation(result, canonical, 100, b'w');
 
-    let mut result = base.clone();
+    let mut result = query_result();
     let mut canonical = expected.clone();
     result.trace.rows_examined = 4;
     canonical.trace.rows_examined = 4;
@@ -856,11 +855,11 @@ fn every_failure_detail_field_changes_an_independent_literal_position() {
 }
 
 fn cursor_page() -> CursorPage {
-    CursorPage {
-        columns: vec!["i".to_owned(), "t".to_owned()],
-        rows: vec![vec![Value::Int64(1), Value::TxId(TxId(42))]],
-        has_more: true,
-    }
+    CursorPage::from_parts(
+        vec!["i".to_owned(), "t".to_owned()],
+        vec![vec![Value::Int64(1), Value::TxId(TxId(42))]],
+        true,
+    )
 }
 
 fn table_metadata() -> MetadataPage {
@@ -900,20 +899,20 @@ fn canonical_cursor_and_metadata_payloads_keep_their_literal_bytes_inside_respon
                 storage_snapshot: None,
                 physical_identity: None,
                 cursor_id: [0x44; 16],
-                payload: CURSOR_PAGE_BYTES.to_vec(),
+                payload: owner_cursor_payload(),
             },
         },
         LocalResponseExpectation::CursorOpen,
-        CURSOR_OPENED_RESPONSE,
+        &owner_opened_fixture(),
     );
     assert_response_codec(
         LocalResponse::CursorPage {
             page: CursorPageResponse {
-                payload: CURSOR_PAGE_BYTES.to_vec(),
+                payload: owner_cursor_payload(),
             },
         },
         LocalResponseExpectation::CursorFetch,
-        CURSOR_PAGE_RESPONSE,
+        &owner_page_fixture(),
     );
 
     assert_eq!(
@@ -957,4 +956,27 @@ fn canonical_cursor_and_metadata_payloads_keep_their_literal_bytes_inside_respon
         ),
         EVENTS_METADATA_RESPONSE,
     );
+}
+
+#[path = "../owner_cursor_test_support.rs"]
+#[allow(dead_code)]
+mod owner_cursor_test_support;
+
+fn owner_cursor_payload() -> Vec<u8> {
+    let page_bytes = CURSOR_PAGE_BYTES;
+    let payload = owner_cursor_test_support::with_empty_observation(page_bytes.to_vec());
+    let page = contextdb_engine::read_contract::decode_cursor_page(page_bytes)
+        .expect("decode the public page fixture");
+    owner_cursor_test_support::assert_empty_observation(&payload, &page);
+    payload
+}
+
+fn owner_opened_fixture() -> Vec<u8> {
+    let mut prefix = vec![2, 0, 0, 0];
+    prefix.extend([0x44; 16]);
+    owner_cursor_test_support::owner_response_fixture(&prefix, CURSOR_PAGE_BYTES)
+}
+
+fn owner_page_fixture() -> Vec<u8> {
+    owner_cursor_test_support::owner_response_fixture(&[3], CURSOR_PAGE_BYTES)
 }

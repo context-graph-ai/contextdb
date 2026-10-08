@@ -205,9 +205,14 @@ fn seed(db: &Database, extra_tail: usize) {
     drive_maintenance(
         db,
         |db| {
+            let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+                db.declared_reader_memory()
+                    .expect("admit the partition observation reader"),
+            );
+
             let ready = db
                 .vector_store_for_test()
-                .partition_infos(&index())
+                .partition_infos(&index(), &mut partition_observation_owner_1)
                 .expect("inspect partition readiness");
             ready.len() == contexts && ready.iter().all(|info| info.graph_available)
         },

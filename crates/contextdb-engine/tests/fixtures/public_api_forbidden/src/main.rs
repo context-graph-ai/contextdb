@@ -70,7 +70,7 @@ fn db() -> Arc<Database> {
     feature = "client_arbitrary_transport"
 ))]
 fn client() -> SyncClient {
-    SyncClient::new(db(), "iroh:ticket", TenantId::from("tenant"))
+    SyncClient::new(db(), "iroh:ticket", TenantId::from("tenant")).expect("construct sync client fixture")
 }
 
 #[cfg(feature = "accountant_accessor")]

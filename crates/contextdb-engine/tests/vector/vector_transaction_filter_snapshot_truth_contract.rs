@@ -24,9 +24,9 @@
 
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{Error, Value, VectorIndexRef, VectorPartitionKey, VectorSearchMode};
+use contextdb_engine::database::VectorSearchTraceObservation;
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
-use contextdb_vector::VectorSearchDebugTrace;
 use contextdb_vector::store::VectorPartitionRef;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -296,9 +296,18 @@ fn seed_indexed_partition(db: &Database, scope: Uuid, first: u128, kind: &str) {
 
 fn drive_until_indexed(db: &Database, scope: Uuid) {
     for _ in 0..MAINTENANCE_CYCLES {
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         if db
             .vector_store_for_test()
-            .partition_info(&index(), &partition(scope))
+            .partition_info(
+                &index(),
+                &partition(scope),
+                &mut partition_observation_owner_1,
+            )
             .unwrap()
             .is_some_and(|info| info.graph_available)
         {
@@ -330,10 +339,15 @@ fn reset_hnsw_trace(db: &Database) {
     db.__reset_last_query_vector_trace_for_test();
 }
 
-fn assert_hnsw_trace(db: &Database, what: &str) -> VectorSearchDebugTrace {
-    let trace = db
-        .__take_last_query_vector_trace_for_test()
-        .unwrap_or_else(|| panic!("{what}: the public vector query published no debug trace"));
+fn assert_hnsw_trace(db: &Database, what: &str) -> VectorSearchTraceObservation {
+    let trace = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .unwrap_or_else(|| panic!("{what}: the public vector query published no debug trace"));
     assert!(
         trace.used_hnsw,
         "{what}: the selected maintained route must use the committed graph, trace={trace:?}"
@@ -350,9 +364,14 @@ fn assert_hnsw_trace(db: &Database, what: &str) -> VectorSearchDebugTrace {
 }
 
 fn assert_exact_trace(db: &Database, what: &str) {
-    let trace = db
-        .__take_last_query_vector_trace_for_test()
-        .unwrap_or_else(|| panic!("{what}: the public vector query published no debug trace"));
+    let trace = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .unwrap_or_else(|| panic!("{what}: the public vector query published no debug trace"));
     assert!(
         !trace.used_hnsw && trace.hnsw_candidate_count == 0,
         "{what}: AUTO must use exact candidate work without a hidden HNSW route, trace={trace:?}"
@@ -555,9 +574,18 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
     .expect("commit its rank-policy value");
     let order_index = VectorIndexRef::new("order_truth", "embedding");
     for _ in 0..MAINTENANCE_CYCLES {
+        let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         if db
             .vector_store_for_test()
-            .partition_info(&order_index, &VectorPartitionKey::unpartitioned())
+            .partition_info(
+                &order_index,
+                &VectorPartitionKey::unpartitioned(),
+                &mut partition_observation_owner_2,
+            )
             .unwrap()
             .is_some_and(|info| info.graph_available)
         {
@@ -566,9 +594,18 @@ fn equal_scores_have_one_row_id_order_for_committed_and_staged_ranked_and_unrank
         db.run_maintenance_cycle()
             .expect("publish the committed tie route in one finite batch");
     }
+    let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert!(
         db.vector_store_for_test()
-            .partition_info(&order_index, &VectorPartitionKey::unpartitioned())
+            .partition_info(
+                &order_index,
+                &VectorPartitionKey::unpartitioned(),
+                &mut partition_observation_owner_3
+            )
             .unwrap()
             .is_some_and(|info| info.graph_available),
         "the tie fixture has a maintained committed route before staging its delta"
@@ -1487,9 +1524,15 @@ impl bounded::ExecutionProbe for PauseRegisteredVectorRead {
 
 fn assert_three_current_vectors(db: &Database, expected: &[f32]) {
     let snapshot = db.snapshot();
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     let entries = db
         .vector_store_for_test()
-        .entries_for_index(&index())
+        .entries_for_index(&index(), &mut vector_fixture_copy_1)
         .unwrap();
     let visible = entries
         .iter()
@@ -1656,9 +1699,15 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
         assert_ne!(initial.rows, expected.rows);
     }
     assert_three_current_vectors(&db, &[0.8, 0.6, 0.0]);
+    let vector_fixture_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_2 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
+
     let entries = db
         .vector_store_for_test()
-        .entries_for_index(&index())
+        .entries_for_index(&index(), &mut vector_fixture_copy_2)
         .unwrap();
     assert!(entries.iter().all(|entry| {
         entry
@@ -1703,7 +1752,8 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
                 TenantId::from(tenant),
                 hub_identity.node_id(),
                 hub_identity.clone(),
-            ),
+            )
+            .expect("construct the authenticated sync endpoint"),
         );
         let stop = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
@@ -1722,7 +1772,8 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
             broker.client_as(&edge_identity.node_id()),
             TenantId::from(tenant),
             edge_identity.clone(),
-        );
+        )
+        .expect("construct the authenticated sync endpoint");
         client.pull_default().await.unwrap();
         drive_until_indexed(&edge, selected_scope());
         assert_three_current_vectors(

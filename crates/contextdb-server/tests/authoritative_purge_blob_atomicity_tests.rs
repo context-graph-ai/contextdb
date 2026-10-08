@@ -63,11 +63,10 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.redb")).expect("open authoritative hub"));
     install_work_ledger_schema(&db).expect("install hub work-ledger schema");
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -121,7 +120,8 @@ async fn inbound_purge_removes_last_ref_blob_and_preserves_shared_blob() {
     submit_blob_job(&edge_db, "shared-survivor", &edge_node, &shared);
 
     let dial = peer_dial_spec(&hub.ticket, &edge_identity);
-    let client = SyncClient::new(edge_db.clone(), &dial, TenantId::from(tenant));
+    let client = SyncClient::new(edge_db.clone(), &dial, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(client.push())
         .await
         .expect("edge-originated blob references reach the authoritative hub");
@@ -318,6 +318,9 @@ async fn restart_resumes_durable_partial_without_whole_object_hydration() {
     drop(consumer_db);
 
     let consumer_db = Arc::new(Database::open(&consumer_path).expect("reopen consumer database"));
+    let consumer_read_memory = consumer_db
+        .declared_reader_memory()
+        .expect("declare blob fixture reader");
     let consumer = BlobStore::new(consumer_db, policy(), consumer_key);
     consumer.set_test_clock(T0);
     assert_eq!(consumer.bytes_hydrated_while_opening_for_test(), 0);
@@ -325,9 +328,14 @@ async fn restart_resumes_durable_partial_without_whole_object_hydration() {
         consumer.verified_partial_bytes_for_test(&hash),
         sink.len() as u64
     );
-    let moved = within(consumer.resume_bytes_moved_for_test(&hash, &ticket, &mut sink))
-        .await
-        .expect("restart resumes the verified tail");
+    let moved = within(consumer.resume_bytes_moved_for_test(
+        consumer_read_memory.clone(),
+        &hash,
+        &ticket,
+        &mut sink,
+    ))
+    .await
+    .expect("restart resumes the verified tail");
     assert_eq!(BlobHash::of(&sink), hash);
     assert!(
         moved <= (content.len() - verified_prefix_len) as u64 + 256 * 1024,
@@ -436,6 +444,9 @@ async fn control_backup_restores_complete_serve_and_interrupted_resume_state() {
     };
 
     let restored_db = Arc::new(Database::open(&backup_path).expect("open restored backup"));
+    let restored_read_memory = restored_db
+        .declared_reader_memory()
+        .expect("declare blob fixture reader");
     let restored = BlobStore::new(restored_db.clone(), policy(), restored_key.clone());
     restored.set_test_clock(T0);
     assert_eq!(restored.bytes_hydrated_while_opening_for_test(), 0);
@@ -477,10 +488,14 @@ async fn control_backup_restores_complete_serve_and_interrupted_resume_state() {
     assert_eq!(served, complete_bytes);
 
     let mut resumed = partial_prefix;
-    let moved =
-        within(restored.resume_bytes_moved_for_test(&partial, &holder_ticket, &mut resumed))
-            .await
-            .expect("restored interrupted state resumes directly from its holder");
+    let moved = within(restored.resume_bytes_moved_for_test(
+        restored_read_memory.clone(),
+        &partial,
+        &holder_ticket,
+        &mut resumed,
+    ))
+    .await
+    .expect("restored interrupted state resumes directly from its holder");
     assert_eq!(resumed, partial_bytes);
     assert!(moved <= partial_bytes.len() as u64);
     restored_endpoint.close().await;

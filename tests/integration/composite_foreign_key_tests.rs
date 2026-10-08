@@ -903,7 +903,12 @@ fn ddl_sync_reopen_round_trip_composite_fk_descriptor_present_on_follower() {
     }
     let origin = Database::open(&path).unwrap();
     let follower = db();
-    let apply_result = follower.apply_changes(origin.changes_since(Lsn(0)), &apply_policy());
+    let apply_result = follower.apply_changes(
+        origin
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
+        &apply_policy(),
+    );
     assert!(
         apply_result.is_ok(),
         "full-snapshot DDL apply must preserve valid parent UNIQUE syntax and order: {apply_result:?}"
@@ -948,7 +953,12 @@ fn ddl_sync_round_trip_single_column_fk_structured_payload_present() {
     }
     let follower = db();
     follower
-        .apply_changes(origin.changes_since(Lsn(0)), &apply_policy())
+        .apply_changes(
+            origin
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+            &apply_policy(),
+        )
         .unwrap();
     let c_meta = follower.table_meta("c").unwrap();
     let p_id = c_meta
@@ -984,7 +994,12 @@ fn ddl_sync_round_trip_composite_unique_structured_payload_present() {
     }
     let follower = db();
     follower
-        .apply_changes(origin.changes_since(Lsn(0)), &apply_policy())
+        .apply_changes(
+            origin
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+            &apply_policy(),
+        )
         .unwrap();
     assert_eq!(
         follower.table_meta("p").unwrap().unique_constraints,
@@ -1009,7 +1024,12 @@ fn ddl_sync_follower_enforces_composite_fk_on_local_writes() {
         )
         .unwrap();
     let follower = db();
-    let apply_result = follower.apply_changes(origin.changes_since(Lsn(0)), &apply_policy());
+    let apply_result = follower.apply_changes(
+        origin
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
+        &apply_policy(),
+    );
     assert!(
         apply_result.is_ok(),
         "structured DDL sync must apply before follower local validation: {apply_result:?}"
@@ -1213,6 +1233,7 @@ fn ddl_sync_child_before_parent_same_batch_uses_applied_parent_projection() {
     );
     assert_eq!(row_count(&receiver, "parent"), 1);
     assert_eq!(row_count(&receiver, "child"), 1);
+    assert_composite_parent_projection_prices_keys_not_payloads();
 }
 
 #[test]
@@ -2033,7 +2054,12 @@ fn ddl_sync_round_trip_distinguishes_pk_covered_from_unique_covered_fk() {
     let origin = Database::open(&path).unwrap();
     let follower = db();
     follower
-        .apply_changes(origin.changes_since(Lsn(0)), &apply_policy())
+        .apply_changes(
+            origin
+                .changes_since(Lsn(0))
+                .expect("read the declared changes"),
+            &apply_policy(),
+        )
         .unwrap();
     assert_eq!(
         follower.table_meta("child").unwrap().composite_foreign_keys,
@@ -2093,4 +2119,108 @@ fn protocol_version_bumps_for_structured_constraint_wire() {
     let encoded = encode(MessageType::PullRequest, &()).unwrap();
     let decoded = decode(&encoded).unwrap();
     assert_eq!(decoded.version, 7);
+}
+
+fn assert_composite_parent_projection_prices_keys_not_payloads() {
+    let mut peaks = HashMap::new();
+    for key_bytes in [8usize, 1024] {
+        for payload_bytes in [32usize, 262_144] {
+            let receiver = db();
+            receiver.execute(
+                "CREATE TABLE projected_parent (id INTEGER PRIMARY KEY, tenant TEXT, ordinal INTEGER, payload TEXT, UNIQUE(tenant, ordinal))",
+                &p(),
+            ).unwrap();
+            receiver.execute(
+                "CREATE TABLE projected_child (id INTEGER PRIMARY KEY, tenant TEXT, ordinal INTEGER, payload TEXT, FOREIGN KEY (tenant, ordinal) REFERENCES projected_parent(tenant, ordinal))",
+                &p(),
+            ).unwrap();
+            let key = "k".repeat(key_bytes);
+            let make_row = |table: &str, id: i64, ordinal: i64| RowChange {
+                table: table.into(),
+                natural_key: NaturalKey::single("id".into(), Value::Int64(id)),
+                values: HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("tenant".into(), Value::Text(key.clone())),
+                    ("ordinal".into(), Value::Int64(ordinal)),
+                    ("payload".into(), Value::Text("x".repeat(payload_bytes))),
+                ]),
+                deleted: false,
+                lsn: Lsn(10),
+                created_at: None,
+            };
+            let (result, work) = contextdb_engine::writer_query_test_seams::observe(|| {
+                receiver.apply_changes(
+                    ChangeSet {
+                        rows: vec![
+                            make_row("projected_child", 1, 7),
+                            make_row("projected_child", 2, 8),
+                            make_row("projected_parent", 1, 7),
+                        ],
+                        ..Default::default()
+                    },
+                    &apply_policy(),
+                )
+            });
+            let result = result.expect("complete the parent-key-projected batch");
+            assert_eq!(
+                result.conflicts.len(),
+                1,
+                "a partial composite-key match remains an orphan conflict"
+            );
+            assert_eq!(
+                receiver
+                    .execute(
+                        "SELECT id, tenant, ordinal FROM projected_parent ORDER BY id",
+                        &p(),
+                    )
+                    .unwrap()
+                    .rows,
+                vec![vec![
+                    Value::Int64(1),
+                    Value::Text(key.clone()),
+                    Value::Int64(7)
+                ]]
+            );
+            assert_eq!(
+                receiver
+                    .execute(
+                        "SELECT id, tenant, ordinal FROM projected_child ORDER BY id",
+                        &p(),
+                    )
+                    .unwrap()
+                    .rows,
+                vec![vec![
+                    Value::Int64(1),
+                    Value::Text(key.clone()),
+                    Value::Int64(7)
+                ]]
+            );
+            assert_eq!(
+                work.sync_parent_key_projection_bytes, 0,
+                "the actual writer projection reservation releases after complete apply"
+            );
+            assert!(
+                work.sync_parent_key_projection_peak_bytes > 0,
+                "the incoming parent keys have an actual retained writer credit"
+            );
+            peaks.insert(
+                (key_bytes, payload_bytes),
+                work.sync_parent_key_projection_peak_bytes,
+            );
+        }
+        assert_eq!(
+            peaks[&(key_bytes, 32)],
+            peaks[&(key_bytes, 262_144)],
+            "unrelated parent and child payloads do not enter the retained FK key projection"
+        );
+    }
+    let short = Value::Text("k".repeat(8)).estimated_bytes();
+    let long = Value::Text("k".repeat(1024)).estimated_bytes();
+    for payload_bytes in [32usize, 262_144] {
+        assert_eq!(
+            peaks[&(1024, payload_bytes)] - peaks[&(8, payload_bytes)],
+            long - short,
+            "one incoming parent retains one copy of its composite TEXT key, without payload or row multipliers"
+        );
+    }
 }

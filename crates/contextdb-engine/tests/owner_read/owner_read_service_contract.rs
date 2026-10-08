@@ -20,8 +20,8 @@ use contextdb_engine::owner_read::{
     OwnerServicePublicationObserver, OwnerServiceSpec, ValidatedOwnerListener,
 };
 use contextdb_engine::read_contract::{
-    cursor_page_encoded_size, decode_cursor_page, decode_metadata_body, decode_metadata_page,
-    decode_query_result, query_result_encoded_size,
+    cursor_page_encoded_size, decode_metadata_body, decode_metadata_page, decode_query_result,
+    query_result_encoded_size,
 };
 use contextdb_engine::{
     Database, MaintenancePolicy, MetadataBody, OwnerReadConfig, OwnerReadTestHooks, cli_render,
@@ -3713,6 +3713,92 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
 #[cfg(feature = "test-seams")]
 #[test]
 fn remote_explain_of_a_bound_partition_key_reports_the_bound_scopes_count_and_route() {
+    {
+        // An owner reader receives the consumer's ranked session answer even
+        // when its bound Context contains no session rows.
+        let harness = Harness::new(limits(), 4, None);
+        for ddl in [
+            "CREATE TABLE contexts (id UUID PRIMARY KEY CONTEXT_ID, name TEXT NOT NULL UNIQUE, labels JSON, properties JSON, created_at TXID NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+            "CREATE TABLE event_context_sessions (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, event_count INTEGER NOT NULL, latest_occurred_at TIMESTAMP, PRIMARY KEY (context_id, connector_id, session_ref)) SYNC OFF",
+            "CREATE INDEX idx_event_context_sessions_recency ON event_context_sessions (context_id, latest_occurred_at DESC, connector_id ASC, session_ref ASC)",
+        ] {
+            harness
+                .database
+                .execute(ddl, &HashMap::new())
+                .expect("declare the consumer session schema and recency index");
+        }
+        let populated = uuid::Uuid::from_u128(1);
+        let empty = uuid::Uuid::from_u128(2);
+        for (context, name) in [(populated, "populated"), (empty, "empty")] {
+            harness
+                .database
+                .execute(
+                    "INSERT INTO contexts (id, name, created_at) VALUES ($id, $name, $tx)",
+                    &HashMap::from([
+                        ("id".to_owned(), Value::Uuid(context)),
+                        ("name".to_owned(), Value::Text(name.to_owned())),
+                        ("tx".to_owned(), Value::TxId(contextdb_core::TxId(1))),
+                    ]),
+                )
+                .expect("commit each consumer Context parent");
+        }
+        harness.database.execute(
+            "INSERT INTO event_context_sessions (context_id, connector_id, session_ref, event_count, latest_occurred_at) VALUES ($context, 'connector', 'session', 1, $occurred)",
+            &HashMap::from([
+                ("context".to_owned(), Value::Uuid(populated)),
+                ("occurred".to_owned(), Value::Timestamp(1)),
+            ]),
+        ).expect("commit one actual consumer session summary");
+        let statement = "WITH ranked_sessions AS (SELECT context_id, connector_id, session_ref, event_count, latest_occurred_at, ROW_NUMBER() OVER (PARTITION BY context_id ORDER BY latest_occurred_at DESC, connector_id ASC, session_ref ASC) AS session_rank FROM event_context_sessions WHERE context_id = $recent_context_0 AND latest_occurred_at IS NOT NULL) SELECT context_id, connector_id, session_ref, event_count, latest_occurred_at FROM ranked_sessions WHERE (context_id = $rank_context_0 AND session_rank <= $rank_limit_0) ORDER BY context_id ASC, session_rank ASC";
+        let answers: Vec<_> = [(70, populated), (71, empty)]
+            .into_iter()
+            .map(|(connection, context)| {
+                let answer = harness.request(
+                    connection,
+                    limits(),
+                    LocalRequest::CursorOpen {
+                        statement: statement.to_owned(),
+                        params: BTreeMap::from([
+                            ("recent_context_0".to_owned(), Value::Uuid(context)),
+                            ("rank_context_0".to_owned(), Value::Uuid(context)),
+                            ("rank_limit_0".to_owned(), Value::Int64(10)),
+                        ]),
+                    },
+                );
+                (connection, context, answer)
+            })
+            .collect();
+        for (connection, context, answer) in answers {
+            let opened = cursor_opened(
+                answer.expect("ranked session CursorOpen answers rather than disconnecting"),
+            );
+            let page = decode_cursor_page(&opened.payload)
+                .expect("decode the owner's complete ranked session page");
+            let expected = if context == populated {
+                vec![vec![
+                    Value::Uuid(populated),
+                    Value::Text("connector".to_owned()),
+                    Value::Text("session".to_owned()),
+                    Value::Int64(1),
+                    Value::Timestamp(1),
+                ]]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                page.rows, expected,
+                "nonempty and empty Contexts keep their exact session answers"
+            );
+            assert!(!page.has_more, "the one-row and empty answers are complete");
+            let responses = harness
+                .request(connection, limits(), query("SELECT 1"))
+                .expect("the same owner connection remains usable after the ranked answer");
+            assert!(matches!(
+                responses.last(),
+                Some(LocalResponse::TerminalSuccess { .. })
+            ));
+        }
+    }
     const SCOPE: &str = "alpha-scope";
 
     let harness = Harness::new(limits(), 4, None);
@@ -3849,3 +3935,8 @@ fn a_cancelled_owner_read_is_reported_as_cancelled() {
         "a cancelled owner read must not be reported as unimplemented: {rendered}"
     );
 }
+
+#[path = "../owner_cursor_test_support.rs"]
+#[allow(dead_code)]
+mod owner_cursor_test_support;
+use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;

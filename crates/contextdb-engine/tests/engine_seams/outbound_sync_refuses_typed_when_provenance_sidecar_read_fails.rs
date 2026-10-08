@@ -103,7 +103,8 @@ async fn serve(
             tenant.clone(),
             node,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -155,10 +156,13 @@ async fn outbound_sync_refuses_typed_when_provenance_sidecar_read_fails() {
         broker.client_as(&edge_identity.node_id()),
         tenant.clone(),
         edge_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let result = client.pull_default().await.unwrap();
     assert_eq!(result.applied_rows, 2);
-    let changes = edge.changes_since(Lsn(0));
+    let changes = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let rows: Vec<_> = changes
         .rows
         .iter()
@@ -174,12 +178,14 @@ async fn outbound_sync_refuses_typed_when_provenance_sidecar_read_fails() {
     assert_eq!((rows.len(), vectors.len()), (2, 2));
     assert!(rows.iter().all(|row| row.lsn == rows[0].lsn));
     assert!(vectors.iter().all(|vector| vector.lsn == rows[0].lsn));
-    assert!(rows.iter().all(|row| edge.row_change_arrived_by_sync(row)));
-    assert!(
-        vectors
-            .iter()
-            .all(|vector| edge.vector_change_arrived_by_sync(vector))
-    );
+    assert!(rows.iter().all(|row| {
+        edge.row_change_arrived_by_sync(row)
+            .expect("read the actual fixture observation")
+    }));
+    assert!(vectors.iter().all(|vector| {
+        edge.vector_change_arrived_by_sync(vector)
+            .expect("inspect the vector arrival provenance")
+    }));
     let a = rows
         .iter()
         .find(|row| row.natural_key.value == Value::Int64(1))
@@ -215,10 +221,18 @@ async fn outbound_sync_refuses_typed_when_provenance_sidecar_read_fails() {
         transport,
         tenant.clone(),
         edge_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let before = (client.push_watermark(), client.pull_watermark());
     typed_fault(client.pending_push_change_count().unwrap_err());
-    typed_fault(client.__ordinary_push_request_for_test().unwrap_err());
+    typed_fault(
+        client
+            .__ordinary_push_request_for_test(
+                edge.declared_reader_memory()
+                    .expect("admit the fixture client reader"),
+            )
+            .unwrap_err(),
+    );
     typed_fault(client.push().await.unwrap_err());
     assert_eq!(
         sends.load(Ordering::SeqCst),
@@ -242,7 +256,8 @@ async fn outbound_sync_refuses_typed_when_provenance_sidecar_read_fails() {
         broker.client_as(&sink_identity.node_id()),
         tenant.clone(),
         sink_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let sink_progress = sink.persisted_sync_watermarks(&tenant).unwrap();
     let sink_cursor = sink.persisted_sync_pull_cursor(&tenant).unwrap();
     let error = client.pull_default().await.unwrap_err();
@@ -291,7 +306,8 @@ async fn outbound_sync_refuses_typed_when_provenance_sidecar_read_fails() {
         transport,
         tenant.clone(),
         edge_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     assert_eq!(
         client.pending_push_change_count().unwrap(),
         0,
@@ -308,7 +324,8 @@ async fn outbound_sync_refuses_typed_when_provenance_sidecar_read_fails() {
         broker.client_as(&edge_identity.node_id()),
         tenant.clone(),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     // One owner in the same local commit can be pending a fresh hub ordering;
     // its sibling's Pulled marker must not suppress that local owner.
     let b = rows
@@ -329,10 +346,14 @@ async fn outbound_sync_refuses_typed_when_provenance_sidecar_read_fails() {
         2,
         "only pending-local B row and its vector remain outbound at the shared LSN"
     );
-    assert!(edge.row_change_arrived_by_sync(a));
-    assert!(!edge.row_change_arrived_by_sync(b));
-    eprintln!(
-        "provenance unknown-kind refusals: push payloads=0, pull pages=0; restored row/vector pending=0, same-LSN local owner pending=2"
+    assert!(
+        edge.row_change_arrived_by_sync(a)
+            .expect("read the actual fixture observation")
+    );
+    assert!(
+        !edge
+            .row_change_arrived_by_sync(b)
+            .expect("read the actual fixture observation")
     );
     drop(client);
     stop_server(stop, task, server).await;

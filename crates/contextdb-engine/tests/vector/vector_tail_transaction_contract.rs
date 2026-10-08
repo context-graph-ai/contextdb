@@ -162,7 +162,9 @@ fn sync_tail_admission_refuses_rows_vectors_and_the_authenticated_receipt() {
             .unwrap();
     }
     source.commit(tx).unwrap();
-    let changes = source.changes_since(Lsn(1));
+    let changes = source
+        .changes_since(Lsn(1))
+        .expect("read the declared changes");
     let source_lsn = changes.max_lsn().unwrap();
     let tenant = TenantId::from("tail-admission");
     let incarnation = Incarnation::mint();

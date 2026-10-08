@@ -124,6 +124,10 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
         observed.fetch_max(bytes, Ordering::SeqCst);
     }));
     db.accountant.set_budget(Some(limit)).unwrap();
+    let fixture_operation_reader_1 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
     let error = match metadata {
         ColdMetadata::Membership => {
             // Exercise the durable fallback frontier loader with the same
@@ -141,7 +145,7 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
             .unwrap_err()
         }
         ColdMetadata::Catalog | ColdMetadata::Journal => context
-            .persist_built_vector_partition(&partition)
+            .persist_built_vector_partition(&partition, fixture_operation_reader_1.clone())
             .unwrap_err(),
     };
     assert!(
@@ -351,8 +355,14 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     let observation = redb::observe_backend_reads(Arc::new(move |bytes| {
         observed.fetch_max(bytes, Ordering::SeqCst);
     }));
+    let fixture_operation_reader_2 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
 
-    let outcome = context.retry_vector_journal_truncations().unwrap();
+    let outcome = context
+        .retry_vector_journal_truncations(fixture_operation_reader_2.clone())
+        .unwrap();
     let details = outcome
         .first_failure_details
         .expect("a refused physical retry probe retains an actionable partition failure");
@@ -367,9 +377,19 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
     assert!(details.available_bytes.unwrap() <= headroom as u64);
     assert_eq!(details.budget_limit_bytes, Some(limit as u64));
     assert!(details.message.contains("graph is durable"));
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     assert_eq!(
         db.vector_store
-            .partition_info(&partition.index, &partition.partition_key)
+            .partition_info(
+                &partition.index,
+                &partition.partition_key,
+                &mut vector_fixture_copy_1
+            )
             .unwrap()
             .unwrap()
             .maintenance_failure_details,
@@ -560,8 +580,13 @@ fn wide_text_partition_metadata_refuses_before_cold_catalog_lookup() {
         observed.fetch_add(1, Ordering::SeqCst);
     }));
     db.accountant.set_budget(Some(baseline + headroom)).unwrap();
+    let fixture_operation_reader_3 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
     let error = context
-        .persist_built_vector_partition(&partition)
+        .persist_built_vector_partition(&partition, fixture_operation_reader_3.clone())
         .unwrap_err();
     assert!(
         matches!(&error, Error::MemoryBudgetExceeded {

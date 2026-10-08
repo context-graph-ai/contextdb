@@ -143,8 +143,13 @@ fn quarantined_inventory_refuses_cold_oversized_source(missing_catalog: bool) {
     }));
 
     db.accountant.set_budget(Some(baseline + 4096)).unwrap();
+    let fixture_operation_reader_1 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
     let early = context
-        .persist_built_vector_partition(&partition)
+        .persist_built_vector_partition(&partition, fixture_operation_reader_1.clone())
         .unwrap_err();
     assert!(
         matches!(early, Error::MemoryBudgetExceeded { operation, .. }
@@ -152,10 +157,18 @@ fn quarantined_inventory_refuses_cold_oversized_source(missing_catalog: bool) {
     );
     assert_eq!(largest_read.load(Ordering::SeqCst), 0);
     assert_eq!(db.accountant.usage().used, baseline);
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
 
     // Construction fits. The retained generation's borrowed payload owns a
     // separate oversized extent and must refuse before its backend read.
-    let layout = db.vector_store.index_layout(&partition.index).unwrap();
+    let layout = db
+        .vector_store
+        .index_layout(&partition.index, &mut vector_fixture_copy_1)
+        .unwrap();
     let plan = VectorGenerationWorkspacePlan::new(
         16,
         16,
@@ -169,8 +182,13 @@ fn quarantined_inventory_refuses_cold_oversized_source(missing_catalog: bool) {
     assert!(headroom < GRAPH_BYTES);
     let limit = baseline + headroom;
     db.accountant.set_budget(Some(limit)).unwrap();
+    let fixture_operation_reader_2 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
     let error = context
-        .persist_built_vector_partition(&partition)
+        .persist_built_vector_partition(&partition, fixture_operation_reader_2.clone())
         .unwrap_err();
     assert!(
         matches!(&error, Error::MemoryBudgetExceeded {

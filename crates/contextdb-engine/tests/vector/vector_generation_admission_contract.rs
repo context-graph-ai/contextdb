@@ -188,9 +188,18 @@ fn assert_published(db: &Database, report: contextdb_engine::MaintenanceReport) 
     assert_eq!(report.vector.remaining_partitions, 0, "{report:?}");
     assert!(report.vector.first_failure.is_none(), "{report:?}");
     assert!(report.vector.first_failure_details.is_none());
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let partition = db
         .vector_store_for_test()
-        .partition_info(&route().index, &route().partition_key)
+        .partition_info(
+            &route().index,
+            &route().partition_key,
+            &mut partition_observation_owner_1,
+        )
         .unwrap()
         .unwrap();
     assert!(partition.graph_available);
@@ -215,9 +224,14 @@ fn fresh_ten_thousand_dense_vectors_publish_and_restart_under_writer_limit() {
     let path = directory.path().join("fresh.db");
     let db = open(&path);
     seed(&db, 10_000, 24, 400);
+    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let partitions = db
         .vector_store_for_test()
-        .partition_infos(&route().index)
+        .partition_infos(&route().index, &mut partition_observation_owner_2)
         .unwrap();
     assert_eq!(partitions.len(), 1);
     assert_eq!(partitions[0].live_rows, 10_000);
@@ -276,9 +290,18 @@ fn retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph()
         }
         db.commit(tx).unwrap();
     }
+    let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let info = db
         .vector_store_for_test()
-        .partition_info(&route().index, &route().partition_key)
+        .partition_info(
+            &route().index,
+            &route().partition_key,
+            &mut partition_observation_owner_3,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(info.live_rows, 6300);

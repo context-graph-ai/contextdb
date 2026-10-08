@@ -74,7 +74,8 @@ fn start_hub(broker: &InProcessBroker) -> Hub {
             TenantId::from(TENANT),
             node_id.clone(),
             identity.clone(),
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -115,6 +116,7 @@ fn edge_client(db: Arc<Database>, broker: &InProcessBroker) -> SyncClient {
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 struct ProjectedDirectionPull {
@@ -403,7 +405,8 @@ async fn received_page_projection_excludes_wire_rows_after_final_direction_chang
         transport,
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
 
     within(client.pull_default())
         .await

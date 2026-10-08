@@ -191,7 +191,8 @@ async fn spawn_latest_wins_server(
             contextdb_core::TenantId::from(tenant_id),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_task = Arc::clone(&server);
     let handle = tokio::spawn(async move { server_task.run().await });
@@ -351,7 +352,8 @@ async fn red_e2e_single_writer_update_converges_over_authenticated_transport() {
         fabric.client_as(&writer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
         writer_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let peer_db = Arc::new(Database::open_memory());
     let peer_identity = Arc::new(FabricIdentity::generate());
     let peer = SyncClient::with_authenticated_transport_and_identity_for_test(
@@ -359,7 +361,8 @@ async fn red_e2e_single_writer_update_converges_over_authenticated_transport() {
         fabric.client_as(&peer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
         peer_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client
         .pull_default()
         .await
@@ -411,7 +414,8 @@ async fn red_e2e_dirty_peer_pull_update_converges() {
         fabric.client_as(&writer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
         writer_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let peer_db = Arc::new(Database::open_memory());
     let peer_identity = Arc::new(FabricIdentity::generate());
     let peer = SyncClient::with_authenticated_transport_and_identity_for_test(
@@ -419,7 +423,8 @@ async fn red_e2e_dirty_peer_pull_update_converges() {
         fabric.client_as(&peer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
         peer_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     writer
         .pull_default()
         .await
@@ -479,7 +484,8 @@ async fn red_e2e_writer_restart_pending_update_converges() {
             contextdb_core::TenantId::from(&tenant_id),
             hub_node_id,
             Arc::clone(&hub_identity),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_task = {
         let server = Arc::clone(&server);
@@ -496,7 +502,8 @@ async fn red_e2e_writer_restart_pending_update_converges() {
             fabric.client_as(&writer_identity.node_id()),
             contextdb_core::TenantId::from(&tenant_id),
             Arc::clone(&writer_identity),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     client
         .pull_default()
@@ -551,7 +558,8 @@ async fn red_e2e_writer_restart_pending_update_converges() {
         fabric.client_as(&writer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
         writer_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let retry_result = restarted.push().await.unwrap();
     assert_single_row_applied_without_conflict(&retry_result, "restart retry push");
 
@@ -580,7 +588,8 @@ async fn red_e2e_single_writer_update_durable_after_server_restart() {
             contextdb_core::TenantId::from(&tenant_id),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let server_task = {
         let server = Arc::clone(&server);
@@ -596,7 +605,8 @@ async fn red_e2e_single_writer_update_durable_after_server_restart() {
         fabric.client_as(&writer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
         writer_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client
         .pull_default()
         .await
@@ -654,13 +664,20 @@ fn guard_single_writer_delete_converges() {
     let after_inserts = writer.current_lsn();
 
     receiver
-        .apply_changes(writer.changes_since(after_schema), &latest_wins())
+        .apply_changes(
+            writer
+                .changes_since(after_schema)
+                .expect("read the declared changes"),
+            &latest_wins(),
+        )
         .unwrap();
     assert_text(&receiver, keep, "keep");
     assert_text(&receiver, delete_me, "delete_me");
 
     delete_sql(&writer, delete_me);
-    let delete_changes = writer.changes_since(after_inserts);
+    let delete_changes = writer
+        .changes_since(after_inserts)
+        .expect("read the declared changes");
     assert!(
         delete_changes
             .rows
@@ -691,7 +708,9 @@ fn guard_two_writer_latest_wins_server_value_survives() {
     insert_sql(&receiver, key, "server-newer");
     assert!(receiver.current_lsn() > edge.current_lsn());
 
-    let changes = edge.changes_since(Lsn(1));
+    let changes = edge
+        .changes_since(Lsn(1))
+        .expect("read the declared changes");
     let arrivals = changes
         .rows
         .iter()
@@ -724,7 +743,11 @@ fn guard_two_writer_latest_wins_edge_value_wins() {
     assert!(edge.current_lsn() > receiver.current_lsn());
 
     let result = receiver
-        .apply_changes(edge.changes_since(Lsn(1)), &latest_wins())
+        .apply_changes(
+            edge.changes_since(Lsn(1))
+                .expect("read the declared changes"),
+            &latest_wins(),
+        )
         .unwrap();
 
     assert_text(&receiver, key, "edge-newer");

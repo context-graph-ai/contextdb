@@ -147,10 +147,10 @@ impl bounded::ExecutionProbe for Probe {
             && self.samples.lock().unwrap().last == Some(bounded::TestWorkSource::AccessControl)
         {
             let prior = self.touches.fetch_add(1, Ordering::SeqCst);
-            if prior == 0 {
-                if let Some(token) = &self.token {
-                    token.cancel();
-                }
+            if prior == 0
+                && let Some(token) = &self.token
+            {
+                token.cancel();
             }
         }
     }
@@ -265,7 +265,6 @@ fn bounded_graph_where_metadata_authorization_charges_request_limits() {
                     Database::open_with_config(&path, Arc::new(CorePlugin), accountant.clone())
                         .unwrap();
                 db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-                let baseline = accountant.usage().used;
                 let reader = Arc::new(db.scoped_with_constraints(
                     None,
                     None,
@@ -285,11 +284,6 @@ fn bounded_graph_where_metadata_authorization_charges_request_limits() {
                 match arm {
                     0 => {
                         let (rows, telemetry) = result.unwrap();
-                        eprintln!(
-                            "metadata authorization initial grants={unrelated} cursor={cursor} rows={rows:?} telemetry={telemetry:?} touches={} wide={:?}",
-                            probe.touches.load(Ordering::SeqCst),
-                            probe.samples.lock().unwrap().wide
-                        );
                         assert_eq!(rows, expected());
                         assert!(
                             telemetry
@@ -301,47 +295,11 @@ fn bounded_graph_where_metadata_authorization_charges_request_limits() {
                         );
                         assert!(probe.touches.load(Ordering::SeqCst) > 0);
                         let samples = probe.samples.lock().unwrap();
-                        if samples.wide.is_none() {
-                            // Qualify whether the cold grant's known 32 KiB body
-                            // can bypass a request ceiling above graph preparation.
-                            let diagnostic_path = directory.path().join("cold-grant-limit.redb");
-                            std::fs::copy(&seed_path, &diagnostic_path).unwrap();
-                            let diagnostic_db = open(&diagnostic_path);
-                            let diagnostic_reader =
-                                Arc::new(diagnostic_db.scoped_with_constraints(
-                                    None,
-                                    None,
-                                    Some(Principal::Human(READER.into())),
-                                ));
-                            let diagnostic_probe = Arc::new(Probe::new(None));
-                            let mut diagnostic_request = bounded::BoundedReadRequest::new(
-                                SQL,
-                                HashMap::from([("source".into(), Value::Uuid(Uuid::from_u128(1)))]),
-                                limits(),
-                                Arc::new(Clock),
-                            );
-                            diagnostic_request.probe = Some(diagnostic_probe.clone());
-                            diagnostic_request.limits.memory = 16_384;
-                            let diagnostic =
-                                run(diagnostic_reader.clone(), &diagnostic_request, cursor);
-                            eprintln!(
-                                "cold grant body=32768 request_memory=16384 result={diagnostic:?} touches={} wide={:?}",
-                                diagnostic_probe.touches.load(Ordering::SeqCst),
-                                diagnostic_probe.samples.lock().unwrap().wide
-                            );
-                            drop(diagnostic_request);
-                            drop(diagnostic_reader);
-                            diagnostic_db.close().unwrap();
-                        }
                         let (requested, held) =
                             samples.wide.expect("real wide grant scratch boundary");
                         boundaries =
                             Some((samples.first_access_work.unwrap() + 1, held + requested - 1));
                         peaks.push(telemetry.peak_temporary_bytes);
-                        eprintln!(
-                            "metadata authorization grants={unrelated} cursor={cursor} owner_baseline={baseline} work={:?} peak={} derived={boundaries:?}",
-                            telemetry.source_work, telemetry.peak_temporary_bytes
-                        );
                     }
                     1 => refusal(result.unwrap_err(), ReadFailureLimit::Work, &probe),
                     2 => refusal(result.unwrap_err(), ReadFailureLimit::Memory, &probe),

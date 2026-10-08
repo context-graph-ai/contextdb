@@ -309,11 +309,10 @@ async fn start_hub_inner(root: &Path, declare_schema: bool) -> Hub {
     if declare_schema {
         declare_tables(&db);
     }
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(TENANT),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -353,7 +352,8 @@ async fn refused_dependency_unit_retires_resend_and_converges_only_after_pull() 
     let dial_spec = peer_dial_spec(&hub.ticket, &identity_path);
     let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
     declare_tables(&edge);
-    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT));
+    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
 
     within(client.push())
         .await
@@ -446,6 +446,7 @@ async fn refused_dependency_unit_retires_resend_and_converges_only_after_pull() 
     assert_eq!(
         hub.db
             .changes_since(hub_before_refusal)
+            .expect("read changes_since fixture")
             .rows
             .iter()
             .filter(|change| change.table == "parents" || change.table == "children")
@@ -498,7 +499,8 @@ async fn refused_dependency_unit_retires_resend_and_converges_only_after_pull() 
     drop(client);
     drop(edge);
     let edge = Arc::new(Database::open(&edge_path).expect("reopen edge database"));
-    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT));
+    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     assert_eq!(
         client
             .pending_push_change_count()
@@ -625,7 +627,8 @@ async fn recreated_generations_return_mixed_terminal_reasons_for_one_dependency_
     let dial_spec = peer_dial_spec(&hub.ticket, &identity_path);
     let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
     declare_tables(&edge);
-    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT));
+    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     within(client.push())
         .await
         .expect("bootstrap declarations reach the hub");
@@ -683,9 +686,11 @@ async fn recreated_generations_return_mixed_terminal_reasons_for_one_dependency_
         observing_transport.clone(),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let source_ceiling = restored
         .changes_since(restored_client.push_watermark())
+        .expect("read changes_since fixture")
         .max_lsn()
         .expect("the stale connected unit is outbound work");
     let replay = within(restored_client.push())
@@ -750,7 +755,8 @@ async fn authenticated_iroh_rejects_stale_connected_replay_as_a_whole_before_rec
     let stale_dial = peer_dial_spec(&stale.ticket, &identity_path);
     let edge = Arc::new(Database::open(&edge_path).expect("open receiving edge database"));
     declare_tables(&edge);
-    let primary_client = SyncClient::new(edge.clone(), &authoritative_dial, TenantId::from(TENANT));
+    let primary_client = SyncClient::new(edge.clone(), &authoritative_dial, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
 
     within(primary_client.push())
         .await
@@ -776,7 +782,8 @@ async fn authenticated_iroh_rejects_stale_connected_replay_as_a_whole_before_rec
         .expect("move the edge destination to seed the stale authenticated hub");
     primary_client.shutdown().await;
     drop(primary_client);
-    let stale_seed = SyncClient::new(edge.clone(), &stale_dial, TenantId::from(TENANT));
+    let stale_seed = SyncClient::new(edge.clone(), &stale_dial, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     within(stale_seed.push())
         .await
         .expect("stale hub receives the pre-delete connected copy");
@@ -798,7 +805,8 @@ async fn authenticated_iroh_rejects_stale_connected_replay_as_a_whole_before_rec
     drop(stale_seed);
 
     let authoritative_client =
-        SyncClient::new(edge.clone(), &authoritative_dial, TenantId::from(TENANT));
+        SyncClient::new(edge.clone(), &authoritative_dial, TenantId::from(TENANT))
+            .expect("construct SyncClient fixture");
     delete_child(&edge, child_id);
     let accepted_delete = within(authoritative_client.push())
         .await
@@ -833,7 +841,8 @@ async fn authenticated_iroh_rejects_stale_connected_replay_as_a_whole_before_rec
         observing_transport.clone(),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let receiver_parent_before = row(&edge, "parents", parent_id).expect("receiver parent");
     assert_eq!(
         body(&receiver_parent_before),

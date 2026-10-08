@@ -221,14 +221,28 @@ fn build_cron_parked_db(
 fn dispatch_cron_now_in_thread(db: Arc<Database>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(5));
-        let _ = db.cron_run_due_now_for_test();
+        let _ = {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        };
     })
 }
 
 /// Drive a single cron tick. Sleeps 5ms first so 1ms-interval schedules become due.
 fn fire_cron_now(db: &Database) {
     thread::sleep(Duration::from_millis(5));
-    let _ = db.cron_run_due_now_for_test();
+    let _ = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+    };
 }
 
 fn fire_trigger_in_thread(db: Arc<Database>, key: u128) -> thread::JoinHandle<Result<()>> {
@@ -3841,7 +3855,7 @@ fn t39_cron_tickler_resilience_after_callback_active() {
         entered.wait();
         // Drive a cron tick while the trigger callback is parked. begin()
         // sees B2 and propagates Err via the `?` on cron.rs:464.
-        let _ = db.cron_run_due_now_for_test();
+        let _ = { let seam_read_memory = db.declared_reader_memory().expect("admit the fixture operation reader"); let mut seam_copy_owner = contextdb_engine::vector_read_memory::admission(seam_read_memory.clone()); db.cron_run_due_now_for_test( &mut seam_copy_owner, seam_read_memory) };
         let audit_after_contention = db.cron_audit_log_for_test();
         // Pin BOTH the schedule_name AND the inner Failed(String) — accept
         // only failures attributed to the typed trigger-cross-thread cause.
@@ -3930,7 +3944,7 @@ fn t39c_cron_tickler_survives_sustained_b2_contention() {
         // Each tick's begin() observes B2 and propagates the typed Err via the
         // `?` on cron.rs:464; run_cron_callback_transaction records Failed.
         for _ in 0..5 {
-            let _ = db.cron_run_due_now_for_test();
+            let _ = { let seam_read_memory = db.declared_reader_memory().expect("admit the fixture operation reader"); let mut seam_copy_owner = contextdb_engine::vector_read_memory::admission(seam_read_memory.clone()); db.cron_run_due_now_for_test( &mut seam_copy_owner, seam_read_memory) };
         }
         let audit_during = db.cron_audit_log_for_test();
         // Pin BOTH the schedule_name AND the inner Failed(String) on every
@@ -4072,7 +4086,8 @@ async fn t40b_sync_push_succeeds_despite_unrelated_trigger_contention() {
             contextdb_core::TenantId::from(tenant),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_handle = server.clone();
@@ -4113,7 +4128,8 @@ async fn t40b_sync_push_succeeds_despite_unrelated_trigger_contention() {
         fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from(tenant),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     // Insert a row on the edge so push has something to send.
     {
         let tx = edge_db.begin().expect("edge begin");

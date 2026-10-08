@@ -100,11 +100,10 @@ async fn hub(root: &Path, tenant: &str) -> Hub {
     let node_id = endpoint.node_id();
     let db = Arc::new(Database::open(db_path).expect("open hub database"));
     table_if_absent(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let stop = stop.clone();
@@ -145,7 +144,8 @@ fn edge(root: &Path, name: &str, ticket: &str, tenant: &str) -> (Arc<Database>, 
     let db = Arc::new(Database::open(root.join(format!("{name}.db"))).expect("open edge"));
     table_if_absent(&db);
     // The documented constructor must derive the adjacent persisted identity.
-    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant));
+    let client = SyncClient::new(db.clone(), ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     (db, client)
 }
 
@@ -290,7 +290,8 @@ async fn assert_authenticated_iroh_lineage_fault_is_refused(fault: LineageFault)
     let dial_spec = peer_dial_spec(&hub.ticket, &identity_path);
     let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
     table(&edge);
-    let bootstrap = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(tenant.as_str()));
+    let bootstrap = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(tenant.as_str()))
+        .expect("construct SyncClient fixture");
     within(bootstrap.push())
         .await
         .expect("bootstrap declarations reach the authenticated hub");
@@ -321,7 +322,8 @@ async fn assert_authenticated_iroh_lineage_fault_is_refused(fault: LineageFault)
         }),
         TenantId::from(tenant.as_str()),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let source_push_before = client.push_watermark();
     let source_progress_before = edge
         .persisted_sync_watermarks(&TenantId::from(tenant.as_str()))
@@ -444,8 +446,10 @@ async fn declared_policy_survives_restart_and_governs_an_authenticated_exchange(
     client_a.shutdown().await;
     client_b.shutdown().await;
     let hub = restart_hub(hub, root.path(), tenant).await;
-    let client_a = SyncClient::new(edge_a.clone(), &hub.ticket, TenantId::from(tenant));
-    let client_b = SyncClient::new(edge_b.clone(), &hub.ticket, TenantId::from(tenant));
+    let client_a = SyncClient::new(edge_a.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
+    let client_b = SyncClient::new(edge_b.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     let refused = within(client_b.push()).await.expect("second push replies");
     within(client_a.pull_default())
         .await
@@ -499,8 +503,10 @@ async fn keep_first_refusal_names_authenticated_winner_and_hub_position() {
     winner.shutdown().await;
     loser.shutdown().await;
     let hub = restart_hub(hub, root.path(), tenant).await;
-    let winner = SyncClient::new(winner_db.clone(), &hub.ticket, TenantId::from(tenant));
-    let loser = SyncClient::new(loser_db.clone(), &hub.ticket, TenantId::from(tenant));
+    let winner = SyncClient::new(winner_db.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
+    let loser = SyncClient::new(loser_db.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(winner.pull_default())
         .await
         .expect("winner pull after hub restart");
@@ -540,7 +546,8 @@ async fn file_backed_identity_survives_restart_and_database_recreation() {
         .sync_incarnation(&TenantId::from(tenant))
         .expect("first incarnation");
     insert(&first, Uuid::new_v4(), "first life");
-    let first_client = SyncClient::new(first.clone(), &hub.ticket, TenantId::from(tenant));
+    let first_client = SyncClient::new(first.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(first_client.push()).await.expect("first push");
     drop(first_client);
     drop(first);
@@ -552,7 +559,8 @@ async fn file_backed_identity_survives_restart_and_database_recreation() {
         first_incarnation,
     );
     insert(&reopened, Uuid::new_v4(), "restarted process");
-    let reopened_client = SyncClient::new(reopened.clone(), &hub.ticket, TenantId::from(tenant));
+    let reopened_client = SyncClient::new(reopened.clone(), &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(reopened_client.push()).await.expect("reopened push");
     drop(reopened_client);
     drop(reopened);
@@ -566,7 +574,8 @@ async fn file_backed_identity_survives_restart_and_database_recreation() {
         first_incarnation,
     );
     insert(&recreated, Uuid::new_v4(), "recreated database");
-    let recreated_client = SyncClient::new(recreated, &hub.ticket, TenantId::from(tenant));
+    let recreated_client = SyncClient::new(recreated, &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(recreated_client.push())
         .await
         .expect("recreated push");
@@ -628,7 +637,8 @@ async fn production_sync_refuses_identityless_transport() {
     table(&anonymous);
     let anonymous_id = Uuid::new_v4();
     insert(&anonymous, anonymous_id, "must not be accepted anonymously");
-    let anonymous_client = SyncClient::new(anonymous, &hub.ticket, TenantId::from(tenant));
+    let anonymous_client = SyncClient::new(anonymous, &hub.ticket, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     assert!(
         within(anonymous_client.push()).await.is_err(),
         "bare in-memory dialing is refused"
@@ -648,7 +658,8 @@ async fn production_sync_refuses_identityless_transport() {
     let explicit_db = Arc::new(Database::open_memory());
     table(&explicit_db);
     insert(&explicit_db, Uuid::new_v4(), "explicit persisted identity");
-    let explicit = SyncClient::new(explicit_db.clone(), &explicit_spec, TenantId::from(tenant));
+    let explicit = SyncClient::new(explicit_db.clone(), &explicit_spec, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(explicit.push())
         .await
         .expect("explicit in-memory identity syncs");
@@ -658,7 +669,8 @@ async fn production_sync_refuses_identityless_transport() {
         Uuid::new_v4(),
         "explicit identity after reconstruction",
     );
-    let explicit_again = SyncClient::new(explicit_db, &explicit_spec, TenantId::from(tenant));
+    let explicit_again = SyncClient::new(explicit_db, &explicit_spec, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(explicit_again.push())
         .await
         .expect("reconstructed explicit client syncs");
@@ -678,11 +690,14 @@ async fn production_sync_refuses_identityless_transport() {
     let broker = InProcessBroker::new();
     let direct_db = Arc::new(Database::open_memory());
     table(&direct_db);
-    let direct_server = Arc::new(SyncServer::with_authenticated_transport_for_test(
-        direct_db.clone(),
-        broker.server(),
-        TenantId::from("identityless-direct"),
-    ));
+    let direct_server = Arc::new(
+        SyncServer::with_authenticated_transport_for_test(
+            direct_db.clone(),
+            broker.server(),
+            TenantId::from("identityless-direct"),
+        )
+        .expect("construct SyncServer fixture"),
+    );
     let direct_stop = Arc::new(AtomicBool::new(false));
     let direct_task = tokio::spawn({
         let direct_server = direct_server.clone();
@@ -698,7 +713,10 @@ async fn production_sync_refuses_identityless_transport() {
     table(&direct_source);
     let after_table = direct_source.current_lsn();
     insert(&direct_source, Uuid::new_v4(), "identityless wire mutation");
-    let changeset: WireChangeSet = direct_source.changes_since(after_table).into();
+    let changeset: WireChangeSet = direct_source
+        .changes_since(after_table)
+        .expect("read changes_since fixture")
+        .into();
     assert!(
         changeset.ddl.is_empty(),
         "direct request carries no duplicate schema DDL"
@@ -873,7 +891,8 @@ async fn edge_with_reply_loss(
         transport.clone(),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push())
         .await
         .expect("ordinary declaration bootstrap");
@@ -979,7 +998,8 @@ async fn current_iroh_lost_refusal_is_not_clean_success_on_any_status_probe() {
         transport.clone(),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert!(matches!(
         within(reopened_client.push()).await,
         Err(contextdb_core::Error::SyncPushUnconfirmed { .. })
@@ -1028,11 +1048,10 @@ async fn current_iroh_push_only_lost_refusal_stays_unconfirmed_without_resending
     hub_db
         .execute(declaration, &HashMap::new())
         .expect("declare hub push-only table");
-    let server = Arc::new(SyncServer::new(
-        hub_db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(hub_db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let stop = stop.clone();
@@ -1079,7 +1098,8 @@ async fn current_iroh_push_only_lost_refusal_stays_unconfirmed_without_resending
         transport.clone(),
         TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let bootstrap = within(client.push())
         .await
         .expect("push-only declaration bootstrap");

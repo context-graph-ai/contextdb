@@ -169,7 +169,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
         database
             .writer_memory_ownership_receipt_for_test()
             .persistence_cache,
-        cache_share,
+        cache_share + database.__writer_cache_index_bytes_for_test().unwrap(),
         "the reopened writer owns the cache share derived from its declared memory limit"
     );
     let displace = || {
@@ -676,8 +676,7 @@ fn reader_at_boundary(boundary: CommitBoundary) {
     let error = refused_cursor
         .cursor
         .fetch(None, Default::default())
-        .err()
-        .expect("idle expiry is a terminal typed refusal");
+        .expect_err("idle expiry is a terminal typed refusal");
     let bounded::TestError::Refused(refusal) = error else {
         panic!("expected typed idle expiry, got {error:?}")
     };
@@ -946,9 +945,19 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
         .set_memory_limit(Some(owners + 256 * 1024))
         .unwrap();
     database.run_maintenance_cycle().unwrap();
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        database
+            .declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let first = database
         .vector_store_for_test()
-        .partition_info(&route.index, &route.partition_key)
+        .partition_info(
+            &route.index,
+            &route.partition_key,
+            &mut partition_observation_owner_1,
+        )
         .unwrap()
         .unwrap();
     eprintln!("native initial owners={owners}, first={first:?}");
@@ -963,9 +972,19 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
     // this fixture proves serving-root identity, not builder peak residency.
     database.set_memory_limit(Some(64 * 1024 * 1024)).unwrap();
     for _ in 0..256 {
+        let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+            database
+                .declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let info = database
             .vector_store_for_test()
-            .partition_info(&route.index, &route.partition_key)
+            .partition_info(
+                &route.index,
+                &route.partition_key,
+                &mut partition_observation_owner_2,
+            )
             .unwrap()
             .unwrap();
         if info.graph_available && info.maintenance_progress.is_none() {
@@ -973,9 +992,19 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
         }
         database.run_maintenance_cycle().unwrap();
     }
+    let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
+        database
+            .declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let published = database
         .vector_store_for_test()
-        .partition_info(&route.index, &route.partition_key)
+        .partition_info(
+            &route.index,
+            &route.partition_key,
+            &mut partition_observation_owner_3,
+        )
         .unwrap()
         .unwrap();
     assert!(
@@ -1026,11 +1055,21 @@ fn paged_vector_reader_keeps_the_root_captured_before_successor_publication() {
         )
         .unwrap(),
     );
+    let mut partition_observation_owner_4 = contextdb_engine::vector_read_memory::admission(
+        database
+            .declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     eprintln!(
         "native reopened info={:?}, generations={:?}, paged_storage={}",
         database
             .vector_store_for_test()
-            .partition_info(&route.index, &route.partition_key)
+            .partition_info(
+                &route.index,
+                &route.partition_key,
+                &mut partition_observation_owner_4
+            )
             .unwrap(),
         database
             .vector_store_for_test()

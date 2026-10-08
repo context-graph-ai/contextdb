@@ -148,9 +148,18 @@ fn small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retri
         .unwrap();
     assert!(before.change.or(before.dormant_change).is_none());
     assert_eq!(before.fresh_tail_entries, DELTA_ROWS);
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let info = db
         .vector_store_for_test()
-        .partition_info(&route().index, &route().partition_key)
+        .partition_info(
+            &route().index,
+            &route().partition_key,
+            &mut partition_observation_owner_1,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(info.live_rows, BASE_ROWS + DELTA_ROWS);

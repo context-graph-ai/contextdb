@@ -169,6 +169,198 @@ const FIXED_SLACK: u64 = 64 * 1024;
 
 #[test]
 fn a_listed_value_read_walks_the_run_each_value_names() {
+    // Closing and reopening removes the seed's live row/index copies. This
+    // IN walk reads committed postings through the writable store's cursor.
+    let writer_directory = tempfile::tempdir().unwrap();
+    let writer_path = writer_directory.path().join("reopened-listed-runs.redb");
+    let writer_seed = Database::open(&writer_path).unwrap();
+    writer_seed.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    writer_seed.execute("CREATE TABLE listed_rows (id INTEGER PRIMARY KEY, k TEXT, secondary INTEGER, payload TEXT)", &empty()).unwrap();
+    writer_seed
+        .execute(
+            &format!("CREATE INDEX {DECLARED_INDEX} ON listed_rows(k, secondary)"),
+            &empty(),
+        )
+        .unwrap();
+    for ordinal in 0..STORED_MATCHES {
+        writer_seed
+            .execute(
+                "INSERT INTO listed_rows VALUES ($id, $k, $secondary, 'matched row')",
+                &HashMap::from([
+                    ("id".to_owned(), Value::Int64(ordinal)),
+                    ("k".to_owned(), Value::Text(stored_value())),
+                    ("secondary".to_owned(), Value::Int64(ordinal)),
+                ]),
+            )
+            .unwrap();
+    }
+    for ordinal in 0..2 {
+        writer_seed
+            .execute(
+                "INSERT INTO listed_rows VALUES ($id, $k, $secondary, 'unselected prefix')",
+                &HashMap::from([
+                    ("id".to_owned(), Value::Int64(STORED_MATCHES + ordinal)),
+                    ("k".to_owned(), Value::Text(listed_value(SHORT_LIST))),
+                    ("secondary".to_owned(), Value::Int64(ordinal)),
+                ]),
+            )
+            .unwrap();
+    }
+    writer_seed.close().unwrap();
+    drop(writer_seed);
+    let writer_reopened = Database::open(&writer_path).unwrap();
+    writer_reopened.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    let writer_answer = bounded::execute(
+        &writer_reopened,
+        &request(&in_list_sql(SHORT_LIST), roomy()),
+    )
+    .unwrap();
+    let mut writer_ids = writer_answer
+        .result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Int64(id) => *id,
+            other => panic!("expected reopened integer id, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    writer_ids.sort_unstable();
+    assert_eq!(writer_ids, (0..STORED_MATCHES).collect::<Vec<_>>());
+    assert_eq!(writer_answer.result.trace.physical_plan, "IndexScan");
+    assert_eq!(
+        writer_answer.result.trace.index_used.as_deref(),
+        Some(DECLARED_INDEX)
+    );
+    let writer_delivered = writer_answer.result.rows.len() as u64;
+    assert_eq!(
+        writer_answer
+            .telemetry
+            .source_work
+            .get(&bounded::TestWorkSource::IndexRange)
+            .copied(),
+        Some(writer_delivered),
+        "the reopened writable IN walk examines exactly its delivered postings"
+    );
+    assert_eq!(
+        writer_answer.result.trace.rows_examined, writer_delivered,
+        "the reopened writable IN walk examines exactly its delivered rows"
+    );
+    writer_reopened.close().unwrap();
+
+    // Both dated directions exhaust a selected context before reaching its
+    // requested rank limit. The following context must not be examined.
+    let dated_directory = tempfile::tempdir().unwrap();
+    let dated_path = dated_directory.path().join("short-dated-groups.redb");
+    let dated = Database::open(&dated_path).unwrap();
+    dated.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    dated.execute("CREATE TABLE event_context_sessions (context_id UUID NOT NULL, connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, event_count INTEGER NOT NULL, latest_occurred_at TIMESTAMP, PRIMARY KEY (context_id, connector_id, session_ref)) SYNC OFF", &empty()).unwrap();
+    dated.execute("CREATE INDEX idx_event_context_sessions_recency ON event_context_sessions (context_id, latest_occurred_at DESC, connector_id ASC, session_ref ASC)", &empty()).unwrap();
+    dated.execute("CREATE INDEX idx_event_context_sessions_oldest ON event_context_sessions (context_id, latest_occurred_at ASC, connector_id ASC, session_ref ASC)", &empty()).unwrap();
+    for id in [1_u128, 2, 3] {
+        for (ordinal, stamp) in [Value::Timestamp(1000), Value::Null]
+            .into_iter()
+            .enumerate()
+        {
+            dated.execute("INSERT INTO event_context_sessions VALUES ($context, 'a', $session, 1, $stamp)", &HashMap::from([
+                ("context".into(), Value::Uuid(uuid::Uuid::from_u128(id))),
+                ("session".into(), Value::Text(format!("session-{ordinal}"))),
+                ("stamp".into(), stamp),
+            ])).unwrap();
+        }
+    }
+    let dated_bindings = HashMap::from([
+        (
+            "recent_context_0".into(),
+            Value::Uuid(uuid::Uuid::from_u128(1)),
+        ),
+        (
+            "recent_context_1".into(),
+            Value::Uuid(uuid::Uuid::from_u128(2)),
+        ),
+        (
+            "rank_context_0".into(),
+            Value::Uuid(uuid::Uuid::from_u128(1)),
+        ),
+        (
+            "rank_context_1".into(),
+            Value::Uuid(uuid::Uuid::from_u128(2)),
+        ),
+        ("rank_limit_0".into(), Value::Int64(2)),
+        ("rank_limit_1".into(), Value::Int64(3)),
+    ]);
+    let dated_newest = "WITH ranked_sessions AS (SELECT context_id, connector_id, session_ref, event_count, latest_occurred_at, ROW_NUMBER() OVER (PARTITION BY context_id ORDER BY latest_occurred_at DESC, connector_id ASC, session_ref ASC) AS session_rank FROM event_context_sessions WHERE context_id IN ($recent_context_0, $recent_context_1) AND latest_occurred_at IS NOT NULL) SELECT context_id, connector_id, session_ref, event_count, latest_occurred_at FROM ranked_sessions WHERE (context_id = $rank_context_0 AND session_rank <= $rank_limit_0) OR (context_id = $rank_context_1 AND session_rank <= $rank_limit_1) ORDER BY context_id ASC, session_rank ASC";
+    let dated_oldest = dated_newest.replace("latest_occurred_at DESC", "latest_occurred_at ASC");
+    let dated_rows = [1_u128, 2]
+        .into_iter()
+        .map(|id| {
+            vec![
+                Value::Uuid(uuid::Uuid::from_u128(id)),
+                Value::Text("a".into()),
+                Value::Text("session-0".into()),
+                Value::Int64(1),
+                Value::Timestamp(1000),
+            ]
+        })
+        .collect::<Vec<_>>();
+    // Collect both routes before asserting so the RED receipt exposes both.
+    let dated_observations = [
+        (
+            "NEWEST",
+            dated.execute(dated_newest, &dated_bindings).unwrap(),
+        ),
+        (
+            "oldest",
+            dated.execute(&dated_oldest, &dated_bindings).unwrap(),
+        ),
+    ]
+    .into_iter()
+    .map(|(label, answer)| {
+        (
+            label,
+            answer.rows,
+            answer.trace.physical_plan,
+            answer.trace.sort_elided,
+            answer
+                .trace
+                .groups
+                .into_iter()
+                .map(|group| (group.route, group.returned_rows, group.examined_entries))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .collect::<Vec<_>>();
+    let dated_expected_groups = [1_u128, 2]
+        .into_iter()
+        .map(|id| {
+            let delivered = dated_rows
+                .iter()
+                .filter(|row| row[0] == Value::Uuid(uuid::Uuid::from_u128(id)))
+                .count() as u64;
+            (
+                contextdb_engine::database::GroupRoute::Index,
+                delivered,
+                delivered,
+            )
+        })
+        .collect::<Vec<_>>();
+    let dated_expected = ["NEWEST", "oldest"]
+        .into_iter()
+        .map(|label| {
+            (
+                label,
+                dated_rows.clone(),
+                "IndexScan",
+                true,
+                dated_expected_groups.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        dated_observations, dated_expected,
+        "both short dated groups examine exactly their delivered rows before the next context"
+    );
+    dated.close().unwrap();
+
     let db = listed_rows();
     let outcome = bounded::execute(&db, &request(&in_list_sql(SHORT_LIST), roomy()))
         .expect("a listed-value read must be served");
@@ -190,6 +382,109 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
         STORED_MATCHES as usize,
         "one listed value names every stored row, and the rest name nothing"
     );
+    // A short durable IN run stops before the next unselected prefix is fetched.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("short-listed-runs.redb");
+    let durable = Database::open(&path).unwrap();
+    durable.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    durable
+        .execute(
+            "CREATE TABLE listed_rows (id INTEGER PRIMARY KEY, k TEXT, secondary INTEGER, payload TEXT)",
+            &empty(),
+        )
+        .unwrap();
+    durable
+        .execute(
+            &format!("CREATE INDEX {DECLARED_INDEX} ON listed_rows(k, secondary)"),
+            &empty(),
+        )
+        .unwrap();
+    for ordinal in 0..STORED_MATCHES {
+        durable
+            .execute(
+                "INSERT INTO listed_rows VALUES ($id, $k, $secondary, 'matched row')",
+                &HashMap::from([
+                    ("id".to_owned(), Value::Int64(ordinal)),
+                    ("k".to_owned(), Value::Text(stored_value())),
+                    ("secondary".to_owned(), Value::Int64(ordinal)),
+                ]),
+            )
+            .unwrap();
+    }
+    let sql = in_list_sql(SHORT_LIST);
+    let control = bounded::execute(&durable, &request(&sql, roomy())).unwrap();
+    let expected_rows = (0..STORED_MATCHES).collect::<Vec<_>>();
+    let mut control_rows = control
+        .result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Int64(id) => *id,
+            other => panic!("expected stored integer id, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    control_rows.sort_unstable();
+    assert_eq!(control_rows, expected_rows);
+    assert_eq!(control.result.trace.physical_plan, "IndexScan");
+    assert_eq!(
+        control.result.trace.index_used.as_deref(),
+        Some(DECLARED_INDEX)
+    );
+    let control_index_work = control
+        .telemetry
+        .source_work
+        .get(&bounded::TestWorkSource::IndexRange)
+        .copied()
+        .expect("the declared run records actual index work");
+    assert!(control_index_work > 0);
+    for ordinal in 0..2 {
+        durable
+            .execute(
+                "INSERT INTO listed_rows VALUES ($id, $k, $secondary, 'unselected prefix')",
+                &HashMap::from([
+                    ("id".to_owned(), Value::Int64(STORED_MATCHES + ordinal)),
+                    ("k".to_owned(), Value::Text(listed_value(SHORT_LIST))),
+                    ("secondary".to_owned(), Value::Int64(ordinal)),
+                ]),
+            )
+            .unwrap();
+    }
+    let after = bounded::execute(&durable, &request(&sql, roomy())).unwrap();
+    let mut after_rows = after
+        .result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Int64(id) => *id,
+            other => panic!("expected stored integer id, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    after_rows.sort_unstable();
+    assert_eq!(after_rows, expected_rows);
+    assert_eq!(
+        after.result.trace.physical_plan,
+        control.result.trace.physical_plan
+    );
+    assert_eq!(
+        after.result.trace.index_used,
+        control.result.trace.index_used
+    );
+    assert_eq!(
+        after
+            .telemetry
+            .source_work
+            .get(&bounded::TestWorkSource::IndexRange),
+        control
+            .telemetry
+            .source_work
+            .get(&bounded::TestWorkSource::IndexRange),
+        "a short IN query owes no index entry from the following unselected prefix"
+    );
+    assert_eq!(
+        after.result.trace.rows_examined, control.result.trace.rows_examined,
+        "the same selected runs examine the same rows after another prefix is appended"
+    );
+    durable.close().unwrap();
 }
 
 #[test]

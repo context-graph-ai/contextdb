@@ -1199,7 +1199,15 @@ fn t30_11_execute_from_cron_callback_against_other_db_returns_callback_reentry()
             Ok(())
         })
         .unwrap();
-        db_x.cron_run_due_now_for_test().expect("cron tick");
+        {
+            let seam_read_memory = db_x
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            db_x.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        }
+        .expect("cron tick");
         let observed = observed.lock().unwrap();
         assert_eq!(observed.len(), 3, "all cron execute DML probes ran");
         for (name, result) in observed.iter() {
@@ -1265,7 +1273,7 @@ fn t30_11_execute_in_tx_from_cron_callback_against_other_db_returns_callback_ree
             )));
             Ok(())
         }).unwrap();
-        db_x.cron_run_due_now_for_test().expect("cron tick");
+        { let seam_read_memory = db_x.declared_reader_memory().expect("admit the fixture operation reader"); let mut seam_copy_owner = contextdb_engine::vector_read_memory::admission(seam_read_memory.clone()); db_x.cron_run_due_now_for_test( &mut seam_copy_owner, seam_read_memory) }.expect("cron tick");
         let observed = observed.lock().unwrap();
         assert_eq!(observed.len(), 3, "all cron execute_in_tx DML probes ran");
         for (name, result) in observed.iter() {
@@ -1306,7 +1314,7 @@ fn t30_11_direct_helpers_from_cron_callback_against_other_db_return_callback_ree
             out.push(("delete_vector", db_y_cb.delete_vector(tx_y, VectorIndexRef::new("v", "embedding"), vector_row)));
             Ok(())
         }).unwrap();
-        db_x.cron_run_due_now_for_test().expect("cron tick");
+        { let seam_read_memory = db_x.declared_reader_memory().expect("admit the fixture operation reader"); let mut seam_copy_owner = contextdb_engine::vector_read_memory::admission(seam_read_memory.clone()); db_x.cron_run_due_now_for_test( &mut seam_copy_owner, seam_read_memory) }.expect("cron tick");
         let observed = observed.lock().unwrap();
         assert_eq!(observed.len(), 7, "all direct helper probes ran");
         for (name, result) in observed.iter() {
@@ -1491,7 +1499,15 @@ fn t30_13_trigger_inside_cron_callback_tx_nested_same_thread_same_db_atomic() {
         .unwrap();
 
         thread::sleep(Duration::from_millis(5));
-        db.cron_run_due_now_for_test().expect("cron tick");
+        {
+            let seam_read_memory = db
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            let mut seam_copy_owner =
+                contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+            db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+        }
+        .expect("cron tick");
 
         let snap = db.snapshot();
         let host_rows = db.scan("host", snap).expect("scan host");
@@ -1520,7 +1536,15 @@ fn t30_14_b1_cron_active_same_db_returns_callback_active_cron_immediately() {
         let db_cron = db.clone();
         let cron_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(5));
-            db_cron.cron_run_due_now_for_test().expect("cron tick");
+            {
+                let seam_read_memory = db_cron
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                let mut seam_copy_owner =
+                    contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+                db_cron.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+            }
+            .expect("cron tick");
         });
         entered_cron.wait();
         let mut done_cron_guard = BarrierReleaseGuard::armed(done_cron.clone());
@@ -1596,7 +1620,7 @@ fn t30_14b_cron_trigger_dispatch_failure_rolls_back_active_tx_while_guard_retain
         .unwrap();
 
         let baseline_used = accountant.usage().used;
-        let successful = db.cron_run_due_now_for_test().expect("cron tick should audit failure");
+        let successful = { let seam_read_memory = db.declared_reader_memory().expect("admit the fixture operation reader"); let mut seam_copy_owner = contextdb_engine::vector_read_memory::admission(seam_read_memory.clone()); db.cron_run_due_now_for_test( &mut seam_copy_owner, seam_read_memory) }.expect("cron tick should audit failure");
         assert_eq!(successful, 0, "failed cron callback must not count as fired");
 
         let audits = db.cron_audit_log_for_test();
@@ -2880,7 +2904,15 @@ fn t30_19_cron_then_trigger_sequential_phases_typed_err_then_wait() {
         let db_cron = db.clone();
         let cron_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(5));
-            db_cron.cron_run_due_now_for_test().expect("cron tick");
+            {
+                let seam_read_memory = db_cron
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                let mut seam_copy_owner =
+                    contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+                db_cron.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+            }
+            .expect("cron tick");
         });
         entered_cron.wait();
         let mut done_cron_guard = BarrierReleaseGuard::armed(done_cron.clone());
@@ -3215,7 +3247,15 @@ fn t30_22_source_order_priority_b1_unrelated_trigger_unchanged() {
         let db_cron = db.clone();
         let cron_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(5));
-            db_cron.cron_run_due_now_for_test().expect("cron tick");
+            {
+                let seam_read_memory = db_cron
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                let mut seam_copy_owner =
+                    contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+                db_cron.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+            }
+            .expect("cron tick");
         });
         entered_cron.wait();
         let mut done_cron_guard = BarrierReleaseGuard::armed(done_cron.clone());
@@ -3512,7 +3552,15 @@ fn t30_cron_b1_immediate_typed_err_remains_unparked() {
         let db_cron = db.clone();
         let cron_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(5));
-            db_cron.cron_run_due_now_for_test().expect("cron tick");
+            {
+                let seam_read_memory = db_cron
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                let mut seam_copy_owner =
+                    contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+                db_cron.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+            }
+            .expect("cron tick");
         });
         entered_cron.wait();
         let mut done_cron_guard = BarrierReleaseGuard::armed(done_cron.clone());

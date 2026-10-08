@@ -82,8 +82,16 @@ fn incoming_purge_atomically_destroys_present_rows_and_adopts_absent_roots() {
         .expect("seed the one lineage this edge actually holds");
     let present_key = NaturalKey::single("id".to_string(), Value::Uuid(present_id));
     let absent_key = NaturalKey::single("id".to_string(), Value::Uuid(absent_id));
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let present = db
-        .resolve_authoritative_purge_selection("notes", &present_key)
+        .resolve_authoritative_purge_selection(
+            "notes",
+            &present_key,
+            fixture_operation_reader_1.clone(),
+        )
         .expect("resolve present immutable lineage");
     let absent_root = format!("author:{}:{}:7", "11".repeat(32), Incarnation(7).to_hex());
     let noncanonical_absent_roots = [
@@ -116,14 +124,34 @@ fn incoming_purge_atomically_destroys_present_rows_and_adopts_absent_roots() {
                 purged_lineage_roots: vec![noncanonical_root],
             },
         ];
+        let fixture_operation_reader_1 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_1 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_1.clone());
+
         assert!(
-            db.apply_incoming_authoritative_purge_batch_while_authoritative(&invalid_items)
-                .is_err(),
+            db.apply_incoming_authoritative_purge_batch_while_authoritative(
+                &invalid_items,
+                &mut fixture_operation_copy_1,
+                fixture_operation_reader_1.clone()
+            )
+            .is_err(),
             "a noncanonical opaque creator root must fail the whole mixed purge batch"
         );
+        let fixture_operation_reader_2 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         assert!(
-            db.row_id_for_natural_key_full("notes", &present_key, db.snapshot_for_read())
-                .is_some(),
+            db.row_id_for_natural_key_full(
+                "notes",
+                &present_key,
+                db.snapshot_for_read(),
+                fixture_operation_reader_2.clone()
+            )
+            .unwrap()
+            .is_some(),
             "failed opaque-root validation must not destroy the present row"
         );
     }
@@ -147,14 +175,43 @@ fn incoming_purge_atomically_destroys_present_rows_and_adopts_absent_roots() {
             purged_lineage_roots: vec![absent_root.clone()],
         },
     ];
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_2 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
 
-    db.preflight_incoming_authoritative_purge_batch_while_authoritative(&items)
-        .expect("sparse edge preflights present destruction plus absent frontier");
-    db.apply_incoming_authoritative_purge_batch_while_authoritative(&items)
-        .expect("one sparse-edge transaction destroys and adopts");
+    db.preflight_incoming_authoritative_purge_batch_while_authoritative(
+        &items,
+        &mut fixture_operation_copy_2,
+        fixture_operation_reader_2.clone(),
+    )
+    .expect("sparse edge preflights present destruction plus absent frontier");
+    let fixture_operation_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_3 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_3.clone());
+
+    db.apply_incoming_authoritative_purge_batch_while_authoritative(
+        &items,
+        &mut fixture_operation_copy_3,
+        fixture_operation_reader_3.clone(),
+    )
+    .expect("one sparse-edge transaction destroys and adopts");
+    let fixture_operation_reader_3 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
-        db.row_id_for_natural_key_full("notes", &present_key, db.snapshot_for_read())
-            .is_none(),
+        db.row_id_for_natural_key_full(
+            "notes",
+            &present_key,
+            db.snapshot_for_read(),
+            fixture_operation_reader_3.clone()
+        )
+        .unwrap()
+        .is_none(),
         "the copy this edge held is physically removed"
     );
     for (key, root) in [

@@ -1270,7 +1270,17 @@ mod tests {
             ))
         });
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = db.run_cron_callback_transaction(callback);
+            let fixture_operation_reader_1 = db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+            let mut fixture_operation_copy_1 =
+                contextdb_engine::vector_read_memory::admission(fixture_operation_reader_1.clone());
+
+            let _ = db.run_cron_callback_transaction(
+                callback,
+                &mut fixture_operation_copy_1,
+                fixture_operation_reader_1.clone(),
+            );
         }));
         let fired = LOCAL_COMMIT_STAGE_FAULT.with(|fault| fault.get().is_none());
         LOCAL_COMMIT_STAGE_FAULT.with(|fault| fault.set(None));

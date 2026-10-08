@@ -87,7 +87,8 @@ pub async fn push_change_through_server(
 
     let identity = PathBuf::from(format!("{}.fabric-identity.key", edge_path.display()));
     let dial_spec = contextdb_server::peer_dial_spec(ticket, &identity);
-    let client = SyncClient::new(db, &dial_spec, contextdb_core::TenantId::from(tenant));
+    let client = SyncClient::new(db, &dial_spec, contextdb_core::TenantId::from(tenant))
+        .expect("construct the authenticated sync endpoint");
     client.push().await.expect("push change through server");
 }
 
@@ -130,7 +131,8 @@ pub async fn push_many_changes_through_server(
 
     let identity = PathBuf::from(format!("{}.fabric-identity.key", edge_path.display()));
     let dial_spec = contextdb_server::peer_dial_spec(ticket, &identity);
-    let client = SyncClient::new(db, &dial_spec, contextdb_core::TenantId::from(tenant));
+    let client = SyncClient::new(db, &dial_spec, contextdb_core::TenantId::from(tenant))
+        .expect("construct the authenticated sync endpoint");
     let push_task = tokio::spawn(async move { client.push().await });
 
     if let Some(started) = started {

@@ -18392,6 +18392,55 @@ mod paged_vector_accounting_tests {
             .collect()
     }
 
+    fn observation_credit_bytes(observation: &CursorObservation) -> usize {
+        let live = observation.charge.as_ref().map(|charge| &charge.live);
+        let returns = observation
+            .group_page_returns
+            .as_ref()
+            .map(|returns| &returns._charge.live);
+        live.map_or(0, |bytes| bytes.load(std::sync::atomic::Ordering::SeqCst))
+            + returns
+                .filter(|bytes| live.is_none_or(|prior| !Arc::ptr_eq(prior, bytes)))
+                .map_or(0, |bytes| bytes.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn release_retained_cursor_receipts(
+        cursor: BoundedCursorHandle,
+        observation: CursorObservation,
+        reader: &crate::memory_accounting::MemoryAccountant,
+        baseline: usize,
+        trace_credit: usize,
+    ) {
+        let observation_credits =
+            cursor.retained_read_bytes_with_observations(Some(&observation), None);
+        assert!(
+            observation_credits > 0,
+            "the released cursor and its caller still hold admitted observations"
+        );
+        assert_eq!(
+            reader.usage().used,
+            baseline + observation_credits + trace_credit,
+            "close releases kernel state and retains exactly the surviving observations and trace"
+        );
+        drop(cursor);
+        let final_observation_credit = observation_credit_bytes(&observation);
+        assert!(
+            final_observation_credit > 0,
+            "the caller's open observation keeps its original credit through the last holder"
+        );
+        assert_eq!(
+            reader.usage().used,
+            baseline + final_observation_credit + trace_credit,
+            "dropping the cursor leaves only the caller observation and Database trace"
+        );
+        drop(observation);
+        assert_eq!(
+            reader.usage().used,
+            baseline + trace_credit,
+            "the final observation releases its credit while the Database trace remains alive"
+        );
+    }
+
     /// A paged vector cursor takes memory for its candidates, its scores and
     /// its output queue, holds them between fetches, and must give every byte
     /// back exactly once — against the reservation that took it. When the
@@ -18403,19 +18452,24 @@ mod paged_vector_accounting_tests {
         let rows = 64usize;
         let root = tempfile::tempdir().expect("task-scoped fixture");
         let db = fixture(&root.path().join("paged.db"), rows as i64);
-        let accountant = db.bounded_read_accountant();
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            usize::try_from(limits().memory)
+                .expect("the original declared reader limit fits usize"),
+        ));
         let baseline = accountant.usage().used;
 
         let mut opened = open_cursor(
             Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
             &statement(rows),
             &params(),
+            accountant.clone(),
             limits(),
             Arc::new(FrozenClock),
             OwnerReadCancellation::new(),
             None,
         )
         .expect("open a paged vector cursor");
+        let first_page = opened.first_page.into_public();
 
         let held_open = accountant.usage().used;
         assert!(
@@ -18423,8 +18477,8 @@ mod paged_vector_accounting_tests {
             "an open cursor holds its continuation: baseline={baseline} open={held_open}"
         );
 
-        let mut delivered = ids(&opened.first_page.rows);
-        let mut more = opened.first_page.has_more;
+        let mut delivered = ids(&first_page.rows);
+        let mut more = first_page.has_more;
         let page = NonZeroUsize::new(8).expect("a non-zero page");
         while more {
             let fetched = fetch_cursor(
@@ -18434,8 +18488,9 @@ mod paged_vector_accounting_tests {
                 None,
             )
             .expect("a paged vector cursor fetches its next page");
-            delivered.extend(ids(&fetched.page.rows));
-            more = fetched.page.has_more;
+            let fetched_page = fetched.page.into_public();
+            delivered.extend(ids(&fetched_page.rows));
+            more = fetched_page.has_more;
         }
         assert_eq!(delivered.len(), rows, "every row, once: {delivered:?}");
         let mut sorted = delivered.clone();
@@ -18444,6 +18499,59 @@ mod paged_vector_accounting_tests {
 
         let peak = accountant.high_water_for_test();
         close_cursor(&mut opened.cursor).expect("the drained cursor closes");
+        let original_trace_credit = db.last_query_vector_trace_credit_bytes_for_test();
+        assert!(
+            original_trace_credit > 0,
+            "the Database retains its last query trace"
+        );
+        release_retained_cursor_receipts(
+            opened.cursor,
+            opened.observation,
+            &accountant,
+            baseline,
+            original_trace_credit,
+        );
+
+        let mut replacement = open_cursor(
+            Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
+            &statement(rows),
+            &params(),
+            accountant.clone(),
+            limits(),
+            Arc::new(FrozenClock),
+            OwnerReadCancellation::new(),
+            None,
+        )
+        .expect("a second query replaces the retained last-query trace");
+        let replacement_first_page = replacement.first_page.into_public();
+        assert!(
+            !replacement_first_page.rows.is_empty(),
+            "the second query performs real vector work"
+        );
+        drop(replacement_first_page);
+        close_cursor(&mut replacement.cursor).expect("close the replacement query cursor");
+        let replacement_trace_credit = db.last_query_vector_trace_credit_bytes_for_test();
+        assert!(
+            replacement_trace_credit > 0,
+            "the replacement trace remains admitted"
+        );
+        release_retained_cursor_receipts(
+            replacement.cursor,
+            replacement.observation,
+            &accountant,
+            baseline,
+            replacement_trace_credit,
+        );
+        assert!(
+            accountant.usage().used
+                <= baseline + original_trace_credit.max(replacement_trace_credit),
+            "the second query retains at most one trace's credit"
+        );
+        assert!(
+            accountant.usage().used < baseline + original_trace_credit + replacement_trace_credit,
+            "replacing the last trace never retains the sum of both traces"
+        );
+        db.__reset_last_query_vector_trace_for_test();
         let after_close = accountant.usage().used;
         eprintln!(
             "paged vector cursor accounting: baseline={baseline} open={held_open} \
@@ -18467,7 +18575,10 @@ mod paged_vector_accounting_tests {
         let rows = 64usize;
         let root = tempfile::tempdir().expect("task-scoped fixture");
         let db = fixture(&root.path().join("refused.db"), rows as i64);
-        let accountant = db.bounded_read_accountant();
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            usize::try_from(limits().memory)
+                .expect("the original declared reader limit fits usize"),
+        ));
         let baseline = accountant.usage().used;
 
         let mut tight = limits();
@@ -18476,6 +18587,7 @@ mod paged_vector_accounting_tests {
             Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
             &statement(rows),
             &params(),
+            accountant.clone(),
             tight,
             Arc::new(FrozenClock),
             OwnerReadCancellation::new(),
@@ -18500,30 +18612,32 @@ mod paged_vector_accounting_tests {
         );
     }
 
-    /// Closing a cursor that is still part way through its range returns its
-    /// whole charge too — the state it was holding is the state it gives back.
+    /// Closing releases kernel state. Surviving observations and the last
+    /// query trace keep their own credit until their final holders release it.
     #[test]
     fn closing_a_part_drained_paged_vector_cursor_returns_every_byte() {
         let rows = 64usize;
         let root = tempfile::tempdir().expect("task-scoped fixture");
         let db = fixture(&root.path().join("partial.db"), rows as i64);
-        let accountant = db.bounded_read_accountant();
+        let accountant = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+            usize::try_from(limits().memory)
+                .expect("the original declared reader limit fits usize"),
+        ));
         let baseline = accountant.usage().used;
 
         let mut opened = open_cursor(
             Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
             &statement(rows),
             &params(),
+            accountant.clone(),
             limits(),
             Arc::new(FrozenClock),
             OwnerReadCancellation::new(),
             None,
         )
         .expect("open a paged vector cursor");
-        assert!(
-            opened.first_page.has_more,
-            "this cursor has more pages to give"
-        );
+        let first_page = opened.first_page.into_public();
+        assert!(first_page.has_more, "this cursor has more pages to give");
         let page = NonZeroUsize::new(8).expect("a non-zero page");
         let _ = fetch_cursor(
             &mut opened.cursor,
@@ -18535,6 +18649,19 @@ mod paged_vector_accounting_tests {
         let held = accountant.usage().used;
         assert!(held > baseline, "the part-drained cursor is holding state");
         close_cursor(&mut opened.cursor).expect("a part-drained cursor closes");
+        let trace_credit = db.last_query_vector_trace_credit_bytes_for_test();
+        assert!(
+            trace_credit > 0,
+            "the Database retains the part-drained query trace"
+        );
+        release_retained_cursor_receipts(
+            opened.cursor,
+            opened.observation,
+            &accountant,
+            baseline,
+            trace_credit,
+        );
+        db.__reset_last_query_vector_trace_for_test();
         let after_close = accountant.usage().used;
         eprintln!(
             "part-drained paged vector cursor: baseline={baseline} held={held} \
@@ -18558,7 +18685,8 @@ mod cursor_replay_budget_tests {
             ..ReadLimits::default()
         };
         let context = RequestContext::new(
-            &db,
+            db.declared_reader_memory()
+                .expect("admit the fixture request reader"),
             limits,
             ReadResumption::AcrossFetches,
             clock.clone(),
@@ -18604,7 +18732,8 @@ mod cursor_replay_budget_tests {
                 ..ReadLimits::default()
             };
             let context = RequestContext::new(
-                &db,
+                db.declared_reader_memory()
+                    .expect("admit the fixture request reader"),
                 limits,
                 ReadResumption::AcrossFetches,
                 clock.clone(),

@@ -65,7 +65,6 @@ fn vector_insert_refusal_limit(extra_table: bool) -> usize {
             .all(|entry| entry.used_after <= limit),
         "prior real owners fit before the vector body"
     );
-    eprintln!("vector refusal profile extra_table={extra_table} owner={owner:?} limit={limit}");
     db.close().unwrap();
     limit
 }

@@ -205,9 +205,15 @@ fn declare_breadth(path: &std::path::Path, runtime: &std::path::Path, breadth: u
         )
         .expect("declare the search breadth");
     let index = VectorIndexRef::new("passages", "embedding");
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        admin
+            .declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let infos = admin
         .vector_store_for_test()
-        .partition_infos(&index)
+        .partition_infos(&index, &mut partition_observation_owner_1)
         .expect("inspect partition readiness");
     assert!(
         !infos.is_empty() && infos.iter().all(|partition| partition.graph_available),

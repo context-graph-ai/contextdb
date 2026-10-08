@@ -318,9 +318,16 @@ fn reclamation_admits_vector_and_edge_identities_without_payload_copies() {
     );
     let row = db.relational_store.tables.read()["retained"][0].row_id;
     let index = VectorIndexRef::new("retained", "v");
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     assert_eq!(
         db.vector_store
-            .directory_versions_for_rows(&index, &HashSet::from([row]))
+            .directory_versions_for_rows(&index, &HashSet::from([row]), &mut vector_fixture_copy_1)
+            .expect("read or publish the admitted vector fixture")
             .len(),
         1
     );
@@ -337,9 +344,16 @@ fn reclamation_admits_vector_and_edge_identities_without_payload_copies() {
     );
     assert!(db.relational_store.tables.read()["retained"].is_empty());
     assert!(db.graph_store.forward_adj.read().is_empty());
+    let vector_fixture_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_2 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
+
     assert!(
         db.vector_store
-            .directory_versions_for_rows(&index, &HashSet::from([row]))
+            .directory_versions_for_rows(&index, &HashSet::from([row]), &mut vector_fixture_copy_2)
+            .expect("read or publish the admitted vector fixture")
             .is_empty()
     );
     db.accountant.set_budget(None).unwrap();
@@ -348,10 +362,17 @@ fn reclamation_admits_vector_and_edge_identities_without_payload_copies() {
     reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     assert!(reopened.relational_store.tables.read()["retained"].is_empty());
     assert!(reopened.graph_store.forward_adj.read().is_empty());
+    let vector_fixture_reader_3 = reopened
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_3 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_3.clone());
+
     assert!(
         reopened
             .vector_store
-            .directory_versions_for_rows(&index, &HashSet::from([row]))
+            .directory_versions_for_rows(&index, &HashSet::from([row]), &mut vector_fixture_copy_3)
+            .expect("read or publish the admitted vector fixture")
             .is_empty()
     );
     reopened.close().unwrap();
@@ -706,8 +727,18 @@ fn wide_partition_inventory_is_admitted_before_reclamation() {
         15
     );
     let index = VectorIndexRef::new("retained", "embedding");
+    let vector_fixture_reader_4 = reopened
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_4 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_4.clone());
+
     assert_eq!(
-        reopened.vector_store.partition_keys(&index).unwrap().len(),
+        reopened
+            .vector_store
+            .partition_keys(&index, &mut vector_fixture_copy_4)
+            .unwrap()
+            .len(),
         15
     );
     reopened.close().unwrap();

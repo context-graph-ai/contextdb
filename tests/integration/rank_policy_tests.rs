@@ -1934,7 +1934,9 @@ fn sy01_ddl_change_round_trip() {
     let origin = Database::open_memory();
     create_standard_policy_schema(&origin);
     let peer = Database::open_memory();
-    let changes = origin.changes_since(Lsn(0));
+    let changes = origin
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     peer.apply_changes(
         changes,
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -1953,7 +1955,9 @@ fn sy02_peer_search_byte_identical() {
     let ids = seed_effective_confidence_fixture(&origin);
     let peer = Database::open_memory();
     peer.apply_changes(
-        origin.changes_since(Lsn(0)),
+        origin
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
     .unwrap();
@@ -1970,7 +1974,9 @@ fn sy03_persisted_full_snapshot_orders_rank_policy_dependencies() {
         create_standard_policy_schema(&origin);
     }
     let reopened = Database::open(&path).unwrap();
-    let changes = reopened.changes_since(Lsn(0));
+    let changes = reopened
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let outcomes_table = changes
         .ddl
         .iter()
@@ -2103,7 +2109,9 @@ fn sy06_persisted_full_snapshot_orders_same_table_rank_policy_dependencies() {
             .unwrap();
     }
     let reopened = Database::open(&path).unwrap();
-    let changes = reopened.changes_since(Lsn(0));
+    let changes = reopened
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let memories_table = changes
         .ddl
         .iter()
@@ -3023,7 +3031,9 @@ fn mv08_sync_round_trip_both_policies() {
     create_evidence_schema(&origin, true, false);
     let peer = Database::open_memory();
     peer.apply_changes(
-        origin.changes_since(Lsn(0)),
+        origin
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
     .unwrap();
@@ -3229,7 +3239,9 @@ fn mv11_quantization_composes_with_rank_policy() {
     assert_sq8_policy_meta(&origin);
     let peer = Database::open_memory();
     peer.apply_changes(
-        origin.changes_since(Lsn(0)),
+        origin
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
     .unwrap();

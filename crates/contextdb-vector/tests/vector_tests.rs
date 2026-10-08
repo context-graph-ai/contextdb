@@ -1,3 +1,6 @@
+#[path = "fixtures/read_owner_test_support.rs"]
+mod read_owner_test_support;
+
 use contextdb_core::{
     Error, Lsn, MemoryUsage, RowId, SnapshotId, TxId, Value, VectorEntry, VectorExecutor,
     VectorIndexRef, VectorQuantization,
@@ -228,23 +231,67 @@ fn quarantined_preload_propagates_typed_cancellation_on_both_search_routes() {
     );
 }
 
+impl contextdb_core::read_memory::ReadMemoryBudget for MemoryAccountant {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> contextdb_core::Result<()> {
+        MemoryBudget::try_allocate_for(self, bytes, subsystem, operation, hint)
+    }
+    fn release(&self, bytes: usize) {
+        MemoryBudget::release(self, bytes);
+    }
+}
+
 struct TestStore {
     vector: Arc<VectorStore>,
-    executing_owner: Arc<MemoryAccountant>,
 }
 
 impl WriteSetApplicator for TestStore {
-    fn apply(&self, ws: &WriteSet) -> contextdb_core::Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
+        let executing_owner = read_owner_test_support::budget(read_memory);
+        // Capture the exact committed body before this fixture publishes inserts.
+        let mut before_owner = VectorCopyAdmission::new(executing_owner.clone());
+        before_owner.reserve(
+            ws.vector_deletes
+                .len()
+                .saturating_mul(std::mem::size_of::<(VectorIndexRef, RowId, TxId, TxId, Lsn)>())
+                .saturating_add(
+                    ws.vector_deletes
+                        .iter()
+                        .map(|(index, _, _)| index.table.len().saturating_add(index.column.len()))
+                        .sum::<usize>(),
+                ),
+        )?;
+        let mut deletes = Vec::with_capacity(ws.vector_deletes.len());
+        for (index, row, tx) in &ws.vector_deletes {
+            let before = self
+                .vector
+                .live_entry_for_row(
+                    index,
+                    *row,
+                    contextdb_core::SnapshotId(tx.0),
+                    &mut before_owner,
+                )?
+                .expect("the fixture deletes an existing committed body");
+            deletes.push((index.clone(), *row, *tx, before.created_tx, before.lsn));
+        }
+
         insert_fixture_vectors(
             &self.vector,
             ws.vector_inserts.clone(),
             None,
-            VectorCopyAdmission::new(self.executing_owner.clone()),
+            VectorCopyAdmission::new(executing_owner.clone()),
         )?;
-        self.vector.apply_deletes(
-            ws.vector_deletes.clone(),
-            VectorCopyAdmission::new(self.executing_owner.clone()),
-        )?;
+        self.vector
+            .apply_deletes(deletes, VectorCopyAdmission::new(executing_owner.clone()))?;
         Ok(())
     }
 
@@ -271,7 +318,6 @@ fn setup(
         .unwrap();
     let tx_mgr = Arc::new(TransactionManager::new(TestStore {
         vector: vector.clone(),
-        executing_owner: Arc::new(MemoryAccountant::no_limit()),
     }));
     let exec = MemVectorExecutor::new(vector, tx_mgr.clone(), hnsw, accountant.clone());
     (tx_mgr, exec)
@@ -307,7 +353,6 @@ fn setup_refs(
     }
     let tx_mgr = Arc::new(TransactionManager::new(TestStore {
         vector: vector.clone(),
-        executing_owner: Arc::new(MemoryAccountant::no_limit()),
     }));
     let exec = Arc::new(MemVectorExecutor::new_with_accountant(
         vector.clone(),
@@ -482,7 +527,9 @@ fn search_returns_top_k_descending() {
         Arc::new(MemoryAccountant::no_limit()),
     )
     .unwrap();
-    tx_mgr.commit(tx).unwrap();
+    tx_mgr
+        .commit(tx, Arc::new(MemoryAccountant::no_limit()))
+        .unwrap();
 
     let r = exec
         .search(
@@ -977,11 +1024,6 @@ fn restricted_layered_search_returns_all_current_rows_with_fixed_history_work() 
                     bounded_trace.selected_generations,
                     trace.debug_trace_for_test().selected_generations
                 );
-                println!(
-                    "quantization={quantization:?} history={history} mode={mode:?} rows={} generations={} source={source_work} distances={distance_work}",
-                    ordinary.len(),
-                    trace.debug_trace_for_test().selected_generations.len()
-                );
                 assert_eq!(
                     store.partition_graph_generation_status(&partition).unwrap(),
                     layers
@@ -1012,7 +1054,9 @@ fn candidate_prefilter_is_applied() {
         Arc::new(MemoryAccountant::no_limit()),
     )
     .unwrap();
-    tx_mgr.commit(tx).unwrap();
+    tx_mgr
+        .commit(tx, Arc::new(MemoryAccountant::no_limit()))
+        .unwrap();
 
     let mut cands = RoaringTreemap::new();
     cands.insert(2);
@@ -1045,7 +1089,9 @@ fn mvcc_snapshot_isolation() {
         Arc::new(MemoryAccountant::no_limit()),
     )
     .unwrap();
-    tx_mgr.commit(tx1).unwrap();
+    tx_mgr
+        .commit(tx1, Arc::new(MemoryAccountant::no_limit()))
+        .unwrap();
 
     let snap1 = tx_mgr.snapshot();
 
@@ -1058,7 +1104,9 @@ fn mvcc_snapshot_isolation() {
         Arc::new(MemoryAccountant::no_limit()),
     )
     .unwrap();
-    tx_mgr.commit(tx2).unwrap();
+    tx_mgr
+        .commit(tx2, Arc::new(MemoryAccountant::no_limit()))
+        .unwrap();
 
     let old = exec
         .search(index(), &[1.0, 0.0], 10, None, snap1, accountant.clone())
@@ -1091,7 +1139,9 @@ fn dimension_mismatch_errors() {
         Arc::new(MemoryAccountant::no_limit()),
     )
     .unwrap();
-    tx_mgr.commit(tx1).unwrap();
+    tx_mgr
+        .commit(tx1, Arc::new(MemoryAccountant::no_limit()))
+        .unwrap();
 
     let tx2 = tx_mgr.begin();
     let err = exec
@@ -1174,7 +1224,9 @@ fn float32_precision_is_preserved() {
         Arc::new(MemoryAccountant::no_limit()),
     )
     .unwrap();
-    tx_mgr.commit(tx).unwrap();
+    tx_mgr
+        .commit(tx, Arc::new(MemoryAccountant::no_limit()))
+        .unwrap();
 
     let r = exec
         .search(
@@ -1193,6 +1245,12 @@ fn float32_precision_is_preserved() {
 
 #[test]
 fn concurrent_same_ref_updates_leave_single_live_vector_after_commit() {
+    for first_tx in [30_001, 30_002] {
+        concurrent_same_ref_updates_in_order(first_tx);
+    }
+}
+
+fn concurrent_same_ref_updates_in_order(first_tx: u64) {
     let r = index();
     let accountant = Arc::new(MemoryAccountant::no_limit());
     let (store, _tx_mgr, exec) = setup_refs(&[(r.clone(), 4)], accountant.clone());
@@ -1208,6 +1266,10 @@ fn concurrent_same_ref_updates_leave_single_live_vector_after_commit() {
     )
     .unwrap();
 
+    let publication_gate = Arc::new(std::sync::Mutex::new(()));
+    let before_identities = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (first_done, second_ready) = mpsc::channel();
+    let second_ready = Arc::new(std::sync::Mutex::new(second_ready));
     let barrier = Arc::new(Barrier::new(3));
     let mut workers = Vec::new();
     for (tx, vector) in [
@@ -1218,11 +1280,35 @@ fn concurrent_same_ref_updates_leave_single_live_vector_after_commit() {
         let accountant = accountant.clone();
         let r = r.clone();
         let barrier = barrier.clone();
+        let publication_gate = publication_gate.clone();
+        let before_identities = before_identities.clone();
+        let first_done = first_done.clone();
+        let second_ready = second_ready.clone();
         workers.push(thread::spawn(move || {
             barrier.wait();
+            if tx != first_tx {
+                second_ready.lock().unwrap().recv().unwrap();
+            }
+            // Raw producers capture the actual before version and publish under one gate.
+            let _publication = publication_gate.lock().unwrap();
+            let mut before_owner = VectorCopyAdmission::new(Arc::new(MemoryAccountant::no_limit()));
+            let before = store
+                .live_entry_for_row_in_partition(
+                    &r,
+                    &contextdb_core::VectorPartitionKey::unpartitioned(),
+                    RowId(7),
+                    SnapshotId(tx),
+                    &mut before_owner,
+                )
+                .unwrap()
+                .expect("publication snapshot has its actual before body");
+            before_identities
+                .lock()
+                .unwrap()
+                .push((tx, before.created_tx, before.lsn));
             store
                 .apply_changes_with_accountant(
-                    vec![(r.clone(), RowId(7), TxId(tx))],
+                    vec![(r.clone(), RowId(7), TxId(tx), before.created_tx, before.lsn)],
                     vec![test_entry(&r, 7, vector, tx)],
                     Vec::new(),
                     Lsn(tx),
@@ -1230,12 +1316,28 @@ fn concurrent_same_ref_updates_leave_single_live_vector_after_commit() {
                     VectorCopyAdmission::new(Arc::new(MemoryAccountant::no_limit())),
                 )
                 .unwrap();
+            if tx == first_tx {
+                first_done.send(()).unwrap();
+            }
         }));
     }
     barrier.wait();
     for worker in workers {
         worker.join().unwrap();
     }
+    let expected_before = if first_tx == 30_001 {
+        vec![
+            (30_001, TxId(16), Lsn(16)),
+            (30_002, TxId(30_001), Lsn(30_001)),
+        ]
+    } else {
+        vec![(30_002, TxId(16), Lsn(16)), (30_001, TxId(16), Lsn(16))]
+    };
+    assert_eq!(
+        *before_identities.lock().unwrap(),
+        expected_before,
+        "each raw publication binds its exact snapshot-visible source under the same gate"
+    );
 
     let live_entries = store
         .entries_for_index(
@@ -1282,7 +1384,7 @@ fn same_row_updates_published_in_reverse_transaction_order_remain_searchable() {
     ] {
         store
             .apply_changes_with_accountant(
-                vec![(r.clone(), RowId(7), TxId(tx))],
+                vec![(r.clone(), RowId(7), TxId(tx), TxId(16), Lsn(16))],
                 vec![test_entry(&r, 7, vector, tx)],
                 Vec::new(),
                 Lsn(tx),
@@ -1609,7 +1711,13 @@ fn same_ref_concurrent_deletes_leave_no_zombie_hnsw_entries() {
             barrier.wait();
             store
                 .apply_deletes_with_accountant(
-                    vec![(r, RowId(row), TxId(30_000 + row))],
+                    vec![(
+                        r,
+                        RowId(row),
+                        TxId(30_000 + row),
+                        TxId(9 + row),
+                        Lsn(9 + row),
+                    )],
                     Some(accountant.as_ref()),
                     VectorCopyAdmission::new(Arc::new(MemoryAccountant::no_limit())),
                 )
@@ -1726,7 +1834,7 @@ fn same_ref_apply_finishes_while_same_ref_hnsw_build_is_paused() {
         started_apply_tx.send(()).unwrap();
         store_apply
             .apply_changes_with_accountant(
-                vec![(r_apply.clone(), RowId(7), TxId(30_000))],
+                vec![(r_apply.clone(), RowId(7), TxId(30_000), TxId(16), Lsn(16))],
                 vec![test_entry(&r_apply, 7, exact_vector(3, 2), 30_000)],
                 Vec::new(),
                 Lsn(30_000),
@@ -1970,7 +2078,15 @@ fn reindex_on_index_a_does_not_block_ingest_on_index_b() {
     let a_worker = a.clone();
     thread::spawn(move || {
         let deletes = (0..HNSW_ROWS_FOR_TEST)
-            .map(|i| (a_worker.clone(), RowId(1 + i as u64), TxId(30_000)))
+            .map(|i| {
+                (
+                    a_worker.clone(),
+                    RowId(1 + i as u64),
+                    TxId(30_000),
+                    TxId(10 + i as u64),
+                    Lsn(10 + i as u64),
+                )
+            })
             .collect::<Vec<_>>();
         let inserts = (0..HNSW_ROWS_FOR_TEST)
             .map(|i| {
@@ -3005,13 +3121,15 @@ fn concurrent_distinct_hnsw_builds_do_not_oversubscribe_transient_budget() {
     let a_search = a.clone();
     let first_copy_thread = first_copy_owner.clone();
     thread::spawn(move || {
-        done_a_tx
-            .send(store_a.run_hnsw_maintenance_for_index_for_test(
+        let result = {
+            let mut copy_admission = VectorCopyAdmission::new(first_copy_thread.clone());
+            store_a.run_hnsw_maintenance_for_index_for_test(
                 &a_search,
                 accountant_a.clone(),
-                &mut VectorCopyAdmission::new(first_copy_thread.clone()),
-            ))
-            .unwrap();
+                &mut copy_admission,
+            )
+        };
+        done_a_tx.send(result).unwrap();
     });
     assert!(pause_a.wait_until_reached(TEST_TIMEOUT));
     let used_while_paused = accountant.usage().used;
@@ -3019,18 +3137,8 @@ fn concurrent_distinct_hnsw_builds_do_not_oversubscribe_transient_budget() {
         contextdb_core::VectorPartitionKey,
         Arc<contextdb_vector::store::IndexState>,
     )>() + contextdb_core::VectorPartitionKey::unpartitioned()
-        .estimated_bytes()
-        + contextdb_vector::VectorIndexLayout::unpartitioned(dim, VectorQuantization::F32)
-            .estimated_bytes()
-        + std::mem::size_of::<contextdb_vector::VectorPartitionInfo>()
-        + a.table.len()
-        + a.column.len()
-        + contextdb_core::VectorPartitionKey::unpartitioned().estimated_bytes();
+        .estimated_bytes();
     assert_eq!(first_copy_owner.usage().used, copied_route_bytes);
-    eprintln!(
-        "paused executing copy {} = route inventory + layout + partition info",
-        copied_route_bytes
-    );
 
     let (done_b_tx, done_b_rx) = mpsc::channel();
     let store_b = store.clone();
@@ -3038,13 +3146,15 @@ fn concurrent_distinct_hnsw_builds_do_not_oversubscribe_transient_budget() {
     let b_search = b.clone();
     let second_copy_thread = second_copy_owner.clone();
     thread::spawn(move || {
-        done_b_tx
-            .send(store_b.run_hnsw_maintenance_for_index_for_test(
+        let result = {
+            let mut copy_admission = VectorCopyAdmission::new(second_copy_thread.clone());
+            store_b.run_hnsw_maintenance_for_index_for_test(
                 &b_search,
                 accountant_b.clone(),
-                &mut VectorCopyAdmission::new(second_copy_thread.clone()),
-            ))
-            .unwrap();
+                &mut copy_admission,
+            )
+        };
+        done_b_tx.send(result).unwrap();
     });
     let b_first = done_b_rx.recv_timeout(TEST_TIMEOUT);
     let b_hnsw_while_a_paused = store.has_hnsw_index_for(&b);
@@ -3441,7 +3551,7 @@ fn ordinary_and_bounded_indexed_search_share_snapshot_effort_across_size_band_de
         .expect("ordinary query must pin its snapshot-compatible graph before delete");
     store
         .apply_deletes_with_accountant(
-            vec![(r.clone(), RowId(1), TxId(20_001))],
+            vec![(r.clone(), RowId(1), TxId(20_001), TxId(10), Lsn(10))],
             Some(accountant.as_ref()),
             VectorCopyAdmission::new(Arc::new(MemoryAccountant::no_limit())),
         )

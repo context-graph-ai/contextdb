@@ -214,7 +214,7 @@ pub fn assert_whole_image_of(db: &Database, statements: &[&str], phase: &str) {
 /// unrelated declaration regrouped into it -- so a retry that re-applied a
 /// prefix, or a receiver that split the migration, fails here.
 pub fn assert_unit_kept_once(db: &Database, expected: &[DdlChange], phase: &str) -> Lsn {
-    let changes = db.changes_since(Lsn(0));
+    let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     let occurrences = changes
         .ddl
         .windows(expected.len())
@@ -275,7 +275,7 @@ pub fn assert_schema_contains(db: &Database, expected: &Database) {
 }
 
 pub fn assert_one_ordered_unit(db: &Database, after: Lsn, expected: &[DdlChange]) -> Lsn {
-    let changes = db.changes_since(after);
+    let changes = db.changes_since(after).expect("read the declared changes");
     assert_eq!(
         changes.ddl, expected,
         "exact authored DDL vector, with neither regrouping nor duplicate prefix"
@@ -298,7 +298,7 @@ pub fn assert_contains_one_ordered_unit(
     expected: &[DdlChange],
     phase: &str,
 ) -> Lsn {
-    let changes = db.changes_since(after);
+    let changes = db.changes_since(after).expect("read the declared changes");
     let positions = changes
         .ddl
         .windows(expected.len())
@@ -336,7 +336,12 @@ pub fn assert_contains_one_ordered_unit(
 
 pub fn assert_no_schema(db: &Database) {
     assert_schema_not_visible(db);
-    assert!(db.changes_since(Lsn(0)).ddl.is_empty());
+    assert!(
+        db.changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .ddl
+            .is_empty()
+    );
 }
 
 /// Metadata inspection is available at an armed commit fence. Change-log
@@ -459,7 +464,8 @@ impl Hub {
                 TenantId::from(tenant),
                 node,
                 identity,
-            ),
+            )
+            .expect("construct the authenticated sync endpoint"),
         );
         let stop = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
@@ -492,6 +498,7 @@ impl Hub {
             TenantId::from(self.tenant.as_str()),
             identity,
         )
+        .expect("construct the authenticated sync endpoint")
     }
 
     pub async fn bind(&self, client: &SyncClient) {

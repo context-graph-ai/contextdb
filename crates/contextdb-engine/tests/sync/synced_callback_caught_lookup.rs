@@ -148,7 +148,9 @@ fn assert_absent(db: &Database, before: Lsn) {
             .iter()
             .all(|column| column.name != "note")
     );
-    let log = db.changes_since(before);
+    let log = db
+        .changes_since(before)
+        .expect("read or construct the declared fixture result");
     assert!(log.rows.is_empty());
     assert!(log.ddl.is_empty());
     assert_control(db);
@@ -167,7 +169,9 @@ fn assert_complete(db: &Database, before: Lsn) {
             .rows,
         vec![vec![Value::Int64(1), Value::Int64(7)]]
     );
-    let log = db.changes_since(before);
+    let log = db
+        .changes_since(before)
+        .expect("read or construct the declared fixture result");
     assert_eq!(
         log.rows.len(),
         2,

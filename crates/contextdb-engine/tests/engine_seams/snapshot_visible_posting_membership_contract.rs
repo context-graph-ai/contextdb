@@ -570,10 +570,6 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         first_budget,
         "owner observation must remain passive"
     );
-    eprintln!(
-        "MEMBERSHIP_CALIBRATION first budget={} owners={:?}",
-        first_budget, first_owners
-    );
     assert_eq!(
         first_owners.reconciliation_gap, 0,
         "every retained owner is named"
@@ -655,10 +651,6 @@ fn membership_admission_refusal_publishes_no_row_or_vector_state() {
         db.accountant().usage().used,
         mixed_budget,
         "owner observation must remain passive"
-    );
-    eprintln!(
-        "MEMBERSHIP_CALIBRATION mixed budget={} owners={:?}",
-        mixed_budget, mixed_owners
     );
     assert_eq!(
         mixed_owners.reconciliation_gap, 0,

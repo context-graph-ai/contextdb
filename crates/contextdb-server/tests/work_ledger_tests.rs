@@ -46,7 +46,8 @@ fn edge_as(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, SyncClient
         broker.client_as(&node_id),
         contextdb_core::TenantId::from(tenant),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     (db, client, node_id)
 }
 

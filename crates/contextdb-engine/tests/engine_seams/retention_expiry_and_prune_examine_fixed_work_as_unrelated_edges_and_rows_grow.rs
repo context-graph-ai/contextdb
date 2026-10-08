@@ -1,9 +1,10 @@
 //! Retention cycles examine a fixed candidate window and selected-node edges;
 //! unrelated history cannot enlarge one cycle or hide future-stamped rows.
+use crate::resident_history_support as support;
 use contextdb_core::{Direction, Value, Wallclock};
 use contextdb_engine::database::resident_history_test_seams::observe;
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
 const NOW: u64 = 1_800_000_000_000;
@@ -142,9 +143,6 @@ fn retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_gro
                 let cycle_bound = 4 * (128 + 32) + 2 + 2 + if future { 32 + 1 } else { 0 };
                 let (report, work) = observe(|| db.run_pruning_cycle_checked());
                 let mut report = report.unwrap();
-                eprintln!(
-                    "retention unrelated={unrelated} expire={expire} future={future} first_work={work:?} report={report:?}"
-                );
                 first_cycles.push((work.retention_keys_examined, work.graph_keys_examined));
                 assert!(
                     work.retention_keys_examined > 0 && work.retention_keys_examined <= cycle_bound,
@@ -168,9 +166,6 @@ fn retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_gro
                     let (next, work) = observe(|| db.run_pruning_cycle_checked());
                     report = next.unwrap();
                     graph_cycles.push(work.graph_keys_examined);
-                    eprintln!(
-                        "retention unrelated={unrelated} expire={expire} future={future} later_cycle={cycle} work={work:?}"
-                    );
                     assert!(
                         work.retention_keys_examined <= cycle_bound,
                         "finite resumed work: {work:?}"
@@ -224,4 +219,241 @@ fn retention_expiry_and_prune_examine_fixed_work_as_unrelated_edges_and_rows_gro
             );
         }
     }
+}
+
+fn ids(db: &contextdb_engine::Database, table: &str) -> BTreeSet<i64> {
+    support::exec(db, &format!("SELECT id FROM {table} ORDER BY id"))
+        .into_iter()
+        .map(|row| match row[0] {
+            Value::Int64(id) => id,
+            ref value => panic!("expected integer identity, got {value:?}"),
+        })
+        .collect()
+}
+#[test]
+fn retention_reclaims_both_expired_foreign_key_ends_across_finite_windows() {
+    let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("expiry-cohorts.redb");
+    let db = support::open(&path, None);
+    support::exec(
+        &db,
+        "CREATE TABLE cohort_parents (id INT PRIMARY KEY, expiry TIMESTAMP EXPIRES) RETAIN 1 HOURS SYNC OFF",
+    );
+    support::exec(
+        &db,
+        "CREATE TABLE cohort_children (id INT PRIMARY KEY, parent INT REFERENCES cohort_parents(id), expiry TIMESTAMP EXPIRES) RETAIN 1 HOURS SYNC OFF",
+    );
+    for id in 0..130 {
+        db.execute(
+            "INSERT INTO cohort_parents VALUES ($id,$expiry)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(id)),
+                ("expiry".into(), Value::Timestamp(100)),
+            ]),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO cohort_children VALUES ($id,$id,$expiry)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(id)),
+                ("expiry".into(), Value::Timestamp(100)),
+            ]),
+        )
+        .unwrap();
+    }
+    // The same declared TTL applies to this child, but its future expiry keeps
+    // the already-expired parent protected throughout every candidate window.
+    db.execute(
+        "INSERT INTO cohort_parents VALUES (1000,$expiry)",
+        &HashMap::from([("expiry".into(), Value::Timestamp(100))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO cohort_children VALUES (1000,1000,$expiry)",
+        &HashMap::from([("expiry".into(), Value::Timestamp(1_800_000_000_000))]),
+    )
+    .unwrap();
+    let mut removed = 0;
+    let mut saw_positive_work = false;
+    for cycle in 0..64 {
+        let (report, work) = observe(|| db.run_pruning_cycle_checked());
+        let report = report.unwrap();
+        assert!(
+            report.pruned_rows <= 64,
+            "finite deletion bound: {report:?}"
+        );
+        assert!(
+            work.retention_keys_examined <= 512,
+            "finite candidate bound: {work:?}"
+        );
+        saw_positive_work |= work.retention_keys_examined > 0;
+        removed += report.pruned_rows;
+        let parents = ids(&db, "cohort_parents");
+        let children = ids(&db, "cohort_children");
+        assert!(
+            children.is_subset(&parents),
+            "no surviving child loses its parent at cycle {cycle}"
+        );
+        assert!(
+            parents.contains(&1000) && children.contains(&1000),
+            "future child protects its expired parent"
+        );
+        if removed == 260 {
+            break;
+        }
+    }
+    assert!(saw_positive_work);
+    assert_eq!(
+        removed, 260,
+        "both expired ends are eventually physically reclaimed"
+    );
+    for table in ["cohort_parents", "cohort_children"] {
+        assert_eq!(ids(&db, table), BTreeSet::from([1000]));
+        assert_eq!(db.__durable_version_count_for_test(table).unwrap(), 1);
+    }
+    db.close().unwrap();
+    drop(db);
+    let db = support::open(&path, None);
+    for table in ["cohort_parents", "cohort_children"] {
+        assert_eq!(ids(&db, table), BTreeSet::from([1000]));
+        assert_eq!(db.__durable_version_count_for_test(table).unwrap(), 1);
+    }
+    db.close().unwrap();
+
+    // Protection must propagate through expired C to P while unrelated U is reclaimed in the same window.
+    let protected_path = dir.path().join("expiry-protected-chain-window.redb");
+    let db = support::open(&protected_path, None);
+    support::exec(
+        &db,
+        "CREATE TABLE protected_chain (id INT PRIMARY KEY, parent INT REFERENCES protected_chain(id), expiry TIMESTAMP EXPIRES) RETAIN 1 HOURS SYNC OFF",
+    );
+    for (id, parent, expiry) in [
+        (1, Value::Null, 100),
+        (2, Value::Int64(1), 100),
+        (3, Value::Int64(2), 1_800_000_000_000),
+        (4, Value::Null, 100),
+    ] {
+        db.execute(
+            "INSERT INTO protected_chain VALUES ($id, $parent, $expiry)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(id)),
+                ("parent".into(), parent),
+                ("expiry".into(), Value::Timestamp(expiry)),
+            ]),
+        )
+        .unwrap();
+    }
+    let before = ids(&db, "protected_chain");
+    let physical_before = db
+        .__durable_version_count_for_test("protected_chain")
+        .unwrap();
+    assert_eq!(before, BTreeSet::from([1, 2, 3, 4]));
+    assert_eq!(physical_before, before.len());
+    assert!(
+        physical_before < 32,
+        "the entire chain and unrelated row fit one existing candidate window"
+    );
+    let (report, work) = observe(|| db.run_pruning_cycle_checked());
+    let report = report.expect("one protected chain must not refuse unrelated expired work");
+    let after = ids(&db, "protected_chain");
+    assert_eq!(after, BTreeSet::from([1, 2, 3]));
+    assert_eq!(
+        support::exec(&db, "SELECT parent FROM protected_chain WHERE id = 2"),
+        vec![vec![Value::Int64(1)]],
+        "the surviving expired child still resolves to its surviving parent"
+    );
+    assert_eq!(
+        support::exec(&db, "SELECT parent FROM protected_chain WHERE id = 3"),
+        vec![vec![Value::Int64(2)]],
+        "the live grandchild still resolves to its surviving child"
+    );
+    assert_eq!(report.pruned_rows, (before.len() - after.len()) as u64);
+    assert!(
+        work.retention_keys_examined > 0,
+        "the real candidate window was examined"
+    );
+    assert!(
+        work.retention_keys_examined <= 512,
+        "the inherited finite candidate bound holds: {work:?}"
+    );
+    assert_eq!(
+        db.__durable_version_count_for_test("protected_chain")
+            .unwrap(),
+        after.len()
+    );
+    db.close().unwrap();
+
+    // A mutual expired pair needs cohort carry when live physical fillers keep its ends in different windows.
+    let split_path = dir.path().join("expiry-split-mutual-cycle.redb");
+    let db = support::open(&split_path, None);
+    support::exec(
+        &db,
+        "CREATE TABLE split_cycle (id INT PRIMARY KEY, peer INT REFERENCES split_cycle(id), expiry TIMESTAMP EXPIRES) RETAIN 1 HOURS SYNC OFF",
+    );
+    db.execute(
+        "INSERT INTO split_cycle VALUES (1, NULL, $expiry)",
+        &HashMap::from([("expiry".into(), Value::Timestamp(100))]),
+    )
+    .unwrap();
+    let filler_ids: BTreeSet<i64> = (2..=34).collect();
+    for id in &filler_ids {
+        db.execute(
+            "INSERT INTO split_cycle VALUES ($id, NULL, $expiry)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(*id)),
+                ("expiry".into(), Value::Timestamp(1_800_000_000_000)),
+            ]),
+        )
+        .unwrap();
+    }
+    db.execute(
+        "INSERT INTO split_cycle VALUES (35, 1, $expiry)",
+        &HashMap::from([("expiry".into(), Value::Timestamp(100))]),
+    )
+    .unwrap();
+    support::exec(&db, "UPDATE split_cycle SET peer = 35 WHERE id = 1");
+    let first = db
+        .point_lookup("split_cycle", "id", &Value::Int64(1), db.snapshot())
+        .unwrap()
+        .unwrap();
+    let last = db
+        .point_lookup("split_cycle", "id", &Value::Int64(35), db.snapshot())
+        .unwrap()
+        .unwrap();
+    assert!(filler_ids.len() > 32);
+    for id in &filler_ids {
+        let filler = db
+            .point_lookup("split_cycle", "id", &Value::Int64(*id), db.snapshot())
+            .unwrap()
+            .unwrap();
+        assert!(first.row_id < filler.row_id && filler.row_id < last.row_id);
+        assert_eq!(filler.values["expiry"], Value::Timestamp(1_800_000_000_000));
+    }
+    for _ in 0..64 {
+        db.run_pruning_cycle_checked().unwrap();
+        let alive = ids(&db, "split_cycle");
+        assert!(
+            filler_ids.is_subset(&alive),
+            "live fillers must keep the physical boundary separated"
+        );
+        assert_eq!(
+            alive.contains(&1),
+            alive.contains(&35),
+            "neither live endpoint loses its foreign-key parent"
+        );
+        if alive == filler_ids {
+            break;
+        }
+    }
+    assert_eq!(
+        ids(&db, "split_cycle"),
+        filler_ids,
+        "cohort carry reclaims both separated expired ends in finite windows"
+    );
+    assert_eq!(
+        db.__durable_version_count_for_test("split_cycle").unwrap(),
+        filler_ids.len()
+    );
+    db.close().unwrap();
 }

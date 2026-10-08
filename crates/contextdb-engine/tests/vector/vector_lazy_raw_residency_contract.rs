@@ -92,9 +92,14 @@ fn seed_partition(db: &Database, scope: Uuid, first: Uuid, axis: usize) {
 
 fn drive_maintenance_until_ready(db: &Database, expected_partitions: usize) {
     for _ in 0..MAX_MAINTENANCE_CYCLES {
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let infos = db
             .vector_store_for_test()
-            .partition_infos(&index())
+            .partition_infos(&index(), &mut partition_observation_owner_1)
             .unwrap();
         if infos.len() == expected_partitions && infos.iter().all(|info| info.graph_available) {
             return;
@@ -436,9 +441,14 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
                 .execute_at_snapshot(&sql, &query, snapshot)
                 .unwrap_or_else(|error| panic!("ordinary {mode} candidate search failed: {error}"));
             let ledger = take_budget_ledger_for_test();
-            let ordinary_trace = db
-                .__take_last_query_vector_trace_for_test()
-                .expect("ordinary indexed route publishes a trace");
+            let ordinary_trace = {
+                let seam_read_memory = db
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                    .expect("read the admitted trace observation")
+            }
+            .expect("ordinary indexed route publishes a trace");
             assert_eq!(ordinary.rows, exact.rows);
             assert_streamed_body_charges(&ledger, 20);
             assert_score_workspace(&ledger, true);
@@ -483,9 +493,14 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
                     panic!("bounded {mode} candidate search failed: {error:?}")
                 });
             let ledger = take_budget_ledger_for_test();
-            let bounded_trace = db
-                .__take_last_query_vector_trace_for_test()
-                .expect("bounded indexed route publishes a trace");
+            let bounded_trace = {
+                let seam_read_memory = db
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                db.__take_last_query_vector_trace_for_test(seam_read_memory)
+                    .expect("read the admitted trace observation")
+            }
+            .expect("bounded indexed route publishes a trace");
             assert_eq!(bounded.result.rows, exact.rows);
             assert_streamed_body_charges(&ledger, 20);
             assert_score_workspace(&ledger, false);
@@ -560,13 +575,6 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
         "candidate reads preserve their preloaded graph ownership"
     );
     assert_eq!(db.accountant().usage().used, settled_usage);
-    eprintln!(
-        "indexed_candidate_memory_receipt partitions={MANY_PARTITIONS} rows={} \
-         graph_candidates={observed_graph_candidates} unique_candidates={observed_unique_candidates} \
-         point_loads={point_loads} point_body_bytes={point_body_bytes} raw_partition_load_delta=0 \
-         resident_raw_partitions=0 query_workspace_bytes={QUERY_WORKSPACE_BYTES}",
-        MANY_PARTITIONS * MANY_ROWS_PER_PARTITION,
-    );
     drop(old_pin);
 }
 
@@ -779,7 +787,15 @@ fn drive_maintenance_until_ready_for_indices(
 ) {
     for _ in 0..MAX_MAINTENANCE_CYCLES {
         let ready = indices.iter().all(|index| {
-            let infos = db.vector_store_for_test().partition_infos(index).unwrap();
+            let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+                db.declared_reader_memory()
+                    .expect("admit the partition observation reader"),
+            );
+
+            let infos = db
+                .vector_store_for_test()
+                .partition_infos(index, &mut partition_observation_owner_2)
+                .unwrap();
             infos.len() == expected_partitions && infos.iter().all(|info| info.graph_available)
         });
         if ready {
@@ -1245,9 +1261,14 @@ fn composite_strict_range_fixture() -> (Database, Uuid) {
     }
     let vector_index = VectorIndexRef::new("composite_range_candidates", "embedding");
     for _ in 0..MAX_MAINTENANCE_CYCLES {
+        let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         if db
             .vector_store_for_test()
-            .partition_infos(&vector_index)
+            .partition_infos(&vector_index, &mut partition_observation_owner_3)
             .expect("inspect the unpartitioned vector route")
             .iter()
             .any(|info| info.graph_available)
@@ -1422,8 +1443,17 @@ fn nullable_single_column_lower_ranges_match_exact_in_both_index_directions() {
             let all_ready = ["nullable_lower_range", "required_lower_range"]
                 .into_iter()
                 .all(|table| {
+                    let mut partition_observation_owner_4 =
+                        contextdb_engine::vector_read_memory::admission(
+                            db.declared_reader_memory()
+                                .expect("admit the partition observation reader"),
+                        );
+
                     db.vector_store_for_test()
-                        .partition_infos(&VectorIndexRef::new(table, "embedding"))
+                        .partition_infos(
+                            &VectorIndexRef::new(table, "embedding"),
+                            &mut partition_observation_owner_4,
+                        )
                         .expect("inspect one unpartitioned vector route")
                         .iter()
                         .any(|info| info.graph_available)

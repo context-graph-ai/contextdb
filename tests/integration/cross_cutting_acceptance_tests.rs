@@ -152,7 +152,8 @@ async fn restart_preserves_committed_sync_visibility() {
             contextdb_core::TenantId::from("t02"),
             hub_node_id.clone(),
             hub_identity.clone(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn({
@@ -167,7 +168,8 @@ async fn restart_preserves_committed_sync_visibility() {
         fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from("t02"),
         edge_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let initial_pull = client.pull_default().await.unwrap();
     assert_eq!(initial_pull.applied_rows, 2);
     assert_eq!(initial_pull.skipped_rows, 0);
@@ -199,7 +201,8 @@ async fn restart_preserves_committed_sync_visibility() {
             contextdb_core::TenantId::from("t02"),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let restarted_handle = tokio::spawn({
         let server = restarted_server.clone();
@@ -212,7 +215,8 @@ async fn restart_preserves_committed_sync_visibility() {
         fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from("t02"),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let delta_pull = restarted_client.pull_default().await.unwrap();
     assert_eq!(
         delta_pull.applied_rows, 1,

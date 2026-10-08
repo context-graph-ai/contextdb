@@ -64,7 +64,9 @@ fn stampless_changeset(
 /// The row's own committed LSN and its resolved served arrival, read back
 /// via the same path a sync peer would use (`changes_since_with_arrivals`).
 fn committed_lsn_and_served_arrival(db: &Database, id: i64) -> (Lsn, Option<Lsn>) {
-    let (changes, arrivals) = db.changes_since_with_arrivals(Lsn(0));
+    let (changes, arrivals) = db
+        .changes_since_with_arrivals(Lsn(0))
+        .expect("read the actual fixture observation");
     let target = Value::Int64(id);
     let row = changes
         .rows

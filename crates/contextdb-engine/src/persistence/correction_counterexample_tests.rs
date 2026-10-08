@@ -392,6 +392,21 @@ fn pull_identity(
             .map(|tx| tx.0)
             .unwrap(),
     );
+    let persistence_fixture_parent_1 =
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            load.source
+                .verified_ordered_runs
+                .memory
+                .accountant
+                .usage()
+                .limit
+                .map(|bytes| bytes as u64)
+                .unwrap_or(u64::MAX),
+        );
+    let persistence_fixture_reader_1 = persistence_fixture_parent_1
+        .child()
+        .expect("admit the persistence fixture reader child");
+
     load.source
         .bounded_relational_ordered_next(
             "postings",
@@ -402,6 +417,7 @@ fn pull_identity(
             &mut || Ok(()),
             &mut || Ok(()),
             &mut |_| Ok(()),
+            persistence_fixture_reader_1,
         )
         .map(|row| row.map(|row| row.row_id))
 }

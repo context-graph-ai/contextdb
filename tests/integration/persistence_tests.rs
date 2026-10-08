@@ -1288,7 +1288,8 @@ async fn p17_edge_pushes_to_server_both_survive_restart() {
             contextdb_core::TenantId::from("p17"),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn({
@@ -1309,7 +1310,8 @@ async fn p17_edge_pushes_to_server_both_survive_restart() {
         fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from("p17"),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.unwrap();
     let id = Uuid::new_v4();
     edge_db
@@ -2153,7 +2155,8 @@ async fn p33_bidirectional_sync_with_persistence() {
             contextdb_core::TenantId::from("p33"),
             hub_node_id.clone(),
             hub_identity.clone(),
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn({
@@ -2174,7 +2177,8 @@ async fn p33_bidirectional_sync_with_persistence() {
         fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from("p33"),
         edge_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.unwrap();
 
     let mut edge_ids = Vec::new();
@@ -2354,7 +2358,8 @@ async fn p33_bidirectional_sync_with_persistence() {
             contextdb_core::TenantId::from("p33"),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown2 = Arc::new(AtomicBool::new(false));
     let handle2 = tokio::spawn({
@@ -2375,7 +2380,8 @@ async fn p33_bidirectional_sync_with_persistence() {
         fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from("p33"),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client2.push().await.unwrap();
     client2.pull_default().await.unwrap();
 

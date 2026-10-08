@@ -268,7 +268,7 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
     }
     if matches!(kind, UnknownCatalog::Incomplete) {
         db.execute(
-            "CREATE TABLE cold_catalog_pressure (id INT PRIMARY KEY, body TEXT) SYNC OFF",
+            "CREATE TABLE cold_catalog_pressure (id INT PRIMARY KEY, body TEXT) HISTORY CURRENT ONLY SYNC OFF",
             &HashMap::new(),
         )
         .unwrap();
@@ -492,9 +492,19 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
         db.vector_store
             .replace_with_dormant_raw_partitions(Vec::new())
             .unwrap();
+        let vector_fixture_reader_1 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_1 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
         assert!(
             db.vector_store
-                .partition_info(&route(0).index, &route(0).partition_key)
+                .partition_info(
+                    &route(0).index,
+                    &route(0).partition_key,
+                    &mut vector_fixture_copy_1
+                )
                 .unwrap()
                 .is_none()
         );
@@ -623,9 +633,19 @@ fn public_unknown_catalog_preserves_healthy_work(before: bool, kind: UnknownCata
     drop(observation);
     db.accountant.set_budget(None).unwrap();
     if matches!(kind, UnknownCatalog::DurableOnly) {
+        let vector_fixture_reader_2 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_2 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_2.clone());
+
         assert!(
             db.vector_store
-                .partition_info(&route(0).index, &route(0).partition_key)
+                .partition_info(
+                    &route(0).index,
+                    &route(0).partition_key,
+                    &mut vector_fixture_copy_2
+                )
                 .unwrap()
                 .is_none(),
             "durable publication does not fabricate an empty resident state"
@@ -912,16 +932,32 @@ fn public_later_inventory_slot_refusal(slot: &'static str) {
             3,
             "the deleted route remains active before the closing-slot refusal"
         );
+        let vector_fixture_reader_3 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_3 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_3.clone());
+
         let retirement_candidate = db
             .vector_store
-            .partition_info(&route(2).index, &route(2).partition_key)
+            .partition_info(
+                &route(2).index,
+                &route(2).partition_key,
+                &mut vector_fixture_copy_3,
+            )
             .unwrap()
             .expect("scope 2 is an active retirement candidate before refusal");
         assert_eq!(retirement_candidate.live_rows, 0);
         assert!(retirement_candidate.retained_rows >= 176);
+        let vector_fixture_reader_4 = db
+            .declared_reader_memory()
+            .expect("admit the vector fixture reader");
+        let mut vector_fixture_copy_4 =
+            contextdb_engine::vector_read_memory::admission(vector_fixture_reader_4.clone());
+
         assert!(
             db.vector_store
-                .index_layout(&route(2).index)
+                .index_layout(&route(2).index, &mut vector_fixture_copy_4)
                 .unwrap()
                 .maintenance_need(&retirement_candidate)
                 .is_none(),

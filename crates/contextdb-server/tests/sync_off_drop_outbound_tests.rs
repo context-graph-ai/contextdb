@@ -50,11 +50,10 @@ async fn start_hub(root: &Path) -> Hub {
         .expect("bind authenticated Iroh hub");
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(db_path).expect("open hub database"));
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(TENANT),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -101,7 +100,8 @@ async fn dropped_sync_off_schema_stays_pending_across_restart_then_clears_after_
     edge.execute("DROP TABLE local_only", &HashMap::new())
         .expect("drop local-only table");
 
-    let first_client = SyncClient::new(edge.clone(), &edge_dial_spec, TenantId::from(TENANT));
+    let first_client = SyncClient::new(edge.clone(), &edge_dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     assert!(
         first_client
             .has_pending_push_changes()
@@ -117,7 +117,8 @@ async fn dropped_sync_off_schema_stays_pending_across_restart_then_clears_after_
         reopened.table_meta(LOCAL_TABLE).is_none(),
         "the dropped local-only table stays absent after the edge reopens"
     );
-    let client = SyncClient::new(reopened.clone(), &edge_dial_spec, TenantId::from(TENANT));
+    let client = SyncClient::new(reopened.clone(), &edge_dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
     assert!(
         client
             .has_pending_push_changes()
@@ -189,6 +190,7 @@ async fn dropped_sync_off_schema_stays_pending_across_restart_then_clears_after_
     assert_eq!(
         hub.db
             .changes_since(Lsn(0))
+            .expect("read changes_since fixture")
             .ddl
             .iter()
             .filter(|change| is_local_table_create_or_drop(change))

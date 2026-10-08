@@ -72,7 +72,9 @@ fn one_answer_per_named_class() -> Vec<Error> {
         },
         Error::NotFound("no such snapshot".to_owned()),
         Error::RecursiveCteNotSupported,
-        Error::WindowFunctionNotSupported,
+        Error::WindowFunctionNotSupported {
+            form: "fixture window form".to_owned(),
+        },
         Error::StoredProcNotSupported,
         Error::SubqueryNotSupported,
         Error::FullTextSearchNotSupported,

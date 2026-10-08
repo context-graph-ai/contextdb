@@ -37,7 +37,12 @@ fn received_then_forwarded() -> (Database, ChangeSet, FabricIdentity, Vec<WireDd
             &empty(),
         )
         .expect("author the source declaration");
-    let source_unit = table_unit(&source.changes_since(Lsn(0)), TABLE);
+    let source_unit = table_unit(
+        &source
+            .changes_since(Lsn(0))
+            .expect("read or construct the declared fixture result"),
+        TABLE,
+    );
 
     let forwarder = Database::open_memory();
     forwarder
@@ -47,8 +52,17 @@ fn received_then_forwarded() -> (Database, ChangeSet, FabricIdentity, Vec<WireDd
         forwarder.table_meta(TABLE).is_some(),
         "the forwarder must actually hold the received declaration"
     );
-    let forwarded = table_unit(&forwarder.changes_since(Lsn(0)), TABLE);
+    let forwarded = table_unit(
+        &forwarder
+            .changes_since(Lsn(0))
+            .expect("read or construct the declared fixture result"),
+        TABLE,
+    );
     let identity = FabricIdentity::generate();
+    let fixture_operation_reader_1 = forwarder
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let provenance = forwarder
         .outbound_ddl_provenance_for_test(
             &forwarded,
@@ -56,6 +70,7 @@ fn received_then_forwarded() -> (Database, ChangeSet, FabricIdentity, Vec<WireDd
             &identity.node_id(),
             Incarnation(1),
             &|bytes| Ok(identity.sign_for_test(bytes)),
+            fixture_operation_reader_1.clone(),
         )
         .expect("serve the declaration the peer received");
     assert_eq!(provenance.len(), 1);
@@ -82,6 +97,12 @@ fn forwarded_unattested_schema_carries_an_explicit_marker_and_no_author_signatur
 fn authenticated_receiver_refuses_forwarded_unattested_schema_with_its_table() {
     let (_, unit, identity, provenance) = received_then_forwarded();
     let receiver = Database::open_memory();
+    let fixture_operation_reader_2 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_2 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
+
     let error = receiver
         .apply_received_schema_for_test(
             unit,
@@ -89,6 +110,8 @@ fn authenticated_receiver_refuses_forwarded_unattested_schema_with_its_table() {
             TenantId::from(TENANT),
             &identity.node_id(),
             Incarnation(1),
+            &mut fixture_operation_copy_2,
+            fixture_operation_reader_2.clone(),
         )
         .expect_err("authenticated schema cannot accept an unattested declaration");
     assert!(
@@ -118,7 +141,16 @@ fn forwarders_own_locally_authored_schema_remains_signed() {
             &empty(),
         )
         .expect("author a separate local declaration on the forwarding peer");
-    let local = table_unit(&forwarder.changes_since(Lsn(0)), LOCAL);
+    let local = table_unit(
+        &forwarder
+            .changes_since(Lsn(0))
+            .expect("read or construct the declared fixture result"),
+        LOCAL,
+    );
+    let fixture_operation_reader_3 = forwarder
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let provenance = forwarder
         .outbound_ddl_provenance_for_test(
             &local,
@@ -126,6 +158,7 @@ fn forwarders_own_locally_authored_schema_remains_signed() {
             &identity.node_id(),
             Incarnation(1),
             &|bytes| Ok(identity.sign_for_test(bytes)),
+            fixture_operation_reader_3.clone(),
         )
         .expect("serve the peer's own declaration");
     let author = provenance[0]
@@ -135,6 +168,12 @@ fn forwarders_own_locally_authored_schema_remains_signed() {
     assert_eq!(author.node_id, identity.node_id());
     assert!(!author.attestation.is_empty());
     let receiver = Database::open_memory();
+    let fixture_operation_reader_4 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_4 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_4.clone());
+
     receiver
         .apply_received_schema_for_test(
             local,
@@ -142,6 +181,8 @@ fn forwarders_own_locally_authored_schema_remains_signed() {
             TenantId::from(TENANT),
             &identity.node_id(),
             Incarnation(1),
+            &mut fixture_operation_copy_4,
+            fixture_operation_reader_4.clone(),
         )
         .expect("an authenticated receiver verifies the forwarder's own declaration");
     assert!(receiver.table_meta(LOCAL).is_some());

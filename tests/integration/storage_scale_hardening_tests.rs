@@ -1315,7 +1315,9 @@ fn ssh_c2_sync_applied_commit_contract() {
 
     insert_uuid_row(&source, "t", uuid(500), 1);
     peer.apply_changes(
-        source.changes_since(base),
+        source
+            .changes_since(base)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .unwrap();
@@ -1709,7 +1711,9 @@ fn ssh_c2_sync_applied_index_ddl_lifecycle() {
     let base = source.current_lsn();
     exec(&source, "CREATE INDEX idx_c ON t (col, col2)");
     peer.apply_changes(
-        source.changes_since(base),
+        source
+            .changes_since(base)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .unwrap();
@@ -1725,7 +1729,9 @@ fn ssh_c2_sync_applied_index_ddl_lifecycle() {
     let drop_base = source.current_lsn();
     exec(&source, "DROP INDEX idx_c ON t");
     peer.apply_changes(
-        source.changes_since(drop_base),
+        source
+            .changes_since(drop_base)
+            .expect("read the declared changes"),
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
     )
     .unwrap();

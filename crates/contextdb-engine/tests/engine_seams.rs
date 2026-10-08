@@ -137,3 +137,9 @@ mod incremental_sync_charges_fixed_memory_as_unrelated_ddl_history_grows;
 
 #[path = "engine_seams/bounded_graph_where_metadata_authorization_charges_request_limits.rs"]
 mod bounded_graph_where_metadata_authorization_charges_request_limits;
+
+#[path = "consumer_declared_count_and_pending_seek_contract.rs"]
+mod consumer_declared_count_and_pending_seek_contract;
+
+#[path = "grouped_session_top_n_contract.rs"]
+mod grouped_session_top_n_contract;

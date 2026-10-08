@@ -177,7 +177,9 @@ fn replicate_schema(sender: &Database, receiver: &Database, schema: &str) {
     sender
         .execute(schema, &empty())
         .expect("the sender accepts the table declaration");
-    let changes = sender.changes_since(Lsn(0));
+    let changes = sender
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert!(
         !changes.ddl.is_empty(),
         "the schema snapshot carries the table declaration"
@@ -212,7 +214,9 @@ fn commit_fixture_items(sender: &Database, items: &[FixtureItem]) -> ChangeSet {
     sender.commit(tx).expect("commit both rows together");
 
     let commit_lsn = sender.current_lsn();
-    let changes = sender.changes_since(watermark);
+    let changes = sender
+        .changes_since(watermark)
+        .expect("read the declared changes");
     assert_eq!(changes.rows.len(), items.len());
     assert_eq!(changes.vectors.len(), items.len());
     assert!(changes.rows.iter().all(|row| row.lsn == commit_lsn));
@@ -397,7 +401,9 @@ fn every_consolidation_form_keeps_schema_identity_across_sync() {
         sender
             .execute(statement, &empty())
             .expect("the sender accepts the consolidation form");
-        let changes = sender.changes_since(watermark);
+        let changes = sender
+            .changes_since(watermark)
+            .expect("read the declared changes");
         assert_eq!(changes.ddl.len(), 1, "the form emits one synced DDL change");
         receiver
             .apply_changes(
@@ -480,7 +486,9 @@ fn received_key_only_update_moves_the_unchanged_vector() {
             ]),
         )
         .expect("change only the declared partition key");
-    let changes = sender.changes_since(watermark);
+    let changes = sender
+        .changes_since(watermark)
+        .expect("read the declared changes");
     assert_eq!(changes.rows.len(), 1);
     assert!(
         changes.vectors.is_empty(),
@@ -695,7 +703,9 @@ fn a_lowered_partition_limit_arriving_over_sync_is_refused_and_changes_nothing()
             &params(vec![("id", Value::Uuid(items[1].id))]),
         )
         .expect("delete one scope's row on the sender to bring its own use to one");
-    let delete_changes = sender.changes_since(delete_watermark);
+    let delete_changes = sender
+        .changes_since(delete_watermark)
+        .expect("read the declared changes");
     assert!(
         delete_changes.ddl.is_empty(),
         "the recovery page must carry only the row deletion"
@@ -709,7 +719,9 @@ fn a_lowered_partition_limit_arriving_over_sync_is_refused_and_changes_nothing()
             &empty(),
         )
         .expect("the sender accepts the lowered limit once its own use is one");
-    let changes = sender.changes_since(watermark);
+    let changes = sender
+        .changes_since(watermark)
+        .expect("read the declared changes");
     assert_eq!(
         changes.ddl.len(),
         1,
@@ -853,7 +865,8 @@ async fn start_partition_limit_server(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -916,7 +929,8 @@ async fn a_refused_lowered_partition_limit_holds_the_tenants_pull_until_its_use_
         broker.client_as(&edge_node),
         TenantId::from(PARTITION_LIMIT_SYNC_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client
         .pull_default()
         .await
@@ -939,7 +953,9 @@ async fn a_refused_lowered_partition_limit_holds_the_tenants_pull_until_its_use_
         &params(vec![("id", Value::Uuid(fixture_items()[1].id))]),
     )
     .expect("delete one scope's row on the hub to bring its own use to one");
-    let delete_only_changes = hub.changes_since(watermark);
+    let delete_only_changes = hub
+        .changes_since(watermark)
+        .expect("read the declared changes");
     assert!(
         delete_only_changes.ddl.is_empty(),
         "the hand-cut recovery page must carry only the row deletion, no DDL"
@@ -1261,7 +1277,8 @@ async fn recognition_reference_sync_scope_delete_and_tenant_isolation_journey() 
         broker.client_as(&kerala_node_id),
         TenantId::from(RECOGNITION_REFERENCE_TENANT),
         kerala_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let bangalore_identity = Arc::new(FabricIdentity::generate());
     let bangalore_node_id = bangalore_identity.node_id();
     let bangalore_client = SyncClient::with_authenticated_transport_and_identity_for_test(
@@ -1269,7 +1286,8 @@ async fn recognition_reference_sync_scope_delete_and_tenant_isolation_journey() 
         broker.client_as(&bangalore_node_id),
         TenantId::from(RECOGNITION_REFERENCE_TENANT),
         bangalore_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let other_identity = Arc::new(FabricIdentity::generate());
     let other_node_id = other_identity.node_id();
     let other_client = SyncClient::with_authenticated_transport_and_identity_for_test(
@@ -1277,7 +1295,8 @@ async fn recognition_reference_sync_scope_delete_and_tenant_isolation_journey() 
         broker.client_as(&other_node_id),
         TenantId::from(OTHER_RECOGNITION_REFERENCE_TENANT),
         other_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
 
     let tenant_context = Uuid::from_u128(0x8101);
     let kerala_context = Uuid::from_u128(0x8102);
@@ -1546,7 +1565,12 @@ fn a_synced_restricted_reads_disclosure_lists_only_its_own_authorized_ids() {
             .expect("stage one context-restricted vector row");
     }
     sender.commit(tx).expect("commit both rows together");
-    apply_fixture_changes(&receiver, sender.changes_since(watermark));
+    apply_fixture_changes(
+        &receiver,
+        sender
+            .changes_since(watermark)
+            .expect("read the declared changes"),
+    );
 
     let scoped = receiver.scoped_with_contexts(BTreeSet::from([ContextId::new(allowed_context)]));
     let sql = "SELECT id FROM context_vector_items \

@@ -141,10 +141,6 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
                 if mode == 1 {
                     let result = bounded::execute(&db, &request).unwrap();
                     identity_request_peak = result.telemetry.peak_temporary_bytes;
-                    eprintln!(
-                        "graph traversal rejected={rejected} sql={} work={:?}",
-                        request.sql, result.telemetry.source_work
-                    );
                     result.result.rows
                 } else {
                     request.limits.cursor_page_rows = 1;
@@ -168,7 +164,6 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
             identity_peaks.push(db.accountant().high_water_for_test() - baseline);
             assert_eq!(db.accountant().usage().used, baseline);
         }
-        eprintln!("graph binding-only control rejected={rejected} peaks={identity_peaks:?}");
         let baseline = db.accountant().usage().used;
         let mut arm = Vec::new();
         for mode in 0..3 {
@@ -184,10 +179,6 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
                 );
                 if mode == 1 {
                     let result = bounded::execute(&db, &request).unwrap();
-                    eprintln!(
-                        "graph traversal rejected={rejected} sql={} work={:?}",
-                        request.sql, result.telemetry.source_work
-                    );
                     result.result.rows
                 } else {
                     request.limits.cursor_page_rows = 1;
@@ -223,7 +214,6 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
                 "predicate outputs and per-binding caches release exactly"
             );
         }
-        eprintln!("graph predicate rejected={rejected} peaks={arm:?} baseline={baseline}");
         let metadata_share = arm
             .iter()
             .zip(&identity_peaks)
@@ -233,7 +223,6 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
                     .expect("metadata control has no predicate payload")
             })
             .collect::<Vec<_>>();
-        eprintln!("graph metadata own share rejected={rejected} bytes={metadata_share:?}");
         peaks.push(metadata_share);
         // Even the binding-only traversal must honor the caller's budget.
         // Use its measured request peak, so this refusal tests its own need

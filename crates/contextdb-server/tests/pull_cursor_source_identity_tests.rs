@@ -182,7 +182,8 @@ fn start_hub_as(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -206,6 +207,7 @@ fn edge_client_as(
         TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 fn edge_client_on_transport(
@@ -220,6 +222,7 @@ fn edge_client_on_transport(
         TenantId::from(tenant),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -597,7 +600,10 @@ async fn a_schema_carrying_page_takes_its_cursor_from_the_schema_position() {
             &p(),
         )
         .expect("ddl");
-    let expected_cursor = hub_db.changes_since(before_ddl).max_lsn();
+    let expected_cursor = hub_db
+        .changes_since(before_ddl)
+        .expect("read changes_since fixture")
+        .max_lsn();
     assert!(
         expected_cursor.is_some(),
         "fixture: a DDL-only changeset must carry a max_lsn derived from the \

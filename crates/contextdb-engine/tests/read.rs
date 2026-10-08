@@ -157,3 +157,6 @@ mod reader_proof_support;
 #[cfg(unix)]
 #[path = "read/working_set_bounded_contract.rs"]
 mod working_set_bounded_contract;
+
+#[path = "read/content_size_independent_contract.rs"]
+mod content_size_independent_contract;

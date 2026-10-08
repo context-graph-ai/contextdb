@@ -150,7 +150,12 @@ fn cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservati
         }
     });
     *db.last_maintenance_cycle_at.lock() = None;
-    let result = context.run_cycle(CurrencyGate::Always);
+    let fixture_operation_reader_1 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
+    let result = context.run_cycle(CurrencyGate::Always, fixture_operation_reader_1.clone());
     drop(hook);
     assert!(matches!(result, Err(Error::ReadCancelled)), "{result:?}");
     assert!(captured_workspace.load(Ordering::SeqCst) > 0);
@@ -229,7 +234,12 @@ fn cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_
         }
     });
     *db.last_maintenance_cycle_at.lock() = None;
-    let result = context.run_cycle(CurrencyGate::Always);
+    let fixture_operation_reader_2 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
+    let result = context.run_cycle(CurrencyGate::Always, fixture_operation_reader_2.clone());
     drop(hook);
     assert!(matches!(result, Err(Error::ReadCancelled)), "{result:?}");
     assert!(captured_workspace.load(Ordering::SeqCst) > 0);
@@ -489,7 +499,12 @@ fn publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_f
     });
     *db.last_maintenance_cycle_at.lock() = None;
     let context = db.maintenance_context();
-    let result = context.run_cycle(CurrencyGate::Always);
+    let fixture_operation_reader_3 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
+    let result = context.run_cycle(CurrencyGate::Always, fixture_operation_reader_3.clone());
     drop(hook);
     assert!(
         matches!(result, Err(Error::PublicationInterrupted)),

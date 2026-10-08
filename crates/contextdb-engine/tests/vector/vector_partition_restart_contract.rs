@@ -80,8 +80,13 @@ fn partition(scope: Uuid) -> VectorPartitionKey {
 }
 
 fn graph_available(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(index, &partition(scope))
+        .partition_info(index, &partition(scope), &mut partition_observation_owner_1)
         .unwrap()
         .map(|info| info.graph_available)
         .unwrap_or(false)
@@ -604,9 +609,14 @@ fn a_filtered_indexed_search_survives_reopen_on_the_maintained_route() {
         auto_filtered_after, expected_filtered,
         "filtered AUTO must return the same ids as the maintained-route answer"
     );
-    let auto_trace = db
-        .__take_last_query_vector_trace_for_test()
-        .expect("the filtered AUTO query must publish a debug trace");
+    let auto_trace = {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .expect("the filtered AUTO query must publish a debug trace");
     assert!(
         auto_trace.used_hnsw && auto_trace.fallback_reason.is_none(),
         "filtered AUTO after reopen must take the maintained graph route with no fallback, \

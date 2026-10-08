@@ -21454,6 +21454,16 @@ mod tests {
     }
 
     impl RawVectorMembershipSource for PruningCatalogSource {
+        fn capture_serving_selection(
+            &self,
+            _: SnapshotId,
+            _: Option<&VectorGraphGeneration>,
+            _: Option<&VectorGraphGeneration>,
+            _: &mut VectorCopyAdmission,
+        ) -> Result<CapturedVectorServingSelection> {
+            panic!("pruning must use catalog metadata")
+        }
+
         fn published_summary(&self) -> RawVectorMembershipSummary {
             self.published
         }
@@ -23294,6 +23304,223 @@ mod tests {
 
     #[test]
     fn refused_sampled_build_restores_the_old_tail_replay_frontier() {
+        // A failed captured suffix load rolls back this invocation's new graph
+        // slots while preserving the exact contents and credit already present.
+        struct SavedGraphProducer {
+            encoded: Arc<Vec<u8>>,
+            reader: Arc<CountingMemoryBudget>,
+        }
+        impl DormantVectorGraphLoader for SavedGraphProducer {
+            fn load(
+                &self,
+                _generation: DormantVectorGraphGeneration,
+                caller_reserved_load_bytes: usize,
+                request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+            ) -> Result<LoadedVectorGraphGeneration> {
+                if !request(DormantVectorLoadRequest::Checkpoint) {
+                    return Err(Error::ReadCancelled);
+                }
+                let graph =
+                    HnswIndex::decode_durable_generation(&self.encoded, 2, VectorQuantization::F32)?;
+                let resident_bytes = graph.estimated_resident_bytes();
+                if resident_bytes > caller_reserved_load_bytes {
+                    return Err(Error::Other("decoded graph exceeds saved admission".into()));
+                }
+                Ok(LoadedVectorGraphGeneration {
+                    graph,
+                    resident_bytes,
+                    accountant: self.reader.clone(),
+                    caller_adopted_bytes: resident_bytes,
+                    fresh_tail: None,
+                })
+            }
+        }
+        struct NeverBindOrLoadSuffix;
+        impl CapturedVectorSuffixSource for NeverBindOrLoadSuffix {
+            fn bind_serving_layer(
+                &self,
+                _descriptor: &DormantVectorGraphGeneration,
+                _owner: &mut VectorCopyAdmission,
+            ) -> Result<CapturedVectorGraphLayer> {
+                panic!("this row tests an already-bound immutable selection")
+            }
+            fn bind_serving_frontier(
+                &self,
+                _base: Option<VectorGraphGeneration>,
+                _change: Option<VectorGraphGeneration>,
+                _owner: &mut VectorCopyAdmission,
+            ) -> Result<CapturedVectorSuffix> {
+                panic!("the suffix admission is already bound before this preload")
+            }
+        }
+        impl CapturedVectorSuffixLoader for NeverBindOrLoadSuffix {
+            fn load(
+                &self,
+                _caller_reserved_load_bytes: usize,
+                _request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+            ) -> Result<LoadedCapturedVectorSuffix> {
+                panic!("the actual reader budget refuses before suffix payload loading")
+            }
+        }
+        let captured_index = index();
+        let mut policy =
+            VectorIndexLayout::unpartitioned(2, VectorQuantization::F32).resolve_policy(1, 1);
+        policy.hnsw_m = 8;
+        let mut saved = Vec::new();
+        for (ordinal, vector) in [[1.0, 0.0], [0.0, 1.0]].into_iter().enumerate() {
+            let graph = HnswIndex::from_vector_entries_with_policy(
+                &[entry(&captured_index, ordinal as u64 + 1, TxId(1), vector)],
+                2,
+                VectorQuantization::F32,
+                policy,
+            );
+            let resident = graph.estimated_resident_bytes();
+            let encoded = Arc::new(graph.encode_durable_generation().unwrap());
+            let quote =
+                HnswIndex::durable_resident_bound(&encoded, 2, VectorQuantization::F32, 8).unwrap();
+            let load = quote.max(resident).checked_add(encoded.len()).unwrap();
+            let identity = VectorGraphGeneration {
+                generation_id: ordinal as u64 + 1,
+                covered_tx: TxId(1),
+                covered_lsn: Lsn(1),
+                durable_bytes: encoded.len() as u64,
+                policy_revision: 1,
+                hnsw_m: 8,
+                hnsw_ef_construction: policy.hnsw_ef_construction as u32,
+            };
+            saved.push((
+                encoded,
+                resident,
+                DormantVectorGraphGeneration {
+                    identity,
+                    resident_bytes: quote.max(resident),
+                    load_bytes: load,
+                    reclaim_bytes: 0,
+                },
+            ));
+        }
+        let reader_limit = saved[0]
+            .2
+            .load_bytes
+            .max(saved[0].1.checked_add(saved[1].2.load_bytes).unwrap())
+            .checked_add(1)
+            .unwrap();
+        for preexisting in [false, true] {
+            let reader = Arc::new(CountingMemoryBudget::with_limit(reader_limit));
+            let registered = Arc::new(CountingMemoryBudget::default());
+            let captured_store = VectorStore::default();
+            captured_store
+                .register_index(
+                    captured_index.clone(),
+                    2,
+                    VectorQuantization::F32,
+                    registered,
+                )
+                .unwrap();
+            let captured_state = captured_store.state(&captured_index).unwrap();
+            let mut selection = CapturedVectorServingSelection::new(
+                RawVectorInspectionSnapshot {
+                    captured_catalog: true,
+                    summary: RawVectorMembershipSummary {
+                        entries: 2,
+                        live_entries: 2,
+                        max_tx: TxId(1),
+                    },
+                    base: Some(saved[0].2.identity),
+                    change: Some(saved[1].2.identity),
+                    pending_inserts: 0,
+                    tombstones: 0,
+                    #[cfg(feature = "test-seams")]
+                    base_pending: None,
+                },
+                Some(CapturedVectorGraphLayer {
+                    descriptor: saved[0].2,
+                    loader: Arc::new(SavedGraphProducer {
+                        encoded: saved[0].0.clone(),
+                        reader: reader.clone(),
+                    }),
+                }),
+                Some(CapturedVectorGraphLayer {
+                    descriptor: saved[1].2,
+                    loader: Arc::new(SavedGraphProducer {
+                        encoded: saved[1].0.clone(),
+                        reader: reader.clone(),
+                    }),
+                }),
+                Arc::new(NeverBindOrLoadSuffix),
+            );
+            selection.suffix = Some(CapturedVectorSuffix {
+                resident_bytes: reader_limit,
+                load_bytes: reader_limit,
+                reclaim_bytes: 0,
+                loader: Arc::new(NeverBindOrLoadSuffix),
+            });
+            if preexisting {
+                for (is_base, (encoded, resident, descriptor)) in [true, false].into_iter().zip(&saved)
+                {
+                    let graph =
+                        HnswIndex::decode_durable_generation(encoded, 2, VectorQuantization::F32)
+                            .unwrap();
+                    reader
+                        .try_allocate_for(*resident, "reader", "existing_graph", "fixture")
+                        .unwrap();
+                    let generation = SealedHnswGeneration::new(
+                        descriptor.identity,
+                        graph,
+                        *resident,
+                        Some(reader.clone()),
+                    );
+                    let slots = selection.resident.get_mut();
+                    if is_base {
+                        slots.base = Some(generation);
+                    } else {
+                        slots.change = Some(generation);
+                    }
+                }
+            }
+            let identities_before = {
+                let slots = selection.resident.lock();
+                (
+                    slots.base.as_ref().map(|g| Arc::as_ptr(&g.contents)),
+                    slots.change.as_ref().map(|g| Arc::as_ptr(&g.contents)),
+                )
+            };
+            let baseline = reader.live_bytes();
+            let slots_at_refusal = std::cell::Cell::new(false);
+            let refused = captured_state.preload_captured_serving_selection::<Error>(
+                &selection,
+                &mut || Ok(()),
+                &mut |bytes| {
+                    if bytes == reader_limit {
+                        let slots = selection.resident.lock();
+                        slots_at_refusal.set(slots.base.is_some() && slots.change.is_some());
+                    }
+                    reader.try_allocate_for(bytes, "reader", "captured_preload", "fixture")
+                },
+                &mut |bytes| reader.release(bytes),
+            );
+            assert!(matches!(refused, Err(Error::MemoryBudgetExceeded { .. })));
+            assert!(
+                slots_at_refusal.get(),
+                "both real graphs installed before suffix refusal"
+            );
+            let slots = selection.resident.lock();
+            assert_eq!(
+                (
+                    slots.base.as_ref().map(|g| Arc::as_ptr(&g.contents)),
+                    slots.change.as_ref().map(|g| Arc::as_ptr(&g.contents)),
+                ),
+                identities_before,
+                "new invocation slots are gone; preexisting native graph identities survive"
+            );
+            assert!(slots.suffix.is_none());
+            assert!(!slots.suffix_loaded);
+            drop(slots);
+            assert_eq!(reader.live_bytes(), baseline);
+            drop(selection);
+            assert_eq!(reader.live_bytes(), 0);
+        }
+
         let executing_accountant = Arc::new(CountingMemoryBudget::default());
         let mut executing_admission = VectorCopyAdmission::new(executing_accountant.clone());
 

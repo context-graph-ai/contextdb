@@ -11,6 +11,10 @@ fn fixture() -> (
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("streamed-raw.db");
     let database = crate::Database::open(&path).unwrap();
+    database.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(1))",
+        &HashMap::new(),
+    ).expect("declare the physical vector fixture table and its maintained totals");
     database.close().unwrap();
     let persistence = Arc::new(RedbPersistence::open(&path).unwrap());
     let partition = VectorPartitionRef::new(
@@ -91,7 +95,7 @@ fn streamed_raw_body_finishes_while_close_contends_for_persistence_ownership() {
         .expect("streamed body read deadlocked behind concurrent close")
         .unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].vector, expected.vector);
+    assert_eq!(entries[0].0.vector, expected.vector);
     stream.join().unwrap();
     close.join().unwrap();
     assert!(persistence.with_db(|_| Ok(())).is_err());
@@ -124,7 +128,7 @@ fn streamed_membership_and_body_use_the_same_root_after_concurrent_body_rewrite(
         )
         .unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].vector, expected.vector);
+    assert_eq!(entries[0].0.vector, expected.vector);
     let current = persistence
         .load_vector_entries_for_memberships(
             &persistence.load_vector_partition_memberships().unwrap(),

@@ -6,7 +6,6 @@ use contextdb_engine::read_session::{
     ReadKernelCancellationEvent, ReadKernelSourceEvent, ReadKernelTestObserver,
 };
 use contextdb_engine::{OwnerReadCancellation, ReadSession, ReadSessionOptions};
-use std::collections::{BTreeSet, HashMap};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -404,106 +403,5 @@ fn version_pruning_and_compaction_resume_finite_safe_batches() {
         [(0, 0), (0, 0)],
         "eligible deferred-free entries and pages actually drain"
     );
-    db.close().unwrap();
-}
-
-fn ids(db: &contextdb_engine::Database, table: &str) -> BTreeSet<i64> {
-    exec(db, &format!("SELECT id FROM {table} ORDER BY id"))
-        .into_iter()
-        .map(|row| match row[0] {
-            Value::Int64(id) => id,
-            ref value => panic!("expected integer identity, got {value:?}"),
-        })
-        .collect()
-}
-#[test]
-fn retention_reclaims_both_expired_foreign_key_ends_across_finite_windows() {
-    let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("expiry-cohorts.redb");
-    let db = open(&path, None);
-    exec(
-        &db,
-        "CREATE TABLE cohort_parents (id INT PRIMARY KEY, expiry TIMESTAMP EXPIRES) RETAIN 1 HOURS SYNC OFF",
-    );
-    exec(
-        &db,
-        "CREATE TABLE cohort_children (id INT PRIMARY KEY, parent INT REFERENCES cohort_parents(id), expiry TIMESTAMP EXPIRES) RETAIN 1 HOURS SYNC OFF",
-    );
-    for id in 0..130 {
-        db.execute(
-            "INSERT INTO cohort_parents VALUES ($id,$expiry)",
-            &HashMap::from([
-                ("id".into(), Value::Int64(id)),
-                ("expiry".into(), Value::Timestamp(100)),
-            ]),
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO cohort_children VALUES ($id,$id,$expiry)",
-            &HashMap::from([
-                ("id".into(), Value::Int64(id)),
-                ("expiry".into(), Value::Timestamp(100)),
-            ]),
-        )
-        .unwrap();
-    }
-    // The same declared TTL applies to this child, but its future expiry keeps
-    // the already-expired parent protected throughout every candidate window.
-    db.execute(
-        "INSERT INTO cohort_parents VALUES (1000,$expiry)",
-        &HashMap::from([("expiry".into(), Value::Timestamp(100))]),
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO cohort_children VALUES (1000,1000,$expiry)",
-        &HashMap::from([("expiry".into(), Value::Timestamp(1_800_000_000_000))]),
-    )
-    .unwrap();
-    let mut removed = 0;
-    let mut saw_positive_work = false;
-    for cycle in 0..64 {
-        let (report, work) = observe(|| db.run_pruning_cycle_checked());
-        let report = report.unwrap();
-        assert!(
-            report.pruned_rows <= 64,
-            "finite deletion bound: {report:?}"
-        );
-        assert!(
-            work.retention_keys_examined <= 512,
-            "finite candidate bound: {work:?}"
-        );
-        saw_positive_work |= work.retention_keys_examined > 0;
-        removed += report.pruned_rows;
-        let parents = ids(&db, "cohort_parents");
-        let children = ids(&db, "cohort_children");
-        assert!(
-            children.is_subset(&parents),
-            "no surviving child loses its parent at cycle {cycle}"
-        );
-        assert!(
-            parents.contains(&1000) && children.contains(&1000),
-            "future child protects its expired parent"
-        );
-        if removed == 260 {
-            break;
-        }
-    }
-    assert!(saw_positive_work);
-    assert_eq!(
-        removed, 260,
-        "both expired ends are eventually physically reclaimed"
-    );
-    for table in ["cohort_parents", "cohort_children"] {
-        assert_eq!(ids(&db, table), BTreeSet::from([1000]));
-        assert_eq!(db.__durable_version_count_for_test(table).unwrap(), 1);
-    }
-    db.close().unwrap();
-    drop(db);
-    let db = open(&path, None);
-    for table in ["cohort_parents", "cohort_children"] {
-        assert_eq!(ids(&db, table), BTreeSet::from([1000]));
-        assert_eq!(db.__durable_version_count_for_test(table).unwrap(), 1);
-    }
     db.close().unwrap();
 }

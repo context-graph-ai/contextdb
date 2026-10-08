@@ -151,11 +151,16 @@ fn caller_driven_store_two_refs_both_enter_build_windows_concurrently() {
     let (done_text_tx, done_text_rx) = mpsc::channel();
     let store_text = vector_store.clone();
     let text_worker_ref = text_ref.clone();
+    let text_reader = db
+        .declared_reader_memory()
+        .expect("admit the maintenance fixture reader");
     thread::spawn(move || {
+        let mut executing_owner = contextdb_engine::vector_read_memory::admission(text_reader);
         done_text_tx
             .send(store_text.run_hnsw_maintenance_for_index_for_test(
                 &text_worker_ref,
                 Arc::new(MemoryAccountant::no_limit()),
+                &mut executing_owner,
             ))
             .unwrap();
     });
@@ -164,11 +169,16 @@ fn caller_driven_store_two_refs_both_enter_build_windows_concurrently() {
     let (done_face_tx, done_face_rx) = mpsc::channel();
     let store_face = vector_store.clone();
     let face_worker_ref = face_ref.clone();
+    let face_reader = db
+        .declared_reader_memory()
+        .expect("admit the maintenance fixture reader");
     thread::spawn(move || {
+        let mut executing_owner = contextdb_engine::vector_read_memory::admission(face_reader);
         done_face_tx
             .send(store_face.run_hnsw_maintenance_for_index_for_test(
                 &face_worker_ref,
                 Arc::new(MemoryAccountant::no_limit()),
+                &mut executing_owner,
             ))
             .unwrap();
     });

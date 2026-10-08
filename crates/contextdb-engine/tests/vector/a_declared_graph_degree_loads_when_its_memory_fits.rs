@@ -139,8 +139,13 @@ fn seed(path: &std::path::Path, declared: &str) -> Vec<Vec<Uuid>> {
     }
     db.commit(tx).expect("commit the partition");
     let ready = || {
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         db.vector_store_for_test()
-            .partition_info(&index(), &partition())
+            .partition_info(&index(), &partition(), &mut partition_observation_owner_1)
             .unwrap()
             .is_some_and(|info| info.graph_available)
     };

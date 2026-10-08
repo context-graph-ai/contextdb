@@ -48,6 +48,7 @@ fn schema(db: &Database, table: &str) -> String {
 fn create_table_ddl_bytes(db: &Database, table: &str) -> Vec<u8> {
     let declaration = db
         .changes_since(Lsn(0))
+        .expect("read the declared changes")
         .ddl
         .into_iter()
         .find(|change| matches!(change, DdlChange::CreateTable { name, .. } if name == table))
@@ -112,7 +113,8 @@ async fn start_server(
             TenantId::from(TENANT),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -203,7 +205,10 @@ async fn current_transport_holds_missing_capabilities_until_the_receiver_gains_t
             )
             .expect("insert one vector through the ordinary SQL path");
     }
-    let vector_changes = source.changes_since(watermark).vectors;
+    let vector_changes = source
+        .changes_since(watermark)
+        .expect("read the declared changes")
+        .vectors;
     assert_eq!(
         vector_changes.len(),
         2,
@@ -228,7 +233,8 @@ async fn current_transport_holds_missing_capabilities_until_the_receiver_gains_t
         broker.client_as(&receiver_node),
         TenantId::from(TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);

@@ -107,9 +107,18 @@ fn lineages(
     author: &Arc<FabricIdentity>,
     incarnation: Incarnation,
 ) -> HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage> {
-    db.outbound_row_lineages(changes, tenant, &author.node_id(), incarnation, &|bytes| {
-        Ok(author.sign_lineage(bytes))
-    })
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    db.outbound_row_lineages(
+        changes,
+        tenant,
+        &author.node_id(),
+        incarnation,
+        &|bytes| Ok(author.sign_lineage(bytes)),
+        fixture_operation_reader_1.clone(),
+    )
     .expect("committed in-memory rows retain authenticated lineage")
 }
 
@@ -174,7 +183,7 @@ fn committed_memory_creation_binds_once_across_retry_and_update() {
     let base = db.current_lsn();
     let id = Uuid::new_v4();
     insert(&db, id, "created");
-    let created = db.changes_since(base);
+    let created = db.changes_since(base).expect("read the declared changes");
 
     let first = lineages(&db, &created, &tenant, &author, incarnation);
     let retry = lineages(&db, &created, &tenant, &author, incarnation);
@@ -183,12 +192,17 @@ fn committed_memory_creation_binds_once_across_retry_and_update() {
 
     let after_insert = db.current_lsn();
     update(&db, id, "updated");
-    let updated = db.changes_since(after_insert);
+    let updated = db
+        .changes_since(after_insert)
+        .expect("read the declared changes");
     let updated_lineage = only_lineage(&lineages(&db, &updated, &tenant, &author, incarnation));
     assert_eq!(
         updated_lineage, created_lineage,
         "updates keep the creation tuple and signature"
     );
+    let fixture_operation_reader_2 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
 
     assert!(
         db.outbound_row_lineages(
@@ -197,6 +211,7 @@ fn committed_memory_creation_binds_once_across_retry_and_update() {
             &other_author.node_id(),
             incarnation,
             &|bytes| Ok(other_author.sign_lineage(bytes)),
+            fixture_operation_reader_2.clone()
         )
         .is_err(),
         "one in-memory database life refuses a different explicit identity"
@@ -246,7 +261,7 @@ fn file_creation_lineage_survives_state_propagation_before_first_sync() {
 
     let author = identity(&root, "author");
     let incarnation = db.sync_incarnation(&tenant).expect("file incarnation");
-    let changes = db.changes_since(Lsn(0));
+    let changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     let creation_evidence = db
         .persistence
         .as_ref()
@@ -261,12 +276,18 @@ fn file_creation_lineage_survives_state_propagation_before_first_sync() {
         "parent and child creation evidence must survive propagation: {creation_evidence:?}"
     );
     for (_, evidence) in &creation_evidence {
+        let fixture_operation_reader_3 = db
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+
         let live_row_id = db
             .row_id_for_natural_key_full(
                 &evidence.table,
                 &evidence.natural_key,
                 db.snapshot_for_read(),
+                fixture_operation_reader_3.clone(),
             )
+            .unwrap()
             .expect("created row remains visible");
         assert_eq!(
             live_row_id, evidence.local_row_id,
@@ -324,12 +345,15 @@ fn rolled_back_memory_creation_publishes_no_lineage_state() {
     .expect("stage insert");
     db.rollback(tx).expect("rollback");
     assert!(
-        db.changes_since(base).rows.is_empty(),
+        db.changes_since(base)
+            .expect("read the declared changes")
+            .rows
+            .is_empty(),
         "rollback publishes no row"
     );
 
     insert(&db, id, "committed");
-    let committed = db.changes_since(base);
+    let committed = db.changes_since(base).expect("read the declared changes");
     let lineage = only_lineage(&lineages(&db, &committed, &tenant, &author, incarnation));
     assert_eq!(
         lineage.author_local_mutation_position, committed.rows[0].lsn,
@@ -353,7 +377,7 @@ fn rolled_back_memory_creation_publishes_no_lineage_state() {
     db.commit(winner).expect("commit winner");
     assert!(db.commit(loser).is_err(), "duplicate commit is refused");
     let _ = db.rollback(loser);
-    let published = db.changes_since(base);
+    let published = db.changes_since(base).expect("read the declared changes");
     let published_lineages = lineages(&db, &published, &tenant, &author, incarnation);
     assert_eq!(
         published_lineages.len(),
@@ -373,7 +397,9 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
     let source_base = source.current_lsn();
     let id = Uuid::new_v4();
     insert(&source, id, "source");
-    let changes = source.changes_since(source_base);
+    let changes = source
+        .changes_since(source_base)
+        .expect("read the declared changes");
     let source_incarnation = source
         .sync_incarnation(&tenant)
         .expect("source incarnation");
@@ -382,6 +408,12 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
 
     let relay = Database::open_memory();
     notes(&relay);
+    let fixture_operation_reader_4 = relay
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_4 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_4.clone());
+
     relay
         .apply_authenticated_received_changes_with_lineages(
             changes.clone(),
@@ -392,9 +424,13 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
             &lineage_entries(&changes, &source_lineages),
             None,
             false,
+            &mut fixture_operation_copy_4,
+            fixture_operation_reader_4.clone(),
         )
         .expect("relay applies authenticated live row");
-    let relayed = relay.changes_since(Lsn(0));
+    let relayed = relay
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let relay_lineage = only_lineage(&lineages(
         &relay,
         &relayed,
@@ -411,8 +447,21 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
     notes(&schema_source);
     let schema_id = Uuid::new_v4();
     insert(&schema_source, schema_id, "schema source");
+    let fixture_operation_reader_5 = schema_source
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_5 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_5.clone());
+    let mut fixture_selection_credit_5 =
+        contextdb_core::read_memory::ReadCredit::new(fixture_operation_reader_5.clone());
+
     let (schema_changes, _, schema_ddl_source) = schema_source
-        .checked_changes_since_with_arrivals(Lsn(0))
+        .checked_changes_since_with_arrivals(
+            Lsn(0),
+            &mut fixture_operation_copy_5,
+            fixture_operation_reader_5.clone(),
+            &mut fixture_selection_credit_5,
+        )
         .expect("schema source changes");
     let schema_incarnation = schema_source
         .sync_incarnation(&tenant)
@@ -424,6 +473,10 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
         &author,
         schema_incarnation,
     );
+    let fixture_operation_reader_6 = schema_source
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let schema_provenance = schema_source
         .outbound_ddl_provenance(
             &schema_changes,
@@ -432,6 +485,7 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
             &author.node_id(),
             schema_incarnation,
             &|bytes| Ok(author.sign_lineage(bytes)),
+            fixture_operation_reader_6.clone(),
         )
         .expect("authenticated schema provenance");
     let received = crate::protocol::ReceivedDdlContext {
@@ -451,6 +505,12 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
             .collect(),
     };
     let schema_relay = Database::open_memory();
+    let fixture_operation_reader_7 = schema_relay
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_7 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_7.clone());
+
     schema_relay
         .apply_authenticated_received_changes_with_lineages(
             schema_changes.clone(),
@@ -461,9 +521,13 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
             &lineage_entries(&schema_changes, &schema_lineages),
             Some(&received),
             false,
+            &mut fixture_operation_copy_7,
+            fixture_operation_reader_7.clone(),
         )
         .expect("relay applies authenticated schema-bearing row");
-    let schema_relayed = schema_relay.changes_since(Lsn(0));
+    let schema_relayed = schema_relay
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     assert_eq!(
         only_lineage(&lineages(
             &schema_relay,
@@ -489,13 +553,30 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
     notes(&source);
     let id = Uuid::new_v4();
     insert(&source, id, "source row");
+    let fixture_operation_reader_8 = source
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_8 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_8.clone());
+    let mut fixture_selection_credit_8 =
+        contextdb_core::read_memory::ReadCredit::new(fixture_operation_reader_8.clone());
+
     let (changes, _, source_ddl_source) = source
-        .checked_changes_since_with_arrivals(Lsn(0))
+        .checked_changes_since_with_arrivals(
+            Lsn(0),
+            &mut fixture_operation_copy_8,
+            fixture_operation_reader_8.clone(),
+            &mut fixture_selection_credit_8,
+        )
         .expect("source schema and row changes");
     let source_incarnation = source
         .sync_incarnation(&tenant)
         .expect("source incarnation");
     let source_lineages = lineages(&source, &changes, &tenant, &author, source_incarnation);
+    let fixture_operation_reader_9 = source
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let source_provenance = source
         .outbound_ddl_provenance(
             &changes,
@@ -504,6 +585,7 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
             &author.node_id(),
             source_incarnation,
             &|bytes| Ok(author.sign_lineage(bytes)),
+            fixture_operation_reader_9.clone(),
         )
         .expect("source schema provenance");
     let received = crate::protocol::ReceivedDdlContext {
@@ -533,6 +615,12 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
     };
 
     let relay = Database::open_memory();
+    let fixture_operation_reader_10 = relay
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_10 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_10.clone());
+
     relay
         .apply_authenticated_received_changes_with_lineages(
             schema_only,
@@ -543,8 +631,16 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
             &[],
             Some(&received),
             true,
+            &mut fixture_operation_copy_10,
+            fixture_operation_reader_10.clone(),
         )
         .expect("schema-less relay accepts authenticated schema");
+    let fixture_operation_reader_11 = relay
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_11 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_11.clone());
+
     relay
         .apply_authenticated_received_changes_with_lineages(
             rows_only.clone(),
@@ -555,11 +651,25 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
             &lineage_entries(&rows_only, &source_lineages),
             None,
             false,
+            &mut fixture_operation_copy_11,
+            fixture_operation_reader_11.clone(),
         )
         .expect("schema-only acceptance supplies the row generation");
+    let fixture_operation_reader_12 = relay
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_12 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_12.clone());
+    let mut fixture_selection_credit_12 =
+        contextdb_core::read_memory::ReadCredit::new(fixture_operation_reader_12.clone());
 
     let (forwarded, _, relay_ddl_source) = relay
-        .checked_changes_since_with_arrivals(Lsn(0))
+        .checked_changes_since_with_arrivals(
+            Lsn(0),
+            &mut fixture_operation_copy_12,
+            fixture_operation_reader_12.clone(),
+            &mut fixture_selection_credit_12,
+        )
         .expect("accepted schema and row are available to forward");
     let forwarded_incarnation = relay.sync_incarnation(&tenant).expect("relay incarnation");
     let forwarded_lineage = only_lineage(&lineages(
@@ -569,6 +679,10 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
         &relay_author,
         forwarded_incarnation,
     ));
+    let fixture_operation_reader_13 = relay
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let forwarded_provenance = relay
         .outbound_ddl_provenance(
             &forwarded,
@@ -577,6 +691,7 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
             &relay_author.node_id(),
             forwarded_incarnation,
             &|bytes| Ok(relay_author.sign_lineage(bytes)),
+            fixture_operation_reader_13.clone(),
         )
         .expect("accepted table generation has outbound provenance");
     assert_eq!(
@@ -636,7 +751,9 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
     insert(&before_send, id, "created then deleted");
     let insert_lsn = before_send.current_lsn();
     delete(&before_send, id);
-    let deleted_before_send = before_send.changes_since(base);
+    let deleted_before_send = before_send
+        .changes_since(base)
+        .expect("read the declared changes");
     let delete_lineages = lineages(
         &before_send,
         &deleted_before_send,
@@ -645,9 +762,13 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
         incarnation,
     );
     let before_send_lineage = deleted_lineage(&deleted_before_send, &delete_lineages);
+    let fixture_operation_reader_14 = before_send
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         before_send
-            .has_durable_pending_delete_obligations()
+            .has_durable_pending_delete_obligations(fixture_operation_reader_14.clone())
             .expect("inspect pending delete"),
         "a local delete remains owed after an unsuccessful send"
     );
@@ -679,11 +800,16 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
             .collect(),
         ..ChangeSet::default()
     };
+    let fixture_operation_reader_15 = before_send
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     before_send
         .validate_received_row_lineages(
             &tenant,
             &delete_only,
             &lineage_entries(&delete_only, &delete_lineages),
+            fixture_operation_reader_15.clone(),
         )
         .expect("pre-push delete creator tuple and signature validate");
 
@@ -695,7 +821,9 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
     let pushed_id = Uuid::new_v4();
     let live_base = accepted_db.current_lsn();
     insert(&accepted_db, pushed_id, "created before first push");
-    let pushed = accepted_db.changes_since(live_base);
+    let pushed = accepted_db
+        .changes_since(live_base)
+        .expect("read the declared changes");
     let pushed_lineage = only_lineage(&lineages(
         &accepted_db,
         &pushed,
@@ -711,6 +839,7 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
     );
     let accepted = accepted_db
         .changes_since(delete_base)
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .filter(|row| row.deleted)
@@ -733,12 +862,20 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
         pushed_lineage,
         "a post-push delete retains its original creation lineage"
     );
+    let fixture_operation_reader_16 = accepted_db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         accepted_db
-            .has_durable_pending_delete_obligations()
+            .has_durable_pending_delete_obligations(fixture_operation_reader_16.clone())
             .expect("inspect accepted-delete pending state"),
         "the post-push delete is pending before the hub acknowledgement"
     );
+    let fixture_operation_reader_1 = accepted_db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     accepted_db
         .record_hub_push_reply_effects_while_authoritative(
             &tenant,
@@ -747,15 +884,20 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
             &[],
             &accepted,
             Lsn(17),
+            fixture_operation_reader_1.clone(),
         )
         .expect("record accepted delete");
     assert!(
         note_is_absent(&accepted_db, pushed_id),
         "the accepted local delete remains absent after the hub acknowledgement"
     );
+    let fixture_operation_reader_17 = accepted_db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         !accepted_db
-            .has_durable_pending_delete_obligations()
+            .has_durable_pending_delete_obligations(fixture_operation_reader_17.clone())
             .expect("inspect accepted delete"),
         "hub acknowledgement retires the pending send obligation"
     );
@@ -778,6 +920,7 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
     delete(&refused_db, refused_id);
     let refused = refused_db
         .changes_since(after_acceptance)
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .filter(|row| row.deleted)
@@ -792,12 +935,20 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
         &author,
         refused_incarnation,
     );
+    let fixture_operation_reader_18 = refused_db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         refused_db
-            .has_durable_pending_delete_obligations()
+            .has_durable_pending_delete_obligations(fixture_operation_reader_18.clone())
             .expect("inspect refused delete"),
         "a delete remains pending until the hub gives its outcome"
     );
+    let fixture_operation_reader_2 = refused_db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     refused_db
         .record_hub_push_reply_effects_while_authoritative(
             &tenant,
@@ -806,11 +957,16 @@ fn memory_deletes_keep_creation_lineage_and_pending_obligation() {
             &[],
             &[],
             Lsn(18),
+            fixture_operation_reader_2.clone(),
         )
         .expect("record refused delete");
+    let fixture_operation_reader_19 = refused_db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         !refused_db
-            .has_durable_pending_delete_obligations()
+            .has_durable_pending_delete_obligations(fixture_operation_reader_19.clone())
             .expect("inspect refused delete retirement"),
         "terminal refusal retires the pending delete obligation"
     );
@@ -840,12 +996,16 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
     let id = Uuid::new_v4();
     let before_insert = source.current_lsn();
     insert(&source, id, "creator-owned row");
-    let inserted = source.changes_since(before_insert);
+    let inserted = source
+        .changes_since(before_insert)
+        .expect("read the declared changes");
     let insert_lsn = inserted.rows.first().expect("creator emits one insert").lsn;
     let inserted_lineages = lineages(&source, &inserted, &tenant, &creator, source_incarnation);
     let before_delete = source.current_lsn();
     delete(&source, id);
-    let deleted = source.changes_since(before_delete);
+    let deleted = source
+        .changes_since(before_delete)
+        .expect("read the declared changes");
     let delete_lsn = deleted
         .rows
         .iter()
@@ -858,6 +1018,12 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
 
     let receiver = Database::open_memory();
     keep_first_notes(&receiver);
+    let fixture_operation_reader_20 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_20 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_20.clone());
+
     receiver
         .apply_authenticated_received_changes_with_receipt_and_lineages(
             inserted.clone(),
@@ -874,8 +1040,16 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
             Some("receiver-hub"),
             &inserted_entries,
             None,
+            &mut fixture_operation_copy_20,
+            fixture_operation_reader_20.clone(),
         )
         .expect("receiver commits the creator row and its authenticated sidecar");
+    let fixture_operation_reader_21 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_21 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_21.clone());
+
     let fresh = receiver
         .apply_authenticated_received_changes_with_receipt_and_lineages(
             deleted.clone(),
@@ -892,6 +1066,8 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
             Some("receiver-hub"),
             &deleted_entries,
             None,
+            &mut fixture_operation_copy_21,
+            fixture_operation_reader_21.clone(),
         )
         .expect("an unordered delete from the exact authenticated creator applies");
     assert_eq!(fresh.applied_rows, 1, "creator delete applies exactly once");
@@ -904,6 +1080,12 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
 
     let relayed_receiver = Database::open_memory();
     keep_first_notes(&relayed_receiver);
+    let fixture_operation_reader_22 = relayed_receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_22 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_22.clone());
+
     relayed_receiver
         .apply_authenticated_received_changes_with_receipt_and_lineages(
             inserted.clone(),
@@ -920,8 +1102,16 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
             Some("receiver-hub"),
             &inserted_entries,
             None,
+            &mut fixture_operation_copy_22,
+            fixture_operation_reader_22.clone(),
         )
         .expect("relay case starts with the same committed creator row");
+    let fixture_operation_reader_23 = relayed_receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_23 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_23.clone());
+
     let relayed = relayed_receiver
         .apply_authenticated_received_changes_with_receipt_and_lineages(
             deleted.clone(),
@@ -938,6 +1128,8 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
             Some("receiver-hub"),
             &deleted_entries,
             None,
+            &mut fixture_operation_copy_23,
+            fixture_operation_reader_23.clone(),
         )
         .expect("a relayed delete is a handled terminal refusal");
     assert_eq!(
@@ -955,6 +1147,12 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
 
     let carried_receiver = Database::open_memory();
     keep_first_notes(&carried_receiver);
+    let fixture_operation_reader_24 = carried_receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_24 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_24.clone());
+
     carried_receiver
         .apply_authenticated_received_changes_with_receipt_and_lineages(
             inserted.clone(),
@@ -971,8 +1169,16 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
             Some("receiver-hub"),
             &inserted_entries,
             None,
+            &mut fixture_operation_copy_24,
+            fixture_operation_reader_24.clone(),
         )
         .expect("carried-arrival case starts with the same committed creator row");
+    let fixture_operation_reader_25 = carried_receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_25 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_25.clone());
+
     let carried = carried_receiver
         .apply_authenticated_received_changes_with_receipt_and_lineages(
             deleted,
@@ -989,6 +1195,8 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
             Some("receiver-hub"),
             &deleted_entries,
             None,
+            &mut fixture_operation_copy_25,
+            fixture_operation_reader_25.clone(),
         )
         .expect("a carried creator delete is a handled stale/no-op path");
     assert_eq!(carried.applied_rows, 0, "carried delete does not apply");
@@ -1015,7 +1223,9 @@ fn authenticated_fresh_creator_delete_does_not_override_server_wins() {
     let claim_key = "job:1";
     let before_insert = source.current_lsn();
     insert_work_claim(&source, claim_key);
-    let inserted = source.changes_since(before_insert);
+    let inserted = source
+        .changes_since(before_insert)
+        .expect("read the declared changes");
     let insert_lsn = inserted
         .rows
         .first()
@@ -1029,7 +1239,9 @@ fn authenticated_fresh_creator_delete_does_not_override_server_wins() {
             &HashMap::from([("claim_key".to_string(), Value::Text(claim_key.to_string()))]),
         )
         .expect("creator deletes its work claim");
-    let deleted = source.changes_since(before_delete);
+    let deleted = source
+        .changes_since(before_delete)
+        .expect("read the declared changes");
     let delete_lsn = deleted
         .rows
         .iter()
@@ -1042,6 +1254,12 @@ fn authenticated_fresh_creator_delete_does_not_override_server_wins() {
 
     let receiver = Database::open_memory();
     server_wins_work_claims(&receiver);
+    let fixture_operation_reader_26 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_26 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_26.clone());
+
     receiver
         .apply_authenticated_received_changes_with_receipt_and_lineages(
             inserted.clone(),
@@ -1058,8 +1276,16 @@ fn authenticated_fresh_creator_delete_does_not_override_server_wins() {
             Some("receiver-hub"),
             &inserted_entries,
             None,
+            &mut fixture_operation_copy_26,
+            fixture_operation_reader_26.clone(),
         )
         .expect("server-wins receiver commits the creator row and its sidecar");
+    let fixture_operation_reader_27 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_27 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_27.clone());
+
     let refused = receiver
         .apply_authenticated_received_changes_with_receipt_and_lineages(
             deleted,
@@ -1076,6 +1302,8 @@ fn authenticated_fresh_creator_delete_does_not_override_server_wins() {
             Some("receiver-hub"),
             &deleted_entries,
             None,
+            &mut fixture_operation_copy_27,
+            fixture_operation_reader_27.clone(),
         )
         .expect("server-wins refusal still acknowledges the handled source unit");
     assert_eq!(refused.applied_rows, 0, "server-wins keeps its row");
@@ -1105,12 +1333,20 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
     let id = Uuid::new_v4();
     let before_insert = source.current_lsn();
     insert(&source, id, "creator-owned row");
-    let inserted = source.changes_since(before_insert);
+    let inserted = source
+        .changes_since(before_insert)
+        .expect("read the declared changes");
     let inserted_lineages = lineages(&source, &inserted, &tenant, &creator, source_incarnation);
     let inserted_entries = lineage_entries(&inserted, &inserted_lineages);
 
     let receiver = Database::open_memory();
     keep_first_notes(&receiver);
+    let fixture_operation_reader_28 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_28 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_28.clone());
+
     receiver
         .apply_authenticated_received_changes_with_lineages(
             inserted,
@@ -1121,6 +1357,8 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
             &inserted_entries,
             None,
             false,
+            &mut fixture_operation_copy_28,
+            fixture_operation_reader_28.clone(),
         )
         .expect("receiver commits the creator row and its authenticated sidecar");
 
@@ -1129,8 +1367,21 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
         .execute("ALTER TABLE notes ADD COLUMN tag TEXT", &HashMap::new())
         .expect("creator alters the same table before deleting its row");
     delete(&source, id);
+    let fixture_operation_reader_29 = source
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_29 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_29.clone());
+    let mut fixture_selection_credit_29 =
+        contextdb_core::read_memory::ReadCredit::new(fixture_operation_reader_29.clone());
+
     let (mixed, arrivals, ddl_source) = source
-        .checked_changes_since_with_arrivals(before_mixed)
+        .checked_changes_since_with_arrivals(
+            before_mixed,
+            &mut fixture_operation_copy_29,
+            fixture_operation_reader_29.clone(),
+            &mut fixture_selection_credit_29,
+        )
         .expect("collect received ALTER and delete");
     let delete_lsn = mixed
         .rows
@@ -1140,6 +1391,10 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
         .lsn;
     let mixed_lineages = lineages(&source, &mixed, &tenant, &creator, source_incarnation);
     let mixed_entries = lineage_entries(&mixed, &mixed_lineages);
+    let fixture_operation_reader_30 = source
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let received = crate::protocol::ReceivedDdlContext {
         tenant_id: tenant.clone(),
         source_node_id: creator.node_id(),
@@ -1152,6 +1407,7 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
                 &creator.node_id(),
                 source_incarnation,
                 &|bytes| Ok(creator.sign_lineage(bytes)),
+                fixture_operation_reader_30.clone(),
             )
             .expect("authenticated ALTER provenance")
             .into_iter()
@@ -1165,6 +1421,12 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
             })
             .collect(),
     };
+    let fixture_operation_reader_31 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_31 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_31.clone());
+
     let applied = receiver
         .apply_authenticated_received_changes_with_receipt_and_lineages(
             mixed,
@@ -1181,6 +1443,8 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
             None,
             &mixed_entries,
             Some(&received),
+            &mut fixture_operation_copy_31,
+            fixture_operation_reader_31.clone(),
         )
         .expect("received-DDL preflight and detached apply agree on the creator delete");
     assert_eq!(applied.applied_rows, 1, "creator delete applies once");
@@ -1221,11 +1485,15 @@ fn fresh_creator_delete_race_errors_without_advancing_its_receipt() {
     let id = Uuid::new_v4();
     let before_insert = source.current_lsn();
     insert(&source, id, "creator-owned row");
-    let inserted = source.changes_since(before_insert);
+    let inserted = source
+        .changes_since(before_insert)
+        .expect("read the declared changes");
     let inserted_lineages = lineages(&source, &inserted, &tenant, &creator, source_incarnation);
     let before_delete = source.current_lsn();
     delete(&source, id);
-    let deleted = source.changes_since(before_delete);
+    let deleted = source
+        .changes_since(before_delete)
+        .expect("read the declared changes");
     let delete_lsn = deleted
         .rows
         .iter()
@@ -1239,6 +1507,12 @@ fn fresh_creator_delete_race_errors_without_advancing_its_receipt() {
 
     let receiver = Arc::new(Database::open_memory());
     keep_first_notes(&receiver);
+    let fixture_operation_reader_32 = receiver
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_32 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_32.clone());
+
     receiver
         .apply_authenticated_received_changes_with_lineages(
             inserted.clone(),
@@ -1249,6 +1523,8 @@ fn fresh_creator_delete_race_errors_without_advancing_its_receipt() {
             &lineage_entries(&inserted, &inserted_lineages),
             None,
             false,
+            &mut fixture_operation_copy_32,
+            fixture_operation_reader_32.clone(),
         )
         .expect("receiver commits the creator row and its authenticated sidecar");
     let pause = receiver.pause_before_sync_apply_commit_for_test();
@@ -1260,6 +1536,13 @@ fn fresh_creator_delete_race_errors_without_advancing_its_receipt() {
         let applying_entries = deleted_entries.clone();
         let apply = scope.spawn(move || {
             applying.mark_this_thread_for_sync_apply_pre_commit_pause_for_test();
+            let fixture_operation_reader_33 = applying
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+            let mut fixture_operation_copy_33 = contextdb_engine::vector_read_memory::admission(
+                fixture_operation_reader_33.clone(),
+            );
+
             applying.apply_authenticated_received_changes_with_receipt_and_lineages(
                 applying_deleted,
                 &HashMap::from([(delete_lsn, None)]),
@@ -1275,6 +1558,8 @@ fn fresh_creator_delete_race_errors_without_advancing_its_receipt() {
                 None,
                 &applying_entries,
                 None,
+                &mut fixture_operation_copy_33,
+                fixture_operation_reader_33.clone(),
             )
         });
         assert!(
@@ -1321,7 +1606,9 @@ fn accepted_local_delete_blocks_only_older_same_source_replay_and_stays_pushable
     let id = Uuid::new_v4();
     let before_insert = edge.current_lsn();
     insert(&edge, id, "before delete");
-    let stale_changes = edge.changes_since(before_insert);
+    let stale_changes = edge
+        .changes_since(before_insert)
+        .expect("read the declared changes");
     let stale_live = stale_changes
         .rows
         .iter()
@@ -1346,6 +1633,7 @@ fn accepted_local_delete_blocks_only_older_same_source_replay_and_stays_pushable
     .expect("local delete");
     let accepted_delete = edge
         .changes_since(stale_lsn)
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .find(|row| row.deleted)
@@ -1357,9 +1645,16 @@ fn accepted_local_delete_blocks_only_older_same_source_replay_and_stays_pushable
     )
     .expect("record accepted local delete");
     assert!(
-        !edge.row_change_arrived_by_sync(&accepted_delete),
+        !edge
+            .row_change_arrived_by_sync(&accepted_delete)
+            .expect("read the actual fixture observation"),
         "an AcceptedLocal delete must remain eligible to repair a hub that regressed"
     );
+    let fixture_operation_reader_34 = edge
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_34 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_34.clone());
 
     edge.apply_authenticated_received_changes_with_lineages(
         stale_changes.clone(),
@@ -1370,12 +1665,19 @@ fn accepted_local_delete_blocks_only_older_same_source_replay_and_stays_pushable
         &stale_lineage_entries,
         None,
         false,
+        &mut fixture_operation_copy_34,
+        fixture_operation_reader_34.clone(),
     )
     .expect("signed stale hub replay is a safe no-op");
     assert!(
         note_is_absent(&edge, id),
         "a stale signed hub replay must not resurrect an acknowledged local delete in this session"
     );
+    let fixture_operation_reader_35 = edge
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_35 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_35.clone());
 
     edge.apply_authenticated_received_changes_with_lineages(
         stale_changes.clone(),
@@ -1386,6 +1688,8 @@ fn accepted_local_delete_blocks_only_older_same_source_replay_and_stays_pushable
         &stale_lineage_entries,
         None,
         false,
+        &mut fixture_operation_copy_35,
+        fixture_operation_reader_35.clone(),
     )
     .expect("signed same-commit authoritative refusal repair applies");
     assert!(
@@ -1397,6 +1701,7 @@ fn accepted_local_delete_blocks_only_older_same_source_replay_and_stays_pushable
     delete(&edge, id);
     let second_delete = edge
         .changes_since(before_second_delete)
+        .expect("read the declared changes")
         .rows
         .into_iter()
         .find(|row| row.deleted)
@@ -1422,6 +1727,12 @@ fn accepted_local_delete_blocks_only_older_same_source_replay_and_stays_pushable
         Some("hub"),
     )
     .expect("record old-source accepted delete");
+    let fixture_operation_reader_36 = edge
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_36 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_36.clone());
+
     edge.apply_authenticated_received_changes_with_lineages(
         stale_changes,
         &HashMap::from([(stale_lsn, Some(Lsn(1)))]),
@@ -1431,6 +1742,8 @@ fn accepted_local_delete_blocks_only_older_same_source_replay_and_stays_pushable
         &stale_lineage_entries,
         None,
         false,
+        &mut fixture_operation_copy_36,
+        fixture_operation_reader_36.clone(),
     )
     .expect("signed new-source authoritative history applies");
     assert!(
@@ -1453,18 +1766,24 @@ async fn failed_memory_delete_send_keeps_the_obligation_pending() {
     let broker = crate::transport::in_process::InProcessBroker::new();
     let hub = "unavailable-hub";
     let _ = broker.server_as(hub);
-    let client = crate::sync_client::SyncClient::with_authenticated_transport_and_identity_for_test(
-        db.clone(),
-        broker.client_as(&author.node_id()),
-        tenant.clone(),
-        author,
-    );
+    let client =
+        crate::sync_client::SyncClient::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.client_as(&author.node_id()),
+            tenant.clone(),
+            author,
+        )
+        .expect("construct the authenticated sync endpoint");
     assert!(
         client.push().await.is_err(),
         "unavailable hub refuses the send"
     );
+    let fixture_operation_reader_37 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
-        db.has_durable_pending_delete_obligations()
+        db.has_durable_pending_delete_obligations(fixture_operation_reader_37.clone())
             .expect("inspect pending delete after failed send"),
         "a failed send leaves the local delete pending for the next push"
     );
@@ -1484,14 +1803,24 @@ fn received_memory_deletes_keep_inherited_lineage() {
     let source_incarnation = source
         .sync_incarnation(&tenant)
         .expect("source incarnation");
-    let inserted = source.changes_since(base);
+    let inserted = source
+        .changes_since(base)
+        .expect("read the declared changes");
     let inserted_lineages = lineages(&source, &inserted, &tenant, &author, source_incarnation);
     delete(&source, id);
-    let deleted = source.changes_since(inserted.rows[0].lsn);
+    let deleted = source
+        .changes_since(inserted.rows[0].lsn)
+        .expect("read the declared changes");
     let deleted_lineages = lineages(&source, &deleted, &tenant, &author, source_incarnation);
 
     let relay = Database::open_memory();
     notes(&relay);
+    let fixture_operation_reader_38 = relay
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_38 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_38.clone());
+
     relay
         .apply_authenticated_received_changes_with_lineages(
             inserted.clone(),
@@ -1502,8 +1831,16 @@ fn received_memory_deletes_keep_inherited_lineage() {
             &lineage_entries(&inserted, &inserted_lineages),
             None,
             false,
+            &mut fixture_operation_copy_38,
+            fixture_operation_reader_38.clone(),
         )
         .expect("relay applies live row");
+    let fixture_operation_reader_39 = relay
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_39 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_39.clone());
+
     relay
         .apply_authenticated_received_changes_with_lineages(
             deleted.clone(),
@@ -1514,9 +1851,13 @@ fn received_memory_deletes_keep_inherited_lineage() {
             &lineage_entries(&deleted, &deleted_lineages),
             None,
             false,
+            &mut fixture_operation_copy_39,
+            fixture_operation_reader_39.clone(),
         )
         .expect("relay applies delete");
-    let relayed_delete = relay.changes_since(Lsn(0));
+    let relayed_delete = relay
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     let relay_incarnation = relay.sync_incarnation(&tenant).expect("relay incarnation");
     let ordinary_delete = relayed_delete
         .rows
@@ -1568,7 +1909,9 @@ fn new_memory_database_is_a_new_incarnation_without_old_state() {
     let first_base = first.current_lsn();
     let live_id = Uuid::new_v4();
     insert(&first, live_id, "first live row");
-    let first_live_changes = first.changes_since(first_base);
+    let first_live_changes = first
+        .changes_since(first_base)
+        .expect("read the declared changes");
     let first_live_lineage = only_lineage(&lineages(
         &first,
         &first_live_changes,
@@ -1579,7 +1922,9 @@ fn new_memory_database_is_a_new_incarnation_without_old_state() {
     let deleted_id = Uuid::new_v4();
     let delete_create_base = first.current_lsn();
     insert(&first, deleted_id, "first pending delete");
-    let delete_creation = first.changes_since(delete_create_base);
+    let delete_creation = first
+        .changes_since(delete_create_base)
+        .expect("read the declared changes");
     let _ = lineages(
         &first,
         &delete_creation,
@@ -1589,14 +1934,20 @@ fn new_memory_database_is_a_new_incarnation_without_old_state() {
     );
     let delete_base = first.current_lsn();
     delete(&first, deleted_id);
-    let first_delete = first.changes_since(delete_base);
+    let first_delete = first
+        .changes_since(delete_base)
+        .expect("read the declared changes");
     let first_delete_lineage = deleted_lineage(
         &first_delete,
         &lineages(&first, &first_delete, &tenant, &author, first_incarnation),
     );
+    let fixture_operation_reader_40 = first
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         first
-            .has_durable_pending_delete_obligations()
+            .has_durable_pending_delete_obligations(fixture_operation_reader_40.clone())
             .expect("first pending delete"),
         "the first memory life carries a pending delete"
     );
@@ -1619,7 +1970,11 @@ fn new_memory_database_is_a_new_incarnation_without_old_state() {
         "a new in-memory database is a distinct life even with the same transport key"
     );
     assert!(
-        second.changes_since(Lsn(0)).rows.is_empty(),
+        second
+            .changes_since(Lsn(0))
+            .expect("read the declared changes")
+            .rows
+            .is_empty(),
         "new life has no old rows"
     );
     assert_eq!(
@@ -1629,9 +1984,13 @@ fn new_memory_database_is_a_new_incarnation_without_old_state() {
         (Lsn(0), Lsn(0)),
         "new life has no old cursors"
     );
+    let fixture_operation_reader_41 = second
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     assert!(
         !second
-            .has_durable_pending_delete_obligations()
+            .has_durable_pending_delete_obligations(fixture_operation_reader_41.clone())
             .expect("memory delete state"),
         "new life has no old pending deletes or lineage"
     );
@@ -1647,7 +2006,9 @@ fn new_memory_database_is_a_new_incarnation_without_old_state() {
     insert(&second, deleted_id, "second life");
     let second_lineage = only_lineage(&lineages(
         &second,
-        &second.changes_since(second_base),
+        &second
+            .changes_since(second_base)
+            .expect("read the declared changes"),
         &tenant,
         &reloaded_author,
         second
@@ -1675,7 +2036,9 @@ fn ordinary_push_outcome_survives_hub_reopen_and_newer_edits() {
         let before = source.current_lsn();
         let id = Uuid::from_u128(0xB001);
         insert(&source, id, "source-value");
-        let changes = source.changes_since(before);
+        let changes = source
+            .changes_since(before)
+            .expect("read the declared changes");
         let incarnation = source.sync_incarnation(&tenant).unwrap();
         let lineages = lineages(&source, &changes, &tenant, &creator, incarnation);
         let entries = lineage_entries(&changes, &lineages);
@@ -1700,6 +2063,12 @@ fn ordinary_push_outcome_survives_hub_reopen_and_newer_edits() {
         };
         let path = root.path().join("hub.db");
         let hub = Database::open(&path).unwrap();
+        let fixture_operation_reader_42 = hub
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_42 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_42.clone());
+
         if refused {
             keep_first_notes(&hub);
             insert(&hub, id, "first-winner");
@@ -1716,6 +2085,8 @@ fn ordinary_push_outcome_survives_hub_reopen_and_newer_edits() {
                 &entries,
                 None,
                 Some(&key),
+                &mut fixture_operation_copy_42,
+                fixture_operation_reader_42.clone(),
             )
             .unwrap();
         assert_eq!(original.conflicts.is_empty(), !refused);
@@ -1731,6 +2102,12 @@ fn ordinary_push_outcome_survives_hub_reopen_and_newer_edits() {
         drop(hub);
         let reopened = Database::open(&path).unwrap();
         let before_retry = reopened.current_lsn();
+        let fixture_operation_reader_43 = reopened
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_43 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_43.clone());
+
         let replay = reopened
             .apply_authenticated_received_changes_with_outcome(
                 changes.clone(),
@@ -1741,6 +2118,8 @@ fn ordinary_push_outcome_survives_hub_reopen_and_newer_edits() {
                 &entries,
                 None,
                 Some(&key),
+                &mut fixture_operation_copy_43,
+                fixture_operation_reader_43.clone(),
             )
             .unwrap();
         assert_eq!(
@@ -1782,7 +2161,9 @@ fn ordinary_push_outcomes_keep_only_the_latest_retry_reachable_request_per_edge(
     let mut keys = Vec::new();
     for (offset, body) in [(0_u128, "first"), (1_u128, "second")] {
         insert(&source, Uuid::from_u128(0xB100 + offset), body);
-        let changes = source.changes_since(since);
+        let changes = source
+            .changes_since(since)
+            .expect("read the declared changes");
         since = changes.max_lsn().unwrap();
         let lineages = lineages(&source, &changes, &tenant, &creator, incarnation);
         let entries = lineage_entries(&changes, &lineages);
@@ -1797,6 +2178,12 @@ fn ordinary_push_outcomes_keep_only_the_latest_retry_reachable_request_per_edge(
         };
         let key =
             Database::sync_push_outcome_key(&tenant, &creator.node_id(), &request, false).unwrap();
+        let fixture_operation_reader_44 = hub
+            .declared_reader_memory()
+            .expect("admit the actual fixture reader");
+        let mut fixture_operation_copy_44 =
+            contextdb_engine::vector_read_memory::admission(fixture_operation_reader_44.clone());
+
         hub.apply_authenticated_received_changes_with_outcome(
             changes,
             &HashMap::new(),
@@ -1813,6 +2200,8 @@ fn ordinary_push_outcomes_keep_only_the_latest_retry_reachable_request_per_edge(
             &entries,
             None,
             Some(&key),
+            &mut fixture_operation_copy_44,
+            fixture_operation_reader_44.clone(),
         )
         .unwrap();
         keys.push(key);
@@ -1876,7 +2265,9 @@ fn purge_leaves_no_natural_key_in_retry_storage_and_exact_refusal_still_replays(
             &HashMap::from([("id".to_string(), Value::Text(FORGOTTEN_KEY.to_string()))]),
         )
         .unwrap();
-    let changes = source.changes_since(before);
+    let changes = source
+        .changes_since(before)
+        .expect("read the declared changes");
     let incarnation = source.sync_incarnation(&tenant).unwrap();
     let lineages = lineages(&source, &changes, &tenant, &creator, incarnation);
     let entries = lineage_entries(&changes, &lineages);
@@ -1908,6 +2299,12 @@ fn purge_leaves_no_natural_key_in_retry_storage_and_exact_refusal_still_replays(
         &HashMap::from([("id".to_string(), Value::Text(FORGOTTEN_KEY.to_string()))]),
     )
     .unwrap();
+    let fixture_operation_reader_45 = hub
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_45 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_45.clone());
+
     let original = hub
         .apply_authenticated_received_changes_with_outcome(
             changes.clone(),
@@ -1918,6 +2315,8 @@ fn purge_leaves_no_natural_key_in_retry_storage_and_exact_refusal_still_replays(
             &entries,
             None,
             Some(&key),
+            &mut fixture_operation_copy_45,
+            fixture_operation_reader_45.clone(),
         )
         .unwrap();
     assert_eq!(original.conflicts.len(), 1);
@@ -1951,6 +2350,12 @@ fn purge_leaves_no_natural_key_in_retry_storage_and_exact_refusal_still_replays(
 
     let reopened = Database::open(&path).unwrap();
     assert_retry_storage_has_no_key(&reopened);
+    let fixture_operation_reader_46 = reopened
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_46 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_46.clone());
+
     let replay = reopened
         .apply_authenticated_received_changes_with_outcome(
             changes,
@@ -1961,6 +2366,8 @@ fn purge_leaves_no_natural_key_in_retry_storage_and_exact_refusal_still_replays(
             &entries,
             None,
             Some(&key),
+            &mut fixture_operation_copy_46,
+            fixture_operation_reader_46.clone(),
         )
         .unwrap();
     assert_eq!(
@@ -2001,7 +2408,9 @@ fn failed_ordinary_apply_never_publishes_an_outcome_or_consumed_progress() {
             &HashMap::from([("id".to_string(), Value::Uuid(Uuid::from_u128(0xB002)))]),
         )
         .unwrap();
-    let changes = source.changes_since(before);
+    let changes = source
+        .changes_since(before)
+        .expect("read the declared changes");
     let incarnation = source.sync_incarnation(&tenant).unwrap();
     let lineages = lineages(&source, &changes, &tenant, &creator, incarnation);
     let entries = lineage_entries(&changes, &lineages);
@@ -2019,6 +2428,12 @@ fn failed_ordinary_apply_never_publishes_an_outcome_or_consumed_progress() {
     let path = root.path().join("hub.db");
     let hub = Database::open_with_plugin(&path, Arc::new(RejectOrdinaryPushCommit)).unwrap();
     notes(&hub);
+    let fixture_operation_reader_47 = hub
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_47 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_47.clone());
+
     let error = hub
         .apply_authenticated_received_changes_with_outcome(
             changes.clone(),
@@ -2036,6 +2451,8 @@ fn failed_ordinary_apply_never_publishes_an_outcome_or_consumed_progress() {
             &entries,
             None,
             Some(&key),
+            &mut fixture_operation_copy_47,
+            fixture_operation_reader_47.clone(),
         )
         .expect_err("the durable commit is interrupted after adjudication");
     assert!(

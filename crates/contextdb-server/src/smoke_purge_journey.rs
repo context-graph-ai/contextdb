@@ -67,7 +67,7 @@ impl Hub {
                     .map_err(|_| "cannot declare purge verifier hub table".to_string())?;
             }
         }
-        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant));
+        let server = SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant)).map_err(|e| format!("cannot construct smoke server: {e}"))?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
@@ -133,7 +133,7 @@ fn open_edge(
         db.clone(),
         &peer_dial_spec(ticket, &identity),
         TenantId::from(tenant),
-    );
+    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
     Ok(Edge {
         db,
         client,
@@ -223,9 +223,17 @@ fn inspect_snapshot_key(
     table: &str,
     column: &str,
     value: Value,
+    inspection_memory: &Arc<contextdb_engine::vector_read_memory::DeclaredReadMemory>,
 ) -> Result<KeyInspection, String> {
     inspector
-        .inspect_key(table, &NaturalKey::single(column.to_string(), value), &[])
+        .inspect_key(
+            table,
+            &NaturalKey::single(column.to_string(), value),
+            &[],
+            inspection_memory
+                .child()
+                .map_err(|e| format!("cannot admit smoke key inspection: {e}"))?,
+        )
         .map_err(|_| "cannot inspect purge key state".to_string())
 }
 
@@ -238,9 +246,15 @@ fn export_key(
 ) -> Result<KeyInspection, String> {
     db.export_snapshot(artifact)
         .map_err(|_| "cannot export purge inspection snapshot".to_string())?;
-    let inspector = SnapshotInspector::open(artifact)
+    let inspection_memory = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        db.owner_read_config().limits.limits.memory,
+    );
+    let inspection_read = inspection_memory
+        .child()
+        .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
+    let inspector = SnapshotInspector::open(artifact, inspection_read, inspection_memory.clone())
         .map_err(|_| "cannot open purge inspection snapshot".to_string())?;
-    let report = inspect_snapshot_key(&inspector, table, column, value)?;
+    let report = inspect_snapshot_key(&inspector, table, column, value, &inspection_memory)?;
     inspector
         .close()
         .map_err(|_| "cannot close purge key inspector".to_string())?;
@@ -250,7 +264,13 @@ fn export_key(
 fn export_blob(db: &Database, artifact: &Path, hash: &BlobHash) -> Result<BlobInspection, String> {
     db.export_snapshot(artifact)
         .map_err(|_| "cannot export blob inspection snapshot".to_string())?;
-    let inspector = SnapshotInspector::open(artifact)
+    let inspection_memory = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        db.owner_read_config().limits.limits.memory,
+    );
+    let inspection_read = inspection_memory
+        .child()
+        .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
+    let inspector = SnapshotInspector::open(artifact, inspection_read, inspection_memory)
         .map_err(|_| "cannot open blob inspection snapshot".to_string())?;
     let report = inspector
         .inspect_blob(hash.as_bytes())
@@ -681,7 +701,13 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
     hub.db
         .export_snapshot(&post_purge)
         .map_err(|_| "cannot export post-purge backup".to_string())?;
-    let backup_inspector = SnapshotInspector::open(&post_purge)
+    let inspection_memory = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        hub.db.owner_read_config().limits.limits.memory,
+    );
+    let inspection_read = inspection_memory
+        .child()
+        .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
+    let backup_inspector = SnapshotInspector::open(&post_purge, inspection_read, inspection_memory.clone())
         .map_err(|_| "cannot inspect post-purge backup".to_string())?;
     for (name, table, column, value) in [
         ("first selected row", "notes", "id", Value::Uuid(selected)),
@@ -698,7 +724,7 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
             Value::Text("selected-detection-job".to_string()),
         ),
     ] {
-        let report = inspect_snapshot_key(&backup_inspector, table, column, value)?;
+        let report = inspect_snapshot_key(&backup_inspector, table, column, value, &inspection_memory)?;
         require_purged_key(&report, &format!("post-purge backup {name}"))?;
     }
     let backup_blob = backup_inspector
@@ -819,7 +845,7 @@ async fn run_recreated_generation(root: &Path) -> Result<(), String> {
         restored.clone(),
         &peer_dial_spec(&hub.ticket, &source.identity),
         TenantId::from(tenant),
-    );
+    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
     let replay = within(client.push())
         .await?
         .map_err(|_| "old-generation replay did not return a result".to_string())?;
@@ -909,7 +935,13 @@ async fn run_recreated_generation(root: &Path) -> Result<(), String> {
 fn sync_state(db: &Database, artifact: &Path) -> Result<JsonValue, String> {
     db.export_snapshot(artifact)
         .map_err(|_| "cannot export purge state fingerprint".to_string())?;
-    let inspector = SnapshotInspector::open(artifact)
+    let inspection_memory = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+        db.owner_read_config().limits.limits.memory,
+    );
+    let inspection_read = inspection_memory
+        .child()
+        .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
+    let inspector = SnapshotInspector::open(artifact, inspection_read, inspection_memory)
         .map_err(|_| "cannot open purge state fingerprint".to_string())?;
     let state = inspector
         .inspect_sync_apply_state()
@@ -1162,7 +1194,7 @@ async fn run_push_only(root: &Path) -> Result<(), String> {
         stale_db.clone(),
         &peer_dial_spec(&hub.ticket, &edge.identity),
         TenantId::from(tenant),
-    );
+    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
     let refusal = within(stale_client.push())
         .await?
         .map_err(|_| "stale push-only replay did not return a result".to_string())?;
@@ -1441,7 +1473,7 @@ async fn run_wrong_hub(root: &Path) -> Result<(), String> {
         edge.db.clone(),
         &peer_dial_spec(&wrong.ticket, &edge.identity),
         TenantId::from(tenant),
-    );
+    ).map_err(|e| format!("cannot construct smoke client: {e}"))?;
     within(wrong_client.ensure_connected())
         .await?
         .map_err(|_| "cannot authenticate wrong-hub fixture".to_string())?;
@@ -1502,7 +1534,7 @@ async fn run_forged_push(root: &Path) -> Result<(), String> {
         vec![0.0, 1.0, 0.0],
     )?;
     let push_watermark = edge.client.push_watermark();
-    let mut changeset = WireChangeSet::from(edge.db.changes_since(push_watermark));
+    let mut changeset = WireChangeSet::from(edge.db.changes_since(push_watermark).map_err(|e| format!("cannot read smoke changes: {e}"))?);
     if changeset.rows.is_empty() {
         return Err("forged-push fixture has no ordinary sibling row".to_string());
     }

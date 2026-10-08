@@ -323,7 +323,6 @@ fn automatic_storage_memory_refusal_keeps_the_store_usable() {
         }
     }
     let error = refusal.expect("a payload relocation exceeds this tight budget");
-    eprintln!("budgeted storage refusal: {error:?}");
     assert!(
         matches!(error, contextdb_core::Error::MemoryBudgetExceeded {
             ref subsystem, ref operation, requested_bytes,

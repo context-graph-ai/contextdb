@@ -473,7 +473,8 @@ async fn start_hub(spec: &str, tenant: &str) -> RunningHub {
             contextdb_core::TenantId::from(tenant),
             node_id.clone(),
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -508,11 +509,14 @@ async fn retained_sync_server_releases_the_stopped_hub_port_for_rebind() {
         .await
         .expect("bind original hub");
     let controller = endpoint.large_request_test_controller();
-    let retained_server = Arc::new(SyncServer::new(
-        Arc::new(Database::open_memory()),
-        &endpoint,
-        contextdb_core::TenantId::from("retained-server-port-release"),
-    ));
+    let retained_server = Arc::new(
+        SyncServer::new(
+            Arc::new(Database::open_memory()),
+            &endpoint,
+            contextdb_core::TenantId::from("retained-server-port-release"),
+        )
+        .expect("construct SyncServer fixture"),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let serve_task = tokio::spawn({
         let retained_server = retained_server.clone();
@@ -548,11 +552,14 @@ async fn owner_forced_close_joins_an_active_serve_before_rebind() {
         .await
         .expect("bind original hub");
     let controller = endpoint.large_request_test_controller();
-    let retained_server = Arc::new(SyncServer::new(
-        Arc::new(Database::open_memory()),
-        &endpoint,
-        contextdb_core::TenantId::from("owner-forced-active-close"),
-    ));
+    let retained_server = Arc::new(
+        SyncServer::new(
+            Arc::new(Database::open_memory()),
+            &endpoint,
+            contextdb_core::TenantId::from("owner-forced-active-close"),
+        )
+        .expect("construct SyncServer fixture"),
+    );
     let serve_task = tokio::spawn({
         let retained_server = retained_server.clone();
         async move {
@@ -974,7 +981,8 @@ async fn sync_push_pull_status_over_iroh() {
         edge_a.clone(),
         &peer_dial_spec(&hub.ticket, &edge_a_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client_a.push()).await.expect("edge a push");
     assert_eq!(
         note_body(&hub.server_db, note_a).as_deref(),
@@ -989,7 +997,8 @@ async fn sync_push_pull_status_over_iroh() {
         edge_b.clone(),
         &peer_dial_spec(&hub.ticket, &edge_b_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client_b.pull_default()).await.expect("edge b pull");
     assert_eq!(
         note_body(&edge_b, note_a).as_deref(),
@@ -1026,7 +1035,8 @@ async fn large_changeset_moves_in_one_stream_over_iroh() {
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &sender_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("large push");
     assert_eq!(
         note_body(&hub.server_db, id).map(|body| body.len()),
@@ -1040,7 +1050,8 @@ async fn large_changeset_moves_in_one_stream_over_iroh() {
         reader.clone(),
         &peer_dial_spec(&hub.ticket, &reader_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(reader_client.pull_default())
         .await
         .expect("large pull");
@@ -2074,7 +2085,10 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
     // Both stores already have the same declaration. Advancing the source
     // watermark before the row write keeps DDL off the wire in this journey.
     create_notes_table(&hub);
-    let server = Arc::new(SyncServer::new(hub.clone(), &endpoint, tenant.clone()));
+    let server = Arc::new(
+        SyncServer::new(hub.clone(), &endpoint, tenant.clone())
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
         let server = server.clone();
@@ -2106,7 +2120,8 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         tenant.clone(),
-    );
+    )
+    .expect("construct SyncClient fixture");
     bootstrap
         .push()
         .await
@@ -2176,11 +2191,14 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
         declaration_lsn.0 + 1,
         "the oversized row-only request must keep all rows in one accepted source LSN"
     );
-    let client = Arc::new(SyncClient::new(
-        edge.clone(),
-        &peer_dial_spec(&ticket, &edge_identity),
-        tenant.clone(),
-    ));
+    let client = Arc::new(
+        SyncClient::new(
+            edge.clone(),
+            &peer_dial_spec(&ticket, &edge_identity),
+            tenant.clone(),
+        )
+        .expect("construct SyncClient fixture"),
+    );
     let hub_before = hub.current_lsn();
     let pull_cursor_before = edge
         .persisted_sync_pull_cursor(&tenant)
@@ -2336,6 +2354,7 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
     );
     let accepted_rows = hub
         .changes_since(hub_before)
+        .expect("read changes_since fixture")
         .rows
         .into_iter()
         .filter(|change| change.table == "notes")
@@ -2417,7 +2436,8 @@ async fn reconnect_after_hub_restart_over_iroh() {
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("push before restart");
     let server_db_before = hub.server_db.clone();
     assert_eq!(
@@ -2488,7 +2508,8 @@ async fn backlog_accumulated_offline_reaches_hub_over_iroh() {
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     assert!(
         within(client.push()).await.is_err(),
         "pushing at a down hub must fail, not hang or silently drop"
@@ -2526,7 +2547,8 @@ async fn unreachable_hub_maps_to_transport_neutral_errors() {
         edge.clone(),
         &peer_dial_spec(&ticket, &edge_identity),
         contextdb_core::TenantId::from("iroh-downed"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let err = within(client.push())
         .await
         .expect_err("push at a downed hub must error")
@@ -2660,7 +2682,8 @@ async fn dial_spec_with_identity_pins_the_edge_fabric_identity() {
         edge.clone(),
         &combined,
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("identified push");
     assert_eq!(
         note_body(&hub.server_db, id).as_deref(),
@@ -2760,7 +2783,8 @@ async fn ticket_relay_url_enables_relay_dialing() {
         edge.clone(),
         &dial_spec,
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push())
         .await
         .expect("push through a relay-only ticket must succeed: the ticket names the relay, so the dialing endpoint must enable exactly that relay");
@@ -2780,7 +2804,8 @@ async fn unsupported_endpoint_scheme_errors_actionably() {
         edge,
         "tcp://localhost:4222",
         contextdb_core::TenantId::from("iroh-compat"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let err = within(client.ensure_connected())
         .await
         .expect_err("an unsupported endpoint scheme must error")
@@ -3174,7 +3199,8 @@ async fn enrollment_ticket_failures_redact_the_ticket_at_every_entrypoint() {
         Arc::new(Database::open_memory()),
         &format!("iroh:malformed/{ticket}"),
         TenantId::from("ticket-redaction-malformed"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     record(
         "dial malformed tagged ticket",
         within(malformed_client.ensure_connected()).await,
@@ -3187,7 +3213,8 @@ async fn enrollment_ticket_failures_redact_the_ticket_at_every_entrypoint() {
             identity.display()
         ),
         TenantId::from("ticket-redaction-bind"),
-    );
+    )
+    .expect("construct SyncClient fixture");
     record(
         "dial bind spec with relay ticket",
         within(bind_client.ensure_connected()).await,
@@ -3535,7 +3562,8 @@ async fn mdns_lookup_resolves_identity_only_tickets_on_the_lan() {
         "iroh:?to={id_only_ticket}&lookup=mdns&identity={}",
         edge_identity.display()
     );
-    let client = SyncClient::new(edge.clone(), &dial, contextdb_core::TenantId::from(tenant));
+    let client = SyncClient::new(edge.clone(), &dial, contextdb_core::TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
 
     // mDNS convergence can take a few announce cycles; retry the push until
     // the resolve succeeds (bounded by the outer test timeout).
@@ -3673,7 +3701,8 @@ async fn sync_status_reports_unreachable_after_hub_dies() {
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("push while hub is up");
     assert!(
         client.is_connected().await,
@@ -3800,7 +3829,8 @@ async fn iroh_push_arms_the_retention_hub_and_records_client_receipts() {
         edge.clone(),
         &peer_dial_spec(&hub.ticket, &edge_identity),
         contextdb_core::TenantId::from(tenant),
-    );
+    )
+    .expect("construct SyncClient fixture");
     within(client.push()).await.expect("push over iroh");
 
     // Consequence 1: the multi-hub refusal is armed against a REAL hub identity.

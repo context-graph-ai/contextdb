@@ -171,7 +171,11 @@ fn the_encoded_row_identity_distinguishes_rows_sharing_all_but_one_key_column() 
     target.execute(WINDOWS_DDL, &p()).expect("target table");
     target
         .apply_changes(
-            across_the_wire(source.changes_since(Lsn(0))),
+            across_the_wire(
+                source
+                    .changes_since(Lsn(0))
+                    .expect("read changes_since fixture"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("apply the decoded changeset");
@@ -201,7 +205,14 @@ fn an_encoded_delete_names_the_whole_key() {
     target.execute(WINDOWS_DDL, &p()).expect("target table");
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     target
-        .apply_changes(across_the_wire(source.changes_since(Lsn(0))), &policies)
+        .apply_changes(
+            across_the_wire(
+                source
+                    .changes_since(Lsn(0))
+                    .expect("read changes_since fixture"),
+            ),
+            &policies,
+        )
         .expect("apply the inserts");
 
     let before_delete = source.current_lsn();
@@ -210,7 +221,11 @@ fn an_encoded_delete_names_the_whole_key() {
         .expect("delete the first window");
     target
         .apply_changes(
-            across_the_wire(source.changes_since(before_delete)),
+            across_the_wire(
+                source
+                    .changes_since(before_delete)
+                    .expect("read changes_since fixture"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .expect("apply the delete");
@@ -257,7 +272,11 @@ fn guard_a_single_column_identity_still_round_trips() {
         .expect("target table");
     target
         .apply_changes(
-            across_the_wire(source.changes_since(Lsn(0))),
+            across_the_wire(
+                source
+                    .changes_since(Lsn(0))
+                    .expect("read changes_since fixture"),
+            ),
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
         .expect("apply the decoded changeset");
@@ -372,7 +391,12 @@ fn the_encoded_natural_key_carries_every_ordered_key_component() {
     source.execute(MARKED_DDL, &p()).expect("source table");
     insert_marked(&source);
 
-    let wire: WireChangeSet = strip_ddl(source.changes_since(Lsn(0))).into();
+    let wire: WireChangeSet = strip_ddl(
+        source
+            .changes_since(Lsn(0))
+            .expect("read changes_since fixture"),
+    )
+    .into();
     assert_eq!(
         wire.rows.len(),
         1,
@@ -408,7 +432,12 @@ fn the_encoded_delete_identity_carries_every_ordered_key_component() {
         .execute("DELETE FROM marked WHERE window_key = 'kmark-delta'", &p())
         .expect("delete the marked row");
 
-    let wire: WireChangeSet = strip_ddl(source.changes_since(before_delete)).into();
+    let wire: WireChangeSet = strip_ddl(
+        source
+            .changes_since(before_delete)
+            .expect("read changes_since fixture"),
+    )
+    .into();
     let tombstone = wire
         .rows
         .iter()
@@ -456,7 +485,14 @@ fn guard_a_keyless_id_table_round_trips_unchanged() {
     }
     let after_insert = source.current_lsn();
     target
-        .apply_changes(across_the_wire(source.changes_since(Lsn(0))), &policies)
+        .apply_changes(
+            across_the_wire(
+                source
+                    .changes_since(Lsn(0))
+                    .expect("read changes_since fixture"),
+            ),
+            &policies,
+        )
         .expect("apply inserts");
 
     source
@@ -467,7 +503,11 @@ fn guard_a_keyless_id_table_round_trips_unchanged() {
         .expect("delete row 1");
     target
         .apply_changes(
-            across_the_wire(source.changes_since(after_insert)),
+            across_the_wire(
+                source
+                    .changes_since(after_insert)
+                    .expect("read changes_since fixture"),
+            ),
             &policies,
         )
         .expect("apply update and delete");

@@ -884,7 +884,9 @@ fn commit_failed_observer_fires_on_pre_commit_rejection_during_sync_pull_apply()
     let db_a = Database::open_memory();
     exec_empty(&db_a, "CREATE TABLE items (id TEXT PRIMARY KEY)");
     exec_empty(&db_a, "INSERT INTO items (id) VALUES ('A')");
-    let mut changes = db_a.changes_since(Lsn(0));
+    let mut changes = db_a
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     changes.ddl.clear();
     changes.ddl_lsn.clear();
     assert_eq!(changes.rows.len(), 1, "sender changeset must carry one row");

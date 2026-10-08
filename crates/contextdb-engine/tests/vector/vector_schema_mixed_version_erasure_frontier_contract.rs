@@ -136,7 +136,8 @@ async fn start_server(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -199,7 +200,8 @@ async fn a_held_tables_authoritative_purge_reaches_the_old_copy_after_upgrade() 
         broker.client_as(&receiver_node),
         TenantId::from(PURGE_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -304,7 +306,8 @@ async fn a_rebuilt_edge_with_the_same_identity_receives_compatible_history_from_
         broker.client_as(&receiver_node),
         TenantId::from(REBUILT_EDGE_TENANT),
         receiver_identity.clone(),
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -334,7 +337,8 @@ async fn a_rebuilt_edge_with_the_same_identity_receives_compatible_history_from_
         broker.client_as(&receiver_node),
         TenantId::from(REBUILT_EDGE_TENANT),
         receiver_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     running
         .server
         .set_peer_vector_schema_support_for_test(&receiver_node, false);
@@ -381,7 +385,8 @@ async fn a_rebuilt_hub_with_the_same_identity_receives_compatible_history_from_z
         broker.client_as(&edge_node),
         TenantId::from(REBUILT_HUB_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.set_peer_vector_schema_support_for_test(false);
     client
         .push()
@@ -444,7 +449,8 @@ async fn a_row_committed_during_schema_only_push_remains_pending_for_the_next_pu
             broker.client_as(&edge_node),
             TenantId::from(SCHEMA_RACE_TENANT),
             edge_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
 
     let socket_root = tempfile::Builder::new()
@@ -613,7 +619,8 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
         broker.client_as(&edge_node),
         TenantId::from(POLICY_SYNC_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     client.pull_default().await.expect(
         "both peers run at PROTOCOL_VERSION: the vector policy vocabulary is not held back",
     );

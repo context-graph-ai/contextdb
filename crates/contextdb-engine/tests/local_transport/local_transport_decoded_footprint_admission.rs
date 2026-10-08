@@ -161,10 +161,13 @@ fn the_crafted_request_bytes_match_the_channel_encoder() {
     let mut params = BTreeMap::new();
     params.insert(
         "p".to_owned(),
-        Value::Json(serde_json::Value::Array(vec![
-            serde_json::Value::from(0u8),
-            serde_json::Value::from(0u8),
-        ])),
+        Value::Json(
+            serde_json::Value::Array(vec![
+                serde_json::Value::from(0u8),
+                serde_json::Value::from(0u8),
+            ])
+            .into(),
+        ),
     );
     let envelope = LocalRequestEnvelope {
         limits: ReadLimits::default(),
@@ -229,12 +232,15 @@ fn an_ordinary_json_parameter_request_is_still_admitted() {
     };
     assert_eq!(
         params.get("p"),
-        Some(&Value::Json(serde_json::Value::Array(vec![
-            serde_json::Value::from(0u8),
-            serde_json::Value::from(0u8),
-            serde_json::Value::from(0u8),
-            serde_json::Value::from(0u8),
-        ])))
+        Some(&Value::Json(
+            serde_json::Value::Array(vec![
+                serde_json::Value::from(0u8),
+                serde_json::Value::from(0u8),
+                serde_json::Value::from(0u8),
+                serde_json::Value::from(0u8),
+            ])
+            .into()
+        ))
     );
 }
 
@@ -279,7 +285,7 @@ fn a_response_frame_carrying_that_cursor_page_is_refused_before_the_page_is_deco
     let payload_length = page_bytes.len();
     let frame = encode_message(&LocalResponse::CursorPage {
         page: CursorPageResponse {
-            payload: page_bytes,
+            payload: owner_cursor_test_support::with_empty_observation(page_bytes),
         },
     })
     .expect("the channel encodes a cursor-page response");
@@ -319,7 +325,7 @@ fn an_ordinary_cursor_page_response_is_still_admitted() {
 
     let frame = encode_message(&LocalResponse::CursorPage {
         page: CursorPageResponse {
-            payload: page_bytes,
+            payload: owner_cursor_test_support::with_empty_observation(page_bytes),
         },
     })
     .expect("the channel encodes a cursor-page response");
@@ -370,3 +376,7 @@ fn an_ordinary_metadata_page_is_still_admitted() {
         .expect("an ordinary metadata page stays admissible");
     assert_eq!(page.items.len(), 4);
 }
+
+#[path = "../owner_cursor_test_support.rs"]
+#[allow(dead_code)]
+mod owner_cursor_test_support;

@@ -89,8 +89,17 @@ fn a_replaced_vector_cannot_end_a_tied_frontier_on_either_reader_route() {
         ["stale_f32", "stale_sq8", "nearer_f32", "nearer_sq8"]
             .into_iter()
             .all(|table| {
+                let mut partition_observation_owner_1 =
+                    contextdb_engine::vector_read_memory::admission(
+                        db.declared_reader_memory()
+                            .expect("admit the partition observation reader"),
+                    );
+
                 db.vector_store_for_test()
-                    .partition_infos(&VectorIndexRef::new(table, "embedding"))
+                    .partition_infos(
+                        &VectorIndexRef::new(table, "embedding"),
+                        &mut partition_observation_owner_1,
+                    )
                     .expect("inspect graph readiness")
                     .iter()
                     .filter(|info| info.graph_available)

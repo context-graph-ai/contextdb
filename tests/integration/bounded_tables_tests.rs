@@ -481,6 +481,7 @@ fn c7_reclaimed_bytes_track_the_memory_released_not_the_file_room() {
         insert_rows(&db, "windows", 1..201, &"q".repeat(payload_bytes));
         let filled = db
             .table_size_estimate("windows")
+            .expect("read the actual fixture observation")
             .expect("size answer before the prune");
         clock.advance(RETENTION_WINDOW_MILLIS * 2);
         let report = drain_prunes(&db);
@@ -490,6 +491,7 @@ fn c7_reclaimed_bytes_track_the_memory_released_not_the_file_room() {
         );
         let pruned = db
             .table_size_estimate("windows")
+            .expect("read the actual fixture observation")
             .expect("size answer after the prune");
         (
             report.reclaimed_bytes,
@@ -773,7 +775,10 @@ fn c8_table_size_estimate_tracks_inserts_and_prunes_with_whole_file_alongside() 
     let (clock, _guard) = MockClock::install(T0);
     let db = open_fragmentable_db(&dir.path().join("bounded.db"));
 
-    let empty = db.table_size_estimate("windows").expect("size answer");
+    let empty = db
+        .table_size_estimate("windows")
+        .expect("read the actual fixture observation")
+        .expect("size answer");
     assert_eq!(empty.row_count, 0);
     assert_eq!(
         empty.whole_file_bytes,
@@ -783,7 +788,10 @@ fn c8_table_size_estimate_tracks_inserts_and_prunes_with_whole_file_alongside() 
 
     let payload = "w".repeat(4 * 1024);
     insert_rows(&db, "windows", 1..201, &payload);
-    let filled = db.table_size_estimate("windows").expect("size answer");
+    let filled = db
+        .table_size_estimate("windows")
+        .expect("read the actual fixture observation")
+        .expect("size answer");
     assert_eq!(filled.row_count, 200, "row count is exact: {filled:?}");
     assert!(
         filled.estimated_live_bytes > empty.estimated_live_bytes,
@@ -796,7 +804,10 @@ fn c8_table_size_estimate_tracks_inserts_and_prunes_with_whole_file_alongside() 
 
     clock.advance(2 * 60 * 60 * 1000);
     drain_prunes(&db);
-    let pruned = db.table_size_estimate("windows").expect("size answer");
+    let pruned = db
+        .table_size_estimate("windows")
+        .expect("read the actual fixture observation")
+        .expect("size answer");
     assert_eq!(
         pruned.row_count, 0,
         "pruned rows leave the count: {pruned:?}"
@@ -819,9 +830,13 @@ fn c8_estimates_are_per_table_and_never_claim_the_whole_file() {
     insert_rows(&db, "windows", 1..101, &"a".repeat(4 * 1024));
     insert_rows(&db, "other_windows", 1..11, "b");
 
-    let big = db.table_size_estimate("windows").expect("size answer");
+    let big = db
+        .table_size_estimate("windows")
+        .expect("read the actual fixture observation")
+        .expect("size answer");
     let small = db
         .table_size_estimate("other_windows")
+        .expect("read the actual fixture observation")
         .expect("size answer");
     assert!(
         big.estimated_live_bytes > small.estimated_live_bytes,
@@ -1563,7 +1578,9 @@ fn c7_a_restore_payload_after_truncation_still_carries_every_live_row() {
     db.run_pruning_cycle_checked().expect("prune cycle");
     assert_eq!(change_log_entries_for(&db, "windows"), 3);
 
-    let payload = db.changes_since(contextdb_core::Lsn(0));
+    let payload = db
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes");
     let rows_for = |table: &str| payload.rows.iter().filter(|row| row.table == table).count();
     assert_eq!(
         rows_for("notes"),
@@ -1724,7 +1741,9 @@ fn c7_changes_since_answers_identically_across_a_prune_and_reopen() {
             report.pruned_rows, 10,
             "the fixture really pruned: {report:?}"
         );
-        let changes = db.changes_since(contextdb_core::Lsn(0));
+        let changes = db
+            .changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes");
         assert!(
             changes.rows.iter().any(|row| row.deleted),
             "the fixture's premise: a delete must be present in the pull, or the \
@@ -1735,7 +1754,10 @@ fn c7_changes_since_answers_identically_across_a_prune_and_reopen() {
     };
 
     let db = Database::open(&path).expect("reopen");
-    let after = fingerprint(&db.changes_since(contextdb_core::Lsn(0)));
+    let after = fingerprint(
+        &db.changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes"),
+    );
 
     assert_eq!(
         after, before,
@@ -1791,7 +1813,9 @@ fn c7_a_prune_that_expires_everything_leaves_the_database_answering_correctly() 
             3,
             "a write after a total sweep must commit and be readable"
         );
-        let changes = db.changes_since(contextdb_core::Lsn(0));
+        let changes = db
+            .changes_since(contextdb_core::Lsn(0))
+            .expect("read the declared changes");
         assert_eq!(
             changes
                 .rows

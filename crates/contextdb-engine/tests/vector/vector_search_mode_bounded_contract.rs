@@ -149,21 +149,37 @@ fn partition_key(partition: i64) -> VectorPartitionKey {
 }
 
 fn partition_row_ids(db: &Database, partition: i64) -> HashSet<RowId> {
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     db.vector_store_for_test()
-        .entries_for_partition(&index(), &partition_key(partition))
+        .entries_for_partition(
+            &index(),
+            &partition_key(partition),
+            &mut vector_fixture_copy_1,
+        )
         .expect("inspect the deterministic partition fixture")
         .into_iter()
         .map(|entry| entry.row_id)
         .collect()
 }
 
-fn take_trace(db: &Database) -> contextdb_vector::VectorSearchDebugTrace {
-    db.__take_last_query_vector_trace_for_test()
-        .expect("the vector query publishes its route trace")
+fn take_trace(db: &Database) -> contextdb_engine::database::VectorSearchTraceObservation {
+    {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .expect("the vector query publishes its route trace")
 }
 
 fn trace_candidates_in(
-    trace: &contextdb_vector::VectorSearchDebugTrace,
+    trace: &contextdb_engine::database::VectorSearchTraceObservation,
     partition_rows: &HashSet<RowId>,
 ) -> Vec<RowId> {
     trace

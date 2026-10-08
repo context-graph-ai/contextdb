@@ -240,7 +240,14 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
     );
     db.__reset_last_query_vector_trace_for_test();
     let auto = db.execute(&query("AUTO"), &HashMap::new()).unwrap();
-    let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
+    let trace = db
+        .__take_last_query_vector_trace_for_test(fixture_operation_reader_1.clone())
+        .expect("read the admitted trace observation")
+        .unwrap();
     assert_eq!(auto.rows, exact.rows);
     assert!(
         trace.used_hnsw,

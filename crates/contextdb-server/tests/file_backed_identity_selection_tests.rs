@@ -62,7 +62,8 @@ async fn start_hub(root: &Path, tenant: &str) -> Hub {
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -107,7 +108,8 @@ async fn explicit_file_identity_overrides_the_adjacent_identity_across_client_re
     declare_notes(&edge);
     let endpoint = peer_dial_spec(&hub.ticket, &explicit_identity);
     insert_note(&edge, Uuid::new_v4(), "first explicit identity push");
-    let first = SyncClient::new(edge.clone(), &endpoint, TenantId::from(tenant));
+    let first = SyncClient::new(edge.clone(), &endpoint, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(first.push())
         .await
         .expect("explicit identity sends the first push");
@@ -115,7 +117,8 @@ async fn explicit_file_identity_overrides_the_adjacent_identity_across_client_re
     drop(first);
 
     insert_note(&edge, Uuid::new_v4(), "second explicit identity push");
-    let reconstructed = SyncClient::new(edge, &endpoint, TenantId::from(tenant));
+    let reconstructed = SyncClient::new(edge, &endpoint, TenantId::from(tenant))
+        .expect("construct SyncClient fixture");
     within(reconstructed.push())
         .await
         .expect("reconstructed client reuses the explicit identity");

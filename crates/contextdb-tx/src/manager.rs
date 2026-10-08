@@ -1104,13 +1104,24 @@ impl<S: WriteSetApplicator> contextdb_core::TransactionManager for TransactionMa
 
 #[cfg(test)]
 mod commit_wait_tests {
+    mod test_read_memory {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/read_memory.rs"
+        ));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     struct NoopStore;
 
     impl WriteSetApplicator for NoopStore {
-        fn apply(&self, _: &WriteSet) -> Result<()> {
+        fn apply(
+            &self,
+            _: &WriteSet,
+            _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        ) -> Result<()> {
             Ok(())
         }
 

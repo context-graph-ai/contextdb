@@ -684,6 +684,7 @@ fn shared_allocation_header_stays_charged_until_final_holder_after_store_drop() 
             receipt.raw_vector_bodies
                 + receipt.raw_reverse_directory
                 + receipt.partition_vectors
+                + receipt.vector_partition_controls
                 + receipt.typed_partition_keys
         );
         drop(state);
@@ -1840,38 +1841,63 @@ fn legacy_shared_source_move_retains_its_funded_owned_copy_without_new_header() 
     }
 }
 
+/// The 768-dimension F32 layout partitioned by one `scope` key into at most
+/// two routes, shared by the received-publication fixtures below.
+fn two_scope_layout() -> VectorIndexLayout {
+    VectorIndexLayout::new(
+        768,
+        VectorQuantization::F32,
+        vec!["scope".into()],
+        Some(2),
+        VectorSearchMode::Exact,
+    )
+}
+
+fn scope(name: &str) -> VectorPartitionKey {
+    VectorPartitionKey::from_values(&[contextdb_core::Value::Text(name.into())]).unwrap()
+}
+
+/// Prepares one received-schema image with the executing statement's copy
+/// admission and publishes it under the declared owner.
+fn publish_received(
+    store: &VectorStore,
+    layouts: Vec<(VectorIndexRef, VectorIndexLayout)>,
+    entries: Vec<PartitionedVectorEntry>,
+    declared: &Arc<Budget>,
+    executing: &Arc<Budget>,
+) {
+    let publication = store
+        .prepare_partitioned_received_schema_publication(
+            layouts,
+            entries,
+            declared.clone(),
+            VectorCopyAdmission::new(executing.clone()),
+        )
+        .unwrap();
+    store.publish_prepared_received_schema(publication, declared.clone());
+}
+
 #[test]
 fn resident_export_retains_exact_disjoint_source_memberships_and_copy_owner() {
     let declared = Arc::new(Budget::default());
     let executing = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = VectorIndexRef::new("source_rows", "embedding");
-    let a = VectorPartitionKey::from_values(&[contextdb_core::Value::Text("a".into())]).unwrap();
-    let b = VectorPartitionKey::from_values(&[contextdb_core::Value::Text("b".into())]).unwrap();
+    let a = scope("a");
+    let b = scope("b");
     let body = entry(&index, 41, TxId(2), 0);
     let first = VectorMembershipProvenance::new(TxId(7), Lsn(101), TxId(7), Some(TxId(11)));
     let second = VectorMembershipProvenance::new(TxId(13), Lsn(211), TxId(13), None);
-    let publication = store
-        .prepare_partitioned_received_schema_publication(
-            vec![(
-                index.clone(),
-                VectorIndexLayout::new(
-                    768,
-                    VectorQuantization::F32,
-                    vec!["scope".into()],
-                    Some(2),
-                    VectorSearchMode::Exact,
-                ),
-            )],
-            vec![
-                PartitionedVectorEntry::with_membership(a.clone(), body.clone(), first, None),
-                PartitionedVectorEntry::with_membership(b.clone(), body.clone(), second, None),
-            ],
-            declared.clone(),
-            VectorCopyAdmission::new(executing.clone()),
-        )
-        .unwrap();
-    store.publish_prepared_received_schema(publication, declared.clone());
+    publish_received(
+        &store,
+        vec![(index.clone(), two_scope_layout())],
+        vec![
+            PartitionedVectorEntry::with_membership(a.clone(), body.clone(), first, None),
+            PartitionedVectorEntry::with_membership(b.clone(), body.clone(), second, None),
+        ],
+        &declared,
+        &executing,
+    );
     let declared_before = declared.used.load(Ordering::SeqCst);
     assert!(declared_before > 0);
     assert_eq!(executing.used.load(Ordering::SeqCst), 0);
@@ -1916,23 +1942,21 @@ fn resident_export_refusal_is_atomic_and_refunds_its_executing_owner() {
     let store = VectorStore::default();
     let index = VectorIndexRef::new("source_rows", "embedding");
     let provenance = VectorMembershipProvenance::new(TxId(21), Lsn(233), TxId(22), Some(TxId(27)));
-    let publication = store
-        .prepare_partitioned_received_schema_publication(
-            vec![(
-                index.clone(),
-                VectorIndexLayout::unpartitioned(768, VectorQuantization::F32),
-            )],
-            vec![PartitionedVectorEntry::with_membership(
-                VectorPartitionKey::unpartitioned(),
-                entry(&index, 4, TxId(2), 0),
-                provenance,
-                None,
-            )],
-            declared.clone(),
-            VectorCopyAdmission::new(executing.clone()),
-        )
-        .unwrap();
-    store.publish_prepared_received_schema(publication, declared.clone());
+    publish_received(
+        &store,
+        vec![(
+            index.clone(),
+            VectorIndexLayout::unpartitioned(768, VectorQuantization::F32),
+        )],
+        vec![PartitionedVectorEntry::with_membership(
+            VectorPartitionKey::unpartitioned(),
+            entry(&index, 4, TxId(2), 0),
+            provenance,
+            None,
+        )],
+        &declared,
+        &executing,
+    );
     let declared_before = declared.used.load(Ordering::SeqCst);
     executing.refuse.store(true, Ordering::SeqCst);
     assert!(matches!(
@@ -1962,34 +1986,23 @@ fn ordinary_row_move_restamps_destination_body_and_preserves_exact_row_binding()
     let executing = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = VectorIndexRef::new("source_rows", "embedding");
-    let a = VectorPartitionKey::from_values(&[contextdb_core::Value::Text("a".into())]).unwrap();
-    let b = VectorPartitionKey::from_values(&[contextdb_core::Value::Text("b".into())]).unwrap();
+    let a = scope("a");
+    let b = scope("b");
     let body = entry(&index, 41, TxId(2), 0);
     let first = VectorMembershipProvenance::new(TxId(7), Lsn(101), TxId(7), None);
     let second = VectorMembershipProvenance::new(TxId(13), Lsn(211), TxId(13), None);
-    let publication = store
-        .prepare_partitioned_received_schema_publication(
-            vec![(
-                index.clone(),
-                VectorIndexLayout::new(
-                    768,
-                    VectorQuantization::F32,
-                    vec!["scope".into()],
-                    Some(2),
-                    VectorSearchMode::Exact,
-                ),
-            )],
-            vec![PartitionedVectorEntry::with_membership(
-                a.clone(),
-                body.clone(),
-                first,
-                None,
-            )],
-            declared.clone(),
-            VectorCopyAdmission::new(executing.clone()),
-        )
-        .unwrap();
-    store.publish_prepared_received_schema(publication, declared.clone());
+    publish_received(
+        &store,
+        vec![(index.clone(), two_scope_layout())],
+        vec![PartitionedVectorEntry::with_membership(
+            a.clone(),
+            body.clone(),
+            first,
+            None,
+        )],
+        &declared,
+        &executing,
+    );
     let prepared = store
         .prepare_partitioned_batch(
             vec![],
@@ -2056,20 +2069,11 @@ fn exact_received_memberships_refuse_overlap_before_publication() {
     let executing = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = VectorIndexRef::new("source_rows", "embedding");
-    let a = VectorPartitionKey::from_values(&[contextdb_core::Value::Text("a".into())]).unwrap();
-    let b = VectorPartitionKey::from_values(&[contextdb_core::Value::Text("b".into())]).unwrap();
+    let a = scope("a");
+    let b = scope("b");
     let body = entry(&index, 41, TxId(2), 0);
     let result = store.prepare_partitioned_received_schema_publication(
-        vec![(
-            index.clone(),
-            VectorIndexLayout::new(
-                768,
-                VectorQuantization::F32,
-                vec!["scope".into()],
-                Some(2),
-                VectorSearchMode::Exact,
-            ),
-        )],
+        vec![(index.clone(), two_scope_layout())],
         vec![
             PartitionedVectorEntry::with_membership(
                 a,
@@ -2105,49 +2109,26 @@ fn selected_resident_export_ignores_giant_unselected_column_and_preserves_proven
     let first = VectorMembershipProvenance::new(TxId(11), Lsn(91), TxId(12), Some(TxId(13)));
     let second = VectorMembershipProvenance::new(TxId(19), Lsn(191), TxId(20), None);
     let body = entry(&selected, 4, TxId(2), 0);
-    let publication = store
-        .prepare_partitioned_received_schema_publication(
-            vec![
-                (
-                    selected.clone(),
-                    VectorIndexLayout::new(
-                        768,
-                        VectorQuantization::F32,
-                        vec!["scope".into()],
-                        Some(2),
-                        VectorSearchMode::Exact,
-                    ),
-                ),
-                (
-                    giant.clone(),
-                    VectorIndexLayout::unpartitioned(768, VectorQuantization::F32),
-                ),
-            ],
-            vec![
-                PartitionedVectorEntry::with_membership(
-                    VectorPartitionKey::from_values(&[contextdb_core::Value::Text("a".into())])
-                        .unwrap(),
-                    body.clone(),
-                    first,
-                    None,
-                ),
-                PartitionedVectorEntry::with_membership(
-                    VectorPartitionKey::from_values(&[contextdb_core::Value::Text("b".into())])
-                        .unwrap(),
-                    body,
-                    second,
-                    None,
-                ),
-                PartitionedVectorEntry::new(
-                    VectorPartitionKey::unpartitioned(),
-                    entry(&giant, 8, TxId(1), 0),
-                ),
-            ],
-            declared.clone(),
-            VectorCopyAdmission::new(executing.clone()),
-        )
-        .unwrap();
-    store.publish_prepared_received_schema(publication, declared.clone());
+    publish_received(
+        &store,
+        vec![
+            (selected.clone(), two_scope_layout()),
+            (
+                giant.clone(),
+                VectorIndexLayout::unpartitioned(768, VectorQuantization::F32),
+            ),
+        ],
+        vec![
+            PartitionedVectorEntry::with_membership(scope("a"), body.clone(), first, None),
+            PartitionedVectorEntry::with_membership(scope("b"), body, second, None),
+            PartitionedVectorEntry::new(
+                VectorPartitionKey::unpartitioned(),
+                entry(&giant, 8, TxId(1), 0),
+            ),
+        ],
+        &declared,
+        &executing,
+    );
     assert_eq!(executing.used.load(Ordering::SeqCst), 0);
     let copied = store
         .try_resident_partitioned_entries_with_membership_matching(
@@ -2562,46 +2543,33 @@ fn canonical_body_deletion_survives_disjoint_placements_selected_reload_and_owne
         let executing = Arc::new(Budget::default());
         let store = VectorStore::default();
         let index = VectorIndexRef::new("canonical", "embedding");
-        let a =
-            VectorPartitionKey::from_values(&[contextdb_core::Value::Text("a".into())]).unwrap();
-        let b =
-            VectorPartitionKey::from_values(&[contextdb_core::Value::Text("b".into())]).unwrap();
+        let a = scope("a");
+        let b = scope("b");
         let mut first_body = entry(&index, 41, TxId(2), 0);
         first_body.deleted_tx = Some(TxId(7));
         let second_body = entry(&index, 41, TxId(2), 0);
         let first = VectorMembershipProvenance::new(TxId(2), Lsn(2), TxId(2), Some(TxId(7)));
         let second = VectorMembershipProvenance::new(TxId(7), Lsn(7), TxId(7), None);
-        let publication = store
-            .prepare_partitioned_received_schema_publication(
-                vec![(
-                    index.clone(),
-                    VectorIndexLayout::new(
-                        768,
-                        VectorQuantization::F32,
-                        vec!["scope".into()],
-                        Some(2),
-                        VectorSearchMode::Exact,
-                    ),
-                )],
-                vec![
-                    PartitionedVectorEntry::with_membership(
-                        a.clone(),
-                        first_body.clone(),
-                        first,
-                        canonical_deleted_tx,
-                    ),
-                    PartitionedVectorEntry::with_membership(
-                        b.clone(),
-                        second_body.clone(),
-                        second,
-                        canonical_deleted_tx,
-                    ),
-                ],
-                declared.clone(),
-                VectorCopyAdmission::new(executing.clone()),
-            )
-            .unwrap();
-        store.publish_prepared_received_schema(publication, declared.clone());
+        publish_received(
+            &store,
+            vec![(index.clone(), two_scope_layout())],
+            vec![
+                PartitionedVectorEntry::with_membership(
+                    a.clone(),
+                    first_body.clone(),
+                    first,
+                    canonical_deleted_tx,
+                ),
+                PartitionedVectorEntry::with_membership(
+                    b.clone(),
+                    second_body.clone(),
+                    second,
+                    canonical_deleted_tx,
+                ),
+            ],
+            &declared,
+            &executing,
+        );
         for (key, body, membership) in [(&a, first_body, first), (&b, second_body, second)] {
             let state = store
                 .try_column(&index)
@@ -2695,8 +2663,7 @@ fn generation_price_and_admission_funder_observers_do_not_load_or_charge() {
         store.generation_copy_bytes_for_test(&unknown, &key, 3),
         None
     );
-    let absent_key =
-        VectorPartitionKey::from_values(&[contextdb_core::Value::Text("absent".into())]).unwrap();
+    let absent_key = scope("absent");
     assert_eq!(
         store.generation_copy_bytes_for_test(&index, &absent_key, 3),
         None
@@ -2719,9 +2686,9 @@ fn canonical_identity_after_ordinary_publication(distinct_identity: bool, move_r
     let executing = Arc::new(Budget::default());
     let store = VectorStore::default();
     let index = VectorIndexRef::new("body_identity", "embedding");
-    let a = VectorPartitionKey::from_values(&[contextdb_core::Value::Text("a".into())]).unwrap();
-    let b = VectorPartitionKey::from_values(&[contextdb_core::Value::Text("b".into())]).unwrap();
-    let c = VectorPartitionKey::from_values(&[contextdb_core::Value::Text("c".into())]).unwrap();
+    let a = scope("a");
+    let b = scope("b");
+    let c = scope("c");
     let mut retired = entry(&index, 41, TxId(2), 0);
     retired.deleted_tx = Some(TxId(7));
     let active = entry(
@@ -2737,27 +2704,16 @@ fn canonical_identity_after_ordinary_publication(distinct_identity: bool, move_r
     } else {
         b.clone()
     };
-    let publication = store
-        .prepare_partitioned_received_schema_publication(
-            vec![(
-                index.clone(),
-                VectorIndexLayout::new(
-                    768,
-                    VectorQuantization::F32,
-                    vec!["scope".into()],
-                    Some(2),
-                    VectorSearchMode::Exact,
-                ),
-            )],
-            vec![
-                PartitionedVectorEntry::with_membership(a.clone(), retired, first, None),
-                PartitionedVectorEntry::with_membership(current_key.clone(), active, second, None),
-            ],
-            declared.clone(),
-            VectorCopyAdmission::new(executing.clone()),
-        )
-        .unwrap();
-    store.publish_prepared_received_schema(publication, declared.clone());
+    publish_received(
+        &store,
+        vec![(index.clone(), two_scope_layout())],
+        vec![
+            PartitionedVectorEntry::with_membership(a.clone(), retired, first, None),
+            PartitionedVectorEntry::with_membership(current_key.clone(), active, second, None),
+        ],
+        &declared,
+        &executing,
+    );
     assert!(declared.used.load(Ordering::SeqCst) > 0);
     assert_eq!(executing.used.load(Ordering::SeqCst), 0);
     let (deletes, moves) = if move_row {

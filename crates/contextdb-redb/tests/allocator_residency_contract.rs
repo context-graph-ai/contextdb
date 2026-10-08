@@ -161,16 +161,10 @@ fn allocator_open_decodes_a_fixed_number_of_regions() {
     let small_counter = Arc::new(ScratchFault::default());
     let large_counter = Arc::new(ScratchFault::default());
     let (small_db, small_loaded) = redb::observe_allocator_region_loads_for_test(|| {
-        builder().open_with_backend(FaultBackend {
-            inner: file_backend(&small),
-            fault: Arc::clone(&small_counter),
-        })
+        builder().open_with_backend(fault_backend(&small, &small_counter))
     });
     let (large_db, large_loaded) = redb::observe_allocator_region_loads_for_test(|| {
-        builder().open_with_backend(FaultBackend {
-            inner: file_backend(&large),
-            fault: Arc::clone(&large_counter),
-        })
+        builder().open_with_backend(fault_backend(&large, &large_counter))
     });
     let small_db = small_db.expect("reopen smaller fixture");
     let large_db = large_db.expect("reopen larger fixture");
@@ -249,10 +243,7 @@ impl BackendWork {
 fn rejected_first_compaction_batch(path: &Path) -> BackendWork {
     let fault = Arc::new(ScratchFault::default());
     let db = builder()
-        .open_with_backend(FaultBackend {
-            inner: file_backend(path),
-            fault: Arc::clone(&fault),
-        })
+        .open_with_backend(fault_backend(path, &fault))
         .expect("open saved allocator source");
     let before = BackendWork::sample(&fault);
     let mut at_admission = None;
@@ -293,7 +284,6 @@ fn allocator_compaction_rejection_has_fixed_pre_admission_work() {
 
     let n = rejected_first_compaction_batch(&small);
     let twice_n = rejected_first_compaction_batch(&large);
-    eprintln!("first compaction admission: N={n:?}, 2N={twice_n:?}");
     assert!(
         n.scratch_calls() <= 32 && twice_n.scratch_calls() <= 32,
         "one-page admission copied allocator state: N={n:?}, 2N={twice_n:?}"
@@ -473,10 +463,7 @@ fn allocator_windows_bound_dirty_regions_in_one_transaction() {
     let path = dir.path().join("dirty.redb");
     let scratch = Arc::new(ScratchFault::default());
     let db = builder()
-        .create_with_backend(FaultBackend {
-            inner: file_backend(&path),
-            fault: Arc::clone(&scratch),
-        })
+        .create_with_backend(fault_backend(&path, &scratch))
         .expect("create fixture");
     let write = db.begin_write().expect("begin write");
     {
@@ -823,6 +810,51 @@ impl StorageBackend for FaultBackend {
     }
 }
 
+fn fault_backend(path: &Path, fault: &Arc<ScratchFault>) -> FaultBackend {
+    FaultBackend {
+        inner: file_backend(path),
+        fault: Arc::clone(fault),
+    }
+}
+
+/// Reopens the store a failed writer left behind; reports whether the open
+/// ran redb's repair instead of trusting a clean header.
+fn reopen_with_repair(path: &Path, context: &str) -> (redb::Database, bool) {
+    let repaired = Arc::new(AtomicBool::new(false));
+    let callback = Arc::clone(&repaired);
+    let mut reopen_builder = builder();
+    reopen_builder.set_repair_callback(move |_| callback.store(true, Ordering::SeqCst));
+    let reopened = reopen_builder.open(path).expect(context);
+    (reopened, repaired.load(Ordering::SeqCst))
+}
+
+/// Inserts `marker` rows for `keys` until one insert is refused, otherwise
+/// commits and requires the commit to be refused; returns the refusal.
+fn first_refusal(
+    write: redb::WriteTransaction,
+    keys: std::ops::Range<u64>,
+    marker: u8,
+    context: &str,
+) -> String {
+    let mut insertion_error = None;
+    {
+        let mut table = write.open_table(TABLE).expect("open failing table");
+        let payload = value(marker);
+        for key in keys {
+            if let Err(error) = table.insert(key, payload.as_slice()) {
+                insertion_error = Some(format!("{error:?}"));
+                break;
+            }
+        }
+    }
+    if let Some(error) = insertion_error {
+        drop(write);
+        error
+    } else {
+        format!("{:?}", write.commit().expect_err(context))
+    }
+}
+
 /// A scratch write failure during allocation must be returned, leave the last
 /// durable root intact, and leave the header repairable after Database::drop.
 #[test]
@@ -831,10 +863,7 @@ fn allocator_scratch_failure_prevents_publication_and_repairs_on_reopen() {
     let path = dir.path().join("fault.redb");
     let fault = Arc::new(ScratchFault::default());
     let db = builder()
-        .create_with_backend(FaultBackend {
-            inner: file_backend(&path),
-            fault: Arc::clone(&fault),
-        })
+        .create_with_backend(fault_backend(&path, &fault))
         .expect("create fault-capable fixture");
     let initial = db.begin_write().expect("begin baseline");
     initial
@@ -847,28 +876,7 @@ fn allocator_scratch_failure_prevents_publication_and_repairs_on_reopen() {
     fault.fail_writes.store(true, Ordering::SeqCst);
     let writes_before = fault.writes.load(Ordering::SeqCst);
     let write = db.begin_write().expect("begin failing write");
-    let mut insertion_error = None;
-    {
-        let mut table = write.open_table(TABLE).expect("open failing table");
-        let payload = value(0x44);
-        for key in 1..129 {
-            if let Err(error) = table.insert(key, payload.as_slice()) {
-                insertion_error = Some(format!("{error:?}"));
-                break;
-            }
-        }
-    }
-    let failure = if let Some(error) = insertion_error {
-        drop(write);
-        error
-    } else {
-        format!(
-            "{:?}",
-            write
-                .commit()
-                .expect_err("scratch failure must refuse commit")
-        )
-    };
+    let failure = first_refusal(write, 1..129, 0x44, "scratch failure must refuse commit");
     assert!(
         failure.contains("injected allocator scratch write failure"),
         "caller lost the scratch I/O cause: {failure}"
@@ -888,17 +896,8 @@ fn allocator_scratch_failure_prevents_publication_and_repairs_on_reopen() {
         "failed writer leaked scratch file"
     );
 
-    let repaired = Arc::new(AtomicBool::new(false));
-    let callback_flag = Arc::clone(&repaired);
-    let mut reopen_builder = builder();
-    reopen_builder.set_repair_callback(move |_| callback_flag.store(true, Ordering::SeqCst));
-    let reopened = reopen_builder
-        .open(&path)
-        .expect("repair and reopen failed writer");
-    assert!(
-        repaired.load(Ordering::SeqCst),
-        "poisoned Drop must not publish a clean header"
-    );
+    let (reopened, repaired) = reopen_with_repair(&path, "repair and reopen failed writer");
+    assert!(repaired, "poisoned Drop must not publish a clean header");
     assert_row(&reopened, 0, 0x21);
     let read = reopened.begin_read().expect("read repaired root");
     let table = read.open_table(TABLE).expect("open repaired table");
@@ -1200,10 +1199,7 @@ fn exercise_nth_scratch_fault(operation: ScratchOperation, nth: usize) {
     let path = dir.path().join("nth-fault.redb");
     let fault = Arc::new(ScratchFault::default());
     let db = builder()
-        .create_with_backend(FaultBackend {
-            inner: file_backend(&path),
-            fault: Arc::clone(&fault),
-        })
+        .create_with_backend(fault_backend(&path, &fault))
         .expect("create injected backend");
     let baseline = db.begin_write().unwrap();
     baseline
@@ -1273,17 +1269,8 @@ fn exercise_nth_scratch_fault(operation: ScratchOperation, nth: usize) {
     );
     drop(db);
 
-    let repaired = Arc::new(AtomicBool::new(false));
-    let callback = Arc::clone(&repaired);
-    let mut reopen_builder = builder();
-    reopen_builder.set_repair_callback(move |_| callback.store(true, Ordering::SeqCst));
-    let reopened = reopen_builder
-        .open(&path)
-        .expect("repair after injected I/O");
-    assert!(
-        repaired.load(Ordering::SeqCst),
-        "failed writer published a clean header"
-    );
+    let (reopened, repaired) = reopen_with_repair(&path, "repair after injected I/O");
+    assert!(repaired, "failed writer published a clean header");
     assert_row(&reopened, 0, 0x24);
     let read = reopened.begin_read().unwrap();
     let table = read.open_table(TABLE).unwrap();
@@ -1306,10 +1293,7 @@ fn allocator_scratch_resize_failure_refuses_open_without_publication() {
     create_regions(&path, 40);
     let fault = Arc::new(ScratchFault::default());
     fault.arm(ScratchOperation::Resize, 1);
-    let result = builder().open_with_backend(FaultBackend {
-        inner: file_backend(&path),
-        fault: Arc::clone(&fault),
-    });
+    let result = builder().open_with_backend(fault_backend(&path, &fault));
     let error = match result {
         Ok(_) => panic!("scratch resize failure must refuse writable open"),
         Err(error) => format!("{error:?}"),
@@ -1335,10 +1319,7 @@ fn allocator_scratch_resize_failure_during_active_shrink_preserves_rows() {
     create_regions(&path, 64);
     let fault = Arc::new(ScratchFault::default());
     let mut db = builder()
-        .open_with_backend(FaultBackend {
-            inner: file_backend(&path),
-            fault: Arc::clone(&fault),
-        })
+        .open_with_backend(fault_backend(&path, &fault))
         .expect("open fault-capable fixture");
     let delete = db.begin_write().expect("begin deletion");
     {
@@ -1365,17 +1346,8 @@ fn allocator_scratch_resize_failure_during_active_shrink_preserves_rows() {
     );
     drop(db);
 
-    let repaired = Arc::new(AtomicBool::new(false));
-    let callback = Arc::clone(&repaired);
-    let mut reopen_builder = builder();
-    reopen_builder.set_repair_callback(move |_| callback.store(true, Ordering::SeqCst));
-    let reopened = reopen_builder
-        .open(&path)
-        .expect("repair after failed shrink");
-    assert!(
-        repaired.load(Ordering::SeqCst),
-        "failed shrink wrote a clean header"
-    );
+    let (reopened, repaired) = reopen_with_repair(&path, "repair after failed shrink");
+    assert!(repaired, "failed shrink wrote a clean header");
     for key in 0..8 {
         assert_row(&reopened, key, 0x35);
     }
@@ -1399,10 +1371,7 @@ fn allocator_scratch_failure_during_source_materialization_preserves_rows() {
     create_regions(&path, 48);
     let fault = Arc::new(ScratchFault::default());
     let mut db = builder()
-        .open_with_backend(FaultBackend {
-            inner: file_backend(&path),
-            fault: Arc::clone(&fault),
-        })
+        .open_with_backend(fault_backend(&path, &fault))
         .expect("open saved allocator source");
     fault.arm(ScratchOperation::Write, 1);
     let mut cursor = redb::CompactionCursor::default();
@@ -1446,10 +1415,7 @@ fn allocator_scratch_failure_during_repair_can_retry_from_durable_root() {
     let path = dir.path().join("repair-fault.redb");
     let first_fault = Arc::new(ScratchFault::default());
     let db = builder()
-        .create_with_backend(FaultBackend {
-            inner: file_backend(&path),
-            fault: Arc::clone(&first_fault),
-        })
+        .create_with_backend(fault_backend(&path, &first_fault))
         .expect("create fault-capable fixture");
     let baseline = db.begin_write().expect("begin baseline");
     baseline
@@ -1461,36 +1427,14 @@ fn allocator_scratch_failure_during_repair_can_retry_from_durable_root() {
 
     first_fault.arm(ScratchOperation::Write, 1);
     let write = db.begin_write().expect("begin failing write");
-    let mut insert_error = None;
-    {
-        let mut table = write.open_table(TABLE).unwrap();
-        let payload = value(0x72);
-        for key in 1..97 {
-            if let Err(error) = table.insert(key, payload.as_slice()) {
-                insert_error = Some(format!("{error:?}"));
-                break;
-            }
-        }
-    }
-    let error = if let Some(error) = insert_error {
-        drop(write);
-        error
-    } else {
-        format!(
-            "{:?}",
-            write.commit().expect_err("scratch fault must refuse write")
-        )
-    };
+    let error = first_refusal(write, 1..97, 0x72, "scratch fault must refuse write");
     assert!(first_fault.hit(), "fixture did not poison the first writer");
     assert!(error.contains("injected allocator scratch write failure"));
     drop(db);
 
     let repair_fault = Arc::new(ScratchFault::default());
     repair_fault.arm(ScratchOperation::Len, 1);
-    let error = match builder().open_with_backend(FaultBackend {
-        inner: file_backend(&path),
-        fault: Arc::clone(&repair_fault),
-    }) {
+    let error = match builder().open_with_backend(fault_backend(&path, &repair_fault)) {
         Ok(_) => panic!("scratch fault must refuse allocator repair"),
         Err(error) => format!("{error:?}"),
     };
@@ -1503,15 +1447,8 @@ fn allocator_scratch_failure_during_repair_can_retry_from_durable_root() {
         "repair lost scratch I/O cause: {error}"
     );
 
-    let repaired = Arc::new(AtomicBool::new(false));
-    let callback = Arc::clone(&repaired);
-    let mut reopen_builder = builder();
-    reopen_builder.set_repair_callback(move |_| callback.store(true, Ordering::SeqCst));
-    let reopened = reopen_builder.open(&path).expect("retry allocator repair");
-    assert!(
-        repaired.load(Ordering::SeqCst),
-        "failed repair wrote a clean header"
-    );
+    let (reopened, repaired) = reopen_with_repair(&path, "retry allocator repair");
+    assert!(repaired, "failed repair wrote a clean header");
     assert_row(&reopened, 0, 0x31);
     let read = reopened.begin_read().unwrap();
     let table = read.open_table(TABLE).unwrap();
@@ -1566,10 +1503,7 @@ fn region_tracker_allocations_stay_bounded_across_reopen_append_and_recycle() {
         let recycled = vec![0x72; BODY_BYTES];
         let heap = HeapScope::start();
         let (db, loaded) = redb::observe_allocator_region_loads_for_test(|| {
-            tracker_builder().open_with_backend(FaultBackend {
-                inner: file_backend(path),
-                fault: Arc::clone(&fault),
-            })
+            tracker_builder().open_with_backend(fault_backend(path, &fault))
         });
         let db = db.expect("reopen the saved tracker");
         let startup_reads = fault.backend_read_bytes.load(Ordering::SeqCst);
@@ -1648,12 +1582,6 @@ fn region_tracker_allocations_stay_bounded_across_reopen_append_and_recycle() {
     assert!(large_regions > small_regions);
     let (small_bytes, small_regions, small_loaded, small_reads) = observe(&small, SMALL_ROWS);
     let (large_bytes, large_regions, large_loaded, large_reads) = observe(&large, 2 * SMALL_ROWS);
-    eprintln!(
-        "actual tracker heap N={small_bytes:?}/{small_regions:?} 2N={large_bytes:?}/{large_regions:?}"
-    );
-    eprintln!(
-        "tracker startup Nloads={small_loaded} 2Nloads={large_loaded} Nreads={small_reads} 2Nreads={large_reads}"
-    );
     assert_eq!(
         small_loaded, large_loaded,
         "startup region decoding stays independent of geometry"

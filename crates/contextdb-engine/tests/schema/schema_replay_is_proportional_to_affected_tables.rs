@@ -246,7 +246,10 @@ async fn identical_schema_replay_does_zero_actual_artifact_work() {
         ("first", &first, &a, first_before),
         ("second", &second, &b, second_before),
     ] {
-        let expected = edge.changes_since(since).ddl;
+        let expected = edge
+            .changes_since(since)
+            .expect("read the declared changes")
+            .ddl;
         assert_eq!(expected.len(), 102);
         let exchange_start = hub.broker.recorded_exchanges().len();
         let pushed = ReceivedSchemaApplyObserverForTest::new();
@@ -317,7 +320,11 @@ async fn schema_replay_is_proportional_to_affected_tables() {
             )
             .unwrap();
     }
-    let entries = source.changes_since(since).ddl.len();
+    let entries = source
+        .changes_since(since)
+        .expect("read the declared changes")
+        .ddl
+        .len();
     assert_eq!(
         entries, 100,
         "one hundred distinct declarations, one per commit"
@@ -510,7 +517,10 @@ async fn ordinary_flow(kind: &str) {
             .unwrap();
     }
     phase("ordinary-authored");
-    let expected_ddl = source.changes_since(since).ddl;
+    let expected_ddl = source
+        .changes_since(since)
+        .expect("read the declared changes")
+        .ddl;
     if kind == "status" {
         phase("ordinary-pending-count-begin");
         let count = client.pending_push_change_count();

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 // Custody adds two writes and three metadata reads; vector inspection and the
 // maintenance cadence add two reads, and the cadence declaration adds a write.
-const STATEMENT_VARIANT_COUNT: usize = 37;
+const STATEMENT_VARIANT_COUNT: usize = 38;
 
 #[test]
 fn binary_memory_declaration_accepts_quoted_and_unquoted_sizes() {
@@ -67,6 +67,7 @@ fn statement_variant(statement: &Statement) -> &'static str {
         Statement::ShowMemoryLimit => "SHOW MEMORY_LIMIT",
         Statement::SetDiskLimit(_) => "SET DISK_LIMIT",
         Statement::ShowDiskLimit => "SHOW DISK_LIMIT",
+        Statement::ShowContentSize => "SHOW CONTENT_SIZE",
         Statement::SetMaintenancePollInterval(_) => "SET MAINTENANCE_POLL_INTERVAL",
         Statement::ShowMaintenancePollInterval => "SHOW MAINTENANCE_POLL_INTERVAL",
         Statement::SetVectorServingCache(_) => "SET VECTOR_SERVING_CACHE",
@@ -174,6 +175,11 @@ fn statement_effect_marks_only_the_inspection_variants_as_reads() {
             StatementEffect::Write,
         ),
         ("SHOW DISK_LIMIT", "SHOW DISK_LIMIT", StatementEffect::Read),
+        (
+            "SHOW CONTENT_SIZE",
+            "SHOW CONTENT_SIZE",
+            StatementEffect::Read,
+        ),
         (
             "SET MAINTENANCE_POLL_INTERVAL",
             "SET MAINTENANCE_POLL_INTERVAL '5 SECONDS'",

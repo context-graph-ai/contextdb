@@ -198,8 +198,17 @@ fn insert_route(db: &Database, scope: Uuid, first_id: u128, axis: usize) {
 }
 
 fn graph_ready(db: &Database, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(&index(), &partition(scope))
+        .partition_info(
+            &index(),
+            &partition(scope),
+            &mut partition_observation_owner_1,
+        )
         .unwrap()
         .is_some_and(|info| info.graph_available)
 }
@@ -228,9 +237,18 @@ fn reset_vector_trace(db: &Database) {
     db.__reset_last_query_vector_trace_for_test();
 }
 
-fn take_vector_trace(db: &Database, what: &str) -> contextdb_vector::VectorSearchDebugTrace {
-    db.__take_last_query_vector_trace_for_test()
-        .unwrap_or_else(|| panic!("{what}: the completed public query published no vector trace"))
+fn take_vector_trace(
+    db: &Database,
+    what: &str,
+) -> contextdb_engine::database::VectorSearchTraceObservation {
+    {
+        let seam_read_memory = db
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        db.__take_last_query_vector_trace_for_test(seam_read_memory)
+            .expect("read the admitted trace observation")
+    }
+    .unwrap_or_else(|| panic!("{what}: the completed public query published no vector trace"))
 }
 
 fn drive_maintenance_until_ready(db: &Database, scopes: &[Uuid]) {
@@ -1112,9 +1130,18 @@ fn caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart
                 &HashMap::new(),
             )
             .unwrap();
+        let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let progress = db
             .vector_store_for_test()
-            .partition_info(&route(alpha).index, &route(alpha).partition_key)
+            .partition_info(
+                &route(alpha).index,
+                &route(alpha).partition_key,
+                &mut partition_observation_owner_2,
+            )
             .unwrap()
             .unwrap()
             .maintenance_progress;

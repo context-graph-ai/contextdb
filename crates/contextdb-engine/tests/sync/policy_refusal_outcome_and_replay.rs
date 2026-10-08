@@ -53,11 +53,10 @@ async fn start_hub(root: &Path) -> Hub {
         .expect("bind hub");
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open hub"));
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(TENANT),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT))
+            .expect("read or construct the declared fixture result"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -79,6 +78,7 @@ fn make_client(edge: &Arc<Database>, ticket: &str, identity: &Path) -> SyncClien
         &peer_dial_spec(ticket, identity),
         TenantId::from(TENANT),
     )
+    .expect("read or construct the declared fixture result")
 }
 
 async fn accepted_base(edge: &Arc<Database>, hub: &Hub, identity: &Path) {
@@ -429,6 +429,10 @@ async fn push_edge_payload(
     let identity = FabricIdentity::load_or_generate(identity_path).unwrap();
     let tenant = TenantId::from(TENANT);
     let incarnation = author.sync_incarnation_for_test(&tenant).unwrap();
+    let fixture_operation_reader_1 = author
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let provenance = author
         .outbound_ddl_provenance_for_test(
             &contextdb_engine::sync_types::ChangeSet {
@@ -440,6 +444,7 @@ async fn push_edge_payload(
             &identity.node_id(),
             incarnation,
             &|bytes| Ok(identity.sign_for_test(bytes)),
+            fixture_operation_reader_1.clone(),
         )
         .unwrap();
     let mut wire = WireChangeSet::from(changes);
@@ -502,13 +507,17 @@ async fn refused_schema_edges_remain_owed(dependency_complete: bool, same_unit_e
     let node = FabricIdentity::load_or_generate(&identity_path)
         .unwrap()
         .node_id();
-    let base = author.changes_since(Lsn(0));
+    let base = author
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     push_edge_payload(&hub, &identity_path, &author, base, dependency_complete).await;
     let before = author.current_lsn();
     author
         .execute("ALTER TABLE links SET SYNC CONFLICT KEEP LATEST", &params())
         .unwrap();
-    let mut refused = author.changes_since(before);
+    let mut refused = author
+        .changes_since(before)
+        .expect("read or construct the declared fixture result");
     let refused_lsn = *refused.ddl_lsn.last().unwrap();
     // Received schema permits connected graph data even though local schema
     // transactions cannot mix DDL and DML. The signed schema is unchanged.
@@ -617,7 +626,9 @@ async fn refused_schema_edges_remain_owed(dependency_complete: bool, same_unit_e
     author
         .execute("ALTER TABLE links SET SYNC CONFLICT KEEP FIRST", &params())
         .unwrap();
-    let correction = author.changes_since(before_correction);
+    let correction = author
+        .changes_since(before_correction)
+        .expect("read or construct the declared fixture result");
     push_edge_payload(
         &hub,
         &identity_path,

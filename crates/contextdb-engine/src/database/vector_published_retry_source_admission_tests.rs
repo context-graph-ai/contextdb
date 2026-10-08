@@ -133,8 +133,19 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
     let observation = redb::observe_backend_reads(Arc::new(move |_| {
         observed.fetch_add(1, Ordering::SeqCst);
     }));
+    let fixture_operation_reader_1 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
     let error = context
-        .retry_one_vector_journal_truncation(&persistence, &catalog, &partition, true)
+        .retry_one_vector_journal_truncation(
+            &persistence,
+            &catalog,
+            &partition,
+            true,
+            fixture_operation_reader_1.clone(),
+        )
         .unwrap_err();
     drop(observation);
     assert_eq!(backend_reads.load(Ordering::SeqCst), 0);
@@ -172,8 +183,19 @@ fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
         catalog
     );
     assert_eq!(db.execute(query, &HashMap::new()).unwrap().rows, old_rows);
+    let fixture_operation_reader_2 = context
+        .read_request_provider
+        .request_budget()
+        .expect("admit the actual fixture reader");
+
     context
-        .retry_one_vector_journal_truncation(&persistence, &catalog, &partition, true)
+        .retry_one_vector_journal_truncation(
+            &persistence,
+            &catalog,
+            &partition,
+            true,
+            fixture_operation_reader_2.clone(),
+        )
         .unwrap();
     let installed = context
         .vector

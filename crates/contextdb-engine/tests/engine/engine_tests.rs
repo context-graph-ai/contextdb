@@ -235,7 +235,7 @@ fn test_file_backed_delete_delta_matches_after_reopen() {
     )
     .unwrap();
 
-    let live = db.changes_since(Lsn(3));
+    let live = db.changes_since(Lsn(3)).expect("read the declared changes");
     assert_eq!(
         live.rows.len(),
         1,
@@ -253,7 +253,9 @@ fn test_file_backed_delete_delta_matches_after_reopen() {
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
-    let persisted = reopened.changes_since(Lsn(3));
+    let persisted = reopened
+        .changes_since(Lsn(3))
+        .expect("read the declared changes");
     assert_eq!(
         persisted.rows.len(),
         1,

@@ -9,6 +9,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../fixtures/read_owner_test_support.rs"]
+mod read_owner_test_support;
+
 use contextdb_core::{
     Error, Lsn, RowId, SnapshotId, TxId, VectorEntry, VectorIndexRef, VectorPartitionKey,
     VectorQuantization, VectorSearchMode,
@@ -184,11 +187,42 @@ impl MemoryBudget for Budget {
 pub struct TestStore {
     vector: Arc<VectorStore>,
     body_owner: Arc<Budget>,
-    executing_owner: Arc<Budget>,
 }
 
 impl WriteSetApplicator for TestStore {
-    fn apply(&self, ws: &WriteSet) -> contextdb_core::Result<()> {
+    fn apply(
+        &self,
+        ws: &WriteSet,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> contextdb_core::Result<()> {
+        let executing_owner = read_owner_test_support::budget(read_memory);
+        // Capture the exact committed body before this fixture publishes inserts.
+        let mut before_owner = VectorCopyAdmission::new(executing_owner.clone());
+        before_owner.reserve(
+            ws.vector_deletes
+                .len()
+                .saturating_mul(std::mem::size_of::<(VectorIndexRef, RowId, TxId, TxId, Lsn)>())
+                .saturating_add(
+                    ws.vector_deletes
+                        .iter()
+                        .map(|(index, _, _)| index.table.len().saturating_add(index.column.len()))
+                        .sum::<usize>(),
+                ),
+        )?;
+        let mut deletes = Vec::with_capacity(ws.vector_deletes.len());
+        for (index, row, tx) in &ws.vector_deletes {
+            let before = self
+                .vector
+                .live_entry_for_row(
+                    index,
+                    *row,
+                    contextdb_core::SnapshotId(tx.0),
+                    &mut before_owner,
+                )?
+                .expect("the fixture deletes an existing committed body");
+            deletes.push((index.clone(), *row, *tx, before.created_tx, before.lsn));
+        }
+
         let bytes = ws
             .vector_inserts
             .iter()
@@ -198,16 +232,14 @@ impl WriteSetApplicator for TestStore {
             .try_allocate_for(bytes, "test", "caller_vector_body", "test")?;
         let result = self.vector.apply_inserts(
             ws.vector_inserts.clone(),
-            VectorCopyAdmission::new(self.executing_owner.clone()),
+            VectorCopyAdmission::new(executing_owner.clone()),
         );
         if result.is_err() {
             self.body_owner.release(bytes);
         }
         result?;
-        self.vector.apply_deletes(
-            ws.vector_deletes.clone(),
-            VectorCopyAdmission::new(self.executing_owner.clone()),
-        )?;
+        self.vector
+            .apply_deletes(deletes, VectorCopyAdmission::new(executing_owner.clone()))?;
         Ok(())
     }
 
@@ -379,11 +411,6 @@ pub fn fixture() -> Fixture {
     let tx_mgr = Arc::new(TransactionManager::new(TestStore {
         vector: store.clone(),
         body_owner: budget.clone(),
-        executing_owner: Arc::new(Budget {
-            limit: AtomicUsize::new(usize::MAX),
-            used: AtomicUsize::new(0),
-            underflows: AtomicUsize::new(0),
-        }),
     }));
     let exec =
         MemVectorExecutor::new_with_accountant(store.clone(), tx_mgr.clone(), hnsw, budget.clone());

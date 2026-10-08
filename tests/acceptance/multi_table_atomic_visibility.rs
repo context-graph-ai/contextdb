@@ -122,6 +122,7 @@ fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
         > 0;
     let raw_phase_has_new_vec = db
         .live_vector_entry(target_row_id, raw_phase_snapshot)
+        .expect("read the actual fixture observation")
         .is_some_and(|entry| entry.vector == vec![0.0, 1.0, 0.0]);
     assert_eq!(
         (
@@ -146,6 +147,7 @@ fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
     let has_edge = db.edge_count(src_id, "LINKS", snap).unwrap_or(0) > 0;
     let has_new_vec = db
         .live_vector_entry(target_row_id, snap)
+        .expect("read the actual fixture observation")
         .is_some_and(|entry| entry.vector == vec![0.0, 1.0, 0.0]);
     assert_eq!(
         (has_renamed, has_edge, has_new_vec),
@@ -175,6 +177,7 @@ fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
     );
     assert_eq!(
         db.live_vector_entry(target_row_id, snap)
+            .expect("read the actual fixture observation")
             .expect("target row has live vector after commit")
             .vector,
         vec![0.0, 1.0, 0.0],
@@ -604,6 +607,7 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
         .row_id;
     let current_live = db
         .live_vector_entry(later_target_row_id, db.snapshot())
+        .expect("read the actual fixture observation")
         .expect("current snapshot must have the later vector entry");
     assert_eq!(
         current_live.vector,
@@ -619,6 +623,7 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
         .row_id;
     let current_mutated_target = db
         .live_vector_entry(current_target_row_id, db.snapshot())
+        .expect("read the actual fixture observation")
         .expect("current snapshot must have the target's later vector");
     assert_eq!(
         current_mutated_target.vector,
@@ -669,6 +674,7 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
     );
     let live = db
         .live_vector_entry(target_row_id, snap)
+        .expect("read the actual fixture observation")
         .expect("target row must have a live vector at event LSN");
     assert_eq!(
         live.vector,
@@ -676,7 +682,9 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
         "vector index not visible at event LSN"
     );
     assert!(
-        db.live_vector_entry(later_target_row_id, snap).is_none(),
+        db.live_vector_entry(later_target_row_id, snap)
+            .expect("read the actual fixture observation")
+            .is_none(),
         "later vector entry leaked into the event-rooted snapshot"
     );
     let historical_vector = db
@@ -1073,6 +1081,7 @@ fn t21_10_snapshot_at_lsn_survives_reopen_after_later_mutations() {
     assert_eq!(
         reopened
             .live_vector_entry(target_row_id, snap)
+            .expect("read the actual fixture observation")
             .expect("event-time vector must survive reopen")
             .vector,
         vec![0.0, 1.0, 0.0]
@@ -1226,7 +1235,9 @@ fn t21_12_missing_commit_directory_refuses_without_repair() {
     write.commit().unwrap();
     drop(redb_db);
 
-    fn durable_state(path: &std::path::Path) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>) {
+    type DurableState = (Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>);
+
+    fn durable_state(path: &std::path::Path) -> DurableState {
         use redb::{ReadableDatabase, ReadableTable};
         let db = redb::Database::open(path).unwrap();
         let read = db.begin_read().unwrap();

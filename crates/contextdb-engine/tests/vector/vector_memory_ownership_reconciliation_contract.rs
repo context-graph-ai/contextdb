@@ -112,9 +112,14 @@ fn drive_maintenance(db: &Database, table: &str, scope: &str) {
     let index = index(table);
     let partition = partition(scope);
     for _ in 0..MAX_MAINTENANCE_CYCLES {
+        let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         if db
             .vector_store_for_test()
-            .partition_info(&index, &partition)
+            .partition_info(&index, &partition, &mut partition_observation_owner_1)
             .unwrap()
             .is_some_and(|info| info.graph_available)
         {
@@ -290,6 +295,10 @@ macro_rules! assert_same_receipt {
             actual.partition_vectors, expected.partition_vectors,
             $message
         );
+        assert_eq!(
+            actual.vector_partition_controls, expected.vector_partition_controls,
+            $message
+        );
         assert_eq!(actual.base_graph, expected.base_graph, $message);
         assert_eq!(actual.change_graph, expected.change_graph, $message);
         assert_eq!(actual.mutable_tail, expected.mutable_tail, $message);
@@ -330,6 +339,10 @@ macro_rules! assert_same_vector_owners {
             actual.partition_vectors, expected.partition_vectors,
             $message
         );
+        assert_eq!(
+            actual.vector_partition_controls, expected.vector_partition_controls,
+            $message
+        );
         assert_eq!(actual.base_graph, expected.base_graph, $message);
         assert_eq!(actual.change_graph, expected.change_graph, $message);
         assert_eq!(actual.mutable_tail, expected.mutable_tail, $message);
@@ -357,11 +370,13 @@ macro_rules! assert_exact_reconciliation {
             receipt.raw_vector_bodies
                 + receipt.raw_reverse_directory
                 + receipt.partition_vectors
+                + receipt.vector_partition_controls
                 + receipt.base_graph
                 + receipt.change_graph
                 + receipt.mutable_tail
                 + receipt.typed_partition_keys
-                + receipt.retired_pinned_graph_bytes,
+                + receipt.retired_pinned_graph_bytes
+                + receipt.source_metadata,
             $message
         );
         assert_eq!(receipt.temporary_workspace, 0, $message);
@@ -515,7 +530,8 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             "durable membership keeps neither a resident reverse directory nor dormant body headers"
         );
         assert!(
-            loaded.partition_vectors > 0 && loaded.typed_partition_keys > 0,
+            loaded.partition_vectors + loaded.vector_partition_controls > 0
+                && loaded.typed_partition_keys > 0,
             "the live fixture still owns its partition registry and typed keys"
         );
         assert_exact_reconciliation!(
@@ -787,12 +803,19 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             let lineage_versions_before_compaction =
                 lineage.__physical_version_count_for_test("ownership_items");
             for _ in 0..MAX_MAINTENANCE_CYCLES {
-                lineage
-                    .__compact_currency_versions_for_tables_for_test(&["ownership_items"])
-                    .expect(
-                        "prune the isolated lineage's update-superseded versions through the \
+                {
+                    let seam_read_memory = lineage
+                        .declared_reader_memory()
+                        .expect("admit the fixture operation reader");
+                    lineage.__compact_currency_versions_for_tables_for_test(
+                        &["ownership_items"],
+                        seam_read_memory,
+                    )
+                }
+                .expect(
+                    "prune the isolated lineage's update-superseded versions through the \
                          production door",
-                    );
+                );
             }
             let lineage_versions_after_compaction =
                 lineage.__physical_version_count_for_test("ownership_items");
@@ -879,9 +902,16 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             // identical unmodified pass (`compact_currency_versions_inner`)
             // against a caller-supplied table instead of the declared
             // eligibility set, so this exercises the same real mechanism.
-            reopened
-                .__compact_currency_versions_for_tables_for_test(&["ownership_items"])
-                .expect("prune the retained history through the production door");
+            {
+                let seam_read_memory = reopened
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                reopened.__compact_currency_versions_for_tables_for_test(
+                    &["ownership_items"],
+                    seam_read_memory,
+                )
+            }
+            .expect("prune the retained history through the production door");
         }
         let physical_versions_after_compaction =
             reopened.__physical_version_count_for_test("ownership_items");
@@ -1221,7 +1251,8 @@ async fn received_image_replacement_is_idempotent_and_its_prepublication_failure
             TenantId::from(RECEIVED_TENANT),
             hub_node_id,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn({
@@ -1239,7 +1270,8 @@ async fn received_image_replacement_is_idempotent_and_its_prepublication_failure
         broker.client_as(&edge_node_id),
         TenantId::from(RECEIVED_TENANT),
         edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
 
     client
         .pull_default()
@@ -1328,7 +1360,8 @@ async fn received_image_replacement_is_idempotent_and_its_prepublication_failure
         "same-shape replacement cannot retain two reverse directories"
     );
     assert!(
-        changed.partition_vectors <= initial.partition_vectors,
+        changed.partition_vectors + changed.vector_partition_controls
+            <= initial.partition_vectors + initial.vector_partition_controls,
         "same-shape replacement cannot retain two partition-vector registries"
     );
     assert!(
@@ -2629,9 +2662,14 @@ fn durable_purge_and_compaction_fault_journeys_reconcile_to_a_fresh_control() {
         // (`compact_currency_versions_inner`) against a caller-supplied
         // table instead of the declared eligibility set, so this exercises
         // the same real mechanism.
-        reopened
-            .__compact_currency_versions_for_tables_for_test(&["purge_items"])
-            .expect("prune the retained history through the production door");
+        {
+            let seam_read_memory = reopened
+                .declared_reader_memory()
+                .expect("admit the fixture operation reader");
+            reopened
+                .__compact_currency_versions_for_tables_for_test(&["purge_items"], seam_read_memory)
+        }
+        .expect("prune the retained history through the production door");
     }
     assert_eq!(
         reopened.__physical_version_count_for_test("purge_items"),
@@ -2821,19 +2859,34 @@ fn retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_
         graph_publications >= 2,
         "the declared low thresholds must publish maintained graphs across successive scalar updates"
     );
+    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert!(
         db.vector_store_for_test()
             .partition_info(
                 &VectorIndexRef::new("passages", "embedding"),
-                &VectorPartitionKey::unpartitioned()
+                &VectorPartitionKey::unpartitioned(),
+                &mut partition_observation_owner_2
             )
             .unwrap()
             .unwrap()
             .graph_available
     );
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     let entries = db
         .vector_store_for_test()
-        .entries_for_index(&VectorIndexRef::new("passages", "embedding"))
+        .entries_for_index(
+            &VectorIndexRef::new("passages", "embedding"),
+            &mut vector_fixture_copy_1,
+        )
         .unwrap();
     assert_eq!(
         entries.len(),

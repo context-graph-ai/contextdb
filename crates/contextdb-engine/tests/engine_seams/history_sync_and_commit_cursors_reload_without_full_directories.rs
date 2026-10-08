@@ -3,6 +3,7 @@
 use crate::resident_history_support as support;
 use contextdb_core::{Lsn, Value, Wallclock};
 use contextdb_engine::database::resident_history_test_seams::observe;
+use contextdb_engine::writer_query_test_seams::observe as writer_work;
 use contextdb_engine::{
     Database,
     sync_types::{ConflictPolicies, ConflictPolicy},
@@ -13,6 +14,8 @@ use support::*;
 fn history_sync_and_commit_cursors_reload_without_full_directories() {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let mut owners = Vec::new();
+    let mut sync_work = Vec::new();
+    let mut append_work = Vec::new();
     for n in [64, 128] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
@@ -50,9 +53,10 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
         let log_entries = db.change_log_since(Lsn(0)).unwrap();
         let log = canonical(&log_entries);
         let commits = db.commit_index_for_test();
-        let changes = canonical(&db.changes_since(Lsn(0)));
+        let changes = canonical(&db.changes_since(Lsn(0)).expect("read the declared changes"));
         let suffix = checkpoints[n / 2].0;
-        let suffix_oracle = canonical(&db.changes_since(suffix));
+        let suffix_oracle =
+            canonical(&db.changes_since(suffix).expect("read the declared changes"));
         let artifact = dir.path().join("snapshot.db");
         db.export_snapshot(&artifact).unwrap();
         db.close().unwrap();
@@ -83,11 +87,36 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
             commits,
             "complete ordered commit oracle"
         );
-        assert_eq!(canonical(&db.changes_since(Lsn(0))), changes);
         assert_eq!(
-            canonical(&db.changes_since(suffix)),
+            canonical(&db.changes_since(Lsn(0)).expect("read the declared changes")),
+            changes
+        );
+        assert_eq!(
+            canonical(&db.changes_since(suffix).expect("read the declared changes")),
             suffix_oracle,
             "resumed export suffix"
+        );
+        let fixed_suffix = checkpoints[n - 1].0;
+        let fixed_oracle = canonical(
+            &log_entries
+                .iter()
+                .filter(|entry| entry.lsn() > fixed_suffix)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let (exported_suffix, export_work) = observe(|| {
+            db.changes_since(fixed_suffix)
+                .expect("read the declared changes")
+        });
+        assert_eq!(
+            canonical(&exported_suffix),
+            fixed_oracle,
+            "resumed export suffix"
+        );
+        sync_work.push(export_work.log_keys_examined);
+        assert!(
+            export_work.log_keys_examined > 0 && export_work.log_keys_examined <= 16,
+            "fixed export suffix must seek the saved position: {export_work:?}"
         );
         for (ordinal, (lsn, snapshot)) in checkpoints.iter().enumerate().step_by(7) {
             assert_eq!(db.snapshot_at(*lsn), *snapshot);
@@ -106,7 +135,7 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
         receiver.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
         receiver
             .apply_changes(
-                db.changes_since(Lsn(0)),
+                db.changes_since(Lsn(0)).expect("read the declared changes"),
                 &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
             )
             .unwrap();
@@ -151,8 +180,40 @@ fn history_sync_and_commit_cursors_reload_without_full_directories() {
             r.ddl_log_estimated_bytes,
             db.__history_sidecar_owners_for_test().total(),
         ));
+        let before_append = db.current_lsn();
+        let ((_, append), directory_append) =
+            writer_work(|| observe(|| exec(&db, "INSERT INTO history VALUES (1000000, 2)")));
+        let (tail, tail_work) = observe(|| db.change_log_since(before_append).unwrap());
+        assert_eq!(tail.len(), 1);
+        assert_eq!(
+            exec(&db, "SELECT revision FROM history WHERE id = 1000000"),
+            vec![vec![Value::Int64(2)]]
+        );
+        let (current_snapshot, directory_lookup) = writer_work(|| db.snapshot_at(db.current_lsn()));
+        assert_eq!(current_snapshot, db.snapshot());
+        assert!(
+            directory_lookup.history.commit_index_entries > 0
+                && directory_lookup.history.commit_index_entries <= 2,
+            "actual saved-directory lookup examines only the requested committed position: {directory_lookup:?}"
+        );
+        append_work.push((
+            append.log_keys_examined,
+            tail_work.log_keys_examined,
+            directory_append.history.commit_index_entries,
+            directory_lookup.history.commit_index_entries,
+        ));
+        assert!(tail_work.log_keys_examined > 0 && tail_work.log_keys_examined <= 16);
+        assert_eq!(db.__resident_commit_directory_bytes_for_test(), 0);
         db.close().unwrap();
     }
+    assert_eq!(
+        sync_work[0], sync_work[1],
+        "fixed resumed export work ignores doubled completed log"
+    );
+    assert_eq!(
+        append_work[0], append_work[1],
+        "post-reopen append and fixed log tail ignore doubled commit history"
+    );
     eprintln!("history retained owners N/2N: {owners:?}");
     assert!(
         owners.iter().all(|(log, commit, ddl, sidecars)| *log == 0

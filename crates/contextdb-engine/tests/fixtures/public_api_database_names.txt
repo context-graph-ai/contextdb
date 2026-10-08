@@ -1,7 +1,9 @@
+__additional_resident_owners_for_test
 __allocator_metadata_bytes_for_test
 __create_region_fixture_for_test
 __damage_membership_envelope_for_test
 __durable_ddl_for_test
+__durable_page_population_for_test
 __durable_relation_tree_height_for_test
 __durable_sidecars_for_test
 __durable_version_count_for_test
@@ -34,6 +36,8 @@ contexts
 cron_status
 current_lsn
 ddl_log_since
+declared_read_request_provider
+declared_reader_memory
 delete_edge
 delete_row
 delete_vector
@@ -45,9 +49,11 @@ event_bus_status
 execute
 execute_at_snapshot
 execute_in_tx
+execute_with_read_memory
 explain
 explain_output
 export_snapshot
+export_snapshot_with_read_memory
 force_reset
 get_edge_properties
 graph_change_arrived_by_sync
@@ -108,6 +114,7 @@ rollback
 row_change_arrived_by_sync
 row_version_arrived_by_sync
 run_maintenance_cycle
+run_maintenance_cycle_with_read_memory
 run_pruning_cycle
 run_pruning_cycle_checked
 scan

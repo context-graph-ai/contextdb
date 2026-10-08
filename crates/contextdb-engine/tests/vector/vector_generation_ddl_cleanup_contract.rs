@@ -31,8 +31,13 @@ fn partition(scope: Uuid) -> VectorPartitionKey {
 }
 
 fn graph_available(db: &Database, index: &VectorIndexRef, scope: Uuid) -> bool {
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     db.vector_store_for_test()
-        .partition_info(index, &partition(scope))
+        .partition_info(index, &partition(scope), &mut partition_observation_owner_1)
         .unwrap()
         .map(|info| info.graph_available)
         .unwrap_or(false)
@@ -44,8 +49,15 @@ fn graph_serial(db: &Database, index: &VectorIndexRef, scope: Uuid) -> Option<u6
 }
 
 fn index_is_present(db: &Database, expected: &VectorIndexRef) -> bool {
+    let vector_fixture_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the vector fixture reader");
+    let mut vector_fixture_copy_1 =
+        contextdb_engine::vector_read_memory::admission(vector_fixture_reader_1.clone());
+
     db.vector_store_for_test()
-        .index_infos()
+        .index_infos(&mut vector_fixture_copy_1)
+        .expect("read or publish the admitted vector fixture")
         .into_iter()
         .any(|info| info.index == *expected)
 }

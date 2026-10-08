@@ -74,23 +74,44 @@ fn author_unit(
 ) -> SignedUnit {
     let before = author.current_lsn();
     author.execute(sql, &HashMap::new()).expect("author DDL");
-    let changes = author.changes_since(before);
-    let provenance = author
-        .outbound_ddl_provenance_for_test(
+    let changes = author
+        .changes_since(before)
+        .expect("read the declared changes");
+    let provenance = {
+        let seam_read_memory = author
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        author.outbound_ddl_provenance_for_test(
             &changes,
             tenant,
             &identity.node_id(),
             INCARNATION,
             &|bytes| Ok(identity.sign_for_test(bytes)),
+            seam_read_memory,
         )
-        .expect("sign exact authored unit");
+    }
+    .expect("sign exact authored unit");
     (changes, provenance)
 }
 
 fn receive(receiver: &Database, unit: SignedUnit, tenant: &TenantId) -> contextdb_core::Result<()> {
-    receiver
-        .apply_received_schema_for_test(unit.0, unit.1, tenant.clone(), SOURCE, INCARNATION)
-        .map(|_| ())
+    {
+        let seam_read_memory = receiver
+            .declared_reader_memory()
+            .expect("admit the fixture operation reader");
+        let mut seam_copy_owner =
+            contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+        receiver.apply_received_schema_for_test(
+            unit.0,
+            unit.1,
+            tenant.clone(),
+            SOURCE,
+            INCARNATION,
+            &mut seam_copy_owner,
+            seam_read_memory,
+        )
+    }
+    .map(|_| ())
 }
 
 #[test]

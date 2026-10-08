@@ -612,7 +612,7 @@ fn assert_durable_side_projection(
 }
 
 fn assert_received_ddl_is_appended(db: &Database, changes: &ChangeSet, receiver_lsn: Lsn) {
-    let actual = db.changes_since(Lsn(0));
+    let actual = db.changes_since(Lsn(0)).expect("read the declared changes");
     assert!(actual.ddl.len() >= changes.ddl.len());
     assert_eq!(
         &actual.ddl[actual.ddl.len() - changes.ddl.len()..],
@@ -782,12 +782,21 @@ fn received_schema_publish_does_not_resurrect_a_worker_acknowledged_queue_entry(
         let applying_received = received.clone();
         let applying_lineages = lineages.clone();
         let stage = scope.spawn(move || {
+            let received_schema_read_memory_1 = applying
+                .declared_reader_memory()
+                .expect("admit the received-schema operation reader");
+            let mut received_schema_copy_owner_1 = contextdb_engine::vector_read_memory::admission(
+                received_schema_read_memory_1.clone(),
+            );
+
             applying.commit_received_schema_stage_for_test(
                 &applying_changes,
                 &applying_received,
                 &applying_lineages,
                 &HashMap::new(),
                 false,
+                &mut received_schema_copy_owner_1,
+                received_schema_read_memory_1,
             )
         });
         assert!(
@@ -862,6 +871,12 @@ fn received_schema_acl_route_fails_closed_for_null_or_omitted_acl_refs() {
         .path()
         .join("received-acl-ref-immediate.redb");
     let immediate = Database::open(&immediate_path).unwrap();
+    let received_schema_read_memory_2 = immediate
+        .declared_reader_memory()
+        .expect("admit the received-schema operation reader");
+    let mut received_schema_copy_owner_2 =
+        contextdb_engine::vector_read_memory::admission(received_schema_read_memory_2.clone());
+
     immediate
         .commit_received_schema_stage_for_test(
             &changes,
@@ -869,6 +884,8 @@ fn received_schema_acl_route_fails_closed_for_null_or_omitted_acl_refs() {
             &lineages,
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_2,
+            received_schema_read_memory_2,
         )
         .unwrap();
     assert_received_incomplete_acl_refs_are_denied(&immediate, "received schema immediately");
@@ -876,6 +893,12 @@ fn received_schema_acl_route_fails_closed_for_null_or_omitted_acl_refs() {
     let reopened_temp = tempfile::TempDir::new().unwrap();
     let reopened_path = reopened_temp.path().join("received-acl-ref-reopen.redb");
     let reopened_seed = Database::open(&reopened_path).unwrap();
+    let received_schema_read_memory_3 = reopened_seed
+        .declared_reader_memory()
+        .expect("admit the received-schema operation reader");
+    let mut received_schema_copy_owner_3 =
+        contextdb_engine::vector_read_memory::admission(received_schema_read_memory_3.clone());
+
     reopened_seed
         .commit_received_schema_stage_for_test(
             &changes,
@@ -883,6 +906,8 @@ fn received_schema_acl_route_fails_closed_for_null_or_omitted_acl_refs() {
             &lineages,
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_3,
+            received_schema_read_memory_3,
         )
         .unwrap();
     reopened_seed.close().unwrap();
@@ -915,6 +940,12 @@ fn received_schema_acl_route_keeps_the_local_route_time_grant_snapshot() {
     let received_path = received_temp.path().join("received-acl-route.redb");
     let received = Database::open(&received_path).unwrap();
     let (changes, context, lineages) = acl_received_migration();
+    let received_schema_read_memory_4 = received
+        .declared_reader_memory()
+        .expect("admit the received-schema operation reader");
+    let mut received_schema_copy_owner_4 =
+        contextdb_engine::vector_read_memory::admission(received_schema_read_memory_4.clone());
+
     received
         .commit_received_schema_stage_for_test(
             &changes,
@@ -922,6 +953,8 @@ fn received_schema_acl_route_keeps_the_local_route_time_grant_snapshot() {
             &lineages,
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_4,
+            received_schema_read_memory_4,
         )
         .unwrap();
     assert_acl_route_delivery(&received, "received schema immediately");
@@ -931,6 +964,12 @@ fn received_schema_acl_route_keeps_the_local_route_time_grant_snapshot() {
         .path()
         .join("received-acl-route-reopen.redb");
     let received_reopen_seed = Database::open(&received_reopen_path).unwrap();
+    let received_schema_read_memory_5 = received_reopen_seed
+        .declared_reader_memory()
+        .expect("admit the received-schema operation reader");
+    let mut received_schema_copy_owner_5 =
+        contextdb_engine::vector_read_memory::admission(received_schema_read_memory_5.clone());
+
     received_reopen_seed
         .commit_received_schema_stage_for_test(
             &changes,
@@ -938,6 +977,8 @@ fn received_schema_acl_route_keeps_the_local_route_time_grant_snapshot() {
             &lineages,
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_5,
+            received_schema_read_memory_5,
         )
         .unwrap();
     received_reopen_seed.close().unwrap();
@@ -952,6 +993,12 @@ fn received_schema_acl_route_keeps_the_local_route_time_grant_snapshot() {
     let fault_path = fault_temp.path().join("faulted-received-acl-route.redb");
     let faulted = Database::open(&fault_path).unwrap();
     crate::persistence::arm_received_schema_side_effect_persistence_fault_for_test();
+    let received_schema_read_memory_6 = faulted
+        .declared_reader_memory()
+        .expect("admit the received-schema operation reader");
+    let mut received_schema_copy_owner_6 =
+        contextdb_engine::vector_read_memory::admission(received_schema_read_memory_6.clone());
+
     assert!(
         faulted
             .commit_received_schema_stage_for_test(
@@ -960,6 +1007,8 @@ fn received_schema_acl_route_keeps_the_local_route_time_grant_snapshot() {
                 &lineages,
                 &HashMap::new(),
                 false,
+                &mut received_schema_copy_owner_6,
+                received_schema_read_memory_6
             )
             .is_err()
     );
@@ -977,12 +1026,20 @@ fn received_schema_migration_publishes_sink_and_trigger_side_effects_atomically(
     let db = Database::open(&path).unwrap();
     seed_preexisting_side_projection(&db);
     let (changes, received, lineages) = migration();
+    let received_schema_read_memory_7 = db
+        .declared_reader_memory()
+        .expect("admit the received-schema operation reader");
+    let mut received_schema_copy_owner_7 =
+        contextdb_engine::vector_read_memory::admission(received_schema_read_memory_7.clone());
+
     db.commit_received_schema_stage_for_test(
         &changes,
         &received,
         &lineages,
         &HashMap::new(),
         false,
+        &mut received_schema_copy_owner_7,
+        received_schema_read_memory_7,
     )
     .unwrap();
     let receiver_lsn = db.current_lsn();
@@ -1036,12 +1093,18 @@ fn failed_received_schema_migration_publishes_no_side_effects() {
     let db = Database::open(&path).unwrap();
     seed_preexisting_side_projection(&db);
     let (changes, received, lineages) = migration();
-    let baseline_changes = db.changes_since(Lsn(0));
+    let baseline_changes = db.changes_since(Lsn(0)).expect("read the declared changes");
     let baseline_config = config_snapshot(&db);
     let baseline_event_bus = db.received_event_bus_projection();
     let baseline_triggers = db.list_triggers();
     let baseline_audit_ring = db.trigger_audit_log();
     crate::persistence::arm_received_schema_side_effect_persistence_fault_for_test();
+    let received_schema_read_memory_8 = db
+        .declared_reader_memory()
+        .expect("admit the received-schema operation reader");
+    let mut received_schema_copy_owner_8 =
+        contextdb_engine::vector_read_memory::admission(received_schema_read_memory_8.clone());
+
     assert!(
         db.commit_received_schema_stage_for_test(
             &changes,
@@ -1049,10 +1112,15 @@ fn failed_received_schema_migration_publishes_no_side_effects() {
             &lineages,
             &HashMap::new(),
             false,
+            &mut received_schema_copy_owner_8,
+            received_schema_read_memory_8
         )
         .is_err()
     );
-    assert_exact_change_log(&db.changes_since(Lsn(0)), &baseline_changes);
+    assert_exact_change_log(
+        &db.changes_since(Lsn(0)).expect("read the declared changes"),
+        &baseline_changes,
+    );
     assert_eq!(config_snapshot(&db), baseline_config);
     assert_eq!(db.received_event_bus_projection(), baseline_event_bus);
     assert_eq!(db.list_triggers(), baseline_triggers);
@@ -1070,7 +1138,12 @@ fn failed_received_schema_migration_publishes_no_side_effects() {
     db.close().unwrap();
     drop(db);
     let reopened = Database::open(&path).unwrap();
-    assert_exact_change_log(&reopened.changes_since(Lsn(0)), &baseline_changes);
+    assert_exact_change_log(
+        &reopened
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
+        &baseline_changes,
+    );
     assert_eq!(config_snapshot(&reopened), baseline_config);
     assert_eq!(reopened.received_event_bus_projection(), baseline_event_bus);
     assert_eq!(reopened.list_triggers(), baseline_triggers);

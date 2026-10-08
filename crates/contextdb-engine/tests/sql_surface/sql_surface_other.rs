@@ -5159,7 +5159,9 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
 
         loop {
             let expected_len = poller_expected.len();
-            let changes = poller_db.changes_since(watermark);
+            let changes = poller_db
+                .changes_since(watermark)
+                .expect("read the declared changes");
             let before_seen = seen_creates.len();
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
                 for ddl in &changes.ddl {
@@ -5278,7 +5280,9 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
 
         loop {
             let expected_len = poller_expected.len();
-            let changes = poller_db.changes_since(watermark);
+            let changes = poller_db
+                .changes_since(watermark)
+                .expect("read the declared changes");
             let before_seen = seen_columns.len();
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
                 for ddl in &changes.ddl {
@@ -5384,7 +5388,9 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
 
         loop {
             let expected_len = poller_expected.len();
-            let changes = poller_db.changes_since(watermark);
+            let changes = poller_db
+                .changes_since(watermark)
+                .expect("read the declared changes");
             let before_seen = seen_tables.len();
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
                 for ddl in &changes.ddl {
@@ -5646,7 +5652,9 @@ fn disk_06_sync_pull_rejected_when_over_disk_budget() {
         )
         .unwrap();
     }
-    let changes = edge.changes_since(Lsn(0));
+    let changes = edge
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
 
     let server = Database::open(&server_path).unwrap();
     server
@@ -6232,14 +6240,18 @@ fn integrity_09_drop_table_removes_vectors() {
         .expect("row must exist")
         .row_id;
     assert!(
-        db.live_vector_entry(row_id, db.snapshot()).is_some(),
+        db.live_vector_entry(row_id, db.snapshot())
+            .expect("read the actual fixture observation")
+            .is_some(),
         "vector must exist before DROP TABLE"
     );
 
     db.execute("DROP TABLE docs", &empty()).unwrap();
 
     assert!(
-        db.live_vector_entry(row_id, db.snapshot()).is_none(),
+        db.live_vector_entry(row_id, db.snapshot())
+            .expect("read the actual fixture observation")
+            .is_none(),
         "DROP TABLE must remove vector entries for dropped rows"
     );
 }
@@ -7011,8 +7023,14 @@ fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() 
     // Table-changing SQL cannot retire a vector state while maintenance owns
     // that same state. It reaches the DDL pause only after maintenance exits.
     assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let mut index_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the index observation reader"),
+    );
+
     let ref_present_during_pause = vector_store
-        .index_infos()
+        .index_infos(&mut index_observation_owner_1)
+        .expect("inspect the declared vector indexes")
         .iter()
         .any(|info| info.index == text_ref);
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
@@ -7085,8 +7103,14 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
     // The rename cannot enter this DDL pause until the maintenance-owned
     // traversal releases the old vector state.
     assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let mut index_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the index observation reader"),
+    );
+
     let old_ref_present_during_pause = vector_store
-        .index_infos()
+        .index_infos(&mut index_observation_owner_2)
+        .expect("inspect the declared vector indexes")
         .iter()
         .any(|info| info.index == old_ref);
     assert!(matches!(
@@ -7148,7 +7172,9 @@ fn sync_alter_table_drop_vector_column_removes_receiver_index() {
         .unwrap();
     receiver
         .apply_changes(
-            origin.changes_since(watermark),
+            origin
+                .changes_since(watermark)
+                .expect("read the declared changes"),
             &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
         )
         .unwrap();
@@ -7211,7 +7237,9 @@ fn sync_alter_table_rename_vector_column_moves_receiver_index() {
         .unwrap();
     receiver
         .apply_changes(
-            origin.changes_since(watermark),
+            origin
+                .changes_since(watermark)
+                .expect("read the declared changes"),
             &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
         )
         .unwrap();
@@ -7575,7 +7603,9 @@ fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
     sender.commit(tx).unwrap();
     let vector_lsn = sender.current_lsn();
 
-    let changes = sender.changes_since(row_lsn);
+    let changes = sender
+        .changes_since(row_lsn)
+        .expect("read the declared changes");
     assert_eq!(changes.rows.len(), 1);
     assert_eq!(changes.vectors.len(), 1);
     assert_eq!(
@@ -7808,7 +7838,9 @@ fn sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_oper
             .execute("ALTER TABLE evidence DROP COLUMN note", &empty())
             .unwrap();
 
-        let changes = author.changes_since(watermark);
+        let changes = author
+            .changes_since(watermark)
+            .expect("read the declared changes");
         let constraints = changes
             .ddl
             .iter()
@@ -7917,7 +7949,9 @@ fn sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors
             )
             .unwrap();
 
-        let changes = author.changes_since(watermark);
+        let changes = author
+            .changes_since(watermark)
+            .expect("read the declared changes");
         let constraints = changes
             .ddl
             .iter()
@@ -8255,7 +8289,9 @@ fn sync_vector_rename_persists_row_image_across_reopen() {
             .unwrap();
         receiver
             .apply_changes(
-                origin.changes_since(watermark),
+                origin
+                    .changes_since(watermark)
+                    .expect("read the declared changes"),
                 &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
             )
             .unwrap();
@@ -8309,7 +8345,9 @@ fn sync_single_vector_column_rename_moves_receiver_index() {
         .unwrap();
     receiver
         .apply_changes(
-            origin.changes_since(watermark),
+            origin
+                .changes_since(watermark)
+                .expect("read the declared changes"),
             &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
         )
         .unwrap();
@@ -9472,9 +9510,24 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     assert_eq!(db.sink_metrics_for_test("prv08_sink"), before_sink);
     assert_eq!(db.__debug_vector_hnsw_len(index.clone()), before_hnsw_len);
     assert_eq!(db.__debug_vector_hnsw_stats(index), before_hnsw_stats);
-    assert!(db.changes_since(before_lsn).rows.is_empty());
-    assert!(db.changes_since(before_lsn).vectors.is_empty());
-    assert!(db.changes_since(before_lsn).ddl.is_empty());
+    assert!(
+        db.changes_since(before_lsn)
+            .expect("read the declared changes")
+            .rows
+            .is_empty()
+    );
+    assert!(
+        db.changes_since(before_lsn)
+            .expect("read the declared changes")
+            .vectors
+            .is_empty()
+    );
+    assert!(
+        db.changes_since(before_lsn)
+            .expect("read the declared changes")
+            .ddl
+            .is_empty()
+    );
 }
 
 #[test]
@@ -10766,7 +10819,7 @@ fn non_embedding_bindings() -> Vec<(&'static str, Value, &'static str)> {
         ("a boolean", Value::Bool(true), "Bool"),
         (
             "a json object",
-            Value::Json(serde_json::json!({"embedding": "later"})),
+            Value::Json(serde_json::json!({"embedding": "later"}).into()),
             "Json",
         ),
     ]

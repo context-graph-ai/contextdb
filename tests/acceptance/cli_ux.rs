@@ -913,11 +913,14 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     let edge_db = Arc::new(Database::open(&edge_path).expect("open blank edge db"));
     let identity_path = tmp.path().join("drain-edge-identity.key");
     let dial_spec = contextdb_server::peer_dial_spec(&sync.ticket, &identity_path);
-    let client = Arc::new(contextdb_server::SyncClient::new(
-        edge_db.clone(),
-        &dial_spec,
-        contextdb_core::TenantId::from("f121"),
-    ));
+    let client = Arc::new(
+        contextdb_server::SyncClient::new(
+            edge_db.clone(),
+            &dial_spec,
+            contextdb_core::TenantId::from("f121"),
+        )
+        .expect("construct the authenticated sync endpoint"),
+    );
     client
         .pull_default()
         .await

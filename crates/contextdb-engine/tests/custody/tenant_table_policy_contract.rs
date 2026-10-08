@@ -76,11 +76,10 @@ async fn start_hub(root: &Path, name: &str, tenant: &str) -> Hub {
     let ticket = endpoint.ticket();
     let node_id = endpoint.node_id();
     let db = Arc::new(Database::open(root.join(format!("{name}.db"))).expect("open the hub store"));
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(tenant))
+            .expect("construct the authenticated sync endpoint"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -110,6 +109,7 @@ fn edge_client(db: &Arc<Database>, ticket: &str, identity_path: &Path, tenant: &
         &peer_dial_spec(ticket, identity_path),
         TenantId::from(tenant),
     )
+    .expect("construct the authenticated sync endpoint")
 }
 
 fn expectation(pairs: &[(&str, &str)]) -> ApplicationTablePolicyExpectation {
@@ -746,7 +746,8 @@ async fn a_binding_reply_from_a_foreign_node_is_refused_and_a_persisted_binding_
             TenantId::from(tenant),
             foreign_node_id.clone(),
             foreign_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let foreign_stop = Arc::new(AtomicBool::new(false));
     let foreign_task = tokio::spawn({
@@ -791,7 +792,8 @@ async fn a_binding_reply_from_a_foreign_node_is_refused_and_a_persisted_binding_
         foreign_broker.client_as(&foreign_edge_identity.node_id()),
         TenantId::from(tenant),
         foreign_edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     assert!(
         foreign_broker.recorded_exchanges().is_empty(),
         "premise: no foreign exchange occurred before the refused bind"
@@ -884,10 +886,11 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
     let edge = Arc::new(Database::open(root.path().join("edge.db")).expect("open the edge store"));
     let client = edge_client(&edge, &hub.ticket, &edge_identity, tenant);
     within(
-        client.__seed_application_table_policy_binding_for_test(expectation(&[
-            ("records", ROOT_CLAUSES),
-            ("record_parts", MEMBER_CLAUSES),
-        ])),
+        client.__seed_application_table_policy_binding_for_test(
+            expectation(&[("records", ROOT_CLAUSES), ("record_parts", MEMBER_CLAUSES)]),
+            edge.declared_reader_memory()
+                .expect("admit the fixture client reader"),
+        ),
     )
     .await
     .expect("the edge binds both tables");
@@ -996,7 +999,8 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
             TenantId::from(tenant),
             hub.node_id.clone(),
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let routed_stop = Arc::new(AtomicBool::new(false));
     let routed_task = tokio::spawn({
@@ -1029,7 +1033,8 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
         }),
         TenantId::from(tenant),
         routed_edge_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let applied = within(adversarial_client.pull_default())
         .await
         .expect("a declaration refusal is per table, not a whole-batch failure");
@@ -1370,7 +1375,9 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
 /// The receiver's schema as its durable DDL log holds it: every statement,
 /// with the commit position it installed at.
 fn hub_schema(db: &Database) -> Vec<(contextdb_core::Lsn, DdlChange)> {
-    let log = db.changes_since(contextdb_core::Lsn(0));
+    let log = db
+        .changes_since(contextdb_core::Lsn(0))
+        .expect("read the declared changes");
     log.ddl_lsn.into_iter().zip(log.ddl).collect()
 }
 

@@ -3098,8 +3098,14 @@ mod tests {
     /// A writing session over a throwaway in-memory database — what these
     /// fixtures drive, and the mode `:memory:` always has.
     fn writing_session(database: &Arc<Database>) -> Session {
-        Session::writing(Arc::clone(database), ReadLimits::default())
-            .expect("a live database opens its own bounded read view")
+        Session::writing(
+            Arc::clone(database),
+            ReadLimits::default(),
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                ReadLimits::default().memory,
+            ),
+        )
+        .expect("a live database opens its own bounded read view")
     }
 
     /// A scripted, human-output context — what the meta-command tests below
@@ -3349,7 +3355,12 @@ mod tests {
         // engine's own bounded seam.
         let mut fire_count = 0;
         for _ in 0..5 {
-            let _ = db.cron_run_due_now_for_test();
+            let read_memory = db
+                .declared_reader_memory()
+                .expect("declare cron fixture reader");
+            let mut vector_copy =
+                contextdb_engine::vector_read_memory::admission(read_memory.clone());
+            let _ = db.cron_run_due_now_for_test(&mut vector_copy, read_memory);
             fire_count = db
                 .cron_status()
                 .iter()
@@ -3436,6 +3447,8 @@ mod tests {
     // it believes reached the hub.
     #[test]
     fn b2_sync_not_configured_message() {
+        let db = Arc::new(Database::open_memory());
+        let session = writing_session(&db);
         for (subcmd, expected_ok) in [
             ("status", true),
             ("auto", true),
@@ -3444,7 +3457,7 @@ mod tests {
             ("reconnect", false),
             ("destination", false),
         ] {
-            let result = handle_sync_command(None, None, subcmd, None);
+            let result = handle_sync_command(&session, None, None, subcmd, None);
             assert!(
                 result.message.contains("Sync not configured"),
                 "subcmd '{}' should return 'Sync not configured', got: {}",
@@ -3463,6 +3476,7 @@ mod tests {
     #[test]
     fn b5_sync_invalid_args() {
         let db = Arc::new(Database::open_memory());
+        let session = writing_session(&db);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = rt.block_on(async {
             SyncClient::new(
@@ -3470,6 +3484,7 @@ mod tests {
                 "iroh:invalid-test-ticket",
                 contextdb_core::TenantId::from("b5-test"),
             )
+            .expect("construct SyncClient fixture")
         });
 
         for bad_input in [
@@ -3481,7 +3496,8 @@ mod tests {
             "policy table_only",
             "policy t InvalidPolicy",
         ] {
-            let result = handle_sync_command(Some(&client), Some(&rt), bad_input, None).message;
+            let result =
+                handle_sync_command(&session, Some(&client), Some(&rt), bad_input, None).message;
             assert!(
                 !result.contains("not implemented"),
                 "bad input '{}' should not return 'not implemented', got: {}",
@@ -3663,6 +3679,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let edge_identity = Arc::new(contextdb_server::FabricIdentity::generate());
+        let session = writing_session(&db);
         let client = SyncClient::with_authenticated_transport_and_identity_for_test(
             db,
             Arc::new(UnreachableAfterConnect {
@@ -3670,7 +3687,8 @@ mod tests {
             }),
             contextdb_core::TenantId::from("usr19-exit"),
             edge_identity,
-        );
+        )
+        .expect("construct SyncClient fixture");
 
         // The library surfaces the distinct indeterminate error — never a bare
         // SyncError and never a false Ok.
@@ -3685,6 +3703,7 @@ mod tests {
         // code 3.
         let mut unconfirmed_push = false;
         let outcome = run_sync_command(
+            &session,
             Some(&client),
             Some(&rt),
             "push",

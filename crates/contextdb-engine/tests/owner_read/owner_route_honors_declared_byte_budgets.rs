@@ -206,11 +206,19 @@ fn a_cursor_page_inside_the_declared_page_budget_is_served_over_the_owner_route(
     let directory = tempfile::TempDir::new().expect("task-scoped byte-budget directory");
     let owner_runtime = secure_runtime_root(directory.path(), "owner-runtime");
     let (database, path) = served_store(directory.path(), owner_runtime.clone());
+    let page_copy_read_memory = database
+        .declared_reader_memory()
+        .expect("admit the page comparison reader");
 
     let over_the_channel = {
         let session = owner_session(&owner_runtime, &path);
         let cursor = session.open_cursor(SELECT_WIDE, &HashMap::new());
-        cursor.map(|cursor| cursor.first_page().clone())
+        cursor.map(|cursor| {
+            cursor
+                .first_page()
+                .try_clone(page_copy_read_memory.clone())
+                .expect("copy the page under its declared reader limit")
+        })
     };
 
     drop(database);
@@ -221,7 +229,8 @@ fn a_cursor_page_inside_the_declared_page_budget_is_served_over_the_owner_route(
             .open_cursor(SELECT_WIDE, &HashMap::new())
             .expect("the committed file serves the same page")
             .first_page()
-            .clone()
+            .try_clone(page_copy_read_memory.clone())
+            .expect("copy the page under its declared reader limit")
     };
 
     let file_bytes = encode_cursor_page(&from_the_file).expect("encode the file route's page");

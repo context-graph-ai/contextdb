@@ -114,11 +114,10 @@ async fn start_hub(root: &Path) -> Hub {
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open hub database"));
     declare_tables(&db);
-    let server = Arc::new(SyncServer::new(
-        db.clone(),
-        &endpoint,
-        TenantId::from(TENANT),
-    ));
+    let server = Arc::new(
+        SyncServer::new(db.clone(), &endpoint, TenantId::from(TENANT))
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -165,7 +164,8 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
     let dial_spec = peer_dial_spec(&hub.ticket, &identity_path);
     let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
     declare_tables(&edge);
-    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT));
+    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT))
+        .expect("construct SyncClient fixture");
 
     client
         .push()
@@ -200,7 +200,9 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
     // this same push durably and immutably binds -- would silently rebuild
     // the reference from a changed fact, not the one the client actually
     // encoded.
-    let (changes, arrivals) = edge.changes_since_with_arrivals(source_before);
+    let (changes, arrivals) = edge
+        .changes_since_with_arrivals(source_before)
+        .expect("read fixture changes and arrivals");
 
     // Production observation seams (test-seam builds only), read before the
     // push so the verdict below is a delta, not an absolute reading that
@@ -259,6 +261,7 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
             &edge_node_id,
             incarnation,
             dummy_lineage_signer,
+            edge.declared_reader_memory().expect("admit the fixture operation reader"),
         )
         .expect(
             "read back the same outbound row lineages and DDL provenance the sync client just attached",
@@ -400,6 +403,7 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
     let dependency_lsns = hub
         .db
         .changes_since(hub_before)
+        .expect("read changes_since fixture")
         .rows
         .iter()
         .filter(|change| {

@@ -109,9 +109,18 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         first_batch.is_ok(),
         "one admitted finite batch must return a report: {first_batch:?}"
     );
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let committed = db
         .vector_store_for_test()
-        .partition_info(&route.index, &route.partition_key)
+        .partition_info(
+            &route.index,
+            &route.partition_key,
+            &mut partition_observation_owner_1,
+        )
         .unwrap()
         .unwrap()
         .maintenance_progress;
@@ -141,9 +150,18 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     db.close().unwrap();
     drop(db);
     let db = Arc::new(open(&path, Some(limit)));
+    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let restored = db
         .vector_store_for_test()
-        .partition_info(&route.index, &route.partition_key)
+        .partition_info(
+            &route.index,
+            &route.partition_key,
+            &mut partition_observation_owner_2,
+        )
         .unwrap()
         .unwrap()
         .maintenance_progress;
@@ -191,7 +209,14 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         }
         let _finished = Finished(reached);
         let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
-        observe(|| worker_db.__maintenance_with_stop_for_test(worker_stop))
+        observe(|| {
+            worker_db.__maintenance_with_stop_for_test(
+                worker_stop,
+                worker_db
+                    .declared_reader_memory()
+                    .expect("admit the maintenance fixture reader"),
+            )
+        })
     });
     if !boundary.recv().unwrap() {
         pause.release();
@@ -203,9 +228,18 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         waiting.join().unwrap(),
         "the real insertion boundary was reached"
     );
+    let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let partial = db
         .vector_store_for_test()
-        .partition_info(&route.index, &route.partition_key)
+        .partition_info(
+            &route.index,
+            &route.partition_key,
+            &mut partition_observation_owner_3,
+        )
         .unwrap()
         .unwrap()
         .maintenance_progress
@@ -228,9 +262,18 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         matches!(cancelled, Err(contextdb_core::Error::ReadCancelled)),
         "cancellation has its typed result: {cancelled:?}"
     );
+    let mut partition_observation_owner_4 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     assert!(
         !db.vector_store_for_test()
-            .partition_info(&route.index, &route.partition_key)
+            .partition_info(
+                &route.index,
+                &route.partition_key,
+                &mut partition_observation_owner_4
+            )
             .unwrap()
             .unwrap()
             .graph_available,
@@ -246,9 +289,18 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
     db.close().unwrap();
     drop(db);
     let db = open(&path, Some(64 * 1024 * 1024));
+    let mut partition_observation_owner_5 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let resume = db
         .vector_store_for_test()
-        .partition_info(&route.index, &route.partition_key)
+        .partition_info(
+            &route.index,
+            &route.partition_key,
+            &mut partition_observation_owner_5,
+        )
         .unwrap()
         .unwrap()
         .maintenance_progress;
@@ -278,16 +330,34 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
                     "resumed initial construction must exclude committed source identities; repeated {identity:?}"
                 );
             }
+            let mut partition_observation_owner_6 = contextdb_engine::vector_read_memory::admission(
+                db.declared_reader_memory()
+                    .expect("admit the partition observation reader"),
+            );
+
             initial_published = db
                 .vector_store_for_test()
-                .partition_info(&route.index, &route.partition_key)
+                .partition_info(
+                    &route.index,
+                    &route.partition_key,
+                    &mut partition_observation_owner_6,
+                )
                 .unwrap()
                 .unwrap()
                 .graph_available;
         }
+        let mut partition_observation_owner_7 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         if let Some(progress) = db
             .vector_store_for_test()
-            .partition_info(&route.index, &route.partition_key)
+            .partition_info(
+                &route.index,
+                &route.partition_key,
+                &mut partition_observation_owner_7,
+            )
             .unwrap()
             .unwrap()
             .maintenance_progress
@@ -332,9 +402,18 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         vector_oracle(0..ROWS + 8, 128)
     );
     all_searches(&db, 0..ROWS + 8, "EXACT");
+    let mut partition_observation_owner_8 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let info = db
         .vector_store_for_test()
-        .partition_info(&route.index, &route.partition_key)
+        .partition_info(
+            &route.index,
+            &route.partition_key,
+            &mut partition_observation_owner_8,
+        )
         .unwrap()
         .unwrap();
     eprintln!(
@@ -378,9 +457,18 @@ fn paged_initial_replacement_and_reclamation_progress_under_writes() {
         result.unwrap();
         assert!(work.workspace_peak <= WORKSPACE && work.maintenance_source_visits <= 512);
     }
+    let mut partition_observation_owner_9 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit the partition observation reader"),
+    );
+
     let replacement = db
         .vector_store_for_test()
-        .partition_info(&route.index, &route.partition_key)
+        .partition_info(
+            &route.index,
+            &route.partition_key,
+            &mut partition_observation_owner_9,
+        )
         .unwrap()
         .unwrap();
     assert!(
@@ -447,16 +535,36 @@ fn maintenance_crash_child() -> bool {
             .read_exact(&mut byte)
             .expect("parent kills paused process");
     };
-    if cut == "Insertion" {
+    if cut == "Insertion" || cut == "CommittedScratch" {
         let route = VectorPartitionRef::new(index("current_build"), partition(0));
-        let boundary = db.__arm_vector_maintenance_progress_pause_for_test(&route, 3);
+        let committed = if cut == "CommittedScratch" {
+            let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+                db.declared_reader_memory()
+                    .expect("admit the partition observation reader"),
+            );
+
+            db.vector_store_for_test()
+                .partition_info(
+                    &route.index,
+                    &route.partition_key,
+                    &mut partition_observation_owner_1,
+                )
+                .unwrap()
+                .expect("the fixture partition exists")
+                .maintenance_progress
+                .expect("parent committed an unfinished batch")
+                .vectors_done
+        } else {
+            0
+        };
+        let boundary = db.__arm_vector_maintenance_progress_pause_for_test(&route, committed + 3);
         let worker_db = db.clone();
         let worker = std::thread::spawn(move || {
             let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
             worker_db.run_maintenance_cycle()
         });
         if boundary.wait_until_reached_blocking() {
-            pause("Insertion");
+            pause(&cut);
         }
         boundary.release();
         worker.join().unwrap().unwrap();
@@ -484,8 +592,13 @@ fn current_only_maintenance_crash_cuts() {
         io::BufRead,
         process::{Command, Stdio},
     };
-    const ROWS: usize = 128;
-    for cut in ["GenerationBeforeRedb", "GenerationAfterRedb", "Insertion"] {
+    for cut in [
+        "GenerationBeforeRedb",
+        "GenerationAfterRedb",
+        "Insertion",
+        "CommittedScratch",
+    ] {
+        let rows: usize = if cut == "CommittedScratch" { 1024 } else { 128 };
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("current-build.db");
         let db = open(&path, Some(64 * 1024 * 1024));
@@ -493,10 +606,42 @@ fn current_only_maintenance_crash_cuts() {
             &db,
             "CREATE TABLE current_build (id INT PRIMARY KEY, scope INT NOT NULL, v VECTOR(128) PARTITION_KEY (scope) MAX_PARTITIONS 2 SEARCH_MODE INDEXED HNSW (M = 16, EF_CONSTRUCTION = 32)) HISTORY CURRENT ONLY SYNC OFF",
         );
-        for id in 0..ROWS {
+        for id in 0..rows {
             insert_vector(&db, "current_build", id, Some(0), 128);
         }
         let frontier = db.snapshot();
+        let route = VectorPartitionRef::new(index("current_build"), partition(0));
+        let mut committed_sources = std::collections::HashSet::new();
+        let preceding = if cut == "CommittedScratch" {
+            const WORKSPACE: usize = 256 * 1024;
+            db.set_memory_limit(Some(db.accountant().usage().used + WORKSPACE))
+                .unwrap();
+            let (report, work) = bounded_cycle(&db, WORKSPACE);
+            report.unwrap();
+            let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+                db.declared_reader_memory()
+                    .expect("admit the partition observation reader"),
+            );
+
+            let progress = db
+                .vector_store_for_test()
+                .partition_info(
+                    &route.index,
+                    &route.partition_key,
+                    &mut partition_observation_owner_2,
+                )
+                .unwrap()
+                .expect("the fixture partition exists")
+                .maintenance_progress
+                .expect("actual unfinished paged batch");
+            assert!(progress.vectors_done > 0 && progress.vectors_done < rows);
+            assert_eq!(progress.vectors_done, work.maintenance_source_keys);
+            committed_sources.extend(work.maintenance_source_identities.into_iter().flatten());
+            assert_eq!(committed_sources.len(), work.maintenance_source_keys);
+            Some(progress)
+        } else {
+            None
+        };
         db.close().unwrap();
         drop(db);
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -539,9 +684,18 @@ fn current_only_maintenance_crash_cuts() {
         );
         let db = open(&path, Some(64 * 1024 * 1024));
         let route = VectorPartitionRef::new(index("current_build"), partition(0));
+        let mut partition_observation_owner_10 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         let restored = db
             .vector_store_for_test()
-            .partition_info(&route.index, &route.partition_key)
+            .partition_info(
+                &route.index,
+                &route.partition_key,
+                &mut partition_observation_owner_10,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -549,10 +703,21 @@ fn current_only_maintenance_crash_cuts() {
             cut == "GenerationAfterRedb",
             "complete graph/catalog publication is atomic across process death: {cut}; {restored:?}"
         );
+        if let Some(preceding) = preceding {
+            assert_eq!(
+                restored.maintenance_progress,
+                Some(preceding),
+                "crash in the next batch preserves the exact preceding durable cursor"
+            );
+            assert_eq!(
+                vector_rows(&db, "current_build", frontier, Some(0)),
+                vector_oracle(0..rows, 128)
+            );
+        }
         // No caller pin is created. Superseding current-only source must leave the
         // durable maintenance floor protecting the captured unfinished frontier.
         if cut == "Insertion" {
-            for id in 0..ROWS {
+            for id in 0..rows {
                 if id % 3 == 0 {
                     exec(&db, &format!("DELETE FROM current_build WHERE id = {id}"));
                 } else {
@@ -560,7 +725,7 @@ fn current_only_maintenance_crash_cuts() {
                         "UPDATE current_build SET scope = $scope, v = $v WHERE id = $id",
                         &std::collections::HashMap::from([
                             ("scope".into(), Value::Int64((id % 3 == 1) as i64)),
-                            ("v".into(), Value::Vector(vector(id + ROWS, 128))),
+                            ("v".into(), Value::Vector(vector(id + rows, 128))),
                             ("id".into(), Value::Int64(id as i64)),
                         ]),
                     )
@@ -570,26 +735,78 @@ fn current_only_maintenance_crash_cuts() {
             db.compact_currency_versions().unwrap();
             assert_eq!(
                 vector_rows(&db, "current_build", frontier, Some(0)),
-                vector_oracle(0..ROWS, 128),
+                vector_oracle(0..rows, 128),
                 "restart restores the maintenance floor before cleanup, without a caller-created pin"
             );
-            // The first batch may correctly roll back to zero progress. This cut
-            // establishes no preceding committed scratch batch; exact durable
-            // node/source/adjacency/progress correspondence awaits that protocol.
+            // This insertion cut has no preceding committed batch; the
+            // separate CommittedScratch arm proves that restart boundary.
         }
+        let mut previous = preceding.map_or(0, |progress| progress.vectors_done);
+        let mut published = restored.graph_available;
         for _ in 0..64 {
-            db.run_maintenance_cycle().unwrap();
+            let (report, work) = observe(|| db.run_maintenance_cycle());
+            report.unwrap();
+            if cut == "CommittedScratch" && !published {
+                assert!(
+                    work.maintenance_source_keys <= 64 && work.maintenance_source_visits <= 512
+                );
+                for identity in work.maintenance_source_identities.into_iter().flatten() {
+                    assert!(
+                        committed_sources.insert(identity),
+                        "restart must skip the preceding committed source batch: {identity:?}"
+                    );
+                }
+                let mut partition_observation_owner_3 =
+                    contextdb_engine::vector_read_memory::admission(
+                        db.declared_reader_memory()
+                            .expect("admit the partition observation reader"),
+                    );
+
+                let info = db
+                    .vector_store_for_test()
+                    .partition_info(
+                        &route.index,
+                        &route.partition_key,
+                        &mut partition_observation_owner_3,
+                    )
+                    .unwrap()
+                    .expect("the fixture partition exists");
+                if let Some(progress) = info.maintenance_progress {
+                    assert!(
+                        progress.vectors_done >= previous
+                            && progress.vectors_done <= previous + work.maintenance_source_keys
+                    );
+                    previous = progress.vectors_done;
+                }
+                published = info.graph_available;
+            }
         }
+        if cut == "CommittedScratch" {
+            assert_eq!(
+                committed_sources.len(),
+                rows,
+                "all committed and resumed source identities are consumed exactly once"
+            );
+        }
+        let mut partition_observation_owner_11 = contextdb_engine::vector_read_memory::admission(
+            db.declared_reader_memory()
+                .expect("admit the partition observation reader"),
+        );
+
         assert!(
             db.vector_store_for_test()
-                .partition_info(&route.index, &route.partition_key)
+                .partition_info(
+                    &route.index,
+                    &route.partition_key,
+                    &mut partition_observation_owner_11
+                )
                 .unwrap()
                 .unwrap()
                 .graph_available
         );
         let changed = cut == "Insertion";
         for scope in 0..=1 {
-            let expected = (0..ROWS)
+            let expected = (0..rows)
                 .filter(|id| {
                     if changed {
                         id % 3 != 0 && (*id % 3 == 1) as usize == scope
@@ -600,7 +817,7 @@ fn current_only_maintenance_crash_cuts() {
                 .map(|id| {
                     vec![
                         Value::Int64(id as i64),
-                        Value::Vector(vector(if changed { id + ROWS } else { id }, 128)),
+                        Value::Vector(vector(if changed { id + rows } else { id }, 128)),
                     ]
                 })
                 .collect::<Vec<_>>();
@@ -610,12 +827,12 @@ fn current_only_maintenance_crash_cuts() {
                 "resumed current graph/source preserves changed vectors, partition moves and deletes: {cut}; scope={scope}"
             );
         }
-        for id in 0..ROWS {
+        for id in 0..rows {
             if changed && id % 3 == 0 {
                 continue;
             }
             let scope = if changed { (id % 3 == 1) as i64 } else { 0 };
-            let query = vector(if changed { id + ROWS } else { id }, 128);
+            let query = vector(if changed { id + rows } else { id }, 128);
             let answer = db.execute("SELECT id FROM current_build WHERE scope = $scope ORDER BY v <=> $v USE VECTOR INDEXED LIMIT 1", &std::collections::HashMap::from([
                 ("scope".into(),Value::Int64(scope)), ("v".into(),Value::Vector(query))])).unwrap();
             assert_eq!(

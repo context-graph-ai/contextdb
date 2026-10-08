@@ -102,15 +102,30 @@ fn stream_resume_seeks_after_prefix_and_exclusive_ordinal() {
         vec![2, 2],
         "only the fixed two-row pending window may be examined"
     );
-    consumer_declarations_seek_to_the_pending_batch();
+    consumer_declarations_seek_to_the_pending_batch(false);
+    consumer_declarations_seek_to_the_pending_batch(true);
 }
 
 // Exercise the consumer's complete key declarations and its batch-claim SQL,
-// including the unbound source_sequence before ordinal in the cursor index.
-fn consumer_declarations_seek_to_the_pending_batch() {
+// matching the saved consumer declarations and claim/discovery SQL.
+fn consumer_declarations_seek_to_the_pending_batch(durable: bool) {
     let mut measurements = Vec::new();
     for completed in [10_i64, 2_010] {
-        let database = Database::open_memory();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("consumer-resume.redb");
+        let database = if durable {
+            contextdb_engine::Database::open_with_options(
+                &path,
+                contextdb_engine::DatabaseOpenOptions {
+                    maintenance_policy: contextdb_engine::MaintenancePolicy::CallerDriven,
+                    memory_limit: Some(64 << 20),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        } else {
+            Database::open_memory()
+        };
         for ddl in [
             "CREATE TABLE contexts (id UUID PRIMARY KEY)",
             "CREATE TABLE event_search_generations (id UUID PRIMARY KEY, context_id UUID NOT NULL, UNIQUE (context_id, id))",
@@ -119,6 +134,8 @@ fn consumer_declarations_seek_to_the_pending_batch() {
             "CREATE TABLE event_search_source_events (membership_id UUID NOT NULL UNIQUE, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), ordinal INTEGER NOT NULL, event_id UUID NOT NULL REFERENCES events(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, source_sequence INTEGER NOT NULL, effective_interpretation_generation_id UUID, captured_source_sha256 TEXT NOT NULL, effective_source_sha256 TEXT NOT NULL, PRIMARY KEY (context_id, generation_id, ordinal), UNIQUE (context_id, generation_id, event_id), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id), FOREIGN KEY (context_id, effective_interpretation_generation_id, event_id) REFERENCES event_interpretation_values(context_id, generation_id, event_id)) IMMUTABLE SYNC OFF",
             "CREATE INDEX idx_event_search_source_events_generation ON event_search_source_events (generation_id, context_id, ordinal)",
             "CREATE INDEX idx_event_search_source_events_cursor_range ON event_search_source_events (context_id, generation_id, connector_id, source_instance_ref, source_sequence, ordinal)",
+            "CREATE INDEX idx_event_search_source_events_session_claim ON event_search_source_events (context_id, generation_id, connector_id, source_instance_ref, session_ref, ordinal)",
+            "CREATE INDEX idx_event_search_source_events_session_sequence ON event_search_source_events (context_id, generation_id, connector_id, source_instance_ref, session_ref, source_sequence)",
         ] {
             database.execute(ddl, &HashMap::new()).unwrap();
         }
@@ -213,7 +230,11 @@ fn consumer_declarations_seek_to_the_pending_batch() {
                     source,
                     session,
                     ordinal,
-                    offset + 1,
+                    if stream == 1 {
+                        completed + offset + 1
+                    } else {
+                        offset + 1
+                    },
                 );
                 id += 1;
             }
@@ -231,7 +252,70 @@ fn consumer_declarations_seek_to_the_pending_batch() {
             );
         }
         database.commit(transaction).unwrap();
-        let result = database.execute(
+        let measured = if durable {
+            database
+                .execute(
+                    "CREATE TABLE durable_resume_pressure (id INT PRIMARY KEY, body TEXT) SYNC OFF",
+                    &HashMap::new(),
+                )
+                .unwrap();
+            let pressure = database.begin_or_panic();
+            for id in 0..128 {
+                database
+                    .execute_in_tx(
+                        pressure,
+                        "INSERT INTO durable_resume_pressure VALUES ($id, $body)",
+                        &HashMap::from([
+                            ("id".into(), Value::Int64(id)),
+                            ("body".into(), Value::Text("p".repeat(65536))),
+                        ]),
+                    )
+                    .unwrap();
+            }
+            database.commit(pressure).unwrap();
+            database.close().unwrap();
+            drop(database);
+            let filter = format!(
+                "{}::durable_consumer_reader_child",
+                module_path!().split_once("::").unwrap().1
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &filter, "--nocapture"])
+                .env("CONTEXTDB_DURABLE_RESUME_FIXTURE", &path)
+                .env("CONTEXTDB_DURABLE_RESUME_COMPLETED", completed.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fresh durable resume child: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let record = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("DURABLE_RESUME "))
+                .expect("fresh child work record");
+            serde_json::from_str::<(u64, u64)>(record).unwrap()
+        } else {
+            measure_consumer_tail(&database, completed)
+        };
+        measurements.push(measured);
+    }
+    assert_eq!(
+        measurements[0], measurements[1],
+        "the declared consumer batch claim must not examine completed entries or neighbouring sessions as the completed prefix grows: {measurements:?}"
+    );
+    assert_eq!(
+        measurements[0],
+        (2, 1),
+        "only the fixed pending batch may be examined"
+    );
+}
+
+fn measure_consumer_tail(database: &Database, completed: i64) -> (u64, u64) {
+    let context = Uuid::from_u128(7);
+    let generation = Uuid::from_u128(11);
+    let result = database.execute(
             "SELECT membership_id, ordinal, event_id, connector_id, source_instance_ref, session_ref, source_sequence, effective_interpretation_generation_id, captured_source_sha256, effective_source_sha256 FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND ordinal >= $start_ordinal ORDER BY ordinal ASC LIMIT 2",
             &HashMap::from([
                 ("context_id".into(),Value::Uuid(context)),
@@ -241,38 +325,91 @@ fn consumer_declarations_seek_to_the_pending_batch() {
                 ("session".into(),Value::Text("selected".into())),
                 ("start_ordinal".into(),Value::Int64(100_000)),
             ])).unwrap();
-        let expected = (0..2_i64)
-            .map(|offset| {
-                vec![
-                    Value::Uuid(Uuid::from_u128(11_000_000 + offset as u128)),
-                    Value::Int64(100_000 + offset),
-                    Value::Uuid(Uuid::from_u128(1_000_000 + offset as u128)),
-                    Value::Text("connector".into()),
-                    Value::Text("source".into()),
-                    Value::Text("selected".into()),
-                    Value::Int64(100_000 + offset + 1),
-                    Value::Null,
-                    Value::Text("captured".into()),
-                    Value::Text("effective".into()),
-                ]
-            })
-            .collect::<Vec<_>>();
+    let expected = (0..2_i64)
+        .map(|offset| {
+            vec![
+                Value::Uuid(Uuid::from_u128(11_000_000 + offset as u128)),
+                Value::Int64(100_000 + offset),
+                Value::Uuid(Uuid::from_u128(1_000_000 + offset as u128)),
+                Value::Text("connector".into()),
+                Value::Text("source".into()),
+                Value::Text("selected".into()),
+                Value::Int64(100_000 + offset + 1),
+                Value::Null,
+                Value::Text("captured".into()),
+                Value::Text("effective".into()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        result.rows, expected,
+        "the batch claim returns only its ordered pending session tail"
+    );
+    assert_eq!(
+        result.trace.index_used.as_deref(),
+        Some("idx_event_search_source_events_session_claim")
+    );
+    assert!(result.trace.sort_elided);
+    let discovery = database.execute(
+            "SELECT ordinal FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND source_sequence > $committed ORDER BY source_sequence ASC LIMIT 1",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(context)),
+                ("generation_id".into(), Value::Uuid(generation)),
+                ("connector_id".into(), Value::Text("connector".into())),
+                ("source".into(), Value::Text("source".into())),
+                ("session".into(), Value::Text("selected".into())),
+                ("committed".into(), Value::Int64(completed)),
+            ]),
+        ).unwrap();
+    assert_eq!(discovery.rows, vec![vec![Value::Int64(100_000)]]);
+    assert_eq!(
+        discovery.trace.index_used.as_deref(),
+        Some("idx_event_search_source_events_session_sequence")
+    );
+    assert!(discovery.trace.sort_elided);
+    (result.trace.rows_examined, discovery.trace.rows_examined)
+}
+#[test]
+fn durable_consumer_reader_child() {
+    let Some(path) = std::env::var_os("CONTEXTDB_DURABLE_RESUME_FIXTURE") else {
+        return;
+    };
+    let completed = std::env::var("CONTEXTDB_DURABLE_RESUME_COMPLETED")
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let database = Database::open_with_options(
+        &path,
+        contextdb_engine::DatabaseOpenOptions {
+            memory_limit: Some(64 << 20),
+            maintenance_policy: contextdb_engine::MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = database.__writer_cache_stats_for_test().unwrap();
+    for id in 0..128 {
         assert_eq!(
-            result.rows, expected,
-            "the batch claim returns only its ordered pending session tail"
+            database
+                .execute(
+                    &format!("SELECT body FROM durable_resume_pressure WHERE id = {id}"),
+                    &HashMap::new()
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Text("p".repeat(65536))]]
         );
-        eprintln!(
-            "consumer batch claim completed={completed} index={:?} sort_elided={} rows_examined={}",
-            result.trace.index_used, result.trace.sort_elided, result.trace.rows_examined
-        );
-        measurements.push(result.trace.rows_examined);
     }
-    assert_eq!(
-        measurements[0], measurements[1],
-        "the declared consumer batch claim must not examine completed entries or neighbouring sessions as the completed prefix grows: {measurements:?}"
+    let displaced = database.__writer_cache_stats_for_test().unwrap();
+    assert!(displaced.1 > before.1 && displaced.2 > before.2);
+    let measured = measure_consumer_tail(&database, completed);
+    assert!(
+        database.__writer_cache_stats_for_test().unwrap().1 > displaced.1,
+        "saved consumer index is read after real cache displacement"
     );
-    assert_eq!(
-        measurements[0], 2,
-        "only the fixed pending batch may be examined"
+    println!(
+        "DURABLE_RESUME {}",
+        serde_json::to_string(&measured).unwrap()
     );
+    database.close().unwrap();
 }

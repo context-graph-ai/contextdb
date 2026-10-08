@@ -32,9 +32,18 @@ fn captured_read_survives_compaction(cursor: bool) {
         let budget = ReadRegistrationBudget::new(Arc::clone(&clock), 0, 10_000);
         let withdrawn = OwnerReadCancellation::new();
         if cursor {
+            let fixture_operation_reader_1 = reader_db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             let (snapshot, _, _, storage, registration, root) = reader_db
                 .bounded_cursor_snapshot_registration_with_root(
-                    false, clock, 10_000, &budget, &withdrawn,
+                    false,
+                    clock,
+                    10_000,
+                    &budget,
+                    &withdrawn,
+                    fixture_operation_reader_1.clone(),
                 )
                 .expect("cursor admission succeeds")
                 .expect("cursor remains active");
@@ -45,8 +54,17 @@ fn captured_read_survives_compaction(cursor: bool) {
                 root.expect("cursor retains its captured physical root"),
             )
         } else {
+            let fixture_operation_reader_2 = reader_db
+                .declared_reader_memory()
+                .expect("admit the actual fixture reader");
+
             let (snapshot, _, registration, root) = reader_db
-                .bounded_read_snapshot_registration_with_root(false, &budget, &withdrawn)
+                .bounded_read_snapshot_registration_with_root(
+                    false,
+                    &budget,
+                    &withdrawn,
+                    fixture_operation_reader_2.clone(),
+                )
                 .expect("read admission succeeds")
                 .expect("read remains active");
             (
@@ -107,8 +125,11 @@ fn captured_read_survives_compaction(cursor: bool) {
             .unwrap()
             > 0
     );
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
 
-    let scope = db.enter_writer_read(Some(root.clone()));
+    let scope = db.enter_writer_read(Some(root.clone()), fixture_operation_reader_1.clone());
     let result = db
         .execute_at_snapshot(
             "SELECT id, body FROM items ORDER BY id",
@@ -178,12 +199,30 @@ fn durable_admission_rechecks_cancellation_and_deadline_before_registering() {
                 let clock: Arc<dyn DeadlineClock> = reader_clock;
                 let budget = ReadRegistrationBudget::new(Arc::clone(&clock), 0, 5);
                 if cursor {
+                    let fixture_operation_reader_3 = reader_db
+                        .declared_reader_memory()
+                        .expect("admit the actual fixture reader");
+
                     reader_db
-                        .bounded_cursor_snapshot_registration(clock, 5, &budget, &reader_withdrawn)
+                        .bounded_cursor_snapshot_registration(
+                            clock,
+                            5,
+                            &budget,
+                            &reader_withdrawn,
+                            fixture_operation_reader_3.clone(),
+                        )
                         .map(|admitted| admitted.is_some())
                 } else {
+                    let fixture_operation_reader_4 = reader_db
+                        .declared_reader_memory()
+                        .expect("admit the actual fixture reader");
+
                     reader_db
-                        .bounded_read_snapshot_registration(&budget, &reader_withdrawn)
+                        .bounded_read_snapshot_registration(
+                            &budget,
+                            &reader_withdrawn,
+                            fixture_operation_reader_4.clone(),
+                        )
                         .map(|admitted| admitted.is_some())
                 }
             });

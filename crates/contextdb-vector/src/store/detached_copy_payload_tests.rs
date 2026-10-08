@@ -137,6 +137,7 @@ fn owned_receipt_bytes(store: &VectorStore) -> usize {
     receipt.raw_vector_bodies
         + receipt.raw_reverse_directory
         + receipt.partition_vectors
+        + receipt.vector_partition_controls
         + receipt.base_graph
         + receipt.change_graph
         + receipt.mutable_tail

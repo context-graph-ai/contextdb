@@ -1319,4 +1319,574 @@ mod test {
             46
         );
     }
+
+    // The writer reopen/doubling acceptance fixture promises that its warmed
+    // fixed cache share stays saturated without growth. These controls prove
+    // that same occupancy promise with the real native cache and page owners.
+    // A uniform native cache fills its declared share to the maximum complete
+    // page count. Held branch pages stay resident while CLOCK replaces leaves.
+    const UNIFORM_PAGE_BYTES: usize = 4096;
+    const UNIFORM_CACHE_CAP: usize = 4 * 1024 * 1024;
+    const UNIFORM_CACHE_SLOTS: usize = 996;
+
+    fn uniform_cache_file(extra_pages: usize) -> PagedCachedFile {
+        assert_eq!(super::cached_page_bytes(UNIFORM_PAGE_BYTES), 4208);
+        assert_eq!(UNIFORM_CACHE_CAP / 4208, UNIFORM_CACHE_SLOTS);
+        let backend = InMemoryBackend::new();
+        backend
+            .set_len(((UNIFORM_CACHE_SLOTS + extra_pages) * UNIFORM_PAGE_BYTES) as u64)
+            .unwrap();
+        PagedCachedFile::new(
+            Box::new(backend),
+            UNIFORM_PAGE_BYTES as u64,
+            UNIFORM_CACHE_CAP,
+        )
+        .unwrap()
+    }
+
+    fn uniform_page(file: &PagedCachedFile, ordinal: usize) -> super::PageMemory {
+        let page = file
+            .read(
+                (ordinal * UNIFORM_PAGE_BYTES) as u64,
+                UNIFORM_PAGE_BYTES,
+                PageHint::Clean,
+            )
+            .unwrap();
+        assert_eq!(page.len(), UNIFORM_PAGE_BYTES);
+        page
+    }
+
+    // Inspect by borrowing: no get, second-chance bit change, or page clone.
+    fn uniform_cache_cut(file: &PagedCachedFile) -> (usize, usize, usize, usize) {
+        let mut entries = 0;
+        let mut payload = 0;
+        let mut charge = 0;
+        let mut pinned = 0;
+        for stripe in &file.read_cache {
+            let stripe = stripe.read().unwrap();
+            for (_, page) in stripe.iter() {
+                assert_eq!(page.len(), UNIFORM_PAGE_BYTES);
+                entries += 1;
+                payload += page.len();
+                charge += super::cached_page_bytes(page.len());
+                pinned += usize::from(Arc::strong_count(&*page) > 1);
+            }
+        }
+        (entries, payload, charge, pinned)
+    }
+
+    fn assert_uniform_cache_full(file: &PagedCachedFile, pinned: usize) {
+        assert_eq!(
+            uniform_cache_cut(file),
+            (
+                UNIFORM_CACHE_SLOTS,
+                UNIFORM_CACHE_SLOTS * UNIFORM_PAGE_BYTES,
+                UNIFORM_CACHE_SLOTS * 4208,
+                pinned,
+            ),
+            "every funded uniform page remains in the cache map"
+        );
+        assert_eq!(
+            file.read_cache_bytes.load(Ordering::Acquire),
+            UNIFORM_CACHE_SLOTS * 4208,
+            "the ledger reconciles every resident page, including pinned pages"
+        );
+        assert_eq!(file.write_buffer_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(
+            file.max_cache_size.load(Ordering::Acquire),
+            UNIFORM_CACHE_CAP
+        );
+        assert!(UNIFORM_CACHE_SLOTS * 4208 <= UNIFORM_CACHE_CAP);
+        assert!((UNIFORM_CACHE_SLOTS + 1) * 4208 > UNIFORM_CACHE_CAP);
+    }
+
+    #[test]
+    fn uniform_cache_fills_its_complete_page_capacity_and_preserves_it_on_misses() {
+        let misses = UNIFORM_CACHE_SLOTS * 2;
+        let file = uniform_cache_file(misses);
+        for ordinal in 0..UNIFORM_CACHE_SLOTS {
+            let page = uniform_page(&file, ordinal);
+            assert!(matches!(page, super::PageMemory::Cached(_)));
+            drop(page);
+        }
+        assert_uniform_cache_full(&file, 0);
+        for ordinal in UNIFORM_CACHE_SLOTS..UNIFORM_CACHE_SLOTS + misses {
+            let page = uniform_page(&file, ordinal);
+            assert!(matches!(page, super::PageMemory::Cached(_)));
+            drop(page);
+            assert_uniform_cache_full(&file, 0);
+        }
+        for stripe in &file.read_cache {
+            stripe.write().unwrap().clear();
+        }
+        assert_eq!(file.read_cache_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pinned_branch_pages_preserve_uniform_cache_occupancy_through_the_last_miss_and_drop() {
+        let misses = UNIFORM_CACHE_SLOTS * 2;
+        let file = uniform_cache_file(misses);
+        // Three branch-like pages in the first CLOCK stripe remain held
+        // across more than two complete passes over every stripe's victims.
+        let branch_ordinals = [0, 131, 262];
+        let branches = branch_ordinals.map(|ordinal| uniform_page(&file, ordinal));
+        for page in &branches {
+            assert!(matches!(page, super::PageMemory::Cached(_)));
+        }
+        for ordinal in 0..UNIFORM_CACHE_SLOTS {
+            drop(uniform_page(&file, ordinal));
+        }
+        assert_uniform_cache_full(&file, branches.len());
+        for ordinal in UNIFORM_CACHE_SLOTS..UNIFORM_CACHE_SLOTS + misses {
+            let page = uniform_page(&file, ordinal);
+            assert!(matches!(page, super::PageMemory::Cached(_)));
+            drop(page);
+            assert_uniform_cache_full(&file, branches.len());
+        }
+        // No refill read occurs after the last miss: holder drop alone must
+        // not lower the funded resident map or its saturated native ledger.
+        drop(branches);
+        assert_uniform_cache_full(&file, 0);
+        #[cfg(feature = "cache_metrics")]
+        let hits = file.cache_stats().read_hits;
+        for ordinal in branch_ordinals {
+            drop(uniform_page(&file, ordinal));
+        }
+        #[cfg(feature = "cache_metrics")]
+        assert_eq!(
+            file.cache_stats().read_hits,
+            hits + branch_ordinals.len() as u64
+        );
+        assert_uniform_cache_full(&file, 0);
+        for stripe in &file.read_cache {
+            stripe.write().unwrap().clear();
+        }
+        assert_eq!(file.read_cache_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn an_all_pinned_uniform_cache_finishes_misses_without_eviction_or_cache_growth() {
+        struct MissCharge(Arc<std::sync::atomic::AtomicUsize>, usize);
+        impl Drop for MissCharge {
+            fn drop(&mut self) {
+                self.0.fetch_sub(self.1, Ordering::SeqCst);
+            }
+        }
+        let misses = 5;
+        let file = uniform_cache_file(misses);
+        let holders = (0..UNIFORM_CACHE_SLOTS)
+            .map(|ordinal| uniform_page(&file, ordinal))
+            .collect::<Vec<_>>();
+        assert_uniform_cache_full(&file, UNIFORM_CACHE_SLOTS);
+        let resident_identities = || {
+            let mut entries = std::collections::BTreeMap::new();
+            for stripe in &file.read_cache {
+                for (offset, page) in stripe.read().unwrap().iter() {
+                    entries.insert(offset, Arc::as_ptr(&*page) as usize);
+                }
+            }
+            entries
+        };
+        let before = resident_identities();
+        #[cfg(feature = "cache_metrics")]
+        let evictions = file.cache_stats().evictions;
+        let charged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for ordinal in UNIFORM_CACHE_SLOTS..UNIFORM_CACHE_SLOTS + misses {
+            let admission = charged.clone();
+            let page = crate::with_read_page_charge(
+                Arc::new(move |bytes| {
+                    assert_eq!(bytes, super::admitted_page_bytes(UNIFORM_PAGE_BYTES));
+                    admission.fetch_add(bytes, Ordering::SeqCst);
+                    Ok(Box::new(MissCharge(admission.clone(), bytes)))
+                }),
+                || uniform_page(&file, ordinal),
+            );
+            // Reaching this assertion proves the all-pinned victim walk
+            // terminated. The miss belongs to its reader, never the cache.
+            assert!(matches!(page, super::PageMemory::Charged(_)));
+            assert_eq!(
+                charged.load(Ordering::SeqCst),
+                super::admitted_page_bytes(UNIFORM_PAGE_BYTES)
+            );
+            assert_eq!(
+                resident_identities(),
+                before,
+                "no pinned entry is removed or replaced"
+            );
+            assert_uniform_cache_full(&file, UNIFORM_CACHE_SLOTS);
+            #[cfg(feature = "cache_metrics")]
+            assert_eq!(file.cache_stats().evictions, evictions);
+            drop(page);
+            assert_eq!(charged.load(Ordering::SeqCst), 0);
+        }
+        // Every pinned holder drops after the final miss, with no refill.
+        drop(holders);
+        assert_uniform_cache_full(&file, 0);
+        assert_eq!(resident_identities(), before);
+        for stripe in &file.read_cache {
+            stripe.write().unwrap().clear();
+        }
+        assert_eq!(file.read_cache_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(charged.load(Ordering::SeqCst), 0);
+    }
+    // P1: actual index allocation includes the boxed stripe descriptors.
+    #[test]
+    fn read_index_live_bytes_are_fixed_for_uniform_and_one_stripe_spreads() {
+        use crate::tree_store::page_store::lru_cache::arena_index_tests::Watch;
+        let mut spread_bytes = [0; 2];
+        let page = super::CachedPage::admitted(
+            Arc::<[u8]>::from(vec![0; 4096]),
+            &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        for (spread, skewed) in [false, true].into_iter().enumerate() {
+            let watch = Watch::start();
+            let stripes = PagedCachedFile::new_read_index(4 * 1024 * 1024, 4096, 0);
+            let index_bytes = stripes[0].read().unwrap().arena_index_bytes()
+                + stripes
+                    .iter()
+                    .map(|s| s.read().unwrap().index_bytes())
+                    .sum::<usize>()
+                + stripes.len()
+                    * size_of::<
+                        std::sync::RwLock<
+                            crate::tree_store::page_store::lru_cache::LRUCache<
+                                Arc<super::CachedPage>,
+                            >,
+                        >,
+                    >();
+            let construction = watch.cut();
+            assert_eq!(construction[2], 0);
+            assert_eq!(construction[3] - construction[4], index_bytes);
+            spread_bytes[spread] = index_bytes;
+            watch.reset();
+            for round in 0..3_u64 {
+                for ordinal in 0..996_u64 {
+                    let stripe = if skewed {
+                        0
+                    } else {
+                        ordinal as usize % stripes.len()
+                    };
+                    assert!(matches!(
+                        stripes[stripe]
+                            .write()
+                            .unwrap()
+                            .try_insert(round * 996 + ordinal, page.clone()),
+                        Ok(None)
+                    ));
+                }
+                assert_eq!(
+                    stripes
+                        .iter()
+                        .map(|s| s.read().unwrap().len())
+                        .sum::<usize>(),
+                    996
+                );
+                for stripe in &stripes {
+                    let mut stripe = stripe.write().unwrap();
+                    while stripe.pop_lowest_priority().is_some() {}
+                }
+                assert_eq!(
+                    watch.cut(),
+                    [0; 5],
+                    "only the original fixed index allocations remain live"
+                );
+            }
+            drop(stripes);
+            let released = watch.cut();
+            assert_eq!(released[0], 0);
+            assert_eq!(released[2], 0);
+            assert_eq!(released[3], 0);
+            assert_eq!(released[4], index_bytes);
+        }
+        assert_eq!(spread_bytes[0], spread_bytes[1]);
+    }
+
+    #[derive(Debug)]
+    struct SparseZeroFixture(std::sync::atomic::AtomicU64);
+    impl StorageBackend for SparseZeroFixture {
+        fn len(&self) -> io::Result<u64> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            self.0.store(len, Ordering::SeqCst);
+            Ok(())
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+            assert!(offset + out.len() as u64 <= self.0.load(Ordering::SeqCst));
+            out.fill(0);
+            Ok(())
+        }
+        fn write(&self, _: u64, _: &[u8]) -> io::Result<()> {
+            panic!("the read-only sparse pressure fixture is never written")
+        }
+        fn sync_data(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // P2: offset skew cannot impose a per-stripe occupancy ceiling.
+    #[test]
+    fn one_stripe_pressure_uses_all_996_shared_read_arena_slots() {
+        let cap = 4 * 1024 * 1024;
+        assert_eq!(super::cached_page_bytes(4096), 4208);
+        assert_eq!(cap / super::cached_page_bytes(4096), 996);
+        let pages = 3 * 996;
+        let backend = SparseZeroFixture(std::sync::atomic::AtomicU64::new(
+            (pages * 131 * 4096) as u64,
+        ));
+        let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
+        let index_bytes = file.index_bytes();
+        for ordinal in 0..pages {
+            let offset = (ordinal * 131 * 4096) as u64;
+            assert_eq!(offset % PagedCachedFile::lock_stripes(), 0);
+            let page = file.read(offset, 4096, PageHint::Clean).unwrap();
+            assert!(matches!(page, super::PageMemory::Cached(_)));
+            assert!(page.iter().all(|byte| *byte == 0));
+            drop(page);
+            if ordinal >= 995 {
+                assert_eq!(file.read_cache[0].read().unwrap().len(), 996);
+                assert!(
+                    file.read_cache[1..]
+                        .iter()
+                        .all(|s| s.read().unwrap().len() == 0)
+                );
+                assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), 996 * 4208);
+                assert_eq!(file.index_bytes(), index_bytes);
+            }
+        }
+    }
+
+    // P5 and P5b: settle changes its fixed index and preserves live holders.
+    #[test]
+    #[cfg(feature = "contextdb-internal")]
+    fn settle_rebuilds_exact_read_index_and_preserves_above_cap_held_pages() {
+        let backend = InMemoryBackend::new();
+        backend.set_len(64 * 4096).unwrap();
+        let file = PagedCachedFile::new(Box::new(backend), 4096, 16 * 4208).unwrap();
+        for cap in [4 * 4208, 32 * 4208, 8 * 4208] {
+            assert_eq!(
+                file.settle_startup_cache_budget(cap).unwrap(),
+                cap + file.index_bytes()
+            );
+            assert_eq!(
+                file.read_cache[0].read().unwrap().arena_capacity_for_test(),
+                cap / super::cached_page_bytes(4096) + 1
+            );
+        }
+        let holders = (0..8)
+            .map(|ordinal| {
+                file.read((ordinal * 4096) as u64, 4096, PageHint::Clean)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            holders
+                .iter()
+                .all(|p| matches!(p, super::PageMemory::Cached(_)))
+        );
+        let before = || {
+            file.read_cache
+                .iter()
+                .flat_map(|stripe| {
+                    let stripe = stripe.read().unwrap();
+                    stripe
+                        .iter()
+                        .map(|(key, value)| (key, Arc::as_ptr(&*value) as usize))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let identities = before();
+        let held_bytes = 8 * 4208;
+        let cap = 2 * 4208;
+        assert_eq!(
+            file.settle_startup_cache_budget(cap).unwrap(),
+            held_bytes.max(cap) + file.index_bytes()
+        );
+        assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), held_bytes);
+        assert_eq!(
+            before(),
+            identities,
+            "settle keeps every held page in its linked stripe index"
+        );
+        for page in &holders {
+            assert_eq!(page.len(), 4096);
+            assert!(page.iter().all(|byte| *byte == 0));
+        }
+        drop(holders);
+        let next_cap = cap;
+        assert_eq!(
+            file.settle_startup_cache_budget(next_cap).unwrap(),
+            next_cap + file.index_bytes()
+        );
+        assert_eq!(
+            file.read_cache[0].read().unwrap().arena_capacity_for_test(),
+            next_cap / super::cached_page_bytes(4096) + 1
+        );
+        assert!(file.read_cache_bytes.load(Ordering::SeqCst) <= next_cap);
+    }
+
+    #[derive(Debug)]
+    struct WritableHeaderFixture {
+        len: std::sync::atomic::AtomicU64,
+        header: std::sync::Mutex<[u8; 320]>,
+    }
+    impl WritableHeaderFixture {
+        fn new(len: u64) -> Self {
+            Self { len: std::sync::atomic::AtomicU64::new(len), header: std::sync::Mutex::new([0; 320]) }
+        }
+    }
+    impl StorageBackend for WritableHeaderFixture {
+        fn len(&self) -> io::Result<u64> { Ok(self.len.load(Ordering::SeqCst)) }
+        fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+            assert!(offset + out.len() as u64 <= self.len.load(Ordering::SeqCst));
+            out.fill(0);
+            if offset == 0 {
+                let header = self.header.lock().unwrap();
+                let count = out.len().min(header.len());
+                out[..count].copy_from_slice(&header[..count]);
+            }
+            Ok(())
+        }
+        fn set_len(&self, len: u64) -> io::Result<()> { self.len.store(len, Ordering::SeqCst); Ok(()) }
+        fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+            assert!(offset + data.len() as u64 <= self.len.load(Ordering::SeqCst));
+            if offset == 0 {
+                let mut header = self.header.lock().unwrap();
+                let count = data.len().min(header.len());
+                header[..count].copy_from_slice(&data[..count]);
+            }
+            Ok(())
+        }
+        fn sync_data(&self) -> io::Result<()> { Ok(()) }
+    }
+
+    // R115: actual header writes reach the read cache through the normal flush.
+    #[test]
+    #[cfg(feature = "contextdb-internal")]
+    fn flushed_header_and_full_pages_use_the_unchanged_cache_byte_budget() {
+        let header_len = super::super::header::DB_HEADER_SIZE;
+        assert_eq!(header_len, 320);
+        let full_bytes = super::cached_page_bytes(4096);
+        let header_bytes = super::cached_page_bytes(header_len);
+        assert_eq!((full_bytes, header_bytes), (4208, 432));
+        for (cap, expected_index) in [(4 * 1024 * 1024, 63_436), (64 * 1024 * 1024, 903_768)] {
+            for stride in [1, 131] {
+                let full_pages = cap / full_bytes;
+                let backend = WritableHeaderFixture::new(
+                    ((full_pages + 1) * stride * 4096) as u64,
+                );
+                let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
+                let index_bytes = file.index_bytes();
+                let mut writable = file.write(0, header_len, true).unwrap();
+                writable.mem_mut().fill(0x7a);
+                drop(writable);
+                file.flush().unwrap();
+                assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), header_bytes);
+                assert_eq!(file.write_map_for_test(), (0, 0));
+                let header = file.read(0, header_len, PageHint::Clean).unwrap();
+                assert!(matches!(header, super::PageMemory::Cached(_)));
+                assert!(header.iter().all(|byte| *byte == 0x7a));
+                for ordinal in 1..=full_pages {
+                    let offset = (ordinal * stride * 4096) as u64;
+                    let page = file.read(offset, 4096, PageHint::Clean).unwrap();
+                    assert!(matches!(page, super::PageMemory::Cached(_)), "a byte-fitting full page must not exhaust the fixed index");
+                    assert!(page.iter().all(|byte| *byte == 0));
+                    drop(page);
+                    assert_eq!(file.index_bytes(), index_bytes);
+                }
+                let resident_bytes = file.read_cache_bytes.load(Ordering::SeqCst);
+                assert_eq!(resident_bytes, header_bytes + full_pages * full_bytes);
+                assert_eq!(index_bytes, expected_index);
+                assert!(resident_bytes <= cap);
+                assert!(cap - resident_bytes < full_bytes);
+                assert_eq!(file.read_cache.iter().map(|s| s.read().unwrap().len()).sum::<usize>(), full_pages + 1);
+                assert_eq!(file.read_cache[0].read().unwrap().arena_capacity_for_test(), full_pages + 1);
+                if stride == 131 {
+                    assert_eq!(file.read_cache[0].read().unwrap().len(), full_pages + 1);
+                    assert!(file.read_cache[1..].iter().all(|s| s.read().unwrap().len() == 0));
+                }
+                assert_eq!(file.settle_startup_cache_budget(cap).unwrap(), cap + index_bytes);
+                assert_eq!(file.settle_startup_cache_budget(cap).unwrap(), cap + index_bytes);
+                assert_eq!(file.index_bytes(), index_bytes);
+                assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), resident_bytes);
+                assert!(header.iter().all(|byte| *byte == 0x7a));
+            }
+        }
+    }
+
+    // Every indexed admission route enforces the same sole-header premise.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn invalid_subpage_normal_scan_and_flush_admissions_fail_loudly() {
+        for (offset, len) in [(4096, 320), (0, 319)] {
+            for route in ["normal", "scan", "flush"] {
+                let backend = WritableHeaderFixture::new(16_384);
+                let file = PagedCachedFile::new(Box::new(backend), 4096, 4 * 1024 * 1024).unwrap();
+                // Ensure the exhausted scan branch has a real evictable page to replace.
+                drop(file.read(8192, 4096, PageHint::Clean).unwrap());
+                let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match route {
+                        "normal" => { let _page = file.read(offset, len, PageHint::Clean).unwrap(); }
+                        "scan" => crate::read_admission::with_scan_reads(|| {
+                            assert!(crate::read_admission::take_scan_growth(crate::read_admission::SCAN_GROWTH_ALLOWANCE));
+                            let _page = file.read(offset, len, PageHint::Clean).unwrap();
+                        }),
+                        "flush" => {
+                            let mut page = file.write(offset, len, true).unwrap();
+                            page.mem_mut().fill(0x7a);
+                            drop(page);
+                            file.flush().unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                }));
+                let panic = invalid.expect_err("an invalid subpage admission must panic");
+                let message = panic.downcast_ref::<String>().map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("");
+                assert!(message.contains("DB_HEADER_SIZE"), "route {route} offset {offset} length {len} must fail its actual header invariant, not a fixture panic: {message}");
+            }
+        }
+    }
+
+    // P6: borrowed write pages keep the baseline cap-0 semantics; flush frees the map.
+    #[test]
+    fn write_buffer_has_zero_entries_and_capacity_after_each_flush() {
+        for cap in [0, 4096, 4 * 1024 * 1024] {
+            let backend = InMemoryBackend::new();
+            backend.set_len(16 * 4096).unwrap();
+            let file = PagedCachedFile::new(Box::new(backend), 4096, cap).unwrap();
+            let index_bytes = file.index_bytes();
+            for transaction in 0..2_u64 {
+                let mut first = file.write(0, 4096, true).unwrap();
+                let mut second = file.write(4096, 4096, true).unwrap();
+                let mut third = file.write(8192, 4096, true).unwrap();
+                first.mem_mut()[..8].copy_from_slice(&(transaction + 1).to_le_bytes());
+                second.mem_mut()[..8].copy_from_slice(&(transaction + 2).to_le_bytes());
+                third.mem_mut()[..8].copy_from_slice(&(transaction + 3).to_le_bytes());
+                drop(third);
+                drop(second);
+                drop(first);
+                file.flush().unwrap();
+                let write = file.write_buffer.lock().unwrap();
+                assert_eq!(write.cache.len(), 0);
+                assert_eq!(write.cache.map_capacity_for_test(), 0);
+                assert_eq!(file.write_buffer_bytes.load(Ordering::SeqCst), 0);
+                drop(write);
+                assert_eq!(file.index_bytes(), index_bytes);
+                for ordinal in 0..3_u64 {
+                    let page = file.read(ordinal * 4096, 4096, PageHint::Clean).unwrap();
+                    assert_eq!(&page[..8], &(transaction + ordinal + 1).to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl PagedCachedFile {
+    pub(crate) fn write_map_for_test(&self) -> (usize, usize) {
+        let write = self.write_buffer.lock().unwrap();
+        (write.cache.len(), write.cache.map_capacity_for_test())
+    }
 }

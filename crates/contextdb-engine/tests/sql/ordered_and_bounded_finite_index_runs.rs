@@ -183,8 +183,14 @@ fn assert_read_paths_match(
     expected_pushed: usize,
 ) {
     let sql = format!("SELECT id FROM finite_nulls WHERE {predicate}");
-    let eager = execute_eager_for_test(db, &sql, &empty())
-        .expect("the eager executor must preserve NULL predicate semantics");
+    let eager = execute_eager_for_test(
+        db,
+        &sql,
+        &empty(),
+        db.declared_reader_memory()
+            .expect("admit the eager fixture reader"),
+    )
+    .expect("the eager executor must preserve NULL predicate semantics");
     let ordinary = db
         .execute(&sql, &empty())
         .expect("ordinary execution must preserve NULL predicate semantics");
@@ -294,8 +300,14 @@ fn unsorted_suffix_in_runs_preserve_requested_order_across_read_paths_and_transa
             ] {
                 let sql =
                     format!("SELECT b FROM finite_order WHERE a = 7 AND b IN (3, 1, 2) {order_by}");
-                let eager = execute_eager_for_test(&db, &sql, &empty())
-                    .expect("the eager executor must answer the finite runs");
+                let eager = execute_eager_for_test(
+                    &db,
+                    &sql,
+                    &empty(),
+                    db.declared_reader_memory()
+                        .expect("admit the eager fixture reader"),
+                )
+                .expect("the eager executor must answer the finite runs");
                 assert_ordered_result(
                     &eager,
                     expected,

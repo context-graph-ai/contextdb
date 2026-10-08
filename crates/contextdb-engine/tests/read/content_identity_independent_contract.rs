@@ -516,7 +516,20 @@ fn observe(path: &Path) -> Observation {
 fn observe_with_root_comparison(path: &Path, compare_typed_root: bool) -> Observation {
     // The independent adapter loads the COMMITTED STORE while idle, not an
     // engine-owned image retained by either production reading session.
-    let content = committed_content_for_test(path).unwrap();
+    let content = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(path, operation_read_memory, declared_read_memory)
+    }
+    .unwrap();
     let expected = independent_typed_digest(&content);
     let snapshots = Arc::new(Snapshots::default());
     let open_scope = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
@@ -582,7 +595,20 @@ fn observe_with_root_comparison(path: &Path, compare_typed_root: bool) -> Observ
     // owner protocol currently has no content-root field; do not invent one.
     drop(owner_session);
     owner.close().unwrap();
-    let after_owner = committed_content_for_test(path).unwrap();
+    let after_owner = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(path, operation_read_memory, declared_read_memory)
+    }
+    .unwrap();
     assert_eq!(
         independent_typed_digest(&after_owner),
         expected,
@@ -775,7 +801,22 @@ fn one_row_change_updates_only_bounded_logical_pages() {
     db.commit(tx).unwrap();
     db.close().unwrap();
     // The committed store the update starts from, read independently.
-    let before = canonical_stored_ids(&committed_content_for_test(&path).unwrap());
+    let before = canonical_stored_ids(
+        &{
+            let declared_read_memory =
+                contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    contextdb_engine::OwnerReadConfig::default()
+                        .limits
+                        .limits
+                        .memory,
+                );
+            let operation_read_memory = declared_read_memory
+                .child()
+                .expect("admit the committed-content observation owner");
+            committed_content_for_test(&path, operation_read_memory, declared_read_memory)
+        }
+        .unwrap(),
+    );
 
     let db = caller_driven(&path);
     db.reset_content_identity_work_for_test().unwrap();
@@ -810,7 +851,20 @@ fn one_row_change_updates_only_bounded_logical_pages() {
     assert!(page_read_bytes <= 2 * 1024 * 1024);
     assert!(page_written_bytes <= 2 * 1024 * 1024);
     db.close().unwrap();
-    let content = committed_content_for_test(&path).unwrap();
+    let content = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(&path, operation_read_memory, declared_read_memory)
+    }
+    .unwrap();
     // Derived, not guessed: the transaction must remove exactly the stored
     // chunks and key blobs that the committed content no longer has - no
     // fewer, which would orphan them, and no more, which would drop a chunk
@@ -1143,7 +1197,18 @@ fn trigger_audit_and_schedule_firing_are_real_durable_identity_mutations() {
             BASE + 7 * 60 * 60 * 1000 + 1,
             std::sync::atomic::Ordering::SeqCst,
         );
-        assert_eq!(db.cron_run_due_now_for_test().unwrap(), 1);
+        assert_eq!(
+            {
+                let seam_read_memory = db
+                    .declared_reader_memory()
+                    .expect("admit the fixture operation reader");
+                let mut seam_copy_owner =
+                    contextdb_engine::vector_read_memory::admission(seam_read_memory.clone());
+                db.cron_run_due_now_for_test(&mut seam_copy_owner, seam_read_memory)
+            }
+            .unwrap(),
+            1
+        );
         assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(db.cron_status()[0].fire_count, 1);
         drop(pause);
@@ -1276,7 +1341,9 @@ async fn authenticated_push_and_pull_preserve_content_identity_and_sync_provenan
     );
     // Real schema-only sync initialization, followed by an authored row on the
     // edge. The ordinary authenticated push supplies its real source identity.
-    let mut schema = hub.changes_since(Lsn(0));
+    let mut schema = hub
+        .changes_since(Lsn(0))
+        .expect("read the declared changes");
     schema.rows.clear();
     schema.edges.clear();
     schema.vectors.clear();
@@ -1305,7 +1372,8 @@ async fn authenticated_push_and_pull_preserve_content_identity_and_sync_provenan
             tenant.clone(),
             node,
             hub_identity,
-        ),
+        )
+        .expect("construct the authenticated sync endpoint"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -1323,7 +1391,8 @@ async fn authenticated_push_and_pull_preserve_content_identity_and_sync_provenan
         broker.client_as(&source_node),
         tenant,
         source_identity,
-    );
+    )
+    .expect("construct the authenticated sync endpoint");
     let pushed = client.push().await;
     let pulled = if pushed.is_ok() {
         Some(client.pull_default().await)
@@ -1495,7 +1564,20 @@ fn the_content_identity_root_is_independently_recomputable_from_the_declaration(
     // The disagreement the oracle exists to produce: recompute the same image
     // while claiming one count the declaration does not name, and the
     // recomputed root must NOT match the published one.
-    let content = committed_content_for_test(&path).unwrap();
+    let content = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(&path, operation_read_memory, declared_read_memory)
+    }
+    .unwrap();
     let mut claimed = content.clone();
     claimed.logical_records.push(LogicalContentRecordForTest {
         family: 10,
@@ -1543,7 +1625,20 @@ fn declare(path: &Path, ddl: &str) -> CommittedContentForTest {
 }
 
 fn reconstructed(path: &Path) -> CommittedContentForTest {
-    let content = committed_content_for_test(path).unwrap();
+    let content = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(path, operation_read_memory, declared_read_memory)
+    }
+    .unwrap();
     assert_eq!(
         independent_typed_digest(&content),
         content.maintained_digest,
@@ -1946,7 +2041,20 @@ fn a_retired_separator_and_a_coalesced_update_remove_exactly_the_canonical_chunk
     db.commit(tx).unwrap();
     db.close().unwrap();
 
-    let before_image = committed_content_for_test(&path).unwrap();
+    let before_image = {
+        let declared_read_memory =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                contextdb_engine::OwnerReadConfig::default()
+                    .limits
+                    .limits
+                    .memory,
+            );
+        let operation_read_memory = declared_read_memory
+            .child()
+            .expect("admit the committed-content observation owner");
+        committed_content_for_test(&path, operation_read_memory, declared_read_memory)
+    }
+    .unwrap();
     let before = canonical_stored_ids(&before_image);
     let relational = before_image
         .logical_records
@@ -1984,7 +2092,22 @@ fn a_retired_separator_and_a_coalesced_update_remove_exactly_the_canonical_chunk
     );
     let (_, _, page_removes) = db.take_content_identity_work_for_test().unwrap();
     db.close().unwrap();
-    let after = canonical_stored_ids(&committed_content_for_test(&path).unwrap());
+    let after = canonical_stored_ids(
+        &{
+            let declared_read_memory =
+                contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    contextdb_engine::OwnerReadConfig::default()
+                        .limits
+                        .limits
+                        .memory,
+                );
+            let operation_read_memory = declared_read_memory
+                .child()
+                .expect("admit the committed-content observation owner");
+            committed_content_for_test(&path, operation_read_memory, declared_read_memory)
+        }
+        .unwrap(),
+    );
     let retired = before.difference(&after).count();
     eprintln!("separator replacement: removes={page_removes} retired={retired}");
     assert!(
@@ -2019,7 +2142,22 @@ fn a_retired_separator_and_a_coalesced_update_remove_exactly_the_canonical_chunk
         }
         db.commit(tx).unwrap();
         db.close().unwrap();
-        let before = canonical_stored_ids(&committed_content_for_test(&path).unwrap());
+        let before = canonical_stored_ids(
+            &{
+                let declared_read_memory =
+                    contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                        contextdb_engine::OwnerReadConfig::default()
+                            .limits
+                            .limits
+                            .memory,
+                    );
+                let operation_read_memory = declared_read_memory
+                    .child()
+                    .expect("admit the committed-content observation owner");
+                committed_content_for_test(&path, operation_read_memory, declared_read_memory)
+            }
+            .unwrap(),
+        );
 
         let db = caller_driven(&path);
         db.reset_content_identity_work_for_test().unwrap();
@@ -2035,7 +2173,20 @@ fn a_retired_separator_and_a_coalesced_update_remove_exactly_the_canonical_chunk
         db.commit(tx).unwrap();
         let work = db.take_content_identity_work_for_test().unwrap();
         db.close().unwrap();
-        let image = committed_content_for_test(&path).unwrap();
+        let image = {
+            let declared_read_memory =
+                contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    contextdb_engine::OwnerReadConfig::default()
+                        .limits
+                        .limits
+                        .memory,
+                );
+            let operation_read_memory = declared_read_memory
+                .child()
+                .expect("admit the committed-content observation owner");
+            committed_content_for_test(&path, operation_read_memory, declared_read_memory)
+        }
+        .unwrap();
         let retired = before.difference(&canonical_stored_ids(&image)).count();
         (work, retired, independent_typed_digest(&image))
     };
@@ -2115,7 +2266,20 @@ fn oversized_index_keys_match_the_independent_rebuild_through_their_whole_life()
     db.close().unwrap();
 
     let agrees = |what: &str| {
-        let content = committed_content_for_test(&path).unwrap();
+        let content = {
+            let declared_read_memory =
+                contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                    contextdb_engine::OwnerReadConfig::default()
+                        .limits
+                        .limits
+                        .memory,
+                );
+            let operation_read_memory = declared_read_memory
+                .child()
+                .expect("admit the committed-content observation owner");
+            committed_content_for_test(&path, operation_read_memory, declared_read_memory)
+        }
+        .unwrap();
         let expected = independent_typed_digest(&content);
         assert_eq!(
             content.maintained_digest, expected,

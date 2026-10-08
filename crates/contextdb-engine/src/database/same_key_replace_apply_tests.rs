@@ -101,7 +101,12 @@ fn same_key_delete_and_reinsert_in_one_transaction_replaces_on_the_receiver() {
     let decision = Uuid::new_v4();
     let original_id = Uuid::new_v4();
     insert_decision(&sender, context, decision, original_id, "original");
-    apply_to_receiver(&receiver, sender.changes_since(Lsn(0)));
+    apply_to_receiver(
+        &receiver,
+        sender
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
+    );
     assert_eq!(
         held(&receiver, context, decision).map(|(_, body)| body),
         Some("original".to_string()),
@@ -143,7 +148,12 @@ fn same_key_delete_and_reinsert_in_one_transaction_replaces_on_the_receiver() {
         "the sender holds the replacement it just committed"
     );
 
-    apply_to_receiver(&receiver, sender.changes_since(before_replace));
+    apply_to_receiver(
+        &receiver,
+        sender
+            .changes_since(before_replace)
+            .expect("read the declared changes"),
+    );
 
     assert_eq!(
         held(&receiver, context, decision),
@@ -168,11 +178,21 @@ fn the_same_replacement_split_across_two_units_converges() {
     let decision = Uuid::new_v4();
     let original_id = Uuid::new_v4();
     insert_decision(&sender, context, decision, original_id, "original");
-    apply_to_receiver(&receiver, sender.changes_since(Lsn(0)));
+    apply_to_receiver(
+        &receiver,
+        sender
+            .changes_since(Lsn(0))
+            .expect("read the declared changes"),
+    );
 
     let before_delete = sender.current_lsn();
     delete_decision(&sender, context, decision);
-    apply_to_receiver(&receiver, sender.changes_since(before_delete));
+    apply_to_receiver(
+        &receiver,
+        sender
+            .changes_since(before_delete)
+            .expect("read the declared changes"),
+    );
     assert_eq!(
         held(&receiver, context, decision),
         None,
@@ -182,7 +202,12 @@ fn the_same_replacement_split_across_two_units_converges() {
     let before_insert = sender.current_lsn();
     let replacement_id = Uuid::new_v4();
     insert_decision(&sender, context, decision, replacement_id, "replacement");
-    apply_to_receiver(&receiver, sender.changes_since(before_insert));
+    apply_to_receiver(
+        &receiver,
+        sender
+            .changes_since(before_insert)
+            .expect("read the declared changes"),
+    );
 
     assert_eq!(
         held(&receiver, context, decision),

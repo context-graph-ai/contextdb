@@ -168,7 +168,8 @@ fn start_hub_as(broker: &InProcessBroker, node_id: &str) -> RunningHub {
             TenantId::from(TENANT),
             authenticated_node_id,
             identity,
-        ),
+        )
+        .expect("construct SyncServer fixture"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -204,6 +205,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> S
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// Receipts exist ONLY for authenticated peers: `peer_node_id` is a plain
@@ -277,6 +279,7 @@ fn offline_client(db: &Arc<Database>, role: &str) -> SyncClient {
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,7 +1109,8 @@ async fn c9_an_unauthenticated_peer_produces_no_transfer_receipt() {
         anonymous.clone(),
         broker.client(),
         TenantId::from(TENANT),
-    );
+    )
+    .expect("construct SyncClient fixture");
     let refusal = within(anonymous_client.push())
         .await
         .expect_err("an identityless transport is refused before it can push");
@@ -1670,6 +1674,7 @@ fn lost_ack_client(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 fn lost_ack_client_with_newer_hub_edit(
@@ -1698,6 +1703,7 @@ fn lost_ack_client_with_newer_hub_edit(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 fn lost_ack_client_with_failed_reconciliation_pull(
@@ -1720,6 +1726,7 @@ fn lost_ack_client_with_failed_reconciliation_pull(
         TenantId::from(TENANT),
         identity,
     )
+    .expect("construct SyncClient fixture")
 }
 
 /// A push whose ack was lost but whose batch landed returns through
@@ -2079,7 +2086,8 @@ async fn lost_refusal_reply_keeps_original_diagnostics_after_a_newer_hub_edit() 
         }),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = within(client.push()).await.unwrap();
     assert_eq!(result.applied_rows, 0);
     assert_eq!(result.skipped_rows, 1);
@@ -2180,7 +2188,8 @@ async fn accepted_delete_replay_retires_only_its_adjudicated_work_across_reopen(
         }),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("construct SyncClient fixture");
     let result = within(client.push()).await.unwrap();
     assert_eq!(result.applied_rows, 0);
     assert_eq!(result.skipped_rows, 2);

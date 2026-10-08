@@ -68,7 +68,9 @@ fn fixd_preflight_projects_the_adopted_policy_so_it_does_not_over_charge() {
         .expect("source table");
     let huge = "x".repeat(4 * 1024 * 1024);
     insert_note(&source, 1, &huge);
-    let changeset = source.changes_since(Lsn(0));
+    let changeset = source
+        .changes_since(Lsn(0))
+        .expect("read changes_since fixture");
 
     // Under the adopted keep-first policy the existing row is left untouched, so
     // the huge update is never applied and never charged — the batch fits. A

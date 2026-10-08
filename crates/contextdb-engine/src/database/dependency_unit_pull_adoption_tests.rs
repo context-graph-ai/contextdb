@@ -121,10 +121,19 @@ fn lineage_entries(
     author: &Arc<FabricIdentity>,
     incarnation: Incarnation,
 ) -> Vec<(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)> {
+    let fixture_operation_reader_1 = db
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     let signed = db
-        .outbound_row_lineages(changes, tenant, &author.node_id(), incarnation, &|bytes| {
-            Ok(author.sign_lineage(bytes))
-        })
+        .outbound_row_lineages(
+            changes,
+            tenant,
+            &author.node_id(),
+            incarnation,
+            &|bytes| Ok(author.sign_lineage(bytes)),
+            fixture_operation_reader_1.clone(),
+        )
         .expect("committed rows retain authenticated lineage");
     changes
         .rows
@@ -166,7 +175,9 @@ fn hub_connected_history(
     for (index, id) in record_ids.iter().enumerate() {
         insert_record(&hub, *id, schema_id, &format!("hub-record-{index}"));
     }
-    let changes = hub.changes_since(before);
+    let changes = hub
+        .changes_since(before)
+        .expect("read the declared changes");
     assert_eq!(
         changes.rows.len(),
         record_ids.len() + 1,
@@ -197,6 +208,12 @@ fn dependency_complete_pull_unit_adopts_hub_keep_first_value_and_applies_sibling
     let record_ids = (0..16).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
 
     let (changes, entries) = hub_connected_history(&root, &tenant, schema_id, &record_ids);
+    let fixture_operation_reader_2 = edge
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_2 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
+
     let result = edge
         .apply_authenticated_received_changes_with_lineages(
             changes,
@@ -207,6 +224,8 @@ fn dependency_complete_pull_unit_adopts_hub_keep_first_value_and_applies_sibling
             &entries,
             None,
             true,
+            &mut fixture_operation_copy_2,
+            fixture_operation_reader_2.clone(),
         )
         .expect("a dependency-complete pull unit must apply despite a policy-resolved member");
 
@@ -269,6 +288,12 @@ fn dependency_complete_pull_unit_without_disagreement_reports_no_conflict() {
     let schema_id = Uuid::new_v4();
     let record_ids = (0..16).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
     let (changes, entries) = hub_connected_history(&root, &tenant, schema_id, &record_ids);
+    let fixture_operation_reader_3 = edge
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_3 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_3.clone());
+
     let result = edge
         .apply_authenticated_received_changes_with_lineages(
             changes,
@@ -279,6 +304,8 @@ fn dependency_complete_pull_unit_without_disagreement_reports_no_conflict() {
             &entries,
             None,
             true,
+            &mut fixture_operation_copy_3,
+            fixture_operation_reader_3.clone(),
         )
         .expect("an uncontested dependency-complete pull unit applies");
 
@@ -322,8 +349,15 @@ fn keyless_push_cannot_overwrite_the_hub_first_accepted_keep_first_value() {
         .expect("pusher incarnation");
     let before = pusher.current_lsn();
     insert_schema_version(&pusher, schema_id, "pushed-divergent-value");
-    let changes = pusher.changes_since(before);
+    let changes = pusher
+        .changes_since(before)
+        .expect("read the declared changes");
     let entries = lineage_entries(&pusher, &changes, &tenant, &author, incarnation);
+    let fixture_operation_reader_4 = hub
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_4 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_4.clone());
 
     let result = hub
         .apply_authenticated_received_changes_with_lineages_as_hub_push(
@@ -335,6 +369,8 @@ fn keyless_push_cannot_overwrite_the_hub_first_accepted_keep_first_value() {
             &entries,
             None,
             false,
+            &mut fixture_operation_copy_4,
+            fixture_operation_reader_4.clone(),
         )
         .expect("an unreceiptable push is a handled refusal, not an error");
 
@@ -391,8 +427,15 @@ fn keyless_push_cannot_overwrite_a_pull_only_table_on_the_hub() {
         .expect("pusher incarnation");
     let before = pusher.current_lsn();
     insert_reading(&pusher, id, "pushed-divergent-reading");
-    let changes = pusher.changes_since(before);
+    let changes = pusher
+        .changes_since(before)
+        .expect("read the declared changes");
     let entries = lineage_entries(&pusher, &changes, &tenant, &author, incarnation);
+    let fixture_operation_reader_5 = hub
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_5 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_5.clone());
 
     hub.apply_authenticated_received_changes_with_lineages_as_hub_push(
         changes,
@@ -403,6 +446,8 @@ fn keyless_push_cannot_overwrite_a_pull_only_table_on_the_hub() {
         &entries,
         None,
         false,
+        &mut fixture_operation_copy_5,
+        fixture_operation_reader_5.clone(),
     )
     .expect("an unreceiptable push is a handled outcome, not an error");
 

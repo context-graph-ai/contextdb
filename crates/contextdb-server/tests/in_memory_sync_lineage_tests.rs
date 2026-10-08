@@ -82,7 +82,10 @@ async fn explicit_memory_identity_keeps_lineage_across_insert_reconstruction_upd
     let ticket = endpoint.ticket();
     let hub_db = Arc::new(Database::open_memory());
     notes(&hub_db);
-    let hub = Arc::new(SyncServer::new(hub_db.clone(), &endpoint, tenant.clone()));
+    let hub = Arc::new(
+        SyncServer::new(hub_db.clone(), &endpoint, tenant.clone())
+            .expect("construct SyncServer fixture"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let hub = hub.clone();
@@ -99,7 +102,8 @@ async fn explicit_memory_identity_keeps_lineage_across_insert_reconstruction_upd
     let dial = peer_dial_spec(&ticket, &edge_identity);
     let id = Uuid::new_v4();
     insert(&edge, id, "created");
-    let first = SyncClient::new(edge.clone(), &dial, tenant.clone());
+    let first =
+        SyncClient::new(edge.clone(), &dial, tenant.clone()).expect("construct SyncClient fixture");
     let inserted = within(first.push()).await.expect("push insert");
     assert!(inserted.conflicts.is_empty(), "insert has no hub conflict");
     let first_pull = within(first.pull_default())
@@ -114,7 +118,8 @@ async fn explicit_memory_identity_keeps_lineage_across_insert_reconstruction_upd
     drop(first);
 
     update(&edge, id, "updated");
-    let reconstructed = SyncClient::new(edge.clone(), &dial, tenant.clone());
+    let reconstructed =
+        SyncClient::new(edge.clone(), &dial, tenant.clone()).expect("construct SyncClient fixture");
     let updated = within(reconstructed.push()).await.expect("push update");
     assert!(updated.conflicts.is_empty(), "update has no hub conflict");
     assert_eq!(

@@ -2544,7 +2544,10 @@ fn a7_02_window_function_rejected() {
         "SELECT ROW_NUMBER() OVER (PARTITION BY x) FROM t",
         &HashMap::new(),
     );
-    assert!(matches!(result, Err(Error::WindowFunctionNotSupported)));
+    assert!(matches!(
+        result,
+        Err(Error::WindowFunctionNotSupported { form: _ })
+    ));
 }
 
 #[test]

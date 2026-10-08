@@ -174,7 +174,9 @@ fn install_source_schema(db: &Database) {
 }
 
 fn source_schema(db: &Database) -> (Vec<DdlChange>, Lsn) {
-    let changes = db.changes_since(Lsn(0));
+    let changes = db
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     let source_lsn = changes.max_lsn().expect("source schema has a frontier");
     assert_eq!(changes.ddl.len(), source_statements().len());
     assert!(changes.ddl_lsn.iter().all(|lsn| *lsn == source_lsn));
@@ -355,7 +357,8 @@ async fn start_server(
             TenantId::from(tenant),
             node_id,
             identity,
-        ),
+        )
+        .expect("read or construct the declared fixture result"),
     );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
@@ -417,7 +420,8 @@ fn received_schema_crash_child() {
             broker.client_as(&edge_node_id),
             TenantId::from(TENANT),
             edge_identity,
-        );
+        )
+        .expect("read or construct the declared fixture result");
         let push = tokio::spawn(async move { client.push().await });
         match boundary {
             CrashBoundary::BeforeDurableCommit => assert!(
@@ -626,7 +630,9 @@ fn assert_complete_schema(db: &Database, expected: &[DdlChange], phase: &str) {
             && route.event_type == "receiver_event"
             && route.sink == "receiver_sink"
     }));
-    let changes = db.changes_since(Lsn(0));
+    let changes = db
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     let start = find_schema_vector(&changes, expected);
     let relevant = changes
         .ddl
@@ -802,7 +808,8 @@ async fn assert_second_edge_readback(
         broker.client_as(&identity.node_id()),
         TenantId::from(TENANT),
         identity,
-    );
+    )
+    .expect("read or construct the declared fixture result");
     client
         .pull_default()
         .await
@@ -845,7 +852,8 @@ async fn retry_after_crash(fixture: &CrashFixture, boundary: CrashBoundary) {
         broker.client_as(&fixture.edge_node_id),
         TenantId::from(TENANT),
         edge_identity,
-    );
+    )
+    .expect("read or construct the declared fixture result");
     let observer = ReceivedSchemaApplyObserverForTest::new();
     let observation_scope = hub.observe_received_schema_applies_for_test(&observer);
     client
@@ -1057,6 +1065,10 @@ fn signed_by_the_author(
     sender: &Database,
     unit: &contextdb_engine::sync_types::ChangeSet,
 ) -> Vec<contextdb_engine::protocol::WireDdlProvenance> {
+    let fixture_operation_reader_1 = sender
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+
     sender
         .outbound_ddl_provenance_for_test(
             unit,
@@ -1064,6 +1076,7 @@ fn signed_by_the_author(
             &schema_author().node_id(),
             AUTHORED_INCARNATION,
             &|bytes| Ok(schema_author().sign_for_test(bytes)),
+            fixture_operation_reader_1.clone(),
         )
         .expect("the author signs its own schema unit")
 }
@@ -1093,12 +1106,20 @@ fn take_delivery(
     edge: &Database,
 ) -> contextdb_core::Result<()> {
     let (unit, provenance) = source_unit(edge);
+    let fixture_operation_reader_2 = hub
+        .declared_reader_memory()
+        .expect("admit the actual fixture reader");
+    let mut fixture_operation_copy_2 =
+        contextdb_engine::vector_read_memory::admission(fixture_operation_reader_2.clone());
+
     hub.apply_received_schema_for_test(
         unit,
         provenance,
         TenantId::from(TENANT),
         fixture_node,
         incarnation,
+        &mut fixture_operation_copy_2,
+        fixture_operation_reader_2.clone(),
     )
     .map(|_| ())
 }
@@ -1283,7 +1304,8 @@ fn received_schema_pre_commit_failure_publishes_neither_schema_nor_receipt() {
             broker.client_as(&fixture.edge_node_id),
             TenantId::from(TENANT),
             edge_identity,
-        );
+        )
+        .expect("read or construct the declared fixture result");
         let error = client
             .push()
             .await
@@ -1325,7 +1347,8 @@ async fn received_schema_observation_scope_restores_after_nesting_return_and_pan
         broker.client_as(&edge_node_id),
         TenantId::from("received-schema-observer"),
         edge_identity,
-    );
+    )
+    .expect("read or construct the declared fixture result");
     let outer = ReceivedSchemaApplyObserverForTest::new();
     let inner = ReceivedSchemaApplyObserverForTest::new();
     let panic_observer = ReceivedSchemaApplyObserverForTest::new();
@@ -1450,9 +1473,15 @@ async fn a_whole_authored_migration_waits_together_while_another_edge_keeps_sync
     source
         .execute("INSERT INTO receiver_control VALUES (1)", &empty())
         .expect("author first unrelated control row");
-    let migration_start = source.changes_since(Lsn(0)).max_lsn().unwrap();
+    let migration_start = source
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result")
+        .max_lsn()
+        .unwrap();
     install_source_schema(&source);
-    let migration = source.changes_since(migration_start);
+    let migration = source
+        .changes_since(migration_start)
+        .expect("read or construct the declared fixture result");
     assert_eq!(migration.ddl.len(), source_statements().len());
     let migration_lsn = migration.max_lsn().expect("migration frontier exists");
     assert!(migration.ddl_lsn.iter().all(|lsn| *lsn == migration_lsn));
@@ -1479,7 +1508,8 @@ async fn a_whole_authored_migration_waits_together_while_another_edge_keeps_sync
         broker.client_as(&old_node),
         TenantId::from("whole-schema-holdback"),
         old_identity,
-    );
+    )
+    .expect("read or construct the declared fixture result");
     running
         .server
         .set_peer_vector_schema_support_for_test(&old_node, false);
@@ -1495,7 +1525,8 @@ async fn a_whole_authored_migration_waits_together_while_another_edge_keeps_sync
         broker.client_as(&current_node),
         TenantId::from("whole-schema-holdback"),
         current_identity,
-    );
+    )
+    .expect("read or construct the declared fixture result");
     current_client
         .pull_default()
         .await
@@ -1604,7 +1635,9 @@ async fn a_whole_authored_migration_waits_together_while_another_edge_keeps_sync
         "holdbacks remain after recovery: {:?}",
         restarted.server.schema_sync_holdbacks()
     );
-    let old_schema = old.changes_since(Lsn(0));
+    let old_schema = old
+        .changes_since(Lsn(0))
+        .expect("read or construct the declared fixture result");
     let start = find_schema_vector(&old_schema, &migration.ddl);
     assert_eq!(
         old_schema.ddl[start..start + migration.ddl.len()],
@@ -1619,7 +1652,9 @@ async fn a_whole_authored_migration_waits_together_while_another_edge_keeps_sync
             .pull_default()
             .await
             .expect("a repeated pull after release is accepted");
-        let again = old.changes_since(Lsn(0));
+        let again = old
+            .changes_since(Lsn(0))
+            .expect("read or construct the declared fixture result");
         assert_eq!(
             again.ddl, old_schema.ddl,
             "retry {attempt} re-applied part of the released migration"
