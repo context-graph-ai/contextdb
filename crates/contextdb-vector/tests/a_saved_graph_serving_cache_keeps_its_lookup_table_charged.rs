@@ -289,7 +289,7 @@ fn a_saved_graph_serving_cache_keeps_its_lookup_table_charged() {
     // (that promise is proved at the engine's own admission gate, in
     // `a_declared_graph_degree_loads_when_its_memory_fits.rs`, which refuses
     // through `MemoryBudgetExceeded` before this decoder ever runs): a
-    // budget well short of what the largest cache size here needs must
+    // budget one byte short of what the fresh largest-cache reader retains must
     // still be refused by the decoder's own bound check once it decodes,
     // rather than silently opening an oversized reader. This leg always
     // runs, never gated on a charge that happened to measure as zero.
@@ -306,7 +306,20 @@ fn a_saved_graph_serving_cache_keeps_its_lookup_table_charged() {
         admitted_full > 0,
         "the admission bound for a live cache size must be positive"
     );
-    let starved_budget = admitted_full / 2;
+    let control = HnswIndex::decode_paged_durable_generation(
+        bytes.as_slice(),
+        Arc::new(Source {
+            bytes: Arc::clone(&bytes),
+        }),
+        DIMENSION,
+        VectorQuantization::F32,
+        admitted_full,
+        small_cache_bytes,
+    )
+    .unwrap();
+    let control_resident = control.estimated_resident_bytes();
+    drop(control);
+    let starved_budget = control_resident - 1;
     let refused = HnswIndex::decode_paged_durable_generation(
         bytes.as_slice(),
         Arc::new(Source {
@@ -318,18 +331,23 @@ fn a_saved_graph_serving_cache_keeps_its_lookup_table_charged() {
         small_cache_bytes,
     );
     match refused {
-        Err(Error::Other(message)) => assert!(
-            message.contains("exceeded its admitted resident bound"),
-            "a starved budget must be refused as exceeding its admitted resident bound, not: \
-             {message}"
-        ),
+        Err(Error::MemoryBudgetExceeded {
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            ..
+        }) => {
+            assert_eq!(requested_bytes, control_resident);
+            assert_eq!(available_bytes, requested_bytes - 1);
+            assert_eq!(budget_limit_bytes, requested_bytes - 1);
+        }
         Err(other) => panic!(
-            "a budget of {starved_budget} bytes, half of the {admitted_full}-byte bound this \
-             cache size needs, must be refused with the typed error, not: {other}"
+            "a budget of {starved_budget} bytes, one byte below the {control_resident}-byte \
+             resident size of the fresh control, must be refused with the typed error, not: {other}"
         ),
         Ok(_) => panic!(
-            "a budget of {starved_budget} bytes, half of the {admitted_full}-byte bound this \
-             cache size needs, must be refused, not opened"
+            "a budget of {starved_budget} bytes, one byte below the {control_resident}-byte \
+             resident size of the fresh control, must be refused, not opened"
         ),
     }
 }

@@ -511,6 +511,11 @@ fn corrupt_journal_quarantines_and_repairs_one_route_while_a_cold_neighbour_buil
                 .expect("AUTO compares the quarantined route exactly within budget"),
             vec![Uuid::from_u128(0xA000)]
         );
+        let exact_control = vector_search(&db, alpha, axis(0), "EXACT")
+            .expect("the fresh exact control reads the quarantined route's authoritative vectors");
+        let auto_fallback = vector_search(&db, alpha, axis(0), "AUTO")
+            .expect("AUTO falls back while the same route remains quarantined");
+        assert_eq!(auto_fallback, exact_control);
         assert_eq!(
             vector_search(&db, bravo, axis(1), "INDEXED")
                 .expect("the healthy sealed route remains indexed"),
