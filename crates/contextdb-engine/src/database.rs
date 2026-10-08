@@ -26,7 +26,7 @@ mod vector_generation_decode_owner_tests;
 #[cfg(test)]
 mod vector_journal_cleanup_cancellation_tests;
 mod vector_maintenance_inventory;
-mod vector_paged_build;
+pub(crate) mod vector_paged_build;
 #[cfg(test)]
 mod vector_public_cycle_admission_tests;
 #[cfg(test)]
@@ -17264,8 +17264,7 @@ impl DurableVectorGenerationLoader {
             self.descriptor.generation_id,
             base.as_ref(),
             |saved| {
-                let paged = self.is_base
-                    && saved.graph_format_version
+                let paged = saved.bytes.starts_with(&crate::persistence::vector_paged::META_MAGIC) || saved.graph_format_version
                         == crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
                 if saved.covered_tx != self.descriptor.covered_tx
                     || saved.covered_lsn != self.descriptor.covered_lsn
@@ -17279,6 +17278,9 @@ impl DurableVectorGenerationLoader {
                         "saved vector graph disagrees with its catalog or column declaration"
                             .to_string(),
                     ));
+                }
+                if !paged {
+                    return Err(crate::persistence::vector_paged::corruption("saved generation has no published topology pages"));
                 }
                 if paged {
                     // A paged generation is served from the image's pinned
@@ -17617,6 +17619,9 @@ impl DurableVectorGenerationLoader {
             &self.layout,
             self.accountant.clone(),
             meta_bytes,
+            self.is_base,
+            self.base_generation_id,
+            self.base_covered,
         )
     }
 }
@@ -17707,6 +17712,9 @@ fn paged_generation_graph_from(
     layout: &VectorIndexLayout,
     accountant: Arc<dyn contextdb_vector::MemoryBudget>,
     meta_bytes: &[u8],
+    is_base: bool,
+    base_generation_id: u64,
+    base_covered: (TxId, Lsn),
 ) -> Result<HnswIndex> {
     use crate::persistence::vector_paged::{NativePagedGraphSource, PagedGenerationMeta};
     let meta = PagedGenerationMeta::decode(meta_bytes)?;
@@ -17728,13 +17736,29 @@ fn paged_generation_graph_from(
     policy.hnsw_ef_construction = meta.declaration.hnsw_ef_construction as usize;
     policy.hnsw_ef_search = meta.declaration.hnsw_ef_search as usize;
     let plan = vector_paged_build::paged_batch_plan(&meta.declaration)?;
+    let node_limit = match &meta.saved {
+        Some(binding) => {
+            let route = RedbPersistence::vector_partition_prefix(&partition.index, &partition.partition_key);
+            if binding.route != *blake3::hash(&route).as_bytes() || binding.is_base != is_base || binding.base_generation_id != base_generation_id
+                || (!is_base && (binding.base_tx, binding.base_lsn) != base_covered)
+                || progress.declaration_digest != meta.declaration.digest()? || meta.declaration.policy_revision != descriptor.policy_revision
+                || meta.declaration.hnsw_m != descriptor.hnsw_m || meta.declaration.hnsw_ef_construction != descriptor.hnsw_ef_construction {
+                return Err(crate::persistence::vector_paged::corruption("saved manifest binding disagrees with its selected root catalog"));
+            }
+            usize::try_from(binding.node_limit).map_err(|_| crate::persistence::vector_paged::corruption("saved point window exceeds usize"))?
+        }
+        None => plan.max_node_bytes,
+    };
     let source = Arc::new(NativePagedGraphSource {
         capture,
+        index: partition.index.clone(),
+        schema_binding: meta.schema_binding,
         storage_id: meta.storage_id,
         declaration: meta.declaration.clone(),
         frontier: progress.frontier_tx,
         points: progress.graph.points,
-        node_limit: plan.max_node_bytes,
+        rows: meta.saved.as_ref().map_or(Ok(progress.graph.points), |saved| usize::try_from(saved.distinct_rows).map_err(|_| crate::persistence::vector_paged::corruption("saved row count exceeds usize")))?,
+        node_limit,
         checkpoint: Arc::new(|| Ok(())),
     });
     let tail = contextdb_vector::hnsw::paged_builder::PagedVectorTail::new(
@@ -17855,7 +17879,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                     &self.partition.partition_key,
                     self.descriptor.generation_id,
                 )?;
-                let paged = record.graph_format_version
+                let paged = record.graph.bytes.starts_with(&crate::persistence::vector_paged::META_MAGIC) || record.graph_format_version
                     == crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
                 if record.highest_included_tx != self.descriptor.covered_tx
                     || record.highest_included_lsn != self.descriptor.covered_lsn
@@ -17889,7 +17913,8 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                             .to_string(),
                     ));
                 }
-                (record.graph.bytes, false)
+                let paged = record.graph.bytes.starts_with(&crate::persistence::vector_paged::META_MAGIC);
+                (record.graph.bytes, paged)
             };
             Self::load_checkpoint(request)?;
             if graph_bytes.len() != graph_workspace {
@@ -17906,6 +17931,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
                 ));
             }
             Self::load_checkpoint(request)?;
+            if !paged { return Err(crate::persistence::vector_paged::corruption("saved generation has no published topology pages")); }
             let current_resident = if paged {
                 resident_bytes
             } else {
@@ -19820,6 +19846,7 @@ impl MaintenanceContext {
                 return Ok(outcome);
             }
             let mut maintenance_vector_copy_owner = maintenance_vector_copy_owner.scratch();
+            let schema_binding = persistence.vector_schema_binding(&partition.index)?;
             let layout = contextdb_vector::scoped_index_layout(
                 &self.vector,
                 &partition.index,
@@ -20440,7 +20467,7 @@ self.tx_mgr.with_maintenance_publication(|publication| -> Result<()> {
                         let outcome = self.publish_resident_paged_generation(
                             partition, persistence, &layout, policy, export_reason,
                             generation_id, previous_generation, covered_tx, covered_lsn,
-                            graph, entries, &mut workspace, workspace_plan,
+                            schema_binding, graph, entries, &mut workspace, workspace_plan,
                             &mut maintenance_vector_copy_owner, read_memory.clone(),
                         )?;
                         drop(snapshot_pin);
@@ -20513,7 +20540,7 @@ self.tx_mgr.with_maintenance_publication(|publication| -> Result<()> {
                             .as_ref()
                             .expect("change publication has one current base catalog");
                         let base = persistence
-                            .load_vector_partition_base_generation_with_expected_graph_bytes(
+                            .load_vector_partition_base_manifest_with_expected_graph_bytes(
                                 &partition.index,
                                 &partition.partition_key,
                                 catalog.base.generation_id,
@@ -20636,6 +20663,36 @@ self.tx_mgr.with_maintenance_publication(|publication| -> Result<()> {
                         VectorMaintenancePreparationPhaseForTest::PersistenceAdmitted,
                     );
                     self.build_checkpoint()?;
+                    let paged_candidate = persistence.prepare_saved_topology_candidate_with_schema_binding(&candidate, schema_binding, &mut |scan_bytes| {
+                        self.build_checkpoint()?;
+                        workspace.resize(persistence_owned.saturating_add(scan_bytes), "prepare_vector_generation", "Free writer memory before exporting saved topology.")
+                    })?;
+                    // The saved export owns only native manifests now. Destroy
+                    // the original encoded envelope before any later phase can
+                    // reduce its graph reservation, while retaining the durable
+                    // abandonment guard independently of the selected buffers.
+                    #[cfg(any(test, feature = "test-seams"))]
+                    {
+                        use crate::vector_observations::{observe_graph_buffer_for_test, VectorGraphBufferKindForTest};
+                        // All backing allocations are still live here. Native
+                        // manifests and original envelopes have distinct Vecs.
+                        observe_graph_buffer_for_test(VectorGraphBufferKindForTest::OriginalEnvelope, &candidate.base.graph.bytes);
+                        if let Some(change) = &candidate.change {
+                            observe_graph_buffer_for_test(VectorGraphBufferKindForTest::OriginalEnvelope, &change.graph.bytes);
+                        }
+                        let selected = paged_candidate.as_ref().map(|saved| &saved.candidate).unwrap_or(&candidate);
+                        observe_graph_buffer_for_test(VectorGraphBufferKindForTest::SelectedBase, &selected.base.graph.bytes);
+                        if let Some(change) = &selected.change {
+                            observe_graph_buffer_for_test(VectorGraphBufferKindForTest::SelectedChange, &change.graph.bytes);
+                        }
+                    }
+                    let (candidate, _saved_export_ownership) = match paged_candidate {
+                        Some(saved) => {
+                            drop(candidate);
+                            (saved.candidate, saved.ownership)
+                        }
+                        None => (candidate, None),
+                    };
                     let prepared = persistence
                         .prepare_vector_partition_generation_candidate_with_admission(
                             &candidate,
@@ -20837,6 +20894,10 @@ self.tx_mgr.with_maintenance_publication(|publication| -> Result<()> {
                     publication.complete();
                     drop(active_removal_pass);
                     drop(retained_chains);
+                    #[cfg(any(test, feature = "test-seams"))]
+                    crate::vector_observations::observe_workspace_resize_for_test(
+                        workspace.retained_bytes(), catalog_owned, "repair_cleanup",
+                    );
                     workspace.resize(
                         catalog_owned,
                         "finalize_repaired_vector_partition",
@@ -20894,11 +20955,19 @@ self.tx_mgr.with_maintenance_publication(|publication| -> Result<()> {
                     if !cleanup_complete {
                         if quarantined {
                             drop(published_catalog);
+                            #[cfg(any(test, feature = "test-seams"))]
+                            crate::vector_observations::observe_workspace_resize_for_test(
+                                workspace.retained_bytes(), 0, "repair_cleanup",
+                            );
                             workspace.resize(0, "prepare_vector_generation",
                                 "Free writer memory before completing vector publication.")?;
                             return Ok(Some(VectorPartitionPublicationOutcome::published()));
                         }
                         drop(published_catalog);
+                        #[cfg(any(test, feature = "test-seams"))]
+                        crate::vector_observations::observe_workspace_resize_for_test(
+                            workspace.retained_bytes(), 0, "retry",
+                        );
                         workspace.resize(0, "prepare_vector_generation",
                                 "Free writer memory before completing vector publication.")?;
                         let cleanup_retry =
@@ -23658,7 +23727,7 @@ impl Database {
             DurableVectorGenerationSource::CommittedImage(ReadOnlyVectorGenerationSource::new(
                 retained_source.clone(),
                 max_lsn,
-            )),
+            )?),
             &accountant,
             None,
             DeclaredServingCache::AsOfOpen(declared_serving_cache_bytes(
@@ -30446,7 +30515,7 @@ impl Database {
         )
     }
 
-    fn durable_lineage_table_generation_key(table: &str) -> String {
+    pub(crate) fn durable_lineage_table_generation_key(table: &str) -> String {
         format!(
             "{}{}",
             Self::DURABLE_LINEAGE_TABLE_GENERATION_PREFIX,
@@ -31855,6 +31924,7 @@ impl Database {
         receipt: Option<&SyncApplyReceipt>,
         push_outcome_key: Option<&SyncPushOutcomeContext>,
         renamed_vector_sources: &HashSet<contextdb_core::VectorIndexRef>,
+        replaced_vector_refs: &HashSet<contextdb_core::VectorIndexRef>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
     ) -> Result<(Vec<StagedCopyCharge>, Database)> {
@@ -32137,14 +32207,14 @@ impl Database {
             };
         prepare_metadata(true, &mut metadata_copy_charges)?;
         let copied_vector_index = |index: &contextdb_core::VectorIndexRef| {
-            renamed_vector_sources.contains(index)
+            !replaced_vector_refs.contains(index) && (renamed_vector_sources.contains(index)
                 || affected_tables.contains(&index.table)
                     && projected_tables.get(&index.table).is_some_and(|meta| {
                         meta.columns.iter().any(|column| {
                             column.name == index.column
                                 && matches!(column.column_type, ColumnType::Vector(_))
                         })
-                    })
+                    }))
         };
         // Price the affected table/row image with the selected vector copy
         // before allocating their bodies. Otherwise refusing that final vector
@@ -32816,6 +32886,43 @@ impl Database {
             .collect())
     }
 
+    fn received_vector_lifetime_changes(
+        &self,
+        live: &HashMap<String, TableMeta>,
+        projected: &HashMap<String, TableMeta>,
+        changes: &ChangeSet,
+        vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<(HashSet<VectorIndexRef>, HashSet<VectorIndexRef>)> {
+        // Output routes outlive each schema decoder's scratch. Keep their
+        // copied names and collection backing with the enclosing apply owner.
+        vector_copy_owner.reserve(live.values().map(TableMeta::metadata_bytes).sum::<usize>()
+            .saturating_mul(16).saturating_add(8192))?;
+        let mut changed_routes = HashSet::new();
+        let mut retired_lifetimes = HashSet::new();
+        for (name, previous) in live {
+            let Some(meta) = projected.get(name) else {
+                for column in previous.columns.iter()
+                    .filter(|column| matches!(column.column_type, ColumnType::Vector(_))) {
+                    changed_routes.insert(VectorIndexRef::new(name, &column.name));
+                    retired_lifetimes.insert(VectorIndexRef::new(name, &column.name));
+                }
+                continue;
+            };
+            let (changed, retired) = if let Some(persistence) = &self.persistence {
+                persistence.received_changed_vector_incarnations(name, meta, &changes.ddl)?
+            } else {
+                let _scratch = StagedCopyCharge::admit(&self.accountant,
+                    previous.metadata_bytes().saturating_add(meta.metadata_bytes())
+                        .saturating_mul(64).saturating_add(8192), "project_schema_incarnations")?;
+                RedbPersistence::received_changed_vector_lifetimes_in_memory(name, previous, meta,
+                    &changes.ddl)?
+            };
+            changed_routes.extend(changed);
+            retired_lifetimes.extend(retired);
+        }
+        Ok((changed_routes, retired_lifetimes))
+    }
+
     /// Vector indexes whose declared layout this received unit changes. An open
     /// transaction that staged a vector against one of them must learn at
     /// commit that the index changed under it.
@@ -32855,14 +32962,10 @@ impl Database {
         let after = vector_layouts_from_meta(&projected.tables)
             .into_iter()
             .collect::<HashMap<_, _>>();
-        Ok(live
-            .keys()
-            .chain(after.keys())
-            .filter(|index| live.get(*index) != after.get(*index))
-            .cloned()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect())
+        let (mut changed, _) = self.received_vector_lifetime_changes(&live_tables, &projected.tables, changes, vector_copy_owner)?;
+        changed.extend(live.keys().chain(after.keys())
+            .filter(|index| live.get(*index) != after.get(*index)).cloned());
+        Ok(changed.into_iter().collect())
     }
 
     /// Whether a schema-only unit with no signed provenance would change
@@ -32977,11 +33080,26 @@ impl Database {
             matches!(ddl, DdlChange::AlterTable { constraints, .. }
                 if !sync_column_renames_from_constraints(constraints).is_empty())
         });
+        // A repeated final declaration must not hide a dropped/recreated
+        // column or an intervening representation change in the authored unit.
+        let changes_column_lifetime = changes.ddl.iter().any(|ddl| {
+            let DdlChange::AlterTable { name, columns, constraints, foreign_keys,
+                composite_foreign_keys, composite_unique } = ddl else { return false; };
+            if !sync_column_drops_from_constraints(constraints).is_empty() {
+                return true;
+            }
+            live_tables.get(name).is_some_and(|existing| {
+                let incoming = rough_sync_table_meta(columns, constraints, foreign_keys,
+                    composite_foreign_keys, composite_unique);
+                Self::sync_alter_vector_shape_changed(existing, &incoming, constraints)
+            })
+        });
         !changes.ddl.is_empty()
             && !restated_shape_disagrees
             && !drops_a_held_table
             && !carries_a_drop
             && !carries_a_column_rename
+            && !changes_column_lifetime
             && Self::canonical_received_schema_tables(live_tables)
                 == Self::canonical_received_schema_tables(&side_semantic.tables)
             && *live_event_bus == side_semantic.event_bus
@@ -33224,7 +33342,10 @@ impl Database {
         let projected_vector_layouts = vector_layouts_from_meta(&side_semantic.tables)
             .into_iter()
             .collect::<HashMap<_, _>>();
+        let (changed_vector_routes, replaced_vector_refs) = self.received_vector_lifetime_changes(
+            &live_tables, &side_semantic.tables, changes, vector_copy_owner)?;
         let mut additional_seeds = retired_vector_tables;
+        additional_seeds.extend(changed_vector_routes.iter().map(|index| index.table.clone()));
         for index in live_vector_layouts
             .keys()
             .chain(projected_vector_layouts.keys())
@@ -33367,6 +33488,7 @@ impl Database {
                             _ => None,
                         })
                         .collect(),
+                    &replaced_vector_refs,
                     vector_copy_owner,
                     read_memory.clone(),
                 )?;
@@ -57079,6 +57201,9 @@ impl Database {
             for (name, meta) in &table_meta {
                 artifact.flush_table_meta(name, meta)?;
             }
+            if let Some(root) = &writer_root {
+                root.copy_schema_into(crate::persistence::writer_source::SourceWindowOwner::Read(read_memory.clone()), artifact)?;
+            }
 
             // Rows: streaming storage-layer copy, batched by position. Positions
             // are stable for the copy's duration: commits only append versions or
@@ -62946,7 +63071,7 @@ impl Database {
             && Self::sync_vector_columns(existing) != Self::sync_vector_columns(incoming)
     }
 
-    fn apply_sync_alter_to_projected_table_meta(
+    pub(crate) fn apply_sync_alter_to_projected_table_meta(
         table_name: &str,
         meta: &mut TableMeta,
         incoming: TableMeta,
@@ -81747,7 +81872,7 @@ fn sync_constraint_is_column_rename(constraint: &str) -> bool {
 }
 
 /// Every authored non-vector column rename a received ALTER declares.
-fn sync_column_renames_from_constraints(constraints: &[String]) -> Vec<(String, String)> {
+pub(crate) fn sync_column_renames_from_constraints(constraints: &[String]) -> Vec<(String, String)> {
     const PREFIX: &str = "COLUMN_RENAME(";
     let mut renames = Vec::new();
     for constraint in constraints {
@@ -81791,7 +81916,7 @@ fn sync_constraint_is_column_drop(constraint: &str) -> bool {
 }
 
 /// Every column a received ALTER's author explicitly dropped.
-fn sync_column_drops_from_constraints(constraints: &[String]) -> HashSet<String> {
+pub(crate) fn sync_column_drops_from_constraints(constraints: &[String]) -> HashSet<String> {
     const PREFIX: &str = "COLUMN_DROP(";
     constraints
         .iter()
@@ -81823,7 +81948,7 @@ pub(crate) fn sync_rename_marker_for_column(
     })
 }
 
-fn sync_vector_rename_from_constraints(constraints: &[String]) -> Option<(String, String)> {
+pub(crate) fn sync_vector_rename_from_constraints(constraints: &[String]) -> Option<(String, String)> {
     const PREFIX: &str = "VECTOR_RENAME(";
     for constraint in constraints {
         let trimmed = constraint.trim();
@@ -82366,7 +82491,7 @@ fn constraint_declares_maintained_counts(
     })
 }
 
-fn rough_sync_table_meta(
+pub(crate) fn rough_sync_table_meta(
     columns: &[(String, String)],
     constraints: &[String],
     foreign_keys: &[SingleColumnForeignKey],

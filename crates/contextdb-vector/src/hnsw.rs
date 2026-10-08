@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 pub mod paged_builder;
+#[doc(hidden)]
+pub mod saved_topology;
 mod unfiltered;
 pub(crate) mod union;
 pub use union::UnionTerminal;
@@ -2956,6 +2958,8 @@ pub trait HnswQuerySelfScoreObserver: Send + Sync {
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub trait PagedVectorObserver: Send + Sync {
+    /// Real storage producer work, distinct from serving-cache fills.
+    fn storage_work(&self, _kind: PagedVectorStorageWork, _bytes: usize) {}
     /// One acquisition of the serving page cache's lock.
     fn page_cache_locked(&self) {}
     /// One page body read from the snapshot source into a serving slot.
@@ -2969,6 +2973,62 @@ pub trait PagedVectorObserver: Send + Sync {
     /// What one walk compared besides the vectors themselves, reported once
     /// when that walk ends.
     fn walk_compared(&self, _work: PagedWalkWork) {}
+}
+
+/// Work emitted at the existing descriptor, page and authentication producers.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagedVectorStorageWork { SourceRead, DescriptorDecode, PageRecordDecode, Authentication }
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn observe_paged_storage_work(kind: PagedVectorStorageWork, bytes: usize) {
+    observe_paged_vector(|observer| observer.storage_work(kind, bytes));
+}
+
+/// Chain producer observations through the same operation collector and its
+/// enclosing proof observer. This changes no graph work or owner.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn with_additional_paged_vector_observer<T>(
+    observer: Arc<dyn PagedVectorObserver>, action: impl FnOnce() -> T,
+) -> T {
+    struct Additional {
+        observer: Arc<dyn PagedVectorObserver>,
+        prior: Option<Arc<dyn PagedVectorObserver>>,
+    }
+    impl PagedVectorObserver for Additional {
+        fn storage_work(&self, kind: PagedVectorStorageWork, bytes: usize) {
+            self.observer.storage_work(kind, bytes);
+            if let Some(prior) = &self.prior { prior.storage_work(kind, bytes); }
+        }
+        fn page_cache_locked(&self) {
+            self.observer.page_cache_locked();
+            if let Some(prior) = &self.prior { prior.page_cache_locked(); }
+        }
+        fn page_filled(&self) {
+            self.observer.page_filled();
+            if let Some(prior) = &self.prior { prior.page_filled(); }
+        }
+        fn page_looked_up(&self, hit: bool) {
+            self.observer.page_looked_up(hit);
+            if let Some(prior) = &self.prior { prior.page_looked_up(hit); }
+        }
+        fn vector_decoded(&self) {
+            self.observer.vector_decoded();
+            if let Some(prior) = &self.prior { prior.vector_decoded(); }
+        }
+        fn query_norm_computed(&self) {
+            self.observer.query_norm_computed();
+            if let Some(prior) = &self.prior { prior.query_norm_computed(); }
+        }
+        fn walk_compared(&self, work: PagedWalkWork) {
+            self.observer.walk_compared(work);
+            if let Some(prior) = &self.prior { prior.walk_compared(work); }
+        }
+    }
+    let prior = PAGED_VECTOR_OBSERVER.with(|slot| slot.borrow().clone());
+    with_paged_vector_observer(Arc::new(Additional { observer, prior }), action)
 }
 
 /// What a graph walk spends outside its distance arithmetic, counted as

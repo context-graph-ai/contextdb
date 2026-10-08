@@ -16,6 +16,9 @@ pub(crate) mod vector_identity_range;
 mod vector_membership_pages;
 pub(crate) mod vector_membership_source;
 pub(crate) mod vector_paged;
+mod vector_saved;
+mod schema_binding;
+pub(crate) use schema_binding::VectorSchemaBinding;
 #[cfg(test)]
 mod vector_streamed_frame_tests;
 pub(crate) mod writer_adapters;
@@ -17866,9 +17869,9 @@ pub struct RedbPersistence {
     /// An explicit runtime-state root; `None` selects the platform default.
     runtime_dir: Option<PathBuf>,
     // Field order preserves flush, data-file release, companion release on unwind.
-    db: std::sync::RwLock<Option<redb::Database>>,
+    db: Arc<std::sync::RwLock<Option<redb::Database>>>,
     writer_file: std::sync::RwLock<Option<Arc<LockedWriterFile>>>,
-    lock_file: std::sync::RwLock<Option<CompanionGuard>>,
+    lock_file: Arc<std::sync::RwLock<Option<CompanionGuard>>>,
     storage_compaction: Mutex<(
         redb::CompactionCursor,
         redb::CompactionProgress,
@@ -17902,6 +17905,8 @@ pub struct RedbPersistence {
     paged_root_capture: std::sync::OnceLock<vector_paged::PagedRootCapture>,
     scoped_vector_root_capture: std::sync::OnceLock<vector_paged::ScopedWriterRootCapture>,
     vector_repair_audit: parking_lot::Mutex<Option<vector_paged::RepairAudit>>,
+    saved_export_recovery_cutoff: std::sync::OnceLock<u64>,
+    saved_export_abandonment_error: Arc<parking_lot::Mutex<Option<String>>>,
 }
 pub(crate) struct RawSyncApplyStateDigest {
     pub(crate) digest: String,
@@ -18242,6 +18247,7 @@ struct VectorPartitionGraphPageManifestRecord {
     graph_bytes: u64,
     graph_checksum: [u8; 32],
     page_count: u32,
+    schema_binding: VectorSchemaBinding,
 }
 
 struct PreencodedVectorPartitionGraphPages {
@@ -18333,6 +18339,7 @@ pub(crate) struct LoadedVectorPartitionGenerationCatalog {
 /// holds one read transaction only for the duration of that load step.
 #[derive(Clone)]
 pub(crate) struct ReadOnlyVectorGenerationSource {
+    read: Arc<redb::ReadTransaction>,
     source: Arc<RetainedReadSource>,
     snapshot_lsn: Lsn,
 }
@@ -18610,11 +18617,9 @@ impl RetainedReadSource {
 }
 
 impl ReadOnlyVectorGenerationSource {
-    pub(crate) fn new(source: Arc<RetainedReadSource>, snapshot_lsn: Lsn) -> Self {
-        Self {
-            source,
-            snapshot_lsn,
-        }
+    pub(crate) fn new(source: Arc<RetainedReadSource>, snapshot_lsn: Lsn) -> Result<Self> {
+        let read=Arc::new(source.begin_read()?);
+        Ok(Self { read, source, snapshot_lsn })
     }
 
     fn corruption(&self, reason: impl Into<String>) -> Error {
@@ -18639,19 +18644,14 @@ impl ReadOnlyVectorGenerationSource {
     }
 
     fn with_read<T>(&self, read: impl FnOnce(&redb::ReadTransaction) -> Result<T>) -> Result<T> {
-        self.source.with_read(read)
+        read(&self.read)
     }
 
     /// Paged generation readers of a committed image read its pinned root.
     pub(crate) fn paged_root_capture(&self) -> vector_paged::PagedRootCapture {
         let source = Arc::clone(&self.source);
-        Arc::new(move || {
-            let read = Arc::new(source.begin_read()?);
-            Ok((
-                read,
-                Arc::clone(&source) as Arc<dyn std::any::Any + Send + Sync>,
-            ))
-        })
+        let read = Arc::clone(&self.read);
+        Arc::new(move || Ok((Arc::clone(&read), Arc::clone(&source) as Arc<dyn std::any::Any + Send + Sync>)))
     }
 
     pub(crate) fn generation_record_bytes(
@@ -18703,6 +18703,7 @@ impl ReadOnlyVectorGenerationSource {
                 value.value(),
             )
             .map_err(|reason| self.corruption(reason))?;
+        RedbPersistence::validate_vector_schema_binding_in_read(read, index, manifest.schema_binding)?;
         let page_bytes = manifest.page_bytes as usize;
         let bounded_page_bytes = VECTOR_PARTITION_GRAPH_PAGE_RECORD_BYTES.checked_sub(
             VECTOR_PARTITION_GRAPH_PAGE_LEAF_FRAME_BYTES
@@ -19252,6 +19253,8 @@ pub(crate) struct PreencodedVectorPartitionGenerationCandidate {
     catalog_bytes: Vec<u8>,
     catalog_route: VectorPartitionRef,
     attributable_stale_catalog_keys: Vec<Vec<u8>>,
+    native_storage: [Option<u64>; 2],
+    _saved_export_ownership: Option<vector_saved::SavedExportOwnership>,
 }
 
 impl PreencodedVectorPartitionGenerationCandidate {
@@ -19364,7 +19367,7 @@ impl VectorPartitionRecordIndex for VectorPartitionBaseGenerationRecord {
         &self.index
     }
     fn native_paged_graph(&self) -> Option<&[u8]> {
-        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION)
+        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION || (self.graph_format_version == 1 && self.graph.bytes.starts_with(&vector_paged::META_MAGIC)))
             .then_some(self.graph.bytes.as_slice())
     }
 }
@@ -19373,7 +19376,7 @@ impl VectorPartitionRecordIndex for VectorPartitionChangeGenerationRecord {
         &self.index
     }
     fn native_paged_graph(&self) -> Option<&[u8]> {
-        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION)
+        (self.graph_format_version == vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION || (self.graph_format_version == 1 && self.graph.bytes.starts_with(&vector_paged::META_MAGIC)))
             .then_some(self.graph.bytes.as_slice())
     }
 }
@@ -20226,6 +20229,9 @@ impl RedbPersistence {
     /// Drain eligible deferred frees while this owner can still commit. A
     /// retained read or savepoint leaves protected entries for a later owner.
     pub(crate) fn drain_deferred_frees_before_handoff(&self) -> Result<()> {
+        if let Some(error) = self.saved_export_abandonment_error.lock().as_ref() {
+            return Err(Error::Other(format!("saved generation abandonment failed: {error}")));
+        }
         let companion = self.lock_file.read().map_err(Self::storage_error)?;
         if companion.is_none() {
             return Err(Error::Other("database persistence is closed".to_string()));
@@ -20426,8 +20432,8 @@ impl RedbPersistence {
         Ok(Self {
             path: path.to_path_buf(),
             runtime_dir: None,
-            lock_file: std::sync::RwLock::new(Some(lock_file)),
-            db: std::sync::RwLock::new(Some(replacement_db)),
+            lock_file: Arc::new(std::sync::RwLock::new(Some(lock_file))),
+            db: Arc::new(std::sync::RwLock::new(Some(replacement_db))),
             writer_file: std::sync::RwLock::new(Some(replacement_owner)),
             storage_compaction: Mutex::new(Default::default()),
             #[cfg(feature = "test-seams")]
@@ -20441,6 +20447,8 @@ impl RedbPersistence {
             paged_root_capture: std::sync::OnceLock::new(),
             scoped_vector_root_capture: std::sync::OnceLock::new(),
             vector_repair_audit: parking_lot::Mutex::new(None),
+            saved_export_recovery_cutoff: std::sync::OnceLock::new(),
+            saved_export_abandonment_error: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -20496,8 +20504,8 @@ impl RedbPersistence {
                     Ok(Self {
                         path: path.to_path_buf(),
                         runtime_dir: runtime_dir.map(Path::to_path_buf),
-                        lock_file: std::sync::RwLock::new(Some(lock_file)),
-                        db: std::sync::RwLock::new(Some(db)),
+                        lock_file: Arc::new(std::sync::RwLock::new(Some(lock_file))),
+                        db: Arc::new(std::sync::RwLock::new(Some(db))),
                         writer_file: std::sync::RwLock::new(Some(owner)),
                         storage_compaction: Mutex::new(Default::default()),
                         #[cfg(feature = "test-seams")]
@@ -20511,6 +20519,8 @@ impl RedbPersistence {
                         paged_root_capture: std::sync::OnceLock::new(),
                         scoped_vector_root_capture: std::sync::OnceLock::new(),
             vector_repair_audit: parking_lot::Mutex::new(None),
+            saved_export_recovery_cutoff: std::sync::OnceLock::new(),
+            saved_export_abandonment_error: Arc::new(parking_lot::Mutex::new(None)),
                     })
                 }
                 Err(err) => {
@@ -20689,8 +20699,8 @@ impl RedbPersistence {
                 let persistence = Self {
                     path: path.to_path_buf(),
                     runtime_dir: runtime_dir.map(Path::to_path_buf),
-                    lock_file: std::sync::RwLock::new(Some(lock_file)),
-                    db: std::sync::RwLock::new(Some(db.database)),
+                    lock_file: Arc::new(std::sync::RwLock::new(Some(lock_file))),
+                    db: Arc::new(std::sync::RwLock::new(Some(db.database))),
                     writer_file: std::sync::RwLock::new(Some(db.owner)),
                     storage_compaction: Mutex::new(Default::default()),
                     #[cfg(feature = "test-seams")]
@@ -20704,6 +20714,8 @@ impl RedbPersistence {
                     paged_root_capture: std::sync::OnceLock::new(),
                     scoped_vector_root_capture: std::sync::OnceLock::new(),
             vector_repair_audit: parking_lot::Mutex::new(None),
+            saved_export_recovery_cutoff: std::sync::OnceLock::new(),
+            saved_export_abandonment_error: Arc::new(parking_lot::Mutex::new(None)),
                 };
                 persistence.recover_authoritative_purge_publication()?;
                 persistence.truncate_uncommitted_commit_index_tail()?;
@@ -22856,7 +22868,7 @@ impl RedbPersistence {
                 if let Some(encoded) = meta_table.get(key.as_str()).map_err(Self::storage_error)? {
                     old_meta.insert(
                         (*table).clone(),
-                        Self::decode::<TableMeta>(encoded.value())?,
+                        Self::decode_table_meta_versioned(encoded.value())?.0,
                     );
                 }
             }
@@ -23119,7 +23131,7 @@ impl RedbPersistence {
                     let previous = stored_meta
                         .get(Self::meta_key(table).as_str())
                         .map_err(Self::storage_error)?
-                        .map(|encoded| Self::decode::<TableMeta>(encoded.value()))
+                        .map(|encoded| Self::decode_table_meta_versioned(encoded.value()).map(|(meta, _)| meta))
                         .transpose()?;
                     let unchanged_declarations = previous.as_ref().is_some_and(|previous| {
                         if previous.maintained_counts != next.maintained_counts {
@@ -23168,6 +23180,11 @@ impl RedbPersistence {
                 let mut meta_table = write_txn
                     .open_table(META_TABLE)
                     .map_err(Self::storage_error)?;
+                let encoded_schemas = stage.table_meta.iter().map(|(table, meta)| {
+                    let encoded = self.schema_update_in_table(&meta_table, table, meta,
+                        stage.ddl_log.iter().map(|(_, change)| change))?;
+                    Ok((table.clone(), encoded))
+                }).collect::<Result<HashMap<_, _>>>()?;
                 for table in &stage.affected_tables {
                     let key = Self::meta_key(table);
                     meta_table
@@ -23176,7 +23193,7 @@ impl RedbPersistence {
                 }
                 for (table, meta) in &stage.table_meta {
                     let key = Self::meta_key(table);
-                    let encoded = Self::encode(meta)?;
+                    let encoded = &encoded_schemas[table].bytes;
                     meta_table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -24134,7 +24151,8 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 for (table, meta) in &stage.affected_table_meta {
                     let key = Self::meta_key(table);
-                    let encoded = Self::encode(meta)?;
+                    let encoded_schema = self.schema_update_in_table(&meta_table, table, meta, &stage.ddl)?;
+                let encoded = &encoded_schema.bytes;
                     meta_table
                         .insert(key.as_str(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -24270,7 +24288,8 @@ impl RedbPersistence {
                     .open_table(META_TABLE)
                     .map_err(Self::storage_error)?;
                 let key = Self::meta_key(name);
-                let encoded = Self::encode(meta)?;
+                let encoded_schema = self.schema_update_in_table(&meta_table, name, meta, &[])?;
+                let encoded = &encoded_schema.bytes;
                 meta_table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
@@ -24323,7 +24342,8 @@ impl RedbPersistence {
                     .open_table(META_TABLE)
                     .map_err(Self::storage_error)?;
                 let key = Self::meta_key(name);
-                let encoded = Self::encode(meta)?;
+                let encoded_schema = self.schema_update_in_table(&meta_table, name, meta, std::slice::from_ref(ddl))?;
+                let encoded = &encoded_schema.bytes;
                 meta_table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
@@ -25692,7 +25712,8 @@ impl RedbPersistence {
                     .open_table(META_TABLE)
                     .map_err(Self::storage_error)?;
                 let key = Self::meta_key(name);
-                let encoded = Self::encode(meta)?;
+                let encoded_schema = self.schema_update_in_table(&meta_table, name, meta, ddl)?;
+                let encoded = &encoded_schema.bytes;
                 meta_table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
@@ -29022,9 +29043,11 @@ impl RedbPersistence {
                 .map(|capture| capture())
                 .transpose()?
                 .flatten(),
+            false,
         )
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn load_vector_partition_base_generation_with_expected_graph_bytes(
         &self,
         index: &VectorIndexRef,
@@ -29032,12 +29055,28 @@ impl RedbPersistence {
         generation_id: u64,
         expected_graph_bytes: u64,
     ) -> Result<VectorPartitionBaseGenerationRecord> {
+        let mut base = self.load_vector_partition_base_generation_with_size(
+            index, partition_key, generation_id, Some(expected_graph_bytes), None, false,
+        )?;
+        if base.graph.bytes.starts_with(&vector_paged::META_MAGIC) {
+            base.graph = VectorPartitionGraphBytes::verified(
+                self.materialize_paged_topology_for_test(&base.graph.bytes)?,
+            );
+        }
+        Ok(base)
+    }
+
+    /// Maintenance carries the selected native source manifest forward without
+    /// loading its graph. Serving opens its pages through the native reader.
+    pub(crate) fn load_vector_partition_base_manifest_with_expected_graph_bytes(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        generation_id: u64,
+        expected_graph_bytes: u64,
+    ) -> Result<VectorPartitionBaseGenerationRecord> {
         self.load_vector_partition_base_generation_with_size(
-            index,
-            partition_key,
-            generation_id,
-            Some(expected_graph_bytes),
-            None,
+            index, partition_key, generation_id, Some(expected_graph_bytes), None, true,
         )
     }
 
@@ -29048,6 +29087,7 @@ impl RedbPersistence {
         generation_id: u64,
         expected_graph_bytes: Option<u64>,
         root: Option<Arc<WriterSnapshot>>,
+        native_only: bool,
     ) -> Result<VectorPartitionBaseGenerationRecord> {
         let key = Self::vector_partition_base_generation_key_from_parts(
             index,
@@ -29099,6 +29139,9 @@ impl RedbPersistence {
                     "base graph byte length {} disagrees with catalog durable byte declaration {expected}",
                     borrowed.graph.bytes.len()
                 )));
+            }
+            if native_only && !borrowed.graph.bytes.starts_with(&vector_paged::META_MAGIC) {
+                return Err(self.vector_partition_corruption("maintenance base has no native paged source"));
             }
             let record = borrowed.into_owned();
             Ok(record)
@@ -29509,6 +29552,27 @@ impl RedbPersistence {
         })
     }
 
+    fn prepare_bound_vector_partition_graph_pages(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        base_generation_id: u64,
+        generation_id: u64,
+        is_base: bool,
+        generation_key: &[u8],
+        graph: &VectorPartitionGraphBytes,
+    ) -> Result<PreencodedVectorPartitionGraphPages> {
+        let schema_binding = if graph.bytes.starts_with(&vector_paged::META_MAGIC) {
+            vector_paged::PagedGenerationMeta::decode(&graph.bytes)?.schema_binding
+        } else {
+            self.vector_schema_binding(index)?
+        };
+        Self::prepare_vector_partition_graph_pages_with_binding(index, partition_key, base_generation_id, generation_id, is_base, generation_key, graph, schema_binding)
+    }
+
+    // Preserve the existing framing-only fixture entry. An unbound frame can
+    // never pass the transactional publication guard.
+    #[cfg(test)]
     fn prepare_vector_partition_graph_pages(
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
@@ -29517,6 +29581,19 @@ impl RedbPersistence {
         is_base: bool,
         generation_key: &[u8],
         graph: &VectorPartitionGraphBytes,
+    ) -> Result<PreencodedVectorPartitionGraphPages> {
+        Self::prepare_vector_partition_graph_pages_with_binding(index, partition_key, base_generation_id, generation_id, is_base, generation_key, graph, VectorSchemaBinding { table_generation: 0, column_incarnation: 0 })
+    }
+
+    fn prepare_vector_partition_graph_pages_with_binding(
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        base_generation_id: u64,
+        generation_id: u64,
+        is_base: bool,
+        generation_key: &[u8],
+        graph: &VectorPartitionGraphBytes,
+        schema_binding: VectorSchemaBinding,
     ) -> Result<PreencodedVectorPartitionGraphPages> {
         let root_key = Self::vector_partition_graph_page_root_key(generation_key, is_base);
         // A graph page occupies one 64 KiB Redb allocation including its
@@ -29548,6 +29625,7 @@ impl RedbPersistence {
             graph_checksum: graph.checksum,
             page_count: u32::try_from(page_count)
                 .map_err(|_| Error::Other("saved graph has too many physical pages".to_string()))?,
+            schema_binding,
         };
         let manifest_bytes = Self::encode_vector_partition_record(
             VectorPartitionRecordKind::GraphPageManifest,
@@ -29664,6 +29742,9 @@ impl RedbPersistence {
         mut admit_scan: impl FnMut(usize) -> Result<()>,
     ) -> Result<PreencodedVectorPartitionGenerationCandidate> {
         self.validate_vector_partition_generation_candidate(candidate)?;
+        let mut paged_candidate = self.prepare_saved_topology_candidate(candidate, &mut admit_scan)?;
+        let candidate = paged_candidate.as_ref().map(|saved| &saved.candidate).unwrap_or(candidate);
+        self.validate_vector_partition_generation_candidate(candidate)?;
         let base_key = Self::vector_partition_base_generation_key(&candidate.base);
         let base_bytes = Self::encode_vector_partition_record(
             VectorPartitionRecordKind::BaseGeneration,
@@ -29673,7 +29754,7 @@ impl RedbPersistence {
             VectorPartitionRecordKind::BaseGeneration,
             &base_bytes,
         )?;
-        let base_pages = Self::prepare_vector_partition_graph_pages(
+        let base_pages = self.prepare_bound_vector_partition_graph_pages(
             &candidate.base.index,
             &candidate.base.partition_key,
             candidate.base.generation_id,
@@ -29704,7 +29785,7 @@ impl RedbPersistence {
             .as_ref()
             .map(|change| {
                 let key = Self::vector_partition_change_generation_key(change);
-                Self::prepare_vector_partition_graph_pages(
+                self.prepare_bound_vector_partition_graph_pages(
                     &change.index,
                     &change.partition_key,
                     change.base_generation_id,
@@ -29807,6 +29888,11 @@ impl RedbPersistence {
                 candidate.catalog.partition_key.clone(),
             ),
             attributable_stale_catalog_keys,
+            native_storage: [
+                candidate.base.graph.bytes.starts_with(&vector_paged::META_MAGIC).then(|| vector_paged::authenticated_native_storage_id(&candidate.base.graph.bytes)).transpose()?,
+                candidate.change.as_ref().filter(|change| change.graph.bytes.starts_with(&vector_paged::META_MAGIC)).map(|change| vector_paged::authenticated_native_storage_id(&change.graph.bytes)).transpose()?,
+            ],
+            _saved_export_ownership: paged_candidate.as_mut().and_then(|saved| saved.ownership.take()),
         })
     }
 
@@ -29932,6 +30018,11 @@ impl RedbPersistence {
         bytes: usize,
         operation: &str,
     ) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::vector_observations::observe_workspace_resize_for_test(
+            workspace.retained_bytes(), bytes,
+            if operation == "finalize_repaired_vector_partition" { "repair_cleanup" } else { "normal_cleanup" },
+        );
         workspace.resize(
             bytes,
             operation,
@@ -30284,6 +30375,18 @@ impl RedbPersistence {
         write_txn: &redb::WriteTransaction,
         prepared: &PreencodedVectorPartitionGenerationCandidate,
     ) -> Result<()> {
+        let manifest: VectorPartitionGraphPageManifestRecord = self.decode_vector_partition_record(
+            VectorPartitionRecordKind::GraphPageManifest, &prepared.base_pages.manifest_bytes,
+        )?;
+        Self::validate_vector_schema_binding_in_write(write_txn, &prepared.catalog_route.index, manifest.schema_binding)?;
+        if let Some(change_pages) = &prepared.change_pages {
+            let change: VectorPartitionGraphPageManifestRecord = self.decode_vector_partition_record(
+                VectorPartitionRecordKind::GraphPageManifest, &change_pages.manifest_bytes,
+            )?;
+            if change.schema_binding != manifest.schema_binding {
+                return Err(self.vector_partition_corruption("base and change column incarnations disagree"));
+            }
+        }
         // All callers insert immutable objects before publishing the catalog.
         // An emptied partitioned route must insert neither generations nor pages:
         // without a catalog, reclamation cannot discover those objects.
@@ -30321,6 +30424,7 @@ impl RedbPersistence {
         if let Some(change_pages) = &prepared.change_pages {
             self.insert_preencoded_vector_partition_graph_pages_in_write(write_txn, change_pages)?;
         }
+        vector_paged::bind_pages_root(write_txn)?;
         Ok(())
     }
 
@@ -30403,6 +30507,9 @@ impl RedbPersistence {
             VectorPartitionRecordKind::GenerationCatalog,
             &prepared.catalog_bytes,
         )?;
+        for storage in prepared.native_storage.into_iter().flatten() {
+            vector_saved::release_saved_export_in_write(write_txn,storage)?;
+        }
         vector_membership_pages::publish_pending_frontier(
             write_txn,
             &prepared.catalog_route,
@@ -35748,7 +35855,7 @@ impl RedbPersistence {
         key
     }
 
-    fn vector_partition_prefix(
+    pub(crate) fn vector_partition_prefix(
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
     ) -> Vec<u8> {
@@ -37663,6 +37770,9 @@ impl RedbPersistence {
     /// had fewer fields than today's, which is exactly the `v1.0.0` case
     /// this fallback exists for.
     fn decode_table_meta_versioned(bytes: &[u8]) -> Result<(TableMeta, bool)> {
+        if bytes.starts_with(schema_binding::SCHEMA_MAGIC) {
+            return Self::decode_persisted_schema(bytes).map(|(meta, _, _)| (meta, false));
+        }
         match Self::decode::<TableMeta>(bytes) {
             Ok(meta) => Ok((meta, false)),
             Err(error @ Error::MemoryBudgetExceeded { .. }) => Err(error),
@@ -37801,6 +37911,9 @@ impl RedbPersistence {
         // Operations borrow shared handle ownership. A writer waiting inside
         // Redb must not hold an exclusive lock needed to begin an ordinary read.
         // Close/recycle still take both exclusive guards before replacing it.
+        if let Some(error) = self.saved_export_abandonment_error.lock().as_ref() {
+            return Err(Error::Other(format!("saved generation abandonment failed: {error}")));
+        }
         let companion = self.lock_file.read().map_err(Self::storage_error)?;
         if companion.is_none() {
             return Err(Error::Other("database persistence is closed".to_string()));

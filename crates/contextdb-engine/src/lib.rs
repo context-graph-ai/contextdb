@@ -240,7 +240,7 @@ pub use sync_types::{
 };
 
 pub(crate) mod custody;
-#[cfg(feature = "test-seams")]
+#[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub mod vector_observations;
 

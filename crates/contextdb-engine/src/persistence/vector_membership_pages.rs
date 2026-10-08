@@ -1215,6 +1215,26 @@ pub(super) fn decode_source_member(
     decode_member(key, encoded)
 }
 
+/// Authenticated decode of one row-ordered reverse membership companion.
+pub(super) fn decode_reverse_member(
+    key: &[u8],
+    encoded: &[u8],
+) -> Result<VectorPartitionMembershipRecord> {
+    let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
+        .map_err(|reason| corruption(&reason))?;
+    prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
+        .map_err(|reason| corruption(&reason))?;
+    let record: VectorPartitionMembershipRecord =
+        decode_vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
+            .map_err(|reason| corruption(&reason))?;
+    if reverse_key(&record) != key {
+        return Err(corruption(
+            "reverse membership key disagrees with its authenticated identity",
+        ));
+    }
+    Ok(record)
+}
+
 /// The route named by a partition prefix (`vector_partition_prefix`).
 pub(super) fn partition_from_prefix(mut key: &[u8]) -> Result<VectorPartitionRef> {
     let table = std::str::from_utf8(component(&mut key)?)

@@ -1195,6 +1195,7 @@ impl RedbPersistence {
             decode_published_root(LogicalFamily::Configuration, value.value())?
         };
         config.content_size_root = Some(content_fingerprint);
+        config.vector_pages_root = Some(vector_schema_pages_root_in_write(write)?);
         roots
             .insert(
                 LogicalFamily::Configuration as u8,
@@ -2005,12 +2006,14 @@ struct PublishedRoot {
     vector_directory_root: Option<[u8; 32]>,
     ddl_selector_roots: Option<[[u8; 32]; 2]>,
     content_size_root: Option<[u8; 32]>,
+    vector_pages_root: Option<[u8; 32]>,
 }
 
 fn empty_published_root(family: LogicalFamily) -> PublishedRoot {
     PublishedRoot {
         identity: empty_root(family),
         content_size_root: (family == LogicalFamily::Configuration).then_some([0; 32]),
+        vector_pages_root: (family == LogicalFamily::Configuration).then_some([0; 32]),
         ddl_selector_roots: (family == LogicalFamily::ChangeAndDdl).then_some([[0; 32]; 2]),
         custody_config_root: (family == LogicalFamily::Configuration)
             .then(|| SetCommitment::empty(CompactIndexSet::CustodyIndex).root()),
@@ -3329,6 +3332,7 @@ struct RootTail {
     vector_directory_root: Option<[u8; 32]>,
     ddl_selector_roots: Option<[[u8; 32]; 2]>,
     content_size_root: Option<[u8; 32]>,
+    vector_pages_root: Option<[u8; 32]>,
 }
 
 fn assign_open_projections(
@@ -3378,6 +3382,7 @@ fn persist_changed_family_roots(
             vector_directory_root: tails[family as usize].vector_directory_root,
             ddl_selector_roots: tails[family as usize].ddl_selector_roots,
             content_size_root: tails[family as usize].content_size_root,
+            vector_pages_root: tails[family as usize].vector_pages_root,
         });
         roots_table
             .insert(family as u8, encoded.as_slice())
@@ -3453,6 +3458,7 @@ fn encode_published_root(root: &PublishedRoot) -> Vec<u8> {
     if let Some(root) = root.content_size_root {
         encoded.extend_from_slice(&root);
     }
+    if let Some(root) = root.vector_pages_root { encoded.extend_from_slice(&root); }
     encoded
 }
 
@@ -3516,6 +3522,8 @@ fn decode_published_root(family: LogicalFamily, bytes: &[u8]) -> Result<Publishe
     let content_size_root = (family == LogicalFamily::Configuration)
         .then(|| take_root_hash(bytes, &mut cursor, "content-size root"))
         .transpose()?;
+    let vector_pages_root = (family == LogicalFamily::Configuration)
+        .then(|| take_root_hash(bytes, &mut cursor, "vector page root")).transpose()?;
     if cursor != bytes.len() || (root.is_none() && hash != empty_hash(family)) {
         return Err(Error::Other(
             "logical identity root is malformed".to_owned(),
@@ -3531,6 +3539,7 @@ fn decode_published_root(family: LogicalFamily, bytes: &[u8]) -> Result<Publishe
         vector_directory_root,
         ddl_selector_roots,
         content_size_root,
+        vector_pages_root,
     })
 }
 
@@ -5647,6 +5656,45 @@ pub(super) fn content_size_root_in_read(read: &redb::ReadTransaction) -> Result<
         .ok_or_else(|| Error::Other("committed content-size root is missing".into()))
 }
 
+/// The existing vector-root field authenticates both native records and
+/// the schema-owned incarnations that select their meaning.
+fn vector_schema_pages_hash(pages: [u8; 32], schema: [u8; 32]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"contextdb-vector-pages-schema-root-v1");
+    hash.update(&pages);
+    hash.update(&schema);
+    *hash.finalize().as_bytes()
+}
+
+pub(super) fn vector_schema_pages_root_in_write(write: &redb::WriteTransaction) -> Result<[u8; 32]> {
+    let pages = write.table_root_fingerprint(super::vector_paged::PAGES).map_err(RedbPersistence::storage_error)?.unwrap_or([0; 32]);
+    let schema = write.table_root_fingerprint(super::META_TABLE).map_err(RedbPersistence::storage_error)?.unwrap_or([0; 32]);
+    Ok(vector_schema_pages_hash(pages, schema))
+}
+
+pub(super) fn vector_schema_pages_root_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
+    let pages = read.table_root_fingerprint(super::vector_paged::PAGES).map_err(RedbPersistence::storage_error)?.unwrap_or([0; 32]);
+    let schema = read.table_root_fingerprint(super::META_TABLE).map_err(RedbPersistence::storage_error)?.unwrap_or([0; 32]);
+    Ok(vector_schema_pages_hash(pages, schema))
+}
+
+pub(super) fn vector_pages_root_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
+    let roots=read.open_table(CONTENT_IDENTITY_ROOTS_TABLE).map_err(RedbPersistence::storage_error)?;
+    let value=roots.get(LogicalFamily::Configuration as u8).map_err(RedbPersistence::storage_error)?.ok_or_else(|| Error::Other("committed configuration root is missing".into()))?;
+    decode_published_root(LogicalFamily::Configuration,value.value())?.vector_pages_root.ok_or_else(|| Error::Other("committed vector page root is missing".into()))
+}
+pub(super) fn bind_vector_pages_root_in_write(write: &redb::WriteTransaction) -> Result<()> {
+    let fingerprint=vector_schema_pages_root_in_write(write)?;
+    let mut roots=write.open_table(CONTENT_IDENTITY_ROOTS_TABLE).map_err(RedbPersistence::storage_error)?;
+    let mut root={
+        let value=roots.get(LogicalFamily::Configuration as u8).map_err(RedbPersistence::storage_error)?;
+        match value { Some(value) => decode_published_root(LogicalFamily::Configuration,value.value())?, None => empty_published_root(LogicalFamily::Configuration) }
+    };
+    root.vector_pages_root=Some(fingerprint);
+    roots.insert(LogicalFamily::Configuration as u8,encode_published_root(&root).as_slice()).map_err(RedbPersistence::storage_error)?;
+    Ok(())
+}
+
 impl RedbPersistence {
     #[cfg(feature = "test-seams")]
     pub(crate) fn reset_content_identity_work_for_test(&self) {
@@ -5949,6 +5997,7 @@ impl RedbPersistence {
             vector_directory_root: None,
             ddl_selector_roots: None,
             content_size_root: None,
+            vector_pages_root: None,
         });
         for family in LogicalFamily::ALL {
             let encoded = roots_table
@@ -5962,6 +6011,7 @@ impl RedbPersistence {
                 vector_directory_root: published.vector_directory_root,
                 ddl_selector_roots: published.ddl_selector_roots,
                 content_size_root: published.content_size_root,
+                vector_pages_root: published.vector_pages_root,
             };
         }
         drop(roots_table);
@@ -6179,6 +6229,7 @@ impl RedbPersistence {
                 .map_err(Self::storage_error)?
                 .unwrap_or([0; 32]),
         );
+        tails[LogicalFamily::Configuration as usize].vector_pages_root = Some(vector_schema_pages_root_in_write(write_txn)?);
         persist_changed_family_roots(write_txn, &roots, &original_roots, &tails, &original_tails)?;
         #[cfg(feature = "test-seams")]
         publish_directory_binding_work();

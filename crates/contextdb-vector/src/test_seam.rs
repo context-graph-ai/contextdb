@@ -356,3 +356,58 @@ impl VectorStore {
         self.pause_registry().maybe_pause(index, PauseWindow::Ddl);
     }
 }
+
+/// Actual immutable input and maximum single-record export bounds. This reports
+/// the producer's bytes and controls; it selects no fixture size or policy.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct SavedTopologyBoundaryForTest {
+    pub source_bytes: usize,
+    pub retained_control_bytes: usize,
+    pub points: usize,
+    pub dimension: usize,
+    pub quantization: VectorQuantization,
+    pub m: usize,
+    pub ef_construction: usize,
+    pub ef_search: usize,
+    pub max_point_bytes: usize,
+    pub max_native_encoded_point_bytes: usize,
+    pub max_workspace_bytes: usize,
+    pub max_exact_key_bytes: usize,
+}
+#[doc(hidden)]
+pub fn saved_topology_boundary_for_test(
+    bytes: &[u8], dimension: usize, quantization: VectorQuantization,
+    checkpoint: &mut dyn FnMut() -> contextdb_core::Result<()>,
+) -> contextdb_core::Result<SavedTopologyBoundaryForTest> {
+    use crate::hnsw::saved_topology::{SavedPointCursor, SavedTopology};
+    let topology = SavedTopology::inspect(bytes, dimension, quantization, checkpoint)?;
+    let mut cursor = SavedPointCursor::default();
+    let mut workspace = 0;
+    let mut exact = 0;
+    let mut encoded = 0;
+    while let Some(point) = topology.next_point(&mut cursor)? {
+        checkpoint()?;
+        workspace = workspace.max(point.workspace_bytes()?);
+        exact = exact.max(point.exact_key().len());
+        // Use the same point codec the exporter writes, with this exact
+        // immutable point. This measures emitted bytes rather than a bound.
+        let mut bytes = Vec::new();
+        let result = match point.decode()? {
+            crate::hnsw::paged_builder::PagedVectorPoint::F32(point) =>
+                crate::hnsw::paged_builder::encode_paged_point_into(&point, &mut bytes),
+            crate::hnsw::paged_builder::PagedVectorPoint::Quantized(point) =>
+                crate::hnsw::paged_builder::encode_paged_point_into(&point, &mut bytes),
+        };
+        result.map_err(|error| contextdb_core::Error::Other(format!("saved point boundary encoding failed: {error}")))?;
+        encoded = encoded.max(bytes.len());
+    }
+    Ok(SavedTopologyBoundaryForTest {
+        source_bytes: bytes.len(), retained_control_bytes: std::mem::size_of_val(&topology),
+        points: topology.state.points, dimension, quantization,
+        m: topology.m, ef_construction: topology.ef_construction, ef_search: topology.ef_search,
+        max_point_bytes: topology.max_point_bytes, max_native_encoded_point_bytes: encoded,
+        max_workspace_bytes: workspace,
+        max_exact_key_bytes: exact,
+    })
+}

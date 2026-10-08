@@ -474,6 +474,181 @@ pub fn observe_source_unit_credit_for_test(
     )
 }
 
+/// A real root and bounded session retained together throughout public calls.
+/// The callback must consume its semantic and SQL answers before returning.
+#[doc(hidden)]
+pub struct SavedVectorRootForTest {
+    manager: usize,
+    writer: Option<Arc<crate::persistence::WriterSnapshot>>,
+    retained: Option<Arc<crate::persistence::RetainedReadSource>>,
+    session: crate::read_session::ReadSession,
+    pub snapshot: SnapshotId,
+    pub storage: redb::StorageSnapshotIdentity,
+}
+impl SavedVectorRootForTest {
+    #[doc(hidden)]
+    pub fn with_public_calls<T>(
+        &self, database: &Database,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        action: impl FnOnce(&Database, &crate::read_session::ReadSession) -> Result<T>,
+    ) -> Result<T> {
+        if self.manager != Arc::as_ptr(&database.tx_mgr) as usize {
+            return Err(Error::Other("saved vector proof root belongs to another database".into()));
+        }
+        if let Some(retained) = &self.retained {
+            let original = database.retained_relational_source.as_ref().or_else(||
+                database.committed_image_startup.as_ref().map(|startup| &startup.config_source));
+            if !original.is_some_and(|source| Arc::ptr_eq(source, retained)) {
+                return Err(Error::Other("saved vector proof retained source changed".into()));
+            }
+        }
+        let _root = database.enter_writer_read(self.writer.clone(), read_memory);
+        action(database, &self.session)
+    }
+}
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SavedVectorGenerationForTest {
+    pub graph_format_version: u16,
+    pub is_base: bool,
+    pub base_generation_id: u64,
+    pub base_tx: TxId,
+    pub base_lsn: Lsn,
+    pub phase: contextdb_vector::hnsw::paged_builder::PagedVectorPhase,
+    pub extend_candidates: bool,
+    pub keep_pruned: bool,
+    pub max_layer: u8,
+    pub scale_bits: u64,
+    pub hnsw_ef_search: u32,
+    pub generation_id: u64,
+    pub storage_id: u64,
+    pub covered_tx: TxId,
+    pub covered_lsn: Lsn,
+    pub dimension: usize,
+    pub quantization: VectorQuantization,
+    pub manifest: Vec<u8>,
+    pub source_digest: [u8; 32],
+    pub record_digest: [u8; 32],
+    pub distinct_rows: u64,
+    pub points: usize,
+    pub record_bytes: u64,
+    pub node_limit: u64,
+    pub declaration_digest: u64,
+    pub policy_revision: u64,
+    pub hnsw_m: u32,
+    pub hnsw_ef_construction: u32,
+}
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SavedTopologyFixtureForTest {
+    pub partition: VectorPartitionRef,
+    pub base: SavedVectorGenerationForTest,
+    pub change: Option<SavedVectorGenerationForTest>,
+    /// Actual original producer inputs, identified by role and generation.
+    pub original_sources: Vec<(bool, u64, Arc<[u8]>)>,
+    pub cycles: usize,
+}
+fn saved_generation_receipt(
+    version: u16, generation_id: u64, bytes: Vec<u8>,
+    descriptor: VectorPartitionGenerationDescriptor,
+) -> Result<SavedVectorGenerationForTest> {
+    let meta = crate::persistence::vector_paged::PagedGenerationMeta::decode(&bytes)?;
+    let progress = meta.progress()?;
+    let saved = meta.saved.as_ref().ok_or_else(|| Error::Other("proof fixture did not publish saved topology".into()))?;
+    if version != 1 {
+        return Err(Error::Other("proof fixture did not publish graph format 1".into()));
+    }
+    Ok(SavedVectorGenerationForTest {
+        graph_format_version: version, generation_id, storage_id: meta.storage_id,
+        is_base: saved.is_base, base_generation_id: saved.base_generation_id,
+        base_tx: saved.base_tx, base_lsn: saved.base_lsn, phase: progress.phase,
+        extend_candidates: saved.extend_candidates, keep_pruned: saved.keep_pruned,
+        max_layer: saved.max_layer, scale_bits: saved.scale_bits,
+        hnsw_ef_search: meta.declaration.hnsw_ef_search,
+        covered_tx: progress.frontier_tx, covered_lsn: progress.frontier_lsn,
+        dimension: meta.declaration.dimension as usize, quantization: meta.declaration.quantization,
+        source_digest: saved.source_digest, record_digest: saved.record_digest,
+        distinct_rows: saved.distinct_rows, points: progress.graph.points,
+        record_bytes: saved.record_bytes, node_limit: saved.node_limit,
+        declaration_digest: progress.declaration_digest, policy_revision: descriptor.policy_revision,
+        hnsw_m: descriptor.hnsw_m, hnsw_ef_construction: descriptor.hnsw_ef_construction,
+        manifest: bytes,
+    })
+}
+impl Database {
+    /// Captures the existing public read root. This opens no alternate route.
+    #[doc(hidden)]
+    pub fn __capture_saved_vector_root_for_test(&self, limits: ReadLimits) -> Result<SavedVectorRootForTest> {
+        let _operation = self.open_operation()?;
+        let writer = self.writer_read_root()?;
+        let retained = self.retained_relational_source.clone().or_else(||
+            self.committed_image_startup.as_ref().map(|startup| Arc::clone(&startup.config_source)));
+        let (snapshot, storage) = if let Some(root) = &writer {
+            (root.snapshot, root.storage_identity())
+        } else if let Some(source) = &retained {
+            (self.snapshot(), source.storage_identity())
+        } else {
+            return Err(Error::Other("saved vector proof requires a durable root".into()));
+        };
+        Ok(SavedVectorRootForTest {
+            manager: Arc::as_ptr(&self.tx_mgr) as usize, writer, retained,
+            session: self.read_session(limits)?, snapshot, storage,
+        })
+    }
+    /// Drive ordinary finite maintenance, without selecting a native format or
+    /// changing declared policy. A route that publishes another format refuses.
+    #[doc(hidden)]
+    pub fn __saved_topology_fixture_for_test(
+        &self, partition: &VectorPartitionRef, require_change: bool,
+        max_cycles: usize,
+        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    ) -> Result<SavedTopologyFixtureForTest> {
+        let sources = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&sources);
+        let selected_partition = partition.clone();
+        let prior = crate::vector_observations::observe_additional_journal_replay(Arc::new(move |event| {
+            if event.partition != selected_partition { return; }
+            if let crate::vector_observations::VectorJournalReplayWork::SavedTopologyExport { is_base, generation_id, bytes } = &event.work {
+                captured.lock().unwrap_or_else(|error| error.into_inner()).push((*is_base, *generation_id, Arc::clone(bytes)));
+            }
+        }));
+        let persistence = self.persistence.as_ref().ok_or_else(|| Error::Other("saved topology fixture requires writable persistence".into()))?;
+        for cycles in 1..=max_cycles {
+            self.run_maintenance_cycle_with_read_memory(read_memory.clone())?;
+            let Some(catalog) = persistence.load_vector_partition_generation_catalog_for(&partition.index, &partition.partition_key)? else { continue; };
+            if require_change && catalog.change.is_none() { continue; }
+            let base = persistence.load_vector_partition_base_generation(&partition.index, &partition.partition_key, catalog.base.generation_id)?;
+            let base = saved_generation_receipt(base.graph_format_version, base.generation_id, base.graph.bytes, catalog.base)?;
+            let change = catalog.change.map(|descriptor| {
+                let change = persistence.load_vector_partition_change_generation(&partition.index, &partition.partition_key, base.generation_id, descriptor.generation_id)?;
+                saved_generation_receipt(change.graph_format_version, change.change_generation_id, change.graph.bytes, descriptor)
+            }).transpose()?;
+            let original_sources = sources.lock().unwrap_or_else(|error| error.into_inner()).clone();
+            let selected = if require_change { change.as_ref().expect("requested change") } else { &base };
+            if !original_sources.iter().any(|(role, _generation, bytes)|
+                *role == selected.is_base && blake3::hash(bytes).as_bytes() == &selected.source_digest) {
+                continue;
+            }
+            drop(prior);
+            return Ok(SavedTopologyFixtureForTest { partition: partition.clone(), base, change, original_sources, cycles });
+        }
+        Err(Error::Other("ordinary maintenance did not publish the requested saved topology within the supplied cycle bound".into()))
+    }
+}
+
+impl SavedTopologyFixtureForTest {
+    /// Borrow the exact immutable producer input captured at publication.
+    /// A previous publication's source must be retained from its factory call.
+    #[doc(hidden)]
+    pub fn original_source(&self, is_base: bool, generation_id: u64) -> Option<&[u8]> {
+        let selected = if is_base { Some(&self.base) } else { self.change.as_ref() }?;
+        if selected.generation_id != generation_id { return None; }
+        self.original_sources.iter().find(|(role, _generation, bytes)|
+            *role == is_base && blake3::hash(bytes).as_bytes() == &selected.source_digest)
+            .map(|(_, _, bytes)| bytes.as_ref())
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     static CHECKPOINT_OBSERVER: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> =

@@ -29,7 +29,7 @@ const PAGED_MIN_BATCHES_PER_CYCLE: usize = 4;
 const PAGED_MAX_BATCHES_PER_CYCLE: usize = 64;
 /// Retained serving controls of one published paged generation: the tail
 /// handle, its progress record and the captured-root source descriptor.
-pub(super) const PAGED_GENERATION_RESIDENT_BYTES: u64 = 4096;
+pub(crate) const PAGED_GENERATION_RESIDENT_BYTES: u64 = 4096;
 
 /// Exact batch plan for one declaration. Every term is the vector crate's own
 /// validation minimum, independent of the partition's population.
@@ -545,7 +545,7 @@ impl MaintenanceContext {
             contextdb_vector::scoped_index_layout(&self.vector, &partition.index, copy_owner)?;
         let progress = record.progress()?;
         let current = declaration_for(&layout, &layout.resolve_policy(progress.total_points, 1))?;
-        if current != record.declaration {
+        if current != record.declaration || persistence.vector_schema_binding(&partition.index)? != record.schema_binding {
             let mut checkpoint = || self.build_checkpoint();
             self.vector
                 .abandon_partition_paged_build(partition, &mut checkpoint)?;
@@ -821,6 +821,7 @@ impl MaintenanceContext {
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         force_paged: bool,
     ) -> Result<Option<PagedBuildRecord>> {
+        let schema_binding = persistence.vector_schema_binding(&partition.index)?;
         let Some(info) = self.vector.try_partition_info(
             &partition.index,
             &partition.partition_key,
@@ -906,6 +907,7 @@ impl MaintenanceContext {
                     frontier_tx,
                     frontier_lsn,
                     total,
+                    schema_binding,
                 )?;
                 self.snapshot_registry
                     .hold_construction_floor(partition, SnapshotId::from_tx(frontier_tx));
@@ -943,6 +945,7 @@ impl MaintenanceContext {
         previous_generation_id: u64,
         covered_tx: TxId,
         covered_lsn: Lsn,
+        schema_binding: crate::persistence::VectorSchemaBinding,
         graph: HnswIndex,
         entries: Vec<VectorEntry>,
         workspace: &mut contextdb_vector::VectorWorkspaceReservation,
@@ -998,6 +1001,7 @@ impl MaintenanceContext {
                         covered_tx,
                         covered_lsn,
                         rows.len(),
+                        schema_binding,
                     )
                     .map(Some)
             })?;
@@ -1091,6 +1095,7 @@ impl MaintenanceContext {
             record.storage_id,
             &record.declaration,
             progress,
+            record.schema_binding,
         )?;
         let durable_bytes = u64::try_from(meta.len())
             .map_err(|_| Error::Other("paged generation metadata exceeds u64".into()))?;
