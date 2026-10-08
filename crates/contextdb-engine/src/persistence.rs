@@ -9700,6 +9700,10 @@ fn read_image_error(error: Error) -> LoadReadImageError {
 
 fn read_storage_error(error: redb::StorageError) -> LoadReadImageError {
     match error {
+        redb::StorageError::AdmissionRefused(error) => match error.downcast::<Error>() {
+            Ok(error) => read_image_error(*error),
+            Err(error) => read_image_corruption(ReadImageCorruptionCause::MalformedRecord, error),
+        },
         redb::StorageError::Io(error) => read_image_io("reading Redb storage", error),
         redb::StorageError::PreviousIo => read_image_io(
             "reading Redb storage",
@@ -13785,7 +13789,7 @@ impl CompanionGuard {
         let mut state = self.lock_state()?;
         if state.companion.needs_initialization {
             state.companion = initialize_companion_inode(&mut state.file)
-                .map_err(RedbPersistence::storage_error)?;
+                .map_err(RedbPersistence::storage_message_error)?;
         }
         Self::resolve_pending_replacement(path, &mut state)?;
         let record = companion_writer_record(
@@ -13888,12 +13892,12 @@ impl CompanionGuard {
         let mut state = self.lock_state()?;
         if state.companion.needs_initialization {
             state.companion = initialize_companion_inode(&mut state.file)
-                .map_err(RedbPersistence::storage_error)?;
+                .map_err(RedbPersistence::storage_message_error)?;
         }
         Self::retain_pending_replacement(path, &mut state)?;
         let record = companion_writer_record(path, state.companion.active_record.as_ref(), true)?;
         let pending = encode_pending_replacement(fingerprint, record)
-            .map_err(RedbPersistence::storage_error)?;
+            .map_err(RedbPersistence::storage_message_error)?;
         let active_slot = state
             .companion
             .active_slot
@@ -26744,16 +26748,14 @@ impl RedbPersistence {
                 "Raise MEMORY_LIMIT to admit the affected stored row before decoding it.",
             )
         });
-        let page_failure = Arc::new(parking_lot::Mutex::new(None));
         let admission = page_memory.as_ref().map(|memory| {
             let memory = Arc::clone(memory);
-            let failure = Arc::clone(&page_failure);
             Arc::new(move |bytes: usize| {
-                memory.reserve(bytes).map_err(|error| {
-                    *failure.lock() = Some(error);
-                    std::io::Error::from(std::io::ErrorKind::OutOfMemory)
-                })
-            }) as Arc<dyn Fn(usize) -> std::io::Result<()> + Send + Sync>
+                memory
+                    .reserve(bytes)
+                    .map_err(|error| redb::StorageError::AdmissionRefused(Box::new(error)))
+            })
+                as Arc<dyn Fn(usize) -> std::result::Result<(), redb::StorageError> + Send + Sync>
         });
         let mut read = || {
             self.with_db(|db| {
@@ -26799,14 +26801,10 @@ impl RedbPersistence {
             }
         })
         };
-        let result = match admission {
-            Some(admission) => redb::with_read_memory_admission(admission, read),
+        match admission {
+            Some(admission) => redb::with_read_memory_admission_storage(admission, read),
             None => read(),
-        };
-        if let Some(error) = page_failure.lock().take() {
-            return Err(error);
         }
-        result
     }
 
     pub fn load_all_tables(&self) -> Result<HashMap<String, Vec<VersionedRow>>> {
@@ -33313,8 +33311,6 @@ impl RedbPersistence {
             "page_paths",
             "Raise MEMORY_LIMIT to admit a storage maintenance batch.",
         )?;
-        let failure = Arc::new(parking_lot::Mutex::new(None));
-        let admission_failure = failure.clone();
         let admission = Arc::new(move |bytes| {
             workspace
                 .lock()
@@ -33324,10 +33320,7 @@ impl RedbPersistence {
                     "relocate_pages",
                     "Raise MEMORY_LIMIT to admit a storage maintenance batch.",
                 )
-                .map_err(|error| {
-                    *admission_failure.lock() = Some(error);
-                    std::io::Error::from(std::io::ErrorKind::OutOfMemory)
-                })
+                .map_err(|error| redb::StorageError::AdmissionRefused(Box::new(error)))
         });
         // A Redb transaction owns its storage references. Keep only that
         // bounded writer transaction during relocation, not the handle or
@@ -33337,8 +33330,8 @@ impl RedbPersistence {
         let on_fingerprint_failure = Arc::clone(&fingerprint_failure);
         let checkpoint_ratio = state.2;
         let mut next_controls = None;
-        let result = redb::with_read_memory_admission(admission.clone(), || {
-            txn.compact_step_with_cursor_hook(
+        let result = redb::with_read_memory_admission_storage(admission.clone(), || {
+            txn.compact_step_with_cursor_hook_storage(
                 &mut state.0,
                 maximum,
                 |bytes| {
@@ -33363,14 +33356,10 @@ impl RedbPersistence {
                                 // table or a deeper page path keeps the same
                                 // retained owner instead of re-pricing it on
                                 // every batch.
-                                next_controls = Some(crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+                                next_controls = Some(Self::reserve_compaction_checkpoint_controls(
                                     checkpoint_accountant.clone(),
-                                    512usize.saturating_add(table.map_or(0, |name| name.len().saturating_mul(2)))
-                                        .saturating_add(position.len().saturating_mul(2 * std::mem::size_of::<usize>()))
-                                        .div_ceil(1024)
-                                        .saturating_mul(1024),
-                                    "storage_compaction", "checkpoint_controls",
-                                    "Raise MEMORY_LIMIT to retain storage maintenance controls.",
+                                    table,
+                                    position,
                                 )?);
                             }
                             let bytes = Self::encode(&(
@@ -33392,17 +33381,11 @@ impl RedbPersistence {
                             Ok(())
                         })
                         .map_err(|error| {
-                            *on_fingerprint_failure.lock() = Some(error);
-                            redb::StorageError::Io(std::io::Error::other(
-                                "storage root binding failed during compaction",
-                            ))
+                            Self::compaction_checkpoint_storage_error(error, &on_fingerprint_failure)
                         })
                 },
             )
         });
-        if let Some(error) = failure.lock().take() {
-            return Err(error);
-        }
         if let Some(error) = fingerprint_failure.lock().take() {
             return Err(error);
         }
@@ -37783,11 +37766,61 @@ impl RedbPersistence {
         }
     }
 
-    pub(crate) fn storage_error(err: impl std::fmt::Display) -> Error {
-        let message = err.to_string();
-        if let Some(error) = crate::database::take_source_page_refusal(&message) {
-            return error;
+    fn reserve_compaction_checkpoint_controls(
+        accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+        table: Option<&str>,
+        position: &[usize],
+    ) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
+        crate::memory_accounting::OwnedMemoryReservation::try_new_for(
+            accountant,
+            512usize
+                .saturating_add(table.map_or(0, |name| name.len().saturating_mul(2)))
+                .saturating_add(
+                    position
+                        .len()
+                        .saturating_mul(2 * std::mem::size_of::<usize>()),
+                )
+                .div_ceil(1024)
+                .saturating_mul(1024),
+            "storage_compaction",
+            "checkpoint_controls",
+            "Raise MEMORY_LIMIT to retain storage maintenance controls.",
+        )
+    }
+
+    // The hook transports reservations and recovered page admissions as
+    // memory refusals. Other root-binding failures retain the existing I/O
+    // hook result and exact engine error in the per-batch recovery slot.
+    fn compaction_checkpoint_storage_error(
+        error: Error,
+        failure: &parking_lot::Mutex<Option<Error>>,
+    ) -> redb::StorageError {
+        match error {
+            error @ Error::MemoryBudgetExceeded { .. } => {
+                redb::StorageError::AdmissionRefused(Box::new(error))
+            }
+            error => {
+                *failure.lock() = Some(error);
+                redb::StorageError::Io(std::io::Error::other(
+                    "storage root binding failed during compaction",
+                ))
+            }
         }
+    }
+
+    pub(crate) fn storage_error(err: impl Into<redb::Error>) -> Error {
+        let err = err.into();
+        if let redb::Error::AdmissionRefused(error) = err {
+            return match error.downcast::<Error>() {
+                Ok(error) => *error,
+                Err(error) => Error::Other(format!("storage admission refused: {error}")),
+            };
+        }
+        Self::storage_message_error(err)
+    }
+
+    fn storage_message_error(err: impl std::fmt::Display) -> Error {
+        let message = err.to_string();
         if let Some(path) = writer_file::take_reader_coordination_refusal() {
             return Error::ReaderCoordinationUnavailable {
                 operation: "storage reclamation".to_owned(),

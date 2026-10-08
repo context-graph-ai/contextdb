@@ -2094,10 +2094,27 @@ impl WriteTransaction {
     /// caller sees the successor in memory only after that commit succeeds.
     #[doc(hidden)]
     pub fn compact_step_with_cursor_hook(
-        mut self,
+        self,
         cursor: &mut CompactionCursor,
         maximum: usize,
         mut admit: impl FnMut(usize) -> std::io::Result<()>,
+        on_batch: impl FnOnce(&Self, &CompactionCursor) -> Result<(), StorageError>,
+    ) -> Result<CompactionProgress, crate::CompactionError> {
+        self.compact_step_with_cursor_hook_storage(
+            cursor,
+            maximum,
+            |bytes| admit(bytes).map_err(StorageError::from),
+            on_batch,
+        )
+    }
+
+    /// Checkpoint relocation while retaining typed caller admission errors.
+    #[doc(hidden)]
+    pub fn compact_step_with_cursor_hook_storage(
+        mut self,
+        cursor: &mut CompactionCursor,
+        maximum: usize,
+        mut admit: impl FnMut(usize) -> Result<(), StorageError>,
         on_batch: impl FnOnce(&Self, &CompactionCursor) -> Result<(), StorageError>,
     ) -> Result<CompactionProgress, crate::CompactionError> {
         assert!(maximum > 0);
@@ -2129,7 +2146,7 @@ impl WriteTransaction {
         &mut self,
         cursor: &mut CompactionCursor,
         maximum: usize,
-        admit: &mut impl FnMut(usize) -> std::io::Result<()>,
+        admit: &mut impl FnMut(usize) -> Result<(), StorageError>,
     ) -> Result<CompactionProgress> {
         // The saved allocator tree is a live lazy bitmap source. Keep that
         // one root reachable instead of copying all its words under the writer

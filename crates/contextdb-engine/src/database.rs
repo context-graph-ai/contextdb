@@ -44,7 +44,6 @@ mod writer_row_charge_tests;
 use vector_maintenance_inventory::{
     FailedMaintenancePartitions, MaintenanceBuildCandidates, MaintenanceMetadataFailures,
 };
-pub(crate) use vector_source_page_admission::take_source_page_refusal;
 // Compare held units even before their first custody outcome.
 mod custody_incumbent;
 pub(crate) mod discard;

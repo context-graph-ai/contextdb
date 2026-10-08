@@ -298,11 +298,17 @@ pub(super) fn publish_pending_frontier(
 
 pub(super) fn metadata_error(error: impl Into<redb::Error>) -> Error {
     let error = error.into();
-    let refusal = RedbPersistence::storage_error(&error);
+    let corrupted = match &error {
+        redb::Error::Corrupted(reason) => Some(reason.clone()),
+        _ => None,
+    };
+    // Consume the error so an admission payload survives the projection's
+    // metadata adapter instead of being flattened through Display.
+    let refusal = RedbPersistence::storage_error(error);
     match refusal {
-        Error::Other(reason) => match error {
-            redb::Error::Corrupted(reason) => corruption(&reason),
-            _ => Error::VectorMetadataIo {
+        Error::Other(reason) => match corrupted {
+            Some(reason) => corruption(&reason),
+            None => Error::VectorMetadataIo {
                 operation: "vector membership metadata".into(),
                 reason,
             },

@@ -31,8 +31,8 @@ fn fixture(bytes: usize) -> (tempfile::TempDir, redb::Database) {
     (directory, db)
 }
 
-fn storage_error(error: impl std::fmt::Display) -> Error {
-    Error::Other(error.to_string())
+fn storage_error(error: impl Into<redb::Error>) -> Error {
+    crate::persistence::RedbPersistence::storage_error(error)
 }
 
 #[test]
@@ -224,7 +224,7 @@ fn caught_source_refusal_preserves_success_and_unrelated_errors() {
     let unrelated = with_source_page_admission(accountant, || -> Result<()> {
         assert!(read.open_table(GENERATIONS).is_err());
         Err(crate::persistence::RedbPersistence::storage_error(
-            "independent storage failure",
+            std::io::Error::other("independent storage failure"),
         ))
     })
     .unwrap_err();
@@ -241,12 +241,18 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
     drop(read.open_table(GENERATIONS).unwrap());
     with_source_page_admission(Arc::new(MemoryAccountant::with_budget(3)), || {
         let outer = read.open_table(GENERATIONS).err().unwrap();
-        let outer_message = outer.to_string();
+        assert!(matches!(
+            &outer,
+            redb::TableError::Storage(redb::StorageError::AdmissionRefused(_))
+        ));
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _: Result<()> =
                 with_source_page_admission(Arc::new(MemoryAccountant::with_budget(7)), || {
                     let inner = read.open_table(GENERATIONS).err().unwrap();
-                    assert!(take_source_page_refusal(&outer_message).is_none());
+                    assert!(matches!(
+                        &inner,
+                        redb::TableError::Storage(redb::StorageError::AdmissionRefused(_))
+                    ));
                     let typed = crate::persistence::RedbPersistence::storage_error(inner);
                     assert!(matches!(
                         typed,
@@ -259,10 +265,10 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
                 });
         }));
         assert!(unwind.is_err());
-        assert!(
-            take_source_page_refusal(&format!("independent failure mentioning {outer_message}"))
-                .is_none()
+        let independent = crate::persistence::RedbPersistence::storage_error(
+            std::io::Error::other("independent failure after nested unwind"),
         );
+        assert!(matches!(independent, Error::Other(_)));
         let typed = crate::persistence::RedbPersistence::storage_error(outer);
         assert!(matches!(
             typed,
@@ -271,7 +277,7 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
                 ..
             }
         ));
-        assert!(take_source_page_refusal(&outer_message).is_none());
+        assert!(read.open_table(GENERATIONS).is_err());
         Ok(())
     })
     .unwrap();
@@ -493,4 +499,122 @@ fn source_refusal_after_durable_publication_keeps_built_count_and_cleanup_detail
         3
     );
     reopened.close().unwrap();
+}
+
+/// Foreground projection uses an exact selected-stream count through execute.
+/// Its maintained-count lookup occurs during query preparation, before the
+/// bounded row reader installs its own page callback. r17 only restores an
+/// image-page refusal after its enclosing visitor returns, so the public
+/// query result observed inside that visitor loses the typed payload.
+#[test]
+fn foreground_projection_query_preserves_page_refusal_before_the_admission_scope_returns() {
+    use crate::{Database, DatabaseOpenOptions, MaintenancePolicy};
+    use contextdb_core::Value;
+    use std::collections::HashMap;
+    const BODY_BYTES: usize = 9 * 1024 * 1024;
+    const PAGE_BUDGET: usize = 1024 * 1024;
+    const QUERY: &str = "SELECT COUNT(*) AS event_count FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("projection-page-refusal.db");
+    let options = DatabaseOpenOptions {
+        maintenance_policy: MaintenancePolicy::CallerDriven,
+        memory_limit: Some(512 * 1024 * 1024),
+        ..DatabaseOpenOptions::default()
+    };
+    let db = Database::open_with_options(&path, options.clone()).unwrap();
+    db.execute(
+        "CREATE TABLE admission_driver (id INT PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO admission_driver VALUES (1)", &HashMap::new())
+        .unwrap();
+    // The nonunique prefix is the projection's selected-stream count key.
+    // A long session makes its physical extent exceed the fixed page cache.
+    db.execute(
+        "CREATE TABLE event_search_source_events (id INT PRIMARY KEY, context_id INT, generation_id INT, connector_id TEXT, source_instance_ref TEXT, session_ref TEXT, UNIQUE (context_id, generation_id, connector_id, source_instance_ref, session_ref, id)) MAINTAIN COUNT (context_id, generation_id, connector_id, source_instance_ref, session_ref)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let params = HashMap::from([
+        ("context_id".into(), Value::Int64(1)),
+        ("generation_id".into(), Value::Int64(1)),
+        ("connector".into(), Value::Text("connector".into())),
+        ("source".into(), Value::Text("source".into())),
+        ("session".into(), Value::Text("p".repeat(BODY_BYTES))),
+    ]);
+    db.execute(
+        "INSERT INTO event_search_source_events VALUES (1, $context_id, $generation_id, $connector, $source, $session)",
+        &params,
+    )
+    .unwrap();
+    db.close().unwrap();
+    drop(db);
+    // Reopen to remove writer buffers. A complete maintained-count extent
+    // larger than the cache must still be admitted before it is faulted.
+    let db = Database::open_with_options(&path, options).unwrap();
+    let persistence = db.persistence.as_ref().unwrap();
+    let pages = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+        PAGE_BUDGET,
+    ));
+    let mut observed = None;
+    let mut available_at_refusal = None;
+    let outer =
+        persistence.visit_relational_table_with_admission("admission_driver", &pages, |_| {
+            // Same public API and statement shape as selected_events_through
+            // in cg foreground event-search projection. Assert its result
+            // before r17's outer side-channel repair can substitute it.
+            observed = Some(db.execute(QUERY, &params).unwrap_err());
+            available_at_refusal = Some(PAGE_BUDGET - pages.usage().used);
+            Ok(())
+        });
+    let error = observed.expect("the admitted driver calls the foreground query");
+    assert!(
+        matches!(&error, Error::MemoryBudgetExceeded {
+            subsystem, operation, requested_bytes, available_bytes,
+            budget_limit_bytes, ..
+        } if subsystem == "sync"
+            && operation == "stage_received_unit_row_image"
+            && *requested_bytes > BODY_BYTES
+            && *available_bytes == available_at_refusal.unwrap()
+            && *budget_limit_bytes == PAGE_BUDGET),
+        "{error:?}"
+    );
+    outer.unwrap();
+    assert_eq!(
+        pages.usage().used,
+        0,
+        "the enclosing image page owner releases its charge"
+    );
+    let retry = db.execute(QUERY, &params).unwrap();
+    assert_eq!(retry.rows[0][0], Value::Int64(1));
+    db.close().unwrap();
+}
+
+#[test]
+fn source_page_callback_returns_original_refusal_in_storage_carrier() {
+    let (_directory, db) = fixture(GRAPH_BYTES);
+    let read = db.begin_read().unwrap();
+    drop(read.open_table(GENERATIONS).unwrap());
+    let accountant = Arc::new(MemoryAccountant::with_budget(CACHE_BYTES + 1024));
+    accountant.try_allocate(CACHE_BYTES).unwrap();
+    let result = with_source_page_admission(Arc::clone(&accountant), || {
+        let table = read.open_table(GENERATIONS).unwrap();
+        let error = table.get(b"old-authoritative".as_slice()).err().unwrap();
+        let redb::StorageError::AdmissionRefused(payload) = error else {
+            panic!("source-page admission crossed storage as {error:?}");
+        };
+        let error = payload.downcast::<Error>().unwrap();
+        assert!(matches!(*error, Error::MemoryBudgetExceeded {
+            subsystem, operation, requested_bytes, available_bytes: 1024,
+            budget_limit_bytes, ..
+        } if subsystem == "vector_maintenance"
+            && operation == "read_vector_generation_source_page"
+            && requested_bytes > GRAPH_BYTES
+            && budget_limit_bytes == CACHE_BYTES + 1024));
+        Ok(())
+    });
+    result.unwrap();
+    assert_eq!(accountant.usage().used, CACHE_BYTES);
+    accountant.release(CACHE_BYTES);
 }

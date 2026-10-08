@@ -1,5 +1,6 @@
 //! Operation-scoped admission before allocating a source page. The caller
 //! keeps admitted bytes owned until its read handles have been released.
+use crate::StorageError;
 use std::{cell::RefCell, io, sync::Arc};
 use std::{marker::PhantomData, rc::Rc};
 type Admission = Arc<dyn Fn(usize) -> io::Result<()> + Send + Sync>;
@@ -13,6 +14,8 @@ type ChargingAdmission = Arc<dyn Fn(usize) -> io::Result<ReadPageCharge> + Send 
 enum ActiveAdmission {
     Scoped(Admission),
     Charging(ChargingAdmission),
+    StorageScoped(Arc<dyn Fn(usize) -> Result<(), StorageError> + Send + Sync>),
+    StorageCharging(Arc<dyn Fn(usize) -> Result<ReadPageCharge, StorageError> + Send + Sync>),
 }
 
 thread_local! { static ACTIVE: RefCell<Vec<ActiveAdmission>> = const { RefCell::new(Vec::new()) }; }
@@ -46,10 +49,46 @@ pub fn with_read_page_charge<R>(admit: ChargingAdmission, operation: impl FnOnce
     operation()
 }
 
-pub(crate) fn admit_read_memory(bytes: usize) -> io::Result<Option<ReadPageCharge>> {
+/// Like the legacy scoped admission, retaining a caller's typed storage refusal.
+#[doc(hidden)]
+pub fn with_read_memory_admission_storage<R>(
+    admit: Arc<dyn Fn(usize) -> Result<(), StorageError> + Send + Sync>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    ACTIVE.with(|active| {
+        active
+            .borrow_mut()
+            .push(ActiveAdmission::StorageScoped(admit));
+    });
+    let _reset = ResetAdmission;
+    operation()
+}
+
+/// Like the legacy charging admission, retaining a caller's typed storage refusal.
+#[doc(hidden)]
+pub fn with_read_page_charge_storage<R>(
+    admit: Arc<dyn Fn(usize) -> Result<ReadPageCharge, StorageError> + Send + Sync>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    ACTIVE.with(|active| {
+        active
+            .borrow_mut()
+            .push(ActiveAdmission::StorageCharging(admit));
+    });
+    let _reset = ResetAdmission;
+    operation()
+}
+
+pub(crate) fn admit_read_memory(bytes: usize) -> Result<Option<ReadPageCharge>, StorageError> {
     ACTIVE.with(|active| match active.borrow().last() {
-        Some(ActiveAdmission::Scoped(admit)) => admit(bytes).map(|()| None),
-        Some(ActiveAdmission::Charging(admit)) => admit(bytes).map(Some),
+        Some(ActiveAdmission::Scoped(admit)) => {
+            admit(bytes).map(|()| None).map_err(StorageError::from)
+        }
+        Some(ActiveAdmission::Charging(admit)) => {
+            admit(bytes).map(Some).map_err(StorageError::from)
+        }
+        Some(ActiveAdmission::StorageScoped(admit)) => admit(bytes).map(|()| None),
+        Some(ActiveAdmission::StorageCharging(admit)) => admit(bytes).map(Some),
         None => Ok(None),
     })
 }

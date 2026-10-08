@@ -1896,28 +1896,31 @@ impl RequestContext {
         source: BoundedWorkSource,
         read: impl FnOnce() -> std::result::Result<T, BoundedExecutionError>,
     ) -> std::result::Result<T, BoundedExecutionError> {
-        let refusal = Arc::new(parking_lot::Mutex::new(None::<BoundedExecutionError>));
         let admission = {
             let context = Arc::clone(self);
-            let refusal = Arc::clone(&refusal);
-            Arc::new(
-                move |bytes: usize| match context.admit_source_page(source, bytes) {
-                    Ok(charge) => Ok(Box::new(charge) as redb::ReadPageCharge),
-                    Err(error) => {
-                        *refusal.lock() = Some(error);
-                        Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory))
-                    }
-                },
-            )
-                as Arc<dyn Fn(usize) -> std::io::Result<redb::ReadPageCharge> + Send + Sync>
+            Arc::new(move |bytes: usize| {
+                context
+                    .admit_source_page(source, bytes)
+                    .map(|charge| Box::new(charge) as redb::ReadPageCharge)
+                    .map_err(|error| {
+                        let error = match error {
+                            BoundedExecutionError::Engine(error) => error,
+                            BoundedExecutionError::Refused(failure) => Error::ReadFailure(failure),
+                            BoundedExecutionError::Cancelled => Error::ReadCancelled,
+                            BoundedExecutionError::Unimplemented => {
+                                Error::ReadSessionNotImplemented
+                            }
+                        };
+                        redb::StorageError::AdmissionRefused(Box::new(error))
+                    })
+            })
+                as Arc<
+                    dyn Fn(usize) -> std::result::Result<redb::ReadPageCharge, redb::StorageError>
+                        + Send
+                        + Sync,
+                >
         };
-        let result = redb::with_read_page_charge(admission, read);
-        // The storage layer reports a refused page as an I/O failure; the
-        // caller is owed the memory refusal that caused it.
-        if let Some(refusal) = refusal.lock().take() {
-            return Err(refusal);
-        }
-        result
+        redb::with_read_page_charge_storage(admission, read)
     }
 
     fn set_encoded_bytes(&self, bytes: u64) {

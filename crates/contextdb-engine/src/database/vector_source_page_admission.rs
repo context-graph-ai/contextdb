@@ -2,43 +2,10 @@
 //! In particular, a borrowed graph still holds its entire redb source page.
 
 use crate::memory_accounting::MemoryAccountant;
-use contextdb_core::{Error, Result};
-use std::cell::RefCell;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
-
-struct SourceRefusal {
-    marker: String,
-    error: parking_lot::Mutex<Option<Error>>,
-}
-
-thread_local! {
-    static SOURCE_REFUSAL: RefCell<Option<Arc<SourceRefusal>>> = const { RefCell::new(None) };
-}
-
-struct SourceRefusalScope(Option<Arc<SourceRefusal>>);
-
-impl Drop for SourceRefusalScope {
-    fn drop(&mut self) {
-        SOURCE_REFUSAL.with(|slot| *slot.borrow_mut() = self.0.take());
-    }
-}
-
-/// Recover only the refusal belonging to this operation and this thread.
-/// The private marker survives redb's I/O error adaptation, so a caught or
-/// unrelated later storage error cannot consume stale source-page detail.
-pub(crate) fn take_source_page_refusal(message: &str) -> Option<Error> {
-    SOURCE_REFUSAL.with(|slot| {
-        let slot = slot.borrow();
-        let refusal = slot.as_ref()?;
-        if message.strip_prefix("I/O error: ") != Some(refusal.marker.as_str()) {
-            return None;
-        }
-        refusal.error.lock().take()
-    })
-}
+#[cfg(test)]
+use contextdb_core::Error;
+use contextdb_core::Result;
+use std::sync::Arc;
 
 struct SourcePageCharge {
     accountant: Arc<MemoryAccountant>,
@@ -56,8 +23,8 @@ impl Drop for SourcePageCharge {
 /// the writer's already-reserved fixed page cache. Decode/build reservations
 /// cover other allocations and must not include this source buffer again.
 ///
-/// Redb restores enclosing callbacks on return or unwind. Capture the exact
-/// admission error separately because redb transports it as an I/O error.
+/// Redb restores enclosing callbacks on return or unwind. Admission errors
+/// travel with their original typed payload through storage adaptation.
 pub(super) fn with_source_page_admission<T>(
     accountant: Arc<MemoryAccountant>,
     read: impl FnOnce() -> Result<T>,
@@ -119,46 +86,21 @@ fn with_source_page_admission_for<T>(
     hint: &'static str,
     read: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
-    let refusal = Arc::new(SourceRefusal {
-        marker: format!(
-            "contextdb vector source-page refusal [{}]",
-            NEXT_SCOPE.fetch_add(1, Ordering::Relaxed)
-        ),
-        error: parking_lot::Mutex::new(None),
-    });
-    let previous = SOURCE_REFUSAL.with(|slot| slot.replace(Some(Arc::clone(&refusal))));
-    let _scope = SourceRefusalScope(previous);
-    let admission = {
-        let refusal = Arc::clone(&refusal);
-        Arc::new(move |bytes: usize| {
-            match accountant.try_allocate_for(bytes, "vector_maintenance", operation, hint) {
-                Ok(()) => Ok(Box::new(SourcePageCharge {
+    let admission = Arc::new(move |bytes: usize| {
+        accountant
+            .try_allocate_for(bytes, "vector_maintenance", operation, hint)
+            .map(|()| {
+                Box::new(SourcePageCharge {
                     accountant: Arc::clone(&accountant),
                     bytes,
-                }) as redb::ReadPageCharge),
-                Err(error) => {
-                    let mut first = refusal.error.lock();
-                    if first.is_none() {
-                        *first = Some(error);
-                    }
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::OutOfMemory,
-                        refusal.marker.clone(),
-                    ))
-                }
-            }
-        }) as Arc<dyn Fn(usize) -> std::io::Result<redb::ReadPageCharge> + Send + Sync>
-    };
-    let result = redb::with_read_page_charge(admission, read);
-    // A caller may have classified a post-publication refusal as a successful
-    // publication with deferred cleanup. Preserve that successful outcome.
-    // Fallback only serves callers that transported our own I/O marker without
-    // using persistence's immediate typed adapter.
-    match result {
-        Err(error) => Err(take_source_page_refusal(&error.to_string()).unwrap_or(error)),
-        Ok(value) => Ok(value),
-    }
+                }) as redb::ReadPageCharge
+            })
+            .map_err(|error| redb::StorageError::AdmissionRefused(Box::new(error)))
+    });
+    // A caller may classify a post-publication refusal as deferred cleanup.
+    // The scoped callback preserves that successful result and restores an
+    // enclosing callback on return or unwind.
+    redb::with_read_page_charge_storage(admission, read)
 }
 
 #[cfg(test)]
@@ -168,7 +110,7 @@ mod tests;
 mod cleanup_attribution_tests {
     use super::*;
     use redb::{ReadableDatabase, ReadableTable, TableDefinition};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone, Copy)]
     enum Cleanup {

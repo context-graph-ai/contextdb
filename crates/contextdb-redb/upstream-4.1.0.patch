@@ -1393,6 +1393,52 @@
  
      #[derive(Debug)]
      struct FailingBackend {
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -12,6 +12,9 @@
+     Corrupted(String),
+     /// The value being inserted exceeds the maximum of 3GiB
+     ValueTooLarge(usize),
++    /// Opaque caller admission refusal, distinct from device or file I/O.
++    #[doc(hidden)]
++    AdmissionRefused(Box<dyn std::error::Error + Send + Sync>),
+     Io(io::Error),
+     PreviousIo,
+     DatabaseClosed,
+@@ -35,6 +38,7 @@
+         match err {
+             StorageError::Corrupted(msg) => Error::Corrupted(msg),
+             StorageError::ValueTooLarge(x) => Error::ValueTooLarge(x),
++            StorageError::AdmissionRefused(error) => Error::AdmissionRefused(error),
+             StorageError::Io(x) => Error::Io(x),
+             StorageError::PreviousIo => Error::PreviousIo,
+             StorageError::DatabaseClosed => Error::DatabaseClosed,
+@@ -56,6 +60,7 @@
+                     MAX_VALUE_LENGTH / 1024 / 1024 / 1024
+                 )
+             }
++            StorageError::AdmissionRefused(error) => write!(f, "admission refused: {error}"),
+             StorageError::Io(err) => {
+                 write!(f, "I/O error: {err}")
+             }
+@@ -553,6 +558,9 @@
+     // Tables cannot be opened for writing multiple times, since they could retrieve immutable &
+     // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
+     TableAlreadyOpen(String, &'static panic::Location<'static>),
++    /// Opaque caller admission refusal, distinct from device or file I/O.
++    #[doc(hidden)]
++    AdmissionRefused(Box<dyn std::error::Error + Send + Sync>),
+     Io(io::Error),
+     DatabaseClosed,
+     /// A previous IO error occurred. The database must be closed and re-opened
+@@ -629,6 +637,7 @@
+             Error::TableAlreadyOpen(name, location) => {
+                 write!(f, "Table '{name}' already opened at: {location}")
+             }
++            Error::AdmissionRefused(error) => write!(f, "admission refused: {error}"),
+             Error::Io(err) => {
+                 write!(f, "I/O error: {err}")
+             }
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -62,10 +62,13 @@
@@ -1452,7 +1498,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +130,16 @@
+@@ -106,3 +130,17 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -1463,7 +1509,8 @@
 +#[doc(hidden)]
 +pub use read_admission::{
 +    ReadPageCharge, ScanAllowance, ScanReads, scan_reads, with_read_memory_admission,
-+    with_read_page_charge, with_scan_reads,
++    with_read_memory_admission_storage, with_read_page_charge, with_read_page_charge_storage,
++    with_scan_reads,
 +};
 +
 +#[cfg(feature = "test-seams")]
@@ -1611,9 +1658,10 @@
 +}
 --- /dev/null
 +++ b/src/read_admission.rs
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,218 @@
 +//! Operation-scoped admission before allocating a source page. The caller
 +//! keeps admitted bytes owned until its read handles have been released.
++use crate::StorageError;
 +use std::{cell::RefCell, io, sync::Arc};
 +use std::{marker::PhantomData, rc::Rc};
 +type Admission = Arc<dyn Fn(usize) -> io::Result<()> + Send + Sync>;
@@ -1627,6 +1675,8 @@
 +enum ActiveAdmission {
 +    Scoped(Admission),
 +    Charging(ChargingAdmission),
++    StorageScoped(Arc<dyn Fn(usize) -> Result<(), StorageError> + Send + Sync>),
++    StorageCharging(Arc<dyn Fn(usize) -> Result<ReadPageCharge, StorageError> + Send + Sync>),
 +}
 +
 +thread_local! { static ACTIVE: RefCell<Vec<ActiveAdmission>> = const { RefCell::new(Vec::new()) }; }
@@ -1660,10 +1710,46 @@
 +    operation()
 +}
 +
-+pub(crate) fn admit_read_memory(bytes: usize) -> io::Result<Option<ReadPageCharge>> {
++/// Like the legacy scoped admission, retaining a caller's typed storage refusal.
++#[doc(hidden)]
++pub fn with_read_memory_admission_storage<R>(
++    admit: Arc<dyn Fn(usize) -> Result<(), StorageError> + Send + Sync>,
++    operation: impl FnOnce() -> R,
++) -> R {
++    ACTIVE.with(|active| {
++        active
++            .borrow_mut()
++            .push(ActiveAdmission::StorageScoped(admit));
++    });
++    let _reset = ResetAdmission;
++    operation()
++}
++
++/// Like the legacy charging admission, retaining a caller's typed storage refusal.
++#[doc(hidden)]
++pub fn with_read_page_charge_storage<R>(
++    admit: Arc<dyn Fn(usize) -> Result<ReadPageCharge, StorageError> + Send + Sync>,
++    operation: impl FnOnce() -> R,
++) -> R {
++    ACTIVE.with(|active| {
++        active
++            .borrow_mut()
++            .push(ActiveAdmission::StorageCharging(admit));
++    });
++    let _reset = ResetAdmission;
++    operation()
++}
++
++pub(crate) fn admit_read_memory(bytes: usize) -> Result<Option<ReadPageCharge>, StorageError> {
 +    ACTIVE.with(|active| match active.borrow().last() {
-+        Some(ActiveAdmission::Scoped(admit)) => admit(bytes).map(|()| None),
-+        Some(ActiveAdmission::Charging(admit)) => admit(bytes).map(Some),
++        Some(ActiveAdmission::Scoped(admit)) => {
++            admit(bytes).map(|()| None).map_err(StorageError::from)
++        }
++        Some(ActiveAdmission::Charging(admit)) => {
++            admit(bytes).map(Some).map_err(StorageError::from)
++        }
++        Some(ActiveAdmission::StorageScoped(admit)) => admit(bytes).map(|()| None),
++        Some(ActiveAdmission::StorageCharging(admit)) => admit(bytes).map(Some),
 +        None => Ok(None),
 +    })
 +}
@@ -2778,7 +2864,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +2064,344 @@
+@@ -1823,46 +2064,361 @@
          Ok(progress)
      }
  
@@ -2812,10 +2898,27 @@
 +    /// caller sees the successor in memory only after that commit succeeds.
 +    #[doc(hidden)]
 +    pub fn compact_step_with_cursor_hook(
-+        mut self,
++        self,
 +        cursor: &mut CompactionCursor,
 +        maximum: usize,
 +        mut admit: impl FnMut(usize) -> std::io::Result<()>,
++        on_batch: impl FnOnce(&Self, &CompactionCursor) -> Result<(), StorageError>,
++    ) -> Result<CompactionProgress, crate::CompactionError> {
++        self.compact_step_with_cursor_hook_storage(
++            cursor,
++            maximum,
++            |bytes| admit(bytes).map_err(StorageError::from),
++            on_batch,
++        )
++    }
++
++    /// Checkpoint relocation while retaining typed caller admission errors.
++    #[doc(hidden)]
++    pub fn compact_step_with_cursor_hook_storage(
++        mut self,
++        cursor: &mut CompactionCursor,
++        maximum: usize,
++        mut admit: impl FnMut(usize) -> Result<(), StorageError>,
 +        on_batch: impl FnOnce(&Self, &CompactionCursor) -> Result<(), StorageError>,
 +    ) -> Result<CompactionProgress, crate::CompactionError> {
 +        assert!(maximum > 0);
@@ -2847,7 +2950,7 @@
 +        &mut self,
 +        cursor: &mut CompactionCursor,
 +        maximum: usize,
-+        admit: &mut impl FnMut(usize) -> std::io::Result<()>,
++        admit: &mut impl FnMut(usize) -> Result<(), StorageError>,
 +    ) -> Result<CompactionProgress> {
 +        // The saved allocator tree is a live lazy bitmap source. Keep that
 +        // one root reachable instead of copying all its words under the writer
@@ -3153,7 +3256,7 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +2576,18 @@
+@@ -2037,6 +2593,18 @@
          })
      }
  
@@ -3172,7 +3275,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,6 +2658,82 @@
+@@ -2107,6 +2675,82 @@
      tree: TableTree,
  }
  
@@ -3255,7 +3358,7 @@
  impl ReadTransaction {
      pub(crate) fn new(
          mem: Arc<TransactionalMemory>,
-@@ -2121,6 +2748,45 @@
+@@ -2121,6 +2765,45 @@
          })
      }
  
@@ -3301,7 +3404,7 @@
      /// Open the given table
      pub fn open_table<K: Key + 'static, V: Value + 'static>(
          &self,
-@@ -2135,12 +2801,54 @@
+@@ -2135,12 +2818,54 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -3357,7 +3460,7 @@
      }
  
      /// Open the given table without a type
-@@ -2161,7 +2869,7 @@
+@@ -2161,7 +2886,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -3366,7 +3469,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +2897,7 @@
+@@ -2189,7 +2914,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -3375,7 +3478,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +2925,7 @@
+@@ -2217,7 +2942,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -3384,7 +3487,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +2971,15 @@
+@@ -2263,7 +2988,15 @@
  
  #[cfg(test)]
  mod test {
@@ -3401,7 +3504,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +3000,840 @@
+@@ -2284,4 +3017,840 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
