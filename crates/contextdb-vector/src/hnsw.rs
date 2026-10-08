@@ -308,12 +308,15 @@ struct PagedVectorPageCache {
 
 impl PagedVectorPageCache {
     fn new(slots: usize) -> Self {
-        Self {
+        let cache = Self {
             slot_by_offset: HashMap::with_capacity(slots),
             slots: (0..slots).map(|_| None).collect(),
             last_used: vec![0; slots],
             clock: 0,
-        }
+        };
+        #[cfg(feature = "test-seams")]
+        observe_paged_vector(|observer| observer.page_cache_constructed(slots));
+        cache
     }
 
     /// The resident page at this offset, as a handle the caller keeps while
@@ -468,9 +471,9 @@ impl PagedVectorPageCache {
     /// to another page: the page is taken out only when the cache's own
     /// handle is the last one, which frees it on the spot, and put back
     /// otherwise. When every page is being read, the new page is not kept.
-    fn install(&mut self, offset: usize, bytes: Arc<PageBody>) -> bool {
+    fn install(&mut self, offset: usize, bytes: Vec<u8>) -> ReadPageBacking {
         if self.slot_by_offset.contains_key(&offset) {
-            return false;
+            return ReadPageBacking::Owned(bytes);
         }
         self.clock = self.clock.wrapping_add(1);
         let slot = match self.slots.iter().position(Option::is_none) {
@@ -514,15 +517,25 @@ impl PagedVectorPageCache {
                     }
                 }
                 let Some(slot) = freed else {
-                    return false;
+                    return ReadPageBacking::Owned(bytes);
                 };
                 slot
             }
         };
-        self.slots[slot] = Some(ResidentPage { offset, bytes });
+        // The selected slot already carries its page body and shared handle
+        // reservation. Retain the caller's Vec charge while conversion may
+        // shrink its backing, so both old and new allocations remain funded.
+        // Rejections above allocate no shared control at all.
+        let bytes = Arc::new(PageBody(bytes.into_boxed_slice()));
+        #[cfg(feature = "test-seams")]
+        observe_paged_vector(|observer| observer.page_control_allocated(offset));
+        self.slots[slot] = Some(ResidentPage {
+            offset,
+            bytes: Arc::clone(&bytes),
+        });
         self.slot_by_offset.insert(offset, slot);
         self.last_used[slot] = self.clock;
-        true
+        ReadPageBacking::Shared(bytes)
     }
 }
 
@@ -577,17 +590,32 @@ pub fn durable_reader_cache_ceiling(
 
 /// A serving page one walk is reading, and the part of it still charged to
 /// that walk: nothing for a page the cache holds (its slot carries the
-/// charge), the page's bytes and shared handle for a copy the cache did not keep. The walk's
-/// handle is dropped first and that charge given back after, so a copy
-/// stays charged for exactly as long as this walk keeps it allocated.
+/// charge), and the owned buffer's capacity for a copy the cache did not keep.
+/// The backing is dropped before its scratch charge is returned.
+enum ReadPageBacking {
+    Owned(Vec<u8>),
+    Shared(Arc<PageBody>),
+}
+
+impl std::ops::Deref for ReadPageBacking {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+}
+
 struct ReadPage<'r, R: FnMut(HnswSearchScratchEvent)> {
-    page: Option<Arc<PageBody>>,
+    page: Option<ReadPageBacking>,
     charged: usize,
     release: &'r mut R,
 }
 
 impl<'r, R: FnMut(HnswSearchScratchEvent)> ReadPage<'r, R> {
-    fn new(page: Arc<PageBody>, charged: usize, release: &'r mut R) -> Self {
+    fn new(page: ReadPageBacking, charged: usize, release: &'r mut R) -> Self {
         Self {
             page: Some(page),
             charged,
@@ -600,7 +628,7 @@ impl<R: FnMut(HnswSearchScratchEvent)> std::ops::Deref for ReadPage<'_, R> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        self.page.as_deref().map_or(&[], |page| &**page)
+        self.page.as_deref().unwrap_or(&[])
     }
 }
 
@@ -1208,14 +1236,12 @@ impl PagedHnsw {
             #[cfg(any(test, feature = "test-seams"))]
             observe_paged_vector(|observer| observer.page_looked_up(resident.is_some()));
             let page = if let Some(page) = resident {
-                ReadPage::new(page, 0, &mut *release)
+                ReadPage::new(ReadPageBacking::Shared(page), 0, &mut *release)
             } else {
                 let page_len = self
                     .source_page_bytes
                     .min(self.graph_len.saturating_sub(page_offset));
-                let reserved = page_len.checked_add(SERVING_PAGE_HANDLE_BYTES).ok_or(
-                    HnswBoundedSearchError::CapacityOverflow("paged vector page handle"),
-                )?;
+                let reserved = page_len;
                 acquire(HnswSearchScratchEvent::Reserve {
                     container: HnswSearchScratchContainer::QueryBytes,
                     previous_capacity: 0,
@@ -1237,20 +1263,7 @@ impl PagedHnsw {
                 contextdb_core::find_attribution::note_page_fill(page.len());
                 #[cfg(any(test, feature = "test-seams"))]
                 observe_paged_vector(|observer| observer.page_filled());
-                let actual = match page.capacity().checked_add(SERVING_PAGE_HANDLE_BYTES) {
-                    Some(actual) => actual,
-                    None => {
-                        drop(page);
-                        release(HnswSearchScratchEvent::Release {
-                            container: HnswSearchScratchContainer::QueryBytes,
-                            capacity: reserved,
-                            element_bytes: 1,
-                        });
-                        return Err(HnswBoundedSearchError::CapacityOverflow(
-                            "paged vector page handle",
-                        ));
-                    }
-                };
+                let actual = page.capacity();
                 if let Err(error) = acquire(HnswSearchScratchEvent::Reconcile {
                     container: HnswSearchScratchContainer::QueryBytes,
                     requested_capacity: reserved,
@@ -1279,32 +1292,30 @@ impl PagedHnsw {
                 // Everything above this point -- the read itself and the
                 // proof of what came back -- happened with the cache
                 // unlocked, and a page that failed either is never installed.
-                let shared = Arc::new(PageBody(page.into_boxed_slice()));
-                let kept = {
+                let backing = {
                     let mut cache = self.page_cache.lock();
                     #[cfg(any(test, feature = "test-seams"))]
                     observe_paged_vector(|observer| observer.page_cache_locked());
-                    cache.install(page_offset, Arc::clone(&shared))
+                    cache.install(page_offset, page)
                 };
-                // A page the cache kept is carried by its slot's charge from
-                // here on. One it did not keep -- another walk installed the
-                // same page first, or every resident page is being read --
-                // is this walk's alone, including its shared handle, and stays charged until the
-                // walk drops it.
-                if kept {
+                // Installation transfers an accepted buffer to its prepaid
+                // slot before the overlapping scratch reservation is returned.
+                // A rejected buffer stays owned and scratch-funded until drop.
+                let charged = if matches!(&backing, ReadPageBacking::Shared(_)) {
                     release(HnswSearchScratchEvent::Release {
                         container: HnswSearchScratchContainer::QueryBytes,
                         capacity: actual,
                         element_bytes: 1,
                     });
-                    ReadPage::new(shared, 0, &mut *release)
+                    0
                 } else {
-                    ReadPage::new(shared, actual, &mut *release)
-                }
+                    actual
+                };
+                ReadPage::new(backing, charged, &mut *release)
             };
-            // A cache-rejected copy has no reusable strong owner after this
-            // read. Keep no Weak that could outlive its reader-owned handle charge.
-            if page.charged == 0 && let Some(shared) = page.page.as_ref() {
+            // Only accepted cache pages have a shared control and directory
+            // custody; rejected owned buffers never publish a Weak.
+            if let Some(ReadPageBacking::Shared(shared)) = page.page.as_ref() {
                 pages.hold(page_offset, shared, self.source_page_bytes);
             }
             let page_len = page.len();
@@ -2960,6 +2971,21 @@ pub trait HnswQuerySelfScoreObserver: Send + Sync {
 pub trait PagedVectorObserver: Send + Sync {
     /// Real storage producer work, distinct from serving-cache fills.
     fn storage_work(&self, _kind: PagedVectorStorageWork, _bytes: usize) {}
+    /// Legacy cache map and slot vectors, or native paged root controls,
+    /// have finished construction. Native roots report zero serving slots;
+    /// this event does not claim that an inline container allocated storage.
+    #[cfg(feature = "test-seams")]
+    fn page_cache_constructed(&self, _slots: usize) {}
+    /// A new legacy PageBody Arc control or native source/root Arc control
+    /// has been allocated. Reported after Arc::new, before publication.
+    /// Native controls have no page offset and report zero.
+    #[cfg(feature = "test-seams")]
+    fn page_control_allocated(&self, _offset: usize) {}
+    /// Native resident admission is about to request these bytes, with the
+    /// route metadata workspace already held. This reports an attempt, not
+    /// successful admission or allocation.
+    #[cfg(feature = "test-seams")]
+    fn resident_admission_requested(&self, _requested_bytes: usize, _metadata_workspace: usize) {}
     /// One acquisition of the serving page cache's lock.
     fn page_cache_locked(&self) {}
     /// One page body read from the snapshot source into a serving slot.
@@ -2986,6 +3012,22 @@ pub fn observe_paged_storage_work(kind: PagedVectorStorageWork, bytes: usize) {
     observe_paged_vector(|observer| observer.storage_work(kind, bytes));
 }
 
+/// Report an actual native source Arc allocation through the paged observer.
+/// Native controls have no legacy page offset, so their event uses zero.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn observe_paged_native_control_allocation() {
+    observe_paged_vector(|observer| observer.page_control_allocated(0));
+}
+
+/// Report the native admission operands through the existing paged observer.
+/// The engine calls this after metadata admission and before resident admission.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn observe_paged_resident_admission(requested_bytes: usize, metadata_workspace: usize) {
+    observe_paged_vector(|observer| observer.resident_admission_requested(requested_bytes, metadata_workspace));
+}
+
 /// Chain producer observations through the same operation collector and its
 /// enclosing proof observer. This changes no graph work or owner.
 #[cfg(feature = "test-seams")]
@@ -3001,6 +3043,18 @@ pub fn with_additional_paged_vector_observer<T>(
         fn storage_work(&self, kind: PagedVectorStorageWork, bytes: usize) {
             self.observer.storage_work(kind, bytes);
             if let Some(prior) = &self.prior { prior.storage_work(kind, bytes); }
+        }
+        fn page_cache_constructed(&self, slots: usize) {
+            self.observer.page_cache_constructed(slots);
+            if let Some(prior) = &self.prior { prior.page_cache_constructed(slots); }
+        }
+        fn page_control_allocated(&self, offset: usize) {
+            self.observer.page_control_allocated(offset);
+            if let Some(prior) = &self.prior { prior.page_control_allocated(offset); }
+        }
+        fn resident_admission_requested(&self, requested_bytes: usize, metadata_workspace: usize) {
+            self.observer.resident_admission_requested(requested_bytes, metadata_workspace);
+            if let Some(prior) = &self.prior { prior.resident_admission_requested(requested_bytes, metadata_workspace); }
         }
         fn page_cache_locked(&self) {
             self.observer.page_cache_locked();
@@ -3373,7 +3427,10 @@ impl HnswIndex {
     /// Install a root-bound paged graph. Its topology and lookup directories
     /// remain in durable point pages; the three legacy maps stay empty.
     pub fn from_paged_tail(tail: paged_builder::PagedVectorTail) -> Self {
-        Self::from_paged_root(Arc::new(tail))
+        let tail = Arc::new(tail);
+        #[cfg(feature = "test-seams")]
+        observe_paged_vector(|observer| observer.page_control_allocated(0));
+        Self::from_paged_root(tail)
     }
     pub(crate) fn from_paged_root(tail: Arc<paged_builder::PagedVectorTail>) -> Self {
         let (dimension, quantization, policy) = tail.definition();
@@ -5092,9 +5149,14 @@ impl HnswIndex {
             .saturating_add(slot_directory_bytes)
             .saturating_add(source.retained_bytes());
         if actual_resident > admitted_resident_bytes {
-            return Err(Error::Other(
-                "paged durable HNSW exceeded its admitted resident bound".to_string(),
-            ));
+            return Err(Error::MemoryBudgetExceeded {
+                subsystem: "vector".to_string(),
+                operation: "paged decode".to_string(),
+                requested_bytes: actual_resident,
+                available_bytes: admitted_resident_bytes,
+                budget_limit_bytes: admitted_resident_bytes,
+                hint: "Paged decode requires an admitted_resident_bytes admission covering the actual resident bytes.".to_string(),
+            });
         }
         Ok(Self {
             hnsw: HnswInner::F32Paged(PagedHnsw {

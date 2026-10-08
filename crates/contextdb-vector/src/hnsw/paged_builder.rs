@@ -820,12 +820,20 @@ impl PagedVectorTail {
             Arc::clone(&accountant),
             root_control_bytes(&progress, source.as_ref())?,
         )?);
-        Ok(Self {
-            partition: Arc::new(RetainedPagedPartition {
-                partition,
-                charge: partition_charge,
-            }),
-            progress: Arc::new(progress),
+        #[cfg(feature = "test-seams")]
+        super::observe_paged_vector(|observer| observer.page_control_allocated(0));
+        let partition = Arc::new(RetainedPagedPartition {
+            partition,
+            charge: partition_charge,
+        });
+        #[cfg(feature = "test-seams")]
+        super::observe_paged_vector(|observer| observer.page_control_allocated(0));
+        let progress = Arc::new(progress);
+        #[cfg(feature = "test-seams")]
+        super::observe_paged_vector(|observer| observer.page_control_allocated(0));
+        let tail = Self {
+            partition,
+            progress,
             policy,
             dimension,
             quantization,
@@ -834,7 +842,10 @@ impl PagedVectorTail {
             accountant,
             live_workspace,
             root_charge,
-        })
+        };
+        #[cfg(feature = "test-seams")]
+        super::observe_paged_vector(|observer| observer.page_cache_constructed(0));
+        Ok(tail)
     }
     pub fn partition(&self) -> &VectorPartitionRef {
         &self.partition.partition

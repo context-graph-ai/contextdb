@@ -17286,6 +17286,8 @@ impl DurableVectorGenerationLoader {
                     // A paged generation is served from the image's pinned
                     // pages; only its small control handle stays resident.
                     let resident = vector_paged_build::PAGED_GENERATION_RESIDENT_BYTES as usize;
+                    #[cfg(feature = "test-seams")]
+                    contextdb_vector::hnsw::observe_paged_resident_admission(resident, metadata_workspace);
                     self.accountant.try_allocate_for(
                         resident,
                         "vector_index",
@@ -17438,6 +17440,8 @@ impl DurableVectorGenerationLoader {
                 let complete_total = total
                     .checked_add(metadata_workspace)
                     .ok_or_else(|| Error::Other("retained vector load overflow".to_string()))?;
+                #[cfg(feature = "test-seams")]
+                contextdb_vector::hnsw::observe_paged_resident_admission(total, metadata_workspace);
                 self.accountant
                     .try_allocate_for(
                         total,
@@ -17761,6 +17765,8 @@ fn paged_generation_graph_from(
         node_limit,
         checkpoint: Arc::new(|| Ok(())),
     });
+    #[cfg(feature = "test-seams")]
+    contextdb_vector::hnsw::observe_paged_native_control_allocation();
     let tail = contextdb_vector::hnsw::paged_builder::PagedVectorTail::new(
         partition.clone(),
         progress,
