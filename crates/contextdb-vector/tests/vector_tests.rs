@@ -618,6 +618,144 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
         ]
     );
     assert!(hnsw.iter().all(|(_, score)| (*score - 1.0).abs() < 1e-6));
+
+    // A real saved decoder refusal leaves this same committed snapshot
+    // searchable through AUTO's exact route; INDEXED preserves the refusal.
+    {
+        use contextdb_core::{VectorPartitionKey, VectorSearchMode};
+        use contextdb_vector::hnsw::{ReadOnlyVectorGraphPageReader, ReadOnlyVectorGraphPageSource};
+        use contextdb_vector::store::{DormantVectorGraphGeneration, DormantVectorGraphLoader,
+            DormantVectorLoadRequest, LoadedVectorGraphGeneration, VectorGraphGeneration};
+        use contextdb_vector::{HnswIndex, VectorPartitionRef};
+
+        struct SavedGraphSource(Arc<Vec<u8>>);
+        impl ReadOnlyVectorGraphPageSource for SavedGraphSource {
+            fn reader(&self) -> contextdb_core::Result<Box<dyn ReadOnlyVectorGraphPageReader>> {
+                Ok(Box::new(Self(self.0.clone())))
+            }
+        }
+        impl ReadOnlyVectorGraphPageReader for SavedGraphSource {
+            fn read_range(&mut self, offset: usize, len: usize) -> contextdb_core::Result<Vec<u8>> {
+                Ok(self.0[offset..offset + len].to_vec())
+            }
+        }
+        struct SavedGraphLoader {
+            bytes: Arc<Vec<u8>>,
+            dimension: usize,
+            quantization: VectorQuantization,
+            cache_bytes: usize,
+            owner: Arc<dyn MemoryBudget>,
+            attempts: std::sync::Mutex<Vec<(DormantVectorGraphGeneration, usize)>>,
+        }
+        impl DormantVectorGraphLoader for SavedGraphLoader {
+            fn load(
+                &self,
+                generation: DormantVectorGraphGeneration,
+                caller_reserved_load_bytes: usize,
+                request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+            ) -> contextdb_core::Result<LoadedVectorGraphGeneration> {
+                if !request(DormantVectorLoadRequest::Checkpoint) {
+                    return Err(Error::ReadCancelled);
+                }
+                self.attempts.lock().unwrap().push((generation, caller_reserved_load_bytes));
+                let graph = HnswIndex::decode_paged_durable_generation(
+                    &self.bytes, Arc::new(SavedGraphSource(self.bytes.clone())),
+                    self.dimension, self.quantization, caller_reserved_load_bytes, self.cache_bytes,
+                )?;
+                let resident_bytes = graph.estimated_resident_bytes();
+                Ok(LoadedVectorGraphGeneration {
+                    graph, resident_bytes, accountant: self.owner.clone(),
+                    caller_adopted_bytes: resident_bytes, fresh_tail: None,
+                })
+            }
+        }
+
+        let snapshot = SnapshotId(50_000);
+        let query = exact_vector(2, 0);
+        let limit_rows = hnsw.len();
+        let mut fixture_owner = VectorCopyAdmission::new(accountant.clone());
+        let entries = store.entries_for_index(&r, &mut fixture_owner).unwrap();
+        let layout = store.index_layout(&r, &mut fixture_owner).unwrap();
+        let policy = layout.resolve_policy(entries.len(), limit_rows);
+        let graph = HnswIndex::from_vector_entries_with_policy(
+            &entries, layout.dimension, layout.quantization, policy,
+        );
+        let (m, ef_construction, _) = graph.policy_values();
+        let bytes = Arc::new(graph.encode_durable_generation().unwrap());
+        drop(graph);
+        let cache_bytes = SavedGraphSource(bytes.clone()).page_bytes();
+        let admitted = HnswIndex::durable_reader_resident_bound_for_cache(
+            &bytes, layout.dimension, layout.quantization, m, cache_bytes,
+        ).unwrap();
+        let control = HnswIndex::decode_paged_durable_generation(
+            &bytes, Arc::new(SavedGraphSource(bytes.clone())), layout.dimension,
+            layout.quantization, admitted, cache_bytes,
+        ).expect("a fresh public decoder control fits the real saved generation");
+        let requested = control.estimated_resident_bytes();
+        assert_eq!(control.len(), entries.len(), "the saved generation contains every authoritative fixture vector");
+        drop(control);
+        let limit = requested.checked_sub(1).expect("the fresh control retains resident bytes");
+        let partition = VectorPartitionRef::new(r.clone(), VectorPartitionKey::unpartitioned());
+        store.clear_hnsw_for(&r, accountant.as_ref());
+        let descriptor = DormantVectorGraphGeneration {
+            identity: VectorGraphGeneration {
+                generation_id: snapshot.0,
+                covered_tx: TxId::from_snapshot(snapshot),
+                covered_lsn: entries.iter().map(|entry| entry.lsn).max().unwrap(),
+                durable_bytes: u64::try_from(bytes.len()).unwrap(),
+                policy_revision: policy.policy_revision,
+                hnsw_m: u32::try_from(m).unwrap(),
+                hnsw_ef_construction: u32::try_from(ef_construction).unwrap(),
+            },
+            resident_bytes: limit, load_bytes: limit, reclaim_bytes: limit,
+        };
+        let loader = Arc::new(SavedGraphLoader {
+            bytes, dimension: layout.dimension, quantization: layout.quantization,
+            cache_bytes, owner: accountant.clone(), attempts: std::sync::Mutex::new(Vec::new()),
+        });
+        store.register_dormant_partition_generation(&partition, true, descriptor, loader.clone()).unwrap();
+        assert_eq!(store.partition_route_quarantine(&partition), None);
+        let (exact, exact_trace) = exec.search_with_mode(
+            r.clone(), &query, limit_rows, None, snapshot, VectorSearchMode::Exact, accountant.clone(),
+        ).expect("the same snapshot completes its authoritative EXACT control");
+        assert!(loader.attempts.lock().unwrap().is_empty(), "EXACT reads authoritative bodies without loading the saved graph");
+        assert_eq!(&*exact, &*hnsw, "the same-snapshot control retains the established ordered row and score tie oracle");
+        drop(exact_trace);
+        let mut route_failures = Vec::new();
+        let before_auto = accountant.usage().used;
+        let automatic = exec.search_with_mode(
+            r.clone(), &query, limit_rows, None, snapshot, VectorSearchMode::Auto, accountant.clone(),
+        );
+        match automatic {
+            Ok((automatic, automatic_trace)) => {
+                assert_eq!(&*automatic, &*exact, "AUTO's complete ordered row IDs and scores equal fresh EXACT after a decoder refusal");
+                assert_eq!(automatic_trace.fallback_reason(), Some("maintained_graph_memory_refused"));
+                drop(automatic);
+                drop(automatic_trace);
+            }
+            Err(error) => route_failures.push(format!("AUTO must complete exact work after the public decoder refusal, received {error:?}")),
+        }
+        assert_eq!(*loader.attempts.lock().unwrap(), vec![(descriptor, limit)], "AUTO reached the real decoder with exactly the supplied one-byte-short admission");
+        assert_eq!(store.partition_route_quarantine(&partition), None, "memory refusal does not quarantine this valid generation");
+        assert_eq!(accountant.usage().used, before_auto, "AUTO refunds its temporary loader and search reservations");
+        let before_indexed = accountant.usage().used;
+        let indexed = exec.search_with_mode(
+            r.clone(), &query, limit_rows, None, snapshot, VectorSearchMode::Indexed, accountant.clone(),
+        );
+        match indexed {
+            Err(Error::MemoryBudgetExceeded { requested_bytes, available_bytes, budget_limit_bytes, .. }) => {
+                assert_eq!(requested_bytes, requested, "INDEXED preserves the fresh decoder control's actual resident requirement");
+                assert_eq!(available_bytes, limit, "INDEXED preserves the actual decoder allowance");
+                assert_eq!(budget_limit_bytes, limit, "INDEXED preserves the actual decoder limit");
+            }
+            Err(other) => route_failures.push(format!("INDEXED must preserve the real public decoder's typed memory refusal, received {other:?}")),
+            Ok(_) => route_failures.push("INDEXED must refuse a saved graph one byte below its measured residency".to_string()),
+        }
+        assert_eq!(*loader.attempts.lock().unwrap(), vec![(descriptor, limit), (descriptor, limit)], "INDEXED also reaches the same real decoder and admission");
+        assert_eq!(store.partition_route_quarantine(&partition), None);
+        assert_eq!(accountant.usage().used, before_indexed, "INDEXED refunds its temporary reservation after the decoder refuses");
+        assert!(route_failures.is_empty(), "AUTO and INDEXED must preserve the public decoder refusal contract: {route_failures:?}");
+    }
 }
 
 #[test]
