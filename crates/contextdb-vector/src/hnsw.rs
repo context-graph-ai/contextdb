@@ -526,7 +526,10 @@ impl PagedVectorPageCache {
         // reservation. Retain the caller's Vec charge while conversion may
         // shrink its backing, so both old and new allocations remain funded.
         // Rejections above allocate no shared control at all.
+        #[cfg(not(test))]
         let bytes = Arc::new(PageBody(bytes.into_boxed_slice()));
+        #[cfg(test)]
+        let bytes = page_ownership_tests::allocating_control(PageBody(bytes.into_boxed_slice()));
         #[cfg(feature = "test-seams")]
         observe_paged_vector(|observer| observer.page_control_allocated(offset));
         self.slots[slot] = Some(ResidentPage {
@@ -11216,3 +11219,6 @@ mod tests {
         assert!(after_history.rows.iter().all(|(row_id, _)| row_id.0 <= 8));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod page_ownership_tests;

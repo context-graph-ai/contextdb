@@ -24320,3 +24320,6 @@ mod reverse_probe_lifetime_tests {
         assert_eq!(budget.live.load(Ordering::SeqCst), 64);
     }
 }
+
+#[cfg(test)]
+mod page_cache_budget_tests;
